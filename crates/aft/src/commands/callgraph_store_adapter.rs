@@ -35,11 +35,14 @@ pub const HUB_SUMMARY_LIMIT: usize = 15;
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
-/// Most macro-template and macro-invocation entries one `callers` answer adds.
+/// Maximum number of macro-template and macro-invocation entries added to one
+/// `callers` answer; further ones are not listed.
 const MACRO_VIA_ENTRY_LIMIT: usize = 50;
-/// Most unanalyzed macro mentions one `callers` answer counts exactly.
+/// Maximum number of unanalyzed macro mentions counted exactly in one
+/// `callers` answer; beyond it the note reports the count as a lower bound.
 const MACRO_MENTION_COUNT_LIMIT: usize = 100;
-/// Mention locations spelled out in the note; the rest are only counted.
+/// Maximum number of mention locations written out in the unanalyzed-macro
+/// note; further locations are counted but not shown.
 const MACRO_MENTION_SHOWN: usize = 5;
 
 fn is_false(value: &bool) -> bool {

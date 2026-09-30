@@ -9011,8 +9011,9 @@ fn schema_fingerprint() -> String {
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
     // Rust scoped aliases, inline modules, reexports, and turbofish calls now add edges.
-    // v10: calls inside `macro_rules!` templates, plus macro-template call and
-    // unparsed macro mention refs.
+    // Content version v10 (the `raw-ref:v10-...` suffix below): calls inside
+    // `macro_rules!` templates are extracted, and macro-template call and
+    // unparsed macro mention refs are stored.
     let input =
         format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v10-rust-macro-templates");
     hash_to_hex(blake3::hash(input.as_bytes()))

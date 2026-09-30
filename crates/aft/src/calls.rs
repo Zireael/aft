@@ -986,7 +986,9 @@ fn collect_rust_token_tree_calls(
     // A call on a macro metavariable (`$value.len()`, `$f(x)`) names nothing
     // until the macro is expanded, so it is dropped rather than recorded as a
     // call a name-based resolver could bind to an unrelated function.
-    // `$crate::path` is the exception: it always means this crate.
+    // `$crate::path` is the exception: in a macro template `$crate` names the
+    // crate that defines the macro, which is the crate of this file, so it is
+    // rewritten to the ordinary `crate::path` the resolver understands.
     fragment_calls.retain_mut(|(full, _, _, _, _)| {
         if full.contains("$crate::") {
             *full = full.replace("$crate::", "crate::");
