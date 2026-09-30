@@ -161,9 +161,21 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
         );
         let manifest = serde_json::to_value(&hello.manifest).expect("manifest json");
         assert_eq!(
-            manifest["provenance"],
-            json!({ "launch_nonce_source": "fd" }),
+            manifest["provenance"]["launch_nonce_source"],
+            json!("fd"),
             "HELLO must report that the nonce came from the pipe"
+        );
+
+        assert_eq!(
+            manifest["provenance"]["wire_crate_version"],
+            json!("0.27.0")
+        );
+        assert_eq!(
+            manifest["provenance"]["build_git_sha"]
+                .as_str()
+                .expect("HELLO build Git SHA")
+                .len(),
+            40
         );
 
         bind_route(&mut stream, project.path()).await;

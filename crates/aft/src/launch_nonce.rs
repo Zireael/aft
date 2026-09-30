@@ -19,7 +19,7 @@
 use std::fmt;
 use std::sync::Mutex;
 
-use subc_protocol::manifest::{LaunchNonceSource, ManifestProvenance};
+use subc_protocol::manifest::{build_provenance, LaunchNonceSource, ManifestProvenance};
 
 /// The nonce AFT was launched with and where it was read from. `Debug` never
 /// prints the value.
@@ -135,12 +135,13 @@ pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
     })
 }
 
-/// The provenance block AFT declares on its HELLO: where the nonce it sends
-/// was read from (`fd` for the pipe, `env` for the environment copy), so the
-/// fleet's provenance report can tell which modules still read the
-/// environment. `None` when AFT has no nonce to send.
+/// Build facts are declared on every HELLO, even when no launch nonce was
+/// supplied. The protocol helper reports the version of the wire crate actually
+/// linked into AFT; the nonce source remains a separate runtime fact.
 pub fn provenance() -> Option<ManifestProvenance> {
-    current().map(|nonce| ManifestProvenance::new().with_launch_nonce_source(Some(nonce.source)))
+    let declared = build_provenance(option_env!("AFT_BUILD_GIT_SHA"), None, None)
+        .expect("the build revision must be a full Git SHA");
+    Some(declared.with_launch_nonce_source(current().map(|nonce| nonce.source)))
 }
 
 /// Restores the previously captured nonce when dropped.
@@ -200,17 +201,23 @@ mod tests {
     }
 
     #[test]
-    fn provenance_reports_the_captured_source_and_nothing_without_a_nonce() {
+    fn provenance_reports_build_facts_with_and_without_a_nonce() {
         let _serial = serial();
         let _none = install_for_tests(None);
-        assert_eq!(provenance(), None);
+        let assert_build_facts = |declared: &ManifestProvenance| {
+            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.27.0"));
+            let sha = declared.build_git_sha.as_deref().expect("build Git SHA");
+            assert_eq!(sha.len(), 40);
+            assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        };
+        let declared = provenance().expect("provenance without a nonce");
+        assert_build_facts(&declared);
+        assert_eq!(declared.launch_nonce_source, None);
         {
             let _env = install_for_tests(Some("n"));
             let declared = provenance().expect("provenance with a nonce");
-            assert_eq!(
-                serde_json::to_value(&declared).unwrap(),
-                serde_json::json!({ "launch_nonce_source": "env" })
-            );
+            assert_build_facts(&declared);
+            assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Env));
         }
         assert_eq!(current(), None, "the guard restores the previous capture");
     }
