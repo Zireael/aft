@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "bridge-reconnect-key-rotation",
+    "tool-input-placeholder-robustness"
+  ],
+  "note": "subc_tool_schemas.json changes only the aft_zoom targets description text (targets merge with path+symbols); no ranking code changes, so ranked rows must stay byte-identical."
+}
