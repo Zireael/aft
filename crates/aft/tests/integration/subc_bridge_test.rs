@@ -13795,7 +13795,19 @@ async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
     std::fs::write(&file, &original).expect("write fixture");
     read_freshness_git(&repo, &["init", "-q"]);
     read_freshness_git(&repo, &["add", "."]);
-    read_freshness_git(&repo, &["commit", "-qm", "fixture"]);
+    // CI runners have no global git identity, so the commit names its own.
+    read_freshness_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=AFT Tests",
+            "-c",
+            "user.email=aft-tests@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
     let window = json!({ "filePath": file.to_string_lossy(), "startLine": 40, "endLine": 100 });
 
     let edit = call_tool_frame(

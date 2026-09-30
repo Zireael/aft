@@ -44,7 +44,19 @@ fn committed_fixture(dir: &Path, linked_worktree: bool) -> (PathBuf, PathBuf) {
     fs::write(primary.join("src/lib.rs"), original_source()).expect("write fixture");
     git(&primary, &["init", "-q"]);
     git(&primary, &["add", "."]);
-    git(&primary, &["commit", "-qm", "fixture"]);
+    // CI runners have no global git identity, so the commit names its own.
+    git(
+        &primary,
+        &[
+            "-c",
+            "user.name=AFT Tests",
+            "-c",
+            "user.email=aft-tests@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
     let root = if linked_worktree {
         let worktree = dir.join("linked");
         git(
