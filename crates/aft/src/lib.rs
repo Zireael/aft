@@ -73,6 +73,7 @@ pub mod config_fix;
 pub mod config_live;
 pub mod config_resolve;
 pub mod context;
+pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
 pub mod edit;

@@ -79,7 +79,17 @@ impl DatabaseWaits {
                 }
             });
         }
-        if !ctx.database_runtime_pending(name) || self.pending.len() >= MAX_WAITERS {
+        if !ctx.database_runtime_pending(name) {
+            return Err(decoded);
+        }
+        // A root reported as initializing always has its open staged or
+        // running. Hand a staged open to the database-open thread now rather
+        // than trusting that the bind's dispatch or the configure tail will
+        // get to it soon: the tail can be queued behind other roots for
+        // minutes, and a missed dispatch must not leave this root refusing
+        // mutations indefinitely. A no-op when the open is already running.
+        crate::database_open::dispatch(&ctx);
+        if self.pending.len() >= MAX_WAITERS {
             return Err(decoded);
         }
         let name = name.to_string();
@@ -145,7 +155,10 @@ mod tests {
     async fn database_wait_notification_releases_only_persistence_calls_and_cancel_aborts_wait() {
         let (_dir, root) = test_support::test_root("database-waits");
         let ctx = test_support::test_ctx();
-        ctx.begin_database_runtime();
+        // Initializing with no staged open, so nothing finishes the open
+        // behind this test's back and only `finish_database_runtime` below
+        // releases the waits.
+        ctx.mark_database_runtime_initializing_for_test();
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let route = route_key(42, 1);

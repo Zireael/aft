@@ -2911,6 +2911,11 @@ pub struct AppContext {
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
     database_runtime_error: parking_lot::Mutex<Option<String>>,
+    /// The pending aft.db open request, the configure epoch it belongs to, and
+    /// whether an open is running. See `crate::database_open`.
+    database_open: parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
+    /// Signalled whenever an open for this root stops running.
+    database_open_idle: parking_lot::Condvar,
     /// Configure-tail work that stepped aside mid-drain so a queued
     /// interactive writer (usually a route bind) could take the actor. The
     /// next tail drain resumes it before anything newly enqueued.
@@ -3397,6 +3402,8 @@ impl AppContext {
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
             database_runtime_error: parking_lot::Mutex::new(None),
+            database_open: parking_lot::Mutex::new(Default::default()),
+            database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
@@ -4966,8 +4973,102 @@ impl AppContext {
         self.app.db()
     }
 
-    pub(crate) fn begin_database_runtime(&self) {
+    /// Mark persistence as initializing for a configure that just committed,
+    /// and stage its database open in the same step, so a root reported as
+    /// initializing always has an open staged or running (never an
+    /// initializing state nobody will finish). A new open epoch keeps any open
+    /// still running for an older configure from publishing over this one;
+    /// taking the open mutex orders this against `publish_database_open`.
+    ///
+    /// A rebind that keeps the root and storage directory of a database that
+    /// is already open and ready changes nothing: re-marking it as
+    /// initializing would refuse bash and edits on a working root until the
+    /// rebind's open ran again. A failed or busy database is always retried.
+    pub(crate) fn begin_database_runtime(
+        &self,
+        canonical_cache_root: PathBuf,
+        storage_root: PathBuf,
+        session_id: String,
+    ) {
+        let mut slot = self.database_open.lock();
+        let target = (canonical_cache_root, storage_root);
+        if self.database_runtime_state.load(Ordering::Acquire) == 2
+            && !slot.running
+            && slot.pending.is_none()
+            && slot.ready_for.as_ref() == Some(&target)
+            && self.app.db_for_path(&target.1.join("aft.db")).is_some()
+        {
+            return;
+        }
+        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.committed_at = Instant::now();
+        let (canonical_cache_root, storage_root) = target;
+        slot.pending = Some(crate::database_open::DatabaseOpenRequest {
+            epoch: slot.epoch,
+            canonical_cache_root,
+            storage_root,
+            session_id,
+            committed_at: slot.committed_at,
+            dispatched_at: None,
+        });
         self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// Mark persistence as initializing with nothing staged, for tests of the
+    /// readiness wait itself that must control when the state changes.
+    #[cfg(test)]
+    pub(crate) fn mark_database_runtime_initializing_for_test(&self) {
+        let mut slot = self.database_open.lock();
+        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.pending = None;
+        self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// Record that the staged open was handed to the database-open thread
+    /// (after a bind reply, or by a tool that found the root initializing).
+    /// False when nothing is staged.
+    pub(crate) fn mark_database_open_dispatched(&self) -> bool {
+        let mut slot = self.database_open.lock();
+        match slot.pending.as_mut() {
+            Some(request) => {
+                request.dispatched_at.get_or_insert_with(Instant::now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn database_open_epoch(&self) -> u64 {
+        self.database_open.lock().epoch
+    }
+
+    pub(crate) fn database_open_slot(
+        &self,
+    ) -> (
+        &parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
+        &parking_lot::Condvar,
+    ) {
+        (&self.database_open, &self.database_open_idle)
+    }
+
+    /// Run `publish` (install or clear the database pools and publish the
+    /// readiness outcome) only if no configure committed since the open for
+    /// `epoch` began. The open runs outside the actor's write gate, so without
+    /// this an open for an older configure could finish after a newer
+    /// configure marked persistence as initializing and report its database
+    /// as ready. Returns whether `publish` ran.
+    pub(crate) fn publish_database_open(
+        &self,
+        epoch: u64,
+        publish: impl FnOnce(&mut crate::database_open::DatabaseOpenSlot),
+    ) -> bool {
+        let mut slot = self.database_open.lock();
+        if slot.epoch != epoch {
+            return false;
+        }
+        publish(&mut slot);
+        drop(slot);
+        true
     }
 
     pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {

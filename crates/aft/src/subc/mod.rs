@@ -5196,6 +5196,16 @@ fn route_bind_error_code_for_configure_response(response: &Response) -> &'static
     }
 }
 
+/// Open the root's database on the dedicated database-open thread now that the
+/// bind reply is out, instead of waiting for the root's configure tail. Tails
+/// are admitted a few at a time across all roots, so after a restart a root's
+/// tail can start minutes after its bind.
+fn start_post_ack_database_open(executor: &Executor, root_id: &ProjectRootId) {
+    if let Some(ctx) = executor.actor_context(root_id) {
+        crate::database_open::dispatch(&ctx);
+    }
+}
+
 fn queue_post_bind_configure_and_completion_maintenance(
     root_id: &ProjectRootId,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -5401,6 +5411,7 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
+    start_post_ack_database_open(executor, &completion.bind_root_id);
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     let replayed = push::replay_buffered_push_frames(
         tx,
@@ -13012,6 +13023,189 @@ mod tests {
         eprintln!("blocked database open: first bind {first_latency:?}, equivalent bind {second_latency:?}");
     }
 
+    /// Poll until `ctx` would admit bash (its database is open and published)
+    /// or `within` passes; the elapsed time when it became ready.
+    fn wait_for_database_ready(ctx: &AppContext, within: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        loop {
+            if ctx.database_runtime_refusal("probe", "bash").is_none() && ctx.db().is_some() {
+                return Some(started.elapsed());
+            }
+            if started.elapsed() >= within {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Restart storm: many roots bind at once while every root's configure
+    /// tail is stuck in a long stage (standing in for view loads and sweeps on
+    /// large roots) and the cold-build limiter is saturated. Tails are
+    /// admitted only a few at a time, so a database open that lives only in
+    /// the tail leaves most roots refusing bash and edits for as long as the
+    /// storm lasts. Every root must get its database within a few seconds of
+    /// its bind reply.
+    #[test]
+    fn every_root_gets_its_database_within_seconds_of_bind_during_a_restart_storm() {
+        const ROOTS: usize = 32;
+        const READY_BOUND: Duration = Duration::from_secs(5);
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let mut roots = Vec::new();
+        let mut gates = Vec::new();
+        let mut releases = Vec::new();
+        let mut permits = Vec::new();
+        for _ in 0..ROOTS {
+            let root = ConfiguredRoot::unconfigured(&executor);
+            root.ctx.isolate_cold_build_limiter_for_test(1);
+            permits.push(
+                root.ctx
+                    .cold_build_limiter()
+                    .try_acquire()
+                    .expect("saturate the root's cold-build limiter"),
+            );
+            let (gate, _held, release) =
+                crate::commands::configure::gate_configure_tail_stage_for_test(
+                    root.canonical_root.clone(),
+                    "view_load",
+                );
+            gates.push(gate);
+            releases.push(release);
+            roots.push(root);
+        }
+
+        // All binds at once, as after a daemon restart.
+        let mut binds = roots
+            .iter()
+            .map(|root| Some(root.submit_bind(&executor, root.bind_request(0, "opencode"))))
+            .collect::<Vec<_>>();
+        let mut acked_at = vec![None; ROOTS];
+        let mut tails = Vec::new();
+        let bind_deadline = Instant::now() + Duration::from_secs(60);
+        while acked_at.iter().any(Option::is_none) {
+            assert!(Instant::now() < bind_deadline, "binds did not finish");
+            for (index, slot) in binds.iter_mut().enumerate() {
+                let Some(bind) = slot.as_mut() else {
+                    continue;
+                };
+                let Ok(response) = bind.try_recv() else {
+                    continue;
+                };
+                assert!(response.success, "bind {index}: {}", response.data);
+                *slot = None;
+                let root = &roots[index];
+                // Mirror `handle_route_bind_completion` after the bind reply:
+                // mark the root bound and dispatch its database open.
+                root.ctx.mark_subc_bound();
+                start_post_ack_database_open(&executor, &root.root);
+                acked_at[index] = Some(Instant::now());
+                // Queue the root's configure tail; the executor admits only
+                // a few maintenance jobs, and admitted tails hold at view_load.
+                tails.push(executor.submit_maintenance_async(
+                    root.root.clone(),
+                    Lane::MaintenanceCommit,
+                    format!("subc-maintenance-drain-configure-tail-storm-{index}"),
+                    Box::new(|ctx| {
+                        let requeue =
+                            runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                        Response::success("tail", json!({ "requeue": requeue }))
+                    }),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let mut ready_after = Vec::new();
+        let mut late = Vec::new();
+        for (index, root) in roots.iter().enumerate() {
+            let acked = acked_at[index].unwrap();
+            let remaining = READY_BOUND.saturating_sub(acked.elapsed());
+            match wait_for_database_ready(&root.ctx, remaining) {
+                Some(_) => ready_after.push(acked.elapsed()),
+                None => late.push(index),
+            }
+        }
+
+        drop(releases);
+        drop(gates);
+        drop(permits);
+        for tail in tails {
+            let _ = tail.blocking_recv();
+        }
+        assert!(
+            late.is_empty(),
+            "{} of {ROOTS} roots still refused bash {READY_BOUND:?} after their bind reply \
+             while configure tails were held: roots {late:?}",
+            late.len()
+        );
+        ready_after.sort();
+        eprintln!(
+            "restart storm: {ROOTS} roots ready, median {:?}, slowest {:?} after bind reply",
+            ready_after[ROOTS / 2],
+            ready_after[ROOTS - 1]
+        );
+    }
+
+    /// A rebind can put a working root back into "initializing": here the
+    /// rebind points the root at a different storage directory, and neither
+    /// the post-reply dispatch nor the configure tail runs (the tail stands in
+    /// for one queued behind other roots). A bash call must still get the
+    /// database within its wait instead of being refused indefinitely, and a
+    /// rebind that changes nothing must keep the ready database.
+    #[test]
+    fn rebind_never_leaves_a_root_initializing_indefinitely() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::new(&executor);
+        fixture.ctx.mark_subc_bound();
+        start_post_ack_database_open(&executor, &fixture.root);
+        assert!(
+            wait_for_database_ready(&fixture.ctx, Duration::from_secs(5)).is_some(),
+            "first bind's database opened without the configure tail"
+        );
+
+        // A rebind that changes configuration but not the root or storage
+        // directory keeps the database ready.
+        let mut same = fixture.bind_request(1, "opencode");
+        same.params["config"][0]["doc"] = json!(json!({
+            "semantic_search": false,
+            "restrict_to_project_root": true,
+        })
+        .to_string());
+        let same = fixture.submit_bind(&executor, same);
+        assert!(same.blocking_recv().unwrap().success);
+        assert!(
+            fixture
+                .ctx
+                .database_runtime_refusal("probe", "bash")
+                .is_none(),
+            "a rebind onto the same database must not re-mark it as initializing"
+        );
+
+        // A rebind onto another storage directory must reopen, and nothing
+        // but the tool call itself is left to schedule that open.
+        let other_storage = tempfile::tempdir().unwrap();
+        let mut moved = fixture.bind_request(2, "opencode");
+        moved.params["storage_dir"] = json!(other_storage.path());
+        let moved = fixture.submit_bind(&executor, moved);
+        assert!(moved.blocking_recv().unwrap().success);
+        assert!(
+            fixture
+                .ctx
+                .database_runtime_refusal("probe", "bash")
+                .is_some(),
+            "a storage change reopens the database"
+        );
+        let started = Instant::now();
+        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(5));
+        assert_eq!(
+            bash["success"], true,
+            "bash after a rebind must get the database, not stay initializing: {bash}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(other_storage.path().join("aft.db").is_file());
+    }
+
     #[test]
     fn failed_database_open_refuses_tools_and_rebind_retries_persistence() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13028,7 +13222,20 @@ mod tests {
         std::fs::remove_dir(&db_path).unwrap();
         let retry = fixture.submit_bind(&executor, fixture.bind_request(1, "opencode"));
         assert!(retry.blocking_recv().unwrap().success);
-        assert_database_refuses_wire_tool(&executor, &fixture, "bash", "database_initializing");
+        // The rebind re-marks persistence as initializing while its new open
+        // is pending...
+        let pending = fixture
+            .ctx
+            .database_runtime_refusal("pending", "bash")
+            .expect("rebind re-marks persistence as initializing");
+        assert_eq!(
+            serde_json::to_value(pending).unwrap()["code"],
+            "database_initializing"
+        );
+        // ...and a waiting bash call schedules the open itself instead of
+        // waiting for the configure tail, so it runs rather than being refused.
+        let bash = database_wire_tool(&executor, &fixture, "bash", Duration::from_secs(3));
+        assert_eq!(bash["success"], true, "{bash}");
         crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
         assert!(fixture
             .ctx

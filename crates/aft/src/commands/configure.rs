@@ -3512,7 +3512,11 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
     ctx.begin_configure_ack_phase("state_commit");
-    ctx.begin_database_runtime();
+    ctx.begin_database_runtime(
+        canonical_cache_root.clone(),
+        crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+        req.session().to_string(),
+    );
     // Commit phase: no validation returns after this point.
     if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
         ctx.advance_semantic_fingerprint_generation();
@@ -5736,25 +5740,32 @@ pub(crate) fn note_finished_load_handoff(
     crate::context::log_discarded_finished_load(plane, Some(root), Some(bytes), reason);
 }
 
-pub(crate) fn configure_database_runtime(
-    ctx: &AppContext,
-    canonical_cache_root: &Path,
-    storage_root: &Path,
-) {
-    configure_database_runtime_with_mode(
-        ctx,
-        canonical_cache_root,
-        storage_root,
-        crate::db::OpenMode::Deferred,
-    );
-}
-
+/// Open the root's database under the newest open epoch (the configure that
+/// committed last). Used by the per-call retry after a busy open; the deferred
+/// open after a bind goes through `crate::database_open`.
 pub(crate) fn configure_database_runtime_with_mode(
     ctx: &AppContext,
     canonical_cache_root: &Path,
     storage_root: &Path,
     mode: crate::db::OpenMode,
 ) {
+    let epoch = ctx.database_open_epoch();
+    let _ = open_database_runtime(ctx, canonical_cache_root, storage_root, mode, epoch);
+}
+
+/// Open `aft.db` under `storage_root`, install it for backups and bash, and
+/// publish the root's persistence readiness, unless a configure newer than
+/// `epoch` committed meanwhile (then the newer configure's open publishes).
+/// Returns how long the floor check and the open took, for the readiness log.
+pub(crate) fn open_database_runtime(
+    ctx: &AppContext,
+    canonical_cache_root: &Path,
+    storage_root: &Path,
+    mode: crate::db::OpenMode,
+    epoch: u64,
+) -> crate::database_open::DatabaseOpenReport {
+    use crate::database_open::{DatabaseOpenOutcome, DatabaseOpenReport};
+
     wait_on_configure_tail_stage_gate_for_test(
         canonical_cache_root,
         ConfigureMaintenanceStage::DatabaseRuntime,
@@ -5783,42 +5794,84 @@ pub(crate) fn configure_database_runtime_with_mode(
     // A database whose schema a newer build wrote (or any database while the
     // storage root's reader floor is above this build) is refused by name
     // before a read-write connection, PRAGMA or migration touches it.
-    if let Err(refusal) = crate::persisted_format::gate(
+    let floor_started = Instant::now();
+    let gate = crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::AftDb,
         &db_path,
         &db_path,
         crate::db::peek_schema_version(&db_path).map(u64::from),
-    ) {
-        ctx.app().clear_db_for_path(&db_path);
-        ctx.backup().lock().clear_db_pool();
-        ctx.bash_background().clear_db_pool();
-        ctx.finish_database_runtime_error(refusal.to_string(), false);
-        slog_warn!("aft.db not opened: {refusal} — tools refused with database_unavailable");
-        return;
-    }
-    match ctx.app().open_db_with_mode(&db_path, mode) {
-        Ok(shared) => {
-            ctx.backup().lock().set_db_pool(shared.clone());
-            ctx.bash_background().set_db_pool(shared);
-            ctx.finish_database_runtime(Ok(()));
-        }
-        Err(err) => {
-            // Do not clear the process-shared handle if another root is already
-            // using it. A failed root configure must not close that root's SQLite
-            // connection and WAL descriptors.
+    );
+    let floor_check = floor_started.elapsed();
+    if let Err(refusal) = gate {
+        let published = ctx.publish_database_open(epoch, |slot| {
+            slot.ready_for = None;
             ctx.app().clear_db_for_path(&db_path);
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
-            ctx.finish_database_runtime_error(
-                format!("{}: {err}", db_path.display()),
-                err.is_busy(),
-            );
-            slog_warn!(
-                "failed to open aft.db at {}: {} — tools refused with database_unavailable",
-                db_path.display(),
-                err
-            );
+            ctx.finish_database_runtime_error(refusal.to_string(), false);
+        });
+        if published {
+            slog_warn!("aft.db not opened: {refusal} — tools refused with database_unavailable");
         }
+        return DatabaseOpenReport {
+            floor_check,
+            open: Duration::ZERO,
+            reused_handle: false,
+            outcome: if published {
+                DatabaseOpenOutcome::Refused(refusal.to_string())
+            } else {
+                DatabaseOpenOutcome::Superseded
+            },
+        };
+    }
+    let reused_handle = ctx.app().db_for_path(&db_path).is_some();
+    let open_started = Instant::now();
+    let opened = ctx.app().open_db_with_mode(&db_path, mode);
+    let open = open_started.elapsed();
+    let (published, outcome) = match opened {
+        Ok(shared) => (
+            ctx.publish_database_open(epoch, |slot| {
+                slot.ready_for = Some((
+                    canonical_cache_root.to_path_buf(),
+                    storage_root.to_path_buf(),
+                ));
+                ctx.backup().lock().set_db_pool(shared.clone());
+                ctx.bash_background().set_db_pool(shared);
+                ctx.finish_database_runtime(Ok(()));
+            }),
+            DatabaseOpenOutcome::Ready,
+        ),
+        Err(err) => {
+            let message = format!("{}: {err}", db_path.display());
+            // Do not clear the process-shared handle if another root is already
+            // using it. A failed root configure must not close that root's SQLite
+            // connection and WAL descriptors.
+            let published = ctx.publish_database_open(epoch, |slot| {
+                slot.ready_for = None;
+                ctx.app().clear_db_for_path(&db_path);
+                ctx.backup().lock().clear_db_pool();
+                ctx.bash_background().clear_db_pool();
+                ctx.finish_database_runtime_error(message.clone(), err.is_busy());
+            });
+            if published {
+                slog_warn!(
+                    "failed to open aft.db at {}: {} — tools refused with database_unavailable",
+                    db_path.display(),
+                    err
+                );
+            }
+            (published, DatabaseOpenOutcome::Failed(message))
+        }
+    };
+    DatabaseOpenReport {
+        floor_check,
+        open,
+        reused_handle,
+        outcome: if published {
+            outcome
+        } else {
+            DatabaseOpenOutcome::Superseded
+        },
     }
 }
 
@@ -6566,8 +6619,15 @@ fn run_configure_maintenance_unit_inner(
             // Opening SQLite can wait on another root's open or on a database
             // writer, and can run migrations. Bind readiness does not depend on
             // persistence, but session replay must use the selected database.
+            // Under subc the dedicated database-open thread usually opened it
+            // right after the bind reply; this runs the open only if nothing
+            // did, and otherwise waits for the running open to publish.
             if job.configure_database_runtime {
-                configure_database_runtime(ctx, &job.canonical_cache_root, &job.storage_root);
+                crate::database_open::run_staged_open(
+                    ctx,
+                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                    true,
+                );
                 if ctx.database_runtime_failed() {
                     forget_configure_job_binding(ctx, job);
                     return ConfigureMaintenanceUnitResult::Complete;
