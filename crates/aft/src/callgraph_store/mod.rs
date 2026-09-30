@@ -477,6 +477,46 @@ mod write_amplification_tests {
     }
 
     #[test]
+    fn callgraph_reader_setup_does_not_read_locked_schema() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("locked.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE meta (k TEXT, v TEXT); BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let reader = open_readonly_connection(&path)
+            .expect("reader setup must not read a schema held by a writer");
+        let error = database_ready(&reader).unwrap_err();
+        assert!(error.is_transient_lock_contention(), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn callgraph_readonly_open_is_retryable_while_legacy_writer_is_locked() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let store_dir = temp.path().join("store");
+        let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        let path = store.sqlite_path.clone();
+        drop(store);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn callgraph_writer_and_reader_use_bounded_normal_pragmas() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
@@ -508,7 +548,10 @@ mod write_amplification_tests {
         let synchronous: i64 = conn
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .unwrap();
-        assert_eq!(synchronous, 1);
+        assert_eq!(
+            synchronous, 2,
+            "readers retain SQLite's default durability setting"
+        );
     }
 
     #[test]
@@ -8552,15 +8595,13 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         SqliteStore::CallgraphGeneration,
     )?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(reader_busy_timeout())?;
+    // Readers do not change durability or journal settings: even synchronous
+    // reads the schema and can block behind an exclusive writer before setup.
+    // Fail fast so repeated readiness probes cannot accumulate busy waits on
+    // the request thread; callers report contention as a retryable build.
+    conn.busy_timeout(Duration::ZERO)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
-}
-
-fn reader_busy_timeout() -> Duration {
-    let jitter = (now_nanos() % 500) as u64;
-    Duration::from_millis(250 + jitter)
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {

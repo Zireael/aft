@@ -2055,6 +2055,15 @@ mod outbound_serialization_failure_tests {
 }
 
 pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStoreError) -> Response {
+    // A published WAL generation can still be busy during writer maintenance.
+    // Contention is temporary, not evidence that the persisted graph is broken.
+    if error.is_transient_lock_contention() {
+        return Response::error(
+            req_id,
+            "callgraph_building",
+            format!("{operation}: persisted callgraph store is busy; retry shortly"),
+        );
+    }
     match error {
         CallGraphStoreError::Aft(error) => Response::error(req_id, error.code(), error.to_string()),
         CallGraphStoreError::Unavailable(message) => Response::error(
@@ -2081,6 +2090,25 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
+
+    #[test]
+    fn sqlite_contention_is_retryable_but_other_store_errors_are_not() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database is locked".into()),
+            ));
+            let response = store_error_response("request", "trace_to", error);
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "callgraph_building");
+        }
+        let response = store_error_response(
+            "request",
+            "trace_to",
+            CallGraphStoreError::Sqlite(rusqlite::Error::InvalidQuery),
+        );
+        assert_eq!(response.data["code"], "callgraph_store_error");
+    }
 
     struct RefusesSerialization;
 
