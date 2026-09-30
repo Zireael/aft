@@ -153,8 +153,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
   mv "$DSYM_TMP" "$DSYM_DEST"
   echo "    dSYM: $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
 fi
-# Checked on the exact (signed) bytes that would be staged, before anything
-# names this card as current.
+# The storage-floor check runs on the signed temporary binary, the exact bytes
+# that would be staged, before the card is moved into staging or recorded in
+# ck-aft.current.
 STORAGE_ROOT="$(ck_aft_default_storage_root)"
 echo "==> storage floor: $STORAGE_ROOT"
 if ! ck_aft_check_storage_floor "$TMP" "$STORAGE_ROOT"; then

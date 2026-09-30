@@ -169,7 +169,8 @@ pub fn write_to_disk(
     #[cfg(test)]
     note_cache_write(&data_path);
     let _cache_lock = SymbolCacheLock::acquire(storage_dir, project_key, &project_root)?;
-    // Checked again under the lock: a newer build may have published between.
+    // Checked again under the lock: another process running a newer build may
+    // have written its cache since the check above.
     check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
     fs::create_dir_all(&dir)?;
     let tmp_path = dir.join(format!(

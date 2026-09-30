@@ -7601,9 +7601,9 @@ impl SemanticIndex {
             data_path,
             version,
         )?;
-        // The segment store has no header of its own to peek (a newer segment
-        // is found, and recorded, while the log is decoded), but a floor above
-        // this build's segment version still refuses the file.
+        // Delta segments have no header to peek here; a newer segment is
+        // detected and recorded while the log is decoded. A reader floor above
+        // this build's segment version still refuses the whole file.
         match crate::persisted_format::refusal_covering(
             crate::persisted_format::PersistedStore::SemanticSegment,
             data_path,

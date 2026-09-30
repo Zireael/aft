@@ -332,8 +332,10 @@ fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
             let floor = floor.unwrap_or_default();
             let unknown = floor.unknown_stores();
             if !unknown.is_empty() {
-                // This build cannot gate a store it has never heard of;
-                // placement refuses such a build before it gets here.
+                // This build cannot refuse a store it has never heard of, so
+                // it only preserves the entry. scripts/stage-card.sh refuses
+                // to stage a build whose `--formats` lacks a store the floor
+                // names, which keeps such a build from being deployed.
                 crate::slog_warn!(
                     "reader floor {} names stores this build does not know ({}); preserving them",
                     path.display(),
@@ -354,8 +356,10 @@ fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
                 .collect()
         }
         Err(error) => {
-            // An unreadable storage root fails every artifact on its own; the
-            // floor adds nothing it could enforce. Try again next configure.
+            // When the floor file cannot be read at all (an I/O error, not a
+            // parse error), every artifact under the root fails on its own
+            // too, so the floor has nothing to add. Forget this root so the
+            // next configure checks it again.
             crate::slog_warn!("{error}");
             prepared_roots()
                 .lock()

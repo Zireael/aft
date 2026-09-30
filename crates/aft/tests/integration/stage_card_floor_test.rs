@@ -87,7 +87,7 @@ fn a_floor_equal_to_the_card_stages() {
 #[test]
 fn a_floor_written_by_this_build_at_startup_stages() {
     let root = tempfile::tempdir().unwrap();
-    // The same baseline configure writes on first run.
+    // The baseline configure writes when it first opens a storage root.
     let baseline = PersistedStore::ALL
         .into_iter()
         .map(|store| (store, store.written()))
