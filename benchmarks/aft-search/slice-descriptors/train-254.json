@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "gh-relay-scoped-open",
+    "launch-nonce-source-scan"
+  ],
+  "note": "gh relay opens its Plexus route under the session's scope with subc-client-rs 0.23.2, plus a source-scan test for launch-nonce readers. No aft_search ranking file is touched."
+}
