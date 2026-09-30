@@ -52,8 +52,34 @@ pub(crate) const FLYCHECK_PUBLISH_SETTLE: Duration = Duration::from_millis(300);
 /// How long after a `textDocument/didSave` a rust-analyzer check run is
 /// expected to begin. rust-analyzer 1.98 announces the run about 150 ms after
 /// the save; the margin covers a busy server. When checking on save is turned
-/// off no run ever begins, and callers stop waiting for one after this long.
+/// off no run ever begins, and callers stop waiting for one this long after
+/// the last of [`MAX_SAVE_SENDS`] sends.
 const SAVE_CHECK_START_GRACE: Duration = Duration::from_secs(3);
+
+/// A save that started no check run within this long is sent again: a
+/// watched-file change reaching rust-analyzer just before or after the save
+/// makes it drop the check.
+const SAVE_RESEND_AFTER: Duration = Duration::from_millis(1500);
+
+/// How many times one save is sent before AFT stops expecting a check.
+const MAX_SAVE_SENDS: u8 = 3;
+
+/// How long after the file watcher reports a Rust source change the save
+/// for it is sent (see [`LspClient::owe_rust_save`]).
+const EXTERNAL_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// A save AFT asked rust-analyzer to check.
+#[derive(Debug, Clone)]
+struct RustSaveRequest {
+    /// The saved document.
+    uri: lsp_types::Uri,
+    /// Set while the save has not been sent: send it once this passes.
+    due_at: Option<Instant>,
+    /// When the save was last sent.
+    last_sent_at: Option<Instant>,
+    /// How many times it has been sent.
+    sends: u8,
+}
 
 /// How a server asked to be told about saved documents
 /// (`textDocumentSync.save` in its initialize response).
@@ -582,11 +608,11 @@ pub struct LspClient {
     rust_flycheck_finished_at: Option<Instant>,
     /// When the most recent rust-analyzer check run began.
     rust_flycheck_started_at: Option<Instant>,
-    /// When AFT last told rust-analyzer that a file was saved. rust-analyzer
-    /// re-runs `cargo check` only on a save, so until a check run begins
-    /// after this moment the published compiler errors describe the files
-    /// as they were before the save.
-    rust_check_requested_at: Option<Instant>,
+    /// The latest save AFT asked rust-analyzer to check, until a check run
+    /// begins for it. rust-analyzer re-runs `cargo check` only on a save, so
+    /// while this is set the published compiler errors describe the files as
+    /// they were before the save.
+    rust_save: Option<RustSaveRequest>,
     /// How the server asked to hear about saves (`textDocumentSync.save` in
     /// its initialize response). `None` until `initialize` succeeds, and when
     /// the server did not ask.
@@ -882,7 +908,7 @@ impl LspClient {
             rust_flycheck_running: HashSet::new(),
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
-            rust_check_requested_at: None,
+            rust_save: None,
             save_notification: None,
             workspace_loaded_at,
             supports_watched_files: false,
@@ -1134,6 +1160,18 @@ impl LspClient {
                 if is_check {
                     self.rust_flycheck_running.insert(token.to_string());
                     self.rust_flycheck_started_at = Some(Instant::now());
+                    // The check a save asked for has begun (a run that began
+                    // for another reason also checks the saved contents).
+                    // A deferred save not sent yet is still owed: the run
+                    // may have begun before the watcher's change reached
+                    // rust-analyzer.
+                    if self
+                        .rust_save
+                        .as_ref()
+                        .is_some_and(|save| save.last_sent_at.is_some())
+                    {
+                        self.rust_save = None;
+                    }
                 }
             }
             "end" => {
@@ -1157,26 +1195,83 @@ impl LspClient {
         self.rust_flycheck_started_at.is_some()
     }
 
-    /// Record that a `textDocument/didSave` was just sent. For rust-analyzer
-    /// this starts a new `cargo check`, and the check results published so far
-    /// describe the files before the save; see [`Self::rust_flycheck_pending`].
-    pub(crate) fn record_save_sent(&mut self) {
+    /// Record that a `textDocument/didSave` for `uri` was just sent. For
+    /// rust-analyzer this starts a new `cargo check`, and the check results
+    /// published so far describe the files before the save; see
+    /// [`Self::rust_flycheck_pending`].
+    pub(crate) fn record_save_sent(&mut self, uri: &lsp_types::Uri) {
         if matches!(&self.kind, ServerKind::Rust) {
-            self.rust_check_requested_at = Some(Instant::now());
+            let now = Instant::now();
+            self.rust_save = Some(RustSaveRequest {
+                uri: uri.clone(),
+                due_at: None,
+                last_sent_at: Some(now),
+                sends: 1,
+            });
+        }
+    }
+
+    /// Ask for a `textDocument/didSave` of `uri` to be sent to rust-analyzer
+    /// a little later instead of now, for a change reported by the file
+    /// watcher. rust-analyzer 1.98 drops the check a save asks for when the
+    /// save arrives right after a `workspace/didChangeWatchedFiles` for the
+    /// same file (measured: at once, no check; one second later, a check), so
+    /// the save is sent from [`Self::take_rust_save_to_send`] once
+    /// [`EXTERNAL_SAVE_DELAY`] has passed. The check counts as requested from
+    /// now on.
+    pub(crate) fn owe_rust_save(&mut self, uri: &lsp_types::Uri) {
+        if matches!(&self.kind, ServerKind::Rust) {
+            let now = Instant::now();
+            self.rust_save = Some(RustSaveRequest {
+                uri: uri.clone(),
+                due_at: Some(now + EXTERNAL_SAVE_DELAY),
+                last_sent_at: None,
+                sends: 0,
+            });
+        }
+    }
+
+    /// The document to send a `textDocument/didSave` for now, if any: a save
+    /// that was deferred (see [`Self::owe_rust_save`]) and is due, or a save
+    /// that started no check run within [`SAVE_RESEND_AFTER`] and may be sent
+    /// again (at most [`MAX_SAVE_SENDS`] times in all). The caller sends it
+    /// and then calls [`Self::mark_rust_save_sent`].
+    pub(crate) fn take_rust_save_to_send(&self, now: Instant) -> Option<lsp_types::Uri> {
+        let save = self.rust_save.as_ref()?;
+        let due = match (save.due_at, save.last_sent_at) {
+            (Some(due_at), _) => now >= due_at,
+            (None, Some(sent)) => {
+                save.sends < MAX_SAVE_SENDS
+                    && now.saturating_duration_since(sent) >= SAVE_RESEND_AFTER
+            }
+            (None, None) => false,
+        };
+        due.then(|| save.uri.clone())
+    }
+
+    /// Record that the save returned by [`Self::take_rust_save_to_send`]
+    /// was sent.
+    pub(crate) fn mark_rust_save_sent(&mut self, now: Instant) {
+        if let Some(save) = self.rust_save.as_mut() {
+            save.due_at = None;
+            save.last_sent_at = Some(now);
+            save.sends = save.sends.saturating_add(1);
         }
     }
 
     /// Whether rust-analyzer's check results may still be missing from the
-    /// published diagnostics: a check run is in progress, one ended less than
-    /// `publish_settle` ago (rust-analyzer can announce the end before it
-    /// publishes the final batch), a save was sent less than
-    /// [`SAVE_CHECK_START_GRACE`] ago and no check run has begun since (the
-    /// save starts one, and until it does the published compiler errors
-    /// describe the files before the save), or the server became quiescent
-    /// less than `start_grace` ago and no check run has been seen yet (the
-    /// first run starts right after quiescence). False for other servers, for
-    /// a server that is still warming (that state is tracked separately), and
-    /// when checking is disabled, once the grace period has passed.
+    /// published diagnostics or describe older file contents: a check run is
+    /// in progress, one ended less than `publish_settle` ago (rust-analyzer
+    /// can announce the end before it publishes the final batch), a save asked
+    /// for a check that has not begun yet (until it does, the published
+    /// compiler errors describe the files before the save, including errors
+    /// already fixed), or the server became quiescent less than `start_grace`
+    /// ago and no check run has been seen yet (the first run starts right
+    /// after quiescence). A save stops counting once it has been sent
+    /// [`MAX_SAVE_SENDS`] times and [`SAVE_CHECK_START_GRACE`] has passed
+    /// since the last send without a check beginning, as when checking on
+    /// save is turned off. False for other servers and for a server that is
+    /// still warming (that state is tracked separately).
     pub(crate) fn rust_flycheck_pending(
         &self,
         now: Instant,
@@ -1189,11 +1284,15 @@ impl LspClient {
         if !self.rust_flycheck_running.is_empty() {
             return true;
         }
-        if let Some(requested) = self.rust_check_requested_at {
-            let begun_since = self
-                .rust_flycheck_started_at
-                .is_some_and(|started| started >= requested);
-            if !begun_since && now.saturating_duration_since(requested) < SAVE_CHECK_START_GRACE {
+        if let Some(save) = &self.rust_save {
+            let awaiting = match save.last_sent_at {
+                None => true,
+                Some(sent) => {
+                    save.sends < MAX_SAVE_SENDS
+                        || now.saturating_duration_since(sent) < SAVE_CHECK_START_GRACE
+                }
+            };
+            if awaiting {
                 return true;
             }
         }

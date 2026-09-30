@@ -5329,7 +5329,10 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     let ctx = configured_context(&root);
     let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
     *ctx.watcher_rx().lock() = Some(watcher_rx);
-    let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src");
+    // Only the use site is examined first, so AFT holds no report for
+    // `src/s.rs` and treats its change as news to announce, not as a file of
+    // its own to resync.
+    let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs");
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
 
     fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
@@ -5343,6 +5346,71 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
 
     let after = scoped_diagnostics_inspect(&ctx, "outside-removal-after", "src/user.rs");
     assert_removed_field_reported(&after);
+}
+
+/// The opposite direction: a compiler error present when rust-analyzer
+/// starts (its first `cargo check` reports it) is then fixed with an AFT
+/// edit. `use of moved value` comes only from the compiler, never from
+/// rust-analyzer's own analysis, so only a new check can clear it. Until
+/// one ran, inspect certified the fixed file with the old error.
+#[test]
+fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _s) = field_removal_crate();
+    let broken = "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v, v)\n}\n";
+    let fixed = "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v.clone(), v)\n}\n";
+    let moves = write_file(&root, "src/moves.rs", broken);
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub mod moves;\npub mod s;\npub mod user;\n",
+    );
+    let ctx = configured_context(&root);
+    let moved_value = |response: &Value| {
+        diagnostic_sources_for(response, "src/moves.rs")
+            .iter()
+            .any(|(_, message)| message.contains("moved value"))
+    };
+    let before = scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src");
+    assert!(
+        moved_value(&before),
+        "control: the first check reports the error: {before:#}"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "fixed-error-edit",
+            "command": "edit_match",
+            "file": moves.display().to_string(),
+            "match": broken,
+            "replacement": fixed,
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "fixed-error-after", "src/moves.rs");
+    let text = after["text"].as_str().expect("rendered text");
+    let still_checking = after["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(after["complete"], false, "{after:#}");
+        return;
+    }
+    assert!(
+        !moved_value(&after),
+        "the fixed error is still reported: {text}\n{after:#}"
+    );
+    assert!(
+        text.contains("diagnostics: 0 errors"),
+        "the fixed file must be reported clean: {text}"
+    );
 }
 
 /// An unscoped inspect makes a whole-project claim, so it too must wait for

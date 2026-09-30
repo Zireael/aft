@@ -1876,7 +1876,10 @@ impl LspManager {
     /// editor, a script, a branch switch). rust-analyzer re-runs `cargo
     /// check` only when told that a file was saved, and a watched-file event
     /// is not such a notice, so without this the compiler errors it reports
-    /// keep describing the files before the change. One notice per batch is
+    /// keep describing the files before the change: new errors missing and
+    /// fixed ones still listed. The save is sent a little later (see
+    /// [`LspClient::owe_rust_save`]) because rust-analyzer drops a check
+    /// asked for right beside the watched-file event. One save per batch is
     /// enough because the check covers the whole workspace. A file AFT wrote
     /// itself was announced as saved when it was written, and its document
     /// still matches the disk, so AFT's own edits do not restart the check.
@@ -1904,20 +1907,10 @@ impl LspManager {
         let Ok(uri) = uri_for_path(&path) else {
             return;
         };
-        let Some(client) = self.clients.get_mut(key) else {
-            return;
-        };
-        let content = match client.save_notification() {
-            Some(SaveNotification::IncludeText) => {
-                std::fs::read_to_string(&path).unwrap_or_default()
+        if let Some(client) = self.clients.get_mut(key) {
+            if client.save_notification().is_some() {
+                client.owe_rust_save(&uri);
             }
-            _ => String::new(),
-        };
-        if let Err(error) = send_did_save(client, &uri, &content) {
-            crate::slog_warn!(
-                "didSave for an external change to {} failed: {error}",
-                path.display()
-            );
         }
     }
 
@@ -2315,11 +2308,52 @@ impl LspManager {
             events.push(event);
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
+        self.send_due_rust_saves();
         DrainedLspEvents {
             events,
             diagnostics_changed,
             accepted_snapshots,
             has_more,
+        }
+    }
+
+    /// Send the rust-analyzer saves that are due: deferred saves for changes
+    /// the file watcher reported, and saves that started no check run and
+    /// may be sent again (see [`LspClient::take_rust_save_to_send`]). Runs
+    /// with every event drain, so callers waiting for a check (inspect,
+    /// `lsp_diagnostics`) keep these moving while they wait.
+    fn send_due_rust_saves(&mut self) {
+        let now = Instant::now();
+        for client in self.clients.values_mut() {
+            let Some(uri) = client.take_rust_save_to_send(now) else {
+                continue;
+            };
+            let Some(save) = client.save_notification() else {
+                continue;
+            };
+            let text = (save == SaveNotification::IncludeText)
+                .then(|| uri_to_path(&uri).and_then(|path| std::fs::read_to_string(path).ok()))
+                .flatten();
+            let sent = client.send_notification::<DidSaveTextDocument>(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(uri.clone()),
+                text,
+            });
+            match sent {
+                Ok(()) => {
+                    client.mark_rust_save_sent(now);
+                    slog_info!(
+                        "lsp_protocol server=rust root={} method=textDocument/didSave event=sent-deferred uri={}",
+                        client.root().display(),
+                        uri.as_str()
+                    );
+                }
+                Err(error) => {
+                    crate::slog_warn!("deferred didSave for {} failed: {error}", uri.as_str());
+                    // Count the attempt so a broken pipe cannot be retried
+                    // on every drain.
+                    client.mark_rust_save_sent(now);
+                }
+            }
         }
     }
 
@@ -4829,7 +4863,7 @@ fn send_did_save(
         text_document: TextDocumentIdentifier::new(uri.clone()),
         text: (save == SaveNotification::IncludeText).then(|| content.to_string()),
     })?;
-    client.record_save_sent();
+    client.record_save_sent(uri);
     slog_info!(
         "lsp_protocol server={} root={} method=textDocument/didSave event=sent uri={}",
         client.kind().id_str(),
