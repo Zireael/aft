@@ -455,10 +455,11 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     response
 }
 
-/// Diagnostics collection is always the warm working set, with or without a
-/// request scope: scope filters rendered findings and adds per-file authority
-/// (named gaps for scoped files no producer has authoritatively analyzed),
-/// never extra collection work.
+/// Diagnostics read the warm working set, with or without a request scope.
+/// A blocking scoped request first has its started language servers analyze
+/// the scoped files (see `scoped_diagnostics_sweep`); scope then filters the
+/// rendered findings and adds per-file authority (named gaps for scoped files
+/// no producer has authoritatively analyzed).
 fn handle_inspect_payload(
     req: &RawRequest,
     ctx: &AppContext,
@@ -592,7 +593,19 @@ fn handle_inspect_payload(
         );
     }
 
-    for category in InspectCategory::active() {
+    // Diagnostics goes last: a blocking scoped request spends part of the
+    // budget asking language servers to analyze the scoped files, and the
+    // other categories' scans must not find their shared deadline already
+    // used up by that wait.
+    let ordered_categories = InspectCategory::active()
+        .iter()
+        .filter(|category| **category != InspectCategory::Diagnostics)
+        .chain(
+            InspectCategory::active()
+                .iter()
+                .filter(|category| **category == InspectCategory::Diagnostics),
+        );
+    for category in ordered_categories {
         if outcomes.contains_key(category) {
             continue;
         }
@@ -600,7 +613,9 @@ fn handle_inspect_payload(
             return inspect_interrupted_response(&req.id);
         }
         let outcome = if *category == InspectCategory::Diagnostics {
-            // Read the warm LSP store with named gaps for producers whose wait expired.
+            // Read the warm LSP store with named gaps for producers whose wait
+            // expired. A blocking scoped request first has its started servers
+            // analyze the scoped files, within half the remaining budget.
             run_diagnostics_category(
                 ctx,
                 &snapshot,
@@ -611,6 +626,9 @@ fn handle_inspect_payload(
                 not_applicable,
                 expected_producers,
                 indexing_gaps,
+                request_deadline
+                    .filter(|_| scope_was_provided)
+                    .map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline, callgraph_phase, tier2_phase)) =
@@ -691,7 +709,16 @@ fn handle_inspect_payload(
 
     let mut payload =
         build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
-    let runtime_notes = ctx.lsp().runtime_notes();
+    // A scoped answer carries only the notes of servers for its own files; a
+    // TypeScript SDK note from a server started for another request does not
+    // belong in an answer about Rust files.
+    let runtime_notes = if scope_was_provided {
+        let producers =
+            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures);
+        ctx.lsp().runtime_notes_for(&producers)
+    } else {
+        ctx.lsp().runtime_notes()
+    };
     if !runtime_notes.is_empty() {
         if let Some(text) = payload.get_mut("text") {
             if let Some(existing) = text.as_str() {
@@ -702,6 +729,29 @@ fn handle_inspect_payload(
         payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
     }
     Response::success(&req.id, payload)
+}
+
+/// The language servers a scoped inspect answers for. A blocking request
+/// already resolved them from the scoped files (started or failed); the
+/// nonblocking path derives them from the scoped files directly.
+fn scope_producer_keys(
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    expected_producers: &[ServerKey],
+    producer_failures: &[ApplicableServerFailure],
+) -> std::collections::HashSet<ServerKey> {
+    if expected_producers.is_empty() && producer_failures.is_empty() {
+        return crate::inspect::diagnostics_category::scope_producer_keys(snapshot, scope);
+    }
+    expected_producers
+        .iter()
+        .cloned()
+        .chain(
+            producer_failures
+                .iter()
+                .map(|failure| failure.server_key.clone()),
+        )
+        .collect()
 }
 
 /// Register one inspect completion whose poll closure only observes the result
@@ -1067,8 +1117,9 @@ fn run_blocking_inspect_body(
         })
         .collect::<Vec<_>>();
     // Give producers a bounded chance to settle before reading the warm store.
-    // The wait is root-level: producers publish while events are drained, and
-    // a request scope never adds per-file diagnostics collection work.
+    // The wait is root-level: producers publish while events are drained. A
+    // scoped request's per-file work happens later, in the diagnostics
+    // category, with its own share of the budget.
     let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline);
     if inspect_cancellation_requested() {
         for phase in quiescence {
@@ -2170,6 +2221,7 @@ fn render_inspect_text(
         .collect::<Map<String, Value>>();
     let summary = &available_summary;
     render_not_applicable_producers(&mut lines, summary);
+    render_scoped_diagnostics_coverage(&mut lines, summary);
     if let Some(notes) = summary
         .get("diagnostics")
         .and_then(|diagnostics| diagnostics.get("notes"))
@@ -2199,6 +2251,43 @@ fn render_inspect_text(
     render_diagnostics_category(&mut lines, summary, details);
 
     lines.join("\n")
+}
+
+/// Say how many scoped files a blocking scoped inspect had its language
+/// servers analyze, and how many it left out because of the file cap, so a
+/// partial answer over a large scope reads as "examined N of M".
+fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    let Some(coverage) = summary
+        .get("diagnostics")
+        .and_then(|section| section.get("coverage"))
+    else {
+        return;
+    };
+    let files = coverage.get("files").and_then(Value::as_u64).unwrap_or(0);
+    if files == 0 {
+        return;
+    }
+    let examined = coverage
+        .get("examined")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let not_examined = coverage
+        .get("not_examined")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let noun = if files == 1 { "file" } else { "files" };
+    let mut line =
+        format!("diagnostics: language servers analyzed {examined} of {files} scoped {noun}");
+    if not_examined > 0 {
+        let cap = coverage
+            .get("file_cap")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        line.push_str(&format!(
+            " ({not_examined} not examined: at most {cap} files per scoped inspect; narrow the scope)"
+        ));
+    }
+    lines.push(line);
 }
 
 /// Name servers that were deliberately not started because the inspected area
@@ -3247,6 +3336,9 @@ fn diagnostics_summary_for(payload: &Value) -> Value {
     }
     if let Some(not_applicable) = payload.get("not_applicable") {
         summary["not_applicable"] = not_applicable.clone();
+    }
+    if let Some(coverage) = payload.get("coverage") {
+        summary["coverage"] = coverage.clone();
     }
     summary
 }

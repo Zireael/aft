@@ -3202,9 +3202,11 @@ fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
         .is_empty());
 }
 
-/// Scope must not change collection work: a scoped request may not spawn
-/// servers, open documents, or pull diagnostics beyond what the warm path
-/// already did. Assertions target the producer/LSP call surface (server
+/// On the nonblocking inspect path, scope must not change collection work: a
+/// scoped request may not spawn servers, open documents, or pull diagnostics
+/// beyond what the warm path already did. (A blocking scoped inspect does
+/// open the scoped files; see the `scoped_blocking_inspect_*` tests.)
+/// Assertions target the producer/LSP call surface (server
 /// roster, open-document store, diagnostic reports), not timing.
 #[test]
 fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
@@ -3510,6 +3512,281 @@ fn scoped_rust_inspect_does_not_start_typescript_for_js_outside_the_scope() {
     assert!(
         !failed_producers(&response).contains(&"typescript".to_string()),
         "response: {response:#}"
+    );
+}
+
+fn diagnostic_messages_for(response: &Value, file: &str) -> Vec<String> {
+    response["details"]["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["file"] == file)
+        .filter_map(|item| item["message"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// `(file, cause reason)` of every scoped file inspect could not certify.
+fn uncovered_files(response: &Value) -> Vec<(String, String)> {
+    response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["kind"] == "uncovered_file")
+        .map(|gap| {
+            (
+                gap["file"].as_str().unwrap_or_default().to_string(),
+                gap["cause"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn single_crate_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    );
+    let lib = write_file(&root, "src/lib.rs", "pub fn f() {}\n");
+    (temp_dir, root, lib)
+}
+
+fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value {
+    inspect_tool_call(
+        ctx,
+        json!({
+            "id": id,
+            "command": "inspect",
+            "scope": scope,
+            "sections": "diagnostics",
+            "topK": 20,
+        }),
+    )
+}
+
+/// Language servers publish diagnostics only for files they were told about.
+/// The fake here behaves like rust-analyzer without pull support: it publishes
+/// for a file only after `didOpen`. A blocking scoped inspect opens the scoped
+/// file, reports what the server published, and closes the file again.
+#[test]
+fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-push");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-push", "src");
+
+    assert!(
+        diagnostic_messages_for(&response, "src/lib.rs")
+            .iter()
+            .any(|message| message.contains("test diagnostic error")),
+        "the opened file's diagnostics must be reported: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"],
+        json!({"files": 1, "examined": 1, "not_examined": 0, "file_cap": 200}),
+        "response: {response:#}"
+    );
+    assert!(
+        !ctx.lsp().document_is_open_for_test(&lib),
+        "inspect must close the documents it opened"
+    );
+
+    // The fake answers the close with an empty publish, as TypeScript does.
+    // That reply describes the closed document, not the file, and must not
+    // replace the diagnostics inspect collected.
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_close = false;
+    while !saw_close {
+        assert!(Instant::now() < hang_deadline, "fake never saw didClose");
+        saw_close = ctx.lsp().drain_events().events.iter().any(|event| {
+            matches!(event, LspEvent::Notification { method, .. } if method == "custom/documentClosed")
+        });
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(200));
+    ctx.lsp().drain_events();
+    assert_eq!(
+        ctx.lsp().get_diagnostics_for_file(&lib).len(),
+        2,
+        "the close reply erased the collected diagnostics"
+    );
+}
+
+/// A server that answers `textDocument/diagnostic` is asked directly. The
+/// fake pushes nothing useful here (an empty list on open), so only the pull
+/// can produce its diagnostic.
+#[test]
+fn scoped_blocking_inspect_pulls_diagnostics_from_a_pull_server() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull", "src/lib.rs");
+
+    assert_eq!(
+        diagnostic_messages_for(&response, "src/lib.rs"),
+        vec!["test pull diagnostic".to_string()],
+        "response: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+}
+
+/// rust-analyzer publishes compiler errors only when its `cargo check` run
+/// finishes. The fake's check ends 1.5s after the file is opened and adds one
+/// compiler error; inspect must wait for it instead of answering with the
+/// analyzer's own diagnostics alone.
+#[test]
+fn scoped_blocking_inspect_waits_for_rust_analyzer_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-flycheck");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck", "src");
+
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "flycheck diagnostic"),
+        "cargo check result missing: {response:#}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "test diagnostic error"),
+        "response: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+}
+
+/// rust-analyzer that answers pulls returns its own analysis through the pull
+/// and pushes `cargo check` results separately, for the same file. Both
+/// reach one store entry, so the later one would hide the other; inspect
+/// must report the pulled diagnostic and the compiler error together.
+#[test]
+fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull-flycheck");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-flycheck", "src");
+
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    for expected in ["test pull diagnostic", "flycheck diagnostic"] {
+        assert!(
+            messages.iter().any(|message| message == expected),
+            "{expected} missing: {response:#}"
+        );
+    }
+}
+
+/// A scope with more files than one inspect opens reports how many it
+/// examined, and names the rest with that cause instead of opening them.
+#[test]
+fn scoped_blocking_inspect_caps_the_files_it_opens() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cap");
+    for index in 0..200 {
+        write_file(&root, &format!("src/m{index:03}.rs"), "pub fn g() {}\n");
+    }
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
+
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"],
+        json!({"files": 201, "examined": 200, "not_examined": 1, "file_cap": 200}),
+        "response: {response:#}"
+    );
+    let uncovered = uncovered_files(&response);
+    assert_eq!(uncovered.len(), 1, "response: {response:#}");
+    assert!(
+        uncovered[0].1.starts_with("not examined:"),
+        "response: {response:#}"
+    );
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(
+        text.contains("language servers analyzed 200 of 201 scoped files (1 not examined"),
+        "{text}"
+    );
+}
+
+/// When `cargo check` is still running at the end of the budget, the Rust
+/// files are named as incomplete with that cause instead of being certified
+/// from reports that lack the compiler's errors.
+#[test]
+fn scoped_blocking_inspect_names_an_unfinished_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-flycheck-slow");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck-slow", "src");
+
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let uncovered = uncovered_files(&response);
+    assert_eq!(uncovered.len(), 1, "response: {response:#}");
+    assert_eq!(uncovered[0].0, "src/lib.rs");
+    assert!(
+        uncovered[0].1.starts_with("still checking:"),
+        "response: {response:#}"
+    );
+}
+
+/// A TypeScript server started for an earlier request keeps its runtime note
+/// (which SDK it runs). An inspect scoped to Rust files must not repeat it.
+/// The fake is installed as the project's `typescript-language-server` so the
+/// real SDK resolution runs and records a note, which a binary override skips.
+#[cfg(unix)]
+#[test]
+fn scoped_rust_inspect_omits_the_note_of_a_typescript_server_started_earlier() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("notes-scope");
+    write_file(&root, "package.json", "{\"name\":\"notes-scope\"}\n");
+    write_file(&root, "web/index.ts", "export const x = 1;\n");
+    let bin_dir = root.join("node_modules/.bin");
+    fs::create_dir_all(&bin_dir).expect("node_modules/.bin");
+    std::os::unix::fs::symlink(
+        fake_server_path(),
+        bin_dir.join("typescript-language-server"),
+    )
+    .expect("link fake typescript-language-server");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let typescript = scoped_diagnostics_inspect(&ctx, "inspect-notes-ts", "web/index.ts");
+    assert!(
+        typescript.to_string().contains("TypeScript: "),
+        "precondition: the TypeScript scope reports its runtime note: {typescript:#}"
+    );
+
+    let rust = scoped_diagnostics_inspect(&ctx, "inspect-notes-rust", "src/lib.rs");
+    assert!(
+        active_server_kinds(&ctx).contains(&ServerKind::TypeScript),
+        "precondition: the TypeScript server is still running"
+    );
+    assert!(
+        !rust.to_string().contains("TypeScript"),
+        "a Rust-only scope must not carry a TypeScript note: {rust:#}"
     );
 }
 
@@ -4547,9 +4824,9 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     lsp.set_extra_env("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI", &rust_root_uri);
     drop(lsp);
 
-    // The blocking tool call reads the warm working set instead of pulling
-    // per-file, so the TypeScript findings must be warmed through the normal
-    // edit path before the inspection runs.
+    // A blocking scoped inspect reads the live report of a document that is
+    // already open instead of asking the server again, so the TypeScript
+    // findings warmed through the normal edit path are the ones it reports.
     let app_ts = root.join("web/src/app.ts");
     open_with_lsp(
         &ctx,

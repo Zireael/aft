@@ -1,10 +1,13 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
+use super::scoped_diagnostics_sweep::{
+    producer_keys_for_file, sweep_scoped_files, ScopedSweep, SCOPED_SWEEP_FILE_CAP,
+    STILL_CHECKING_REASON,
+};
 use crate::config::{
     Config, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
 };
@@ -93,10 +96,14 @@ struct DiagnosticsCollection {
 
 /// Collect diagnostics for the explicit inspect path.
 ///
-/// Collection never depends on the request scope: scoped and unscoped
-/// requests both read the warm working set, so a scope cannot switch the
-/// category onto a more expensive collection strategy. Scope only filters
-/// which findings the payload renders.
+/// Both scoped and unscoped requests read the warm working set. A blocking
+/// scoped request (`sweep_deadline` set) first asks its started servers to
+/// analyze the scoped files (see `scoped_diagnostics_sweep`), because servers
+/// publish only for files they were told about; without that step a scoped
+/// file nobody had opened stayed unknown even with a working server. The
+/// sweep is bounded by a file cap and the deadline, and closes what it
+/// opened after the payload is built. Unscoped and nonblocking requests do
+/// no per-file work.
 ///
 /// The authority halves differ by design. An unscoped request makes a
 /// full-root claim, so producer settlement over the started set decides
@@ -119,7 +126,34 @@ pub(crate) fn run_diagnostics_category(
     not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
     indexing_gaps: &[(ServerKey, String)],
+    sweep_deadline: Option<Instant>,
 ) -> JobOutcome {
+    // A scoped request reports on the servers of its own files only, so a
+    // server started earlier for another part of the project cannot add its
+    // notes or failures to this answer.
+    let scoped = scope_was_provided.then(|| {
+        let mut tsconfig_membership = TsconfigMembershipCache::new();
+        let candidates =
+            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership);
+        let producer_keys = candidates
+            .iter()
+            .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
+            .collect::<HashSet<_>>();
+        (candidates, producer_keys)
+    });
+    let mut sweep = match (&scoped, sweep_deadline) {
+        (Some((candidates, _)), Some(deadline)) if !applicability_is_empty => {
+            Some(sweep_scoped_files(
+                ctx,
+                &snapshot.config,
+                &snapshot.project_root,
+                candidates,
+                expected_producers,
+                deadline,
+            ))
+        }
+        _ => None,
+    };
     let mut collection = if applicability_is_empty {
         // No applicable producer means there is no diagnostic artifact to wait
         // for; the empty category is authoritative for this applicability snapshot.
@@ -128,7 +162,12 @@ pub(crate) fn run_diagnostics_category(
             ..DiagnosticsCollection::default()
         }
     } else {
-        collect_warm_working_set(ctx, snapshot, expected_producers)
+        collect_warm_working_set(
+            ctx,
+            snapshot,
+            expected_producers,
+            scoped.as_ref().map(|(_, producer_keys)| producer_keys),
+        )
     };
     collection.indexing_gaps = indexing_gaps
         .iter()
@@ -140,16 +179,24 @@ pub(crate) fn run_diagnostics_category(
         .map(|server| (server.server_id.clone(), server.reason()))
         .collect();
 
-    if scope_was_provided {
+    if let Some((candidates, _)) = &scoped {
         collection.apply_scope(scope);
-        collection.record_scope_coverage_gaps(ctx, snapshot, scope);
+        collection.record_scope_coverage_gaps(ctx, snapshot, candidates, sweep.as_ref());
         // Per-file coverage gaps make the scoped verdict self-certifying:
         // every scoped file is either covered by an authoritative report or
         // named as a gap, so the payload is honest without waiting on global
         // quiescence signals that may describe files outside the scope.
-        return JobOutcome::Fresh {
-            payload: collection.into_payload(snapshot),
-        };
+        let mut payload = collection.into_payload(snapshot);
+        if let Some(sweep) = sweep.as_mut() {
+            payload["coverage"] = serde_json::json!({
+                "files": sweep.eligible,
+                "examined": sweep.examined,
+                "not_examined": sweep.not_examined.len(),
+                "file_cap": SCOPED_SWEEP_FILE_CAP,
+            });
+            sweep.close_opened(ctx);
+        }
+        return JobOutcome::Fresh { payload };
     }
 
     if collection.is_reportable() || !collection.indexing_gaps.is_empty() {
@@ -165,6 +212,7 @@ fn collect_warm_working_set(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
     expected_producers: &[ServerKey],
+    scope_producers: Option<&HashSet<ServerKey>>,
 ) -> DiagnosticsCollection {
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
@@ -200,11 +248,14 @@ fn collect_warm_working_set(
         // with no published report is complete rather than forever pending.
         // When the caller started a specific set, that set is the obligation;
         // otherwise the currently running clients are.
-        let producers = if expected_producers.is_empty() {
+        let mut producers = if expected_producers.is_empty() {
             lsp.active_server_keys()
         } else {
             expected_producers.to_vec()
         };
+        if let Some(scope_producers) = scope_producers {
+            producers.retain(|server| scope_producers.contains(server));
+        }
         for server in &producers {
             if let Some(note) = lsp.producer_warning(server) {
                 collection.producer_notes.insert(note.to_string());
@@ -264,14 +315,21 @@ enum ScopedFileCoverage {
 /// scoped request for a file nothing ever analyzed returns a confident empty
 /// payload instead of a named gap, exactly the regression the coverage gap
 /// exists to prevent.
+///
+/// The flag is per thread: the nonblocking inspect path computes coverage on
+/// the calling thread, and a process-wide flag leaked into scoped inspects
+/// that other tests ran at the same time, removing their expected gaps.
 pub fn force_scoped_diagnostic_coverage_for_test(forced: bool) {
-    FORCE_SCOPED_DIAGNOSTIC_COVERAGE.store(forced, Ordering::SeqCst);
+    FORCE_SCOPED_DIAGNOSTIC_COVERAGE.with(|flag| flag.set(forced));
 }
 
-static FORCE_SCOPED_DIAGNOSTIC_COVERAGE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static FORCE_SCOPED_DIAGNOSTIC_COVERAGE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> ScopedFileCoverage {
-    if FORCE_SCOPED_DIAGNOSTIC_COVERAGE.load(Ordering::SeqCst) {
+    if FORCE_SCOPED_DIAGNOSTIC_COVERAGE.with(std::cell::Cell::get) {
         return ScopedFileCoverage::Covered;
     }
     if servers_for_file(file, config).is_empty() {
@@ -358,6 +416,18 @@ fn scoped_coverage_candidates(
     candidates.into_iter().collect()
 }
 
+/// The language servers that would analyze the files of a request scope.
+pub(crate) fn scope_producer_keys(
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+) -> HashSet<ServerKey> {
+    let mut tsconfig_membership = TsconfigMembershipCache::new();
+    scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership)
+        .iter()
+        .flat_map(|file| producer_keys_for_file(file, &snapshot.config, &snapshot.project_root))
+        .collect()
+}
+
 impl DiagnosticsCollection {
     fn record_producer_failures(
         &mut self,
@@ -401,17 +471,34 @@ impl DiagnosticsCollection {
         &mut self,
         ctx: &AppContext,
         snapshot: &InspectSnapshot,
-        scope: &JobScope,
+        candidates: &[PathBuf],
+        sweep: Option<&ScopedSweep>,
     ) {
-        let mut tsconfig_membership = TsconfigMembershipCache::new();
-        let candidates =
-            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut tsconfig_membership);
         if candidates.is_empty() {
             return;
         }
         let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
         for file in candidates {
-            let coverage = scoped_file_coverage(ctx, &snapshot.config, &file);
+            let coverage = scoped_file_coverage(ctx, &snapshot.config, file);
+            // A report published while `cargo check` was still running lacks
+            // the compiler's errors, so it cannot certify the file.
+            let checking = sweep.and_then(|sweep| {
+                producer_keys_for_file(file, &snapshot.config, &snapshot.project_root)
+                    .into_iter()
+                    .find(|key| sweep.still_checking.contains(key))
+            });
+            if let Some(key) = checking {
+                self.scope_coverage_gaps.push(ScopedCoverageGap {
+                    file: file.clone(),
+                    reason: "the reporting LSP server has not finished checking this file",
+                    cause: CoverageCause {
+                        producer: Some(server_id(&key)),
+                        root: Some(key.root.clone()),
+                        reason: STILL_CHECKING_REASON.to_string(),
+                    },
+                });
+                continue;
+            }
             let reason = match coverage {
                 ScopedFileCoverage::Covered => continue,
                 ScopedFileCoverage::NoProducer => {
@@ -427,11 +514,13 @@ impl DiagnosticsCollection {
             let cause = if coverage == ScopedFileCoverage::NoProducer {
                 CoverageCause::unattributed(reason)
             } else {
-                self.uncovered_file_cause(ctx, snapshot, &active, &file)
+                sweep
+                    .and_then(|sweep| sweep_cause(sweep, file))
+                    .or_else(|| self.uncovered_file_cause(ctx, snapshot, &active, file))
                     .unwrap_or_else(|| CoverageCause::unattributed(reason))
             };
             self.scope_coverage_gaps.push(ScopedCoverageGap {
-                file,
+                file: file.clone(),
                 reason,
                 cause,
             });
@@ -731,13 +820,34 @@ fn display_root(snapshot: &InspectSnapshot, root: &Path) -> String {
     }
 }
 
-/// Why a running server has no report for a scoped file. Inspect reads only
-/// what servers have already published and never opens files, and some
-/// servers (TypeScript among them) publish only for files that were opened,
-/// so an untouched file stays unknown even when the server works.
+/// Why a running server has no report for a scoped file. Only files a server
+/// has analyzed are covered; the nonblocking inspect path reads what servers
+/// already published and never opens files, and some servers (TypeScript
+/// and rust-analyzer among them) publish only for files that were opened.
 const RUNNING_WITHOUT_REPORT: &str = "running, but has not published diagnostics for these files; \
-     inspect does not open files, so only files a server already analyzed (for example after an \
-     edit) are covered";
+     only files a server already analyzed are covered (a blocking scoped aft_inspect opens them)";
+
+/// The cause the scoped sweep recorded for an uncovered file: past the file
+/// cap, or opened without a report before the budget ran out.
+fn sweep_cause(sweep: &ScopedSweep, file: &Path) -> Option<CoverageCause> {
+    if let Some(key) = sweep.not_examined.get(file) {
+        return Some(CoverageCause {
+            producer: Some(server_id(key)),
+            root: Some(key.root.clone()),
+            reason: format!(
+                "not examined: a scoped inspect opens at most {SCOPED_SWEEP_FILE_CAP} files; narrow the scope"
+            ),
+        });
+    }
+    sweep
+        .unanswered
+        .get(file)
+        .map(|(key, reason)| CoverageCause {
+            producer: Some(server_id(key)),
+            root: Some(key.root.clone()),
+            reason: reason.clone(),
+        })
+}
 
 /// Name uninstalled project dependencies as the reason a Node-based server's
 /// binary could not be found. The binary resolver looks in

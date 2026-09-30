@@ -418,6 +418,18 @@ pub struct LspClient {
     rust_analyzer_failure: Option<String>,
     /// Non-fatal analyzer health warning; published diagnostics remain usable.
     pub(crate) rust_analyzer_warning: Option<String>,
+    /// When rust-analyzer last reported that its workspace analysis became
+    /// quiescent. rust-analyzer starts its first `cargo check` right after
+    /// that moment, so a caller that needs check results waits briefly past
+    /// it for the check to announce itself.
+    rust_analyzer_quiescent_at: Option<Instant>,
+    /// `$/progress` tokens of rust-analyzer check runs (`cargo check`,
+    /// "flycheck") that have begun and not yet ended. Compiler errors reach
+    /// the diagnostics store only when such a run finishes, so while one is
+    /// running the published Rust diagnostics are missing those errors.
+    rust_flycheck_running: HashSet<String>,
+    /// When the most recent rust-analyzer check run ended.
+    rust_flycheck_finished_at: Option<Instant>,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -696,6 +708,9 @@ impl LspClient {
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
             rust_analyzer_warning: None,
+            rust_analyzer_quiescent_at: None,
+            rust_flycheck_running: HashSet::new(),
+            rust_flycheck_finished_at: None,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
@@ -801,6 +816,12 @@ impl LspClient {
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
         }
+        if matches!(&self.kind, ServerKind::Rust) {
+            // rust-analyzer reports its `cargo check` runs only to clients that
+            // accept server-initiated progress. Inspect needs those begin/end
+            // events to know when compiler errors have been published.
+            params_value["capabilities"]["window"] = json!({ "workDoneProgress": true });
+        }
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(params_value)?;
 
@@ -876,7 +897,63 @@ impl LspClient {
             return false;
         }
         self.rust_analyzer_quiescent = true;
+        self.rust_analyzer_quiescent_at = Some(Instant::now());
         true
+    }
+
+    /// Record one rust-analyzer `$/progress` notification. Only check runs
+    /// are tracked: rust-analyzer names their token `rust-analyzer/flycheck/N`
+    /// and titles them with the check command (`cargo check`, `cargo clippy`).
+    pub(crate) fn record_rust_progress(&mut self, token: &str, kind: &str, title: Option<&str>) {
+        if !matches!(&self.kind, ServerKind::Rust) {
+            return;
+        }
+        match kind {
+            "begin" => {
+                let is_check = token.contains("flycheck")
+                    || title.is_some_and(|title| {
+                        title.starts_with("cargo check")
+                            || title.starts_with("cargo clippy")
+                            || title.contains("flycheck")
+                    });
+                if is_check {
+                    self.rust_flycheck_running.insert(token.to_string());
+                }
+            }
+            "end" => {
+                if self.rust_flycheck_running.remove(token) {
+                    self.rust_flycheck_finished_at = Some(Instant::now());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether rust-analyzer's check results may still be missing from the
+    /// published diagnostics: a check run is in progress, one ended less than
+    /// `publish_settle` ago (rust-analyzer can announce the end before it
+    /// publishes the final batch), or the server became quiescent less than
+    /// `start_grace` ago and no check run has been seen yet (the first run
+    /// starts right after quiescence). False for other servers, for a server
+    /// that is still warming (that state is tracked separately), and when
+    /// checking is disabled, once the grace period has passed.
+    pub(crate) fn rust_flycheck_pending(
+        &self,
+        now: Instant,
+        start_grace: Duration,
+        publish_settle: Duration,
+    ) -> bool {
+        if !matches!(&self.kind, ServerKind::Rust) || !self.rust_analyzer_quiescent {
+            return false;
+        }
+        if !self.rust_flycheck_running.is_empty() {
+            return true;
+        }
+        if let Some(finished) = self.rust_flycheck_finished_at {
+            return now.saturating_duration_since(finished) < publish_settle;
+        }
+        self.rust_analyzer_quiescent_at
+            .is_some_and(|at| now.saturating_duration_since(at) < start_grace)
     }
 
     /// Whether the server advertised initialize-time

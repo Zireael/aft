@@ -221,6 +221,20 @@ fn changed_diagnostics() -> Value {
     ])
 }
 
+fn write_flycheck_progress(writer: &mut impl Write, kind: &str) -> io::Result<()> {
+    let mut value = json!({ "kind": kind });
+    if kind == "begin" {
+        value["title"] = json!("cargo check");
+    }
+    write_notification(
+        writer,
+        &Notification::new(
+            "$/progress",
+            Some(json!({ "token": "rust-analyzer/flycheck/0", "value": value })),
+        ),
+    )
+}
+
 fn push_diagnostics_enabled() -> bool {
     std::env::var("AFT_FAKE_LSP_DISABLE_PUSH").ok().as_deref() != Some("1")
 }
@@ -252,6 +266,13 @@ fn main() -> io::Result<()> {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut should_register_watched_files = false;
+    // Emulates rust-analyzer's `cargo check` ("flycheck"): with
+    // AFT_FAKE_LSP_FLYCHECK=<ms> a check run begins at `initialized` and, on
+    // the first opened document, ends <ms> later after publishing the opened
+    // diagnostics plus one compiler error. With AFT_FAKE_LSP_FLYCHECK=never
+    // the run begins and never ends.
+    let flycheck_mode = std::env::var("AFT_FAKE_LSP_FLYCHECK").ok();
+    let mut flycheck_running = false;
     let ignore_shutdown = std::env::var("AFT_FAKE_LSP_IGNORE_SHUTDOWN")
         .ok()
         .as_deref()
@@ -737,6 +758,10 @@ fn main() -> io::Result<()> {
                             ),
                         )?;
                     }
+                    if let Some(mode) = flycheck_mode.as_deref() {
+                        write_flycheck_progress(&mut writer, "begin")?;
+                        flycheck_running = mode != "never";
+                    }
                     if should_register_watched_files {
                         write_request(
                             &mut writer,
@@ -778,12 +803,12 @@ fn main() -> io::Result<()> {
                     if push_diagnostics_enabled() {
                         write_publish_diagnostics_versioned(
                             &mut writer,
-                            uri,
+                            uri.clone(),
                             opened_diagnostics(),
-                            version,
+                            version.clone(),
                         )?;
                     } else {
-                        write_publish_diagnostics(&mut writer, uri, json!([]))?;
+                        write_publish_diagnostics(&mut writer, uri.clone(), json!([]))?;
                     }
                     if matches!(
                         std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref(),
@@ -800,6 +825,30 @@ fn main() -> io::Result<()> {
                                 })),
                             ),
                         )?;
+                    }
+                    if flycheck_running {
+                        flycheck_running = false;
+                        let delay_ms = flycheck_mode
+                            .as_deref()
+                            .and_then(|mode| mode.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let mut checked = opened_diagnostics();
+                        checked
+                            .as_array_mut()
+                            .expect("opened diagnostics are an array")
+                            .push(json!({
+                                "range": {
+                                    "start": { "line": 3, "character": 0 },
+                                    "end": { "line": 3, "character": 4 }
+                                },
+                                "severity": 1,
+                                "code": "E0063",
+                                "source": "rustc",
+                                "message": "flycheck diagnostic"
+                            }));
+                        write_publish_diagnostics_versioned(&mut writer, uri, checked, version)?;
+                        write_flycheck_progress(&mut writer, "end")?;
                     }
                 }
                 "textDocument/didChange" => {

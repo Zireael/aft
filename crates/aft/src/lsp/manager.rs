@@ -490,7 +490,28 @@ pub struct LspManager {
     /// Advanced whenever every client is taken away, so a start that was in
     /// flight across it does not publish its client into the emptied manager.
     clients_generation: u64,
+    /// Documents a scoped inspect opened only to collect their diagnostics
+    /// and then closed, with the close time. Servers answer `didClose` with
+    /// one more publish that describes the closed document, not the file
+    /// (TypeScript sends an empty list, meaning "no longer tracked"). Storing
+    /// it would replace the diagnostics the inspect just collected with a
+    /// clean-looking report, so that one publish is ignored.
+    inspect_closed_documents: HashMap<(ServerKey, PathBuf), Instant>,
+    /// The latest pushed diagnostics per file from rust-analyzer instances
+    /// that also answer pull requests. In that mode rust-analyzer reports its
+    /// own analysis through pull and its `cargo check` results through push,
+    /// and both land in the same store entry, so whichever arrives last would
+    /// hide the other. A scoped inspect stores the union of the two. Other
+    /// servers that support both report one analysis either way, so for them
+    /// the pulled report stands alone as before.
+    latest_push_for_pull_servers: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
 }
+
+/// How long after a scoped inspect closes a document a publish for it is
+/// taken to be the server's reply to that `didClose`. Servers reply within
+/// milliseconds; a later publish (for example a new `cargo check` result) is
+/// real news about the file and is stored.
+const INSPECT_CLOSE_REPLY_WINDOW: Duration = Duration::from_secs(2);
 
 /// How many server-exit log lines `LspManager` keeps for inspection.
 const RECENT_EXIT_LOG_LINES: usize = 16;
@@ -529,6 +550,8 @@ impl LspManager {
             pending_exit_reports: HashMap::new(),
             starting: HashMap::new(),
             clients_generation: 0,
+            inspect_closed_documents: HashMap::new(),
+            latest_push_for_pull_servers: HashMap::new(),
         }
     }
 
@@ -1522,6 +1545,236 @@ impl LspManager {
         }
     }
 
+    /// Open a document in the given running servers so they analyze it and
+    /// publish its diagnostics. Unlike [`Self::ensure_file_open`] this never
+    /// starts a server: a scoped inspect has already started exactly the
+    /// servers its scope needs, and must not spawn others from inside a file
+    /// loop. Servers that are not running, or already have the document open,
+    /// are skipped. Returns the servers that received `didOpen` in this call.
+    pub(crate) fn open_document_for_servers(
+        &mut self,
+        file_path: &Path,
+        server_keys: &[ServerKey],
+    ) -> Result<Vec<ServerKey>, LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let targets = server_keys
+            .iter()
+            .filter(|key| self.clients.contains_key(*key))
+            .filter(|key| {
+                !self
+                    .documents
+                    .get(*key)
+                    .is_some_and(|store| store.is_open(&canonical_path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uri = uri_for_path(&canonical_path)?;
+        let language_id = language_id_for_extension(
+            canonical_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or_default(),
+        )
+        .to_string();
+        let content = std::fs::read_to_string(&canonical_path).map_err(LspError::Io)?;
+        let mut opened = Vec::with_capacity(targets.len());
+        for key in targets {
+            let Some(client) = self.clients.get_mut(&key) else {
+                continue;
+            };
+            let sent = client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem::new(
+                    uri.clone(),
+                    language_id.clone(),
+                    0,
+                    content.clone(),
+                ),
+            });
+            if let Err(err) = sent {
+                // Leave no half-opened set behind: the caller only closes what
+                // this call reports as opened.
+                let _ = self.close_inspect_documents(&canonical_path, &opened);
+                return Err(err);
+            }
+            log_did_open_sent(&key, &canonical_path, &language_id);
+            self.documents
+                .entry(key.clone())
+                .or_default()
+                .open(canonical_path.clone());
+            self.inspect_closed_documents
+                .remove(&(key.clone(), canonical_path.clone()));
+            opened.push(key);
+        }
+        Ok(opened)
+    }
+
+    /// Close documents a scoped inspect opened with
+    /// [`Self::open_document_for_servers`]. The diagnostics collected while
+    /// they were open stay in the store: they are the latest analysis of the
+    /// file, and a later external edit marks them stale through the watcher.
+    /// The server's reply to the close is ignored (see
+    /// `inspect_closed_documents`).
+    pub(crate) fn close_inspect_documents(
+        &mut self,
+        file_path: &Path,
+        server_keys: &[ServerKey],
+    ) -> Result<(), LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let uri = uri_for_path(&canonical_path)?;
+        let mut first_error = None;
+        for key in server_keys {
+            let was_open = self
+                .documents
+                .get(key)
+                .is_some_and(|store| store.is_open(&canonical_path));
+            if !was_open {
+                continue;
+            }
+            if let Some(client) = self.clients.get_mut(key) {
+                match client.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
+                    text_document: TextDocumentIdentifier::new(uri.clone()),
+                }) {
+                    Ok(()) => {
+                        self.inspect_closed_documents
+                            .insert((key.clone(), canonical_path.clone()), Instant::now());
+                    }
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(store) = self.documents.get_mut(key) {
+                store.close(&canonical_path);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the running server answers `textDocument/diagnostic` requests.
+    pub(crate) fn server_supports_pull(&self, server_key: &ServerKey) -> bool {
+        self.clients
+            .get(server_key)
+            .and_then(|client| client.diagnostic_capabilities())
+            .is_some_and(|caps| caps.pull_diagnostics)
+    }
+
+    /// This server's current stored diagnostics for a file, if it has a report.
+    pub(crate) fn server_file_diagnostics(
+        &self,
+        server_key: &ServerKey,
+        file_path: &Path,
+    ) -> Option<Vec<StoredDiagnostic>> {
+        let lookup_path = normalize_lookup_path(file_path);
+        self.diagnostics
+            .entries_for_file(&lookup_path)
+            .into_iter()
+            .find_map(|(key, entry)| (key == server_key).then(|| entry.diagnostics.clone()))
+    }
+
+    /// Store the union of a pulled report and the server's latest push for
+    /// the same file, keeping the stored report's resultId and document
+    /// version. See `latest_push_for_pull_servers` for why one would
+    /// otherwise hide the other. Identical diagnostics are kept once.
+    pub(crate) fn store_pull_push_union(
+        &mut self,
+        server_key: &ServerKey,
+        file_path: &Path,
+        pulled: Vec<StoredDiagnostic>,
+    ) {
+        let lookup_path = normalize_lookup_path(file_path);
+        let pushed = self
+            .latest_push_for_pull_servers
+            .get(&(server_key.clone(), lookup_path.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let (result_id, version) = self
+            .diagnostics
+            .entries_for_file(&lookup_path)
+            .into_iter()
+            .find_map(|(key, entry)| {
+                (key == server_key).then(|| (entry.result_id.clone(), entry.version))
+            })
+            .unwrap_or((None, None));
+        let mut merged = pulled;
+        for diagnostic in pushed {
+            if !merged.contains(&diagnostic) {
+                merged.push(diagnostic);
+            }
+        }
+        let provisional = self
+            .clients
+            .get(server_key)
+            .is_some_and(|client| client.diagnostics_are_provisional());
+        self.diagnostics.publish_full_with_provisional(
+            server_key.clone(),
+            lookup_path,
+            merged,
+            result_id,
+            version,
+            provisional,
+        );
+    }
+
+    /// Whether a document is open in this server's document store.
+    pub(crate) fn document_is_open_in(&self, server_key: &ServerKey, file_path: &Path) -> bool {
+        let lookup_path = normalize_lookup_path(file_path);
+        self.documents
+            .get(server_key)
+            .is_some_and(|store| store.is_open(&lookup_path))
+    }
+
+    /// The publish epoch of this server's current report for a file, if it
+    /// has one. A higher epoch than one read earlier proves a newer report.
+    pub(crate) fn diagnostic_epoch(&self, server_key: &ServerKey, file_path: &Path) -> Option<u64> {
+        let lookup_path = normalize_lookup_path(file_path);
+        self.diagnostics
+            .entries_for_file(&lookup_path)
+            .into_iter()
+            .find_map(|(key, entry)| (key == server_key).then_some(entry.epoch))
+    }
+
+    /// Whether this server is a running client.
+    pub(crate) fn has_client(&self, server_key: &ServerKey) -> bool {
+        self.clients.contains_key(server_key)
+    }
+
+    /// Whether rust-analyzer's `cargo check` results may still be missing
+    /// from this server's published diagnostics. See
+    /// [`LspClient::rust_flycheck_pending`].
+    pub(crate) fn rust_flycheck_pending(
+        &self,
+        server_key: &ServerKey,
+        start_grace: Duration,
+        publish_settle: Duration,
+    ) -> bool {
+        self.clients.get(server_key).is_some_and(|client| {
+            client.rust_flycheck_pending(Instant::now(), start_grace, publish_settle)
+        })
+    }
+
+    /// Runtime notes (the SDK a server started with) for the given servers
+    /// only, so an inspect scoped to Rust files does not repeat a TypeScript
+    /// note from a server started for some other request.
+    pub fn runtime_notes_for(&self, server_keys: &HashSet<ServerKey>) -> Vec<String> {
+        let mut notes: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(key, _)| server_keys.contains(*key))
+            .filter_map(|(_, client)| client.runtime_note.clone())
+            .collect();
+        notes.sort();
+        notes.dedup();
+        notes
+    }
+
     /// Get an active client for a file path, if one exists.
     pub fn client_for_file(&self, file_path: &Path, config: &Config) -> Option<&LspClient> {
         let key = self.server_key_for_file(file_path, config)?;
@@ -2084,6 +2337,41 @@ impl LspManager {
         let mut results = Vec::with_capacity(opened.server_keys.len());
 
         for key in opened.server_keys {
+            let outcome = self.pull_open_document(&key, &canonical_path, &uri, deadline);
+            results.push(PullFileResult {
+                server_key: key,
+                outcome,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Pull one server's diagnostics for a document that server already has
+    /// open, within an optional deadline, and store the report. A scoped
+    /// inspect uses this after opening the document in exactly the servers
+    /// its scope started.
+    pub(crate) fn pull_document_for_server(
+        &mut self,
+        key: &ServerKey,
+        file_path: &Path,
+        deadline: Instant,
+    ) -> Result<PullFileOutcome, LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let uri = uri_for_path(&canonical_path)?;
+        Ok(self.pull_open_document(key, &canonical_path, &uri, Some(deadline)))
+    }
+
+    fn pull_open_document(
+        &mut self,
+        key: &ServerKey,
+        canonical_path: &Path,
+        uri: &lsp_types::Uri,
+        deadline: Option<Instant>,
+    ) -> PullFileOutcome {
+        let key = key.clone();
+        let canonical_path = canonical_path.to_path_buf();
+        {
             let supports_pull = self
                 .clients
                 .get(&key)
@@ -2091,11 +2379,7 @@ impl LspManager {
                 .is_some_and(|caps| caps.pull_diagnostics);
 
             if !supports_pull {
-                results.push(PullFileResult {
-                    server_key: key.clone(),
-                    outcome: PullFileOutcome::PullNotSupported,
-                });
-                continue;
+                return PullFileOutcome::PullNotSupported;
             }
 
             // Look up previous resultId for incremental requests.
@@ -2140,7 +2424,7 @@ impl LspManager {
                     .map(|version| version.to_string())
                     .unwrap_or_else(|| "none".to_string())
             );
-            let outcome = match self.send_pull_request(&key, params, request_timeout) {
+            match self.send_pull_request(&key, params, request_timeout) {
                 Ok(report) => {
                     let report_kind = match &report {
                         lsp_types::DocumentDiagnosticReportResult::Report(
@@ -2201,15 +2485,8 @@ impl LspManager {
                         }
                     }
                 }
-            };
-
-            results.push(PullFileResult {
-                server_key: key,
-                outcome,
-            });
+            }
         }
-
-        Ok(results)
     }
 
     /// Issue a `workspace/diagnostic` request to a specific server. Cancels
@@ -2922,6 +3199,15 @@ impl LspManager {
                 self.handle_server_status(server_kind.clone(), root.clone(), params);
                 None
             }
+            LspEvent::Notification {
+                server_kind: ServerKind::Rust,
+                root,
+                method,
+                params: Some(params),
+            } if method == "$/progress" => {
+                self.handle_rust_progress(root.clone(), params);
+                None
+            }
             LspEvent::ServerExited {
                 server_kind,
                 root,
@@ -2962,6 +3248,8 @@ impl LspManager {
                     self.server_binaries.remove(&key);
                     self.documents.remove(&key);
                     self.diagnostics.clear_for_server(&key);
+                    self.latest_push_for_pull_servers
+                        .retain(|(server, _), _| *server != key);
                     None
                 }
             }
@@ -3024,11 +3312,27 @@ impl LspManager {
             diagnostic_count
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
+        let key = ServerKey { kind: server, root };
+        if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
+            // Recorded before the close-reply check below: rust-analyzer's
+            // reply to a close still carries the file's `cargo check` results.
+            self.latest_push_for_pull_servers
+                .insert((key.clone(), file.clone()), stored.clone());
+        }
+        if self.is_reply_to_inspect_close(&key, &file) {
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-inspect-closed-document file={} diagnostics={}",
+                key.kind.id_str(),
+                key.root.display(),
+                file.display(),
+                diagnostic_count
+            );
+            return None;
+        }
         // Store with the real ServerKey and the published document version
         // so observation sources can accept only reports that prove which
         // in-memory document state they describe. The earlier
         // `publish_with_kind` path silently dropped both facts.
-        let key = ServerKey { kind: server, root };
         let provisional = self
             .clients
             .get(&key)
@@ -3054,6 +3358,61 @@ impl LspManager {
             );
         }
         Some(file)
+    }
+
+    fn handle_rust_progress(&mut self, root: PathBuf, params: &serde_json::Value) {
+        let token = match params.get("token") {
+            Some(serde_json::Value::String(token)) => token.clone(),
+            Some(serde_json::Value::Number(token)) => token.to_string(),
+            _ => return,
+        };
+        let Some(value) = params.get("value") else {
+            return;
+        };
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let title = value.get("title").and_then(serde_json::Value::as_str);
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root,
+        };
+        if let Some(client) = self.clients.get_mut(&key) {
+            if matches!(kind, "begin" | "end") {
+                slog_info!(
+                    "lsp_protocol server=rust root={} method=$/progress event={} token={} title={}",
+                    key.root.display(),
+                    kind,
+                    token,
+                    title.unwrap_or("-")
+                );
+            }
+            client.record_rust_progress(&token, kind, title);
+        }
+    }
+
+    /// True when this publish is the server's reply to a `didClose` a scoped
+    /// inspect sent for a document it opened only to read its diagnostics.
+    /// The reply is consumed: only one publish per close is ignored.
+    fn is_reply_to_inspect_close(&mut self, key: &ServerKey, file: &Path) -> bool {
+        if self.inspect_closed_documents.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        self.inspect_closed_documents.retain(|_, closed_at| {
+            now.saturating_duration_since(*closed_at) < INSPECT_CLOSE_REPLY_WINDOW
+        });
+        let lookup = (key.clone(), file.to_path_buf());
+        if self.inspect_closed_documents.remove(&lookup).is_none() {
+            return false;
+        }
+        // A document reopened since the close is live again; its publishes
+        // describe the current file.
+        !self
+            .documents
+            .get(key)
+            .is_some_and(|store| store.is_open(file))
     }
 
     fn handle_server_status(

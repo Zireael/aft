@@ -6,6 +6,7 @@ mod entry_points;
 mod frameworks;
 pub mod freshness;
 mod generated;
+pub(crate) mod scoped_diagnostics_sweep;
 pub(crate) use generated::{is_generated_file, path_has_generated_shape};
 pub mod job;
 mod manager;
