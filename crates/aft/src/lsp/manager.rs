@@ -3915,6 +3915,23 @@ fn typescript_runtime_options(
     let (lib, fallback) = if let Some(lib) = local {
         (lib, false)
     } else {
+        // A TypeScript 7+ project must not be served by the cached 5.x SDK:
+        // its diagnostics would silently follow another compiler's defaults
+        // and accept options TypeScript 7 removed. Leave SDK discovery to the
+        // server, which fails on the native compiler; the initialize failure
+        // then names the cause.
+        if let Some(project) = find_project_typescript_package(source_file, boundary)
+            .filter(ProjectTypeScript::is_native_compiler)
+        {
+            return Ok((
+                options,
+                format!(
+                    "TypeScript {}: native compiler at {}, which has no tsserver; AFT cache fallback not used",
+                    project.version,
+                    project.package_dir.display()
+                ),
+            ));
+        }
         let Some(lib) = config
             .lsp_paths_extra
             .iter()
@@ -3968,9 +3985,7 @@ fn typescript_initialize_failure_reason(
     }
     // Installing dependencies cannot help a TypeScript 7 project: the native
     // compiler never ships the tsserver.js typescript-language-server loads.
-    if let Some(project) =
-        project_typescript.filter(|ts| ts.major().is_some_and(|major| major >= 7))
-    {
+    if let Some(project) = project_typescript.filter(|ts| ts.is_native_compiler()) {
         return format!(
             "TypeScript unavailable: this project uses TypeScript {} (native compiler) at {}, {TS_NATIVE_NO_TSSERVER}. Run the project's tsc --noEmit for type errors. {reason}",
             project.version,
@@ -4007,6 +4022,12 @@ impl ProjectTypeScript {
             .take_while(char::is_ascii_digit)
             .collect();
         digits.parse().ok()
+    }
+
+    /// TypeScript 7 and later are the native (Go) compiler, which ships no
+    /// tsserver.js for typescript-language-server to load.
+    fn is_native_compiler(&self) -> bool {
+        self.major().is_some_and(|major| major >= 7)
     }
 }
 
@@ -5739,6 +5760,46 @@ mod typescript_worktree_tests {
             std::fs::read_to_string(file).unwrap(),
             "const x: number = 'wrong';"
         );
+    }
+
+    #[test]
+    fn typescript_7_project_does_not_fall_back_to_the_cached_sdk() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("ts7");
+        // TypeScript 7 installs package.json but none of the lib/*.js files.
+        let package_dir = project.join("node_modules").join("typescript");
+        std::fs::create_dir_all(package_dir.join("lib")).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2"}"#,
+        )
+        .unwrap();
+        let file = project.join("index.ts");
+        let cache = temp.path().join("cache");
+        sdk(&cache, "5.9.3");
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache.join("node_modules").join(".bin")],
+            ..Config::default()
+        };
+        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
+        assert!(options.pointer("/tsserver/path").is_none(), "{options}");
+        assert!(
+            note.starts_with("TypeScript 7.0.2: native compiler at "),
+            "{note}"
+        );
+        assert!(note.contains("AFT cache fallback not used"), "{note}");
+
+        // The same layout on TypeScript 5 (a broken install without
+        // tsserver.js) still uses the cache.
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"typescript","version":"5.9.3"}"#,
+        )
+        .unwrap();
+        let (options, note) = typescript_runtime_options(None, &file, &project, &config).unwrap();
+        assert!(options.pointer("/tsserver/path").is_some(), "{options}");
+        assert!(note.contains("AFT cache fallback"), "{note}");
     }
 
     #[test]
