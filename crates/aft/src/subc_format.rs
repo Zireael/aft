@@ -2312,17 +2312,23 @@ pub(crate) fn format_diagnostics_summary_with(
             .filter(|gap| gap.get("kind").and_then(Value::as_str) != Some("uncovered_file"))
             .map(|gap| {
                 let producer = gap.get("producer").and_then(Value::as_str);
+                let reason = gap
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                // A producer still checking has not failed, and its reason
+                // already names the server.
+                if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
+                    return reason.to_string();
+                }
                 if let (true, Some(producer)) = (gap_reasons_rendered_above, producer) {
                     return format!("producer {producer} failed, reason above");
                 }
                 format!(
-                    "{}: {}",
+                    "{}: {reason}",
                     producer
                         .or_else(|| gap.get("file").and_then(Value::as_str))
                         .unwrap_or("unknown producer"),
-                    gap.get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unavailable")
                 )
             })
             .collect::<Vec<_>>();

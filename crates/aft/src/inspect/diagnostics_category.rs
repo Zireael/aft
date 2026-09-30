@@ -18,6 +18,12 @@ use crate::lsp::registry::{servers_for_file, ServerKind};
 use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
+/// Why diagnostics are unknown while rust-analyzer's `cargo check` (started
+/// by an edit's save, or by the server's first analysis) has not finished:
+/// the compiler errors it has published describe the files before the edit.
+pub(crate) const RUST_CHECK_RUNNING_REASON: &str =
+    "rust-analyzer: cargo check still running; retry";
+
 /// Whole-request server budget for blocking inspect. Every phase shares one
 /// absolute deadline derived from this value; client transport adds separate
 /// headroom so the server always answers before the client gives up.
@@ -92,6 +98,10 @@ struct DiagnosticsCollection {
     /// store is still a complete answer.
     producers_settled: bool,
     indexing_gaps: BTreeMap<String, String>,
+    /// Server ids of rust-analyzer producers whose `cargo check` had not
+    /// finished when the wait ran out. Their published reports lack the
+    /// compiler's newest results, so totals cannot be certified.
+    checking_producers: BTreeSet<String>,
 }
 
 /// Collect diagnostics for the explicit inspect path.
@@ -173,6 +183,21 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|(server, reason)| (server_id(server), reason.clone()))
         .collect();
+    // A producer that settled but whose check was still running is not
+    // indexing: its gap is kept apart so it is not mistaken for a warming
+    // server (whose provisional rows would then be shown).
+    collection.indexing_gaps.retain(|producer, reason| {
+        let checking = reason == RUST_CHECK_RUNNING_REASON;
+        if checking {
+            collection.checking_producers.insert(producer.clone());
+        }
+        !checking
+    });
+    if let Some(sweep) = &sweep {
+        collection
+            .checking_producers
+            .extend(sweep.still_checking.iter().map(server_id));
+    }
     collection.record_producer_failures(producer_failures, &snapshot.project_root);
     collection.not_applicable = not_applicable
         .iter()
@@ -707,6 +732,13 @@ impl DiagnosticsCollection {
                 "kind": "failed_producer", "producer": producer,
                 "reason": self.indexing_gaps.get(&producer).map(String::as_str)
                     .unwrap_or("producer has not settled"),
+            }));
+        }
+        for producer in self.checking_producers {
+            gaps.push(serde_json::json!({
+                "kind": "checking_producer",
+                "producer": producer,
+                "reason": RUST_CHECK_RUNNING_REASON,
             }));
         }
         if !gaps.is_empty() {

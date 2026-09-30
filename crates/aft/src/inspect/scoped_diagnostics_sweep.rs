@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::context::AppContext;
+use crate::lsp::client::{FLYCHECK_PUBLISH_SETTLE, FLYCHECK_START_GRACE};
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::PullFileOutcome;
 use crate::lsp::registry::{servers_for_file, ServerKind};
@@ -27,15 +28,6 @@ use crate::lsp::roots::ServerKey;
 /// is bounded; files past the cap are reported as not examined, with a
 /// count, rather than silently skipped.
 pub(crate) const SCOPED_SWEEP_FILE_CAP: usize = 200;
-
-/// rust-analyzer starts its first `cargo check` as soon as it becomes
-/// quiescent. When no check has been seen yet, wait this long after
-/// quiescence for one to begin before treating checking as disabled.
-const FLYCHECK_START_GRACE: Duration = Duration::from_secs(1);
-
-/// rust-analyzer can report the end of a check run just before it publishes
-/// the run's last diagnostics; keep reading events this long after the end.
-const FLYCHECK_PUBLISH_SETTLE: Duration = Duration::from_millis(300);
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -235,14 +227,21 @@ pub(crate) fn sweep_scoped_files(
                     continue;
                 }
                 // A document that was already open is analyzed continuously
-                // (an edit opened it, for example); its current report is live
-                // and is read as it stands. A document opened now needs a
-                // report newer than whatever was stored before (a `cargo check`
-                // result, or an older analysis).
-                if was_open && lsp.has_diagnostic_report_for_server_file(&key, file) {
+                // (an edit opened it, for example); its current report is
+                // live and is read as it stands. rust-analyzer answering
+                // pulls is the exception: it analyzes a document only when
+                // asked, so its stored report can predate an edit to another
+                // file (removing a struct field the document still sets, for
+                // example) and is asked for again. A document opened now needs
+                // a report newer than whatever was stored before (a `cargo
+                // check` result, or an older analysis).
+                let pulls = lsp.server_supports_pull(&key);
+                let repull_open = pulls && key.kind == ServerKind::Rust;
+                if was_open && !repull_open && lsp.has_diagnostic_report_for_server_file(&key, file)
+                {
                     continue;
                 }
-                if lsp.server_supports_pull(&key) {
+                if pulls {
                     to_pull.push((key, epoch_before));
                 } else {
                     waiting.push((file.clone(), key, epoch_before));

@@ -91,6 +91,26 @@ pub fn disable_in_process_file_watcher() {
     });
 }
 
+/// Whether a real `rust-analyzer` can run here. Tests that need one print
+/// `SKIP <test>` and return when it cannot. A CI job that installs
+/// rust-analyzer sets `AFT_TEST_REQUIRE_RUST_ANALYZER=1`, and then a missing
+/// server fails the test instead: a skip there would hide lost coverage.
+#[allow(dead_code)]
+pub fn real_rust_analyzer_available(test: &str) -> bool {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            std::env::var_os("AFT_TEST_REQUIRE_RUST_ANALYZER").is_none(),
+            "{test}: AFT_TEST_REQUIRE_RUST_ANALYZER is set but rust-analyzer does not run"
+        );
+        eprintln!("SKIP {test}: rust-analyzer is not installed (or rustup component unavailable)");
+    }
+    available
+}
+
 /// Pay macOS's first-exec assessment while a test fixture is still in setup.
 ///
 /// Test fixtures frequently create a new executable inode and then invoke it

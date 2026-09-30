@@ -3851,6 +3851,11 @@ fn scoped_blocking_inspect_names_an_unfinished_cargo_check() {
         uncovered[0].1.starts_with("still checking:"),
         "response: {response:#}"
     );
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(
+        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry;"),
+        "{text}"
+    );
 }
 
 /// A TypeScript server started for an earlier request keeps its runtime note
@@ -5178,6 +5183,207 @@ fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
             .contains("--locked was passed"),
         "{fixed:#}"
     );
+}
+
+/// A crate whose `src/user.rs` builds `S { a, b }` from `src/s.rs`. Returns
+/// the root and the path of `src/s.rs`.
+fn field_removal_crate() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub mod s;\npub mod user;\n");
+    let s = write_file(
+        &root,
+        "src/s.rs",
+        "pub struct S {\n    pub a: u8,\n    pub b: u8,\n}\n",
+    );
+    write_file(
+        &root,
+        "src/user.rs",
+        "use crate::s::S;\n\npub fn make() -> S {\n    S { a: 1, b: 2 }\n}\n",
+    );
+    // AFT runs rust-analyzer with `--locked`, which needs a lockfile.
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    (temp_dir, root, s)
+}
+
+/// `(source, message)` of every diagnostic inspect reported for `file`.
+fn diagnostic_sources_for(response: &Value, file: &str) -> Vec<(String, String)> {
+    response["details"]["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["file"] == file)
+        .map(|item| {
+            (
+                item["source"].as_str().unwrap_or_default().to_string(),
+                item["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// After `b` was removed from `S`, `src/user.rs` no longer compiles. A
+/// scoped inspect of it must say so, from the compiler (`cargo check`,
+/// source `rustc`) and from rust-analyzer's own analysis, or name the
+/// unfinished check. A clean answer is the stale result this guards against.
+fn assert_removed_field_reported(response: &Value) {
+    let text = response["text"].as_str().expect("rendered text");
+    let still_checking = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert!(
+            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            "{text}"
+        );
+        return;
+    }
+    let reported = diagnostic_sources_for(response, "src/user.rs");
+    assert!(
+        reported
+            .iter()
+            .any(|(source, message)| source == "rustc" && message.contains("no field named `b`")),
+        "cargo check's error for the removed field is missing: {text}\n{response:#}"
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|(source, message)| source == "rust-analyzer" && message.contains("no such field")),
+        "rust-analyzer's own error for the removed field is missing: {text}\n{response:#}"
+    );
+    assert!(!text.contains("diagnostics: 0 errors"), "{text}");
+}
+
+/// An agent edits a use site (which leaves it open in rust-analyzer), then
+/// removes a struct field with an AFT edit. rust-analyzer re-runs `cargo
+/// check` only on a save and analyzes an open document for a pull only when
+/// asked, so without both the next inspect certified the use site from
+/// reports made before the removal.
+#[test]
+fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, s) = field_removal_crate();
+    let ctx = configured_context(&root);
+    let warm = scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src");
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+
+    let user_edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "field-removal-edit-user",
+            "command": "edit_match",
+            "file": root.join("src/user.rs").display().to_string(),
+            "match": "use crate::s::S;\n",
+            "replacement": "use crate::s::S;\n// builds S\n",
+        })),
+        &ctx,
+    );
+    assert!(user_edit.success, "{user_edit:?}");
+    let before = scoped_diagnostics_inspect(&ctx, "field-removal-before", "src/user.rs");
+    assert_eq!(
+        before["summary"]["diagnostics"]["errors"], 0,
+        "control: the use site compiles before the removal: {before:#}"
+    );
+
+    let removal = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "field-removal-edit",
+            "command": "edit_match",
+            "file": s.display().to_string(),
+            "match": "    pub b: u8,\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(removal.success, "{removal:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "field-removal-after", "src/user.rs");
+    assert_removed_field_reported(&after);
+}
+
+/// The same removal made by another program (a plain file write the project
+/// watcher reports): rust-analyzer hears of it only as a watched-file change,
+/// which does not start `cargo check`, so AFT announces it as a save.
+#[test]
+fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, s) = field_removal_crate();
+    let ctx = configured_context(&root);
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src");
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+
+    fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
+    // What the live watcher delivers for the rewritten file.
+    watcher_tx
+        .send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            s.clone()
+        ]))
+        .expect("send watcher event");
+    aft::runtime_drain::drain_watcher_events(&ctx);
+
+    let after = scoped_diagnostics_inspect(&ctx, "outside-removal-after", "src/user.rs");
+    assert_removed_field_reported(&after);
+}
+
+/// An unscoped inspect makes a whole-project claim, so it too must wait for
+/// rust-analyzer's `cargo check`. The fake's check never finishes: the
+/// answer names the running check instead of certifying the published
+/// reports, and does not call the producer failed.
+#[test]
+fn unscoped_inspect_names_an_unfinished_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-flycheck-slow");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-flycheck-slow",
+            "command": "inspect",
+            "sections": "diagnostics",
+        }),
+    );
+
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let gaps: Vec<&Value> = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["producer"] == "rust")
+        .collect();
+    assert_eq!(gaps.len(), 1, "response: {response:#}");
+    assert_eq!(gaps[0]["kind"], "checking_producer", "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(
+        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry)"),
+        "{text}"
+    );
+    assert!(!text.contains("producer rust failed"), "{text}");
 }
 
 #[test]

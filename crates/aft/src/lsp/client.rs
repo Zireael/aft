@@ -38,6 +38,50 @@ const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
 
+/// rust-analyzer starts its first `cargo check` as soon as it becomes
+/// quiescent. When no check has been seen yet, callers that need compiler
+/// errors wait this long after quiescence for one to begin before treating
+/// checking as disabled.
+pub(crate) const FLYCHECK_START_GRACE: Duration = Duration::from_secs(1);
+
+/// rust-analyzer can report the end of a check run just before it publishes
+/// the run's last diagnostics; callers keep reading events this long after
+/// the end.
+pub(crate) const FLYCHECK_PUBLISH_SETTLE: Duration = Duration::from_millis(300);
+
+/// How long after a `textDocument/didSave` a rust-analyzer check run is
+/// expected to begin. rust-analyzer 1.98 announces the run about 150 ms after
+/// the save; the margin covers a busy server. When checking on save is turned
+/// off no run ever begins, and callers stop waiting for one after this long.
+const SAVE_CHECK_START_GRACE: Duration = Duration::from_secs(3);
+
+/// How a server asked to be told about saved documents
+/// (`textDocumentSync.save` in its initialize response).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveNotification {
+    /// Send `textDocument/didSave` without the document text.
+    WithoutText,
+    /// Send `textDocument/didSave` carrying the saved text.
+    IncludeText,
+}
+
+/// Read `textDocumentSync.save` from an initialize response's capabilities.
+/// A bare sync kind (a number) or a missing or `false` `save` means the
+/// server does not want save notifications.
+fn parse_save_notification(capabilities: &Value) -> Option<SaveNotification> {
+    match capabilities.pointer("/textDocumentSync/save")? {
+        Value::Bool(true) => Some(SaveNotification::WithoutText),
+        Value::Object(options) => Some(
+            if options.get("includeText").and_then(Value::as_bool) == Some(true) {
+                SaveNotification::IncludeText
+            } else {
+                SaveNotification::WithoutText
+            },
+        ),
+        _ => None,
+    }
+}
+
 /// Spawn on a process-lifetime thread on Linux: PR_SET_PDEATHSIG observes the
 /// creating thread's death, even when the rest of the parent process is alive.
 /// Keep initialization outside this queue so slow handshakes do not serialize
@@ -536,6 +580,17 @@ pub struct LspClient {
     rust_flycheck_running: HashSet<String>,
     /// When the most recent rust-analyzer check run ended.
     rust_flycheck_finished_at: Option<Instant>,
+    /// When the most recent rust-analyzer check run began.
+    rust_flycheck_started_at: Option<Instant>,
+    /// When AFT last told rust-analyzer that a file was saved. rust-analyzer
+    /// re-runs `cargo check` only on a save, so until a check run begins
+    /// after this moment the published compiler errors describe the files
+    /// as they were before the save.
+    rust_check_requested_at: Option<Instant>,
+    /// How the server asked to hear about saves (`textDocumentSync.save` in
+    /// its initialize response). `None` until `initialize` succeeds, and when
+    /// the server did not ask.
+    save_notification: Option<SaveNotification>,
     /// Wall-clock time at which this server last started reading the
     /// workspace's Cargo manifests: the spawn, or the latest workspace reload
     /// AFT requested. A manifest or lockfile modified after this moment is
@@ -826,6 +881,9 @@ impl LspClient {
             rust_analyzer_quiescent_at: None,
             rust_flycheck_running: HashSet::new(),
             rust_flycheck_finished_at: None,
+            rust_flycheck_started_at: None,
+            rust_check_requested_at: None,
+            save_notification: None,
             workspace_loaded_at,
             supports_watched_files: false,
             watched_file_registrations,
@@ -957,6 +1015,7 @@ impl LspClient {
             .cloned()
             .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
+        self.save_notification = parse_save_notification(&caps_value);
 
         // Capture initialize-time (static) workspace/didChangeWatchedFiles
         // support. Runtime client/registerCapability subscriptions are recorded
@@ -1074,6 +1133,7 @@ impl LspClient {
                     });
                 if is_check {
                     self.rust_flycheck_running.insert(token.to_string());
+                    self.rust_flycheck_started_at = Some(Instant::now());
                 }
             }
             "end" => {
@@ -1085,14 +1145,38 @@ impl LspClient {
         }
     }
 
+    /// How this server wants to be told that a document was saved, or `None`
+    /// when it did not ask to hear about saves.
+    pub(crate) fn save_notification(&self) -> Option<SaveNotification> {
+        self.save_notification
+    }
+
+    /// Whether rust-analyzer has begun at least one check run. Before that,
+    /// nothing it pushed carries compiler results.
+    pub(crate) fn rust_check_seen(&self) -> bool {
+        self.rust_flycheck_started_at.is_some()
+    }
+
+    /// Record that a `textDocument/didSave` was just sent. For rust-analyzer
+    /// this starts a new `cargo check`, and the check results published so far
+    /// describe the files before the save; see [`Self::rust_flycheck_pending`].
+    pub(crate) fn record_save_sent(&mut self) {
+        if matches!(&self.kind, ServerKind::Rust) {
+            self.rust_check_requested_at = Some(Instant::now());
+        }
+    }
+
     /// Whether rust-analyzer's check results may still be missing from the
     /// published diagnostics: a check run is in progress, one ended less than
     /// `publish_settle` ago (rust-analyzer can announce the end before it
-    /// publishes the final batch), or the server became quiescent less than
-    /// `start_grace` ago and no check run has been seen yet (the first run
-    /// starts right after quiescence). False for other servers, for a server
-    /// that is still warming (that state is tracked separately), and when
-    /// checking is disabled, once the grace period has passed.
+    /// publishes the final batch), a save was sent less than
+    /// [`SAVE_CHECK_START_GRACE`] ago and no check run has begun since (the
+    /// save starts one, and until it does the published compiler errors
+    /// describe the files before the save), or the server became quiescent
+    /// less than `start_grace` ago and no check run has been seen yet (the
+    /// first run starts right after quiescence). False for other servers, for
+    /// a server that is still warming (that state is tracked separately), and
+    /// when checking is disabled, once the grace period has passed.
     pub(crate) fn rust_flycheck_pending(
         &self,
         now: Instant,
@@ -1104,6 +1188,14 @@ impl LspClient {
         }
         if !self.rust_flycheck_running.is_empty() {
             return true;
+        }
+        if let Some(requested) = self.rust_check_requested_at {
+            let begun_since = self
+                .rust_flycheck_started_at
+                .is_some_and(|started| started >= requested);
+            if !begun_since && now.saturating_duration_since(requested) < SAVE_CHECK_START_GRACE {
+                return true;
+            }
         }
         if let Some(finished) = self.rust_flycheck_finished_at {
             return now.saturating_duration_since(finished) < publish_settle;

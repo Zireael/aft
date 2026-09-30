@@ -1155,8 +1155,13 @@ fn run_blocking_inspect_body(
     // Give producers a bounded chance to settle before reading the warm store.
     // The wait is root-level: producers publish while events are drained. A
     // scoped request's per-file work happens later, in the diagnostics
-    // category, with its own share of the budget.
-    let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline);
+    // category, with its own share of the budget; that step also waits for
+    // rust-analyzer's `cargo check`, so only an unscoped request waits for
+    // it here.
+    let scoped_request =
+        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
+    let wait_outcome =
+        wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request);
     if inspect_cancellation_requested() {
         for phase in quiescence {
             phase.fail("inspect request cancelled");
@@ -1292,14 +1297,19 @@ fn run_blocking_inspect_body(
 /// Wait for every successfully started producer to settle before the payload
 /// reads the warm store: a producer settles once it holds a current
 /// authoritative (non-stale, non-provisional) report or stops warming
-/// (declares quiescence). Events are drained with the manager lock held only
-/// for the drain itself, so producers keep publishing while the wait ticks.
-/// Cancellation and the bounded phase deadline are checked at every tick.
-/// At the deadline, retain observations and name only the unsettled producers.
+/// (declares quiescence). With `wait_for_rust_check`, a rust-analyzer
+/// producer must also have no `cargo check` running or just requested (an
+/// edit's save starts one): until it finishes, the compiler errors in the
+/// store describe the files before the edit. Events are drained with the
+/// manager lock held only for the drain and the checks, so producers keep
+/// publishing while the wait ticks. Cancellation and the bounded phase
+/// deadline are checked at every tick. At the deadline, retain observations
+/// and name only the unsettled producers.
 fn wait_for_root_quiescence(
     ctx: &AppContext,
     expected: &[ServerKey],
     deadline: InspectRequestDeadline,
+    wait_for_rust_check: bool,
 ) -> Result<
     (
         Vec<AcceptedDiagnosticSnapshot>,
@@ -1312,27 +1322,44 @@ fn wait_for_root_quiescence(
     let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
     let mut accepted_snapshots = Vec::new();
     let mut blocked = false;
+    let rust_check_pending = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
+        wait_for_rust_check && lsp.rust_check_pending(server)
+    };
     loop {
         if inspect_cancellation_requested() {
             return Err("inspect request cancelled during LSP quiescence".to_string());
         }
         accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
-        if root_producers_settled(ctx, expected) {
+        if root_producers_settled(ctx, expected) && {
+            let lsp = ctx.lsp();
+            !expected
+                .iter()
+                .any(|server| rust_check_pending(&*lsp, server))
+        } {
             return Ok((accepted_snapshots, blocked, Vec::new()));
         }
         if Instant::now() >= wait_until {
             let lsp = ctx.lsp();
             let gaps = expected
                 .iter()
-                .filter(|server| !lsp.producer_has_settled(server))
-                .map(|server| {
-                    (
-                        server.clone(),
-                        format!(
+                .filter_map(|server| {
+                    if !lsp.producer_has_settled(server) {
+                        Some((
+                            server.clone(),
+                            format!(
                     "still indexing after {:.1}s; retry aft_inspect after the server settles",
                     started.elapsed().as_secs_f64()
                 ),
-                    )
+                        ))
+                    } else if rust_check_pending(&*lsp, server) {
+                        Some((
+                            server.clone(),
+                            crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON
+                                .to_string(),
+                        ))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             return Ok((accepted_snapshots, blocked, gaps));
@@ -2383,6 +2410,12 @@ fn render_incomplete_categories(
             }
             if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
                 // Rendered below as one line per cause, not one line per file.
+                continue;
+            }
+            if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
+                // Not a failure: the producer is still checking, and the
+                // reason names it.
+                lines.push(format!("Incomplete {category}: {reason}"));
                 continue;
             }
             let producer = gap

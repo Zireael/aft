@@ -2925,6 +2925,97 @@ fn lsp_diagnostics_recovers_after_external_cargo_update_with_real_rust_analyzer(
     );
 }
 
+/// `lsp_diagnostics` after an AFT write removes a struct field that
+/// `src/user.rs` still sets. rust-analyzer's pull answers with its own
+/// analysis; the compiler's errors come from a `cargo check` that only a save
+/// starts. The answer must carry the compiler's error for the new contents,
+/// or say the check is still running; a complete answer without it is built
+/// from a check of the files before the write.
+#[test]
+fn lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let temp_dir = tempdir().expect("tempdir");
+    let root = temp_dir.path().join("project");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), "pub mod s;\npub mod user;\n").expect("write lib");
+    let s = root.join("src/s.rs");
+    fs::write(&s, "pub struct S {\n    pub a: u8,\n    pub b: u8,\n}\n").expect("write s");
+    let user = root.join("src/user.rs");
+    fs::write(
+        &user,
+        "use crate::s::S;\n\npub fn make() -> S {\n    S { a: 1, b: 2 }\n}\n",
+    )
+    .expect("write user");
+    // AFT runs rust-analyzer with `--locked`, which needs a lockfile.
+    let generated = Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    let ctx = configured_rust_context(&root);
+
+    let clean = poll_lsp_diagnostics(&ctx, &user, Duration::from_secs(60), |response| {
+        response["complete"] == true
+    });
+    assert_eq!(clean["complete"], true, "{clean:#}");
+    assert_eq!(
+        error_lines_for(&clean),
+        Vec::<u64>::new(),
+        "control: the use site compiles before the removal: {clean:#}"
+    );
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "write-field-removal",
+        "command": "write",
+        "file": s.display().to_string(),
+        "content": "pub struct S {\n    pub a: u8,\n}\n"
+    }))
+    .expect("request parses");
+    let written = serde_json::to_value(handle_write(&req, &ctx)).expect("response serializes");
+    assert_eq!(written["success"], true, "write failed: {written:#}");
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-after-removal",
+        "command": "lsp_diagnostics",
+        "file": user.display().to_string(),
+        "wait_ms": 10_000
+    }))
+    .expect("request parses");
+    let after =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    if after["complete"] == false && after["note"].as_str().is_some() {
+        assert_eq!(
+            after["note"], "rust-analyzer: cargo check still running; retry",
+            "{after:#}"
+        );
+        return;
+    }
+    let compiler_error = after["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|diagnostic| {
+            diagnostic["source"] == "rustc"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("no field named `b`"))
+        });
+    assert!(
+        compiler_error,
+        "cargo check's error for the removed field is missing: {after:#}"
+    );
+}
+
 /// A Rust workspace served by the fake language server with the environment
 /// `env` builds from the workspace root, its server started on
 /// `src/main.rs`, and a watcher channel the test feeds.

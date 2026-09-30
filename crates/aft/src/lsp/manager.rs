@@ -6,17 +6,22 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
     DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument,
 };
 use lsp_types::{
     DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, VersionedTextDocumentIdentifier,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileChangeType, FileEvent,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    VersionedTextDocumentIdentifier,
 };
 
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
-use crate::lsp::client::{LspClient, LspEvent, ServerExitReport, ServerPhase, ServerState};
+use crate::lsp::client::{
+    LspClient, LspEvent, SaveNotification, ServerExitReport, ServerPhase, ServerState,
+    FLYCHECK_PUBLISH_SETTLE, FLYCHECK_START_GRACE,
+};
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
@@ -383,6 +388,38 @@ pub fn pull_file_diagnostics_unlocked<G>(
 where
     G: std::ops::DerefMut<Target = LspManager>,
 {
+    pull_file_diagnostics_unlocked_inner(lock, file_path, config, timeout, false)
+}
+
+/// [`pull_file_diagnostics_unlocked`], storing each rust-analyzer report
+/// together with the file's latest `cargo check` results. rust-analyzer
+/// answers a pull with its own analysis only and pushes the compiler's errors
+/// separately, so storing the pulled report alone drops them. Use this only
+/// after waiting for a running check to finish (see
+/// [`LspManager::rust_check_pending`]); otherwise the stored compiler errors
+/// can describe the files before an edit.
+pub fn pull_file_diagnostics_with_cargo_check_unlocked<G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    config: &Config,
+    timeout: Option<Duration>,
+) -> Result<Vec<PullFileResult>, LspError>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    pull_file_diagnostics_unlocked_inner(lock, file_path, config, timeout, true)
+}
+
+fn pull_file_diagnostics_unlocked_inner<G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    config: &Config,
+    timeout: Option<Duration>,
+    with_cargo_check: bool,
+) -> Result<Vec<PullFileResult>, LspError>
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let pulls = lock().begin_file_pulls(file_path, config, deadline)?;
     // All requests are in flight at once; wait for each without the lock.
@@ -396,6 +433,24 @@ where
         .map(|pull| {
             let server_key = pull.key.clone();
             let outcome = lsp.finish_document_pull(pull);
+            // Read the pulled report under the same lock that stored it: a
+            // push drained in between would replace it. Until a check has
+            // run, nothing pushed holds compiler results worth keeping.
+            if with_cargo_check
+                && server_key.kind == ServerKind::Rust
+                && lsp
+                    .clients
+                    .get(&server_key)
+                    .is_some_and(LspClient::rust_check_seen)
+                && matches!(
+                    outcome,
+                    PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged
+                )
+            {
+                if let Some(pulled) = lsp.server_file_diagnostics(&server_key, file_path) {
+                    lsp.store_pull_push_union(&server_key, file_path, pulled);
+                }
+            }
             PullFileResult {
                 server_key,
                 outcome,
@@ -1345,17 +1400,23 @@ impl LspManager {
                     .map(|v| v + 1)
                     .unwrap_or(1);
                 let send_result = if let Some(client) = self.clients.get_mut(key) {
-                    client.send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
-                        text_document: VersionedTextDocumentIdentifier::new(
-                            uri.clone(),
-                            next_version,
-                        ),
-                        content_changes: vec![TextDocumentContentChangeEvent {
-                            range: None,
-                            range_length: None,
-                            text: content,
-                        }],
-                    })
+                    // The file changed on disk, which for the server is a
+                    // save: rust-analyzer re-runs `cargo check` only on
+                    // `didSave`, so without it the compiler errors it
+                    // reports keep describing the old contents.
+                    client
+                        .send_notification::<DidChangeTextDocument>(DidChangeTextDocumentParams {
+                            text_document: VersionedTextDocumentIdentifier::new(
+                                uri.clone(),
+                                next_version,
+                            ),
+                            content_changes: vec![TextDocumentContentChangeEvent {
+                                range: None,
+                                range_length: None,
+                                text: content.clone(),
+                            }],
+                        })
+                        .and_then(|()| send_did_save(client, &uri, &content))
                 } else {
                     Ok(())
                 };
@@ -1491,6 +1552,11 @@ impl LspManager {
                             }],
                         },
                     )?;
+                    // AFT has written this content to disk: tell the server
+                    // it was saved. rust-analyzer re-runs `cargo check` only
+                    // on `didSave`, so without it the compiler errors it
+                    // reports keep describing the file before the edit.
+                    send_did_save(client, &uri, content)?;
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
                     store.bump_version(&canonical_path);
@@ -1509,6 +1575,8 @@ impl LspManager {
                     ),
                 })?;
                 log_did_open_sent(&key, &canonical_path, &language_id);
+                // The content was just written to disk: a save, as above.
+                send_did_save(client, &uri, content)?;
             }
             self.documents
                 .entry(key.clone())
@@ -1782,6 +1850,11 @@ impl LspManager {
             if key.kind != ServerKind::Rust {
                 continue;
             }
+            let changed: Vec<PathBuf> = in_root
+                .iter()
+                .map(|(_, resolved, _)| resolved.clone())
+                .collect();
+            self.announce_external_rust_save(&key, &changed);
             manifests.retain(|manifest| {
                 !sent_to_registered_watcher.contains(manifest)
                     || !matches!(
@@ -1797,6 +1870,55 @@ impl LspManager {
             }
         }
         rust_manifest_changes
+    }
+
+    /// Tell rust-analyzer that a Rust source file changed outside AFT (an
+    /// editor, a script, a branch switch). rust-analyzer re-runs `cargo
+    /// check` only when told that a file was saved, and a watched-file event
+    /// is not such a notice, so without this the compiler errors it reports
+    /// keep describing the files before the change. One notice per batch is
+    /// enough because the check covers the whole workspace. A file AFT wrote
+    /// itself was announced as saved when it was written, and its document
+    /// still matches the disk, so AFT's own edits do not restart the check.
+    fn announce_external_rust_save(&mut self, key: &ServerKey, changed: &[PathBuf]) {
+        // Deciding whether AFT already announced a file reads and hashes it;
+        // past this many candidates, announce without looking further.
+        const SCAN_CAP: usize = 64;
+        let documents = self.documents.get(key);
+        let mut rust_files = changed
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .peekable();
+        let first = rust_files.peek().map(|path| (*path).clone());
+        let saved = rust_files
+            .by_ref()
+            .take(SCAN_CAP)
+            .find(|path| {
+                !documents.is_some_and(|store| store.is_open(path) && !store.is_stale_on_disk(path))
+            })
+            .cloned()
+            .or_else(|| rust_files.next().and(first));
+        let Some(path) = saved else {
+            return;
+        };
+        let Ok(uri) = uri_for_path(&path) else {
+            return;
+        };
+        let Some(client) = self.clients.get_mut(key) else {
+            return;
+        };
+        let content = match client.save_notification() {
+            Some(SaveNotification::IncludeText) => {
+                std::fs::read_to_string(&path).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        if let Err(error) = send_did_save(client, &uri, &content) {
+            crate::slog_warn!(
+                "didSave for an external change to {} failed: {error}",
+                path.display()
+            );
+        }
     }
 
     /// Register a watcher-started rust-analyzer reload. Returns false when
@@ -2112,6 +2234,13 @@ impl LspManager {
         self.clients.get(server_key).is_some_and(|client| {
             client.rust_flycheck_pending(Instant::now(), start_grace, publish_settle)
         })
+    }
+
+    /// [`Self::rust_flycheck_pending`] with the standard grace periods: true
+    /// while rust-analyzer's `cargo check` results may still be missing or
+    /// out of date.
+    pub(crate) fn rust_check_pending(&self, server_key: &ServerKey) -> bool {
+        self.rust_flycheck_pending(server_key, FLYCHECK_START_GRACE, FLYCHECK_PUBLISH_SETTLE)
     }
 
     /// Runtime notes (the SDK a server started with) for the given servers
@@ -4682,6 +4811,32 @@ fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str) {
         file.display(),
         language_id
     );
+}
+
+/// Tell `client` that the document at `uri` was saved with `content`, if
+/// the server asked to hear about saves (`textDocumentSync.save`). Servers
+/// do on-save work only then; rust-analyzer's `cargo check`, the source of
+/// its compiler errors, is the case that matters.
+fn send_did_save(
+    client: &mut LspClient,
+    uri: &lsp_types::Uri,
+    content: &str,
+) -> Result<(), LspError> {
+    let Some(save) = client.save_notification() else {
+        return Ok(());
+    };
+    client.send_notification::<DidSaveTextDocument>(DidSaveTextDocumentParams {
+        text_document: TextDocumentIdentifier::new(uri.clone()),
+        text: (save == SaveNotification::IncludeText).then(|| content.to_string()),
+    })?;
+    client.record_save_sent();
+    slog_info!(
+        "lsp_protocol server={} root={} method=textDocument/didSave event=sent uri={}",
+        client.kind().id_str(),
+        client.root().display(),
+        uri.as_str()
+    );
+    Ok(())
 }
 
 fn normalize_lookup_path(path: &Path) -> PathBuf {
