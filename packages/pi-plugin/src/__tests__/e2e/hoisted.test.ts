@@ -48,8 +48,9 @@ maybeDescribe("hoisted tools (real bridge)", () => {
   });
 
   test("read refuses an inverted range by name instead of returning nothing", async () => {
-    // Shape recorded from a model that fills every declared property. It
-    // used to come back as an empty success.
+    // Models that fill every declared property send inverted ranges like
+    // this one (startLine 12, endLine 4). It must be refused by name, not
+    // returned as an empty success.
     await expect(
       harness.callTool("read", {
         path: "sample.ts",

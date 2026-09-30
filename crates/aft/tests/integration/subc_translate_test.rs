@@ -676,7 +676,8 @@ fn tool_call_read_refuses_recorded_inverted_range() {
         "{response:#}"
     );
 
-    // The same placeholders next to a real range still read it.
+    // Zero offset/limit placeholders next to a real startLine/endLine range
+    // still read that range.
     let response = placeholder_tool_call(
         &mut aft,
         "read-real-range",
@@ -770,7 +771,7 @@ fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
         "{text}"
     );
 
-    // Nothing usable at all is still refused.
+    // When every zoom input is a blank placeholder, the call is refused.
     let response = placeholder_tool_call(
         &mut aft,
         "zoom-nothing",

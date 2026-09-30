@@ -185,8 +185,9 @@ export function runZoomToolcallSuite(
     });
 
     test("placeholder targets merge with a real path + symbols request", async () => {
-      // Shape recorded from a model that fills every declared property: the
-      // real request is path + symbols, `targets` carries a placeholder `x`.
+      // Models that fill every declared property send a real path + symbols
+      // lookup next to a placeholder target {path: "x", symbol: "x"}. The real
+      // lookup must be answered and the `x` target reported on its own line.
       const h = await harness();
 
       const output = await runZoom(h, {

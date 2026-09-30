@@ -1647,8 +1647,8 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
     expect(result).toBe("10: ...\n29: ...");
     expect(result).not.toContain("Use startLine/endLine");
     expect(result).not.toContain("(Lines");
-    // offset/limit are forwarded as given; the server turns them into lines
-    // 10-29 in the one place shared with Pi and direct daemon callers.
+    // offset/limit are forwarded unchanged: the server converts them to
+    // lines 10-29 (for every host alike), so the plugin must not convert them.
     expect(calls[0]).toEqual({
       command: "read",
       params: { filePath: "small.ts", offset: 10, limit: 20 },
