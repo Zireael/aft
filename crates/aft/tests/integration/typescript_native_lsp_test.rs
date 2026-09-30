@@ -10,6 +10,10 @@
 //!   `typescript@5` and `typescript-language-server`, for the mixed-version
 //!   test.
 //!
+//! CI installs both with `scripts/install-typescript-test-servers.sh`. A set
+//! variable that points at a missing or wrong install fails the test instead
+//! of skipping it.
+//!
 //! Fixture projects link `node_modules/typescript` to the shared install, the
 //! way Bun's isolated linker and pnpm do, so the native binary must be found
 //! from the package's real path.
@@ -24,17 +28,45 @@ use super::helpers::AftProcess;
 const TS7_ENV: &str = "AFT_TEST_TS7_NODE_MODULES";
 const TS5_ENV: &str = "AFT_TEST_TS5_NODE_MODULES";
 
-fn installed(env: &str, test: &str) -> Option<PathBuf> {
-    let Some(modules) = std::env::var_os(env).map(PathBuf::from) else {
-        eprintln!("SKIP {test}: {env} not set (see the module comment)");
-        return None;
-    };
+/// The install named by `env`, or `None` when the variable is unset. A set
+/// variable that does not point at the expected install fails the test: CI
+/// sets it, and a broken install step must not turn into a silent skip.
+fn configured(env: &str) -> Option<PathBuf> {
+    let modules = std::env::var_os(env).map(PathBuf::from)?;
+    let package_json = modules.join("typescript").join("package.json");
+    let version = fs::read_to_string(&package_json)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|json| json["version"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            panic!(
+                "{env} is set but {} is missing or unreadable",
+                package_json.display()
+            )
+        });
+    let expected_major = if env == TS7_ENV { "7." } else { "5." };
     assert!(
-        modules.join("typescript").join("package.json").is_file(),
-        "{env} has no typescript package: {}",
-        modules.display()
+        version.starts_with(expected_major),
+        "{env} holds typescript {version}, expected {expected_major}x"
     );
+    if env == TS5_ENV {
+        assert!(
+            modules
+                .join(".bin")
+                .join("typescript-language-server")
+                .exists(),
+            "{env} has no .bin/typescript-language-server"
+        );
+    }
     Some(modules)
+}
+
+fn installed(env: &str, test: &str) -> Option<PathBuf> {
+    let modules = configured(env);
+    if modules.is_none() {
+        eprintln!("SKIP {test}: {env} not set (see the module comment)");
+    }
+    modules
 }
 
 fn write(path: &Path, contents: &str) {
@@ -291,7 +323,7 @@ fn mixed_typescript_5_and_7_packages_get_separate_servers() {
         "{legacy_diagnostics}"
     );
     let mut stored = serde_json::Value::Null;
-    for _ in 0..40 {
+    for _ in 0..80 {
         stored = aft.send(
             &json!({"id": "inspect-lsp", "command": "lsp_inspect", "file": legacy}).to_string(),
         );
@@ -379,7 +411,7 @@ fn typescript_7_without_its_platform_package_is_a_named_gap_and_spawns_nothing()
     write(&root.join("package.json"), r#"{"private":true}"#);
     write(&root.join("tsconfig.json"), "{}");
     let package_dir = root.join("node_modules").join("typescript");
-    match std::env::var_os(TS7_ENV).map(PathBuf::from) {
+    match configured(TS7_ENV) {
         // A real install, copied without the platform package.
         Some(modules) => copy_dir(&modules.join("typescript"), &package_dir),
         None => write(

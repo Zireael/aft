@@ -3135,6 +3135,12 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             match rx.try_recv() {
                 Ok(WatcherDispatchEvent::Paths(paths)) => {
                     dispatch_events_received += 1;
+                    // Before the ignore filter: lockfiles and installed
+                    // packages are often gitignored but still change which
+                    // TypeScript server a file gets.
+                    crate::lsp::typescript_project::invalidate_typescript_selection(
+                        paths.iter().map(PathBuf::as_path),
+                    );
                     if !state.rescan_required {
                         state.pending_paths.extend(paths.into_iter().filter(|path| {
                             !crate::watcher_filter::queued_path_is_ignored_by_matcher(
@@ -3146,6 +3152,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
                     dispatch_events_received += 1;
+                    // A rescan means the watcher dropped the individual
+                    // changed paths, so any of them may have changed the
+                    // installed TypeScript.
+                    crate::lsp::typescript_project::clear_typescript_selection();
                     state.rescan_required = true;
                     state.rescan_reason = reason;
                     state.pending_paths.clear();

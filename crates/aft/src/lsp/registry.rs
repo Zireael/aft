@@ -6,9 +6,7 @@ use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
     find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
 };
-use crate::lsp::typescript_project::{
-    project_typescript_for, resolve_native_binary, ProjectTypeScript, NATIVE_SERVER_ARGS,
-};
+use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -754,19 +752,24 @@ fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> 
         return server;
     }
     let project_root = config.project_root.as_deref();
-    let Some(root) = server.workspace_root_for_file_with_project_root(path, project_root) else {
+    let markers = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        server.root_markers.hash(&mut hasher);
+        server.priority_root_markers.hash(&mut hasher);
+        hasher.finish()
+    };
+    let Some(native) = native_typescript_for(path, project_root, markers, || {
+        server.workspace_root_for_file_with_project_root(path, project_root)
+    }) else {
         return server;
     };
-    let Some(project) = project_typescript_for(path, &root, project_root)
-        .filter(ProjectTypeScript::is_native_compiler)
-    else {
-        return server;
-    };
-    let binary = resolve_native_binary(&project)
+    let binary = native
+        .binary
         .map(|binary| binary.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "tsc".into());
+        .unwrap_or_else(|| "tsc".into());
     ServerDef {
-        kind: ServerKind::TypeScriptNative(Arc::from(project.package_dir.as_path())),
+        kind: ServerKind::TypeScriptNative(Arc::from(native.project.package_dir.as_path())),
         name: "TypeScript native language server".into(),
         extensions: server.extensions,
         binary,
@@ -1146,6 +1149,79 @@ mod tests {
             legacy.workspace_root_for_file_with_project_root(&legacy_file, config_root),
         );
         assert_ne!(native.kind, legacy.kind);
+    }
+
+    /// Choosing the TypeScript server for many files in one directory reads
+    /// the installed package once, not once per file. Bypassing the memo makes
+    /// this 200 reads or more; the bound leaves room for a parallel test that
+    /// clears the memo mid-loop.
+    #[test]
+    fn typescript_server_choice_is_memoized_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let files: Vec<PathBuf> = (0..100)
+            .map(|index| root.join("src").join(format!("file{index}.ts")))
+            .collect();
+        for file in &files {
+            write_file(file, "");
+        }
+        let before = crate::lsp::typescript_project::package_json_reads_on_this_thread();
+        for file in &files {
+            let server = typescript_server(file, &config).unwrap();
+            assert!(matches!(server.kind, ServerKind::TypeScriptNative(_)));
+        }
+        let reads = crate::lsp::typescript_project::package_json_reads_on_this_thread() - before;
+        assert!(
+            reads <= 10,
+            "{reads} package.json reads for 100 files in one directory"
+        );
+    }
+
+    /// After the watcher reports an installation change, the TypeScript
+    /// server choice is recomputed.
+    #[test]
+    fn typescript_server_choice_follows_an_install_after_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        let package_dir = install_typescript(&root, "5.9.3");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        assert_eq!(
+            typescript_server(&file, &config).unwrap().kind,
+            ServerKind::TypeScript
+        );
+        install_typescript(&root, "7.0.2");
+        let changed = package_dir.join("package.json");
+        assert!(crate::lsp::typescript_project::path_affects_typescript_selection(&changed));
+        crate::lsp::typescript_project::invalidate_typescript_selection([changed.as_path()]);
+        assert_eq!(
+            typescript_server(&file, &config).unwrap().kind,
+            ServerKind::TypeScriptNative(Arc::from(package_dir.as_path()))
+        );
+        // Editing a source file cannot change which TypeScript is installed,
+        // so it does not empty the memo.
+        assert!(!crate::lsp::typescript_project::path_affects_typescript_selection(&file));
+        for path in [
+            "/r/bun.lock",
+            "/r/node_modules/.bin/tsc",
+            "/r/node_modules/@typescript/typescript-linux-x64/lib/tsc",
+        ] {
+            assert!(
+                crate::lsp::typescript_project::path_affects_typescript_selection(Path::new(path)),
+                "{path}"
+            );
+        }
     }
 
     #[test]

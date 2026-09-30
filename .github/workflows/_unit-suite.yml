@@ -346,6 +346,21 @@ jobs:
       - name: Install Pyright integration dependency
         run: npm install --global pyright@1.1.411
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Real TypeScript 7 and TypeScript 5 installs for
+      # typescript_native_lsp_test; the script exports their paths. Without
+      # them those tests skip, and the native server path has no coverage.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
+
+      - name: Install TypeScript test servers (pinned)
+        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
+
       - uses: actions/download-artifact@v4
         with:
           name: linux-nextest-archive
@@ -679,6 +694,25 @@ jobs:
           mkdir -p "$HOME/.cargo/bin"
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Real TypeScript 7 and TypeScript 5 installs for
+      # typescript_native_lsp_test; the script exports their paths. Without
+      # them those tests skip, and the native server path has no coverage.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
+
+      - name: Install TypeScript test servers (pinned)
+        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
 
       - uses: actions/download-artifact@v4
         with:

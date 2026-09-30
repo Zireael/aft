@@ -14,9 +14,25 @@
 //! runs, and starting the server that matches the lockfile would fail against
 //! the installed compiler.
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use super::environmental::TS_NATIVE_NO_TSSERVER;
+
+thread_local! {
+    /// How many `node_modules/typescript/package.json` reads this thread has
+    /// attempted. Per thread so a test can count its own lookups while other
+    /// tests run in parallel.
+    static PACKAGE_JSON_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Attempted `node_modules/typescript/package.json` reads on this thread.
+#[cfg(test)]
+pub(crate) fn package_json_reads_on_this_thread() -> u64 {
+    PACKAGE_JSON_READS.with(Cell::get)
+}
 
 /// The `serverInfo.name` the native TypeScript language server reports in its
 /// `initialize` response.
@@ -64,6 +80,7 @@ impl ProjectTypeScript {
     /// Read the package at `package_dir` (a `node_modules/typescript`
     /// directory). `None` when it has no package.json.
     pub(crate) fn read(package_dir: &Path) -> Option<Self> {
+        PACKAGE_JSON_READS.with(|reads| reads.set(reads.get() + 1));
         let bytes = std::fs::read(package_dir.join("package.json")).ok()?;
         let version = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
@@ -124,6 +141,130 @@ pub(crate) fn project_typescript_for(
         .filter(|root| source_file.starts_with(root))
         .unwrap_or(&server_root);
     find_project_typescript_package(&source_file, boundary)
+}
+
+/// A TypeScript 7+ installation chosen for a file, and its native binary when
+/// it resolves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeTypeScript {
+    pub(crate) project: ProjectTypeScript,
+    pub(crate) binary: Option<PathBuf>,
+}
+
+/// Entries kept before the memo is emptied and refilled. Each entry is one
+/// source directory, so this covers far more directories than a large
+/// monorepo has while keeping memory bounded.
+const SELECTION_MEMO_CAPACITY: usize = 16_384;
+
+/// (directory the ancestor walk starts in, configured project root, hash of
+/// the root-marker file names the server definition uses to find its
+/// workspace root).
+type SelectionKey = (PathBuf, Option<PathBuf>, u64);
+
+/// Memo of [`native_typescript_for`] results.
+///
+/// The applicability walk and scoped inspect ask which TypeScript server
+/// serves every TS/JS file they visit, and each answer costs a canonicalize,
+/// an ancestor walk with a `package.json` read attempt per level, and the
+/// platform-binary lookup. Every file in one directory gets the same answer,
+/// so the answer is memoized per directory and repeated lookups are one hash
+/// probe. It is emptied on configure and when a watched path that can change
+/// the answer changes (see [`invalidate_typescript_selection`]).
+fn selection_memo() -> &'static parking_lot::Mutex<HashMap<SelectionKey, Option<NativeTypeScript>>>
+{
+    static MEMO: OnceLock<parking_lot::Mutex<HashMap<SelectionKey, Option<NativeTypeScript>>>> =
+        OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// The TypeScript 7+ installation that serves `source_file`, or `None` when
+/// its nearest installed TypeScript is not the native compiler (or there is
+/// none). `server_root` is only called when the answer is not memoized; it
+/// bounds the walk when the file is outside `project_root`. `markers` is a
+/// fingerprint of the root markers that `server_root` uses, so definitions
+/// with different markers do not share answers.
+pub(crate) fn native_typescript_for(
+    source_file: &Path,
+    project_root: Option<&Path>,
+    markers: u64,
+    server_root: impl FnOnce() -> Option<PathBuf>,
+) -> Option<NativeTypeScript> {
+    let start = source_file.parent()?;
+    let key = (
+        start.to_path_buf(),
+        project_root.map(Path::to_path_buf),
+        markers,
+    );
+    if let Some(memoized) = selection_memo().lock().get(&key) {
+        return memoized.clone();
+    }
+    // Computed without the lock so parallel lookups in other directories do
+    // not wait on this one's file-system work.
+    let answer = server_root().and_then(|root| {
+        let project = project_typescript_for(source_file, &root, project_root)
+            .filter(ProjectTypeScript::is_native_compiler)?;
+        let binary = resolve_native_binary(&project).ok();
+        Some(NativeTypeScript { project, binary })
+    });
+    let mut memo = selection_memo().lock();
+    if memo.len() >= SELECTION_MEMO_CAPACITY {
+        memo.clear();
+    }
+    memo.insert(key, answer.clone());
+    answer
+}
+
+/// Forget every memoized TypeScript server choice.
+pub(crate) fn clear_typescript_selection() {
+    selection_memo().lock().clear();
+}
+
+/// Whether a change to `path` can change which TypeScript server a file gets:
+/// the installed TypeScript or its platform package, the `.bin/tsc` link an
+/// install rewrites, a lockfile or `package.json` (installs and branch
+/// switches change these), or a root marker that moves a server root.
+///
+/// The file watcher drops most paths inside `node_modules`, so after an
+/// install the lockfile or `package.json` change is usually the signal that
+/// arrives; configure clears the memo as well.
+pub(crate) fn path_affects_typescript_selection(path: &Path) -> bool {
+    const NAMES: &[&str] = &[
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        "bun.lock",
+        "bun.lockb",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    ];
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| NAMES.contains(&name))
+    {
+        return true;
+    }
+    let components: Vec<_> = path
+        .components()
+        .map(|component| component.as_os_str())
+        .collect();
+    components.windows(2).any(|pair| {
+        pair[0] == "node_modules" && (pair[1] == "typescript" || pair[1] == "@typescript")
+    }) || components.windows(3).any(|triple| {
+        triple[0] == "node_modules"
+            && triple[1] == ".bin"
+            && Path::new(triple[2])
+                .file_stem()
+                .is_some_and(|stem| stem == "tsc")
+    })
+}
+
+/// Forget the memoized choices when any of `paths` can change them.
+pub(crate) fn invalidate_typescript_selection<'a>(paths: impl IntoIterator<Item = &'a Path>) {
+    if paths.into_iter().any(path_affects_typescript_selection) {
+        clear_typescript_selection();
+    }
 }
 
 /// The npm name of the platform package that carries the native compiler for

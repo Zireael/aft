@@ -2704,6 +2704,10 @@ fn register_hashline_for_configure(
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    // Configure can change the project root, search paths or server
+    // overrides, and follows installs the file watcher may not report, so the
+    // memoized TypeScript server choices are recomputed.
+    crate::lsp::typescript_project::clear_typescript_selection();
     let response = handle_configure_inner(req, ctx);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.

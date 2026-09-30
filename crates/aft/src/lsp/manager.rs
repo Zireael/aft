@@ -6510,4 +6510,33 @@ mod typescript_worktree_tests {
         assert!(note.contains("server-managed SDK resolution"), "{note}");
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
+
+    /// Cost of choosing the TypeScript server for every file of a real
+    /// project, through the same applicability walk `aft_inspect` runs. Opt-in:
+    /// `AFT_TS_SELECTION_CORPUS=<project root> cargo test -p agent-file-tools
+    /// --lib measure_typescript_selection -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_typescript_selection_on_a_corpus() {
+        let Some(root) = std::env::var_os("AFT_TS_SELECTION_CORPUS").map(PathBuf::from) else {
+            eprintln!("SKIP: AFT_TS_SELECTION_CORPUS not set");
+            return;
+        };
+        let root = crate::inspect::job::canonicalize_normalized(&root);
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        for round in 1..=3 {
+            let reads = crate::lsp::typescript_project::package_json_reads_on_this_thread();
+            let started = Instant::now();
+            let walk = walk_applicable_area(&root, None, &config, None).unwrap();
+            eprintln!(
+                "round {round}: walk {:?}, {} server keys, {} package.json reads",
+                started.elapsed(),
+                walk.candidates.len(),
+                crate::lsp::typescript_project::package_json_reads_on_this_thread() - reads
+            );
+        }
+    }
 }

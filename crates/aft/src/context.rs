@@ -9543,6 +9543,9 @@ impl AppContext {
     }
 
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {
+        // An agent write to package.json or a lockfile can change which
+        // TypeScript server a file gets, even with the file watcher off.
+        crate::lsp::typescript_project::invalidate_typescript_selection([file_path]);
         let custom_markers = self.custom_lsp_root_markers();
         if !is_config_file_path_with_custom(file_path, &custom_markers) {
             return;
