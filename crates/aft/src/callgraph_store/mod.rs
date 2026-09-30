@@ -45,6 +45,12 @@ pub(crate) const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
 const PROVENANCE_NAME_MATCH: &str = "name_match";
 const PROVENANCE_TYPE_MATCH: &str = "type_match";
 const PROVENANCE_VALUE_REF: &str = "value_ref";
+/// Ref kind for a call written directly in a `macro_rules!` template; the
+/// macro name is stored in `local_name`. Never resolved into an edge.
+pub(crate) const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
+/// Ref kind for an identifier inside a Rust macro token tree that could not be
+/// parsed as Rust. Never resolved into an edge.
+pub(crate) const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -2484,6 +2490,19 @@ pub trait CallGraphRead {
     fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>>;
+    /// Raw ref rows of `kind` whose short name is `short_name`, resolved or
+    /// not, at most `limit` of them in file and line order. `callers` uses it
+    /// to find macro invocations and macro facts by name. Stores that keep no
+    /// such rows answer with none.
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        let _ = (kind, short_name, limit);
+        Ok(Vec::new())
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -2801,6 +2820,17 @@ pub struct StoreUnresolvedCall {
     pub line: u32,
     pub byte_start: usize,
     pub byte_end: usize,
+}
+
+/// One raw ref row located by name; see `CallGraphRead::ref_sites_named`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRefSite {
+    pub file: String,
+    /// Scoped name of the symbol containing the ref, when it has a node.
+    pub caller_symbol: Option<String>,
+    pub line: u32,
+    /// For macro-template call refs, the macro (`name!`) making the call.
+    pub local_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5780,6 +5810,18 @@ impl CallGraphStore {
         unresolved_calls_for_node(&conn, node)
     }
 
+    pub fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        ref_sites_named(&conn, kind, short_name, limit)
+    }
+
     pub fn call_tree(
         &self,
         file_rel: &Path,
@@ -6290,6 +6332,15 @@ impl ReadonlyCallGraphStore {
         self.inner.unresolved_calls_of(node)
     }
 
+    pub fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.inner.ref_sites_named(kind, short_name, limit)
+    }
+
     pub fn call_tree(
         &self,
         file_rel: &Path,
@@ -6397,6 +6448,14 @@ impl CallGraphRead for CallGraphStore {
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         CallGraphStore::unresolved_calls_of(self, node)
     }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        CallGraphStore::ref_sites_named(self, kind, short_name, limit)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -6497,6 +6556,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         (**self).unresolved_calls_of(node)
     }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        (**self).ref_sites_named(kind, short_name, limit)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -6596,6 +6663,14 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     }
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         self.unresolved_calls_of(node)
+    }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        ReadonlyCallGraphStore::ref_sites_named(self, kind, short_name, limit)
     }
     fn call_tree(
         &self,
@@ -7292,6 +7367,37 @@ fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<V
                 byte_end: row.get::<_, i64>(4)?.max(0) as usize,
                 resolved: row.get::<_, String>(5)? == "resolved",
                 provenance: row.get(6)?,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn ref_sites_named(
+    conn: &Connection,
+    kind: &str,
+    short_name: &str,
+    limit: usize,
+) -> Result<Vec<StoreRefSite>> {
+    // The LIMIT bounds the work: the short-name index yields matching rows
+    // and SQLite stops once `limit` of them are sorted out.
+    let mut stmt = conn.prepare_cached(
+        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name
+         FROM refs r
+         LEFT JOIN nodes n ON n.id = r.caller_node
+         WHERE r.short_name = ?1 AND r.kind = ?2
+         ORDER BY r.caller_file, r.line, r.ref_id
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![short_name, kind, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok(StoreRefSite {
+                file: row.get(0)?,
+                caller_symbol: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                local_name: row.get(3)?,
             })
         },
     )?;
@@ -8905,8 +9011,10 @@ fn schema_fingerprint() -> String {
     // edge sources, broader call extraction) even if the table SHAPE is
     // unchanged, so existing on-disk stores rebuild and pick up the new edges.
     // Rust scoped aliases, inline modules, reexports, and turbofish calls now add edges.
+    // v10: calls inside `macro_rules!` templates, plus macro-template call and
+    // unparsed macro mention refs.
     let input =
-        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v9-rust-resolver-batch");
+        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v10-rust-macro-templates");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
@@ -10461,6 +10569,21 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
+    // Macro facts are stored as refs of their own kinds. The resolver only
+    // binds `call` and `value_ref` rows, so these never become edges; the
+    // `callers` query reads them by name (see `macro_ref_sites`).
+    raw_refs.extend(build_macro_body_call_refs(
+        &rel_path,
+        &data,
+        &node_by_scoped,
+    ));
+    raw_refs.extend(build_callable_refs(
+        &rel_path,
+        &data.macro_mentions_by_symbol,
+        &node_by_scoped,
+        &BTreeSet::new(),
+        MACRO_MENTION_REF_KIND,
+    ));
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
@@ -10617,6 +10740,28 @@ fn build_call_refs(
         import_dependencies,
         "call",
     )
+}
+
+/// Refs for calls written directly in `macro_rules!` templates. The refs table
+/// keeps no caller symbol column (only a caller node, and a macro is not a
+/// node), so the macro name (`name!`) is kept in `local_name`, which call refs
+/// otherwise fill with the callee name.
+fn build_macro_body_call_refs(
+    rel_path: &str,
+    data: &FileCallData,
+    node_by_scoped: &HashMap<String, String>,
+) -> Vec<RawRef> {
+    let mut refs = build_callable_refs(
+        rel_path,
+        &data.macro_body_calls_by_macro,
+        node_by_scoped,
+        &BTreeSet::new(),
+        MACRO_BODY_CALL_REF_KIND,
+    );
+    for raw in &mut refs {
+        raw.local_name = raw.caller_symbol.clone();
+    }
+    refs
 }
 
 fn build_value_ref_refs(
@@ -21519,6 +21664,8 @@ export function leaf() {}
             data: FileCallData {
                 calls_by_symbol: HashMap::new(),
                 value_refs_by_symbol: HashMap::new(),
+                macro_body_calls_by_macro: HashMap::new(),
+                macro_mentions_by_symbol: HashMap::new(),
                 exported_symbols: Vec::new(),
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,

@@ -750,6 +750,9 @@ pub fn extract_calls_full(
     byte_end: usize,
     lang: LangId,
 ) -> Vec<(String, String, u32, usize, usize)> {
+    if lang == LangId::Rust {
+        return extract_rust_calls_with_macro_facts(source, root, byte_start, byte_end).0;
+    }
     let mut results = Vec::new();
     let call_kinds = call_node_kinds(lang);
     collect_calls_full(
@@ -760,12 +763,83 @@ pub fn extract_calls_full(
         &call_kinds,
         &mut results,
     );
-    if lang == LangId::Rust {
-        collect_rust_macro_calls(root, source, byte_start, byte_end, 0, &mut results);
-        results.sort_by_key(|(_, _, _, start, end)| (*start, *end));
-        results.dedup();
-    }
     results
+}
+
+/// Call-site tuple shared by the extraction helpers:
+/// `(full_callee, short_name, line, byte_start, byte_end)`.
+pub type CallTuple = (String, String, u32, usize, usize);
+
+/// Upper bound on unanalyzed macro mentions recorded for one file. A file full
+/// of DSL macros (SQL, HTML templates) would otherwise record every word in
+/// them; past this many the note on `callers` output is already clear enough.
+const MAX_UNPARSED_MACRO_MENTIONS_PER_FILE: usize = 512;
+
+/// The template of one `macro_rules!` arm, located in the original source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustMacroBody {
+    /// Macro name without the `!`.
+    pub name: String,
+    /// Byte range strictly inside the arm's template delimiters.
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+/// What call extraction learned about Rust macros beyond the calls themselves.
+#[derive(Debug, Clone, Default)]
+pub struct RustMacroFacts {
+    /// Every `macro_rules!` arm template that was re-parsed for calls.
+    pub bodies: Vec<RustMacroBody>,
+    /// Identifiers inside macro token trees that tree-sitter could not parse
+    /// as Rust, excluding names that were still recognized as callees. Each is
+    /// a `CallTuple` whose full and short names are the identifier. A call
+    /// hidden in such a region is invisible to the call graph, so `callers`
+    /// reports these mentions instead of claiming there are no callers.
+    pub unparsed_mentions: Vec<CallTuple>,
+}
+
+/// Rust call extraction including calls written inside macro token trees:
+/// invocation arguments (`vec![f(x)]`, `tokio::select! { .. }`) and
+/// `macro_rules!` templates, which tree-sitter keeps as opaque tokens. Each
+/// token tree is parsed again on its own as Rust; tree-sitter's error recovery
+/// still yields the calls in most macro argument shapes. Returns the calls
+/// sorted by position, plus the macro facts gathered on the way.
+pub fn extract_rust_calls_with_macro_facts(
+    source: &str,
+    root: tree_sitter::Node,
+    byte_start: usize,
+    byte_end: usize,
+) -> (Vec<CallTuple>, RustMacroFacts) {
+    let mut results = Vec::new();
+    let call_kinds = call_node_kinds(LangId::Rust);
+    collect_calls_full(
+        root,
+        source,
+        byte_start,
+        byte_end,
+        &call_kinds,
+        &mut results,
+    );
+    let mut facts = RustMacroFacts::default();
+    collect_rust_macro_calls(
+        root,
+        source,
+        byte_start,
+        byte_end,
+        0,
+        &mut results,
+        &mut facts,
+    );
+    results.sort_by_key(|(_, _, _, start, end)| (*start, *end));
+    results.dedup();
+    facts
+        .unparsed_mentions
+        .sort_by_key(|(_, _, _, start, end)| (*start, *end));
+    facts.unparsed_mentions.dedup();
+    facts
+        .unparsed_mentions
+        .truncate(MAX_UNPARSED_MACRO_MENTIONS_PER_FILE);
+    (results, facts)
 }
 
 fn collect_rust_macro_calls(
@@ -774,7 +848,8 @@ fn collect_rust_macro_calls(
     byte_start: usize,
     byte_end: usize,
     depth: u32,
-    results: &mut Vec<(String, String, u32, usize, usize)>,
+    results: &mut Vec<CallTuple>,
+    facts: &mut RustMacroFacts,
 ) {
     if depth >= MAX_RUST_MACRO_CALL_DEPTH
         || node.end_byte() <= byte_start
@@ -783,27 +858,69 @@ fn collect_rust_macro_calls(
         return;
     }
 
-    if node.kind() == "macro_invocation" {
-        let mut cursor = node.walk();
-        if cursor.goto_first_child() {
-            loop {
-                let child = cursor.node();
-                if child.kind() == "token_tree" {
-                    collect_rust_token_tree_calls(child, source, depth, results);
-                    break;
-                }
-                if !cursor.goto_next_sibling() {
-                    break;
+    match node.kind() {
+        "macro_invocation" => {
+            let mut cursor = node.walk();
+            if cursor.goto_first_child() {
+                loop {
+                    let child = cursor.node();
+                    if child.kind() == "token_tree" {
+                        collect_rust_token_tree_calls(child, source, depth, results, facts);
+                        break;
+                    }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                 }
             }
+            return;
         }
-        return;
+        // A `macro_rules!` template is code that runs wherever the macro is
+        // expanded. Whole method families are sometimes written inside one,
+        // so its calls are extracted like any other; the body ranges let the
+        // call graph tell which calls came from which macro.
+        "macro_definition" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| source.get(name.byte_range()))
+                .map(str::to_string);
+            let mut cursor = node.walk();
+            for rule in node.children(&mut cursor) {
+                if rule.kind() != "macro_rule" {
+                    continue;
+                }
+                let Some(right) = rule.child_by_field_name("right") else {
+                    continue;
+                };
+                if let Some(name) = &name {
+                    let range = right.byte_range();
+                    if range.end > range.start + 1 {
+                        facts.bodies.push(RustMacroBody {
+                            name: name.clone(),
+                            byte_start: range.start + 1,
+                            byte_end: range.end - 1,
+                        });
+                    }
+                }
+                collect_rust_token_tree_calls(right, source, depth, results, facts);
+            }
+            return;
+        }
+        _ => {}
     }
 
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_rust_macro_calls(cursor.node(), source, byte_start, byte_end, depth, results);
+            collect_rust_macro_calls(
+                cursor.node(),
+                source,
+                byte_start,
+                byte_end,
+                depth,
+                results,
+                facts,
+            );
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -815,7 +932,8 @@ fn collect_rust_token_tree_calls(
     token_tree: tree_sitter::Node<'_>,
     source: &str,
     depth: u32,
-    results: &mut Vec<(String, String, u32, usize, usize)>,
+    results: &mut Vec<CallTuple>,
+    facts: &mut RustMacroFacts,
 ) {
     let range = token_tree.byte_range();
     if range.end <= range.start + 1 {
@@ -837,6 +955,7 @@ fn collect_rust_token_tree_calls(
     };
 
     let mut fragment_calls = Vec::new();
+    let mut fragment_facts = RustMacroFacts::default();
     collect_calls_full(
         tree.root_node(),
         fragment,
@@ -852,22 +971,92 @@ fn collect_rust_token_tree_calls(
         fragment.len(),
         depth + 1,
         &mut fragment_calls,
+        &mut fragment_facts,
     );
+    if tree.root_node().has_error() {
+        collect_unparsed_mentions(
+            tree.root_node(),
+            fragment,
+            &fragment_calls,
+            &mut fragment_facts.unparsed_mentions,
+        );
+    }
 
     let token_start_row = token_tree.start_position().row as u32;
-    results.extend(
-        fragment_calls
+    let remap = |(full, short, line, start, end): CallTuple| {
+        (
+            full,
+            short,
+            token_start_row + line,
+            inner_start + start,
+            inner_start + end,
+        )
+    };
+    results.extend(fragment_calls.into_iter().map(remap));
+    facts.bodies.extend(
+        fragment_facts
+            .bodies
             .into_iter()
-            .map(|(full, short, line, call_start, call_end)| {
-                (
-                    full,
-                    short,
-                    token_start_row + line,
-                    inner_start + call_start,
-                    inner_start + call_end,
-                )
+            .map(|body| RustMacroBody {
+                name: body.name,
+                byte_start: inner_start + body.byte_start,
+                byte_end: inner_start + body.byte_end,
             }),
     );
+    let room = MAX_UNPARSED_MACRO_MENTIONS_PER_FILE.saturating_sub(facts.unparsed_mentions.len());
+    facts.unparsed_mentions.extend(
+        fragment_facts
+            .unparsed_mentions
+            .into_iter()
+            .take(room)
+            .map(remap),
+    );
+}
+
+/// Record the identifiers tree-sitter had to put in `ERROR` nodes while
+/// re-parsing one macro token tree. Names that were recognized as callees
+/// anyway are skipped: the call graph already has those calls.
+fn collect_unparsed_mentions(
+    root: tree_sitter::Node<'_>,
+    fragment: &str,
+    fragment_calls: &[CallTuple],
+    mentions: &mut Vec<CallTuple>,
+) {
+    let callee_names: BTreeSet<&str> = fragment_calls
+        .iter()
+        .map(|(_, short, _, _, _)| short.as_str())
+        .collect();
+    // Explicit stack instead of recursion: fragments come from arbitrary
+    // macro input and can nest deeply.
+    let mut pending = vec![(root, false)];
+    while let Some((node, in_error)) = pending.pop() {
+        if mentions.len() >= MAX_UNPARSED_MACRO_MENTIONS_PER_FILE {
+            return;
+        }
+        let in_error = in_error || node.is_error();
+        if in_error && node.kind() == "identifier" {
+            if let Some(name) = fragment.get(node.byte_range()) {
+                if !callee_names.contains(name) {
+                    mentions.push((
+                        name.to_string(),
+                        name.to_string(),
+                        node.start_position().row as u32 + 1,
+                        node.start_byte(),
+                        node.end_byte(),
+                    ));
+                }
+            }
+            continue;
+        }
+        // Only subtrees that contain an error can hold an unparsed mention.
+        if !in_error && !node.has_error() {
+            continue;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            pending.push((child, in_error));
+        }
+    }
 }
 
 fn collect_calls_full(

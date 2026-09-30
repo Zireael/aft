@@ -1320,6 +1320,7 @@ fn make_callers_value(count: usize, depth_limited: bool) -> Value {
                     line: index as u32,
                     approximate: None,
                     resolved_by: None,
+                    via: None,
                 })
                 .collect(),
         }],
@@ -1330,6 +1331,7 @@ fn make_callers_value(count: usize, depth_limited: bool) -> Value {
         depth_limited,
         truncated: 0,
         callers_list_envelope: build_callgraph_envelope(Unit::Items, count, count, 0),
+        macro_note: None,
     };
     serde_json::to_value(result).expect("callers fixture serialization")
 }
@@ -1383,6 +1385,7 @@ fn make_capped_impact_value(count: usize) -> Value {
             parameters: Vec::new(),
             approximate: None,
             resolved_by: None,
+            via: None,
         })
         .collect::<Vec<_>>();
 
@@ -1434,6 +1437,7 @@ fn make_capped_callers_value(count: usize) -> Value {
             line: i as u32,
             approximate: None,
             resolved_by: None,
+            via: None,
         })
         .collect::<Vec<_>>();
 
@@ -1475,6 +1479,7 @@ fn make_capped_callers_value(count: usize) -> Value {
         depth_limited: false,
         truncated: 0,
         callers_list_envelope,
+        macro_note: None,
     };
     serde_json::to_value(result).expect("capped callers fixture serialization")
 }

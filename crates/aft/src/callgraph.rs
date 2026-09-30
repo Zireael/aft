@@ -506,6 +506,16 @@ pub struct FileCallData {
     /// Rust function items referenced as values, grouped by containing symbol.
     /// These do not participate in callgraph navigation.
     pub value_refs_by_symbol: HashMap<String, Vec<CallSite>>,
+    /// Calls written in a `macro_rules!` template outside any item defined in
+    /// that template, keyed by macro name with its `!` (e.g. `check!`). They
+    /// run wherever the macro is invoked, so `callers` reports the macro's
+    /// invocation sites for them instead of a caller in this file.
+    pub macro_body_calls_by_macro: HashMap<String, Vec<CallSite>>,
+    /// Identifiers inside Rust macro token trees that could not be parsed as
+    /// Rust, grouped by containing symbol. `callers` counts these as mentions
+    /// it could not analyze, so a target named only there is not reported as
+    /// having no callers without comment.
+    pub macro_mentions_by_symbol: HashMap<String, Vec<CallSite>>,
     /// Names of exported symbols in this file.
     pub exported_symbols: Vec<String>,
     /// Per-symbol metadata (kind, exported, signature).
@@ -1306,6 +1316,82 @@ fn collect_calls_by_symbol(
     )
 }
 
+/// Separate calls written directly in a `macro_rules!` template from ordinary
+/// calls. A call inside an item that the template itself defines (a method in
+/// a macro that stamps out a whole `impl` body) stays an ordinary call of that
+/// item. Any other call in a template belongs to the macro, keyed `name!`,
+/// because attributing it to the code around the definition would name a
+/// caller that never runs it.
+fn split_macro_body_calls(
+    source: &str,
+    symbols: &[Symbol],
+    raw_calls: Vec<crate::calls::CallTuple>,
+    bodies: &[crate::calls::RustMacroBody],
+) -> (
+    Vec<crate::calls::CallTuple>,
+    HashMap<String, Vec<CallSite>>,
+) {
+    let mut body_calls: HashMap<String, Vec<CallSite>> = HashMap::new();
+    if bodies.is_empty() {
+        return (raw_calls, body_calls);
+    }
+    let line_index = SourceLineIndex::new(source);
+    let symbol_ranges = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                line_index.byte_offset(symbol.range.start_line, symbol.range.start_col),
+                line_index.byte_offset(symbol.range.end_line, symbol.range.end_col),
+            )
+        })
+        .collect::<Vec<_>>();
+    // For each template, the items it defines itself.
+    let body_symbols = bodies
+        .iter()
+        .map(|body| {
+            symbol_ranges
+                .iter()
+                .copied()
+                .filter(|(start, end)| body.byte_start <= *start && *end <= body.byte_end)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut ordinary = Vec::with_capacity(raw_calls.len());
+    for call in raw_calls {
+        let (_, _, _, call_start, call_end) = call;
+        // Templates can nest; the innermost one holding the call owns it.
+        let innermost = bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| body.byte_start <= call_start && call_end <= body.byte_end)
+            .min_by_key(|(_, body)| body.byte_end - body.byte_start);
+        let Some((body_index, body)) = innermost else {
+            ordinary.push(call);
+            continue;
+        };
+        let inside_defined_item = body_symbols[body_index]
+            .iter()
+            .any(|(start, end)| *start <= call_start && call_end <= *end);
+        if inside_defined_item {
+            ordinary.push(call);
+            continue;
+        }
+        let (full, short, line, byte_start, byte_end) = call;
+        body_calls
+            .entry(format!("{}!", body.name))
+            .or_default()
+            .push(CallSite {
+                callee_name: short,
+                full_callee: full,
+                line,
+                byte_start,
+                byte_end,
+            });
+    }
+    (ordinary, body_calls)
+}
+
 fn collect_rust_value_refs_by_symbol(
     source: &str,
     root: Node<'_>,
@@ -1409,7 +1495,20 @@ pub(crate) fn build_file_data_from_source_with_lang(
     let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
 
     let root = tree.root_node();
-    let mut calls_by_symbol = collect_calls_by_symbol(&source, root, lang, &symbols);
+    let mut macro_body_calls_by_macro = HashMap::new();
+    let mut macro_mentions_by_symbol = HashMap::new();
+    let mut calls_by_symbol = if lang == LangId::Rust {
+        let (raw_calls, macro_facts) =
+            crate::calls::extract_rust_calls_with_macro_facts(&source, root, 0, source.len());
+        let (raw_calls, body_calls) =
+            split_macro_body_calls(&source, &symbols, raw_calls, &macro_facts.bodies);
+        macro_body_calls_by_macro = body_calls;
+        macro_mentions_by_symbol =
+            attribute_sites_to_symbols(&source, &symbols, macro_facts.unparsed_mentions);
+        attribute_sites_to_symbols(&source, &symbols, raw_calls)
+    } else {
+        collect_calls_by_symbol(&source, root, lang, &symbols)
+    };
     let value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols)
     } else {
@@ -1519,6 +1618,8 @@ pub(crate) fn build_file_data_from_source_with_lang(
     Ok(FileCallData {
         calls_by_symbol,
         value_refs_by_symbol,
+        macro_body_calls_by_macro,
+        macro_mentions_by_symbol,
         exported_symbols,
         symbol_metadata,
         default_export_symbol: default_export.map(|export| export.symbol),
@@ -3887,6 +3988,8 @@ def right():
         let file_data = FileCallData {
             calls_by_symbol: HashMap::new(),
             value_refs_by_symbol: HashMap::new(),
+            macro_body_calls_by_macro: HashMap::new(),
+            macro_mentions_by_symbol: HashMap::new(),
             exported_symbols: vec!["total_disk_bytes".to_string()],
             symbol_metadata,
             default_export_symbol: None,

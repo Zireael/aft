@@ -975,6 +975,10 @@ impl ParseBlob {
         Ok(FileCallData {
             calls_by_symbol,
             value_refs_by_symbol,
+            // Blobs carry no macro-template calls or unparsed macro mentions
+            // yet, so blob-backed stores answer `callers` without them.
+            macro_body_calls_by_macro: HashMap::new(),
+            macro_mentions_by_symbol: HashMap::new(),
             symbol_metadata,
             exported_symbols: self
                 .exported_symbols

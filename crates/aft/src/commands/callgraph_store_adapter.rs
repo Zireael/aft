@@ -7,6 +7,7 @@ use tree_sitter::{Node, Parser};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
+    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
@@ -34,6 +35,12 @@ pub const HUB_SUMMARY_LIMIT: usize = 15;
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
+/// Most macro-template and macro-invocation entries one `callers` answer adds.
+const MACRO_VIA_ENTRY_LIMIT: usize = 50;
+/// Most unanalyzed macro mentions one `callers` answer counts exactly.
+const MACRO_MENTION_COUNT_LIMIT: usize = 100;
+/// Mention locations spelled out in the note; the rest are only counted.
+const MACRO_MENTION_SHOWN: usize = 5;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -76,6 +83,22 @@ pub struct StoreCallersResult {
     pub truncated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callers_list_envelope: Option<ListEnvelope>,
+    /// Present when the target's name appears inside Rust macro token trees
+    /// that could not be parsed, so the caller list may be incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_note: Option<StoreMacroNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreMacroNote {
+    pub message: String,
+    /// Distinct unanalyzed mention locations found, capped at
+    /// `MACRO_MENTION_COUNT_LIMIT`.
+    pub mentions: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub mentions_is_lower_bound: bool,
+    /// `file:line` of the first mentions.
+    pub sites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +115,10 @@ pub struct StoreCallerEntry {
     pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
+    /// The macro (`name!`) whose template makes the call. Set on the sites
+    /// that invoke that macro: the call runs there once the macro expands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -550,14 +577,10 @@ pub fn callers_result(
         None
     };
 
-    let callers_list_envelope = build_callgraph_envelope(
-        Unit::Items,
-        shown,
-        post_filter_count,
-        truncated.max(usize::from(depth_limited)),
-    );
     let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
+    let mut listed = HashSet::new();
     for site in visible_sites {
+        listed.insert((site.caller.file.clone(), site.line));
         groups
             .entry(site.caller.file.clone())
             .or_default()
@@ -566,8 +589,32 @@ pub fn callers_result(
                 line: site.line,
                 approximate: edge_approximate(&site),
                 resolved_by: edge_resolved_by(&site),
+                via: None,
             });
     }
+
+    let is_rust = target.representative.lang == crate::parser::LangId::Rust;
+    let via_entries = if is_rust {
+        macro_via_entries(store, &target, include_tests, &listed)?
+    } else {
+        Vec::new()
+    };
+    let via_count = via_entries.len();
+    for (file, entry) in via_entries {
+        groups.entry(file).or_default().push(entry);
+    }
+    let macro_note = if is_rust {
+        unanalyzed_macro_note(store, &target.representative.name, include_tests)?
+    } else {
+        None
+    };
+
+    let callers_list_envelope = build_callgraph_envelope(
+        Unit::Items,
+        shown + via_count,
+        post_filter_count + via_count,
+        truncated.max(usize::from(depth_limited)),
+    );
 
     Ok(StoreCallersResult {
         symbol: target.representative.symbol,
@@ -576,14 +623,136 @@ pub fn callers_result(
             .into_iter()
             .map(|(file, callers)| StoreCallerGroup { file, callers })
             .collect(),
-        total_callers,
+        total_callers: total_callers + via_count,
         hidden_test_callers: if include_tests { 0 } else { hidden_tests },
         hub_summary,
         scanned_files: store.indexed_file_count()?,
         depth_limited,
         truncated,
         callers_list_envelope,
+        macro_note,
     })
+}
+
+/// Callers reached through `macro_rules!` templates that call the target
+/// outside any item the template defines. Each such template contributes its
+/// own call site (listed under the macro name, `name!`) and every invocation
+/// of the macro (listed under the invoking symbol, annotated `via name!`).
+///
+/// Templates, invocations and the target are all matched by name only, so
+/// every entry is marked name-resolved. When several symbols share the
+/// target's name no entries are produced, because nothing tells which of them
+/// a template calls. Only macros defined in the project have template refs,
+/// and the entry count is capped at `MACRO_VIA_ENTRY_LIMIT` by the queries.
+fn macro_via_entries(
+    store: &impl CallGraphRead,
+    target: &ResolvedStoreSymbol,
+    include_tests: bool,
+    listed: &HashSet<(String, u32)>,
+) -> StoreAdapterResult<Vec<(String, StoreCallerEntry)>> {
+    let name = &target.representative.name;
+    let template_calls =
+        store.ref_sites_named(MACRO_BODY_CALL_REF_KIND, name, MACRO_VIA_ENTRY_LIMIT)?;
+    if template_calls.is_empty() {
+        return Ok(Vec::new());
+    }
+    let namesakes = store
+        .nodes_matching(name)?
+        .into_iter()
+        .filter(|node| node.name == *name && !target.nodes.contains(node))
+        .count();
+    if namesakes > 0 {
+        return Ok(Vec::new());
+    }
+
+    let name_match = |symbol: String, line: u32, via: Option<String>| StoreCallerEntry {
+        symbol,
+        line,
+        approximate: Some(true),
+        resolved_by: Some("name_match".to_string()),
+        via,
+    };
+    let mut entries = Vec::new();
+    let mut macros = BTreeSet::new();
+    for site in template_calls {
+        let Some(macro_name) = site.local_name else {
+            continue;
+        };
+        if include_tests || !is_test_file(&site.file) {
+            entries.push((site.file, name_match(macro_name.clone(), site.line, None)));
+        }
+        macros.insert(macro_name);
+    }
+    for macro_name in macros {
+        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
+        if remaining == 0 {
+            break;
+        }
+        for site in store.ref_sites_named("call", &macro_name, remaining)? {
+            if (!include_tests && is_test_file(&site.file))
+                || listed.contains(&(site.file.clone(), site.line))
+            {
+                continue;
+            }
+            let symbol = site
+                .caller_symbol
+                .unwrap_or_else(|| "<top-level>".to_string());
+            entries.push((
+                site.file,
+                name_match(symbol, site.line, Some(macro_name.clone())),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+/// A note naming where the target's name occurs inside Rust macro token trees
+/// that could not be parsed as Rust. Calls there are invisible to the call
+/// graph, so without the note an empty or short caller list would read as
+/// complete when it may not be.
+fn unanalyzed_macro_note(
+    store: &impl CallGraphRead,
+    name: &str,
+    include_tests: bool,
+) -> StoreAdapterResult<Option<StoreMacroNote>> {
+    // One more than the limit tells an exact count from a lower bound.
+    let rows = store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
+    let mut seen = BTreeSet::new();
+    let mut sites = Vec::new();
+    for row in rows {
+        if !include_tests && is_test_file(&row.file) {
+            continue;
+        }
+        if seen.insert((row.file.clone(), row.line)) {
+            sites.push(format!("{}:{}", row.file, row.line));
+        }
+    }
+    if sites.is_empty() {
+        return Ok(None);
+    }
+    let mentions_is_lower_bound = sites.len() > MACRO_MENTION_COUNT_LIMIT;
+    sites.truncate(MACRO_MENTION_COUNT_LIMIT);
+    let mentions = sites.len();
+    sites.truncate(MACRO_MENTION_SHOWN);
+    let count = if mentions_is_lower_bound {
+        format!("{mentions}+")
+    } else {
+        mentions.to_string()
+    };
+    let noun = if mentions == 1 { "mention" } else { "mentions" };
+    let listed = if mentions > sites.len() {
+        format!("{}, … (shown {} of {count})", sites.join(", "), sites.len())
+    } else {
+        sites.join(", ")
+    };
+    Ok(Some(StoreMacroNote {
+        message: format!(
+            "{count} {noun} of `{name}` inside macros could not be analyzed: {listed}"
+        ),
+        mentions,
+        mentions_is_lower_bound,
+        sites,
+    }))
 }
 
 pub fn call_tree_result(
