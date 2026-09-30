@@ -7,6 +7,8 @@
 //! owning component reports itself unavailable with that refusal as the reason.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -59,19 +61,21 @@ impl Fixture {
     }
 
     fn configure(&self, indexes: Value) -> Arc<AppContext> {
+        self.configure_with_embeddings(indexes, "http://127.0.0.1:9")
+    }
+
+    fn configure_with_embeddings(&self, indexes: Value, embedding_url: &str) -> Arc<AppContext> {
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config::default(),
         ));
         let mut doc = json!({ "indexes": indexes, "views": { "enabled": false } });
         if indexes["semantic"] == true {
-            // An unreachable endpoint: the semantic lane must never need an
-            // embedding to reach its refusal.
             doc["semantic"] = json!({
                 "backend": "openai_compatible",
                 "model": "rollback-probe",
-                "base_url": "http://127.0.0.1:9",
-                "timeout_ms": 200,
+                "base_url": embedding_url,
+                "timeout_ms": 2_000,
             });
         }
         let request: RawRequest = serde_json::from_value(json!({
@@ -99,6 +103,72 @@ impl Fixture {
         }
         ctx
     }
+}
+
+/// The search lane published an index: a built one or a denied (empty) one.
+fn search_settled(ctx: &AppContext) -> bool {
+    ctx.search_index().read().ok().is_some_and(|index| {
+        index
+            .as_ref()
+            .is_some_and(|index| index.ready || index.build_denied)
+    })
+}
+
+/// A minimal OpenAI-compatible embedding endpoint, so a semantic cold build
+/// could actually run (and persist) if the refusal did not stop it first.
+fn start_embedding_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 8192];
+                let body = loop {
+                    let Ok(read) = stream.read(&mut chunk) else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&bytes[..end])
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break bytes[end + 4..end + 4 + length].to_vec();
+                    }
+                };
+                let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+                let inputs = match &request["input"] {
+                    Value::Array(values) => values.len(),
+                    Value::String(_) => 1,
+                    _ => 0,
+                };
+                let data = (0..inputs)
+                    .map(|index| json!({ "embedding": [0.1, 0.2, 0.3], "index": index }))
+                    .collect::<Vec<_>>();
+                let body = json!({ "data": data }).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+        }
+    });
+    url
 }
 
 fn drain(ctx: &AppContext) {
@@ -198,12 +268,15 @@ fn future_search_index_is_refused_by_name_and_left_byte_identical() {
     let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
     // The configure worker settles on a build-denied (empty) index instead of
     // building and persisting over the newer cache.
-    settle(&ctx, "search index", |ctx| {
+    settle(&ctx, "search index", search_settled);
+    assert!(
         ctx.search_index()
             .read()
-            .ok()
-            .is_some_and(|index| index.as_ref().is_some_and(|index| index.build_denied))
-    });
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.build_denied),
+        "the search build must be denied, not run"
+    );
 
     assert_eq!(
         fs::read(&cache).unwrap(),
@@ -235,15 +308,22 @@ fn future_semantic_index_is_refused_by_name_and_left_byte_identical() {
     bytes.extend_from_slice(&[0x5A; 256]);
     fs::write(&snapshot, &bytes).unwrap();
 
-    let ctx = fixture.configure(json!({ "trigram": false, "semantic": true, "callgraph": false }));
-    // The semantic lane ends with a failure (the refusal, or the unreachable
-    // test backend), never with a rebuilt snapshot.
+    // A working embedding backend: without the refusal, the lane would cold
+    // build and persist a fresh snapshot over the newer one.
+    let embeddings = start_embedding_server();
+    let ctx = fixture.configure_with_embeddings(
+        json!({ "trigram": false, "semantic": true, "callgraph": false }),
+        &embeddings,
+    );
     settle(&ctx, "semantic index", |ctx| {
         matches!(
             *ctx.semantic_index_status().read().unwrap(),
             aft::context::SemanticIndexStatus::Failed(_)
+                | aft::context::SemanticIndexStatus::Ready { .. }
         )
     });
+    // Let a persist that follows a (wrongly) finished build reach the disk.
+    thread::sleep(Duration::from_millis(500));
 
     assert_eq!(
         fs::read(&snapshot).unwrap(),
@@ -346,12 +426,7 @@ fn future_symbol_cache_is_refused_by_name_and_left_byte_identical() {
 
     // The search index load prewarms (and persists) the symbol cache.
     let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
-    settle(&ctx, "search index", |ctx| {
-        ctx.search_index()
-            .read()
-            .ok()
-            .is_some_and(|index| index.as_ref().is_some_and(|index| index.ready))
-    });
+    settle(&ctx, "search index", search_settled);
     // Give the prewarm, which runs after the index is published, time to
     // reach its persist step.
     thread::sleep(Duration::from_millis(500));
@@ -458,12 +533,7 @@ fn a_reader_floor_above_this_build_refuses_the_store_before_anything_is_written(
     .unwrap();
 
     let ctx = fixture.configure(json!({ "trigram": true, "semantic": false, "callgraph": false }));
-    settle(&ctx, "search index", |ctx| {
-        ctx.search_index()
-            .read()
-            .ok()
-            .is_some_and(|index| index.as_ref().is_some_and(|index| index.build_denied))
-    });
+    settle(&ctx, "search index", search_settled);
 
     let cache = fixture
         .storage
