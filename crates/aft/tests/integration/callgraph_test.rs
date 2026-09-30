@@ -2793,3 +2793,208 @@ fn callgraph_ops_return_building_then_ready_async() {
 
     aft.shutdown();
 }
+
+/// Rust fixture whose calls live inside macro token trees: invocation
+/// arguments, a `macro_rules!` template, methods stamped out by a macro, and
+/// a DSL macro tree-sitter cannot parse as Rust.
+fn write_rust_macro_fixture(root: &Path) {
+    write_rust_manifest(root, "rust-macro-fixture");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub mod targets;\npub mod callers;\npub mod methods;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/targets.rs"),
+        "pub fn select_target() -> u32 { 1 }\n\
+         pub fn select_branch_target() {}\n\
+         pub fn matches_target(v: u32) -> bool { v > 0 }\n\
+         pub fn custom_target() -> u32 { 2 }\n\
+         pub fn template_target() {}\n\
+         pub fn dsl_target() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/callers.rs"),
+        r#"use crate::targets::{select_target, select_branch_target, matches_target, custom_target, template_target, dsl_target};
+
+macro_rules! run_template {
+    ($x:expr) => {
+        template_target();
+        $x
+    };
+}
+
+pub async fn select_caller(rx: Receiver) {
+    tokio::select! {
+        biased;
+        res = async { select_target() } => { select_branch_target(); }
+        _ = rx.recv() => {}
+    }
+}
+
+pub fn matches_caller(x: Option<u32>) -> bool {
+    matches!(x, Some(v) if matches_target(v))
+}
+
+pub fn custom_caller() {
+    let _ = my_custom!(first: custom_target(), second => 3);
+}
+
+pub fn template_caller_one() {
+    run_template!(1);
+}
+
+pub fn template_caller_two() {
+    run_template!(2);
+}
+
+pub fn dsl_caller() {
+    my_dsl! { when ready then dsl_target @ 3 }
+}
+"#,
+    )
+    .unwrap();
+    // A macro that stamps out a family of methods, expanded inside an impl
+    // elsewhere: the method bodies call each other through `self`.
+    fs::write(
+        root.join("src/methods.rs"),
+        r#"macro_rules! runtime_methods {
+    () => {
+        async fn poll_session(&self, id: &str) {
+            if self.handle_refusal(id).await {
+                return;
+            }
+        }
+
+        async fn handle_refusal(&self, id: &str) -> bool {
+            id.is_empty()
+        }
+    };
+}
+
+pub struct Runtime;
+
+impl Runtime {
+    runtime_methods!();
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn rust_macro_callers(aft: &mut AftProcess, root: &Path, file: &str, symbol: &str) -> Value {
+    let resp = aft.send(&format!(
+        r#"{{"id":"1","command":"callers","file":{},"symbol":"{symbol}","depth":1}}"#,
+        crate::helpers::json_string(&root.join(file).display())
+    ));
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    resp
+}
+
+/// Calls in the arguments of `tokio::select!`, `matches!` and a custom macro
+/// are found by re-parsing the invocation's token tree as Rust.
+#[test]
+fn callgraph_rust_calls_inside_macro_invocation_arguments_have_callers() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_macro_fixture(root);
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    for (target, caller) in [
+        ("select_target", "select_caller"),
+        ("select_branch_target", "select_caller"),
+        ("matches_target", "matches_caller"),
+        ("custom_target", "custom_caller"),
+    ] {
+        let resp = rust_macro_callers(&mut aft, root, "src/targets.rs", target);
+        assert_single_caller(&resp, "src/callers.rs", caller);
+    }
+    aft.shutdown();
+}
+
+/// A call written in a `macro_rules!` template is listed at the template
+/// and at every invocation of the macro, name-resolved and marked `via`.
+#[test]
+fn callgraph_rust_macro_template_call_lists_invocations_via_macro() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_macro_fixture(root);
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = rust_macro_callers(&mut aft, root, "src/targets.rs", "template_target");
+    let entries = flattened_caller_entries(&resp);
+    let summary = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["symbol"].as_str().unwrap_or("").to_string(),
+                entry["line"].as_u64().unwrap_or(0),
+                entry["via"].as_str().unwrap_or("").to_string(),
+                entry["resolved_by"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary,
+        vec![
+            ("run_template!".to_string(), 5, String::new(), "name_match".to_string()),
+            (
+                "template_caller_one".to_string(),
+                27,
+                "run_template!".to_string(),
+                "name_match".to_string()
+            ),
+            (
+                "template_caller_two".to_string(),
+                31,
+                "run_template!".to_string(),
+                "name_match".to_string()
+            ),
+        ],
+        "template call and both invocations expected: {resp:?}"
+    );
+    let text = format_callgraph_response("callers", &resp);
+    assert!(
+        text.contains("↳ template_caller_one:27 ~ via run_template!"),
+        "text should mark the invocation as name-resolved via the macro: {text}"
+    );
+    aft.shutdown();
+}
+
+/// Methods defined inside a `macro_rules!` template call each other through
+/// `self`; those calls are extracted and resolved like ordinary calls.
+#[test]
+fn callgraph_rust_methods_defined_in_macro_template_have_callers() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_macro_fixture(root);
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = rust_macro_callers(&mut aft, root, "src/methods.rs", "handle_refusal");
+    assert_single_caller(&resp, "src/methods.rs", "poll_session");
+    aft.shutdown();
+}
+
+/// A name that occurs only inside a macro tree-sitter cannot parse yields
+/// no caller, and the answer says where the unanalyzed mention is instead
+/// of reporting a bare zero.
+#[test]
+fn callgraph_rust_unparseable_macro_mention_is_noted() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    write_rust_macro_fixture(root);
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = rust_macro_callers(&mut aft, root, "src/targets.rs", "dsl_target");
+    assert_eq!(resp["total_callers"], 0, "no parseable caller: {resp:?}");
+    let message = resp["macro_note"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message, "1 mention of `dsl_target` inside macros could not be analyzed: src/callers.rs:35",
+        "note should name the mention: {resp:?}"
+    );
+    let text = format_callgraph_response("callers", &resp);
+    assert!(text.contains(message), "text should carry the note: {text}");
+    aft.shutdown();
+}

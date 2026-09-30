@@ -184,8 +184,11 @@ function renderCallersGroupLines(group: Record<string, unknown>, theme: Callgrap
   const bySymbolProvenance = new Map<string, number[]>();
   for (const caller of callers) {
     const symbol = asString(caller.symbol) ?? "(unknown)";
+    const via = asString(caller.via) ?? "";
     const provenanceKey =
-      asString(caller.resolved_by) === "name_match" ? `${symbol}\0name_match` : `${symbol}\0exact`;
+      asString(caller.resolved_by) === "name_match"
+        ? `${symbol}\0${via}\0name_match`
+        : `${symbol}\0${via}\0exact`;
     const line = asNumber(caller.line);
     const bucket = bySymbolProvenance.get(provenanceKey) ?? [];
     if (line !== undefined) bucket.push(line);
@@ -194,12 +197,13 @@ function renderCallersGroupLines(group: Record<string, unknown>, theme: Callgrap
 
   const keys = [...bySymbolProvenance.keys()].sort((a, b) => a.localeCompare(b));
   for (const key of keys) {
-    const symbol = key.split("\0")[0] ?? "(unknown)";
+    const [symbol = "(unknown)", via = ""] = key.split("\0");
     const isNameMatch = key.endsWith("\0name_match");
     const lineNums = (bySymbolProvenance.get(key) ?? []).sort((a, b) => a - b);
     const linePart = lineNums.length > 0 ? lineNums.map(String).join(", ") : "?";
     const marker = isNameMatch ? ` ${theme.fg("warning", "~")}` : "";
-    lines.push(`  ↳ ${symbol}:${linePart}${marker}`);
+    const viaPart = via ? ` via ${via}` : "";
+    lines.push(`  ↳ ${symbol}:${linePart}${marker}${viaPart}`);
   }
 
   return lines;
@@ -238,6 +242,9 @@ export function formatCallgraphSections(
     groups.forEach((group) => {
       sections.push(renderCallersGroupLines(group, theme).join("\n"));
     });
+    // Rust macro token trees that could not be parsed may hide more callers.
+    const macroNote = asString(asRecord(record.macro_note)?.message);
+    if (macroNote) sections.push(theme.fg("warning", macroNote));
     return sections;
   }
 

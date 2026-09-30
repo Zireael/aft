@@ -1385,7 +1385,6 @@ fn make_capped_impact_value(count: usize) -> Value {
             parameters: Vec::new(),
             approximate: None,
             resolved_by: None,
-            via: None,
         })
         .collect::<Vec<_>>();
 

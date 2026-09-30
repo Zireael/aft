@@ -132,6 +132,7 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
             line: i as u32,
             approximate: None,
             resolved_by: None,
+            via: None,
         })
         .collect::<Vec<_>>();
 
@@ -173,6 +174,7 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
         depth_limited,
         truncated,
         callers_list_envelope,
+        macro_note: None,
     }
 }
 

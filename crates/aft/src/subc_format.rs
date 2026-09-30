@@ -2894,6 +2894,13 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
             "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
         ));
     }
+    if let Some(note) = record
+        .get("macro_note")
+        .and_then(Value::as_object)
+        .and_then(|note| string_field(note, "message"))
+    {
+        sections.push(note.to_string());
+    }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             sections.push(String::new());
@@ -2915,14 +2922,17 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         } else {
             "exact"
         };
-        let key = format!("{symbol}\0{provenance}");
+        let via = string_field(caller, "via").unwrap_or("");
+        let key = format!("{symbol}\0{via}\0{provenance}");
         let bucket = by_symbol_provenance.entry(key).or_default();
         if let Some(line) = number_field(caller, "line") {
             bucket.push(line);
         }
     }
     for (key, mut line_nums) in by_symbol_provenance {
-        let symbol = key.split('\0').next().unwrap_or("(unknown)");
+        let mut parts = key.split('\0');
+        let symbol = parts.next().unwrap_or("(unknown)");
+        let via = parts.next().unwrap_or("");
         let is_name_match = key.ends_with("\0name_match");
         line_nums.sort_unstable();
         let line_part = if line_nums.is_empty() {
@@ -2935,7 +2945,12 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
                 .join(", ")
         };
         let marker = if is_name_match { " ~" } else { "" };
-        lines.push(format!("  ↳ {symbol}:{line_part}{marker}"));
+        let via_part = if via.is_empty() {
+            String::new()
+        } else {
+            format!(" via {via}")
+        };
+        lines.push(format!("  ↳ {symbol}:{line_part}{marker}{via_part}"));
     }
     lines
 }
