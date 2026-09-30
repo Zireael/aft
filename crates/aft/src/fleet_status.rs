@@ -435,7 +435,8 @@ trait StatusConsumer {
     type Route;
 
     fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static);
-    /// The daemon's channel-0 control pushes (`route.closing`, `route.closed`).
+    /// The daemon's route-lifecycle notifications, sent on the connection's
+    /// control channel (`route.closing`, `route.closed`, each with a reason).
     fn control_pushes(&self) -> mpsc::Receiver<ControlPush>;
     async fn catalog_list(&self) -> Result<CatalogList, String>;
     async fn open_route(

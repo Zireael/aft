@@ -1003,10 +1003,12 @@ struct RouteIdentityData {
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
     disabled_tools: Arc<Vec<String>>,
-    /// The scope the daemon stamped on this route at bind (`None` for a route
-    /// opened without one, or by a daemon that predates scopes). Kept with the
-    /// route so that ending a scope can later end the work started under it;
-    /// nothing reads it yet.
+    /// The scope the daemon stamped on this route at bind: the owner and
+    /// session (`ref`, `scope_epoch`) of the work the route was opened for.
+    /// `None` for a route opened without one, or by a daemon that predates
+    /// scopes. Kept so that when the daemon ends that scope, the bash tasks
+    /// started on this route can be ended with it; that cleanup is not built
+    /// yet, so nothing reads the field.
     #[allow(dead_code)]
     scope: Option<subc_protocol::scope::ScopeStamp>,
 }
@@ -3656,15 +3658,16 @@ where
 {
     // ModuleHello registers the tool and management providers and advertises
     // the separate channel-0 control operations.
-    // Echo the launch nonce the daemon handed over at spawn (captured once at
-    // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
-    // accepted; absent for non-reserved/self-connect.
-    // Read once, before HELLO: it selects the warm-up budget and nothing else.
+    // The spawn role is read once, before HELLO: it selects the warm-up budget
+    // and nothing else.
     let spawn_role = readiness::SpawnRole::from_process_env();
     // The catalog is module-wide and sent once, before any route binds, so it
     // can only reflect the user config file: project and per-harness disables
     // are enforced per route at dispatch.
     let catalog_disabled = crate::subc_config::catalog_disabled_tools(user_config_path.as_deref());
+    // Echo the launch nonce the daemon handed over at spawn (captured once at
+    // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
+    // accepted; absent for non-reserved/self-connect.
     let launch_nonce = crate::launch_nonce::current();
     let mut manifest = build_manifest_without(&catalog_disabled);
     manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
@@ -6648,7 +6651,8 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, refusal, "invalid_request refusal").await;
     }
     if let Some(pin) = call.schema_pin.as_deref() {
-        // Recorded only: pinning a call to a catalog version is not built yet.
+        // The pin is only logged: refusing a call built against a catalog
+        // version that no longer matches is not implemented yet.
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;

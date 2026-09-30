@@ -61,9 +61,10 @@ const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
 const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
     subc_protocol::SUBC_MODULE_ID_ENV,
     subc_protocol::SUBC_LAUNCH_NONCE_ENV,
-    // Names the descriptor the daemon passed the nonce through. A child that
-    // inherited it without the pipe would read and close whatever it has at
-    // that number, so it goes with the nonce itself.
+    // Names the descriptor the daemon passed the nonce through. It is removed
+    // along with the nonce: a child that inherited this variable without the
+    // pipe would read and close whatever unrelated descriptor it has at that
+    // number.
     subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV,
 ];
 
