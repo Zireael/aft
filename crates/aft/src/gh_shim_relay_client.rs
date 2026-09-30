@@ -266,7 +266,15 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     },
                     None => Reply::Malformed("plexus refused without a refusal_code".to_string()),
                 },
-                _ => Reply::Malformed("plexus's reply had no known result.status".to_string()),
+                // New statuses need an explicit contract before they can authorize
+                // success, refusal, or retry; never infer one from other fields.
+                _ => {
+                    let status = result.get("status").unwrap_or(&Value::Null);
+                    log::warn!("gh-shim: unrecognised plexus result.status: {status}");
+                    Reply::Malformed(format!(
+                        "plexus's reply had no known result.status: {status}"
+                    ))
+                }
             }
         }
         Some("error") => match data.get("refusal_code").and_then(Value::as_str) {
@@ -659,7 +667,13 @@ async fn exchange(
                 }
                 return RouteOutcome::Result(output);
             }
-            Reply::Malformed(message) => return RouteOutcome::SchemaMismatch(message),
+            Reply::Malformed(message) => {
+                // The request was sent; an unreadable reply cannot prove the
+                // write did not happen, so returning a refusal risks a duplicate.
+                return RouteOutcome::OutcomeUndetermined(outcome_undetermined_text(&format!(
+                    "unreadable plexus reply: {message}"
+                )));
+            }
             Reply::Refused {
                 code,
                 stage,

@@ -58,6 +58,14 @@ pub fn is_relay_operation(operation: &str) -> bool {
 /// in a tool-call result whose first text block holds the reply as JSON.
 /// Return the facade reply in both cases.
 pub fn facade_reply(value: &Value) -> Value {
+    // Direct facade fields are authoritative: a tool-call result may also
+    // carry text containing only the inner result, not the whole reply.
+    if ["result", "error", "repo_binding_generation"]
+        .iter()
+        .any(|field| value.get(field).is_some())
+    {
+        return value.clone();
+    }
     let wrapped = value
         .get("content")
         .and_then(Value::as_array)

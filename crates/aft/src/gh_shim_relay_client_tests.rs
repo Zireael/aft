@@ -764,6 +764,72 @@ fn assertion_refusals_retry_once_for_a_fresh_mint() {
 }
 
 #[test]
+fn unknown_result_status_is_outcome_undetermined_and_never_resent() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-future", "call-future", "/p");
+    let reply = json!({"op": BOT_REQUEST_OPERATION, "status": "ok", "data": {
+        "result": {"status": "some_future_state"},
+    }});
+    let harness = harness(ticket_gated(vec![reply]));
+    let manifest = v12_manifest();
+    let args = comment_args("hi");
+    let Classification::Governed {
+        tuple, canonical, ..
+    } = classify(&args, &manifest, "macos")
+    else {
+        panic!("not governed");
+    };
+    let request =
+        super::super::canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .unwrap();
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let outcome = route(
+        &harness.paths,
+        &rung,
+        &binding,
+        request,
+        TEST_NOW,
+        &manifest,
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: live.value().map(str::to_string),
+            transient_delays: [Duration::from_millis(1); 2],
+            relay_budget: Duration::from_secs(5),
+        },
+    );
+    assert_eq!(harness.daemon.bot_requests().len(), 1, "never resent");
+    let RouteOutcome::OutcomeUndetermined(text) = &outcome else {
+        panic!("expected OutcomeUndetermined, got {outcome:?}");
+    };
+    assert!(text.contains("some_future_state"));
+    assert!(text.contains("the bot write may have executed; check before retrying"));
+    assert!(text.contains("gh api repos/<owner>/<repo>/issues/<n>/comments"));
+    assert_eq!(
+        super::super::governed_outcome_status(&harness.paths, &binding, TEST_NOW, outcome),
+        OUTCOME_UNKNOWN_EXIT_STATUS
+    );
+}
+
+#[test]
+fn completed_reply_with_inner_result_content_decodes_as_completed() {
+    let mut reply = completed(None);
+    reply["content"] = json!([{"type": "text", "text": reply["result"].to_string()}]);
+    assert_eq!(rendered(reply), "completed\n");
+}
+
+#[test]
 fn outcome_unknown_is_never_resent_and_exits_87() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-outcome", "call-o", "/p");
     let harness = harness(ticket_gated(vec![plexus_refused("outcome_unknown")]));
@@ -781,6 +847,11 @@ fn terminal_setup_and_unknown_codes_are_not_retried() {
         "module_grant_absent",
         "agent_repository_conflict{claimed_agent: a, bound_agent: b}",
         "quota_exhausted_v2",
+        "scope_not_synced",
+        "scope_ended",
+        "delegation_withdrawn",
+        "scope_unverifiable",
+        "agent_identity_conflict",
     ] {
         let harness = harness(ticket_gated(vec![plexus_refused(code)]));
         let (status, upstream) = dispatch_comment(&harness, live.value(), "hi");

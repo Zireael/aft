@@ -693,6 +693,21 @@ fn facade_reply_unwraps_a_tool_call_result() {
     assert_eq!(facade_reply(&wrapped), direct);
 }
 
+#[test]
+fn facade_reply_prefers_direct_fields_over_inner_result_content() {
+    let inner = json!({"status": "completed", "result": {"url": "https://example.test/comment"}});
+    let direct = json!({
+        "repo_binding_generation": 1,
+        "result": inner,
+        "content": [{"type": "text", "text": inner.to_string()}],
+    });
+    assert_eq!(facade_reply(&direct), direct);
+    for field in ["result", "error", "repo_binding_generation"] {
+        let value = json!({field: null, "content": [{"text": inner.to_string()}]});
+        assert_eq!(facade_reply(&value), value, "direct {field} must win");
+    }
+}
+
 /// A stamp as the daemon puts it on a head's tool route, owned by
 /// prefrontal-core.
 fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeStamp {
