@@ -2798,9 +2798,11 @@ fn lsp_diagnostics_for(ctx: &AppContext, id: &str, file: &std::path::Path) -> se
     serde_json::to_value(handle_lsp_diagnostics(&req, ctx)).expect("response serializes")
 }
 
-/// The lines of `file` that `lsp_diagnostics` currently reports errors on.
+/// The distinct lines of `file` that `lsp_diagnostics` currently reports
+/// errors on, sorted. A line can carry two errors for one fault: rust-analyzer's
+/// own analysis and rustc's from the `cargo check` result it merges in.
 fn error_lines_for(response: &serde_json::Value) -> Vec<u64> {
-    response["diagnostics"]
+    let mut lines: Vec<u64> = response["diagnostics"]
         .as_array()
         .map(|diagnostics| {
             diagnostics
@@ -2809,7 +2811,10 @@ fn error_lines_for(response: &serde_json::Value) -> Vec<u64> {
                 .filter_map(|diagnostic| diagnostic["line"].as_u64())
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
 }
 
 /// Poll `lsp_diagnostics` until `done` accepts the response or `timeout`
