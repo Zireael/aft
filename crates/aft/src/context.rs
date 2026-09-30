@@ -2878,6 +2878,13 @@ pub struct AppContext {
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// Watcher changes waiting for the LSP manager lock. `Some` while the one
+    /// helper thread that forwards them exists; drains that find the lock
+    /// busy merge into it instead of starting threads of their own (see
+    /// [`Self::lsp_forward_or_queue_watcher_changes`]).
+    lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
+    /// How many of those helper threads were started, for tests.
+    lsp_watcher_forward_helpers_spawned: AtomicUsize,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
     /// teardown. Already-admitted workers use it to decide whether their disk
@@ -3375,6 +3382,8 @@ impl AppContext {
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
+            lsp_watcher_forward_slot: Default::default(),
+            lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle: SubcLifecycleAdmission::default(),
@@ -9175,14 +9184,7 @@ impl AppContext {
         if paths.is_empty() {
             return;
         }
-        let events: Vec<(PathBuf, FileChangeType)> = paths
-            .iter()
-            .map(|path| (path.clone(), Self::change_type_from_current_state(path)))
-            .collect();
-        let markers = self.custom_lsp_root_markers();
-        self.with_lsp_manager_off_drain("aft-lsp-watched-files", move |lsp| {
-            lsp.forward_watcher_file_events(&events, &markers)
-        });
+        self.lsp_forward_or_queue_watcher_changes(paths, false);
     }
 
     /// After the file watcher lost events (an overflow that needs a rescan),
@@ -9192,55 +9194,79 @@ impl AppContext {
     /// them more than a missed notification for files AFT resyncs when it
     /// next opens or edits them.
     pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
-        self.with_lsp_manager_off_drain("aft-lsp-watcher-rescan", |lsp| {
-            lsp.rust_server_keys()
-                .into_iter()
-                .map(|key| (key, Vec::new()))
-                .collect()
-        });
+        self.lsp_forward_or_queue_watcher_changes(&[], true);
     }
 
-    /// Run `work` on the LSP manager for the watcher drain, then start the
-    /// rust-analyzer reloads it returns (see
-    /// [`crate::lsp::manager::spawn_watcher_rust_workspace_reload`]).
+    /// Deliver watcher changes to the LSP manager without making the drain
+    /// wait for its lock.
     ///
-    /// The drain must not wait for the manager lock, but dropping the work
-    /// when another thread holds it would leave servers on the old files (and
-    /// rust-analyzer on the old workspace) until some later change. So an
-    /// uncontended lock runs `work` here, and a contended one hands it to a
-    /// helper thread that waits.
-    fn with_lsp_manager_off_drain<F>(&self, thread_name: &str, work: F)
-    where
-        F: FnOnce(&mut LspManager) -> Vec<(crate::lsp::roots::ServerKey, Vec<PathBuf>)>
-            + Send
-            + 'static,
-    {
-        fn run<F>(manager: &Arc<parking_lot::Mutex<LspManager>>, lsp: &mut LspManager, work: F)
-        where
-            F: FnOnce(&mut LspManager) -> Vec<(crate::lsp::roots::ServerKey, Vec<PathBuf>)>,
+    /// An uncontended lock forwards them here. A contended one queues them in
+    /// a single per-context slot served by one helper thread that waits for
+    /// the lock: while that helper exists, later drains merge into its slot
+    /// (deduplicated and capped, see [`crate::lsp::manager::WatcherForwardBacklog`])
+    /// and start nothing. Dropping the changes instead would leave servers
+    /// on the old files (and rust-analyzer on the old workspace) until some
+    /// later change; a thread per contended drain would pile up without
+    /// bound while the lock stays held, for example during a server start.
+    fn lsp_forward_or_queue_watcher_changes(&self, paths: &[PathBuf], reload_all_rust: bool) {
+        use crate::lsp::manager::WatcherForwardBacklog;
+        let markers = self.custom_lsp_root_markers();
         {
-            for (key, manifests) in work(lsp) {
-                crate::lsp::manager::spawn_watcher_rust_workspace_reload(
-                    Arc::clone(manager),
-                    key,
-                    manifests,
-                );
+            // A queued backlog goes first, so newer changes join it rather
+            // than overtake it on the fast path.
+            let mut slot = self.lsp_watcher_forward_slot.lock();
+            if let Some(backlog) = slot.as_mut() {
+                backlog.merge(paths, reload_all_rust, markers);
+                return;
             }
         }
         if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            run(&self.lsp_manager, &mut lsp, work);
+            let mut backlog = WatcherForwardBacklog::default();
+            backlog.merge(paths, reload_all_rust, markers);
+            let reloads = backlog.apply(&mut lsp);
+            drop(lsp);
+            crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
             return;
         }
-        let manager = Arc::clone(&self.lsp_manager);
-        if let Err(error) = std::thread::Builder::new()
-            .name(thread_name.to_string())
-            .spawn(move || {
-                let mut lsp = manager.lock();
-                run(&manager, &mut lsp, work);
-            })
-        {
-            crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
+        let mut slot = self.lsp_watcher_forward_slot.lock();
+        if let Some(backlog) = slot.as_mut() {
+            backlog.merge(paths, reload_all_rust, markers);
+            return;
         }
+        let mut backlog = WatcherForwardBacklog::default();
+        backlog.merge(paths, reload_all_rust, markers);
+        *slot = Some(backlog);
+        drop(slot);
+        let manager = Arc::clone(&self.lsp_manager);
+        let forward_slot = Arc::clone(&self.lsp_watcher_forward_slot);
+        match std::thread::Builder::new()
+            .name("aft-lsp-watched-files".into())
+            .spawn(move || crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot))
+        {
+            Ok(_) => {
+                self.lsp_watcher_forward_helpers_spawned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                // Free the slot so a later drain can try again.
+                self.lsp_watcher_forward_slot.lock().take();
+                crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
+            }
+        }
+    }
+
+    /// How many helper threads have waited for the LSP manager lock on behalf
+    /// of contended watcher drains.
+    #[doc(hidden)]
+    pub fn lsp_watcher_forward_helpers_spawned_for_test(&self) -> usize {
+        self.lsp_watcher_forward_helpers_spawned
+            .load(Ordering::Relaxed)
+    }
+
+    /// Whether watcher changes are still queued for the LSP manager.
+    #[doc(hidden)]
+    pub fn lsp_watcher_forward_pending_for_test(&self) -> bool {
+        self.lsp_watcher_forward_slot.lock().is_some()
     }
 
     /// Drop cached LSP diagnostics for a deleted/renamed-away file so its

@@ -15,7 +15,7 @@ use aft::context::AppContext;
 use aft::lsp::child_registry::LspChildRegistry;
 use aft::lsp::client::{LspClient, LspEvent};
 use aft::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
-use aft::lsp::manager::{LspManager, WATCHED_FILE_FORWARD_CAP};
+use aft::lsp::manager::{LspManager, WATCHED_FILE_FORWARD_CAP, WATCHER_FORWARD_BACKLOG_CAP};
 use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, ServerKind};
 use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
@@ -3220,5 +3220,79 @@ fn watcher_manifest_change_forwarded_to_registered_glob_does_not_reload() {
     assert!(
         !saw_workspace_reload(&ctx, Duration::from_millis(1500)),
         "rust-analyzer re-reads a lockfile it registered for; a reload on top would repeat the load"
+    );
+}
+
+/// Wait until the helper serving contended watcher drains has forwarded
+/// everything queued and exited.
+fn wait_for_watcher_forward_helper(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ctx.lsp_watcher_forward_pending_for_test() {
+        assert!(
+            Instant::now() < deadline,
+            "the watcher forward helper never finished"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn contended_watcher_drains_share_one_helper_and_one_merged_forward() {
+    let (_temp_dir, root, file, ctx, _watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
+    {
+        // Holding the manager lock makes every drain below find it busy.
+        let _held = ctx.lsp();
+        for batch in 0..20usize {
+            // Each batch repeats the previous batch's path, so the merge
+            // must also deduplicate.
+            let paths = vec![
+                root.join(format!("src/batch_{batch}.rs")),
+                root.join(format!("src/batch_{}.rs", batch.saturating_sub(1))),
+            ];
+            ctx.lsp_forward_watcher_file_events(&paths);
+        }
+        assert_eq!(
+            ctx.lsp_watcher_forward_helpers_spawned_for_test(),
+            1,
+            "contended drains share one helper thread"
+        );
+    }
+    wait_for_watcher_forward_helper(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "one merged forward: {watched:?}");
+    let mut expected: Vec<(String, i64)> = (0..20)
+        .map(|batch| (format!("src/batch_{batch}.rs"), 3))
+        .collect();
+    expected.sort();
+    assert_eq!(forwarded_changes(&root, &watched[0]), expected);
+    assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
+}
+
+#[test]
+fn contended_watcher_drains_past_the_backlog_cap_forward_only_config_files() {
+    let (_temp_dir, root, file, ctx, _watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
+    {
+        let _held = ctx.lsp();
+        let per_batch = WATCHER_FORWARD_BACKLOG_CAP / 2 + 1;
+        for batch in 0..3 {
+            let mut paths: Vec<PathBuf> = (0..per_batch)
+                .map(|index| root.join(format!("src/gen_{batch}_{index}.rs")))
+                .collect();
+            if batch == 0 {
+                paths.push(root.join("Cargo.toml"));
+            }
+            ctx.lsp_forward_watcher_file_events(&paths);
+        }
+        assert_eq!(ctx.lsp_watcher_forward_helpers_spawned_for_test(), 1);
+    }
+    wait_for_watcher_forward_helper(&ctx);
+
+    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    assert_eq!(watched.len(), 1, "{} notifications", watched.len());
+    assert_eq!(
+        forwarded_changes(&root, &watched[0]),
+        vec![("Cargo.toml".to_string(), 2)],
+        "an overflowing backlog keeps only configuration files"
     );
 }

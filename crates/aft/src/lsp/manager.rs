@@ -5118,6 +5118,146 @@ pub fn reload_rust_workspace_if_manifests_changed(
 /// [`LspManager::forward_watcher_file_events`].
 pub const WATCHED_FILE_FORWARD_CAP: usize = 512;
 
+/// How many distinct watcher paths may wait for the LSP manager lock (see
+/// [`WatcherForwardBacklog`]). One drain batch holds at most this many, so
+/// a single contended batch never overflows on its own; each notification
+/// is still bounded per server by [`WATCHED_FILE_FORWARD_CAP`].
+pub const WATCHER_FORWARD_BACKLOG_CAP: usize = 2_048;
+
+/// The per-context slot holding watcher changes queued for the LSP manager.
+/// `Some` exactly while the one helper thread serving it exists.
+pub type WatcherForwardSlot = Arc<parking_lot::Mutex<Option<WatcherForwardBacklog>>>;
+
+/// Watcher changes merged across drains until the LSP manager lock is free.
+///
+/// Paths are deduplicated. Past [`WATCHER_FORWARD_BACKLOG_CAP`] the backlog
+/// follows the same overflow rule as a single oversized forward: only
+/// project configuration files are kept (none if even those overflow), and
+/// every running rust-analyzer gets a manifest-gated reload check in place
+/// of the dropped paths.
+#[derive(Debug, Default)]
+pub struct WatcherForwardBacklog {
+    paths: Vec<PathBuf>,
+    seen: HashSet<PathBuf>,
+    /// Paths were dropped, so rust-analyzer must check its manifests itself.
+    overflowed: bool,
+    /// The watcher lost events; same consequence as `overflowed`.
+    reload_all_rust: bool,
+    extra_config_markers: Vec<String>,
+}
+
+impl WatcherForwardBacklog {
+    /// Add one drain's changes. `extra_config_markers` replaces the previous
+    /// value, so the latest configuration decides what counts as config.
+    pub(crate) fn merge(
+        &mut self,
+        paths: &[PathBuf],
+        reload_all_rust: bool,
+        extra_config_markers: Vec<String>,
+    ) {
+        self.extra_config_markers = extra_config_markers;
+        self.reload_all_rust |= reload_all_rust;
+        for path in paths {
+            if self.overflowed && !self.is_config(path) {
+                continue;
+            }
+            if !self.seen.insert(path.clone()) {
+                continue;
+            }
+            self.paths.push(path.clone());
+            if self.paths.len() > WATCHER_FORWARD_BACKLOG_CAP {
+                self.overflow();
+            }
+        }
+    }
+
+    fn is_config(&self, path: &Path) -> bool {
+        is_config_file_path_with_custom(path, &self.extra_config_markers)
+    }
+
+    fn overflow(&mut self) {
+        self.overflowed = true;
+        let markers = std::mem::take(&mut self.extra_config_markers);
+        self.paths
+            .retain(|path| is_config_file_path_with_custom(path, &markers));
+        self.extra_config_markers = markers;
+        if self.paths.len() > WATCHER_FORWARD_BACKLOG_CAP {
+            self.paths.clear();
+        }
+        self.seen = self.paths.iter().cloned().collect();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty() && !self.overflowed && !self.reload_all_rust
+    }
+
+    /// Forward the backlog (see [`LspManager::forward_watcher_file_events`])
+    /// and return the rust-analyzer reloads to start once the lock is
+    /// released. Change kinds are read from disk now, not when queued, so a
+    /// file created and deleted while waiting is reported as deleted.
+    pub(crate) fn apply(self, lsp: &mut LspManager) -> Vec<(ServerKey, Vec<PathBuf>)> {
+        let events: Vec<(PathBuf, FileChangeType)> = self
+            .paths
+            .into_iter()
+            .map(|path| {
+                let typ = if path.exists() {
+                    FileChangeType::CHANGED
+                } else {
+                    FileChangeType::DELETED
+                };
+                (path, typ)
+            })
+            .collect();
+        let mut reloads = lsp.forward_watcher_file_events(&events, &self.extra_config_markers);
+        if self.overflowed || self.reload_all_rust {
+            for key in lsp.rust_server_keys() {
+                if !reloads.iter().any(|(known, _)| known == &key) {
+                    reloads.push((key, Vec::new()));
+                }
+            }
+        }
+        reloads
+    }
+}
+
+/// Body of the one helper thread serving a [`WatcherForwardSlot`]: wait for
+/// the manager lock, forward everything queued, and repeat while drains
+/// queued more meanwhile. Clearing the slot under its lock when nothing is
+/// left is what lets the next contended drain start a new helper, so no
+/// change is stranded and at most one helper exists at a time.
+pub(crate) fn run_watcher_forward_helper(
+    manager: &Arc<parking_lot::Mutex<LspManager>>,
+    slot: &WatcherForwardSlot,
+) {
+    loop {
+        let mut lsp = manager.lock();
+        let backlog = {
+            let mut guard = slot.lock();
+            let Some(backlog) = guard.as_mut() else {
+                return;
+            };
+            if backlog.is_empty() {
+                *guard = None;
+                return;
+            }
+            std::mem::take(backlog)
+        };
+        let reloads = backlog.apply(&mut lsp);
+        drop(lsp);
+        spawn_watcher_rust_workspace_reloads(manager, reloads);
+    }
+}
+
+/// Start [`spawn_watcher_rust_workspace_reload`] for each returned server.
+pub(crate) fn spawn_watcher_rust_workspace_reloads(
+    manager: &Arc<parking_lot::Mutex<LspManager>>,
+    reloads: Vec<(ServerKey, Vec<PathBuf>)>,
+) {
+    for (key, manifests) in reloads {
+        spawn_watcher_rust_workspace_reload(Arc::clone(manager), key, manifests);
+    }
+}
+
 /// How long a watcher-started rust-analyzer reload waits before checking the
 /// manifests, so the several files one `cargo` command or checkout writes
 /// lead to one reload rather than one per file.
