@@ -1,16 +1,14 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "lsp-forward-once",
     "gh-shim-undetermined",
     "database-open-thread"
   ],
-  "note": "LSP watched-file forwarding once per drain phase, gh shim outcome-undetermined for unreadable post-send replies, and aft.db opened on its own thread after bind. No aft_search ranking file is touched."
+  "note": "lib.rs only gains the new database_open module declaration; LSP watched-file forwarding, gh shim outcome-undetermined replies and the aft.db open thread change no ranking code, so ranked rows must stay byte-identical."
 }
