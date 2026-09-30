@@ -134,9 +134,9 @@ htmd = "0.5.4"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-subc-protocol = "=0.26.0"
-subc-transport = "=0.8.0"
-subc-client-rs = "=0.23.0"
+subc-protocol = "=0.27.0"
+subc-transport = "=0.8.1"
+subc-client-rs = "=0.23.1"
 # The one reader of the daemon's launch nonce (pipe first, environment copy
 # second). subc-client-rs reads through the same cached accessor, so this pin
 # must match the version subc-client-rs depends on.

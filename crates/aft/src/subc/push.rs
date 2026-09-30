@@ -1147,6 +1147,7 @@ mod tests {
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
                 disabled_tools: Arc::default(),
+                scope: None,
             })),
         );
         let mut root_channels = HashMap::new();

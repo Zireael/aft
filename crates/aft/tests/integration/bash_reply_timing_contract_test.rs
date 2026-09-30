@@ -904,6 +904,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         stream,

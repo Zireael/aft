@@ -1003,6 +1003,12 @@ struct RouteIdentityData {
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
     disabled_tools: Arc<Vec<String>>,
+    /// The scope the daemon stamped on this route at bind (`None` for a route
+    /// opened without one, or by a daemon that predates scopes). Kept with the
+    /// route so that ending a scope can later end the work started under it;
+    /// nothing reads it yet.
+    #[allow(dead_code)]
+    scope: Option<subc_protocol::scope::ScopeStamp>,
 }
 
 impl Deref for RouteIdentity {
@@ -5571,6 +5577,7 @@ async fn handle_control_request(
             principal,
             consumer_capabilities,
             admission_facts: _,
+            scope,
         } => {
             let route_id = route_key(route_channel, epoch);
             if epoch == 0 {
@@ -5844,6 +5851,7 @@ async fn handle_control_request(
                 },
                 consumer_elicitation_capable,
                 disabled_tools: bind_disabled_tools,
+                scope,
             }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -6553,6 +6561,7 @@ async fn handle_tool_call(
                 edit_slot_survives: None,
                 preview: false,
                 call_key: None,
+                schema_pin: None,
             })
         }
     };
@@ -6634,13 +6643,13 @@ async fn handle_tool_call(
     let RouteRequest::ToolCall(call) = route_request else {
         unreachable!("background event subscription returned above")
     };
-    if let Some(error) = call
-        .call_key
-        .as_deref()
-        .and_then(|key| subc_protocol::tool_call::validate_call_key(key).err())
-    {
-        let refusal = call_key_refusal_frame(&frame, &error)?;
-        return send_reliable_writer_frame(tx, metrics, refusal, "call_key refusal").await;
+    if let Err(error) = validate_opaque_call_fields(&call) {
+        let refusal = opaque_field_refusal_frame(&frame, &error)?;
+        return send_reliable_writer_frame(tx, metrics, refusal, "invalid_request refusal").await;
+    }
+    if let Some(pin) = call.schema_pin.as_deref() {
+        // Recorded only: pinning a call to a catalog version is not built yet.
+        log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
     let bare_name = call.name;
@@ -7694,8 +7703,8 @@ enum BgEventsOp {
 /// This is AFT's own type rather than `subc_protocol::tool_call::ToolCallRequest`
 /// because the AFT plugins also send `edit_slot_survives` and `preview`, which
 /// the shared type has no fields for; decoding into it would silently drop
-/// both. The members the two share (`name`, `arguments`, `call_key`) keep the
-/// shared type's wire names.
+/// both. The members the two share (`name`, `arguments`, `call_key`,
+/// `schema_pin`) keep the shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
     name: String,
@@ -7717,14 +7726,34 @@ struct ToolCallRequest {
     /// in which case the task id AFT mints stands in for it.
     #[serde(default)]
     call_key: Option<String>,
+    /// The catalog version the consumer built this call against. Checked with
+    /// the same shape validator as `call_key` and otherwise not acted on yet:
+    /// refusing a call whose pin no longer matches the catalog comes later.
+    #[serde(default)]
+    schema_pin: Option<String>,
 }
 
-/// The error frame for a tool call whose `call_key` fails subc-protocol's
-/// shape check: `invalid_request`, with the refused field named in `detail`
-/// so the consumer can tell its key, not the tool arguments, was at fault.
-fn call_key_refusal_frame(
+/// Check the consumer-chosen opaque tokens on a call (`call_key`,
+/// `schema_pin`) with subc-protocol's shared validator, before anything runs.
+fn validate_opaque_call_fields(
+    call: &ToolCallRequest,
+) -> Result<(), subc_protocol::tool_call::OpaqueFieldError> {
+    if let Some(key) = call.call_key.as_deref() {
+        subc_protocol::tool_call::validate_call_key(key)?;
+    }
+    if let Some(pin) = call.schema_pin.as_deref() {
+        subc_protocol::tool_call::validate_schema_pin(pin)?;
+    }
+    Ok(())
+}
+
+/// The error frame for a tool call whose `call_key` or `schema_pin` fails
+/// subc-protocol's shape check: `invalid_request`, with the refused field
+/// named in `detail` so the consumer can tell which of its own tokens, not
+/// the tool arguments, was at fault.
+fn opaque_field_refusal_frame(
     frame: &Frame,
-    error: &subc_protocol::tool_call::CallKeyError,
+    error: &subc_protocol::tool_call::OpaqueFieldError,
 ) -> Result<Frame, SubcError> {
     build_error_frame_with_detail(
         frame.header.ver,
@@ -8855,6 +8884,7 @@ pub(crate) mod test_support {
             },
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            scope: None,
         }))
     }
 
@@ -8892,6 +8922,57 @@ mod tests {
     };
     use super::*;
     use crate::bash_background::BgTaskStatus;
+
+    /// `call_key` and `schema_pin` decode from the request body and are held
+    /// to subc-protocol's shape; a refusal names the field that failed.
+    #[test]
+    fn tool_call_decodes_and_validates_call_key_and_schema_pin() {
+        let call: ToolCallRequest = serde_json::from_value(json!({
+            "name": "read",
+            "arguments": {},
+            "call_key": "run-7:call-3",
+            "schema_pin": "catalog:v3",
+        }))
+        .expect("decode tool call");
+        assert_eq!(call.call_key.as_deref(), Some("run-7:call-3"));
+        assert_eq!(call.schema_pin.as_deref(), Some("catalog:v3"));
+        assert!(validate_opaque_call_fields(&call).is_ok());
+
+        let request_frame = Frame::build(
+            FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+            1,
+            1,
+            7,
+            Vec::new(),
+        )
+        .expect("request frame");
+        for (body, field) in [
+            (
+                json!({ "name": "read", "call_key": "has space" }),
+                "call_key",
+            ),
+            (json!({ "name": "read", "schema_pin": "" }), "schema_pin"),
+            (
+                json!({ "name": "read", "call_key": "ok", "schema_pin": "pin\u{7f}" }),
+                "schema_pin",
+            ),
+            (
+                json!({ "name": "read", "schema_pin": "p".repeat(257) }),
+                "schema_pin",
+            ),
+        ] {
+            let call: ToolCallRequest = serde_json::from_value(body.clone()).expect("decode");
+            let error = validate_opaque_call_fields(&call).expect_err("malformed token");
+            assert_eq!(error.field(), field, "{body}");
+            let refusal = opaque_field_refusal_frame(&request_frame, &error).expect("frame");
+            assert_eq!(refusal.header.ty, FrameType::Error);
+            assert_eq!(refusal.header.corr, 7);
+            let error_body: ErrorBody = serde_json::from_slice(&refusal.body).expect("body");
+            assert_eq!(error_body.code, "invalid_request");
+            assert_eq!(error_body.detail, Some(json!({ "field": field })), "{body}");
+        }
+    }
 
     /// Only a daemon-requested stop may exit 0. The supervisor never respawns
     /// a clean exit, so a fatal-actor teardown that mapped to Ok(()) left the
@@ -9099,6 +9180,7 @@ mod tests {
                 principal: Some(subc_protocol::Principal::Direct),
                 consumer_capabilities: None,
                 admission_facts: Default::default(),
+                scope: None,
             };
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,
@@ -11999,6 +12081,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            scope: None,
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);
         let completion = RouteBindCompletion {
@@ -12081,6 +12164,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            scope: None,
         }));
         let completion = RouteBindCompletion {
             route,

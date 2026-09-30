@@ -102,6 +102,7 @@ async fn bind(
             consumer_capabilities: None,
             principal: Some(Principal::Direct),
             admission_facts: Default::default(),
+            scope: None,
         })
         .unwrap(),
         out,

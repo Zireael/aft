@@ -3380,6 +3380,7 @@ async fn drive_s1_rejection_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         &mut stream,
@@ -3640,6 +3641,7 @@ async fn drive_readiness_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         &mut stream,
@@ -4480,8 +4482,8 @@ async fn drive_bash_background_daemon(input: FakeDaemonInput) {
 
 /// A consumer's `call_key` is recorded on the bash task it starts, keyed by
 /// the route's principal; a call without one records the minted task id; and
-/// a key outside subc-protocol's shape is refused before anything runs, with
-/// the field named.
+/// a `call_key` or `schema_pin` outside subc-protocol's shape is refused
+/// before anything runs, with the field named.
 async fn drive_bash_call_key_daemon(input: FakeDaemonInput) {
     use aft::bash_background::TaskCallKey;
 
@@ -4602,6 +4604,55 @@ async fn drive_bash_call_key_daemon(input: FakeDaemonInput) {
         );
     }
 
+    // A well-formed schema_pin is accepted (and not acted on yet); a
+    // malformed one is refused with its own field named.
+    send_tool_call_with_tokens(
+        &mut stream,
+        1,
+        140,
+        "bash",
+        background("printf pinned"),
+        None,
+        Some("catalog:v3"),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "pinned bash response").await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "a well-formed pin is accepted"
+    );
+    assert!(!tool_result_is_error(&frame));
+    for (corr, malformed) in [(141, ""), (142, "pin with space")] {
+        send_tool_call_with_tokens(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            background("printf must-not-run"),
+            Some("well-formed-key"),
+            Some(malformed),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "malformed schema_pin refusal").await;
+        assert_eq!(frame.header.corr, corr);
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "schema_pin {malformed:?}"
+        );
+        let body: ErrorBody = serde_json::from_slice(&frame.body).expect("error body");
+        assert_eq!(body.code, "invalid_request");
+        assert_eq!(body.detail, Some(json!({ "field": "schema_pin" })));
+    }
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    assert_eq!(
+        ctx.bash_background()
+            .task_id_for_call_key("direct", "well-formed-key"),
+        None,
+        "a call refused for its pin starts no task"
+    );
+
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -4613,9 +4664,24 @@ async fn send_tool_call_with_call_key(
     arguments: Value,
     call_key: Option<&str>,
 ) {
+    send_tool_call_with_tokens(stream, channel, corr, name, arguments, call_key, None).await;
+}
+
+async fn send_tool_call_with_tokens(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    call_key: Option<&str>,
+    schema_pin: Option<&str>,
+) {
     let mut body = json!({ "name": name, "arguments": arguments });
     if let Some(call_key) = call_key {
         body["call_key"] = json!(call_key);
+    }
+    if let Some(schema_pin) = schema_pin {
+        body["schema_pin"] = json!(schema_pin);
     }
     send_frame(
         stream,
@@ -9142,6 +9208,7 @@ async fn send_route_bind_with_elicitation_capability(
         principal: Some(subc_mcp_principal()),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         stream,
@@ -10111,6 +10178,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         &mut stream,
@@ -11748,6 +11816,7 @@ async fn send_management_route_bind_with_harness(
             principal,
             consumer_capabilities: None,
             admission_facts: Default::default(),
+            scope: None,
         },
     )
     .await;
@@ -11959,6 +12028,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         principal,
         consumer_capabilities,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         stream,

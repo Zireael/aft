@@ -799,6 +799,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
     };
     send_frame(
         stream,

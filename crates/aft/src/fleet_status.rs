@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{
-    CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerOptions, PushEvent,
-    RouteHandle, SubcConsumer,
+    CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerOptions, ControlPush,
+    PushEvent, RouteCloseReason, RouteHandle, SubcConsumer,
 };
 use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
@@ -435,6 +435,8 @@ trait StatusConsumer {
     type Route;
 
     fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static);
+    /// The daemon's channel-0 control pushes (`route.closing`, `route.closed`).
+    fn control_pushes(&self) -> mpsc::Receiver<ControlPush>;
     async fn catalog_list(&self) -> Result<CatalogList, String>;
     async fn open_route(
         &self,
@@ -451,6 +453,10 @@ impl StatusConsumer for SubcConsumer {
 
     fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
         SubcConsumer::on_connection_state(self, cb);
+    }
+
+    fn control_pushes(&self) -> mpsc::Receiver<ControlPush> {
+        SubcConsumer::control_pushes(self, CONTROL_PUSH_CAPACITY)
     }
 
     async fn catalog_list(&self) -> Result<CatalogList, String> {
@@ -507,6 +513,11 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         connection_state_client.set_route_live(false);
         let _ = connection_state_tx.send(state);
     });
+    let mut control_pushes = Some(consumer.control_pushes());
+    // Set when the daemon closed the holder's routes for a reason that forbids
+    // reopening them (see `close_forbids_reopen`). Cleared when the connection
+    // is restored, since a new daemon connection starts a new route history.
+    let mut reopen_forbidden: Option<String> = None;
 
     let mut route: Option<C::Route> = None;
     let mut route_events = None;
@@ -516,7 +527,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         if tokio::time::Instant::now() >= next_discovery_at {
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
-                    if route.is_none() {
+                    if route.is_none() && reopen_forbidden.is_none() {
                         // `BindIdentity::new` leaves the registered project id
                         // unset: the dial has no resolved id to send.
                         let identity = BindIdentity::new(
@@ -623,13 +634,34 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             }
             maybe_state = connection_state_rx.recv() => {
                 match maybe_state {
-                    Some(ConnectionState::Dropped | ConnectionState::Restored { .. }) => {
+                    Some(state @ (ConnectionState::Dropped | ConnectionState::Restored { .. })) => {
+                        if matches!(state, ConnectionState::Restored { .. }) {
+                            reopen_forbidden = None;
+                        }
                         route = None;
                         route_events = None;
                         client.set_route_live(false);
                         next_discovery_at = tokio::time::Instant::now();
                     }
                     None => {}
+                }
+            }
+            maybe_push = async {
+                control_pushes
+                    .as_mut()
+                    .expect("control push receiver guarded by select condition")
+                    .recv()
+                    .await
+            }, if control_pushes.is_some() => {
+                match maybe_push {
+                    Some(push) => {
+                        if record_forbidden_reopen(&push, &mut reopen_forbidden) {
+                            route = None;
+                            route_events = None;
+                            client.set_route_live(false);
+                        }
+                    }
+                    None => control_pushes = None,
                 }
             }
             maybe_event = async {
@@ -640,6 +672,14 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     .await
             }, if route_events.is_some() => {
                 if maybe_event.is_none() {
+                    // The daemon sends `route.closed` before it ends the route,
+                    // so its reason is already queued: read it before deciding
+                    // whether the next discovery may reopen.
+                    if let Some(receiver) = control_pushes.as_mut() {
+                        while let Ok(push) = receiver.try_recv() {
+                            record_forbidden_reopen(&push, &mut reopen_forbidden);
+                        }
+                    }
                     route = None;
                     route_events = None;
                     client.set_route_live(false);
@@ -690,6 +730,46 @@ fn catalog_advertises_status_line(entries: &[subc_client_rs::CatalogEntry]) -> b
             )
         })
     })
+}
+
+/// Room for the daemon's control pushes between two turns of the dial loop.
+/// They are rare (one per route close), and a full queue only drops advisory
+/// pushes, so a small bound is enough.
+const CONTROL_PUSH_CAPACITY: usize = 16;
+
+/// Whether a route-close reason forbids reopening the route. A scope close
+/// (`scope_ended`, `scope_carrier_removed`, `scope_delegation_changed`,
+/// `scope_parent_ended`) means the work the route belonged to is over, and a
+/// reason this build does not know may mean the same, so neither may bring the
+/// route back. The reasons the dial already handled (reload, restart, crash,
+/// disable, capability_denied) keep their behaviour: the next discovery reopens
+/// when the holder is advertised again.
+fn close_forbids_reopen(reason: &str) -> bool {
+    reason.starts_with("scope_")
+        || matches!(
+            RouteCloseReason::from_wire(reason),
+            RouteCloseReason::Unknown(_)
+        )
+}
+
+/// Note a `route.closed` / `route.closing` push for the status holder whose
+/// reason forbids reopening. Returns true when it did.
+fn record_forbidden_reopen(push: &ControlPush, reopen_forbidden: &mut Option<String>) -> bool {
+    if push.body.get("module_id").and_then(Value::as_str) != Some(STATUS_HOLDER_MODULE) {
+        return false;
+    }
+    let Some(reason) = push
+        .route_close_reason()
+        .and_then(|_| push.body.get("reason").and_then(Value::as_str))
+    else {
+        return false;
+    };
+    if !close_forbids_reopen(reason) {
+        return false;
+    }
+    log::info!("fleet status dial: holder route closed ({reason}); not reopening it");
+    *reopen_forbidden = Some(reason.to_owned());
+    true
 }
 
 fn next_discovery_backoff(current: Duration) -> Duration {
@@ -775,7 +855,8 @@ mod tests {
         attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
         succeeds_on: Option<usize>,
         connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
-        push_sender: parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>,
+        push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
+        control_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<ControlPush>>>>,
     }
 
     impl StatusConsumer for RejectingConsumer {
@@ -783,6 +864,12 @@ mod tests {
 
         fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
             *self.connection_callback.lock() = Some(Box::new(cb));
+        }
+
+        fn control_pushes(&self) -> mpsc::Receiver<ControlPush> {
+            let (tx, rx) = mpsc::channel(CONTROL_PUSH_CAPACITY);
+            *self.control_sender.lock() = Some(tx);
+            rx
         }
 
         async fn catalog_list(&self) -> Result<CatalogList, String> {
@@ -842,7 +929,8 @@ mod tests {
             attempts: attempts.clone(),
             succeeds_on,
             connection_callback: callback.clone(),
-            push_sender: parking_lot::Mutex::new(None),
+            push_sender: Arc::default(),
+            control_sender: Arc::default(),
         };
         let task = tokio::spawn(run_connected_status_dial(
             consumer,
@@ -853,6 +941,82 @@ mod tests {
         ));
         tokio::task::yield_now().await;
         (task, attempts, callback)
+    }
+
+    /// Opens the holder route, has the daemon close it for `reason` (the
+    /// `route.closed` push, then the end of the route), lets several discovery
+    /// cadences pass, and returns how many route opens the dial made.
+    async fn route_opens_after_holder_close(reason: &str) -> usize {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+        let first_request = wire_rx.try_recv().expect("first discovery request");
+        let identity = FleetRouteIdentity::from(&first_request);
+        // Answered here rather than handed to the dial: the test consumer
+        // fails every publish, and a failed publish drops the route itself.
+        first_request.complete_unavailable();
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let push_sender = Arc::new(parking_lot::Mutex::new(None));
+        let control_sender = Arc::new(parking_lot::Mutex::new(None));
+        let consumer = RejectingConsumer {
+            attempts: attempts.clone(),
+            succeeds_on: Some(1),
+            connection_callback: Arc::default(),
+            push_sender: push_sender.clone(),
+            control_sender: control_sender.clone(),
+        };
+        let task = tokio::spawn(run_connected_status_dial(
+            consumer, client, wire_rx, identity, None,
+        ));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts.lock().len(), 1, "the holder route opened");
+
+        let push = ControlPush {
+            op: "route.closed".to_owned(),
+            body: json!({
+                "op": "route.closed",
+                "module_id": STATUS_HOLDER_MODULE,
+                "reason": reason,
+            }),
+        };
+        control_sender
+            .lock()
+            .as_ref()
+            .expect("dial registered for control pushes")
+            .try_send(push)
+            .expect("queue route.closed");
+        push_sender.lock().take();
+        for _ in 0..3 {
+            tokio::time::advance(STATUS_CADENCE).await;
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+        }
+        task.abort();
+        let opens = attempts.lock().len();
+        opens
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_and_unknown_route_closes_never_reopen_the_holder_route() {
+        for reason in [
+            "scope_ended",
+            "scope_carrier_removed",
+            "scope_delegation_changed",
+            "scope_parent_ended",
+            "a_reason_from_a_newer_daemon",
+        ] {
+            assert_eq!(
+                route_opens_after_holder_close(reason).await,
+                1,
+                "a {reason} close must not reopen the route"
+            );
+        }
+        assert!(
+            route_opens_after_holder_close("reload").await > 1,
+            "a reload close still reopens on the next discovery"
+        );
     }
 
     async fn advance_and_observe(
