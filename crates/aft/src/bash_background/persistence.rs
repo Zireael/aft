@@ -531,6 +531,10 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
+    /// Who started the task and the key they gave the call. Absent on records
+    /// written before AFT recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_key: Option<super::TaskCallKey>,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -563,6 +567,7 @@ impl PersistedTask {
         notify_on_completion: bool,
         compressed: bool,
     ) -> Self {
+        let call_key = Some(super::call_key_for_new_task(&task_id));
         Self {
             schema_version: SCHEMA_VERSION,
             harness: super::route_harness().map(|harness| harness.storage_segment()),
@@ -593,6 +598,7 @@ impl PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            call_key,
         }
     }
 
@@ -712,6 +718,7 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            call_key: None,
         }
     }
 }

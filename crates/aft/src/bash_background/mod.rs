@@ -30,6 +30,70 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
+/// Who started a background task and the key they gave the call, recorded on
+/// the task so a consumer can find the task its own call started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCallKey {
+    /// The principal of the route the call arrived on (`direct`,
+    /// `reserved:<module>`, `unverified`, or `absent`), or `first-party` for
+    /// a call with no subc route (standalone mode).
+    pub requester: String,
+    /// The consumer's `call_key`, or the task id when it sent none.
+    pub key: String,
+    /// True when the consumer sent no key and the task id AFT minted stands
+    /// in for it, so a reader can tell a fallback from a key the consumer chose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minted: bool,
+}
+
+thread_local! {
+    /// The `call_key` of the tool call whose dispatch is running on this
+    /// thread. Installed around the dispatch like the authenticated principal
+    /// (see [`with_call_key`]), because the bash handler that creates the task
+    /// only sees the tool's own arguments, which the agent controls.
+    static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `call_key` as the current call's key, restoring the
+/// previous one afterwards, even if `run` panics.
+pub(crate) fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_CALL_KEY.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_CALL_KEY.with(|slot| slot.replace(call_key));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// The requester and key to record on a task being created now: the
+/// consumer's key when the call carried one, otherwise the task id.
+pub(crate) fn call_key_for_new_task(task_id: &str) -> TaskCallKey {
+    let requester = match current_authenticated_principal() {
+        crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => "first-party".to_string(),
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+            principal_id.unwrap_or_else(|| "absent".to_string())
+        }
+    };
+    match CURRENT_CALL_KEY.with(|slot| slot.borrow().clone()) {
+        Some(key) => TaskCallKey {
+            requester,
+            key,
+            minted: false,
+        },
+        None => TaskCallKey {
+            requester,
+            key: task_id.to_string(),
+            minted: true,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BashShell {

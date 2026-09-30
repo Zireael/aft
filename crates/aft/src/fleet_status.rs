@@ -464,9 +464,17 @@ impl StatusConsumer for SubcConsumer {
         target: RouteTarget,
         identity: BindIdentity,
     ) -> Result<Self::Route, String> {
-        SubcConsumer::open_route(self, target, identity, CallOptions::default())
-            .await
-            .map_err(|error| error.to_string())
+        SubcConsumer::open_route(
+            self,
+            target,
+            identity,
+            CallOptions {
+                consumer_identity: crate::launch_nonce::consumer_identity(),
+                ..CallOptions::default()
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 
     fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String> {
@@ -669,11 +677,7 @@ fn complete_status_publish_call(request: StatusWireRequest, body: &[u8]) -> bool
 }
 
 fn consumer_identity_is_available() -> bool {
-    ["SUBC_MODULE_ID", "SUBC_LAUNCH_NONCE"].iter().all(|key| {
-        std::env::var(key)
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    })
+    crate::launch_nonce::consumer_identity().is_some()
 }
 
 fn catalog_advertises_status_line(entries: &[subc_client_rs::CatalogEntry]) -> bool {
@@ -748,6 +752,7 @@ mod tests {
         subc_client_rs::CatalogEntry {
             module_id: module_id.to_string(),
             ready: true,
+            not_ready: None,
             module_version: None,
             roles: vec![ProviderRole::ManagementSurface {
                 operations: vec![ManagementOperation {

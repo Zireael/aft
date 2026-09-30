@@ -560,6 +560,7 @@ async fn serve_connection(
                         subc_ops: Vec::new(),
                         subc_capabilities: Vec::new(),
                         storage: None,
+                        machine_id: None,
                     })
                     .expect("hello ack body"),
                 )

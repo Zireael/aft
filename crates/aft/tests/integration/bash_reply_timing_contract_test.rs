@@ -865,6 +865,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )

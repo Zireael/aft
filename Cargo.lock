@@ -82,6 +82,7 @@ dependencies = [
  "similar",
  "streaming-iterator",
  "subc-client-rs",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "tempfile",
@@ -3500,14 +3501,15 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-client-rs"
-version = "0.15.6"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aa79ec4dc0a94661bd4988bbdf79a066d3d4fb5c7e1e6f6fcdadeb64753b8cb"
+checksum = "8100549e292dcf672c91695897ded2c618edf370af1d5ed33c23db2a99640980"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
  "subc-control",
+ "subc-os",
  "subc-protocol",
  "subc-transport",
  "tokio",
@@ -3516,9 +3518,9 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.16.2"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29c84f842c4629c1ef87bcac7c0283212d0573ad7572a9fca09b86f278e3e81e"
+checksum = "20d30ba73332abc412959d2d6de1e4f74356fba73a1f9a824272a6f64e8974ba"
 dependencies = [
  "serde",
  "serde_json",
@@ -3526,10 +3528,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "subc-protocol"
-version = "0.23.0"
+name = "subc-os"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5697ab8006351dcc9978d6c79c95bd197d497fcfdead3626d61a3cede8080336"
+checksum = "40337d37994eb5dc7d1e7c9bf4f40911d013db1ea0555b7c2a91d402609b96b3"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
+name = "subc-protocol"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de90f0ad3cf5b6d37ae099148744b7efd35c3da1bfaba41fc241b61699b3e86"
 dependencies = [
  "serde",
  "serde_json",
@@ -3537,9 +3549,9 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.7.2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f08b2deee871c0b4ff21fb7245689fbf2e02dfbf7482dbe3378959ac1617c1"
+checksum = "8a82578c4bc804d8846539350a9a0f55ff051d8b0e693d93ded6bbc6463c003e"
 dependencies = [
  "getrandom 0.2.17",
  "hmac",

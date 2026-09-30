@@ -102,6 +102,7 @@ pub mod inspect;
 pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
+pub mod launch_nonce;
 pub mod legacy_partitions;
 pub(crate) mod lifecycle_census;
 pub mod list_envelope;

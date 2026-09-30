@@ -73,6 +73,17 @@ fn exit_after_log_flush(code: i32) -> i32 {
 }
 
 fn main() {
+    // The subc daemon hands a supervised module its launch nonce through an
+    // inherited pipe (and, for now, an environment copy). Take it before
+    // anything else can run: this is the only moment the process has one
+    // thread and no children, so the pipe is read and closed and both
+    // variables are removed before any child (the login-shell PATH probe
+    // below included) could inherit them. Standalone mode has no nonce and
+    // never touches the descriptor.
+    if parse_subc_arg(std::env::args_os().skip(1)).is_some() {
+        aft::launch_nonce::capture_at_startup();
+    }
+
     // Record ORT_DYLIB_PATH as the spawner passed it, before anything in this
     // process can export its own value: only a spawn-time value is an operator
     // override of the ONNX Runtime library pin.
@@ -238,6 +249,7 @@ fn main() {
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
     if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
         aft::slog_info!("subc mode, pid {}", std::process::id());
+        aft::launch_nonce::log_capture_outcome();
         // The supervised module holds the secret it authenticates to the
         // daemon with, so it loads only an ONNX Runtime it could hash first
         // (see ort_pin), never one found by bare name on the loader search path.

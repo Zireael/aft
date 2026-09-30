@@ -324,10 +324,11 @@ pub fn is_tool_call_admitted_for_test(name: &str) -> bool {
     manifest::is_subc_agent_core_tool(name) || manifest::is_subc_native_plumbing_tool(name)
 }
 use self::wire::{
-    build_error_frame, build_goodbye_frame, build_tool_response_frame,
-    build_tool_response_frame_with_limit, decrement_counted_channel, response_is_fatal_panic,
-    response_message, send_counted_channel, send_frame, send_reliable_writer_frame,
-    send_traced_tool_response_frame, ToolResponseWriteTrace, WriterFrame, WriterSender,
+    build_error_frame, build_error_frame_with_detail, build_goodbye_frame,
+    build_tool_response_frame, build_tool_response_frame_with_limit, decrement_counted_channel,
+    response_is_fatal_panic, response_message, send_counted_channel, send_frame,
+    send_reliable_writer_frame, send_traced_tool_response_frame, ToolResponseWriteTrace,
+    WriterFrame, WriterSender,
 };
 
 struct DecodedFrame {
@@ -1107,6 +1108,9 @@ struct PendingBashAsk {
     session_id: String,
     spawn_principal: AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
+    /// The consumer's `call_key`, already validated, for the task this call
+    /// starts once the user allows it.
+    call_key: Option<String>,
     request_id: String,
     arguments: Value,
     format_context: crate::subc_format::FormatContext,
@@ -2516,6 +2520,7 @@ async fn handle_bash_elicitation_reply(
                 BindTrust::Untrusted,
                 pending.spawn_principal,
                 pending.edit_slot_survives,
+                pending.call_key,
                 Some(pending.grants),
                 pending.repeat,
             );
@@ -3645,22 +3650,25 @@ where
 {
     // ModuleHello registers the tool and management providers and advertises
     // the separate channel-0 control operations.
-    // Echo the one-time launch nonce the daemon injected via SUBC_LAUNCH_NONCE so a
-    // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
+    // Echo the launch nonce the daemon handed over at spawn (captured once at
+    // startup, see `crate::launch_nonce`) so a reserved module_id's HELLO is
+    // accepted; absent for non-reserved/self-connect.
     // Read once, before HELLO: it selects the warm-up budget and nothing else.
     let spawn_role = readiness::SpawnRole::from_process_env();
     // The catalog is module-wide and sent once, before any route binds, so it
     // can only reflect the user config file: project and per-harness disables
     // are enforced per route at dispatch.
     let catalog_disabled = crate::subc_config::catalog_disabled_tools(user_config_path.as_deref());
-    let manifest = build_manifest_without(&catalog_disabled);
+    let launch_nonce = crate::launch_nonce::current();
+    let mut manifest = build_manifest_without(&catalog_disabled);
+    manifest::declare_provenance(&mut manifest, crate::launch_nonce::provenance());
     let manifest_provides = manifest.provides.clone();
     let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: control_ops(),
-        launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
+        launch_nonce: launch_nonce.map(|nonce| nonce.value().to_string()),
     };
     let hello_frame = Frame::build(
         FrameType::Hello,
@@ -6544,6 +6552,7 @@ async fn handle_tool_call(
                     .unwrap_or_else(|| json!({})),
                 edit_slot_survives: None,
                 preview: false,
+                call_key: None,
             })
         }
     };
@@ -6625,6 +6634,15 @@ async fn handle_tool_call(
     let RouteRequest::ToolCall(call) = route_request else {
         unreachable!("background event subscription returned above")
     };
+    if let Some(error) = call
+        .call_key
+        .as_deref()
+        .and_then(|key| subc_protocol::tool_call::validate_call_key(key).err())
+    {
+        let refusal = call_key_refusal_frame(&frame, &error)?;
+        return send_reliable_writer_frame(tx, metrics, refusal, "call_key refusal").await;
+    }
+    let call_key = call.call_key;
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     // Decided before the arguments move into the job: slow-call logging needs
@@ -6886,6 +6904,7 @@ async fn handle_tool_call(
                     session_id: identity.session.clone(),
                     spawn_principal: identity.spawn_principal.clone(),
                     edit_slot_survives: call.edit_slot_survives,
+                    call_key,
                     request_id,
                     arguments,
                     format_context,
@@ -6940,6 +6959,7 @@ async fn handle_tool_call(
             bind_trust,
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
+            call_key,
             None,
             repeat,
         );
@@ -7669,6 +7689,13 @@ enum BgEventsOp {
     BgEvents,
 }
 
+/// A tool call as AFT decodes it from a route `REQUEST` body.
+///
+/// This is AFT's own type rather than `subc_protocol::tool_call::ToolCallRequest`
+/// because the AFT plugins also send `edit_slot_survives` and `preview`, which
+/// the shared type has no fields for; decoding into it would silently drop
+/// both. The members the two share (`name`, `arguments`, `call_key`) keep the
+/// shared type's wire names.
 #[derive(Debug, Deserialize)]
 struct ToolCallRequest {
     name: String,
@@ -7683,6 +7710,32 @@ struct ToolCallRequest {
     /// apply fail with not-found.
     #[serde(default)]
     preview: bool,
+    /// The consumer's own key for this call, which lets it recognise the
+    /// same call arriving twice. Checked with subc-protocol's validator
+    /// before anything runs; a bash call records it on its background task.
+    /// `None` means this consumer sends no key (the OpenCode and Pi plugins),
+    /// in which case the task id AFT mints stands in for it.
+    #[serde(default)]
+    call_key: Option<String>,
+}
+
+/// The error frame for a tool call whose `call_key` fails subc-protocol's
+/// shape check: `invalid_request`, with the refused field named in `detail`
+/// so the consumer can tell its key, not the tool arguments, was at fault.
+fn call_key_refusal_frame(
+    frame: &Frame,
+    error: &subc_protocol::tool_call::CallKeyError,
+) -> Result<Frame, SubcError> {
+    build_error_frame_with_detail(
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.header.flags,
+        "invalid_request",
+        &error.to_string(),
+        json!({ "field": error.field() }),
+    )
 }
 
 #[cfg(test)]

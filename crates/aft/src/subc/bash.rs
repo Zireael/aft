@@ -420,6 +420,7 @@ pub(super) fn submit_deferred_bash(
     bind_trust: BindTrust,
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
+    call_key: Option<String>,
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) {
@@ -517,10 +518,12 @@ pub(super) fn submit_deferred_bash(
                 };
                 let (response, storage_dir) =
                     crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
-                        (
-                            dispatch(raw_req, ctx),
-                            crate::bash_background::task_storage_dir(ctx),
-                        )
+                        crate::bash_background::with_call_key(call_key, || {
+                            (
+                                dispatch(raw_req, ctx),
+                                crate::bash_background::task_storage_dir(ctx),
+                            )
+                        })
                     });
                 if !response.success {
                     return finish_bash_spawn_immediate(
@@ -1492,6 +1495,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                None,
             );
         }
 
@@ -1617,6 +1621,7 @@ mod grant_path_tests {
             },
             BindTrust::FirstParty,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
             None,
             None,
             None,

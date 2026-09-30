@@ -569,7 +569,7 @@ fn log_tail(log: &str) -> String {
     lines[lines.len().saturating_sub(20)..].join("\n")
 }
 
-fn write_user_config(config_home: &Path, storage: &Path) {
+pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
     let config_dir = config_home.join("cortexkit");
     std::fs::create_dir_all(&config_dir).expect("create user config dir");
     std::fs::write(
@@ -586,7 +586,7 @@ fn write_user_config(config_home: &Path, storage: &Path) {
     .expect("write user config");
 }
 
-async fn write_connection_file(conn_dir: &Path) -> TcpListener {
+pub(super) async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
         .set_nonblocking(true)
@@ -609,8 +609,8 @@ async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     TcpListener::from_std(std_listener).expect("tokio listener")
 }
 
-struct ModuleProcess {
-    child: Child,
+pub(super) struct ModuleProcess {
+    pub(super) child: Child,
 }
 
 impl ModuleProcess {
@@ -697,7 +697,7 @@ impl ModuleProcess {
         self.wait_for_exit("module process-group termination")
     }
 
-    fn wait_for_exit(&mut self, label: &str) -> ExitStatus {
+    pub(super) fn wait_for_exit(&mut self, label: &str) -> ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match self.child.try_wait() {
@@ -756,6 +756,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -765,7 +766,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
     stream
 }
 
-async fn bind_route(stream: &mut TcpStream, root: &Path) {
+pub(super) async fn bind_route(stream: &mut TcpStream, root: &Path) {
     bind_route_as(stream, root, ROUTE_CHANNEL, "opencode").await;
 }
 
@@ -821,7 +822,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
     assert_eq!(body, ModuleControlResponse::RouteBindAck {});
 }
 
-async fn send_tool_call(
+pub(super) async fn send_tool_call(
     stream: &mut TcpStream,
     channel: u16,
     corr: u64,
@@ -862,7 +863,7 @@ async fn bash_status(stream: &mut TcpStream, corr: u64, task_id: &str) -> Value 
     tool_response_json(&frame)
 }
 
-async fn wait_for_status(
+pub(super) async fn wait_for_status(
     stream: &mut TcpStream,
     start_corr: u64,
     task_id: &str,
@@ -884,7 +885,7 @@ async fn wait_for_status(
     }
 }
 
-async fn send_connection_goodbye(stream: &mut TcpStream) {
+pub(super) async fn send_connection_goodbye(stream: &mut TcpStream) {
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
@@ -920,11 +921,11 @@ async fn send_module_draining(stream: &mut TcpStream) {
     .await;
 }
 
-async fn send_frame(stream: &mut TcpStream, frame: Frame) {
+pub(super) async fn send_frame(stream: &mut TcpStream, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
 
-async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
+pub(super) async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
     tokio::time::timeout(Duration::from_secs(30), read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
@@ -949,7 +950,7 @@ async fn read_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
     }
 }
 
-async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> Frame {
+pub(super) async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> Frame {
     let frame = read_frame_timeout(stream, label).await;
     assert_eq!(frame.header.ty, FrameType::Response, "{label} frame type");
     assert_eq!(frame.header.channel, ROUTE_CHANNEL, "{label} channel");
@@ -957,7 +958,7 @@ async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> F
     frame
 }
 
-fn tool_response_json(frame: &Frame) -> Value {
+pub(super) fn tool_response_json(frame: &Frame) -> Value {
     let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
     let structured = &body["structuredContent"];
     assert!(
@@ -967,16 +968,16 @@ fn tool_response_json(frame: &Frame) -> Value {
     structured.clone()
 }
 
-fn tool_result_is_error(frame: &Frame) -> bool {
+pub(super) fn tool_result_is_error(frame: &Frame) -> bool {
     let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
     body["isError"].as_bool().unwrap_or(false)
 }
 
-fn frame_body(frame: &Frame) -> String {
+pub(super) fn frame_body(frame: &Frame) -> String {
     String::from_utf8_lossy(&frame.body).into_owned()
 }
 
-fn extract_task_id(frame: &Frame) -> String {
+pub(super) fn extract_task_id(frame: &Frame) -> String {
     let structured = tool_response_json(frame);
     if let Some(task_id) = structured.get("task_id").and_then(Value::as_str) {
         return task_id.to_string();
@@ -1024,6 +1025,6 @@ fn assert_process_alive(pid: u32, label: &str) {
     assert!(alive, "{label} should still be alive (pid {pid})");
 }
 
-fn control_flags() -> Flags {
+pub(super) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }

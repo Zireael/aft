@@ -1621,6 +1621,11 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
     let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
+    // The subc loop runs inside this test process, so `main` never captures a
+    // launch nonce. Install whatever nonce the test put in the environment as
+    // the module's captured one, which is what `main` would have read.
+    let _launch_nonce =
+        aft::launch_nonce::install_for_tests(std::env::var("SUBC_LAUNCH_NONCE").ok().as_deref());
     let state = Arc::new(BridgeState::default());
     install_bridge_state(Arc::clone(&state));
 
@@ -1927,6 +1932,7 @@ async fn complete_initial_attach(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -3115,6 +3121,16 @@ fn subc_bridge_bash_background_returns_launch_text() {
 }
 
 #[test]
+fn subc_bridge_bash_records_call_key_and_refuses_malformed_keys() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_records_call_key_and_refuses_malformed_keys",
+        Duration::from_secs(30),
+        drive_bash_call_key_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_watch_regex_pattern_round_trips_validation() {
     run_subc_bridge_production_test(
         "subc_bridge_bash_watch_regex_pattern_round_trips_validation",
@@ -3341,6 +3357,7 @@ async fn drive_s1_rejection_daemon(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -3546,6 +3563,7 @@ async fn drive_readiness_daemon(
                 ],
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -3722,6 +3740,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -4457,6 +4476,160 @@ async fn drive_bash_background_daemon(input: FakeDaemonInput) {
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
     send_connection_goodbye(&mut stream).await;
+}
+
+/// A consumer's `call_key` is recorded on the bash task it starts, keyed by
+/// the route's principal; a call without one records the minted task id; and
+/// a key outside subc-protocol's shape is refused before anything runs, with
+/// the field named.
+async fn drive_bash_call_key_daemon(input: FakeDaemonInput) {
+    use aft::bash_background::TaskCallKey;
+
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let background = |command: &str| {
+        json!({
+            "command": command,
+            "background": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        })
+    };
+
+    // Both ends of the accepted range (0x21 and 0x7E) and a `prefix:id` form.
+    let keyed = "!run-7:call-3~";
+    send_tool_call_with_call_key(
+        &mut stream,
+        1,
+        120,
+        "bash",
+        background("printf keyed"),
+        Some(keyed),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "keyed bash response").await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "a well-formed key is accepted"
+    );
+    assert!(!tool_result_is_error(&frame));
+    let keyed_task = extract_bash_task_id(&tool_result_text(&frame));
+
+    send_tool_call_with_call_key(
+        &mut stream,
+        1,
+        121,
+        "bash",
+        background("printf unkeyed"),
+        None,
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "unkeyed bash response").await;
+    assert!(!tool_result_is_error(&frame));
+    let unkeyed_task = extract_bash_task_id(&tool_result_text(&frame));
+
+    {
+        let ctx = executor.actor_context(&root_id).expect("root1 actor");
+        let registry = ctx.bash_background();
+        assert_eq!(
+            registry.task_call_key(&keyed_task),
+            Some(TaskCallKey {
+                requester: "direct".to_string(),
+                key: keyed.to_string(),
+                minted: false,
+            })
+        );
+        assert_eq!(
+            registry.task_id_for_call_key("direct", keyed),
+            Some(keyed_task.clone())
+        );
+        assert_eq!(
+            registry.task_id_for_call_key("reserved:other", keyed),
+            None,
+            "the key belongs to the requester that sent it"
+        );
+        assert_eq!(
+            registry.task_call_key(&unkeyed_task),
+            Some(TaskCallKey {
+                requester: "direct".to_string(),
+                key: unkeyed_task.clone(),
+                minted: true,
+            }),
+            "a call without a key records the minted task id in its place"
+        );
+    }
+
+    let too_long = "k".repeat(257);
+    for (corr, malformed) in [
+        (130, ""),
+        (131, "has space"),
+        (132, too_long.as_str()),
+        (133, "caf\u{e9}"),
+        (134, "tab\tkey"),
+    ] {
+        send_tool_call_with_call_key(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            background("printf must-not-run"),
+            Some(malformed),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "malformed call_key refusal").await;
+        assert_eq!(frame.header.corr, corr);
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "call_key {malformed:?} must be refused"
+        );
+        let body: ErrorBody = serde_json::from_slice(&frame.body).expect("error body");
+        assert_eq!(body.code, "invalid_request");
+        assert_eq!(body.detail, Some(json!({ "field": "call_key" })));
+        let ctx = executor.actor_context(&root_id).expect("root1 actor");
+        assert_eq!(
+            ctx.bash_background()
+                .task_id_for_call_key("direct", malformed),
+            None,
+            "a refused call starts no task"
+        );
+    }
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn send_tool_call_with_call_key(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    call_key: Option<&str>,
+) {
+    let mut body = json!({ "name": name, "arguments": arguments });
+    if let Some(call_key) = call_key {
+        body["call_key"] = json!(call_key);
+    }
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("tool call body"),
+        )
+        .expect("tool call frame"),
+    )
+    .await;
 }
 
 async fn drive_bash_watch_regex_pattern_daemon(input: FakeDaemonInput) {
@@ -6401,6 +6574,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -6588,6 +6762,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -7000,6 +7175,7 @@ async fn open_status_bar_module(input: &FakeDaemonInput) -> tokio::net::TcpStrea
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -9913,6 +10089,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )

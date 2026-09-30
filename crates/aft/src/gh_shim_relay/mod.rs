@@ -476,11 +476,7 @@ impl SubcRelayTransport {
     }
 
     fn identity_available() -> bool {
-        ["SUBC_MODULE_ID", "SUBC_LAUNCH_NONCE"].iter().all(|key| {
-            std::env::var(key)
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-        })
+        crate::launch_nonce::consumer_identity().is_some()
     }
 
     async fn consumer(&self) -> Result<Arc<subc_client_rs::SubcConsumer>, TransportError> {
@@ -525,7 +521,14 @@ impl SubcRelayTransport {
             session.to_string(),
         );
         let route = match consumer
-            .open_route(target, identity, CallOptions::default())
+            .open_route(
+                target,
+                identity,
+                CallOptions {
+                    consumer_identity: crate::launch_nonce::consumer_identity(),
+                    ..CallOptions::default()
+                },
+            )
             .await
         {
             Ok(route) => route,

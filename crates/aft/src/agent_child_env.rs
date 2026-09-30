@@ -58,9 +58,13 @@ const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
-const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
+const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
     subc_protocol::SUBC_MODULE_ID_ENV,
     subc_protocol::SUBC_LAUNCH_NONCE_ENV,
+    // Names the descriptor the daemon passed the nonce through. A child that
+    // inherited it without the pipe would read and close whatever it has at
+    // that number, so it goes with the nonce itself.
+    subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV,
 ];
 
 /// Git for Windows runs shebang hooks through its bundled POSIX shell, so the
@@ -1222,6 +1226,7 @@ mod tests {
         let mut command = Command::new("unused-test-command");
         command
             .env("SUBC_LAUNCH_NONCE", "ambient-nonce")
+            .env("SUBC_LAUNCH_NONCE_FD", "3:12345")
             .env("SUBC_FUTURE_CREDENTIAL", "future-secret");
         apply_to_command(&mut command, &request_environment);
         let configured = command
@@ -1235,6 +1240,7 @@ mod tests {
         for key in [
             "SUBC_MODULE_ID",
             "SUBC_LAUNCH_NONCE",
+            "SUBC_LAUNCH_NONCE_FD",
             "SUBC_FUTURE_CREDENTIAL",
         ] {
             assert_eq!(
@@ -1247,6 +1253,7 @@ mod tests {
         let mut pty_command = portable_pty::CommandBuilder::new("unused-test-command");
         pty_command.env("SUBC_MODULE_ID", "aft");
         pty_command.env("SUBC_LAUNCH_NONCE", "nonce");
+        pty_command.env("SUBC_LAUNCH_NONCE_FD", "3:12345");
         pty_command.env("SUBC_FUTURE_CREDENTIAL", "future-secret");
         pty_command.env("CUSTOM", "kept");
         scrub_pty_command(&mut pty_command);
@@ -1257,6 +1264,7 @@ mod tests {
         for key in [
             "SUBC_MODULE_ID",
             "SUBC_LAUNCH_NONCE",
+            "SUBC_LAUNCH_NONCE_FD",
             "SUBC_FUTURE_CREDENTIAL",
         ] {
             assert_eq!(pty_command.get_env(key), None, "PTY child retained {key}");

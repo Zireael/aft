@@ -6285,6 +6285,26 @@ impl BgTaskRegistry {
         self.task(task_id).is_none_or(|task| task.is_terminal())
     }
 
+    /// The task a requester started under `call_key`: the `(requester,
+    /// call_key)` pair a consumer uses to recognise its own call. A call that
+    /// came without a key is found under its task id, which stands in for it.
+    pub fn task_id_for_call_key(&self, requester: &str, call_key: &str) -> Option<String> {
+        let tasks: Vec<Arc<BgTask>> = self.inner.tasks.lock().ok()?.values().cloned().collect();
+        tasks.into_iter().find_map(|task| {
+            let state = task.state.lock().ok()?;
+            let recorded = state.metadata.call_key.as_ref()?;
+            (recorded.requester == requester && recorded.key == call_key)
+                .then(|| task.task_id.clone())
+        })
+    }
+
+    /// The requester and call key recorded on a task.
+    pub fn task_call_key(&self, task_id: &str) -> Option<super::TaskCallKey> {
+        let task = self.task(task_id)?;
+        let state = task.state.lock().ok()?;
+        state.metadata.call_key.clone()
+    }
+
     fn task_for_session(&self, task_id: &str, session_id: &str) -> Option<Arc<BgTask>> {
         self.task(task_id)
             .filter(|task| task.session_id == session_id)

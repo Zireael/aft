@@ -302,6 +302,17 @@ pub(super) fn build_manifest_without(disabled: &[String]) -> ModuleManifest {
     filter_manifest_tools(build_manifest(), disabled)
 }
 
+/// Attach the provenance AFT declares on its HELLO. `None` (no launch nonce)
+/// leaves the manifest without a provenance block, as before.
+pub(super) fn declare_provenance(
+    manifest: &mut ModuleManifest,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) {
+    if provenance.is_some() {
+        manifest.provenance = provenance;
+    }
+}
+
 pub(super) fn filter_manifest_tools(
     mut manifest: ModuleManifest,
     disabled: &[String],
@@ -342,7 +353,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // module as ready, which is the behaviour before readiness existed.
     //
     // The builder leaves `capabilities`, `self_signals` and `provenance`
-    // unset, so none of them reaches the wire. `consumes` is descriptive (the
+    // unset, so neither of the first two reaches the wire; `provenance` is
+    // added at HELLO time by `declare_provenance`, because where the launch
+    // nonce came from is a fact about the running process, not the build.
+    // `consumes` is descriptive (the
     // daemon doesn't read it) and lists the modules AFT opens routes to: the
     // fleet status holder always, and synapse only when it is the configured
     // embedding backend. The manifest is static, so the config-dependent synapse

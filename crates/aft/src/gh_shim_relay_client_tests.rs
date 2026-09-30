@@ -405,6 +405,7 @@ impl FakeRelayDaemon {
                                                 subc_ops: Vec::new(),
                                                 subc_capabilities: Vec::new(),
                                                 storage: None,
+                                                machine_id: None,
                                             }).unwrap(),
                                         ).unwrap(),
                                         FrameType::Request => {

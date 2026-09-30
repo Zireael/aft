@@ -591,7 +591,10 @@ impl SynapseState {
                     self.route_harness.clone(),
                     format!("aft-semantic-{}", std::process::id()),
                 ),
-                CallOptions::default(),
+                CallOptions {
+                    consumer_identity: crate::launch_nonce::consumer_identity(),
+                    ..CallOptions::default()
+                },
             )
             .await
             .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
