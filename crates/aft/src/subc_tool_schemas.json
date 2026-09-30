@@ -438,7 +438,7 @@
         ]
       },
       "targets": {
-        "description": "Cross-file batch: `{ path, symbol }` or an array of them. Mutually exclusive with path/url/symbols.",
+        "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
         "anyOf": [
           {
             "type": "object",
@@ -490,7 +490,7 @@
         "type": "boolean"
       }
     },
-    "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them."
+    "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line."
   },
   "inspect": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

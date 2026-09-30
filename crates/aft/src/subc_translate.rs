@@ -117,7 +117,9 @@ fn normalize_zoom_target_aliases(target: &mut Value, index: usize) -> Result<(),
             "'targets[{index}].path' must be a non-empty string"
         )));
     };
-    normalize_path_alias_pair(object, "path", "filePath", true)
+    // Not required here: an entry with only a symbol still reaches the zoom
+    // command, which reports it as its own per-target error line.
+    normalize_path_alias_pair(object, "path", "filePath", false)
 }
 
 fn parse_stringified_collection(
@@ -154,14 +156,28 @@ fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateE
             "targets must be an array of {path, symbol} (got an invalid type)",
         ));
     }
-    match targets {
+    // Entries whose path and symbol are both blank are placeholders from
+    // hosts that fill every declared property; they are dropped here, and a
+    // `targets` left with no entries counts as not supplied at all.
+    let keep = match targets {
         Value::Array(items) => {
             for (index, target) in items.iter_mut().enumerate() {
-                normalize_zoom_target_aliases(target, index)?;
+                if !zoom_target_entry_is_empty(target) {
+                    normalize_zoom_target_aliases(target, index)?;
+                }
             }
+            items.retain(|target| !zoom_target_entry_is_empty(target));
+            !items.is_empty()
         }
-        Value::Object(_) => normalize_zoom_target_aliases(targets, 0)?,
-        _ => {}
+        Value::Object(_) if zoom_target_entry_is_empty(targets) => false,
+        Value::Object(_) => {
+            normalize_zoom_target_aliases(targets, 0)?;
+            true
+        }
+        _ => false,
+    };
+    if !keep {
+        map.remove("targets");
     }
     Ok(())
 }
@@ -1471,6 +1487,69 @@ fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateCont
     out.insert("preview".to_string(), Value::Bool(ctx.preview));
 }
 
+/// Line window a `read` call resolves to, in the native command's terms.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReadRange {
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    limit: Option<u64>,
+}
+
+/// Resolve `startLine`/`endLine`/`offset`/`limit` into one line window.
+///
+/// Both plugins and direct daemon callers reach `read` through this function,
+/// so it is the one place that decides what the four fields mean together:
+///
+/// - Some models fill every declared property on every call, sending `0`,
+///   `""` or `null` for the ones they do not mean. Those are outside the
+///   1-based domain of all four fields, so they count as absent here.
+/// - `startLine`/`endLine` take precedence over `offset`/`limit`, matching the
+///   documented contract ("offset is ignored if startLine is provided").
+/// - `limit` still bounds the window whenever no end line was given.
+/// - A start after the end is refused by name. Clamping it (the old
+///   behaviour) returned an empty success, which a reader cannot tell apart
+///   from "those lines are empty".
+fn resolve_read_range(map_in: &Map<String, Value>) -> Result<ReadRange, TranslateError> {
+    let int = |key: &str| coerce_optional_int_result(map_in.get(key), key, 1, MAX_SAFE_INTEGER);
+    let start_line = int("startLine")?;
+    let end_line = int("endLine")?;
+    let offset = int("offset")?;
+    let limit = int("limit")?;
+
+    let start = start_line.or(offset);
+    let end = end_line.or_else(|| {
+        // `limit` is a line count from `offset`; it only derives an end line
+        // when `offset` is the start actually in use.
+        match (start_line, offset, limit) {
+            (None, Some(offset), Some(limit)) => Some(offset.saturating_add(limit) - 1),
+            _ => None,
+        }
+    });
+    if let (Some(start), Some(end)) = (start, end) {
+        if start > end {
+            let (start_name, end_name) = (
+                if start_line.is_some() {
+                    "startLine"
+                } else {
+                    "offset"
+                },
+                "endLine",
+            );
+            return Err(TranslateError {
+                code: "invalid_range",
+                message: format!(
+                    "invalid_range: {start_name} {start} is after {end_name} {end}; no lines selected. Use a start line at or before the end line."
+                ),
+            });
+        }
+    }
+    Ok(ReadRange {
+        start_line: start,
+        end_line: end,
+        limit: if end.is_none() { limit } else { None },
+    })
+}
+
 fn translate_read(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let file_path = map_in
@@ -1482,28 +1561,15 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
     let mut out = Map::new();
     insert_file_or_github_target(&mut out, project_root, file_path);
 
-    let mut start_line = map_in.get("startLine").and_then(Value::as_u64);
-    let mut end_line = map_in.get("endLine").and_then(Value::as_u64);
-
-    if start_line.is_none() {
-        if let Some(offset) = map_in.get("offset").and_then(Value::as_u64) {
-            start_line = Some(offset);
-            if let Some(limit) = map_in.get("limit").and_then(Value::as_u64) {
-                end_line = Some(offset.saturating_add(limit).saturating_sub(1));
-            }
-        }
-    }
-
-    if let Some(sl) = start_line {
+    let range = resolve_read_range(&map_in)?;
+    if let Some(sl) = range.start_line {
         out.insert("start_line".to_string(), Value::Number(sl.into()));
     }
-    if let Some(el) = end_line {
+    if let Some(el) = range.end_line {
         out.insert("end_line".to_string(), Value::Number(el.into()));
     }
-    if map_in.get("offset").is_none() {
-        if let Some(limit) = map_in.get("limit").and_then(Value::as_u64) {
-            out.insert("limit".to_string(), Value::Number(limit.into()));
-        }
+    if let Some(limit) = range.limit {
+        out.insert("limit".to_string(), Value::Number(limit.into()));
     }
     if let Some(vision_capability) = map_in.get("vision_capability").and_then(model_boolean) {
         out.insert(
@@ -2056,13 +2122,21 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
 
     let mut out = Map::new();
     insert_present_renamed(&mut out, &map_in, "name", "name");
+    // A blank entry in `files` is a placeholder from hosts that fill every
+    // declared property (`files: [""]`), not a path; it counts as absent.
     let files = map_in
         .get("files")
         .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
         .map(|items| {
             items
                 .iter()
+                .filter(|item| !matches!(item, Value::String(path) if path.trim().is_empty()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .map(|items| {
+            items
+                .into_iter()
                 .map(resolve_path)
                 .collect::<Result<Vec<_>, _>>()
         })
@@ -2379,19 +2453,23 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     })
 }
 
+/// True when a `targets` entry carries nothing: null, or an object whose
+/// path and symbol are both missing, null, or blank. Models that fill every
+/// declared property send such entries (`{path: "", symbol: ""}`) when they
+/// mean "no targets". Any other value is real input and is validated.
 fn zoom_target_entry_is_empty(entry: &Value) -> bool {
-    let Some(obj) = entry.as_object() else {
-        return true;
+    let blank = |value: Option<&Value>| match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
     };
-    let file_path_empty = obj
-        .get("path")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty);
-    let symbol_empty = obj
-        .get("symbol")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty);
-    file_path_empty && symbol_empty
+    match entry {
+        Value::Null => true,
+        Value::Object(obj) => {
+            blank(obj.get("path")) && blank(obj.get("filePath")) && blank(obj.get("symbol"))
+        }
+        _ => false,
+    }
 }
 
 fn zoom_targets_provided(value: Option<&Value>) -> bool {
@@ -2408,88 +2486,131 @@ fn zoom_targets_provided(value: Option<&Value>) -> bool {
     }
 }
 
-fn translate_zoom_targets(
-    targets_value: &Value,
-    project_root: &Path,
-) -> Result<Vec<Value>, TranslateError> {
+/// Translate the (already placeholder-free) `targets` entries into native
+/// `{file, symbol, target_label}` objects. An entry missing its path or its
+/// symbol is forwarded with that field empty rather than refused here: the
+/// zoom command turns it into its own per-target error line and still answers
+/// every other entry in the batch.
+fn translate_zoom_targets(targets_value: &Value, project_root: &Path) -> Vec<Value> {
     let target_values: Vec<&Value> = match targets_value {
         Value::Array(items) => items.iter().collect(),
         Value::Object(_) => vec![targets_value],
-        _ => {
-            return Err(invalid_request(
-                "'targets' must be a non-empty object or array",
-            ))
-        }
+        _ => Vec::new(),
     };
 
-    if target_values.is_empty() {
-        return Err(invalid_request(
-            "'targets' must be a non-empty object or array",
-        ));
-    }
-
     let mut out = Vec::with_capacity(target_values.len());
-    for (index, target) in target_values.into_iter().enumerate() {
-        let obj = target.as_object();
-        let file_path = obj
-            .and_then(|obj| obj.get("path"))
-            .and_then(Value::as_str)
-            .filter(|file_path| !file_path.is_empty())
-            .ok_or_else(|| {
-                invalid_request(format!(
-                    "targets[{index}].filePath must be a non-empty string"
-                ))
-            })?;
-        let symbol = obj
-            .and_then(|obj| obj.get("symbol"))
-            .and_then(Value::as_str)
-            .filter(|symbol| !symbol.is_empty())
-            .ok_or_else(|| {
-                invalid_request(format!(
-                    "targets[{index}].symbol must be a non-empty string"
-                ))
-            })?;
+    for target in target_values {
+        let field = |key: &str| {
+            target
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let file_path = field("path");
+        let symbol = field("symbol");
         let mut target_out = Map::new();
-        insert_file_or_github_target(&mut target_out, project_root, file_path);
-        target_out.insert("symbol".to_string(), Value::String(symbol.to_string()));
+        match file_path {
+            Some(file_path) => {
+                insert_file_or_github_target(&mut target_out, project_root, file_path);
+            }
+            None => {
+                target_out.insert("file".to_string(), Value::String(String::new()));
+            }
+        }
+        target_out.insert(
+            "symbol".to_string(),
+            Value::String(symbol.unwrap_or_default().to_string()),
+        );
         target_out.insert(
             "target_label".to_string(),
-            Value::String(file_path.to_string()),
+            Value::String(file_path.unwrap_or("(no path)").to_string()),
         );
         out.push(Value::Object(target_out));
     }
-    Ok(out)
+    out
+}
+
+/// True when a zoom field carries real input: not null, and not an empty or
+/// whitespace-only string, array, or object.
+fn zoom_field_present(value: Option<&Value>) -> bool {
+    match value {
+        None => false,
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(value) => !is_empty_param(value),
+    }
 }
 
 fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
 
     let has_targets = zoom_targets_provided(map_in.get("targets"));
-    let has_file_path = map_in
-        .get("path")
-        .is_some_and(|value| !is_empty_param(value));
-    let has_url = map_in
-        .get("url")
-        .is_some_and(|value| !is_empty_param(value));
-    let has_symbols = map_in
-        .get("symbols")
-        .is_some_and(|value| !is_empty_param(value));
+    let has_file_path = zoom_field_present(map_in.get("path"));
+    let has_url = zoom_field_present(map_in.get("url"));
+    let has_symbols = zoom_field_present(map_in.get("symbols"));
 
     let mut out = Map::new();
 
     if has_targets {
-        if has_file_path || has_url || has_symbols {
+        // `targets` together with `path`/`url` + `symbols` is one merged
+        // batch, not a conflict: models that fill every declared property send
+        // a real same-file request next to a placeholder `targets` entry, and
+        // refusing both lost the real request. The zoom command expands the
+        // top-level file and symbols into batch entries; each entry that does
+        // not resolve reports its own error line.
+        if has_file_path && has_url {
             return Err(invalid_request(
-                "'targets' is mutually exclusive with 'filePath', 'url', and 'symbols'",
+                "Provide exactly ONE of 'filePath' or 'url' — not both",
             ));
         }
         let targets_value = map_in
             .get("targets")
             .expect("has_targets implies a targets value exists");
-        out.insert(
-            "targets".to_string(),
-            Value::Array(translate_zoom_targets(targets_value, project_root)?),
-        );
+        let mut targets = translate_zoom_targets(targets_value, project_root);
+
+        let base = if has_file_path {
+            map_in.get("path").and_then(Value::as_str).map(str::trim)
+        } else if has_url {
+            map_in.get("url").and_then(Value::as_str).map(str::trim)
+        } else {
+            None
+        };
+        if let Some(base) = base {
+            if has_url {
+                out.insert("file".to_string(), Value::String(base.to_string()));
+            } else {
+                insert_file_or_github_target(&mut out, project_root, base);
+            }
+            out.insert("target_label".to_string(), Value::String(base.to_string()));
+            insert_zoom_symbols(&mut out, &map_in)?;
+        } else if has_symbols {
+            // Symbols with no file to look in: each still gets its own line
+            // saying the path is missing, instead of vanishing silently.
+            let names: Vec<String> = match map_in.get("symbols") {
+                Some(Value::String(symbol)) => vec![symbol.trim().to_string()],
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => {
+                    return Err(invalid_request(
+                        "'symbols' must be a string or array of strings",
+                    ))
+                }
+            };
+            let mut orphaned = names
+                .into_iter()
+                .map(|name| {
+                    serde_json::json!({ "file": "", "symbol": name, "target_label": "(no path)" })
+                })
+                .collect::<Vec<_>>();
+            orphaned.append(&mut targets);
+            targets = orphaned;
+        }
+        out.insert("targets".to_string(), Value::Array(targets));
 
         if let Some(context_lines) = coerce_optional_int_result(
             map_in.get("contextLines"),
@@ -2516,11 +2637,11 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
     let file_path = map_in
         .get("path")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.trim().is_empty());
     let url = map_in
         .get("url")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.trim().is_empty());
 
     match (file_path, url) {
         (None, None) => {
@@ -2542,36 +2663,7 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
         insert_file_or_github_target(&mut out, project_root, file_path);
     }
 
-    if let Some(symbols) = map_in.get("symbols") {
-        if !is_empty_param(symbols) {
-            match symbols {
-                Value::String(symbol) => {
-                    out.insert("symbol".to_string(), Value::String(symbol.to_string()));
-                }
-                Value::Array(items) => {
-                    // Pass the array THROUGH to the leaf (handle_zoom's
-                    // parse_zoom_symbol_names handles a `symbols` array natively,
-                    // one lookup per element). Joining into one space-separated
-                    // string would break multi-heading markdown/HTML zoom, whose
-                    // heading names legitimately contain spaces.
-                    let names: Vec<Value> = items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter(|name| !name.is_empty())
-                        .map(|name| Value::String(name.to_string()))
-                        .collect();
-                    if !names.is_empty() {
-                        out.insert("symbols".to_string(), Value::Array(names));
-                    }
-                }
-                _ => {
-                    return Err(invalid_request(
-                        "'symbols' must be a string or array of strings",
-                    ))
-                }
-            }
-        }
-    }
+    insert_zoom_symbols(&mut out, &map_in)?;
 
     if let Some(context_lines) = coerce_optional_int_result(
         map_in.get("contextLines"),
@@ -2593,6 +2685,45 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
         command: "zoom".into(),
         args: out,
     })
+}
+
+fn insert_zoom_symbols(
+    out: &mut Map<String, Value>,
+    map_in: &Map<String, Value>,
+) -> Result<(), TranslateError> {
+    let Some(symbols) = map_in.get("symbols") else {
+        return Ok(());
+    };
+    if is_empty_param(symbols) {
+        return Ok(());
+    }
+    match symbols {
+        Value::String(symbol) => {
+            out.insert("symbol".to_string(), Value::String(symbol.to_string()));
+        }
+        Value::Array(items) => {
+            // Pass the array THROUGH to the leaf (handle_zoom's
+            // parse_zoom_symbol_names handles a `symbols` array natively,
+            // one lookup per element). Joining into one space-separated
+            // string would break multi-heading markdown/HTML zoom, whose
+            // heading names legitimately contain spaces.
+            let names: Vec<Value> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(|name| Value::String(name.to_string()))
+                .collect();
+            if !names.is_empty() {
+                out.insert("symbols".to_string(), Value::Array(names));
+            }
+        }
+        _ => {
+            return Err(invalid_request(
+                "'symbols' must be a string or array of strings",
+            ))
+        }
+    }
+    Ok(())
 }
 
 fn translate_conflicts(args: Value) -> Result<Translated, TranslateError> {
@@ -4133,5 +4264,177 @@ mod model_boolean_tests {
         let nested = json!({"path": "file.ts", "edits": [{"oldString": "old", "newString": "new", "replaceAll": " TrUe "}]});
         let result = subc_translate("edit", &nested, root).unwrap();
         assert_eq!(result.args["edits"][0]["replaceAll"], true);
+    }
+}
+
+/// Hosts whose model fills every declared tool property on every call send
+/// placeholder values (`0`, `""`, `null`, `{path: "x", symbol: "x"}`) for the
+/// properties they do not mean. These tests replay the shapes recorded from
+/// such a model and pin that the real part of the request still works.
+#[cfg(test)]
+mod placeholder_argument_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn abs(path: &str) -> String {
+        resolve_path_from_project_root(Path::new("/project"), path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn read(args: Value) -> Result<Translated, TranslateError> {
+        subc_translate_owned("read", args, Path::new("/project"))
+    }
+
+    #[test]
+    fn read_refuses_the_recorded_inverted_range_by_name() {
+        let error = read(json!({
+            "filePath": "src/conversion-lane.ts",
+            "startLine": 245,
+            "endLine": 145,
+            "offset": 245,
+            "limit": 70
+        }))
+        .expect_err("an inverted range must not translate into an empty read");
+        assert_eq!(error.code, "invalid_range");
+        assert!(
+            error.message.contains("startLine 245 is after endLine 145"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn read_zero_empty_and_null_line_fields_count_as_absent() {
+        let translated = read(json!({
+            "path": "a.ts",
+            "startLine": 0,
+            "endLine": "",
+            "offset": null,
+            "limit": 0
+        }))
+        .expect("placeholders only");
+        assert!(!translated.args.contains_key("start_line"));
+        assert!(!translated.args.contains_key("end_line"));
+        assert!(!translated.args.contains_key("limit"));
+
+        // Real offset/limit next to placeholder line fields keep working.
+        let translated = read(json!({
+            "path": "a.ts",
+            "startLine": 0,
+            "endLine": 0,
+            "offset": 40,
+            "limit": 10
+        }))
+        .expect("offset/limit with placeholder range");
+        assert_eq!(translated.args["start_line"], 40);
+        assert_eq!(translated.args["end_line"], 49);
+
+        // Real range next to placeholder offset/limit keeps working.
+        let translated = read(json!({
+            "path": "a.ts",
+            "startLine": 5,
+            "endLine": 9,
+            "offset": 0,
+            "limit": 0
+        }))
+        .expect("range with placeholder offset/limit");
+        assert_eq!(translated.args["start_line"], 5);
+        assert_eq!(translated.args["end_line"], 9);
+        assert!(!translated.args.contains_key("limit"));
+    }
+
+    #[test]
+    fn read_start_line_wins_over_offset_and_limit_bounds_an_open_range() {
+        let translated = read(json!({ "path": "a.ts", "startLine": 10, "offset": 99, "limit": 5 }))
+            .expect("startLine with offset and limit");
+        assert_eq!(translated.args["start_line"], 10);
+        assert!(!translated.args.contains_key("end_line"));
+        assert_eq!(translated.args["limit"], 5);
+
+        let error = read(json!({ "path": "a.ts", "startLine": -3 }))
+            .expect_err("a negative line is invalid, not absent");
+        assert!(error.message.contains("startLine"), "{error:?}");
+    }
+
+    fn zoom(args: Value) -> Result<Translated, TranslateError> {
+        subc_translate_owned("zoom", args, Path::new("/project"))
+    }
+
+    #[test]
+    fn zoom_placeholder_targets_count_as_absent() {
+        for targets in [
+            json!([]),
+            json!({}),
+            json!({ "path": "", "symbol": "" }),
+            json!([{ "path": "  ", "symbol": "\t" }, { "filePath": "", "symbol": null }]),
+            json!(null),
+        ] {
+            let translated = zoom(json!({
+                "path": "src/a.ts",
+                "symbols": ["foo"],
+                "url": "",
+                "targets": targets.clone()
+            }))
+            .unwrap_or_else(|error| panic!("targets {targets} must count as absent: {error:?}"));
+            assert!(!translated.args.contains_key("targets"), "{targets}");
+            assert_eq!(translated.args["file"], abs("src/a.ts"));
+            assert_eq!(translated.args["symbols"], json!(["foo"]));
+        }
+
+        let error = zoom(json!({ "targets": [{ "path": "", "symbol": "" }] }))
+            .expect_err("nothing usable given");
+        assert!(error.message.contains("Provide exactly one"), "{error:?}");
+    }
+
+    #[test]
+    fn zoom_merges_real_path_and_symbols_with_a_placeholder_target() {
+        let translated = zoom(json!({
+            "path": "src/a.ts",
+            "symbols": ["foo", "bar"],
+            "url": "",
+            "targets": { "path": "x", "symbol": "x" },
+            "contextLines": 0,
+            "callgraph": false
+        }))
+        .expect("targets plus path and symbols merge into one batch");
+        assert_eq!(translated.command, "zoom");
+        assert_eq!(translated.args["file"], abs("src/a.ts"));
+        assert_eq!(translated.args["target_label"], "src/a.ts");
+        assert_eq!(translated.args["symbols"], json!(["foo", "bar"]));
+        assert_eq!(
+            translated.args["targets"],
+            json!([{ "file": abs("x"), "symbol": "x", "target_label": "x" }])
+        );
+        assert!(!translated.args.contains_key("context_lines"));
+        assert!(!translated.args.contains_key("callgraph"));
+    }
+
+    #[test]
+    fn zoom_partial_targets_are_forwarded_for_per_target_errors() {
+        let translated = zoom(json!({
+            "targets": [
+                { "path": "src/a.ts", "symbol": "foo" },
+                { "path": "src/b.ts", "symbol": "" }
+            ]
+        }))
+        .expect("a partial entry does not refuse the batch");
+        assert_eq!(
+            translated.args["targets"],
+            json!([
+                { "file": abs("src/a.ts"), "symbol": "foo", "target_label": "src/a.ts" },
+                { "file": abs("src/b.ts"), "symbol": "", "target_label": "src/b.ts" }
+            ])
+        );
+    }
+
+    #[test]
+    fn safety_blank_files_entries_count_as_absent() {
+        let translated = subc_translate_owned(
+            "safety",
+            json!({ "op": "checkpoint", "name": "cp", "files": [""], "path": "" }),
+            Path::new("/project"),
+        )
+        .expect("blank files entry is a placeholder");
+        assert!(!translated.args.contains_key("files"));
     }
 }

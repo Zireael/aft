@@ -611,3 +611,173 @@ fn effective_hashline_edit_rejects_every_legacy_key_with_hashline_steering() {
     assert!(error.message.contains("hashline patch"));
     assert!(!error.message.contains("requires exactly one edit mode"));
 }
+
+fn placeholder_tool_call(aft: &mut AftProcess, id: &str, name: &str, arguments: Value) -> Value {
+    aft.send(
+        &json!({
+            "id": id,
+            "command": "tool_call",
+            "session_id": "subc-translate-placeholders",
+            "name": name,
+            "arguments": arguments,
+        })
+        .to_string(),
+    )
+}
+
+// Replays a `read` call recorded from a model that fills every property:
+// the line range is inverted, and offset/limit carry their own values. It
+// used to come back as an empty SUCCESS, and a reader concluded code "was not
+// there" that sat in exactly those lines. It must now be refused by name.
+#[test]
+fn tool_call_read_refuses_recorded_inverted_range() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    let content = (1..=300).map(|n| format!("line {n}\n")).collect::<String>();
+    fs::write(root.join("conversion-lane.ts"), content).expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(configure["success"], true, "configure: {configure:#}");
+
+    let response = placeholder_tool_call(
+        &mut aft,
+        "read-inverted",
+        "read",
+        json!({
+            "filePath": "conversion-lane.ts",
+            "startLine": 245,
+            "endLine": 145,
+            "offset": 245,
+            "limit": 70
+        }),
+    );
+    assert_eq!(response["success"], false, "{response:#}");
+    assert_eq!(response["code"], "invalid_range", "{response:#}");
+    let message = response["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("startLine 245 is after endLine 145"),
+        "{response:#}"
+    );
+
+    // A start past the last line is refused the same way.
+    let response = placeholder_tool_call(
+        &mut aft,
+        "read-past-end",
+        "read",
+        json!({ "filePath": "conversion-lane.ts", "startLine": 400, "endLine": 0, "offset": 0, "limit": 0 }),
+    );
+    assert_eq!(response["success"], false, "{response:#}");
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("startLine 400 is past the end of the file (300 lines)"),
+        "{response:#}"
+    );
+
+    // The same placeholders next to a real range still read it.
+    let response = placeholder_tool_call(
+        &mut aft,
+        "read-real-range",
+        "read",
+        json!({ "filePath": "conversion-lane.ts", "startLine": 145, "endLine": 147, "offset": 0, "limit": 0 }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("145: line 145") && text.contains("147: line 147"),
+        "{text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+// Replays the `aft_zoom` shapes recorded from a model that fills every
+// property: a real `path` + `symbols` request arrives next to a placeholder
+// `targets` entry (`x`/`x`) or an empty one. The real request must be
+// answered, and the unresolvable `x` target must report its own error line.
+#[test]
+fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    fs::write(
+        root.join("lane.ts"),
+        "export function alpha() {\n  return 1;\n}\n\nexport function beta() {\n  return 2;\n}\n",
+    )
+    .expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(configure["success"], true, "configure: {configure:#}");
+
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-x-target",
+        "zoom",
+        json!({
+            "path": "lane.ts",
+            "symbols": ["alpha", "beta"],
+            "url": "",
+            "targets": { "path": "x", "symbol": "x" },
+            "contextLines": 0,
+            "callgraph": false
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(text.contains("function alpha()"), "{text}");
+    assert!(text.contains("function beta()"), "{text}");
+    assert!(text.contains("Symbol \"x\" not found in x:"), "{text}");
+    assert!(
+        text.contains("Incomplete zoom results: one or more symbols failed."),
+        "{text}"
+    );
+
+    for targets in [
+        json!({ "path": "", "symbol": "" }),
+        json!([{ "path": " ", "symbol": "" }]),
+        json!([]),
+    ] {
+        let response = placeholder_tool_call(
+            &mut aft,
+            "zoom-empty-target",
+            "zoom",
+            json!({ "path": "lane.ts", "symbols": "alpha", "url": "", "targets": targets }),
+        );
+        assert_eq!(response["success"], true, "{targets}: {response:#}");
+        let text = response["text"].as_str().unwrap_or_default();
+        assert!(text.contains("function alpha()"), "{targets}: {text}");
+        assert!(!text.contains("Incomplete"), "{targets}: {text}");
+    }
+
+    // One usable target next to one missing its symbol: the usable one is
+    // answered, the other reports its own line.
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-partial-target",
+        "zoom",
+        json!({ "targets": [
+            { "path": "lane.ts", "symbol": "beta" },
+            { "path": "lane.ts", "symbol": "" }
+        ] }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(text.contains("function beta()"), "{text}");
+    assert!(
+        text.contains("targets[1].symbol must be a non-empty string"),
+        "{text}"
+    );
+
+    // Nothing usable at all is still refused.
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-nothing",
+        "zoom",
+        json!({ "path": "", "symbols": "", "url": "", "targets": { "path": "", "symbol": "" } }),
+    );
+    assert_eq!(response["success"], false, "{response:#}");
+
+    assert!(aft.shutdown().success());
+}

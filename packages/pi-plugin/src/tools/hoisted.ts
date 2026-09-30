@@ -24,6 +24,7 @@ import {
   decodeFileUrl,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
+  isFindReplaceOnlyEdit,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
 import {
@@ -825,21 +826,7 @@ export function registerHoistedTools(
           }
           if (isGithubResourcePath(filePathArg)) {
             const edits = params.edits;
-            const onlyFindReplace =
-              Array.isArray(edits) &&
-              edits.length > 0 &&
-              params.appendContent === undefined &&
-              params.symbol === undefined &&
-              params.content === undefined &&
-              edits.every(
-                (entry) =>
-                  typeof entry.oldString === "string" &&
-                  (entry.newString === undefined || typeof entry.newString === "string") &&
-                  entry.startLine === undefined &&
-                  entry.endLine === undefined &&
-                  entry.content === undefined,
-              );
-            if (!onlyFindReplace) {
+            if (!isFindReplaceOnlyEdit(argsRecord)) {
               throw new Error(
                 "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
               );

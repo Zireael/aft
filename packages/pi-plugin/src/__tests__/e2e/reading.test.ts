@@ -191,6 +191,23 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     const text = harness.text(result);
     expect(text).toContain("funcA");
   });
+
+  test("zoom merges a placeholder target with a real path + symbols request", async () => {
+    // Shape recorded from a model that fills every declared property: the
+    // real request is path + symbols, `targets` carries a placeholder `x`.
+    const result = await harness.callTool("aft_zoom", {
+      filePath: "sample.ts",
+      symbols: ["funcA", "funcB"],
+      url: "",
+      targets: { path: "x", symbol: "x" },
+      contextLines: 0,
+      callgraph: false,
+    });
+    const text = harness.text(result);
+    expect(text).toContain("[function funcA]");
+    expect(text).toContain("[function funcB]");
+    expect(text).toContain('Symbol "x" not found in x:');
+  });
 });
 
 /**

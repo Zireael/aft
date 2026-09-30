@@ -231,6 +231,31 @@ maybeDescribe("e2e read command", () => {
     expect(binary.title).toBe("binary.bin");
   });
 
+  test("hoisted read tool refuses an inverted range by name instead of returning nothing", async () => {
+    // Shape recorded from a model that fills every declared property. It
+    // used to come back as an empty success.
+    const h = await harness();
+    await expect(
+      executeReadTool(h, {
+        filePath: "sample.ts",
+        startLine: 12,
+        endLine: 4,
+        offset: 12,
+        limit: 70,
+      }),
+    ).rejects.toThrow("invalid_range: startLine 12 is after endLine 4");
+
+    // Zero placeholders next to a real offset/limit still page correctly.
+    const paged = await executeReadTool(h, {
+      filePath: "sample.ts",
+      startLine: 0,
+      endLine: 0,
+      offset: 4,
+      limit: 4,
+    });
+    expect(paged.output).toBe(lineNumberRangeText(await readTextFile(h.path("sample.ts")), 4, 7));
+  });
+
   test("hoisted read tool preserves the server footer for default truncated reads", async () => {
     const h = await harness();
     const filePath = h.path("large-hoisted.txt");

@@ -346,22 +346,49 @@ describe("reading tool adapters", () => {
     expect(text).toContain("src/a.ts:1-2 [function ok]");
   });
 
-  test("aft_zoom targets is mutually exclusive with filePath/symbols/url", async () => {
+  test("aft_zoom merges targets with path + symbols into one batch (placeholder-filling models)", async () => {
+    // Models that fill every declared property send a real path + symbols
+    // request next to a placeholder target such as {path: "x", symbol: "x"}.
+    // Refusing the pair lost the real request; both now go to the server as
+    // one batch, and the unresolvable target reports its own error line.
     const root = await tempProject();
-    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      text: "ok",
+    }));
 
+    await tools.aft_zoom.execute(
+      {
+        targets: { path: "x", symbol: "x" },
+        filePath: "src/a.ts",
+        symbols: ["foo", "bar"],
+        url: "",
+        contextLines: 0,
+        callgraph: false,
+      },
+      createMockSdkContext(root),
+    );
+    expect(sendCalls).toHaveLength(0);
+    expect(toolCallCalls.map((call) => call.rawArgs)).toEqual([
+      {
+        targets: [{ filePath: "x", symbol: "x" }],
+        filePath: "src/a.ts",
+        symbols: ["foo", "bar"],
+      },
+    ]);
+
+    // A path and a url together are still two different files: refused.
     await expect(
       tools.aft_zoom.execute(
         {
           targets: [{ filePath: "src/a.ts", symbol: "foo" }],
           filePath: "src/a.ts",
-          symbols: "foo",
+          url: "https://example.com/doc.md",
         },
         createMockSdkContext(root),
       ),
-    ).rejects.toThrow(/mutually exclusive/);
-    expect(sendCalls).toHaveLength(0);
-    expect(toolCallCalls).toHaveLength(0);
+    ).rejects.toThrow(/not both/);
+    expect(toolCallCalls).toHaveLength(1);
   });
 
   test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {
@@ -512,29 +539,35 @@ describe("reading tool adapters", () => {
     expect(text).toContain('Symbol "missing" not found:');
   });
 
-  test("aft_zoom targets rejects empty filePath/symbol entries", async () => {
+  test("aft_zoom forwards partial targets entries for the server's per-target errors", async () => {
     const root = await tempProject();
-    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
+    const { sendCalls, toolCallCalls, tools } = createMockReadingHarness(() => ({
+      success: true,
+      text: "ok",
+    }));
 
-    await expect(
-      tools.aft_zoom.execute(
-        { targets: [{ filePath: "src/a.ts", symbol: "" }] },
-        createMockSdkContext(root),
-      ),
-    ).rejects.toThrow(/targets\[0\]\.symbol/);
-
-    // An empty sentinel on a required path field means the field was not
-    // supplied in substance, so the error names the canonical `path` as
-    // missing (v0.49 surface rule) rather than the legacy `filePath` alias.
-    await expect(
-      tools.aft_zoom.execute(
-        { targets: [{ filePath: "", symbol: "x" }] },
-        createMockSdkContext(root),
-      ),
-    ).rejects.toThrow(/targets\[0\]\.path/);
+    // An entry missing its symbol or its path is no longer refused here: the
+    // server answers the rest of the batch and reports that entry on its own
+    // line (or refuses the call when no entry is usable).
+    await tools.aft_zoom.execute(
+      {
+        targets: [
+          { filePath: "src/a.ts", symbol: "" },
+          { filePath: "", symbol: "x" },
+        ],
+      },
+      createMockSdkContext(root),
+    );
 
     expect(sendCalls).toHaveLength(0);
-    expect(toolCallCalls).toHaveLength(0);
+    expect(toolCallCalls.map((call) => call.rawArgs)).toEqual([
+      {
+        targets: [
+          { filePath: "src/a.ts", symbol: "" },
+          { filePath: "", symbol: "x" },
+        ],
+      },
+    ]);
   });
 
   test("aft_zoom threads callgraph true to all zoom request shapes and omits it by default", async () => {

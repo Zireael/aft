@@ -5,7 +5,43 @@ import {
   coerceJsonCollectionParam,
   coerceStringArray,
   coerceTargetParam,
+  isFindReplaceOnlyEdit,
+  usableZoomTargets,
 } from "../coerce.js";
+
+describe("usableZoomTargets", () => {
+  test("drops placeholder entries and keeps partial ones", () => {
+    expect(usableZoomTargets(undefined)).toEqual([]);
+    expect(usableZoomTargets([])).toEqual([]);
+    expect(usableZoomTargets({})).toEqual([]);
+    expect(usableZoomTargets({ path: "", symbol: "" })).toEqual([]);
+    expect(
+      usableZoomTargets([
+        { path: " ", symbol: "\t" },
+        { filePath: "", symbol: null },
+      ]),
+    ).toEqual([]);
+    expect(usableZoomTargets({ path: "x", symbol: "x" })).toEqual([{ path: "x", symbol: "x" }]);
+    expect(usableZoomTargets([{ path: "", symbol: "foo" }])).toEqual([{ path: "", symbol: "foo" }]);
+  });
+});
+
+describe("isFindReplaceOnlyEdit", () => {
+  test("treats empty placeholders for unused edit fields as absent", () => {
+    expect(
+      isFindReplaceOnlyEdit({
+        edits: [{ oldString: "a", newString: "b", startLine: 0, endLine: null, content: "" }],
+        appendContent: "",
+        symbol: "",
+        content: null,
+      }),
+    ).toBe(true);
+    expect(isFindReplaceOnlyEdit({ edits: [{ oldString: "a" }], appendContent: "x" })).toBe(false);
+    expect(isFindReplaceOnlyEdit({ edits: [{ startLine: 1, endLine: 2, content: "new" }] })).toBe(
+      false,
+    );
+  });
+});
 
 describe("coerceJsonCollectionParam", () => {
   test("parses JSON targets and sections without altering plain sections", () => {

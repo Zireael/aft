@@ -11,7 +11,12 @@
 
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
-import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceStringArray,
+  isFindReplaceOnlyEdit,
+  toolErrorFromResponse,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig } from "../config.js";
@@ -403,31 +408,25 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           );
         }
 
-        const rawStartLine = coerceOptionalInt(
+        const startLine = coerceOptionalInt(
           args.startLine,
           "startLine",
           1,
           Number.MAX_SAFE_INTEGER,
         );
-        const rawEndLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
-        const rawLimit = coerceOptionalInt(args.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
-        const rawOffset = coerceOptionalInt(args.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
+        const endLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+        const limit = coerceOptionalInt(args.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
+        const offset = coerceOptionalInt(args.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
 
-        // Normalize offset/limit to startLine/endLine (backward compat with opencode's read)
-        let startLine = rawStartLine;
-        let endLine = rawEndLine;
-        if (startLine === undefined && rawOffset !== undefined) {
-          startLine = rawOffset;
-          if (rawLimit !== undefined) {
-            endLine = rawOffset + rawLimit - 1;
-          }
-        }
-
+        // Forward the four range fields as given (empty placeholders already
+        // dropped). The server resolves how they combine, and refuses an
+        // inverted range by name, in one place shared with the Pi plugin and
+        // direct daemon callers, so every host reads the same lines.
         const rawArgs: Record<string, unknown> = { filePath: file };
         if (startLine !== undefined) rawArgs.startLine = startLine;
         if (endLine !== undefined) rawArgs.endLine = endLine;
-        // Only send limit if we did NOT convert offset to startLine/endLine.
-        if (rawLimit !== undefined && rawOffset === undefined) rawArgs.limit = rawLimit;
+        if (offset !== undefined) rawArgs.offset = offset;
+        if (limit !== undefined) rawArgs.limit = limit;
 
         // GitHub resources can embed images. For local media extensions, exclude
         // directories before negotiating capability; all other reads dispatch directly.
@@ -835,24 +834,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       if (!file) throw new Error("'path' parameter is required");
       if (isGithubResourcePath(file)) {
         const edits = argsRecord.edits;
-        const onlyFindReplace =
-          Array.isArray(edits) &&
-          edits.length > 0 &&
-          argsRecord.appendContent === undefined &&
-          argsRecord.symbol === undefined &&
-          argsRecord.content === undefined &&
-          edits.every(
-            (entry) =>
-              entry !== null &&
-              typeof entry === "object" &&
-              typeof (entry as Record<string, unknown>).oldString === "string" &&
-              ((entry as Record<string, unknown>).newString === undefined ||
-                typeof (entry as Record<string, unknown>).newString === "string") &&
-              (entry as Record<string, unknown>).startLine === undefined &&
-              (entry as Record<string, unknown>).endLine === undefined &&
-              (entry as Record<string, unknown>).content === undefined,
-          );
-        if (!onlyFindReplace) {
+        if (!isFindReplaceOnlyEdit(argsRecord)) {
           throw new Error(
             "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
           );

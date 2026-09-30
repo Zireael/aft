@@ -600,6 +600,32 @@ fn webp_has_animation(bytes: &[u8]) -> bool {
     false
 }
 
+/// Refusal for a line window whose start comes after its end. Clamping such a
+/// window used to return an empty success, which reads exactly like "those
+/// lines exist and are empty"; agents drew wrong conclusions from it.
+fn inverted_range_error(id: &str, start_line: u64, end_line: u64) -> Response {
+    Response::error(
+        id,
+        "invalid_range",
+        format!(
+            "invalid_range: startLine {start_line} is after endLine {end_line}; no lines selected. Use a start line at or before the end line."
+        ),
+    )
+}
+
+/// Refusal for a window that starts after the last line of a non-empty file,
+/// for the same reason as [`inverted_range_error`]: zero lines must never
+/// look like a successful read.
+fn start_past_end_error(id: &str, start_line: u64, total_lines: u32) -> Response {
+    Response::error(
+        id,
+        "invalid_range",
+        format!(
+            "invalid_range: startLine {start_line} is past the end of the file ({total_lines} lines); no lines selected. Use a start line between 1 and {total_lines}."
+        ),
+    )
+}
+
 fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response {
     let byte_size = bytes.len();
     if let Some(media) = sniff_media(&bytes[..bytes.len().min(MEDIA_MAGIC_BYTES)]) {
@@ -645,6 +671,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         .params
         .get("limit")
         .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
         .map(|value| value as u32)
         .unwrap_or(DEFAULT_LIMIT);
     let start_line = req
@@ -653,10 +680,20 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         .and_then(|value| value.as_u64())
         .map(|value| value.max(1) as u32)
         .unwrap_or(1);
-    let end_line = req
+    let explicit_end_line = req
         .params
         .get("end_line")
         .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0);
+    if let Some(end_line) = explicit_end_line {
+        if u64::from(start_line) > end_line {
+            return inverted_range_error(&req.id, u64::from(start_line), end_line);
+        }
+    }
+    if start_line > total_lines && total_lines > 0 {
+        return start_past_end_error(&req.id, u64::from(start_line), total_lines);
+    }
+    let end_line = explicit_end_line
         .map(|value| value as u32)
         .unwrap_or_else(|| {
             start_line
@@ -1195,12 +1232,17 @@ fn read_selection(
         .get("start_line")
         .and_then(Value::as_u64)
         .unwrap_or(1) as usize;
-    let explicit_end = req.params.get("end_line").and_then(Value::as_u64);
+    let explicit_end = req
+        .params
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
     if req.params.get("start_line").is_some() || explicit_end.is_some() {
         let limit = req
             .params
             .get("limit")
             .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_LIMIT as u64) as usize;
         let end = explicit_end
             .map(|value| value as usize)
@@ -1290,11 +1332,14 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         return handle_media_read(req, path.as_path(), metadata.len(), media);
     }
 
-    // Parse range parameters
+    // Parse range parameters. Zero is outside the 1-based domain of every
+    // range field, so a `0` placeholder counts as absent rather than selecting
+    // an empty window (a zero limit or end line would read no lines at all).
     let limit = req
         .params
         .get("limit")
         .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_LIMIT);
 
@@ -1305,10 +1350,20 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|v| v.max(1) as u32)
         .unwrap_or(1);
 
-    let explicit_end_line = req.params.get("end_line").and_then(|v| v.as_u64());
+    let explicit_end_line = req
+        .params
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0);
     let has_explicit_range = req.params.get("start_line").is_some()
         || explicit_end_line.is_some()
         || req.params.get("limit").is_some();
+
+    if let Some(end_line) = explicit_end_line {
+        if u64::from(start_line) > end_line {
+            return inverted_range_error(&req.id, u64::from(start_line), end_line);
+        }
+    }
 
     if has_explicit_range {
         return handle_streaming_range_read(
@@ -1379,22 +1434,16 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len() as u32;
 
-    let end_line = req
-        .params
-        .get("end_line")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or_else(|| {
-            start_line
-                .saturating_add(limit)
-                .saturating_sub(1)
-                .min(total_lines)
-        });
+    let end_line = explicit_end_line.map(|v| v as u32).unwrap_or_else(|| {
+        start_line
+            .saturating_add(limit)
+            .saturating_sub(1)
+            .min(total_lines)
+    });
 
-    // Clamp to actual line count. `.max(start_idx)` guards against agents
-    // sending inverted ranges (e.g. end_line < start_line) which would
-    // otherwise panic at `lines[start_idx..end_idx]` below. With this guard,
-    // inverted ranges yield an empty slice and return zero lines.
+    // Clamp to actual line count. `.max(start_idx)` keeps the slice below
+    // from panicking; inverted windows were already refused above, so it
+    // never turns a real request into an empty one.
     let start_idx = (start_line.saturating_sub(1) as usize).min(lines.len());
     let end_idx = (end_line as usize).min(lines.len()).max(start_idx);
 
@@ -1669,6 +1718,13 @@ fn handle_streaming_range_read(
     }
 
     let exact_total_lines = (!has_more_after_range && !scan_gap).then_some(observed_lines);
+
+    if selected_lines.is_empty() && !scan_gap && observed_lines > 0 {
+        // The whole file was scanned and the window still selected nothing,
+        // so the start lies past the last line. Saying so by name keeps the
+        // reader from taking an empty result as "those lines are blank".
+        return start_past_end_error(&req.id, u64::from(start_line), observed_lines);
+    }
 
     if selected_lines.is_empty() {
         let mut data = serde_json::json!({

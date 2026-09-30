@@ -226,6 +226,50 @@ fn serialize_zoom_target_response(req: &RawRequest, response: Response) -> serde
     })
 }
 
+/// Why one `targets` entry cannot be zoomed: the refusal text plus the label
+/// and symbol name its per-target error line is rendered under.
+struct InvalidZoomTarget {
+    label: String,
+    name: String,
+    message: String,
+}
+
+fn zoom_target_fields(
+    target: &serde_json::Value,
+    index: usize,
+) -> Result<(&str, &str, &str), InvalidZoomTarget> {
+    let obj = target.as_object();
+    let field = |key: &str| {
+        obj.and_then(|obj| obj.get(key))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+    };
+    let label = obj
+        .and_then(|obj| obj.get("target_label").or_else(|| obj.get("targetLabel")))
+        .and_then(|value| value.as_str())
+        .filter(|label| !label.trim().is_empty());
+    let file = field("file");
+    let symbol = field("symbol");
+    let invalid = |message: String| InvalidZoomTarget {
+        label: label.or(file).unwrap_or("(no path)").to_string(),
+        name: symbol.unwrap_or("").to_string(),
+        message,
+    };
+    let Some(file) = file else {
+        return Err(invalid(deterministic_zoom_refusal(
+            format!("zoom: targets[{index}].file must be a non-empty string"),
+            "Provide a file path for every target.",
+        )));
+    };
+    let Some(symbol) = symbol else {
+        return Err(invalid(deterministic_zoom_refusal(
+            format!("zoom: targets[{index}].symbol must be a non-empty string"),
+            "Provide a symbol name for every target.",
+        )));
+    };
+    Ok((file, symbol, label.unwrap_or(file)))
+}
+
 fn handle_zoom_targets(
     req: &RawRequest,
     ctx: &AppContext,
@@ -244,50 +288,45 @@ fn handle_zoom_targets(
         );
     }
 
+    // An unusable entry (no file or no symbol) becomes its own error line so
+    // the rest of the batch still answers. The whole call is refused only
+    // when no entry is usable, because then there is nothing to return.
     let mut entries = Vec::with_capacity(targets.len());
+    let mut first_refusal: Option<String> = None;
+    let mut any_usable = false;
     for (index, target) in targets.iter().enumerate() {
-        let obj = target.as_object();
-        let Some(file) = obj
-            .and_then(|obj| obj.get("file"))
-            .and_then(|value| value.as_str())
-            .filter(|file| !file.is_empty())
-        else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                deterministic_zoom_refusal(
-                    format!("zoom: targets[{index}].file must be a non-empty string"),
-                    "Provide a file path for every target.",
-                ),
-            );
-        };
-        let Some(symbol) = obj
-            .and_then(|obj| obj.get("symbol"))
-            .and_then(|value| value.as_str())
-            .filter(|symbol| !symbol.is_empty())
-        else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                deterministic_zoom_refusal(
-                    format!("zoom: targets[{index}].symbol must be a non-empty string"),
-                    "Provide a symbol name for every target.",
-                ),
-            );
-        };
-        let target_label = obj
-            .and_then(|obj| obj.get("target_label").or_else(|| obj.get("targetLabel")))
-            .and_then(|value| value.as_str())
-            .filter(|label| !label.is_empty())
-            .unwrap_or(file);
-
-        let response =
-            zoom_one_target_response(req, ctx, file, symbol, context_lines, include_callgraph);
-        entries.push(serde_json::json!({
-            "targetLabel": target_label,
-            "name": symbol,
-            "response": serialize_zoom_target_response(req, response),
-        }));
+        match zoom_target_fields(target, index) {
+            Ok((file, symbol, target_label)) => {
+                any_usable = true;
+                let response = zoom_one_target_response(
+                    req,
+                    ctx,
+                    file,
+                    symbol,
+                    context_lines,
+                    include_callgraph,
+                );
+                entries.push(serde_json::json!({
+                    "targetLabel": target_label,
+                    "name": symbol,
+                    "response": serialize_zoom_target_response(req, response),
+                }));
+            }
+            Err(invalid) => {
+                let response = Response::error(&req.id, "invalid_request", invalid.message.clone());
+                first_refusal.get_or_insert(invalid.message);
+                entries.push(serde_json::json!({
+                    "targetLabel": invalid.label,
+                    "name": invalid.name,
+                    "response": serialize_zoom_target_response(req, response),
+                }));
+            }
+        }
+    }
+    if !any_usable {
+        if let Some(message) = first_refusal {
+            return Response::error(&req.id, "invalid_request", message);
+        }
     }
 
     Response::success(
@@ -296,6 +335,36 @@ fn handle_zoom_targets(
             "targets": entries,
         }),
     )
+}
+
+/// Expand a top-level `file` (or `url`) plus `symbol`/`symbols` that arrived
+/// next to `targets` into batch entries, one per symbol, split exactly as the
+/// single-file mode splits them. Some models fill every declared parameter on
+/// every call, so a real same-file request routinely arrives beside a
+/// placeholder `targets` entry; answering both beats refusing both. A file
+/// with no symbol still becomes one entry, which reports the missing symbol
+/// on its own line.
+fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value> {
+    let label = req
+        .params
+        .get("target_label")
+        .and_then(|value| value.as_str())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(file);
+    let names = if is_github_read_target(file) {
+        github_zoom_selector(req)
+            .map(|selector| vec![selector])
+            .unwrap_or_default()
+    } else {
+        parse_zoom_symbol_names(&req.params, detect_language(Path::new(file))).unwrap_or_default()
+    };
+    if names.is_empty() {
+        return vec![serde_json::json!({ "file": file, "symbol": "", "target_label": label })];
+    }
+    names
+        .into_iter()
+        .map(|name| serde_json::json!({ "file": file, "symbol": name, "target_label": label }))
+        .collect()
 }
 
 /// Handle a `zoom` request.
@@ -327,7 +396,18 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                 ),
             );
         };
-        return handle_zoom_targets(req, ctx, targets, context_lines, include_callgraph);
+        let mut merged = Vec::with_capacity(targets.len() + 1);
+        if let Some(file) = req
+            .params
+            .get("file")
+            .or_else(|| req.params.get("url"))
+            .and_then(|v| v.as_str())
+            .filter(|file| !file.trim().is_empty())
+        {
+            merged.extend(same_file_zoom_targets(req, file));
+        }
+        merged.extend(targets.iter().cloned());
+        return handle_zoom_targets(req, ctx, &merged, context_lines, include_callgraph);
     }
 
     let file = match req

@@ -225,3 +225,71 @@ export function coerceJsonCollectionParam(value: unknown, field: "targets" | "se
   }
   throw new Error(`${field} must be ${shape} (got an invalid type)`);
 }
+
+/**
+ * True when a value is an empty placeholder: anything `isEmptyParam` treats
+ * as empty, plus a string of only whitespace. Some models fill every declared
+ * tool property on every call and send `" "` as readily as `""`.
+ */
+export function isBlankParam(value: unknown): boolean {
+  if (typeof value === "string") return value.trim().length === 0;
+  return isEmptyParam(value);
+}
+
+/**
+ * The `aft_zoom` `targets` entries that carry real input, as an array.
+ *
+ * Accepts the decoded `targets` value (a single `{path, symbol}` object or
+ * an array of them). An entry whose path (or `filePath`) and symbol are both
+ * blank is a placeholder and is dropped, so `targets: {path: "", symbol: ""}`
+ * or `[]` yields no entries and counts as not supplied. Every other entry,
+ * including one with only a path or only a symbol, is kept; the server
+ * reports such an entry as its own per-target error line.
+ */
+export function usableZoomTargets(targets: unknown): unknown[] {
+  if (isEmptyParam(targets)) return [];
+  const entries = Array.isArray(targets) ? targets : [targets];
+  return entries.filter((entry) => {
+    if (entry === null || entry === undefined) return false;
+    if (typeof entry !== "object") return true;
+    const record = entry as Record<string, unknown>;
+    return !(
+      isBlankParam(record.path) &&
+      isBlankParam(record.filePath) &&
+      isBlankParam(record.symbol)
+    );
+  });
+}
+
+/**
+ * True when an `edit` call is only `edits[]` find/replace items, the one
+ * shape GitHub comment resources accept.
+ *
+ * Unused edit fields count as absent when they carry an empty placeholder
+ * (`""` or null, and `0` for the 1-based line fields): models that fill
+ * every declared property send them on every call, and refusing a valid
+ * find/replace because of them would reject a correct request.
+ */
+export function isFindReplaceOnlyEdit(args: Record<string, unknown>): boolean {
+  const absent = (value: unknown) => value === undefined || value === null || value === "";
+  const absentLine = (value: unknown) => absent(value) || value === 0;
+  const edits = args.edits;
+  return (
+    Array.isArray(edits) &&
+    edits.length > 0 &&
+    absent(args.appendContent) &&
+    absent(args.symbol) &&
+    absent(args.content) &&
+    edits.every((entry) => {
+      if (entry === null || typeof entry !== "object") return false;
+      const item = entry as Record<string, unknown>;
+      return (
+        typeof item.oldString === "string" &&
+        (absent(item.newString) || typeof item.newString === "string") &&
+        absentLine(item.startLine) &&
+        absentLine(item.endLine) &&
+        absent(item.content)
+      );
+    })
+  );
+}

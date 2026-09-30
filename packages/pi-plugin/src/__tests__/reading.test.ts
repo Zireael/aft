@@ -362,19 +362,53 @@ describe("reading tool adapters", () => {
     expect(result.content[0].text).toContain("src/a.ts:1-1 [function ok]");
   });
 
-  test("aft_zoom targets is mutually exclusive with filePath/symbols/url", async () => {
+  test("aft_zoom merges targets with path + symbols into one batch (placeholder-filling models)", async () => {
+    // Models that fill every declared property send a real path + symbols
+    // request next to a placeholder target such as {path: "x", symbol: "x"}.
+    // Refusing the pair lost the real request; both now go to the server as
+    // one batch, and the unresolvable target reports its own error line.
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge();
     registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
 
+    await executeTool(tools.get("aft_zoom")!, {
+      targets: { path: "x", symbol: "x" },
+      filePath: "src/a.ts",
+      symbols: ["foo", "bar"],
+      url: "",
+      contextLines: 0,
+      callgraph: false,
+    });
+    expect(calls).toHaveLength(1);
+    expect(toolArgs(calls[0])).toEqual({
+      targets: [{ filePath: "x", symbol: "x" }],
+      filePath: "src/a.ts",
+      symbols: ["foo", "bar"],
+    });
+
+    // Partial entries are forwarded for the server's per-target errors.
+    await executeTool(tools.get("aft_zoom")!, {
+      targets: [
+        { filePath: "src/a.ts", symbol: "" },
+        { filePath: "", symbol: "x" },
+      ],
+    });
+    expect(toolArgs(calls[1])).toEqual({
+      targets: [
+        { filePath: "src/a.ts", symbol: "" },
+        { filePath: "", symbol: "x" },
+      ],
+    });
+
+    // A path and a url together are still two different files: refused.
     await expect(
       executeTool(tools.get("aft_zoom")!, {
         targets: [{ filePath: "src/a.ts", symbol: "foo" }],
         filePath: "src/a.ts",
-        symbols: "foo",
+        url: "https://example.com/doc.md",
       }),
-    ).rejects.toThrow(/mutually exclusive/);
-    expect(calls).toHaveLength(0);
+    ).rejects.toThrow(/not both/);
+    expect(calls).toHaveLength(2);
   });
 
   test("aft_zoom treats empty-content targets shapes as not provided (GPT empty-param regression)", async () => {

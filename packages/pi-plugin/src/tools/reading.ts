@@ -3,7 +3,13 @@
  * Structural overview and symbol/section inspection.
  */
 
-import { coerceBoolean, coerceJsonCollectionParam, coerceTargetParam } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceJsonCollectionParam,
+  coerceTargetParam,
+  isBlankParam,
+  usableZoomTargets,
+} from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
   ExtensionAPI,
@@ -38,6 +44,11 @@ import {
   renderToolCall,
   shortenPath,
 } from "./render-helpers.js";
+
+/** GitHub discussion targets are fetched by the server, not read from disk. */
+function isGithubPathArg(value: unknown): boolean {
+  return typeof value === "string" && (value.startsWith("issue://") || value.startsWith("pr://"));
+}
 
 const OutlineParams = Type.Object({
   target: Type.Union([Type.String(), Type.Array(Type.String())], {
@@ -79,7 +90,7 @@ const ZoomParams = Type.Object({
   targets: Type.Optional(
     Type.Union([ZoomTarget, Type.Array(ZoomTarget)], {
       description:
-        "Cross-file batch: `{ path, symbol }` or an array of them. Mutually exclusive with path/url/symbols.",
+        "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
     }),
   ),
   contextLines: optionalInt(
@@ -440,7 +451,7 @@ export function registerReadingTools(
         name: "aft_zoom",
         label: "zoom",
         description:
-          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line." +
           (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
         parameters: ZoomParams,
         async execute(
@@ -451,35 +462,16 @@ export function registerReadingTools(
           extCtx,
         ) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
-          // GPT-family models send empty strings / empty arrays / empty objects
-          // instead of omitting optional params. Use `isEmptyParam` so e.g.
-          // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
-          // against fields the agent didn't actually intend to provide.
-          // `targets` also accepts nested object/array shapes. Only treat
-          // `targets` as not-provided when EVERY entry is fully empty
-          // (`[{path: "", symbol: ""}]`, `{path: "", symbol: ""}`)
-          // — that's the GPT-class "I didn't intend this param" signal.
-          // If any entry has even one non-empty field, the agent intends
-          // targets mode; let the per-entry validation below surface the
-          // specific error ("targets[0].path must be non-empty" etc).
-          const hasTargetsProvided = (t: unknown): boolean => {
-            if (isEmptyParam(t)) return false;
-            const entryEmpty = (entry: unknown): boolean => {
-              if (!entry || typeof entry !== "object") return true;
-              const fp = (entry as { path?: unknown }).path;
-              const sym = (entry as { symbol?: unknown }).symbol;
-              const fpEmpty = typeof fp !== "string" || fp.length === 0;
-              const symEmpty = typeof sym !== "string" || sym.length === 0;
-              return fpEmpty && symEmpty;
-            };
-            if (Array.isArray(t)) return !t.every(entryEmpty);
-            return !entryEmpty(t);
-          };
+          // Some models fill every declared property on every call, sending
+          // empty strings / arrays / objects (or whitespace) for the ones they
+          // do not mean. Blank values count as absent, and `targets` entries
+          // whose path and symbol are both blank are dropped as placeholders.
           const targetsInput = coerceJsonCollectionParam(params.targets, "targets");
-          const hasPath = !isEmptyParam(params.path);
-          const hasUrl = !isEmptyParam(params.url);
-          const hasTargets = hasTargetsProvided(targetsInput);
-          const hasSymbols = !isEmptyParam(params.symbols);
+          const targetEntries = usableZoomTargets(targetsInput);
+          const hasPath = !isBlankParam(params.path);
+          const hasUrl = !isBlankParam(params.url);
+          const hasTargets = targetEntries.length > 0;
+          const hasSymbols = !isBlankParam(params.symbols);
           // Coerce stringified booleans and numbers here so they reach the server
           // in the same form the main client sends.
           const wantCallgraph = coerceBoolean(params.callgraph);
@@ -490,35 +482,40 @@ export function registerReadingTools(
             Number.MAX_SAFE_INTEGER,
           );
 
-          // Multi-target mode (cross-file). Mutually exclusive with the other
-          // modes so the agent doesn't accidentally provide overlapping inputs
-          // that get silently ignored.
+          // Cross-file batch. `path`/`url` + `symbols` sent alongside
+          // `targets` join the same batch instead of being refused: the server
+          // answers every lookup and reports each one that fails on its own
+          // line.
           if (hasTargets) {
-            if (hasPath || hasUrl || hasSymbols) {
-              throw new Error("'targets' is mutually exclusive with 'path', 'url', and 'symbols'");
+            if (hasPath && hasUrl) {
+              throw new Error("Provide exactly ONE of 'path' or 'url' — not both");
             }
-            const targets = Array.isArray(targetsInput)
-              ? (targetsInput as Array<{ path: string; symbol: string }>)
-              : ([targetsInput] as Array<{ path: string; symbol: string }>);
-            if (targets.length === 0) {
-              throw new Error("'targets' must be a non-empty object or array");
-            }
-            for (const [i, entry] of targets.entries()) {
-              if (!entry || typeof entry.path !== "string" || entry.path.length === 0) {
+            const targets = targetEntries.map((entry, i) => {
+              if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
                 throw new Error(`targets[${i}].path must be a non-empty string`);
               }
-              if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
-                throw new Error(`targets[${i}].symbol must be a non-empty string`);
-              }
-            }
+              const record = entry as Record<string, unknown>;
+              const targetPath = isBlankParam(record.path) ? record.filePath : record.path;
+              return {
+                path: typeof targetPath === "string" ? targetPath : "",
+                symbol: typeof record.symbol === "string" ? record.symbol : "",
+              };
+            });
+            const localPaths = targets
+              .map((target) => target.path)
+              .filter((path) => path.trim().length > 0 && !isGithubPathArg(path));
+            if (hasPath && !isGithubPathArg(params.path)) localPaths.push(params.path as string);
             const resolvedTargets = await Promise.all(
-              targets.map((t) => resolvePathArg(extCtx.cwd, t.path)),
+              localPaths.map((path) => resolvePathArg(extCtx.cwd, path)),
             );
             await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
 
             const rawArgs: Record<string, unknown> = {
               targets: targets.map((target) => ({ filePath: target.path, symbol: target.symbol })),
             };
+            if (hasPath) rawArgs.filePath = params.path;
+            else if (hasUrl) rawArgs.url = params.url;
+            if (hasSymbols) rawArgs.symbols = params.symbols;
             if (contextLines !== undefined) rawArgs.contextLines = contextLines;
             if (wantCallgraph) rawArgs.callgraph = true;
 
@@ -540,12 +537,7 @@ export function registerReadingTools(
           // File mode still resolves locally before dispatch so external-directory
           // permission checks approve the same path the server will read.
           const githubPath =
-            (hasPath &&
-              (String(params.path).startsWith("issue://") ||
-                String(params.path).startsWith("pr://"))) ||
-            (hasUrl &&
-              (String(params.url).startsWith("issue://") ||
-                String(params.url).startsWith("pr://")));
+            (hasPath && isGithubPathArg(params.path)) || (hasUrl && isGithubPathArg(params.url));
           if (!hasUrl && !githubPath) {
             const file = await resolvePathArg(extCtx.cwd, params.path as string);
             await assertReadPathPermissions(extCtx, ctx, file);

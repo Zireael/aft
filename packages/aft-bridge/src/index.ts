@@ -104,7 +104,10 @@ export {
   coerceOptionalInt,
   coerceStringArray,
   coerceTargetParam,
+  isBlankParam,
   isEmptyParam,
+  isFindReplaceOnlyEdit,
+  usableZoomTargets,
 } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- config error state (a plugin that loads but fails every tool call) ---
