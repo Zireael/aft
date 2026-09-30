@@ -31,11 +31,55 @@
 //! a standalone process keeps it, logged once as unpinned, so users relying on
 //! a system-installed runtime keep working.
 //!
-//! Known limit: the file is hashed, then loaded by path. A process that can
-//! write the folder and wins the race between the two could still swap it.
+//! # Hashing and loading the same file
+//!
+//! Hashing a path and then loading the same path leaves a window: a process
+//! that can write the folder could replace the file after the hash matched and
+//! before the loader opened it. A pinned library is therefore opened once,
+//! hashed through that open file, and loaded through the same open file, so
+//! the loader maps the file that was hashed whatever the path names by then:
+//! - macOS: `dlopen("/dev/fd/<n>")`. Opening `/dev/fd/<n>` duplicates the
+//!   descriptor, so dyld maps the inode that was hashed. Measured on macOS 27
+//!   with the 1.24.4 library, from a plain binary and from one signed with
+//!   hardened runtime and `disable-library-validation`: the load succeeds, a
+//!   second `dlopen` of the same `/dev/fd` path returns the same handle, and
+//!   renaming another library over the original path between `open` and
+//!   `dlopen` still loads the hashed 1.24.4 file (the replacement's
+//!   constructor never runs; loading the same swap by path runs it). dyld
+//!   records the file's real path for the image (`dladdr` names it), so
+//!   `@loader_path` still resolves as for a load by path.
+//! - Linux: `dlopen("/proc/self/fd/<n>")`, which reopens the inode behind the
+//!   descriptor.
+//! - Windows: the file stays open with only read sharing (no write or delete
+//!   sharing) until the load is over, so it cannot be rewritten, replaced,
+//!   renamed or deleted, and `LoadLibrary` of its path loads the bytes that
+//!   were hashed.
+//!
+//! Residual, macOS and Linux: the same user can still rewrite the hashed file
+//! in place (same inode) between the hash and the moment the loader maps it;
+//! no user-space lock stops a same-user writer. After loading, the file is
+//! checked again (same device, inode, size, change time, and a fresh sha256
+//! through the open file) and the load is reported as failed if anything
+//! changed, so the library is never used. That detects the rewrite but cannot
+//! undo it: the library's initializers have already run by then. The same
+//! check also fails a load whose file was replaced by a rename meanwhile (the
+//! unlinked original's change time moves), even though the checked bytes were
+//! the ones loaded: a library replaced mid-load means something is writing to
+//! the folder, and the load fails closed. Windows residual: a directory
+//! junction on the path could be re-pointed during the load; AFT's own runtime
+//! folder contains none.
+//!
+//! An operator's library (named by `ORT_DYLIB_PATH` at spawn, outside the
+//! managed folder) is accepted whatever its bytes are, so there is no check to
+//! race; it is loaded by its path, as before, which keeps any sibling
+//! libraries it resolves relative to its own location loadable.
+//!
+//! No private copy of the library is made, so there is nothing left behind in
+//! AFT's storage to clean up.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
@@ -209,12 +253,180 @@ pub(crate) struct OrtPinPolicy<'a> {
     pub pinned_sha256: &'a [&'a str],
 }
 
+/// A library the pin admitted, with the open file it was hashed through.
+///
+/// A pinned library must be loaded through [`AuthorizedOrtLibrary::load_path`]
+/// while this value is alive: the path names the open file, so the loader maps
+/// the bytes that were hashed even if the file's own path has been replaced
+/// since. Dropping the value closes the file; do that only after the load.
+#[derive(Debug)]
+pub struct AuthorizedOrtLibrary {
+    authorization: OrtLoadAuthorization,
+    held: Option<HeldLibrary>,
+}
+
+/// The open file a pinned library was hashed through, and what it looked like
+/// while being hashed.
+#[derive(Debug)]
+struct HeldLibrary {
+    file: File,
+    path: PathBuf,
+    sha256: String,
+    #[cfg(unix)]
+    identity: FileIdentity,
+}
+
+/// The metadata that changes when a file is replaced or written to. The change
+/// time (`ctime`) is set by the kernel on every write and cannot be set back
+/// by a user process, unlike the modification time.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    fn of(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+        })
+    }
+}
+
+impl AuthorizedOrtLibrary {
+    /// Why the load is allowed.
+    pub fn authorization(&self) -> &OrtLoadAuthorization {
+        &self.authorization
+    }
+
+    /// The path to give the loader (`dlopen`, `LoadLibrary`, `ort::init_from`),
+    /// or `None` for a load by bare name from the loader search path.
+    ///
+    /// For a pinned library this names the open file the hash was computed
+    /// through (`/dev/fd/<n>` on macOS, `/proc/self/fd/<n>` on Linux), never
+    /// the path it was found at. On Windows it is the original path: the file
+    /// is held open without write or delete sharing, so that path cannot name
+    /// different bytes until this value is dropped.
+    pub fn load_path(&self) -> Option<PathBuf> {
+        // Only a pinned library is held, and it is always held.
+        if let Some(held) = &self.held {
+            return Some(held_file_load_path(&held.file, &held.path));
+        }
+        match &self.authorization {
+            OrtLoadAuthorization::LoaderSearchUnpinned => None,
+            OrtLoadAuthorization::OperatorUnpinned { path, .. }
+            | OrtLoadAuthorization::Pinned { path, .. } => Some(path.clone()),
+        }
+    }
+
+    /// Check, after the load, that the held file still is what was hashed:
+    /// same device, inode, size and change time, and the same sha256 read
+    /// again through the open file. A same-user process can rewrite the file in
+    /// place between the hash and the loader mapping it; this reports that
+    /// rewrite so the library is never used, though its initializers have
+    /// already run. Always `Ok` for loads that were not pinned.
+    pub fn confirm_unchanged(&self) -> Result<(), String> {
+        let Some(held) = self.held.as_ref() else {
+            return Ok(());
+        };
+        let path = &held.path;
+        let changed = |detail: String| {
+            // Worded like the hash-mismatch refusal, for the same reason: it
+            // must not read as a missing runtime (see `open_authorized_with`).
+            format!(
+                "onnx runtime library changed while it was being checked at {}: {detail}. \
+                 It is not used, so semantic search is unavailable. Remove the file and \
+                 reinstall with `npx @cortexkit/aft doctor --clear`.",
+                path.display()
+            )
+        };
+        #[cfg(unix)]
+        {
+            let now = FileIdentity::of(&held.file)
+                .map_err(|error| changed(format!("cannot read its metadata: {error}")))?;
+            if now != held.identity {
+                return Err(changed("it was replaced or written to".to_string()));
+            }
+        }
+        let mut file = &held.file;
+        let sha256 = file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| sha256_reader(&mut file))
+            .map_err(|error| changed(format!("cannot read it again: {error}")))?;
+        if sha256 != held.sha256 {
+            return Err(changed(format!("its sha256 is now {sha256}")));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn held_file_load_path(file: &File, _path: &Path) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn held_file_load_path(file: &File, _path: &Path) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(windows)]
+fn held_file_load_path(_file: &File, path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Open a library to hash it. On Windows the file is shared for reading only,
+/// so nothing can write, replace, rename or delete it (or rename a folder
+/// above it) while it stays open.
+fn open_library(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
 /// Decide whether the library at `candidate` (or the bare-name load when
 /// `None`) may be loaded. Reads and hashes the file; never loads it.
+#[cfg(test)]
 pub(crate) fn authorize_with(
     policy: &OrtPinPolicy<'_>,
     candidate: Option<&OsStr>,
 ) -> Result<OrtLoadAuthorization, String> {
+    open_authorized_with(policy, candidate).map(|library| library.authorization)
+}
+
+/// [`authorize_with`], keeping a pinned library's file open so it can be
+/// loaded through the same open file it was hashed through.
+pub(crate) fn open_authorized_with(
+    policy: &OrtPinPolicy<'_>,
+    candidate: Option<&OsStr>,
+) -> Result<AuthorizedOrtLibrary, String> {
     let Some(candidate) = candidate.filter(|value| !value.is_empty()) else {
         if policy.require_pinned {
             // Keeps the missing-runtime prefix: the semantic build treats that
@@ -228,34 +440,58 @@ pub(crate) fn authorize_with(
                  `npx @cortexkit/aft doctor --fix` to install it."
             ));
         }
-        return Ok(OrtLoadAuthorization::LoaderSearchUnpinned);
+        return Ok(AuthorizedOrtLibrary {
+            authorization: OrtLoadAuthorization::LoaderSearchUnpinned,
+            held: None,
+        });
     };
 
     let path = Path::new(candidate);
-    let sha256 = sha256_file(path).map_err(|error| {
+    let unreadable = |error: std::io::Error| {
         format!(
             "{ONNX_RUNTIME_MISSING_PREFIX} cannot read '{}' to check its sha256 before \
              loading it: {error}. Run `npx @cortexkit/aft doctor --fix` to install it.",
             path.display()
         )
-    })?;
+    };
+    let mut file = open_library(path).map_err(unreadable)?;
+    #[cfg(unix)]
+    let identity = FileIdentity::of(&file).map_err(unreadable)?;
+    let sha256 = sha256_reader(&mut file).map_err(unreadable)?;
+    // Rewind so a loader that reads through the descriptor (opening
+    // `/dev/fd/<n>` on macOS shares this file's offset) starts at the top.
+    file.seek(SeekFrom::Start(0)).map_err(unreadable)?;
 
     if policy
         .pinned_sha256
         .iter()
         .any(|pinned| pinned.eq_ignore_ascii_case(&sha256))
     {
-        return Ok(OrtLoadAuthorization::Pinned {
-            path: path.to_path_buf(),
-            sha256,
+        return Ok(AuthorizedOrtLibrary {
+            authorization: OrtLoadAuthorization::Pinned {
+                path: path.to_path_buf(),
+                sha256: sha256.clone(),
+            },
+            // The metadata is taken before hashing, so a write while the hash
+            // was being read also shows up in `confirm_unchanged`.
+            held: Some(HeldLibrary {
+                file,
+                path: path.to_path_buf(),
+                sha256,
+                #[cfg(unix)]
+                identity,
+            }),
         });
     }
 
     let named_at_spawn = policy.spawn_value == Some(candidate);
     if named_at_spawn && !is_inside_any(path, policy.managed_roots) {
-        return Ok(OrtLoadAuthorization::OperatorUnpinned {
-            path: path.to_path_buf(),
-            sha256,
+        return Ok(AuthorizedOrtLibrary {
+            authorization: OrtLoadAuthorization::OperatorUnpinned {
+                path: path.to_path_buf(),
+                sha256,
+            },
+            held: None,
         });
     }
 
@@ -292,12 +528,18 @@ fn is_inside_any(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 /// Lowercase hex sha256 of a file's bytes, following symlinks.
+#[cfg(test)]
 pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    sha256_reader(&mut File::open(path)?)
+}
+
+/// Lowercase hex sha256 of everything `reader` yields from its current
+/// position.
+fn sha256_reader(reader: &mut impl Read) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 16];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -317,11 +559,12 @@ fn pinned_hashes() -> Vec<&'static str> {
         .collect()
 }
 
-/// Authorize the next ONNX Runtime load against this process's state. Every
-/// path that loads the library calls this first, and loads only on `Ok`.
-pub fn authorize_onnx_runtime_load(
+/// Authorize the next ONNX Runtime load against this process's state and keep
+/// the checked file open for it. Every path that loads the library goes
+/// through this (via [`load_authorized_with`]) and loads only on `Ok`.
+pub fn open_onnx_runtime_for_load(
     candidate: Option<&OsStr>,
-) -> Result<OrtLoadAuthorization, String> {
+) -> Result<AuthorizedOrtLibrary, String> {
     let roots = managed_runtime_roots();
     let pinned = pinned_hashes();
     let policy = OrtPinPolicy {
@@ -330,9 +573,9 @@ pub fn authorize_onnx_runtime_load(
         managed_roots: &roots,
         pinned_sha256: &pinned,
     };
-    let authorization = authorize_with(&policy, candidate)?;
-    log_unpinned_once(&authorization);
-    Ok(authorization)
+    let library = open_authorized_with(&policy, candidate)?;
+    log_unpinned_once(library.authorization());
+    Ok(library)
 }
 
 fn log_unpinned_once(authorization: &OrtLoadAuthorization) {
@@ -356,15 +599,26 @@ fn log_unpinned_once(authorization: &OrtLoadAuthorization) {
     }
 }
 
-/// Authorize `path`, then hand it to `load`. A refused library never reaches
-/// the loader. `load` is `ort::init_from` in production.
+/// Authorize `candidate`, then hand `load` the path to load it through (see
+/// [`AuthorizedOrtLibrary::load_path`]; `None` means load by bare name), with
+/// the checked file held open until `load` returns. A refused library never
+/// reaches the loader, and a pinned library that changed during the load is
+/// reported as an error instead of being used.
+///
+/// `after_check` runs between the hash and the load. Production passes a
+/// no-op; tests use it to replace or rewrite the file in exactly the window
+/// this function exists to close.
 pub(crate) fn load_authorized_with<T>(
-    authorize: impl FnOnce(Option<&OsStr>) -> Result<OrtLoadAuthorization, String>,
-    path: &Path,
-    load: impl FnOnce(&Path) -> Result<T, String>,
+    open: impl FnOnce(Option<&OsStr>) -> Result<AuthorizedOrtLibrary, String>,
+    candidate: Option<&OsStr>,
+    after_check: impl FnOnce(),
+    load: impl FnOnce(Option<&Path>) -> Result<T, String>,
 ) -> Result<T, String> {
-    authorize(Some(path.as_os_str()))?;
-    load(path)
+    let library = open(candidate)?;
+    after_check();
+    let loaded = load(library.load_path().as_deref())?;
+    library.confirm_unchanged()?;
+    Ok(loaded)
 }
 
 #[cfg(test)]
@@ -396,6 +650,236 @@ mod tests {
         }
     }
 
+    /// Stands in for the loader: reads whatever `load_path` names, as `dlopen`
+    /// would map it. `None` (a bare-name load) is not expected here.
+    fn read_as_loader(load_path: Option<&Path>) -> Result<Vec<u8>, String> {
+        let load_path = load_path.ok_or("a pinned library must be loaded by path")?;
+        std::fs::read(load_path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn a_library_swapped_between_the_check_and_the_load_is_never_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_library(dir.path(), "libonnxruntime.dylib", b"genuine build");
+        let replacement = write_library(dir.path(), "replacement.dylib", b"swapped build");
+        let hash = hash_of(&path);
+        let pinned = [hash.as_str()];
+        let roots = [dir.path().to_path_buf()];
+        let policy = policy(None, true, &roots, &pinned);
+
+        let swapped = Cell::new(None);
+        let mapped = RefCell::new(None);
+        let result = load_authorized_with(
+            |candidate| open_authorized_with(&policy, candidate),
+            Some(path.as_os_str()),
+            || swapped.set(Some(std::fs::rename(&replacement, &path).is_ok())),
+            |load_path| {
+                *mapped.borrow_mut() = Some(read_as_loader(load_path)?);
+                Ok(())
+            },
+        );
+        // What the loader got is the checked file, on every platform.
+        assert_eq!(*mapped.borrow(), Some(b"genuine build".to_vec()));
+        if cfg!(unix) {
+            // The rename succeeded, and the path now names the replacement.
+            assert_eq!(swapped.get(), Some(true), "the swap ran");
+            assert_eq!(std::fs::read(&path).unwrap(), b"swapped build");
+            // The swap still fails the load closed: unlinking the checked
+            // file moved its change time, and a replaced library is a sign
+            // the folder was tampered with.
+            let error = result.expect_err("a swap during the load is reported");
+            assert!(
+                error.starts_with("onnx runtime library changed while it was being checked"),
+                "{error}"
+            );
+        } else {
+            // The held file cannot be replaced at all.
+            assert_eq!(swapped.get(), Some(false), "the swap was refused");
+            assert_eq!(result, Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_library_rewritten_in_place_after_the_check_is_reported_and_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_library(dir.path(), "libonnxruntime.dylib", b"genuine build");
+        let hash = hash_of(&path);
+        let pinned = [hash.as_str()];
+        let roots = [dir.path().to_path_buf()];
+        let policy = policy(None, true, &roots, &pinned);
+
+        let rewritten = Cell::new(None);
+        let result = load_authorized_with(
+            |candidate| open_authorized_with(&policy, candidate),
+            Some(path.as_os_str()),
+            // Same length, so only the content (and the change time) differs.
+            || rewritten.set(Some(std::fs::write(&path, b"hostile build").is_ok())),
+            read_as_loader,
+        );
+        assert_eq!(
+            rewritten.get(),
+            Some(cfg!(unix)),
+            "the rewrite ran as expected"
+        );
+        if cfg!(unix) {
+            // No user-space lock stops a same-user writer on Unix; the rewrite
+            // is caught after the load, and the load is reported as failed.
+            let error = result.expect_err("a library rewritten after its check must not be used");
+            assert!(
+                error.starts_with(&format!(
+                    "onnx runtime library changed while it was being checked at {}",
+                    path.display()
+                )),
+                "{error}"
+            );
+            assert!(
+                !crate::semantic_index::is_onnx_runtime_unavailable(&error),
+                "a rewritten library is not a missing runtime: {error}"
+            );
+        } else {
+            // Windows refuses the write while the file is held.
+            assert_eq!(result, Ok(b"genuine build".to_vec()));
+        }
+    }
+
+    #[test]
+    fn a_pinned_library_is_loaded_through_the_checked_file_not_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_library(dir.path(), "libonnxruntime.dylib", b"genuine build");
+        let hash = hash_of(&path);
+        let pinned = [hash.as_str()];
+        let roots = [dir.path().to_path_buf()];
+        let library =
+            open_authorized_with(&policy(None, true, &roots, &pinned), Some(path.as_os_str()))
+                .expect("a pinned library is admitted");
+        let load_path = library
+            .load_path()
+            .expect("a pinned library has a load path");
+        #[cfg(target_os = "macos")]
+        assert!(load_path.starts_with("/dev/fd"), "{}", load_path.display());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert!(
+            load_path.starts_with("/proc/self/fd"),
+            "{}",
+            load_path.display()
+        );
+        #[cfg(windows)]
+        assert_eq!(load_path, path);
+        assert_eq!(library.confirm_unchanged(), Ok(()));
+    }
+
+    #[test]
+    fn an_operator_library_is_loaded_by_its_own_path() {
+        let operator_dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = write_library(operator_dir.path(), "libonnxruntime.dylib", b"brew build");
+        let roots = [storage.path().join("onnxruntime")];
+        let pinned: [&str; 0] = [];
+        let library = open_authorized_with(
+            &policy(Some(path.as_os_str()), true, &roots, &pinned),
+            Some(path.as_os_str()),
+        )
+        .expect("the operator's spawn-time choice is admitted");
+        assert_eq!(library.load_path(), Some(path.clone()));
+        // Its bytes are accepted whatever they are, so there is nothing to
+        // re-check after the load.
+        std::fs::write(&path, b"other build").unwrap();
+        assert_eq!(library.confirm_unchanged(), Ok(()));
+    }
+
+    #[test]
+    fn a_bare_name_load_has_no_path() {
+        let roots: [PathBuf; 0] = [];
+        let pinned: [&str; 0] = [];
+        let library = open_authorized_with(&policy(None, false, &roots, &pinned), None)
+            .expect("standalone bare-name loads are allowed");
+        assert_eq!(library.load_path(), None);
+    }
+
+    /// A real ONNX Runtime the pin accepts, if this machine has one:
+    /// `AFT_TEST_ORT_LIBRARY_DIR`, else the runtime AFT manages for this user.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn real_pinned_runtime() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        const NAME: &str = "libonnxruntime.dylib";
+        #[cfg(target_os = "linux")]
+        const NAME: &str = "libonnxruntime.so";
+        let dir = std::env::var_os("AFT_TEST_ORT_LIBRARY_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let home = PathBuf::from(std::env::var_os("HOME")?);
+                Some(home.join(".local/share/cortexkit/aft/onnxruntime/1.24.4"))
+            })?;
+        let library = dir.join(NAME);
+        let hash = sha256_file(&library).ok()?;
+        pinned_hashes().contains(&hash.as_str()).then_some(library)
+    }
+
+    /// The first two entries of ONNX Runtime's `OrtApiBase`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[repr(C)]
+    struct OrtApiBase {
+        _get_api: unsafe extern "C" fn(u32) -> *const std::ffi::c_void,
+        get_version_string: unsafe extern "C" fn() -> *const std::ffi::c_char,
+    }
+
+    /// The real loader, the real library: a file swapped in after the check is
+    /// not what `dlopen` maps. Loading by path here would fail (the
+    /// replacement is not a library at all); loading through the descriptor
+    /// maps the checked ONNX Runtime and reports its version.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn real_dlopen_maps_the_checked_runtime_after_a_swap() {
+        let Some(real) = real_pinned_runtime() else {
+            eprintln!(
+                "skipping: no pinned ONNX Runtime on this machine (AFT_TEST_ORT_LIBRARY_DIR)"
+            );
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(real.file_name().unwrap());
+        std::fs::copy(&real, &path).unwrap();
+        let replacement = write_library(dir.path(), "replacement", b"not a library");
+        let pinned = pinned_hashes();
+        let roots = [dir.path().to_path_buf()];
+        let policy = policy(None, true, &roots, &pinned);
+
+        let mapped_version = RefCell::new(None);
+        let result = load_authorized_with(
+            |candidate| open_authorized_with(&policy, candidate),
+            Some(path.as_os_str()),
+            || std::fs::rename(&replacement, &path).unwrap(),
+            |load_path| {
+                let load_path = load_path.ok_or("a pinned library is loaded by path")?;
+                let c_path = std::ffi::CString::new(load_path.to_str().unwrap()).unwrap();
+                let symbol_name = std::ffi::CString::new("OrtGetApiBase").unwrap();
+                // SAFETY: loads a pinned Microsoft build and calls its
+                // documented entry point; the handle is closed before return.
+                unsafe {
+                    let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW);
+                    if handle.is_null() {
+                        let error = std::ffi::CStr::from_ptr(libc::dlerror());
+                        return Err(error.to_string_lossy().into_owned());
+                    }
+                    let symbol = libc::dlsym(handle, symbol_name.as_ptr());
+                    assert!(!symbol.is_null(), "OrtGetApiBase is exported");
+                    let get_api_base: unsafe extern "C" fn() -> *const OrtApiBase =
+                        std::mem::transmute(symbol);
+                    let version =
+                        std::ffi::CStr::from_ptr(((*get_api_base()).get_version_string)())
+                            .to_string_lossy()
+                            .into_owned();
+                    libc::dlclose(handle);
+                    *mapped_version.borrow_mut() = Some(version);
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(*mapped_version.borrow(), Some("1.24.4".to_string()));
+        // The swap itself is still reported (see the fake-library swap test).
+        assert!(result.is_err(), "{result:?}");
+    }
+
     #[test]
     fn sha256_file_matches_a_known_digest() {
         let dir = tempfile::tempdir().unwrap();
@@ -419,10 +903,13 @@ mod tests {
 
         let loads = Cell::new(0);
         let result = load_authorized_with(
-            |candidate| authorize_with(&policy, candidate),
-            &path,
+            |candidate| open_authorized_with(&policy, candidate),
+            Some(path.as_os_str()),
+            || {},
             |loaded| {
-                assert_eq!(loaded, path.as_path());
+                // The loader gets a path naming the checked file (not
+                // necessarily its original path; see `load_path`).
+                assert_eq!(read_as_loader(loaded), Ok(b"genuine build".to_vec()));
                 loads.set(loads.get() + 1);
                 Ok(())
             },
@@ -448,8 +935,9 @@ mod tests {
 
         let loads = Cell::new(0);
         let error = load_authorized_with(
-            |candidate| authorize_with(&policy, candidate),
-            &path,
+            |candidate| open_authorized_with(&policy, candidate),
+            Some(path.as_os_str()),
+            || {},
             |_| {
                 loads.set(loads.get() + 1);
                 Ok(())

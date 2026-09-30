@@ -579,7 +579,6 @@ impl OnnxPairScorer {
             ));
         }
         crate::semantic_index::pre_validate_onnx_runtime()?;
-        crate::semantic_index::bind_late_onnx_runtime()?;
         let _ort_section = crate::ort_lifecycle::enter()
             .ok_or_else(|| "rerank model not loaded: the process is shutting down".to_string())?;
         let session = Session::builder()

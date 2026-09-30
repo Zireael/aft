@@ -2970,7 +2970,7 @@ pub fn onnx_runtime_download_in_progress(storage_dir: &Path) -> bool {
 /// plugin's download has finished. A daemon spawned while the download was
 /// still running has no path, and setting the environment variable now would
 /// race every other thread that reads the environment. The path is kept here
-/// instead and handed to `ort` directly by `bind_late_onnx_runtime`.
+/// instead and handed to `ort` directly by `pre_validate_onnx_runtime`.
 static LATE_ONNX_RUNTIME: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Pick up a runtime the plugin published after this process started, so the
@@ -3048,50 +3048,6 @@ fn effective_onnx_runtime_path() -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// Point `ort` at a runtime adopted after startup, before its first use.
-///
-/// Without this, `ort` resolves its library from `ORT_DYLIB_PATH` alone and
-/// would dlopen the bare library name again. Only call this after
-/// `pre_validate_onnx_runtime` accepted the same path: `ort` records a failed
-/// load as permanently initialised (its `OnceLock` completes even when the
-/// loader returns an error), so a load that `ort` itself rejects can never be
-/// retried in this process. Our own pre-validation uses a plain `dlopen`, which
-/// leaves no state behind, and that is what makes waiting for a download and
-/// retrying safe.
-///
-/// The first outcome is cached for the life of the process for the same reason.
-pub(crate) fn bind_late_onnx_runtime() -> Result<(), String> {
-    static BOUND: OnceLock<Result<(), String>> = OnceLock::new();
-    if onnx_runtime_override_configured_with(|name| std::env::var_os(name)) {
-        return Ok(());
-    }
-    let Some(path) = LATE_ONNX_RUNTIME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-    else {
-        return Ok(());
-    };
-    BOUND
-        .get_or_init(|| {
-            // Only the library load matters here. The returned builder carries
-            // default environment options, which `ort` also uses when no
-            // builder is committed, so it is dropped rather than committed.
-            // The pin is checked again right before the load, so a library
-            // swapped after pre-validation is still refused.
-            crate::ort_pin::load_authorized_with(
-                crate::ort_pin::authorize_onnx_runtime_load,
-                &path,
-                |path| {
-                    ort::init_from(path)
-                        .map(drop)
-                        .map_err(|error| format_embedding_init_error(error.to_string()))
-                },
-            )
-        })
-        .clone()
-}
-
 /// Find the highest compatible managed ONNX Runtime library under
 /// `<storage_dir>/onnxruntime/`, or None when absent/incompatible.
 ///
@@ -3163,24 +3119,84 @@ fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Pre-validate ONNX Runtime by attempting a raw dlopen before ort touches it.
-/// This catches broken/incompatible .so files without risking a panic in the ort crate.
-/// Also checks the runtime version via OrtGetApiBase if available.
+/// Serializes ONNX Runtime loading, and remembers the outcome once `ort` has
+/// been handed a library.
+static ORT_RUNTIME_LOAD: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Check and load ONNX Runtime before `ort` touches it, then bind `ort` to the
+/// library that was checked.
+///
+/// The library is authorized by the pin in `crate::ort_pin`, which keeps the
+/// checked file open; everything below loads it through that open file, so a
+/// file replaced after the check is never the one loaded. A raw `dlopen` /
+/// `LoadLibrary` probe runs first: it catches broken or incompatible libraries
+/// (and too-old versions) with an actionable message instead of a panic inside
+/// `ort`, and leaves no state behind, so a missing runtime can be retried once
+/// the plugin's download finishes. Then `ort::init_from` loads the same file.
+/// Binding `ort` here matters: left alone, `ort` would load `ORT_DYLIB_PATH`
+/// by path on first use, unchecked.
+///
+/// `ort` keeps the first library it loads for the life of the process, so the
+/// outcome of that first bind is kept too and returned by every later call.
+/// With no path configured (a standalone process relying on the loader search
+/// path), `ort` is not bound here and finds the library by name itself.
 pub fn pre_validate_onnx_runtime() -> Result<(), String> {
+    let mut bound = ORT_RUNTIME_LOAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(outcome) = bound.as_ref() {
+        return outcome.clone();
+    }
     let dylib_path = effective_onnx_runtime_path();
-    // A load runs the library's initializers, so the pin must be checked
-    // before the probe below, not only before `ort` loads it.
-    crate::ort_pin::authorize_onnx_runtime_load(dylib_path.as_deref().map(std::ffi::OsStr::new))?;
+    let shown = dylib_path.as_deref().unwrap_or(DEFAULT_ORT_LIB_NAME);
+    let mut bind_attempted = false;
+    let outcome = crate::ort_pin::load_authorized_with(
+        crate::ort_pin::open_onnx_runtime_for_load,
+        dylib_path.as_deref().map(std::ffi::OsStr::new),
+        || {},
+        |load_path| {
+            probe_onnx_runtime(load_path, shown)?;
+            let Some(load_path) = load_path else {
+                return Ok(());
+            };
+            bind_attempted = true;
+            // Only the library load matters here. The returned builder carries
+            // default environment options, which `ort` also uses when no
+            // builder is committed, so it is dropped rather than committed.
+            ort::init_from(load_path)
+                .map(drop)
+                .map_err(|error| format_embedding_init_error(error.to_string()))
+        },
+    );
+    if bind_attempted {
+        *bound = Some(outcome.clone());
+    }
+    outcome
+}
+
+#[cfg(target_os = "macos")]
+const DEFAULT_ORT_LIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(target_os = "windows")]
+const DEFAULT_ORT_LIB_NAME: &str = "onnxruntime.dll";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const DEFAULT_ORT_LIB_NAME: &str = "libonnxruntime.so";
+
+/// Load the library at `load_path` (or by bare name when `None`) with a plain
+/// `dlopen` / `LoadLibrary`, check its version, and unload it. `shown` is the
+/// path as configured, used in messages and as the version-detection fallback
+/// (`load_path` may be a `/dev/fd/<n>` alias that says nothing about either).
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables)
+)]
+fn probe_onnx_runtime(load_path: Option<&Path>, shown: &str) -> Result<(), String> {
+    let lib_name = load_path
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| DEFAULT_ORT_LIB_NAME.to_string());
+    let lib_name = lib_name.as_str();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        #[cfg(target_os = "linux")]
-        let default_name = "libonnxruntime.so";
-        #[cfg(target_os = "macos")]
-        let default_name = "libonnxruntime.dylib";
-
-        let lib_name = dylib_path.as_deref().unwrap_or(default_name);
-
         unsafe {
             let c_name = std::ffi::CString::new(lib_name)
                 .map_err(|e| format!("invalid library path: {}", e))?;
@@ -3193,9 +3209,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned()
                 };
                 return Err(format!(
-                    "{ONNX_RUNTIME_MISSING_PREFIX} dlopen('{}') failed: {}. \
-                     Run `npx @cortexkit/aft doctor --fix` to install it.",
-                    lib_name, msg
+                    "{ONNX_RUNTIME_MISSING_PREFIX} dlopen('{shown}') failed: {msg}. \
+                     Run `npx @cortexkit/aft doctor --fix` to install it."
                 ));
             }
 
@@ -3204,7 +3219,7 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             // older system ORT through loader search paths; checking only the
             // caller-supplied soname would miss that and let ort fail opaquely.
             let (detected_version, version_source) =
-                detect_ort_version_from_loaded_library(handle, lib_name);
+                detect_ort_version_from_loaded_library(handle, shown);
 
             libc::dlclose(handle);
 
@@ -3229,8 +3244,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
         // via LoadLibraryExW before the ort crate attempts its own LoadLibrary.
         // This way we can produce a friendly error (with installation hints)
         // instead of a raw LoadLibrary failure from deep inside fastembed.
-        let lib_name = dylib_path.as_deref().unwrap_or("onnxruntime.dll");
-
+        // `lib_name` is the configured path itself here: the pin holds the
+        // file open against writes, so no descriptor alias is needed.
         // Use kernel32 LoadLibraryExW for the validation — built-in, no
         // crate dependency required. GetModuleFileNameW resolves the loaded
         // DLL path for version probing via the version.dll API.
