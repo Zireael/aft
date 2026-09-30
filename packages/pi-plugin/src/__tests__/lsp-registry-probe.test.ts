@@ -113,3 +113,28 @@ describe("pickEligibleVersion", () => {
     expect(result.version).toBe("1.0.0");
   });
 });
+
+describe("pickEligibleVersion version filter", () => {
+  const now = Date.parse("2026-09-30T00:00:00Z");
+  const response = {
+    time: {
+      "5.8.3": isoDaysAgo(now, 200),
+      "5.9.3": isoDaysAgo(now, 120),
+      "6.0.2": isoDaysAgo(now, 60),
+      "7.0.2": isoDaysAgo(now, 30),
+    },
+  };
+
+  test("picks the newest accepted version even when a newer major exists", () => {
+    const result = pickEligibleVersion(response, 7, now, (v) => v.startsWith("5."));
+    expect(result.version).toBe("5.9.3");
+    expect(result.outsideSupportedRange).toBe(false);
+  });
+
+  test("reports outsideSupportedRange when no release passes the filter", () => {
+    const result = pickEligibleVersion(response, 7, now, (v) => v.startsWith("4."));
+    expect(result.version).toBeNull();
+    expect(result.blockedByGrace).toBe(false);
+    expect(result.outsideSupportedRange).toBe(true);
+  });
+});

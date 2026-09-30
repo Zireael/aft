@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { findNpmServerByBinary, findNpmServerById, NPM_LSP_TABLE } from "../lsp-npm-table";
+import {
+  findNpmServerByBinary,
+  findNpmServerById,
+  isVersionSupported,
+  majorVersionOf,
+  NPM_LSP_TABLE,
+} from "../lsp-npm-table";
 
 describe("npm LSP table", () => {
   test("includes the agreed v0.17.0 packages", () => {
@@ -51,5 +57,29 @@ describe("npm LSP table", () => {
   test("findNpmServerByBinary finds a known entry by binary name", () => {
     const found = findNpmServerByBinary("docker-langserver");
     expect(found?.npm).toBe("dockerfile-language-server-nodejs");
+  });
+  // typescript-language-server needs lib/tsserver.js from this SDK, and
+  // TypeScript 7 (the native compiler) ships none.
+  test("typescript-sdk is capped to the 5.x line", () => {
+    const sdk = findNpmServerById("typescript-sdk");
+    expect(sdk?.npm).toBe("typescript");
+    expect(sdk?.supportedMajor).toBe(5);
+    if (!sdk) throw new Error("typescript-sdk entry missing");
+    expect(isVersionSupported(sdk, "5.9.3")).toBe(true);
+    expect(isVersionSupported(sdk, "6.0.2")).toBe(false);
+    expect(isVersionSupported(sdk, "7.0.2")).toBe(false);
+  });
+
+  test("entries without a cap accept any major", () => {
+    const pyright = findNpmServerById("python");
+    if (!pyright) throw new Error("python entry missing");
+    expect(isVersionSupported(pyright, "99.0.0")).toBe(true);
+  });
+
+  test("majorVersionOf reads the leading integer", () => {
+    expect(majorVersionOf("5.9.3")).toBe(5);
+    expect(majorVersionOf("7.1.0-dev.20260929.1")).toBe(7);
+    expect(majorVersionOf("v6.0.0")).toBe(6);
+    expect(majorVersionOf("latest")).toBeNull();
   });
 });

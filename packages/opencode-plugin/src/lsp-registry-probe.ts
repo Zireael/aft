@@ -30,6 +30,8 @@ export interface VersionPickResult {
   version: string | null;
   /** True when the registry has versions but none is older than `graceDays`. */
   blockedByGrace: boolean;
+  /** True when the registry has versions but none passes the caller's version filter. */
+  outsideSupportedRange: boolean;
   /** All eligible versions sorted by publish date (newest first). For tests/logs. */
   eligible: ReadonlyArray<{ version: string; publishedAt: string }>;
 }
@@ -39,24 +41,29 @@ export interface VersionPickResult {
  *   1. is published at least `graceDays` ago
  *   2. is the newest such version (per ISO publish time)
  *
- * Pre-release versions (semver "-" tags) are skipped.
+ * Pre-release versions (semver "-" tags) are skipped, and so are versions
+ * `accept` rejects (for example, a major version the caller cannot use).
  */
 export function pickEligibleVersion(
   response: RegistryResponse,
   graceDays: number,
   now: number = Date.now(),
+  accept: (version: string) => boolean = () => true,
 ): VersionPickResult {
   const times = response.time || {};
   const cutoff = now - graceDays * 24 * 60 * 60 * 1000;
 
   // Filter out reserved keys (`created`, `modified`) and pre-releases.
   const candidates: Array<{ version: string; publishedAt: string; ts: number }> = [];
+  let releaseCount = 0;
   for (const [version, publishedAt] of Object.entries(times)) {
     if (version === "created" || version === "modified") continue;
     if (version.includes("-")) continue; // skip pre-releases
     if (typeof publishedAt !== "string") continue;
     const ts = Date.parse(publishedAt);
     if (Number.isNaN(ts)) continue;
+    releaseCount += 1;
+    if (!accept(version)) continue;
     candidates.push({ version, publishedAt, ts });
   }
 
@@ -69,12 +76,14 @@ export function pickEligibleVersion(
   return {
     version: eligible[0]?.version ?? null,
     blockedByGrace,
+    outsideSupportedRange: releaseCount > 0 && candidates.length === 0,
     eligible: eligible.map(({ version, publishedAt }) => ({ version, publishedAt })),
   };
 }
 
 /**
- * Fetch the registry document for `npmPackage` and apply the grace filter.
+ * Fetch the registry document for `npmPackage` and apply the grace filter
+ * plus the optional `accept` version filter.
  *
  * Returns `null` on HTTP/network failure (logs a warning) so callers can
  * fall back to "use whatever's currently installed".
@@ -83,6 +92,7 @@ export async function probeRegistry(
   npmPackage: string,
   graceDays: number,
   fetchImpl: typeof fetch = fetch,
+  accept?: (version: string) => boolean,
 ): Promise<VersionPickResult | null> {
   // Scoped packages need their `/` URL-encoded once.
   const encoded = encodeURIComponent(npmPackage).replace(/^%40/, "@");
@@ -98,7 +108,7 @@ export async function probeRegistry(
       return null;
     }
     const json = (await res.json()) as RegistryResponse;
-    return pickEligibleVersion(json, graceDays);
+    return pickEligibleVersion(json, graceDays, Date.now(), accept);
   } catch (err) {
     warn(`[lsp] registry probe failed for ${npmPackage}: ${err}`);
     return null;
