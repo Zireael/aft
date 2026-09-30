@@ -1,15 +1,15 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "typescript-sdk-cap",
-    "subc-build-provenance"
+    "subc-build-provenance",
+    "plugin-test-discovery",
+    "rerank-slot-test-race"
   ],
-  "note": "The auto-installed TypeScript SDK is capped to 5.x in both plugins, typescript-language-server 6.x's missing-tsserver error and TypeScript 7 projects get named messages, and TS7 projects never fall back to the cached 5.x SDK. AFT's HELLO declares wire_crate_version and build_git_sha. No ranking-fence files."
+  "note": "The only fenced file is commands/semantic_search/rerank/tests.rs, a test-only fix: a rerank build that finishes before read re-reads the slot may read as Ready. No search, ranking or embedding code changes, so every ranked row must stay byte-identical to the committed reference. Also caps the auto-installed TypeScript SDK to 5.x, names TypeScript 7 and typescript-language-server 6.x failures, declares wire_crate_version and build_git_sha in AFT's HELLO, and moves plugin tests into src/__tests__ where CI runs them."
 }
