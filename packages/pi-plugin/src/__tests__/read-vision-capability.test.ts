@@ -1,22 +1,22 @@
-/// <reference path="../../bun-test.d.ts" />
+/// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { registerHoistedTools } from "../tools/hoisted.js";
 import {
   executeTool,
   makeExtContext,
   makeMockApi,
   makeMockBridge,
   makePluginContext,
-} from "../../__tests__/tool-test-utils.js";
-import { registerHoistedTools } from "../hoisted.js";
+} from "./tool-test-utils.js";
 
 function registerReadHarness(ghReadEnabled = false) {
   const { api, tools } = makeMockApi();
   const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "read result" }));
   registerHoistedTools(
     api,
-    makePluginContext(bridge, { config: { gh_read: { enabled: ghReadEnabled } } }),
+    makePluginContext(bridge, { config: { github: { read: ghReadEnabled } } }),
     {
       hoistRead: true,
       hoistWrite: false,
@@ -56,7 +56,7 @@ describe("Pi read vision capability", () => {
     ]);
     expect(parameters.properties).not.toHaveProperty("vision_capability");
     expect(tool.description).toBe(
-      "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
+      "Read file contents with line numbers or sorted directory entries. Use startLine/endLine or 1-based offset/limit for either. Directory limit defaults to and is capped at 1000; enumeration stops at 10,000 entries and partial listings carry a shown/total trailer. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.",
     );
   });
 

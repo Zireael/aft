@@ -1,12 +1,12 @@
-/// <reference path="../../bun-test.d.ts" />
+/// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { rememberReadModel, VISION_HOST_TIMEOUT_MS } from "../../shared/read-vision.js";
-import type { PluginContext } from "../../types.js";
-import { createReadTool } from "../hoisted.js";
+import { rememberReadModel, VISION_HOST_TIMEOUT_MS } from "../shared/read-vision.js";
+import { createReadTool } from "../tools/hoisted.js";
+import type { PluginContext } from "../types.js";
 
 type RecordedCall = {
   sessionID: string | undefined;

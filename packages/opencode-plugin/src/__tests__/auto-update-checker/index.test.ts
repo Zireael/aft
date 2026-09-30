@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { OpenCodeAdapter } from "../../../../aft-cli/src/adapters/opencode.js";
-import { cacheDir, getOpenCodeCacheRoot } from "./constants.js";
+import { cacheDir, getOpenCodeCacheRoot } from "../../hooks/auto-update-checker/constants.js";
 
 const logMock = mock(() => {});
 const warnMock = mock(() => {});
@@ -31,13 +31,13 @@ mock.module("../../logger.js", () => ({
   error: mock(() => {}),
 }));
 
-mock.module("./checker.js", () => checkerMocks);
-mock.module("./cache.js", () => cacheMocks);
+mock.module("../../hooks/auto-update-checker/checker.js", () => checkerMocks);
+mock.module("../../hooks/auto-update-checker/cache.js", () => cacheMocks);
 
 let importCounter = 0;
 
 function freshIndexImport() {
-  return import(`./index.ts?test=${importCounter++}`);
+  return import(`../../hooks/auto-update-checker/index.ts?test=${importCounter++}`);
 }
 
 function createCtx() {

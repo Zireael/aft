@@ -49,7 +49,7 @@ function stubSnapshotFs() {
 let importCounter = 0;
 
 function freshCacheImport() {
-  return import(`./cache.ts?test=${importCounter++}`);
+  return import(`../../hooks/auto-update-checker/cache.ts?test=${importCounter++}`);
 }
 
 afterEach(() => {

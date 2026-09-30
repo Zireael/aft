@@ -15,7 +15,7 @@ mock.module("../../logger.js", () => ({
 let importCounter = 0;
 
 function freshCheckerImport() {
-  return import(`./checker.ts?test=${importCounter++}`);
+  return import(`../../hooks/auto-update-checker/checker.ts?test=${importCounter++}`);
 }
 
 async function withoutNpm(
