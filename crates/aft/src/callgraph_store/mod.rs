@@ -642,6 +642,73 @@ mod write_amplification_tests {
         drop(writer_store);
     }
 
+    /// Legacy migrations publish through their own path, and a backup copy is
+    /// written in rollback mode. It must be in WAL mode by the time its pointer
+    /// is published, before any writer opens it, or its first writer locks
+    /// readers out of a published store in the same way a cold build did.
+    #[test]
+    fn migrated_generation_is_published_in_wal_mode() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let callgraph_dir = temp.path().join("store");
+        fs::create_dir_all(&callgraph_dir).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let lease = acquire_writer_lease(&callgraph_dir, &project_key, &root)
+            .unwrap()
+            .expect("writer lease");
+        let generation = migration_generation_file_name(&project_key, "backup");
+        let temp_path = migration_temp_path(&callgraph_dir, &generation);
+        {
+            let conn = Connection::open(&temp_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta (k TEXT, v TEXT);")
+                .unwrap();
+        }
+        assert_eq!(
+            &fs::read(&temp_path).unwrap()[18..20],
+            &[1, 1],
+            "the migrated copy starts in rollback mode"
+        );
+        let legacy_dir = temp.path().join("legacy");
+        let source = LegacyCallgraphTarget {
+            partition: LegacyCallgraphPartition {
+                harness: "opencode".to_string(),
+                dir: legacy_dir.clone(),
+                key: project_key.clone(),
+                bytes: 1,
+                freshness: None,
+            },
+            sqlite_path: legacy_dir.join("legacy.sqlite"),
+            generation: None,
+            source_bytes: 1,
+            source_blake3: "0".repeat(64),
+        };
+
+        let published = publish_migrated_generation(
+            &callgraph_dir,
+            &project_key,
+            &generation,
+            &temp_path,
+            &source,
+            1,
+            lease,
+            "sqlite_backup",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_pointer(&callgraph_dir, &project_key).as_deref(),
+            Some(published.as_str())
+        );
+        // Bytes 18 and 19 of the SQLite header are the file format write and
+        // read versions: 1 for a rollback journal, 2 for WAL.
+        assert_eq!(
+            &fs::read(callgraph_dir.join(&published)).unwrap()[18..20],
+            &[2, 2],
+            "a published migration generation must already be in WAL mode"
+        );
+    }
+
     #[test]
     fn own_refresh_skips_identical_extract_but_not_position_shift() {
         let temp = tempdir().unwrap();
@@ -8425,6 +8492,9 @@ fn publish_migrated_generation(
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
         crate::fs_lock::sync_parent(&gen_path);
+        // A backup copy is written in rollback mode; switch it while no
+        // pointer names it, as a cold build does.
+        switch_generation_to_wal_before_publication(&gen_path);
 
         verify_writer_lease(&writer_lease)?;
         publish_pointer(callgraph_dir, project_key, generation)?;
