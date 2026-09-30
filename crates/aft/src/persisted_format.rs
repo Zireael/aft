@@ -350,8 +350,9 @@ pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
 }
 
 /// Gate one artifact read: a floor refusal for the store wins; otherwise a
-/// newer `found` version is recorded and returned, and an acceptable one
-/// clears any stale refusal for the same artifact.
+/// newer `found` version is recorded and returned. Anything else (a readable
+/// version, or no recognisable artifact at all) clears a stale refusal left
+/// for the same artifact, for example after the operator removed it.
 pub fn gate(
     store: PersistedStore,
     path: &Path,
@@ -369,9 +370,7 @@ pub fn gate(
             Err(refusal)
         }
         None => {
-            if found.is_some() {
-                clear(store, scope);
-            }
+            clear(store, scope);
             Ok(())
         }
     }

@@ -656,12 +656,15 @@ pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
 
 /// Schema version of an existing AFT database, read through a read-only
 /// connection so nothing about the file changes. `None` when the file is
-/// absent, cannot be opened read-only, or has no schema table yet.
+/// absent, cannot be opened read-only, has no schema table yet, or is locked
+/// right now: the peek never waits, because the full open that follows has
+/// its own bounded busy handling and repeats the version check.
 pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
     if !path.is_file() {
         return None;
     }
     let conn = open_readonly(path).ok()?;
+    conn.busy_timeout(Duration::ZERO).ok()?;
     let has_table: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",

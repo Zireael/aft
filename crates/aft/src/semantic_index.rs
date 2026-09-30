@@ -7476,16 +7476,11 @@ impl SemanticIndex {
             .join(project_key)
             .join("semantic.bin");
         let file_len = usize::try_from(data_path.metadata().ok()?.len()).ok()?;
-        // A snapshot (or one of its delta segments) written by a newer build is
-        // refused by name before anything else looks at it: it is neither
-        // removed as too small or corrupt nor replaced by a rebuild.
-        if Self::check_disk_format_at(&data_path).is_err()
-            || crate::persisted_format::refusal_covering(
-                crate::persisted_format::PersistedStore::SemanticSegment,
-                &data_path,
-            )
-            .is_some()
-        {
+        // A snapshot written by a newer build is refused by name: neither
+        // removed as corrupt nor replaced by a rebuild. A newer delta segment
+        // behind a readable base is found (and refused) while the log is
+        // decoded below.
+        if Self::check_disk_format_at(&data_path).is_err() {
             return None;
         }
         if file_len < HEADER_BYTES_V1 {
@@ -7515,6 +7510,10 @@ impl SemanticIndex {
 
         match Self::load_artifact_path(&data_path, current_canonical_root) {
             Ok(loaded) => {
+                crate::persisted_format::clear(
+                    crate::persisted_format::PersistedStore::SemanticSegment,
+                    &data_path,
+                );
                 if let Some(expected) = expected_fingerprint {
                     let matches = loaded
                         .index
@@ -7585,11 +7584,15 @@ impl SemanticIndex {
         data_path: &Path,
     ) -> Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
         let version = (|| {
+            let mut file = fs::File::open(data_path).ok()?;
+            // A file shorter than the smallest snapshot header of any version
+            // was not written whole by any build, newer ones included: it is
+            // corrupt (and removed as such by the reader), not a version.
+            if usize::try_from(file.metadata().ok()?.len()).ok()? < HEADER_BYTES_V1 {
+                return None;
+            }
             let mut version_buf = [0_u8; 1];
-            fs::File::open(data_path)
-                .ok()?
-                .read_exact(&mut version_buf)
-                .ok()?;
+            file.read_exact(&mut version_buf).ok()?;
             Some(u64::from(version_buf[0]))
         })();
         crate::persisted_format::gate(
@@ -7598,14 +7601,18 @@ impl SemanticIndex {
             data_path,
             version,
         )?;
-        // The segment store has no header of its own to peek, but a floor
-        // above this build's segment version still refuses the file.
-        crate::persisted_format::gate(
+        // The segment store has no header of its own to peek (a newer segment
+        // is found, and recorded, while the log is decoded), but a floor above
+        // this build's segment version still refuses the file.
+        match crate::persisted_format::refusal_covering(
             crate::persisted_format::PersistedStore::SemanticSegment,
             data_path,
-            data_path,
-            None,
-        )
+        ) {
+            Some(refusal) if refusal.source != crate::persisted_format::RefusalSource::Artifact => {
+                Err(refusal)
+            }
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn read_from_disk_borrow_tolerant(
