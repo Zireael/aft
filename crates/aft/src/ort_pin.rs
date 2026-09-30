@@ -346,8 +346,9 @@ impl AuthorizedOrtLibrary {
         };
         let path = &held.path;
         let changed = |detail: String| {
-            // Worded like the hash-mismatch refusal, for the same reason: it
-            // must not read as a missing runtime (see `open_authorized_with`).
+            // Worded like the hash-mismatch refusal so it does not match
+            // `semantic_index::is_onnx_runtime_unavailable`: a missing runtime
+            // is answered with `doctor --fix`, which cannot help here.
             format!(
                 "onnx runtime library changed while it was being checked at {}: {detail}. \
                  It is not used, so semantic search is unavailable. Remove the file and \
@@ -684,9 +685,10 @@ mod tests {
             // The rename succeeded, and the path now names the replacement.
             assert_eq!(swapped.get(), Some(true), "the swap ran");
             assert_eq!(std::fs::read(&path).unwrap(), b"swapped build");
-            // The swap still fails the load closed: unlinking the checked
-            // file moved its change time, and a replaced library is a sign
-            // the folder was tampered with.
+            // The load is still reported as failed: the rename unlinked the
+            // checked file, which moves its change time, and the check after
+            // the load treats that as a change. A library replaced mid-load
+            // means something is writing to the folder.
             let error = result.expect_err("a swap during the load is reported");
             assert!(
                 error.starts_with("onnx runtime library changed while it was being checked"),
@@ -876,7 +878,8 @@ mod tests {
             },
         );
         assert_eq!(*mapped_version.borrow(), Some("1.24.4".to_string()));
-        // The swap itself is still reported (see the fake-library swap test).
+        // The version came from the checked library, but the rename itself
+        // is still reported as a failed load, as in the swap test above.
         assert!(result.is_err(), "{result:?}");
     }
 
