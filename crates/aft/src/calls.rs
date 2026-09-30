@@ -3,7 +3,7 @@
 //! Extracted from `commands/zoom.rs` so both the zoom command and the
 //! call-graph engine can reuse the same AST-walking logic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::parser::LangId;
 
@@ -795,7 +795,21 @@ pub struct RustMacroFacts {
     /// a `CallTuple` whose full and short names are the identifier. A call
     /// hidden in such a region is invisible to the call graph, so `callers`
     /// reports these mentions instead of claiming there are no callers.
+    /// Only one mention of each name per file is kept: one location per
+    /// file is enough to point a reader at the macro, and macro-heavy
+    /// files would otherwise record every local variable many times over.
     pub unparsed_mentions: Vec<CallTuple>,
+    mention_names: HashSet<String>,
+}
+
+impl RustMacroFacts {
+    fn push_mention(&mut self, mention: CallTuple) {
+        if self.unparsed_mentions.len() < MAX_UNPARSED_MACRO_MENTIONS_PER_FILE
+            && self.mention_names.insert(mention.1.clone())
+        {
+            self.unparsed_mentions.push(mention);
+        }
+    }
 }
 
 /// Rust call extraction including calls written inside macro token trees:
@@ -835,10 +849,6 @@ pub fn extract_rust_calls_with_macro_facts(
     facts
         .unparsed_mentions
         .sort_by_key(|(_, _, _, start, end)| (*start, *end));
-    facts.unparsed_mentions.dedup();
-    facts
-        .unparsed_mentions
-        .truncate(MAX_UNPARSED_MACRO_MENTIONS_PER_FILE);
     (results, facts)
 }
 
@@ -978,7 +988,7 @@ fn collect_rust_token_tree_calls(
             tree.root_node(),
             fragment,
             &fragment_calls,
-            &mut fragment_facts.unparsed_mentions,
+            &mut fragment_facts,
         );
     }
 
@@ -993,24 +1003,16 @@ fn collect_rust_token_tree_calls(
         )
     };
     results.extend(fragment_calls.into_iter().map(remap));
-    facts.bodies.extend(
-        fragment_facts
-            .bodies
-            .into_iter()
-            .map(|body| RustMacroBody {
-                name: body.name,
-                byte_start: inner_start + body.byte_start,
-                byte_end: inner_start + body.byte_end,
-            }),
-    );
-    let room = MAX_UNPARSED_MACRO_MENTIONS_PER_FILE.saturating_sub(facts.unparsed_mentions.len());
-    facts.unparsed_mentions.extend(
-        fragment_facts
-            .unparsed_mentions
-            .into_iter()
-            .take(room)
-            .map(remap),
-    );
+    facts
+        .bodies
+        .extend(fragment_facts.bodies.into_iter().map(|body| RustMacroBody {
+            name: body.name,
+            byte_start: inner_start + body.byte_start,
+            byte_end: inner_start + body.byte_end,
+        }));
+    for mention in fragment_facts.unparsed_mentions {
+        facts.push_mention(remap(mention));
+    }
 }
 
 /// Record the identifiers tree-sitter had to put in `ERROR` nodes while
@@ -1020,7 +1022,7 @@ fn collect_unparsed_mentions(
     root: tree_sitter::Node<'_>,
     fragment: &str,
     fragment_calls: &[CallTuple],
-    mentions: &mut Vec<CallTuple>,
+    facts: &mut RustMacroFacts,
 ) {
     let callee_names: BTreeSet<&str> = fragment_calls
         .iter()
@@ -1030,14 +1032,14 @@ fn collect_unparsed_mentions(
     // macro input and can nest deeply.
     let mut pending = vec![(root, false)];
     while let Some((node, in_error)) = pending.pop() {
-        if mentions.len() >= MAX_UNPARSED_MACRO_MENTIONS_PER_FILE {
+        if facts.unparsed_mentions.len() >= MAX_UNPARSED_MACRO_MENTIONS_PER_FILE {
             return;
         }
         let in_error = in_error || node.is_error();
         if in_error && node.kind() == "identifier" {
             if let Some(name) = fragment.get(node.byte_range()) {
                 if !callee_names.contains(name) {
-                    mentions.push((
+                    facts.push_mention((
                         name.to_string(),
                         name.to_string(),
                         node.start_position().row as u32 + 1,

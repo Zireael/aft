@@ -2939,7 +2939,12 @@ fn callgraph_rust_macro_template_call_lists_invocations_via_macro() {
     assert_eq!(
         summary,
         vec![
-            ("run_template!".to_string(), 5, String::new(), "name_match".to_string()),
+            (
+                "run_template!".to_string(),
+                5,
+                String::new(),
+                "name_match".to_string()
+            ),
             (
                 "template_caller_one".to_string(),
                 27,
@@ -2991,7 +2996,7 @@ fn callgraph_rust_unparseable_macro_mention_is_noted() {
     assert_eq!(resp["total_callers"], 0, "no parseable caller: {resp:?}");
     let message = resp["macro_note"]["message"].as_str().unwrap_or_default();
     assert_eq!(
-        message, "1 mention of `dsl_target` inside macros could not be analyzed: src/callers.rs:35",
+        message, "1 mention of `dsl_target` inside macros could not be analyzed (one location per file): src/callers.rs:35",
         "note should name the mention: {resp:?}"
     );
     let text = format_callgraph_response("callers", &resp);

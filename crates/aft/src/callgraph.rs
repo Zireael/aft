@@ -1327,10 +1327,7 @@ fn split_macro_body_calls(
     symbols: &[Symbol],
     raw_calls: Vec<crate::calls::CallTuple>,
     bodies: &[crate::calls::RustMacroBody],
-) -> (
-    Vec<crate::calls::CallTuple>,
-    HashMap<String, Vec<CallSite>>,
-) {
+) -> (Vec<crate::calls::CallTuple>, HashMap<String, Vec<CallSite>>) {
     let mut body_calls: HashMap<String, Vec<CallSite>> = HashMap::new();
     if bodies.is_empty() {
         return (raw_calls, body_calls);

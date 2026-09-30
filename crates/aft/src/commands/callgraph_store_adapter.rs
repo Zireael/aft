@@ -92,8 +92,8 @@ pub struct StoreCallersResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct StoreMacroNote {
     pub message: String,
-    /// Distinct unanalyzed mention locations found, capped at
-    /// `MACRO_MENTION_COUNT_LIMIT`.
+    /// Unanalyzed mention locations found (extraction keeps one per name and
+    /// file), capped at `MACRO_MENTION_COUNT_LIMIT`.
     pub mentions: usize,
     #[serde(skip_serializing_if = "is_false")]
     pub mentions_is_lower_bound: bool,
@@ -716,7 +716,8 @@ fn unanalyzed_macro_note(
     include_tests: bool,
 ) -> StoreAdapterResult<Option<StoreMacroNote>> {
     // One more than the limit tells an exact count from a lower bound.
-    let rows = store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
+    let rows =
+        store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
     let mut seen = BTreeSet::new();
     let mut sites = Vec::new();
     for row in rows {
@@ -747,7 +748,7 @@ fn unanalyzed_macro_note(
     };
     Ok(Some(StoreMacroNote {
         message: format!(
-            "{count} {noun} of `{name}` inside macros could not be analyzed: {listed}"
+            "{count} {noun} of `{name}` inside macros could not be analyzed (one location per file): {listed}"
         ),
         mentions,
         mentions_is_lower_bound,
