@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "per-checkout-slice-2",
+    "per-checkout-slice-4",
+    "per-checkout-slice-5"
+  ],
+  "note": "The only fenced file is search_index.rs, where project_walk_builder becomes pub(crate) so the opt-in per-checkout trigram views walk a checkout with the same filters as the shared index; its body is unchanged. No search, ranking, chunking or embedding code changes, and per-checkout views stay off by default, so every ranked row must stay byte-identical to the committed reference. Adds opt-in trigram views with synchronous write intent, blob-backed callgraph planes with the ruled receiver dispatch matrix, the composite first-load driver with query waits and watcher binding, and request-pinned callgraph routing for inspect when views are opted in."
+}
