@@ -35,7 +35,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { resolveGithubConfig } from "../config.js";
+import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
+import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -373,7 +374,7 @@ const EditParams = Type.Object({
   ),
 });
 
-const HASHLINE_EDIT_DESCRIPTION = [
+const HASHLINE_EDIT_GRAMMAR = [
   "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string. Server-owned preview control is outside this schema.",
   "",
   "Quick reference:",
@@ -382,8 +383,18 @@ const HASHLINE_EDIT_DESCRIPTION = [
   "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), `<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). A plain `N` PUT replaces; use `<N` or `>N` to insert.",
   "- PUT text: `PUT <address>:` followed by one or more `+` body rows (`+` alone is blank). A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.",
   "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. `*** Begin Patch`/`*** End Patch` is an optional envelope.",
-  "- Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
 ].join("\n");
+
+/**
+ * The hashline `edit` description: the patch grammar plus the rule naming
+ * which calls mint tags. That rule names the bash rewrite path and the AFT
+ * navigation tools only when this configuration registers them.
+ */
+function hashlineEditDescription(config: PluginContext["config"]): string {
+  const bashRewrites = toolEnabled(config, "bash") && resolveBashConfig(config).rewrite;
+  const tagSources = hashlineTagSourceSentence(bashRewrites, (name) => toolEnabled(config, name));
+  return `${HASHLINE_EDIT_GRAMMAR}\n- ${tagSources}`;
+}
 
 const HashlineEditParams = Type.Object(
   {
@@ -736,7 +747,7 @@ export function registerHoistedTools(
     pi.registerTool<typeof HashlineEditParams, FileMutationDetails>({
       name: editName,
       label: editName,
-      description: HASHLINE_EDIT_DESCRIPTION,
+      description: hashlineEditDescription(ctx.config),
       promptSnippet: `Apply a tagged hashline patch through the ${editName} tool`,
       promptGuidelines: [
         "Read a file to obtain its current hashline tag before editing it.",

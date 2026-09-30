@@ -190,7 +190,10 @@ describe("OpenCode shell surface follows bash.compress, bash.background and sand
   }
 });
 
-function capturePi(config: Record<string, unknown>): {
+function capturePi(
+  config: Record<string, unknown>,
+  hashlineEffective = false,
+): {
   tools: Map<string, PiToolDefinition>;
   hints: string;
 } {
@@ -205,6 +208,7 @@ function capturePi(config: Record<string, unknown>): {
     },
   } as unknown as ExtensionAPI;
   const ctx = stubContext(config) as PiContext;
+  ctx.hashlineEffective = hashlineEffective;
   const surface = resolvePiToolSurface(ctx.config as PiConfig);
   registerPiToolSurface(pi, ctx, surface);
 
@@ -265,5 +269,119 @@ describe("Pi shell surface follows bash.compress, bash.background and sandbox.en
         forbiddenHintPatterns(combo),
       );
     });
+  }
+});
+
+/**
+ * Tools named in `disabled_tools` are not registered, so no description,
+ * parameter text, prompt snippet or workflow hint may name them either. Every
+ * registered tool's text is scanned, not only the shell family, because other
+ * tools point at each other too (for example "prefer aft_search + aft_zoom").
+ * Only AFT's own names are checked: `bash`, `read` and `grep` are host slots,
+ * and disabling AFT's registration leaves the host's own tool under that name.
+ */
+const DISABLED_CASES: string[][] = [
+  [],
+  ["bash_status"],
+  ["bash_watch"],
+  ["bash_write"],
+  ["bash_kill"],
+  ["aft_search"],
+  ["aft_zoom"],
+  ["aft_outline"],
+  ["aft_search", "aft_zoom"],
+  ["aft_callgraph"],
+];
+
+const AFT_TOOL_NAME = /\b(aft_[a-z_]+|bash_(?:status|watch|write|kill))\b/g;
+
+function disabledConfig(disabled: string[], hashline: boolean): Record<string, unknown> {
+  return {
+    disabled_tools: disabled,
+    sandbox: { enabled: true },
+    ...(hashline ? { edit_mode: "hashline" } : {}),
+  };
+}
+
+function disabledLabel(disabled: string[], hashline: boolean): string {
+  const list = disabled.length > 0 ? disabled.join("+") : "nothing";
+  return `disabled=${list} hashline=${hashline ? "on" : "off"}`;
+}
+
+function assertNamesRegistered(
+  texts: Array<{ where: string; text: string }>,
+  registered: ReadonlySet<string>,
+): void {
+  // Collect every violation so one run shows all of them, not just the first.
+  const violations = new Set<string>();
+  for (const { where, text } of texts) {
+    for (const match of text.matchAll(AFT_TOOL_NAME)) {
+      if (!registered.has(match[1])) violations.add(`${where} names ${match[1]}`);
+    }
+  }
+  expect([...violations]).toEqual([]);
+}
+
+describe("OpenCode text names only registered tools when tools are disabled", () => {
+  for (const disabled of DISABLED_CASES) {
+    for (const hashline of [false, true]) {
+      test(disabledLabel(disabled, hashline), () => {
+        const config = disabledConfig(disabled, hashline);
+        const ctx = stubContext(config) as OpenCodeContext;
+        ctx.hashlineEffective = hashline;
+        const tools = buildOpenCodeToolMap(ctx, config as OpenCodeConfig) as Record<
+          string,
+          { description?: string; args: Record<string, unknown> }
+        >;
+        const registered = new Set(Object.keys(tools));
+        for (const name of disabled) expect(registered.has(name), name).toBe(false);
+
+        const texts: Array<{ where: string; text: string }> = [];
+        for (const [name, definition] of Object.entries(tools)) {
+          texts.push({ where: `${name} description`, text: definition.description ?? "" });
+          const schema = tool.schema.toJSONSchema(tool.schema.object(definition.args), {
+            io: "input",
+          });
+          for (const text of schemaDescriptions(schema)) {
+            texts.push({ where: `${name} parameter`, text });
+          }
+        }
+        texts.push({
+          where: "workflow hints",
+          text: buildHintsForRegisteredTools(config as OpenCodeConfig, registered, hashline) ?? "",
+        });
+        assertNamesRegistered(texts, registered);
+      });
+    }
+  }
+});
+
+describe("Pi text names only registered tools when tools are disabled", () => {
+  for (const disabled of DISABLED_CASES) {
+    for (const hashline of [false, true]) {
+      test(disabledLabel(disabled, hashline), () => {
+        const { tools, hints } = capturePi(disabledConfig(disabled, hashline), hashline);
+        const registered = new Set(tools.keys());
+        for (const name of disabled) expect(registered.has(name), name).toBe(false);
+
+        const texts: Array<{ where: string; text: string }> = [];
+        for (const [name, definition] of tools) {
+          const pi = definition as PiToolDefinition & {
+            promptSnippet?: string;
+            promptGuidelines?: string[];
+          };
+          texts.push({ where: `${name} description`, text: pi.description ?? "" });
+          texts.push({ where: `${name} promptSnippet`, text: pi.promptSnippet ?? "" });
+          for (const guideline of pi.promptGuidelines ?? []) {
+            texts.push({ where: `${name} promptGuidelines`, text: guideline });
+          }
+          for (const text of schemaDescriptions(pi.parameters)) {
+            texts.push({ where: `${name} parameter`, text });
+          }
+        }
+        texts.push({ where: "workflow hints", text: hints });
+        assertNamesRegistered(texts, registered);
+      });
+    }
   }
 });

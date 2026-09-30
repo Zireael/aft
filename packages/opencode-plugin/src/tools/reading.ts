@@ -72,6 +72,23 @@ interface ZoomBatchResult {
 /**
  * Tool definitions for code reading commands: outline + zoom.
  */
+/**
+ * The outline description's steer toward focused reading. It names
+ * `aft_search`, `aft_zoom` and `aft_callgraph` only when each is registered,
+ * falling back to `read` for symbol reading.
+ */
+function outlineFocusSteer(config: PluginContext["config"]): string {
+  const zoomEnabled = toolEnabled(config, "aft_zoom");
+  const reader = zoomEnabled ? "aft_zoom" : "read";
+  const locate = toolEnabled(config, "aft_search") ? `aft_search + ${reader}` : reader;
+  const callgraph = zoomEnabled
+    ? toolEnabled(config, "aft_callgraph")
+      ? " aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces."
+      : " aft_zoom with `callgraph:true` gives one-level forward calls-out."
+    : "";
+  return `For understanding a specific feature, prefer ${locate} on named symbols; use aft_outline on a whole directory only for high-level structure mapping.${callgraph}`;
+}
+
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
   const ghReadEnabled = resolveGithubConfig(ctx.config).read;
@@ -89,9 +106,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
         (zoomEnabled ? "aft_zoom" : "read") +
         ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
-        (zoomEnabled
-          ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n"
-          : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping.\n\n") +
+        outlineFocusSteer(ctx.config) +
+        "\n\n" +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline source files under it\n" +

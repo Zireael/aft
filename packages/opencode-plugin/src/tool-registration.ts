@@ -168,8 +168,8 @@ export function buildAftToolDefinitions(
  * Rewrite the `bash` description for the final registered surface.
  *
  * The description names other tools: its code-search prohibition steers to
- * `aft_search` (else the grep tool) and to `aft_zoom`, and its background
- * sentence steers waits to `bash_watch`. Which of those exist is only known
+ * `aft_search` (else the grep tool), `aft_outline` and `aft_zoom`, and its
+ * background sentences name `bash_watch`, `bash_status` and `bash_write`. Which of those exist is only known
  * once `disabled_tools` has been applied, so the tool factory's default
  * wording is replaced here. The compression and background/PTY sentences
  * follow the resolved bash config.
@@ -188,6 +188,11 @@ function describeBashForRegisteredSurface(
     bashCfg.detach_on_user_message,
     "aft_zoom" in allTools,
     "bash_watch" in allTools,
+    {
+      outline: "aft_outline" in allTools,
+      status: "bash_status" in allTools,
+      write: "bash_write" in allTools,
+    },
   );
 }
 

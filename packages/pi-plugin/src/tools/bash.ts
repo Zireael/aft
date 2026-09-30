@@ -208,19 +208,98 @@ const BashParams = Type.Object({
  * A stale call that still sends a removed argument is ignored in `execute`.
  * Keys keep the order of the full set, so the all-on schema is unchanged.
  */
-function bashParamsForConfig(features: {
-  background: boolean;
-  compress: boolean;
-  sandbox: boolean;
-}): typeof BashParams {
+function bashParamsForConfig(
+  features: {
+    background: boolean;
+    compress: boolean;
+    sandbox: boolean;
+    subagentBackground: boolean;
+  },
+  companions: RegisteredCompanions,
+): typeof BashParams {
   return Type.Object({
     ...BashBaseParams,
     ...(features.background ? BashWaitParam : {}),
     ...(features.sandbox ? BashSandboxParam : {}),
-    ...(features.background ? BashBackgroundFlagParam : {}),
+    ...(features.background
+      ? {
+          background: Type.Optional(
+            Type.Boolean({ description: backgroundParamDescription(companions) }),
+          ),
+        }
+      : {}),
     ...(features.compress ? BashCompressionParam : {}),
-    ...(features.background ? BashPtyParams : {}),
+    ...(features.background
+      ? {
+          ...BashPtyParams,
+          pty: Type.Optional(
+            Type.Boolean({
+              description: ptyParamDescription(companions, features.subagentBackground),
+            }),
+          ),
+        }
+      : {}),
   }) as unknown as typeof BashParams;
+}
+
+/** Which bash companions the model can call; descriptions name only these. */
+interface RegisteredCompanions {
+  status: boolean;
+  watch: boolean;
+  write: boolean;
+  kill: boolean;
+}
+
+/**
+ * Whether a bash companion tool is registered for this configuration: it
+ * needs `bash.background` and must not be in `disabled_tools`.
+ */
+export function bashCompanionRegistered(
+  config: PluginContext["config"],
+  companion: "bash_status" | "bash_watch" | "bash_write" | "bash_kill",
+): boolean {
+  return resolveBashConfig(config).background && toolEnabled(config, companion);
+}
+
+function registeredCompanions(config: PluginContext["config"]): RegisteredCompanions {
+  return {
+    status: bashCompanionRegistered(config, "bash_status"),
+    watch: bashCompanionRegistered(config, "bash_watch"),
+    write: bashCompanionRegistered(config, "bash_write"),
+    kill: bashCompanionRegistered(config, "bash_kill"),
+  };
+}
+
+function backgroundParamDescription(c: RegisteredCompanions): string {
+  let controls = "";
+  if (c.watch) {
+    controls += ` Use bash_watch to wait for completion or output patterns${c.status ? "; bash_status for a one-shot snapshot only." : "."}`;
+  } else if (c.status) {
+    controls += " Use bash_status for a one-shot snapshot.";
+  }
+  if (c.kill) controls += " Use bash_kill to terminate.";
+  return `Spawn command in background and return immediately with a task_id.${controls} Ideal for long-running tasks like builds or dev servers.`;
+}
+
+/**
+ * A PTY session only exists as a background task, so with
+ * `bash.subagent_background: false` worker sessions refuse `pty: true`; the
+ * description says so only in that configuration.
+ */
+function ptyParamDescription(c: RegisteredCompanions, subagentBackground: boolean): string {
+  let drive = "";
+  if (c.status && c.write) {
+    drive =
+      ' Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.';
+  } else if (c.status) {
+    drive = ' Inspect with bash_status({ task_id, output_mode: "screen" }).';
+  } else if (c.write) {
+    drive = " Send input with bash_write.";
+  }
+  const workers = subagentBackground
+    ? ""
+    : " Unavailable in worker sessions because bash.subagent_background is false.";
+  return `Spawn the command in a real PTY for interactive programs. Implies background: true automatically.${workers}${drive}`;
 }
 
 /**
@@ -501,6 +580,30 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
   return api.hooks?.bashSpawn;
 }
 
+/**
+ * How the description tells the agent to wait on a background task, naming
+ * `bash_watch` and `bash_status` only when they are registered.
+ */
+function backgroundWaitSentence(c: RegisteredCompanions): string {
+  if (c.watch) {
+    const noPolling = c.status ? ", and never loop `bash_status` to wait" : "";
+    return `then \`bash_watch\` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one)${noPolling}.`;
+  }
+  return c.status
+    ? "the task keeps running after the call returns, a completion reminder arrives when it exits, and `bash_status` reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else."
+    : "the task keeps running after the call returns and a completion reminder arrives when it exits. Use bash({wait:true}) instead when the result is needed before anything else.";
+}
+
+/** How a PTY session is driven, naming only the companions that exist. */
+function ptyDriveClause(c: RegisteredCompanions): string {
+  if (c.status && c.write) {
+    return ', and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`';
+  }
+  if (c.status) return ', and its screen is read with `bash_status({ output_mode: "screen" })`';
+  if (c.write) return ", and is driven with `bash_write`";
+  return "";
+}
+
 /** Register AFT's primary bash tool under either the host or aft_ name. */
 export function registerBashTool(
   pi: ExtensionAPI,
@@ -523,9 +626,16 @@ export function registerBashTool(
   // describe a no-op. Background/PTY/watch wording appears only when
   // `bash.background` is enabled.
   const zoomSteer = toolEnabled(ctx.config, "aft_zoom") ? ", or `aft_zoom`" : "";
-  const searchSteer = aftSearchRegistered
-    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`
-    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`;
+  const steerTools = [
+    aftSearchRegistered
+      ? "`aft_search` (concepts, identifiers, regex, literals)"
+      : `the \`${grepToolName}\` tool`,
+    `\`${readToolName}\``,
+    ...(toolEnabled(ctx.config, "aft_outline") ? ["`aft_outline`"] : []),
+  ].join(", ");
+  const searchSteer = `use ${steerTools}${zoomSteer} instead`;
+  // Companion names appear in this tool's text only when the model can call them.
+  const companions = registeredCompanions(ctx.config);
   const bashCfg = resolveBashConfig(ctx.config);
   // Every command probes the module before fallback. Retain only enough state to
   // clear fallback mode after the first successful module response.
@@ -549,7 +659,7 @@ export function registerBashTool(
     ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
   const tasksSentence = bashCfg.background
-    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; then \`bash_watch\` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one), and never loop \`bash_status\` to wait. A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background, and is driven with \`bash_status({ output_mode: "screen" })\` plus \`bash_write\`.`
+    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: registeredName,
@@ -569,11 +679,15 @@ export function registerBashTool(
             : []),
           "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
         ],
-    parameters: bashParamsForConfig({
-      background: bashCfg.background,
-      compress: bashCfg.compress,
-      sandbox: nativeSandboxEnabled(ctx.config),
-    }),
+    parameters: bashParamsForConfig(
+      {
+        background: bashCfg.background,
+        compress: bashCfg.compress,
+        sandbox: nativeSandboxEnabled(ctx.config),
+        subagentBackground: bashCfg.subagent_background,
+      },
+      companions,
+    ),
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
@@ -835,8 +949,8 @@ export function createBashStatusTool(ctx: PluginContext) {
   return {
     name: "bash_status",
     label: "bash_status",
-    description:
-      "Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+    // Point at bash_watch for waiting only when the model can call it.
+    description: `Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
@@ -867,8 +981,8 @@ export function createBashWatchTool(ctx: PluginContext) {
   return {
     name: "bash_watch",
     label: "bash_watch",
-    description:
-      "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+    // The polling warning names bash_status only when the model can call it.
+    description: `Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max \`bash.watch_sync_max_ms\`, 120s by default); for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${bashCompanionRegistered(ctx.config, "bash_status") ? " Never loop bash_status to wait." : ""}`,
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(
@@ -1032,7 +1146,8 @@ export function createBashWriteTool(ctx: PluginContext) {
     name: "bash_write",
     label: "bash_write",
     description:
-      'Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: "pty" first. ' +
+      // Suggest checking the task mode first only when bash_status is callable.
+      `Write input bytes to a running PTY bash task. PTY-only${bashCompanionRegistered(ctx.config, "bash_status") ? '; check bash_status reports mode: "pty" first.' : "."} ` +
       'Input is either a string (verbatim bytes) or an array mixing strings and { key: "esc" | "enter" | "up" | "ctrl-c" | ... } objects ' +
       'for atomic text+key sequences such as [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ]. ' +
       "Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. " +

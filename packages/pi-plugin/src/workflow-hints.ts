@@ -7,6 +7,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
+import { hashlineTagSourceSentence } from "./hashline-tag-sources.js";
 import { log } from "./logger.js";
 import { skipsEagerStartup } from "./session-kind.js";
 import { piHashlineEffective } from "./tool-registration.js";
@@ -29,16 +30,16 @@ export interface WorkflowHintsOpts {
 const HEADING = "## IMPORTANT NOTICE about your tools";
 
 /**
- * Routing rule for hashline sessions. Kept byte-identical to the OpenCode copy.
- *
- * Navigation tools return source that looks edit-ready but never publishes a
- * snapshot, so an agent that inspects a symbol and then patches it is refused
- * for a tag it believes it already has. The bash rewrite path is named only
- * when it exists (bash registered and `bash.rewrite` on).
+ * Routing rule for hashline sessions: which calls mint the tags a patch
+ * addresses (see `hashlineTagSourceSentence`). The bash rewrite path and each
+ * AFT navigation tool are named only when present. Kept byte-identical to the
+ * OpenCode copy.
  */
-export function hashlineTagSourceHint(bashRewritesMintTags: boolean): string {
-  const rewrites = bashRewritesMintTags ? " (and accepted AFT `cat`/`head`/`tail` rewrites)" : "";
-  return `**Hashline edit tags**: Only \`read\`${rewrites} mint hashline tags. \`aft_zoom\`, \`aft_outline\`, \`grep\`, \`aft_search\`, and conflict snippets do not. After navigation, call \`read\` on every file and range the patch addresses.`;
+export function hashlineTagSourceHint(
+  bashRewritesMintTags: boolean,
+  isRegistered: (toolName: string) => boolean = () => true,
+): string {
+  return `**Hashline edit tags**: ${hashlineTagSourceSentence(bashRewritesMintTags, isRegistered)}`;
 }
 
 /** The hashline hint for a session whose bash rewrites `cat`/`head`/`tail`. */
@@ -150,7 +151,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // Conditional on the hashline arm being the registered one: a legacy-edit
   // session has no tags and must not be told to go mint them.
   if (opts.hashlineEffective === true) {
-    sections.push(hashlineTagSourceHint(hasBash && opts.bashRewriteEnabled !== false));
+    sections.push(
+      hashlineTagSourceHint(
+        hasBash && opts.bashRewriteEnabled !== false,
+        (name) => !opts.absentTools.has(name),
+      ),
+    );
   }
 
   if (sections.length === 0) {

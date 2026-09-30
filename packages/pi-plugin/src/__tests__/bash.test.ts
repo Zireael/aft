@@ -231,6 +231,23 @@ describe("bash tool adapter", () => {
     expect(properties?.sandbox).toMatchObject({ const: "host" });
   });
 
+  test("pty param mentions the worker refusal only when subagent_background is off", () => {
+    const describePty = (config: PluginContext["config"]): string => {
+      const tools = new Map<string, MockToolDef>();
+      registerBashTool(makeMockApi(tools), makeMockContext(makeMockBridge(), config));
+      const properties = (
+        tools.get("bash")!.parameters as {
+          properties?: Record<string, { description?: string }>;
+        }
+      ).properties;
+      return properties?.pty?.description ?? "";
+    };
+    expect(describePty({} as PluginContext["config"])).not.toContain("worker");
+    expect(
+      describePty({ bash: { subagent_background: false } } as PluginContext["config"]),
+    ).toContain("Unavailable in worker sessions because bash.subagent_background is false.");
+  });
+
   test("schema omits wait, background and PTY params when bash.background is disabled", () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

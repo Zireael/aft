@@ -45,7 +45,7 @@
         "type": "boolean"
       },
       "pty": {
-        "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+        "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
         "type": "boolean"
       },
       "ptyRows": {
@@ -124,7 +124,7 @@
         "type": "boolean"
       },
       "pty": {
-        "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Unavailable in subagent sessions. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+        "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
         "type": "boolean"
       },
       "ptyRows": {
