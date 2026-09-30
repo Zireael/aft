@@ -3551,6 +3551,19 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         });
         backup.set_db_harness(harness.clone());
+        // Select the undo store's disk namespace here, before the configure
+        // reply, rather than in the deferred maintenance job. The database can
+        // be open (so mutating tools and undo pass the persistence gate) before
+        // that job runs; a store without a storage directory then keeps
+        // snapshots in memory only, and after a restart undo cannot find
+        // them. Selecting the directory does no disk I/O.
+        if let Some(storage_dir) = next_config.storage_dir.clone() {
+            backup.set_storage_dir_for_harness(
+                storage_dir,
+                harness.clone(),
+                next_config.checkpoint_ttl_hours,
+            );
+        }
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     crate::root_cache::configure_artifact_access(

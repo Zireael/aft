@@ -9,7 +9,7 @@ use serde_json::json;
 
 const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
-pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.";
+pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling.";
 
 pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
     format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
@@ -217,7 +217,7 @@ mod tests {
     fn unknown_task_message_steers_agents_to_rerun() {
         assert_eq!(
             format_unknown_task_message("bash-unknown"),
-            "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
+            "background task not found: bash-unknown. No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling."
         );
     }
 

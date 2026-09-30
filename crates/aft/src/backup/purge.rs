@@ -255,6 +255,9 @@ pub fn purge_backups(
         report.examined.namespaces.push(label.clone());
 
         let mut working = BackupStore::new();
+        // The working store addresses this namespace explicitly; a route
+        // harness installed on the calling thread must not redirect it.
+        working.follow_request_harness = false;
         working.set_storage_dir_inner(storage_dir.to_path_buf(), namespace.clone(), 0);
         if let (Some(db), Some(segment)) = (db.as_ref(), namespace.as_ref()) {
             working.set_db_pool(Arc::clone(db));
@@ -668,9 +671,18 @@ impl BackupStore {
         self.clear_db_mirror_sync();
     }
 
-    /// True when this store persists into `storage_dir` under `namespace`.
+    /// True when this store persists into `storage_dir` under `namespace`,
+    /// either as its configured namespace or as one a request's route used.
     fn uses_namespace(&self, storage_dir: &Path, namespace: Option<&str>) -> bool {
-        self.storage_harness.as_deref() == namespace
+        let serves_namespace = self.storage_harness.as_deref() == namespace
+            || namespace.is_some_and(|namespace| {
+                self.storage_harness.is_some()
+                    && self
+                        .request_namespaces
+                        .read()
+                        .is_ok_and(|namespaces| namespaces.contains(namespace))
+            });
+        serves_namespace
             && self
                 .storage_dir
                 .as_deref()

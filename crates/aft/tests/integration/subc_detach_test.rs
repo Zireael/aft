@@ -184,6 +184,105 @@ fn subc_foreground_drain_preserves_route_harness_across_restart() {
     });
 }
 
+/// A root context is shared by routes from several harnesses, and each bind
+/// reconfigures it with its own harness. An edit and a background command made
+/// through the opencode route after a runner route bound the same root must
+/// still be found by the opencode route after the module restarts, when only
+/// the opencode route binds again.
+#[test]
+fn subc_undo_and_background_task_survive_restart_after_mixed_harness_binds() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // Undo snapshots skip files under the system temp directory, so the
+        // edited project lives under the target directory instead.
+        let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let target = project.path().join("undo-target.txt");
+        std::fs::write(&target, "original\n").unwrap();
+
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        // Another consumer configures the same root without owning this route.
+        bind_route_as(&mut stream, project.path(), 2, "runner").await;
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            20,
+            "write",
+            json!({ "filePath": target.to_string_lossy(), "content": "changed\n" }),
+        )
+        .await;
+        let written = read_tool_response(&mut stream, 20, "opencode write").await;
+        assert!(!tool_result_is_error(&written), "{}", frame_body(&written));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            21,
+            "bash",
+            json!({
+                "command": "echo mixed-harness-done", "background": true,
+                "timeout": 60_000, "compressed": false,
+            }),
+        )
+        .await;
+        let launch = read_tool_response(&mut stream, 21, "opencode background launch").await;
+        assert!(!tool_result_is_error(&launch), "{}", frame_body(&launch));
+        let task_id = extract_task_id(&launch);
+        wait_for_status(&mut stream, 22, &task_id, "completed").await;
+
+        send_module_draining(&mut stream).await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("mixed-harness module").success());
+        drop(stream);
+
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+
+        let replayed = bash_status(&mut stream, 40, &task_id).await;
+        assert_eq!(replayed["status"], "completed", "{replayed}");
+        assert!(
+            replayed["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mixed-harness-done"),
+            "{replayed}"
+        );
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            50,
+            "safety",
+            json!({ "op": "undo", "filePath": target.to_string_lossy() }),
+        )
+        .await;
+        let undo = read_tool_response(&mut stream, 50, "undo after restart").await;
+        assert!(
+            !tool_result_is_error(&undo),
+            "undo history written through the opencode route must survive the restart: {}",
+            frame_body(&undo)
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("restarted module").success());
+    });
+}
+
 #[test]
 fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
     let runtime = tokio::runtime::Builder::new_current_thread()

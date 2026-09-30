@@ -65,6 +65,45 @@ static RESTORE_BEFORE_LOCK_HOOKS: LazyLock<Mutex<HashMap<String, RestoreBeforeLo
 static BACKUP_MAINTENANCE_KEYS: LazyLock<Mutex<HashSet<(PathBuf, Option<String>)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+thread_local! {
+    /// Storage segment of the harness whose route issued the request running on
+    /// this thread. One project root's `BackupStore` is shared by routes from
+    /// several harnesses, and every bind reconfigures it with its own harness,
+    /// so the configured harness names whichever route bound last. Undo history
+    /// must instead land in, and be read from, the namespace of the route that
+    /// made the edit; otherwise it is written under one harness and looked up
+    /// under another after a restart, and undo reports no history.
+    static REQUEST_HARNESS_SEGMENT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct RequestHarnessScope(Option<String>);
+
+impl Drop for RequestHarnessScope {
+    fn drop(&mut self) {
+        REQUEST_HARNESS_SEGMENT.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+/// Run `run` with backups keyed under the storage namespace of `harness`, the
+/// harness of the route that issued the request. An unparseable harness leaves
+/// the store's configured namespace in effect.
+pub(crate) fn with_request_harness<R>(harness: &str, run: impl FnOnce() -> R) -> R {
+    let segment = harness
+        .parse::<crate::harness::Harness>()
+        .ok()
+        .map(|harness| harness.storage_segment());
+    let previous = REQUEST_HARNESS_SEGMENT.with(|slot| slot.replace(segment));
+    let _scope = RequestHarnessScope(previous);
+    run()
+}
+
+fn request_harness_segment() -> Option<String> {
+    REQUEST_HARNESS_SEGMENT.with(|slot| slot.borrow().clone())
+}
+
 #[cfg(test)]
 fn set_restore_before_lock_hook_for_tests(
     session: &str,
@@ -677,6 +716,14 @@ pub struct BackupStore {
     counter: AtomicU64,
     storage_dir: Option<PathBuf>,
     storage_harness: Option<String>,
+    /// When true, a request's route harness (see `with_request_harness`)
+    /// overrides `storage_harness` and `db_harness`. Purge's working stores
+    /// turn it off because they address one namespace explicitly.
+    follow_request_harness: bool,
+    /// Namespaces other than `storage_harness` that requests have read or
+    /// written through this store since it was configured. Purge consults this
+    /// so it also evicts in-memory stacks loaded under a route's namespace.
+    request_namespaces: RwLock<HashSet<String>>,
     maintenance_ttl_hours: u32,
     db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     db_harness: RwLock<Option<String>>,
@@ -740,6 +787,8 @@ impl BackupStore {
             counter: AtomicU64::new(0),
             storage_dir: None,
             storage_harness: None,
+            follow_request_harness: true,
+            request_namespaces: RwLock::new(HashSet::new()),
             maintenance_ttl_hours: 0,
             db_pool: RwLock::new(None),
             db_harness: RwLock::new(None),
@@ -848,6 +897,9 @@ impl BackupStore {
         self.storage_dir = Some(dir);
         self.storage_harness = harness;
         self.maintenance_ttl_hours = ttl_hours;
+        if let Ok(mut namespaces) = self.request_namespaces.write() {
+            namespaces.clear();
+        }
         self.entries.clear();
         self.disk_index.clear();
         self.session_meta.clear();
@@ -865,7 +917,7 @@ impl BackupStore {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return;
         };
-        let key = (storage_dir, self.storage_harness.clone());
+        let key = (storage_dir, self.effective_storage_harness());
         if !BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key) {
             return;
         }
@@ -1878,8 +1930,38 @@ impl BackupStore {
 
     fn db_pool_and_harness(&self) -> Option<(Arc<Mutex<TrackedConnection>>, String)> {
         let pool = self.db_pool.read().ok().and_then(|slot| slot.clone())?;
-        let harness = self.db_harness.read().ok().and_then(|slot| slot.clone())?;
+        let harness = self.effective_db_harness()?;
         Some((pool, harness))
+    }
+
+    /// Harness namespace of the on-disk store for the current request: the
+    /// issuing route's harness when one is installed, else the configured one.
+    /// A store configured without a harness keeps its unscoped layout.
+    fn effective_storage_harness(&self) -> Option<String> {
+        let configured = self.storage_harness.as_ref()?;
+        let segment = match request_harness_segment() {
+            Some(segment) if self.follow_request_harness && &segment != configured => segment,
+            _ => return Some(configured.clone()),
+        };
+        let known = self
+            .request_namespaces
+            .read()
+            .is_ok_and(|namespaces| namespaces.contains(&segment));
+        if !known {
+            if let Ok(mut namespaces) = self.request_namespaces.write() {
+                namespaces.insert(segment.clone());
+            }
+        }
+        Some(segment)
+    }
+
+    /// Harness column for SQLite backup rows, chosen like the disk namespace.
+    fn effective_db_harness(&self) -> Option<String> {
+        let configured = self.db_harness.read().ok().and_then(|slot| slot.clone())?;
+        match request_harness_segment() {
+            Some(segment) if self.follow_request_harness => Some(segment),
+            _ => Some(configured),
+        }
     }
 
     fn clear_db_mirror_sync(&self) {
@@ -2729,7 +2811,7 @@ impl BackupStore {
     fn backups_dir(&self) -> Option<PathBuf> {
         self.storage_dir
             .as_ref()
-            .map(|dir| match &self.storage_harness {
+            .map(|dir| match self.effective_storage_harness() {
                 Some(harness) => dir.join(harness).join("backups"),
                 None => dir.join("backups"),
             })
@@ -2780,7 +2862,9 @@ impl BackupStore {
     }
 
     fn repair_root_backups_if_needed(&self) {
-        let (Some(storage_dir), Some(harness)) = (&self.storage_dir, &self.storage_harness) else {
+        let (Some(storage_dir), Some(harness)) =
+            (&self.storage_dir, self.effective_storage_harness())
+        else {
             return;
         };
         let root_backups = storage_dir.join("backups");
@@ -3815,7 +3899,7 @@ impl BackupStore {
         let Some(pool) = pool else {
             return;
         };
-        let harness = self.db_harness.read().ok().and_then(|slot| slot.clone());
+        let harness = self.effective_db_harness();
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "dual-write backup to DB skipped for {}: harness not configured",
@@ -6282,6 +6366,38 @@ mod tests {
         assert_eq!(entry0.content, "v0", "second undo should restore v0");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn request_harness_keeps_undo_history_in_the_issuing_routes_namespace() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = project.path().join("routed.txt");
+        fs::write(&path, "v0").unwrap();
+
+        {
+            // The shared root was configured last by a runner route, while
+            // the edit comes from an opencode route.
+            let mut shared = BackupStore::new();
+            shared.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Runner, 72);
+            with_request_harness("opencode", || {
+                shared.snapshot("session-a", &path, "captures v0")
+            })
+            .unwrap();
+            fs::write(&path, "v1").unwrap();
+        }
+        assert!(storage
+            .path()
+            .join("opencode/backups")
+            .join(hash_session("session-a"))
+            .is_dir());
+        assert!(!storage.path().join("runner/backups").exists());
+
+        // After a restart only the opencode route binds again.
+        let mut restarted = BackupStore::new();
+        restarted.set_storage_dir_for_harness(storage.path().to_path_buf(), Harness::Opencode, 72);
+        restarted.restore_latest("session-a", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "v0");
     }
 
     #[test]
