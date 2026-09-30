@@ -35,7 +35,6 @@ import {
   ConfigRejectedError,
   getConfigLoadErrors,
   loadAftConfig,
-  resolveBashConfig,
   resolveBridgePoolTransportOptions,
   resolvedIndexes,
   resolveOpenCodeRegistrationRoot,
@@ -80,10 +79,9 @@ import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
-import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
-import { appendHintsToSystem, buildHintsFromConfig } from "./workflow-hints.js";
+import { appendHintsToSystem, buildHintsForRegisteredTools } from "./workflow-hints.js";
 
 type BashPatternMatchPayload = {
   session_id: string;
@@ -772,20 +770,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // AFT workflows. Computed from the final tool surface so we never
   // advertise tools the agent doesn't have. User-only — see config.ts
   // for the security rationale.
-  // We pass the complement of registered tools (i.e. names that AREN'T in
-  // allTools) so buildHintsFromConfig drops sections for tools the agent
-  // can't actually call.
-  const HINTS_TOOL_NAMES = [
-    "aft_outline",
-    "aft_zoom",
-    "aft_search",
-    "aft_callgraph",
-    "aft_inspect",
-    "grep",
-    "read",
-    "bash",
-    "bash_status",
-  ];
   const registeredTools = new Set(Object.keys(allTools));
   // The registration flag describes the hashline edit arm, not merely the
   // presence of the default edit tool. A config/schema mismatch must downgrade
@@ -813,29 +797,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // not rewrite (for example, greps with unsupported flags or pipes).
   (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
     aftSearchRegistered;
-  // The bash tool description embeds a code-search prohibition that steers to
-  // aft_search when registered (else the grep tool). Registration is only
-  // known once the full tool map exists, so select the variant here — the
-  // factory default assumes aft_search is absent. The compression and
-  // background/PTY sentences are config-gated too: only advertised when the
-  // feature is actually on for this project.
-  for (const name of ["bash"]) {
-    const def = allTools[name];
-    if (def) {
-      const bashCfg = resolveBashConfig(aftConfig);
-      def.description = bashToolDescription(
-        aftSearchRegistered,
-        bashCfg.compress,
-        bashCfg.background,
-        bashCfg.detach_on_user_message,
-      );
-    }
-  }
-  const hintsAbsentTools = new Set<string>();
-  for (const name of HINTS_TOOL_NAMES) {
-    if (!registeredTools.has(name)) hintsAbsentTools.add(name);
-  }
-  const hintsBlock = buildHintsFromConfig(aftConfig, hintsAbsentTools, hashlineEditRegistered);
+  // The bash tool description already names only registered tools and enabled
+  // features: `buildAftToolDefinitions` rewrote it for the final surface.
+  const hintsBlock = buildHintsForRegisteredTools(
+    aftConfig,
+    registeredTools,
+    hashlineEditRegistered,
+  );
   if (hintsBlock) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }

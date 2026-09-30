@@ -141,12 +141,18 @@ const BashBaseParams = {
         "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax.",
     }),
   ),
+};
+
+const BashWaitParam = {
   wait: Type.Optional(
     Type.Boolean({
       description:
         "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
     }),
   ),
+};
+
+const BashSandboxParam = {
   sandbox: Type.Optional(
     Type.Literal("host", {
       description:
@@ -184,19 +190,46 @@ const BashPtyParams = {
   ptyCols: optionalInt(1, 140, "PTY terminal width in columns (minimum 1, maximum 140)"),
 };
 
+/** The full argument set, used for the parameter types `execute` receives. */
 const BashParams = Type.Object({
   ...BashBaseParams,
+  ...BashWaitParam,
+  ...BashSandboxParam,
   ...BashBackgroundFlagParam,
   ...BashCompressionParam,
   ...BashPtyParams,
 });
-const BashForegroundOnlyParams = Type.Object({
-  ...BashBaseParams,
-  ...BashCompressionParam,
-});
 
-function bashParamsForConfig(backgroundEnabled: boolean): typeof BashParams {
-  return (backgroundEnabled ? BashParams : BashForegroundOnlyParams) as typeof BashParams;
+/**
+ * The argument set a model is shown: each optional argument exists only while
+ * the feature it controls is on, so no knob that does nothing is offered.
+ * `wait`, `background` and the PTY arguments need `bash.background`,
+ * `compressed` needs `bash.compress`, and `sandbox` needs `sandbox.enabled`.
+ * A stale call that still sends a removed argument is ignored in `execute`.
+ * Keys keep the order of the full set, so the all-on schema is unchanged.
+ */
+function bashParamsForConfig(features: {
+  background: boolean;
+  compress: boolean;
+  sandbox: boolean;
+}): typeof BashParams {
+  return Type.Object({
+    ...BashBaseParams,
+    ...(features.background ? BashWaitParam : {}),
+    ...(features.sandbox ? BashSandboxParam : {}),
+    ...(features.background ? BashBackgroundFlagParam : {}),
+    ...(features.compress ? BashCompressionParam : {}),
+    ...(features.background ? BashPtyParams : {}),
+  }) as unknown as typeof BashParams;
+}
+
+/**
+ * Whether the native bash sandbox is on for this configuration. The `sandbox`
+ * argument only asks to leave that sandbox for one command, so it is offered
+ * only when there is a sandbox to leave.
+ */
+export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
+  return config.sandbox?.enabled === true;
 }
 
 const BashTaskParams = Type.Object({
@@ -500,6 +533,18 @@ export function registerBashTool(
   const compressionSentence = bashCfg.compress
     ? " Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`."
     : "";
+  // The prompt snippet lists what the call supports, so each entry follows the
+  // feature that provides it.
+  const supported = bashCfg.background
+    ? [
+        "workdir",
+        "background tasks",
+        ...(bashCfg.compress ? ["compressed output"] : []),
+        "PTY mode",
+      ].join(", ")
+    : bashCfg.compress
+      ? "workdir and compressed output"
+      : "workdir";
   const detachSentence = bashCfg.detach_on_user_message
     ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
@@ -513,18 +558,22 @@ export function registerBashTool(
       ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
       : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
     promptSnippet: isPowerShell
-      ? "Run PowerShell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
-      : bashCfg.background
-        ? "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
-        : "Run shell commands (timeout in milliseconds; supports workdir and compressed output)",
+      ? `Run PowerShell commands (timeout in milliseconds; supports ${supported})`
+      : `Run shell commands (timeout in milliseconds; supports ${supported})`,
     promptGuidelines: isPowerShell
       ? ["Use PowerShell syntax. Every command requires explicit approval."]
       : [
           `DO NOT use bash for code search or exploration — ${searchSteer}.`,
-          "Set compressed: false when you need ANSI color codes in the output.",
+          ...(bashCfg.compress
+            ? ["Set compressed: false when you need ANSI color codes in the output."]
+            : []),
           "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
         ],
-    parameters: bashParamsForConfig(bashCfg.background),
+    parameters: bashParamsForConfig({
+      background: bashCfg.background,
+      compress: bashCfg.compress,
+      sandbox: nativeSandboxEnabled(ctx.config),
+    }),
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
@@ -551,7 +600,12 @@ export function registerBashTool(
         ? undefined
         : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(params.compressed, true);
-      const requestedWait = coerceBoolean(params.wait);
+      // With background off, `wait` is not in the schema and every command
+      // already runs to completion. A stale `wait: true` is ignored rather than
+      // forwarded: the engine would otherwise make the call detachable on the
+      // next user message, which would move it into a background task. The
+      // contradiction checks below therefore only fire while background is on.
+      const requestedWait = !backgroundDisabled && coerceBoolean(params.wait);
       const rawRequestedPty = coerceBoolean(params.pty);
       const rawRequestedBackground = coerceBoolean(params.background);
       if (requestedWait && rawRequestedPty) {
@@ -643,10 +697,10 @@ export function registerBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (isPowerShell || !bashCfg.host_fallback || fallbackCause === undefined) throw error;
-        if (rawRequestedBackground) {
+        if (!backgroundDisabled && rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
-        if (rawRequestedPty) {
+        if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
         }
         if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
@@ -727,8 +781,9 @@ export function registerBashTool(
 
 /**
  * Register controls for AFT-owned background task IDs. Each companion is an
- * independent registration controlled only by its own name in
- * `disabled_tools`; the bash runtime gate is enforced by the engine.
+ * independent registration controlled by its own name in `disabled_tools`;
+ * the bash runtime gate is enforced by the engine. All four only act on
+ * background tasks, so none is registered while `bash.background` is off.
  */
 export function registerBashCompanionTools(
   pi: ExtensionAPI,
@@ -740,6 +795,7 @@ export function registerBashCompanionTools(
     bashKill: boolean;
   } = { bashStatus: true, bashWatch: true, bashWrite: true, bashKill: true },
 ): void {
+  if (!resolveBashConfig(ctx.config).background) return;
   if (enabled.bashStatus) {
     pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
   }

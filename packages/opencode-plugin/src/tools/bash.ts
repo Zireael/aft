@@ -305,11 +305,56 @@ async function withPermissionLoop(
   throw new Error("bash permission retry failed: too many rounds");
 }
 
+/**
+ * Whether the native bash sandbox is on for this configuration. The `sandbox`
+ * argument only asks to leave that sandbox for one command, so it is offered
+ * only when there is a sandbox to leave.
+ */
+export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
+  return config.sandbox?.enabled === true;
+}
+
 export function createBashTool(
   ctx: PluginContext,
   aftSearchRegisteredOverride?: boolean,
 ): ToolDefinition {
   const initialBashCfg = resolveBashConfig(ctx.config);
+  // Each optional argument exists only while the feature it controls is on, so
+  // a model is never offered a knob that does nothing: `wait`, `background` and
+  // the PTY arguments need `bash.background`, `compressed` needs
+  // `bash.compress`, and `sandbox` needs `sandbox.enabled`. The set is fixed
+  // when the tool is built; a stale call that still sends a removed argument is
+  // ignored in `execute` rather than rejected.
+  const waitArg = initialBashCfg.background
+    ? {
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
+          ),
+      }
+    : {};
+  const sandboxArg = nativeSandboxEnabled(ctx.config)
+    ? {
+        sandbox: z
+          .literal("host")
+          .optional()
+          .describe(
+            "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+          ),
+      }
+    : {};
+  const compressedArg = initialBashCfg.compress
+    ? {
+        compressed: z
+          .boolean()
+          .optional()
+          .describe(
+            "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+          ),
+      }
+    : {};
   const backgroundFlagArg = initialBashCfg.background
     ? {
         background: z
@@ -357,25 +402,10 @@ export function createBashTool(
       .describe(
         "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
       ),
-    wait: z
-      .boolean()
-      .optional()
-      .describe(
-        `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
-      ),
-    sandbox: z
-      .literal("host")
-      .optional()
-      .describe(
-        "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
-      ),
+    ...waitArg,
+    ...sandboxArg,
     ...backgroundFlagArg,
-    compressed: z
-      .boolean()
-      .optional()
-      .describe(
-        "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
-      ),
+    ...compressedArg,
     ...ptyArgs,
   };
 
@@ -408,9 +438,15 @@ export function createBashTool(
       // Detect whether the calling session is a subagent (has a non-empty parentID).
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const backgroundDisabled = !bashCfg.background;
-      const requestedWait = coerceBoolean(args.wait);
+      // With background off, `wait` is not in the schema and every command
+      // already runs to completion. A stale `wait: true` is ignored rather than
+      // forwarded: the engine would otherwise make the call detachable on the
+      // next user message, which would move it into a background task.
+      const requestedWait = !backgroundDisabled && coerceBoolean(args.wait);
       const rawRequestedPty = coerceBoolean(args.pty);
       const rawRequestedBackground = coerceBoolean(args.background);
+      // The contradiction checks below only fire while background is on:
+      // requestedWait is false otherwise, so stale arguments never error.
       if (requestedWait && rawRequestedPty) {
         throw new Error(
           "wait:true cannot be used with pty:true because PTY sessions run in background.",
@@ -510,10 +546,10 @@ export function createBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (!bashCfg.host_fallback || fallbackCause === undefined) throw error;
-        if (rawRequestedBackground) {
+        if (!backgroundDisabled && rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
-        if (rawRequestedPty) {
+        if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
         }
 

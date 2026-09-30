@@ -204,10 +204,13 @@ describe("OpenCode 1 keeps its bash family byte-identical", () => {
   /**
    * Captured from the V1 registration before the OpenCode 2 permission work,
    * so any change to what an OpenCode 1 agent is shown for these tools, or to
-   * their names, fails here.
+   * their names, fails here. The native sandbox is enabled so the `sandbox`
+   * argument, offered only then, stays pinned. The `bash` description is the
+   * one an agent sees once `aft_search` is registered: the registration map
+   * now carries that final wording instead of the factory default.
    */
   test("names, descriptions and schemas match the capture", () => {
-    const config = resolved(ALL_TOOLS_CONFIG);
+    const config = resolved({ ...ALL_TOOLS_CONFIG, sandbox: { enabled: true } });
     const v1 = buildOpenCodeToolMap(
       {
         pool: {

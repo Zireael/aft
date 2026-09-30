@@ -1,9 +1,10 @@
 import { unknownDisabledTools } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 
-import { type AftConfig, resolvedDisabledTools } from "./config.js";
+import { type AftConfig, resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import { astTools } from "./tools/ast.js";
+import { bashToolDescription } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
 import {
   projectV2Tool,
@@ -121,11 +122,14 @@ export function openCodeHashlineDowngrade(
 /**
  * Build the exact OpenCode registration map without starting a bridge.
  *
- * A tool is registered exactly when its canonical name is absent from the
- * resolved `disabled_tools`. Index state, backends and runtime gates (bash,
- * backup, inspect) never remove a registration; those tools report their
- * runtime state when called. Production calls this after startup has prepared
- * the transport context, and the registration tests call the same function.
+ * A tool is registered when its canonical name is absent from the resolved
+ * `disabled_tools`, with one exception: the bash companions (`bash_status`,
+ * `bash_watch`, `bash_write`, `bash_kill`) also need `bash.background`, since
+ * they only act on background tasks. Index state, backends and the other
+ * runtime gates (`bash.enabled`, backup, inspect) never remove a registration;
+ * those tools report their runtime state when called. Production calls this
+ * after startup has prepared the transport context, and the registration tests
+ * call the same function.
  *
  * `onUnknownDisabled` receives, once per call, the sorted distinct disabled
  * names that are not in the canonical tool inventory.
@@ -156,7 +160,35 @@ export function buildAftToolDefinitions(
   const unknown = unknownDisabledTools(disabled);
   if (unknown.length > 0) onUnknownDisabled?.(unknown);
 
+  describeBashForRegisteredSurface(allTools, config);
   return allTools;
+}
+
+/**
+ * Rewrite the `bash` description for the final registered surface.
+ *
+ * The description names other tools: its code-search prohibition steers to
+ * `aft_search` (else the grep tool) and to `aft_zoom`, and its background
+ * sentence steers waits to `bash_watch`. Which of those exist is only known
+ * once `disabled_tools` has been applied, so the tool factory's default
+ * wording is replaced here. The compression and background/PTY sentences
+ * follow the resolved bash config.
+ */
+function describeBashForRegisteredSurface(
+  allTools: Record<string, ToolDefinition>,
+  config: AftConfig,
+): void {
+  const bash = allTools.bash;
+  if (!bash) return;
+  const bashCfg = resolveBashConfig(config);
+  bash.description = bashToolDescription(
+    "aft_search" in allTools,
+    bashCfg.compress,
+    bashCfg.background,
+    bashCfg.detach_on_user_message,
+    "aft_zoom" in allTools,
+    "bash_watch" in allTools,
+  );
 }
 
 /** Backward-compatible V1 name for the shared definition inventory. */

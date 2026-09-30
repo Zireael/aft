@@ -173,7 +173,10 @@ function safeParse(schema: unknown, value: unknown): { success: boolean } {
 
 describe("OpenCode bash adapter", () => {
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
-    const { tool: bash } = createHarness(() => ({ success: true, output: "" }));
+    // `sandbox` is only offered while the native sandbox is enabled.
+    const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+      sandbox: { enabled: true },
+    } as PluginContext["config"]);
 
     expect(bash.description).toContain("Output is compressed by default");
     expect(bash.description).toContain("compressed: false");
@@ -221,20 +224,22 @@ describe("OpenCode bash adapter", () => {
     }
   });
 
-  test("schema omits background and PTY args when bash.background is disabled", () => {
+  test("schema omits wait, background and PTY args when bash.background is disabled", () => {
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
       bash: { background: false },
     } as PluginContext["config"]);
 
+    // `wait` only changes whether a command may auto-promote to the
+    // background, so it leaves with the other background arguments. `sandbox`
+    // is absent too: this config does not enable the native sandbox.
     expect(Object.keys(bash.args)).toEqual([
       "command",
       "timeout",
       "workdir",
       "description",
-      "wait",
-      "sandbox",
       "compressed",
     ]);
+    expect(bash.args.wait).toBeUndefined();
     expect(bash.args.background).toBeUndefined();
     expect(bash.args.pty).toBeUndefined();
     expect(bash.args.ptyRows).toBeUndefined();
@@ -1112,6 +1117,38 @@ describe("OpenCode bash adapter", () => {
     expect(calls[0].params.timeout).toBe(25);
     expect(calls[0].params.block_to_completion).toBe(true);
     expect(calls[0].options?.transportTimeoutMs).toBe(10_025);
+  });
+
+  test("stale wait, background and pty arguments are ignored, never rejected, when background is off", async () => {
+    // These arguments are not in the schema with background off, but a model
+    // replaying an older call can still send them. Paired, they would trip the
+    // wait/background contradiction checks; alone, `wait: true` would make the
+    // call detachable into a background task.
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: true, status: "completed", exit_code: 0, output: "done" }),
+      undefined,
+      false,
+      { bash: { background: false } } as PluginContext["config"],
+    );
+
+    for (const stale of [
+      { wait: true, background: true },
+      { wait: true, pty: true },
+      { wait: true },
+    ]) {
+      const output = bashText(
+        await bash.execute(
+          { command: "true", ...stale },
+          createMockSdkContext({ sessionID: "no-bg-stale" }),
+        ),
+      );
+      expect(output).toBe("done");
+      const params = calls.at(-1)?.params ?? {};
+      expect(params.wait).toBe(false);
+      expect(params.background).toBe(false);
+      expect(params.pty).toBe(false);
+      expect(params.block_to_completion).toBe(true);
+    }
   });
 
   test("explicit background spawn enables completion notifications", async () => {

@@ -234,3 +234,27 @@ describe("buildHintsFromConfig", () => {
     expect(buildHintsFromConfig(on, new Set())).toContain("**Long-running commands**");
   });
 });
+
+describe("hints name only registered companions and enabled bash features", () => {
+  const REWRITE_CLAUSE = "(and accepted AFT `cat`/`head`/`tail` rewrites)";
+
+  test("the hashline hint names bash rewrites only while bash is registered and rewrite is on", () => {
+    expect(buildHintsFromConfig({}, new Set(), true)).toContain(REWRITE_CLAUSE);
+    expect(buildHintsFromConfig({ bash: { rewrite: false } }, new Set(), true)).not.toContain(
+      REWRITE_CLAUSE,
+    );
+    expect(buildHintsFromConfig({}, new Set(["bash"]), true)).not.toContain(REWRITE_CLAUSE);
+    expect(buildHintsFromConfig({ bash: { rewrite: false } }, new Set(), true)).toContain(
+      "**Hashline edit tags**: Only `read` mint hashline tags.",
+    );
+  });
+
+  test("each background section needs the companion it names", () => {
+    const noWatch = buildHintsFromConfig({}, new Set(["bash_watch"])) ?? "";
+    expect(noWatch).not.toContain("**Long-running commands**");
+    expect(noWatch).toContain("**PTY / interactive commands**");
+    const noWrite = buildHintsFromConfig({}, new Set(["bash_write"])) ?? "";
+    expect(noWrite).toContain("**Long-running commands**");
+    expect(noWrite).not.toContain("**PTY / interactive commands**");
+  });
+});

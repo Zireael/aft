@@ -14,6 +14,12 @@ import { piHashlineEffective } from "./tool-registration.js";
 export interface WorkflowHintsOpts {
   bashBackgroundEnabled: boolean;
   bashCompressionEnabled: boolean;
+  /**
+   * Resolved `bash.rewrite` flag. Only rewritten `cat`/`head`/`tail` commands
+   * mint hashline tags through bash, so the hashline hint names them only when
+   * rewriting is on. Omitted means on.
+   */
+  bashRewriteEnabled?: boolean;
   /** Set of tool names KNOWN-ABSENT from the registered surface. */
   absentTools: Set<string>;
   /** Whether the hashline `edit` arm is the one actually registered. */
@@ -27,10 +33,16 @@ const HEADING = "## IMPORTANT NOTICE about your tools";
  *
  * Navigation tools return source that looks edit-ready but never publishes a
  * snapshot, so an agent that inspects a symbol and then patches it is refused
- * for a tag it believes it already has.
+ * for a tag it believes it already has. The bash rewrite path is named only
+ * when it exists (bash registered and `bash.rewrite` on).
  */
-export const HASHLINE_TAG_SOURCE_HINT =
-  "**Hashline edit tags**: Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.";
+export function hashlineTagSourceHint(bashRewritesMintTags: boolean): string {
+  const rewrites = bashRewritesMintTags ? " (and accepted AFT `cat`/`head`/`tail` rewrites)" : "";
+  return `**Hashline edit tags**: Only \`read\`${rewrites} mint hashline tags. \`aft_zoom\`, \`aft_outline\`, \`grep\`, \`aft_search\`, and conflict snippets do not. After navigation, call \`read\` on every file and range the patch addresses.`;
+}
+
+/** The hashline hint for a session whose bash rewrites `cat`/`head`/`tail`. */
+export const HASHLINE_TAG_SOURCE_HINT = hashlineTagSourceHint(true);
 
 export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const sections: string[] = [];
@@ -48,6 +60,9 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasInspect = !opts.absentTools.has("aft_inspect");
   const hasBash = !opts.absentTools.has(bashName);
   const hasBgBash = opts.bashBackgroundEnabled && hasBash && !opts.absentTools.has("bash_status");
+  // Each background section names its companion, so it needs that tool too.
+  const hasWatch = !opts.absentTools.has("bash_watch");
+  const hasWrite = !opts.absentTools.has("bash_write");
 
   if (hasBash && opts.bashCompressionEnabled) {
     // The section itself is config-gated, so the text never hedges with
@@ -117,7 +132,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     );
   }
 
-  if (hasBgBash) {
+  if (hasBgBash && hasWatch) {
     sections.push(
       [
         `**Long-running commands** (builds, installs, full test suites): run them in the FOREGROUND — use \`${bashName}({ command, wait: true })\` when you know it is long and need the result before anything else; if you send a new message, the wait detaches to background; otherwise omit \`wait\` so auto-promote can hand you a reminder while you work.`,
@@ -125,6 +140,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         "- `bash_watch` is for blocking on an ALREADY-backgrounded task once you've run out of parallel work (sync — the user can interrupt), or reacting to a specific early output line (async: background:true + pattern). Never loop `bash_status` to wait — it's a one-shot inspector.",
       ].join("\n"),
     );
+  }
+  if (hasBgBash && hasWrite) {
     sections.push(
       `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`bash_status({ task_id, output_mode: "screen" })\`, and send input with \`bash_write({ task_id, input: "..." })\`.`,
     );
@@ -133,7 +150,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // Conditional on the hashline arm being the registered one: a legacy-edit
   // session has no tags and must not be told to go mint them.
   if (opts.hashlineEffective === true) {
-    sections.push(HASHLINE_TAG_SOURCE_HINT);
+    sections.push(hashlineTagSourceHint(hasBash && opts.bashRewriteEnabled !== false));
   }
 
   if (sections.length === 0) {
@@ -159,9 +176,11 @@ export function buildHintsFromConfig(
   // Background-bash gating reads the resolved bash config so the graduated
   // `bash.background` setting controls whether the hint appears. See
   // `resolveBashConfig` in config.ts.
+  const bashCfg = resolveBashConfig(config);
   return buildWorkflowHints({
-    bashBackgroundEnabled: resolveBashConfig(config).background,
-    bashCompressionEnabled: resolveBashConfig(config).compress,
+    bashBackgroundEnabled: bashCfg.background,
+    bashCompressionEnabled: bashCfg.compress,
+    bashRewriteEnabled: bashCfg.rewrite,
     absentTools,
     hashlineEffective,
   });
@@ -182,6 +201,8 @@ interface ToolSurfaceFlags {
   hoistEdit: boolean;
   hoistRead: boolean;
   bashStatus: boolean;
+  bashWatch: boolean;
+  bashWrite: boolean;
 }
 
 /**
@@ -211,6 +232,8 @@ export function registerWorkflowHints(
   if (!surface.hoistRead) absent.add("read");
   if (!surface.hoistBash) absent.add("bash");
   if (!surface.bashStatus) absent.add("bash_status");
+  if (!surface.bashWatch) absent.add("bash_watch");
+  if (!surface.bashWrite) absent.add("bash_write");
 
   const hintsBlock = buildHintsFromConfig(config, absent, piHashlineEffective(config, surface));
   if (!hintsBlock) return;

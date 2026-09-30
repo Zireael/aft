@@ -42,9 +42,11 @@ say so instead of returning an empty result:
 These replace the host harness's built-ins under the same names. A tool is registered unless
 its name is in `disabled_tools`; disabling a host name (for example `"grep"`) leaves the
 host's own tool in place. There are no `aft_`-prefixed alternatives. The `bash_status`,
-`bash_watch`, `bash_write`, and `bash_kill` companions register independently of `bash`.
-Index state and runtime settings never remove a registration: a tool whose index is off or
-building reports that when called.
+`bash_watch`, `bash_write`, and `bash_kill` companions register independently of `bash`,
+but only while `bash.background` is on: they act only on background tasks. Apart from that,
+index state and runtime settings never remove a registration: a tool whose index is off or
+building reports that when called. The `bash` arguments follow their features the same way
+(see [shell-tool-surface.md](shell-tool-surface.md)).
 
 The Pi/OMP adapter has no `apply_patch` or `glob` implementation, so those two tools are not
 registered there.

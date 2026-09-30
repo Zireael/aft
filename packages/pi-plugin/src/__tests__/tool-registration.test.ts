@@ -48,16 +48,26 @@ describe("Pi PowerShell registration", () => {
 });
 
 describe("Pi tool registration", () => {
-  test("runtime gates and index switches never change the registered set", () => {
+  test("runtime gates other than bash.background and index switches never change the registered set", () => {
     const base = register({ disabled_tools: [] });
     const gated = register({
       disabled_tools: [],
-      bash: { enabled: false, background: false },
+      bash: { enabled: false },
       inspect: { enabled: false },
       backup: { enabled: false },
       indexes: { trigram: false, semantic: false, callgraph: false },
     });
     expect([...gated.tools.keys()].sort()).toEqual([...base.tools.keys()].sort());
+  });
+
+  test("bash.background off leaves out exactly the four companions", () => {
+    // They only act on background tasks, so without background there is
+    // nothing for them to inspect, wait on, feed or stop.
+    const base = register({ disabled_tools: [] });
+    const foreground = register({ disabled_tools: [], bash: { background: false } });
+    const removed = [...base.tools.keys()].filter((name) => !foreground.tools.has(name));
+    expect(removed.sort()).toEqual(["bash_kill", "bash_status", "bash_watch", "bash_write"]);
+    expect([...foreground.tools.keys()].filter((name) => !base.tools.has(name))).toEqual([]);
   });
 
   test("host slots register under host names; no prefixed alternatives exist", async () => {

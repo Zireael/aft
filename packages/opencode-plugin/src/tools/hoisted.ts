@@ -19,7 +19,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { resolveGithubConfig } from "../config.js";
+import { resolveBashConfig, resolveGithubConfig } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import { currentSessionVisionCapability } from "../shared/read-vision.js";
 import { measurePreStage } from "../tool-perf.js";
@@ -1259,16 +1259,27 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 
 /**
  * Returns AFT's host-slot tools keyed by the host's built-in names, plus the
- * move/delete tools and the bash companions.
+ * move/delete tools and, while `bash.background` is on, the bash companions.
  *
- * Every entry is always returned; `buildAftToolDefinitions` removes only the
- * names listed in the resolved `disabled_tools`. The bash companions
- * (`bash_status`, `bash_write`, `bash_watch`, `bash_kill`) are independent
- * registrations: disabling `bash` does not remove them, and when the bash
- * runtime gate (`bash.enabled`) is off every bash operation reports
- * `bash_disabled` instead of disappearing.
+ * `buildAftToolDefinitions` then removes the names listed in the resolved
+ * `disabled_tools`. The bash companions (`bash_status`, `bash_write`,
+ * `bash_watch`, `bash_kill`) are independent of `bash` itself: disabling
+ * `bash` does not remove them, and when the bash runtime gate (`bash.enabled`)
+ * is off every bash operation reports `bash_disabled` instead of disappearing.
+ * They exist only to inspect, wait on, feed and stop background tasks, so with
+ * `bash.background` off, when no background task can exist, they are not
+ * registered at all.
  */
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
+  const backgroundCompanions: Record<string, ToolDefinition> = resolveBashConfig(ctx.config)
+    .background
+    ? {
+        bash_status: createBashStatusTool(ctx),
+        bash_write: createBashWriteTool(ctx),
+        bash_watch: createBashWatchTool(ctx),
+        bash_kill: createBashKillTool(ctx),
+      }
+    : {};
   const tools: Record<string, ToolDefinition> = {
     read: createReadTool(ctx),
     write: createWriteTool(ctx, "edit"),
@@ -1277,10 +1288,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
     bash: createBashTool(ctx),
-    bash_status: createBashStatusTool(ctx),
-    bash_write: createBashWriteTool(ctx),
-    bash_watch: createBashWatchTool(ctx),
-    bash_kill: createBashKillTool(ctx),
+    ...backgroundCompanions,
   };
 
   return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });

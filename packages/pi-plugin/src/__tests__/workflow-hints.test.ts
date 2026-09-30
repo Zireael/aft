@@ -209,6 +209,8 @@ describe("Pi registerWorkflowHints", () => {
       hoistEdit: true,
       hoistRead: true,
       bashStatus: true,
+      bashWatch: true,
+      bashWrite: true,
     };
     const handlers: Array<(event: { systemPrompt: string }) => { systemPrompt: string }> = [];
     const pi = {
