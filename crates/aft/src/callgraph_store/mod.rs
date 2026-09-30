@@ -554,6 +554,94 @@ mod write_amplification_tests {
         );
     }
 
+    /// A store whose pointer is published and whose `meta` says ready must be
+    /// readable from that moment on. Here another process holds a read open on
+    /// the just-published generation (a readiness probe, or a second AFT reading
+    /// the shared store) while the builder opens its own writer handle on it.
+    /// When the generation was published in rollback-journal mode, that writer
+    /// had to switch it to WAL under an exclusive lock, waited for the outside
+    /// read to end, and meanwhile SQLite refused every new reader, so queries
+    /// answered "building" for a published, ready store.
+    #[test]
+    fn published_generation_stays_readable_while_its_first_writer_opens_beside_a_held_read() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        fs::write(
+            &source,
+            "export function main() { helper(); }\nfunction helper() {}\n",
+        )
+        .unwrap();
+        let callgraph_dir = temp.path().join("store");
+        fs::create_dir_all(&callgraph_dir).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let lease = acquire_writer_lease(&callgraph_dir, &project_key, &root)
+            .unwrap()
+            .expect("writer lease");
+
+        // Publish exactly as a cold build does, stopping before the builder
+        // opens its own handle on the published generation.
+        let (_stats, generation) = CallGraphStore::cold_build_publish_locked(
+            &callgraph_dir,
+            &root,
+            &project_key,
+            std::slice::from_ref(&source),
+            0,
+            Arc::clone(&lease),
+        )
+        .unwrap();
+        let gen_path = callgraph_dir.join(&generation);
+
+        let outside_reader =
+            Connection::open_with_flags(&gen_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        outside_reader.execute_batch("BEGIN").unwrap();
+        let ready: String = outside_reader
+            .query_row("SELECT v FROM meta WHERE k = 'ready'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ready, "1", "the generation is published and ready");
+
+        let writer = {
+            let callgraph_dir = callgraph_dir.clone();
+            let root = root.clone();
+            let project_key = project_key.clone();
+            let generation = generation.clone();
+            std::thread::spawn(move || {
+                CallGraphStore::open_generation(
+                    &callgraph_dir,
+                    root,
+                    project_key,
+                    generation,
+                    lease,
+                )
+            })
+        };
+        // Read once the writer has either finished opening or started a
+        // rollback-journal write that it cannot commit while the outside read
+        // is open. The bound stays under the writer's five-second busy timeout
+        // so a blocked writer is still blocked when the read happens.
+        let journal = sqlite_file_set_path(&gen_path, "-journal");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !writer.is_finished() && !journal.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let read = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone());
+
+        outside_reader.execute_batch("COMMIT").unwrap();
+        let writer_store = writer
+            .join()
+            .expect("writer thread joined")
+            .expect("the builder's writer handle opens");
+        let reader = read
+            .expect("read-only open of the published generation")
+            .expect("a published, ready generation must be readable while its writer opens");
+        assert_eq!(
+            reader.inner.generation.as_deref(),
+            Some(generation.as_str())
+        );
+        drop(writer_store);
+    }
+
     #[test]
     fn own_refresh_skips_identical_extract_but_not_position_shift() {
         let temp = tempdir().unwrap();
@@ -4157,6 +4245,11 @@ impl CallGraphStore {
             drop(_files);
 
             notify_cold_build_swap_observer(&temp_path, &gen_path);
+
+            // No pointer names the new file yet, so nothing else has it open:
+            // this is the one moment its journal mode can change without
+            // locking out readers of a published store.
+            switch_generation_to_wal_before_publication(&gen_path);
 
             // Atomically publish the new generation, then best-effort GC old ones.
             verify_writer_lease(&writer_lease)?;
@@ -8652,6 +8745,45 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
+}
+
+/// Put a renamed, not yet published generation into WAL mode.
+///
+/// The staging database is switched to rollback (DELETE) journaling before the
+/// rename so the moved file holds every committed page on its own. Published
+/// that way, the first writer to open it (the builder's own handle, or a later
+/// refresh) must switch it back to WAL, and on a rollback-journal database that
+/// switch is a write transaction that needs an exclusive lock on the file. The
+/// writer waits for that lock (up to its busy timeout) for as long as any other
+/// connection, in this process or another, keeps a read open, and while it
+/// waits SQLite refuses every new reader with SQLITE_BUSY. Query readers do not
+/// wait on a busy store, so a store that was published and ready answered
+/// "building" for that whole time. Switching here, before the pointer names the
+/// file, means a published generation is already in WAL mode, where writers
+/// never need an exclusive lock and never block readers.
+///
+/// A failure is logged and publication goes ahead: the rollback-mode file is
+/// still a complete, correct generation, only one whose first writer briefly
+/// locks readers out.
+fn switch_generation_to_wal_before_publication(path: &Path) {
+    let switched = (|| -> Result<String> {
+        let conn = TrackedConnection::open(path, SqliteStore::CallgraphGeneration)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?)
+    })();
+    match switched {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+        Ok(mode) => crate::slog_warn!(
+            "callgraph generation {} stayed in {} journal mode before publication",
+            path.display(),
+            mode
+        ),
+        Err(error) => crate::slog_warn!(
+            "callgraph generation {} could not switch to WAL before publication: {}",
+            path.display(),
+            error
+        ),
+    }
 }
 
 /// A copied migration generation may carry a WAL sidecar. Checkpoint only the
