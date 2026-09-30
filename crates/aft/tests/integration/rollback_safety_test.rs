@@ -269,6 +269,12 @@ fn future_search_index_is_refused_by_name_and_left_byte_identical() {
     // The configure worker settles on a build-denied (empty) index instead of
     // building and persisting over the newer cache.
     settle(&ctx, "search index", search_settled);
+
+    assert_eq!(
+        fs::read(&cache).unwrap(),
+        bytes,
+        "newer search cache was changed"
+    );
     assert!(
         ctx.search_index()
             .read()
@@ -276,12 +282,6 @@ fn future_search_index_is_refused_by_name_and_left_byte_identical() {
             .as_ref()
             .is_some_and(|index| index.build_denied),
         "the search build must be denied, not run"
-    );
-
-    assert_eq!(
-        fs::read(&cache).unwrap(),
-        bytes,
-        "newer search cache was changed"
     );
     assert_plane_refused(
         &ctx,
