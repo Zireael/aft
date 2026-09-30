@@ -3015,7 +3015,17 @@ fn forwarded_changes(root: &std::path::Path, params: &serde_json::Value) -> Vec<
         .map(|change| {
             let uri = url::Url::parse(change["uri"].as_str().expect("uri")).expect("file uri");
             let path = uri.to_file_path().expect("file path");
-            let path = fs::canonicalize(&path).unwrap_or(path);
+            // Canonicalize so the path compares against the canonical root
+            // (on Windows that is a `\\?\` verbatim path). Some forwarded
+            // paths name files that were never created, which canonicalize
+            // refuses, so fall back to the canonical parent plus the name.
+            let path = fs::canonicalize(&path)
+                .ok()
+                .or_else(|| {
+                    let parent = fs::canonicalize(path.parent()?).ok()?;
+                    Some(parent.join(path.file_name()?))
+                })
+                .unwrap_or(path);
             let relative = path
                 .strip_prefix(&root)
                 .unwrap_or(&path)
