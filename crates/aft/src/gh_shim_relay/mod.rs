@@ -12,6 +12,20 @@
 //! The ticket is the only authority. A session or agent field in the body is
 //! never used to pick the speaker, and a missing or unknown ticket is refused
 //! before anything leaves the daemon.
+//!
+//! A bot write goes out on one of two paths:
+//!
+//! - **stamp**: the session's tool route was bound under a daemon scope that
+//!   lets providers act as the session's agent (see [`delegating_agent`]). The
+//!   daemon then opens its plexus route under that same scope and sends the
+//!   write without an assertion; plexus reads the agent from the scope stamp on
+//!   that route and re-checks the scope before each write it sends.
+//! - **assertion**: everything else. The daemon mints a signed assertion from
+//!   prefrontal and sends it with the write on an unscoped route.
+//!
+//! The stamp path needs a transport that can open a scoped route
+//! ([`RelayTransport::opens_scoped_routes`]); the production transport cannot
+//! yet, so production bot writes use the assertion path until it can.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,6 +88,69 @@ pub enum TransportError {
     OutcomeUnknown(String),
 }
 
+/// The daemon scope stamped on a route at bind.
+pub type ScopeStamp = subc_protocol::scope::ScopeStamp;
+/// The scope a route open asks to be admitted under.
+pub type ScopeSelector = subc_protocol::scope::ScopeSelector;
+
+/// The agent a stamp lets a provider act as, if any.
+///
+/// This is exactly the rule plexus applies to a bot write that carries no
+/// assertion: the scope must delegate, its owner must be one the daemon trusts
+/// to set agent identity (`owner_authorized`), and it must name an agent. Any
+/// other stamp grants plexus no one to act as, so a write without an assertion
+/// would be refused (`assertion_absent`).
+pub fn delegating_agent(stamp: &ScopeStamp) -> Option<&str> {
+    if stamp.attributes.delegates && stamp.owner_authorized {
+        stamp.attributes.agent_id.as_deref()
+    } else {
+        None
+    }
+}
+
+/// The selector that opens a route under the scope a stamp names, pinned to
+/// the stamp's epoch so a newer session under the same ref is not picked up.
+fn scope_selector(stamp: &ScopeStamp) -> ScopeSelector {
+    ScopeSelector {
+        owner: stamp.owner.clone(),
+        scope_ref: stamp.scope_ref.clone(),
+        scope_epoch: Some(stamp.scope_epoch),
+    }
+}
+
+/// The scope stamps of AFT's bound tool routes, keyed by the session each
+/// route was bound for. The subc frame loop copies them when a relay request
+/// arrives, because the relay runs on its own task and cannot read the loop's
+/// route table.
+#[derive(Clone, Debug, Default)]
+pub struct RouteScopes {
+    routes: Vec<(String, Option<ScopeStamp>)>,
+}
+
+impl RouteScopes {
+    /// Record one bound tool route and the stamp the daemon put on it.
+    pub fn push(&mut self, session: &str, stamp: Option<ScopeStamp>) {
+        self.routes.push((session.to_string(), stamp));
+    }
+
+    /// The stamp of the session's tool route, when there is exactly one answer.
+    ///
+    /// A ticket names a session, not a route, and a session can have more than
+    /// one route bound at a time. When those routes carry different stamps, or
+    /// one of them carries none, the relay cannot tell which route launched the
+    /// command, so this returns `None` and the write uses the assertion path,
+    /// which is what an unstamped session gets.
+    pub fn for_session(&self, session: &str) -> Option<&ScopeStamp> {
+        let mut stamps = self
+            .routes
+            .iter()
+            .filter(|(bound, _)| bound == session)
+            .map(|(_, stamp)| stamp.as_ref());
+        let first = stamps.next()??;
+        stamps.all(|other| other == Some(first)).then_some(first)
+    }
+}
+
 /// The two outbound calls the relay makes. Production uses the daemon's own
 /// `reserved:aft` subc connection; tests use fakes that record the bodies.
 pub trait RelayTransport: Send + Sync {
@@ -85,12 +162,19 @@ pub trait RelayTransport: Send + Sync {
         body: Value,
     ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
+    /// With `scope`, the route to plexus must be opened under that scope, so
+    /// plexus sees its stamp; without one the route is unscoped.
     fn plexus(
         &self,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
+    /// Whether [`RelayTransport::plexus`] can open its route under a scope.
+    /// The stamp path is only taken when this is true: a write without an
+    /// assertion on an unscoped route would be refused by plexus.
+    fn opens_scoped_routes(&self) -> bool;
 }
 
 #[derive(Clone, Debug)]
@@ -185,11 +269,18 @@ pub struct RelayCall<'a> {
     pub first_party: bool,
     /// Current Unix time in seconds, for the token cache.
     pub now: u64,
+    /// Scope stamps of the daemon's bound tool routes when the request arrived.
+    pub route_scopes: &'a RouteScopes,
 }
 
+/// Which path a bot write took, for the relay log line.
+const PATH_STAMP: &str = "stamp";
+const PATH_ASSERTION: &str = "assertion";
+
 /// Run one relay operation. `log` receives exactly one line per call carrying
-/// the redeemed session, task id, nonce, action, repository and outcome; the
-/// ticket and the assertion never appear in it.
+/// the redeemed session, task id, nonce, action, repository, the path the
+/// write took (`stamp` or `assertion`, `-` when refused before one was chosen)
+/// and the outcome; the ticket, the assertion and the scope never appear in it.
 pub async fn relay<T: RelayTransport>(
     transport: &T,
     cache: &TokenCache,
@@ -216,6 +307,7 @@ pub async fn relay<T: RelayTransport>(
 
     let mut session = "-".to_string();
     let mut task = "-".to_string();
+    let mut path = "-";
     let reply = 'reply: {
         if !call.first_party {
             break 'reply RelayReply::refused(
@@ -250,20 +342,28 @@ pub async fn relay<T: RelayTransport>(
         };
         match call.operation {
             BINDINGS_READ_OPERATION => {
+                path = PATH_ASSERTION;
                 bindings_read(transport, cache, &redeemed, params, call.now).await
             }
-            _ => bot_request(transport, cache, &redeemed, params, call.now).await,
+            _ => {
+                let stamp = call.route_scopes.for_session(&redeemed.session_id);
+                let (reply, taken) =
+                    bot_request(transport, cache, &redeemed, stamp, params, call.now).await;
+                path = taken;
+                reply
+            }
         }
     };
 
     log(&format!(
-        "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} outcome={}",
+        "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} path={} outcome={}",
         call.operation,
         session,
         task,
         if nonce.is_empty() { "-" } else { nonce },
         action,
         repository,
+        path,
         reply.outcome_label(),
     ));
     reply
@@ -361,7 +461,7 @@ async fn bindings_read<T: RelayTransport>(
         "arguments": {"op": "bindings.read", "connection_id": connection_id},
     });
     match transport
-        .plexus(&redeemed.project_root, &redeemed.session_id, body)
+        .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
         .await
     {
         Ok(reply) => RelayReply::relayed(reply),
@@ -369,22 +469,30 @@ async fn bindings_read<T: RelayTransport>(
     }
 }
 
+/// Relay one bot write, returning plexus's reply and the path it took.
 async fn bot_request<T: RelayTransport>(
     transport: &T,
     cache: &TokenCache,
     redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
     params: &Value,
     now: u64,
-) -> RelayReply {
+) -> (RelayReply, &'static str) {
     let Some(nonce) = params
         .get("request_nonce")
         .and_then(Value::as_str)
         .filter(|nonce| !nonce.is_empty())
     else {
-        return RelayReply::refused("request_malformed", "request", "request_nonce is required");
+        return (
+            RelayReply::refused("request_malformed", "request", "request_nonce is required"),
+            "-",
+        );
     };
     let Some(request) = params.get("request").filter(|request| request.is_object()) else {
-        return RelayReply::refused("request_malformed", "request", "request must be an object");
+        return (
+            RelayReply::refused("request_malformed", "request", "request must be an object"),
+            "-",
+        );
     };
     // The agent is the one the shim's signed manifest binds to the target
     // repository. It names whose bot to mint for; the session comes from the
@@ -395,16 +503,65 @@ async fn bot_request<T: RelayTransport>(
         .and_then(Value::as_str)
         .filter(|agent| !agent.is_empty())
     else {
-        return RelayReply::refused(
-            "request_malformed",
-            "request",
-            "request.metadata.agent_id is required",
+        return (
+            RelayReply::refused(
+                "request_malformed",
+                "request",
+                "request.metadata.agent_id is required",
+            ),
+            "-",
         );
     };
     let session = redeemed.session_id.as_str();
+
+    // The stamp path: the session's scope lets plexus act as its agent, and
+    // the route to plexus can be opened under that scope so plexus sees it.
+    if let Some((stamp_agent, stamp)) = stamp
+        .filter(|_| transport.opens_scoped_routes())
+        .and_then(|stamp| delegating_agent(stamp).map(|agent| (agent, stamp)))
+    {
+        // Plexus takes the agent from the stamp, so a request naming another
+        // agent would speak as the wrong bot. Plexus refuses the same mismatch
+        // under this code when a stamp and an assertion disagree.
+        if stamp_agent != agent_id {
+            return (
+                RelayReply::refused(
+                    "agent_identity_conflict",
+                    "scope",
+                    format!(
+                        "the session's scope acts as agent {stamp_agent}, but the request names agent {agent_id}"
+                    ),
+                ),
+                PATH_STAMP,
+            );
+        }
+        let selector = scope_selector(stamp);
+        let body = json!({
+            "name": "github",
+            "arguments": {
+                "op": "bot_request",
+                "request_nonce": nonce,
+                "request": request,
+            },
+        });
+        // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
+        // `delegation_withdrawn`, `agent_identity_conflict`, with their
+        // `legs_sent`), goes back to the shim as plexus sent it. The write is
+        // never retried on the assertion path: plexus refused because of the
+        // scope, and an assertion would get the write past that decision.
+        let reply = match transport
+            .plexus(&redeemed.project_root, session, Some(&selector), body)
+            .await
+        {
+            Ok(reply) => RelayReply::relayed(reply),
+            Err(error) => transport_refusal("plexus", error),
+        };
+        return (reply, PATH_STAMP);
+    }
+
     let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
         Ok(token) => token,
-        Err(refusal) => return refusal,
+        Err(refusal) => return (refusal, PATH_ASSERTION),
     };
     let body = json!({
         "name": "github",
@@ -415,8 +572,8 @@ async fn bot_request<T: RelayTransport>(
             "request": request,
         },
     });
-    match transport
-        .plexus(&redeemed.project_root, session, body)
+    let reply = match transport
+        .plexus(&redeemed.project_root, session, None, body)
         .await
     {
         Ok(reply) => {
@@ -430,7 +587,8 @@ async fn bot_request<T: RelayTransport>(
             RelayReply::relayed(reply)
         }
         Err(error) => transport_refusal("plexus", error),
-    }
+    };
+    (reply, PATH_ASSERTION)
 }
 
 fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
@@ -593,8 +751,19 @@ impl RelayTransport for SubcRelayTransport {
         &self,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> Result<Value, TransportError> {
+        // Opening the route unscoped instead would send the write without the
+        // stamp that stands in for its assertion, so a scoped call fails here
+        // before anything is sent. The relay never asks for one while
+        // `opens_scoped_routes` is false.
+        if scope.is_some() && !self.opens_scoped_routes() {
+            return Err(TransportError::Refused {
+                code: subc_protocol::error_codes::SCOPE_UNSUPPORTED.to_string(),
+                message: "the daemon's subc client cannot open a route under a scope".to_string(),
+            });
+        }
         self.call(
             subc_protocol::RouteTarget::ToolProvider {
                 module_id: PLEXUS_MODULE_ID.to_string(),
@@ -604,6 +773,19 @@ impl RelayTransport for SubcRelayTransport {
             body,
         )
         .await
+    }
+
+    /// Always false for now, which keeps every production bot write on the
+    /// assertion path.
+    ///
+    /// The stamp path needs the route to plexus opened as a carrier under the
+    /// session's scope, and the subc client SDK cannot do that yet:
+    /// subc-client-rs 0.23.1 hardcodes `scope: None` in the `RouteOpen` it
+    /// sends (`consumer.rs:997` and `consumer.rs:2741`) and no public
+    /// `open_route` variant takes a scope. When the SDK can open a scoped
+    /// route, pass the selector through `call` to it and return true here.
+    fn opens_scoped_routes(&self) -> bool {
+        false
     }
 }
 

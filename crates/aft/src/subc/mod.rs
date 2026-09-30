@@ -1004,12 +1004,13 @@ struct RouteIdentityData {
     /// config edit applies to the next bind, not mid-session.
     disabled_tools: Arc<Vec<String>>,
     /// The scope the daemon stamped on this route at bind: the owner and
-    /// session (`ref`, `scope_epoch`) of the work the route was opened for.
-    /// `None` for a route opened without one, or by a daemon that predates
-    /// scopes. Kept so that when the daemon ends that scope, the bash tasks
-    /// started on this route can be ended with it; that cleanup is not built
-    /// yet, so nothing reads the field.
-    #[allow(dead_code)]
+    /// session (`ref`, `scope_epoch`) of the work the route was opened for,
+    /// and whether providers may act as its agent. `None` for a route opened
+    /// without one, or by a daemon that predates scopes. The gh shim relay
+    /// reads it to decide whether a bot write from this session may go to
+    /// plexus under the scope instead of with a minted assertion. It is also
+    /// kept so that when the daemon ends that scope, the bash tasks started on
+    /// this route can be ended with it; that cleanup is not built yet.
     scope: Option<subc_protocol::scope::ScopeStamp>,
 }
 
@@ -4219,6 +4220,7 @@ where
                                 &gh_relay,
                                 &dispatch_path_metrics,
                                 true,
+                                gh_relay_route_scopes(&routes),
                             );
                             Ok(())
                         } else if management_routes.contains(&route) {
@@ -6206,8 +6208,22 @@ fn gh_relay_operation(frame: &Frame) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Run a gh shim relay request on its own task. The relay makes two network
-/// calls (prefrontal, then plexus); running them here keeps the subc frame
+/// The scope stamps of every bound tool route, for the gh shim relay. The shim
+/// opens its own unscoped management route, so the scope a bot write may act
+/// under is the one stamped on the tool route of the session that launched the
+/// command; the relay finds that route by the session its ticket names.
+fn gh_relay_route_scopes(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+) -> crate::gh_shim_relay::RouteScopes {
+    let mut scopes = crate::gh_shim_relay::RouteScopes::default();
+    for identity in routes.values() {
+        scopes.push(&identity.session, identity.scope.clone());
+    }
+    scopes
+}
+
+/// Run a gh shim relay request on its own task. The relay makes up to two
+/// network calls (prefrontal, then plexus); running them here keeps the subc frame
 /// loop free, and the relay holds no lock across them.
 fn spawn_gh_relay(
     tx: &WriterSender,
@@ -6215,6 +6231,7 @@ fn spawn_gh_relay(
     relay: &Arc<crate::gh_shim_relay::GhRelay>,
     metrics: &Arc<DispatchPathMetrics>,
     first_party: bool,
+    route_scopes: crate::gh_shim_relay::RouteScopes,
 ) {
     let tx = tx.clone();
     let frame = frame.clone();
@@ -6240,6 +6257,7 @@ fn spawn_gh_relay(
                 params: &params,
                 first_party,
                 now,
+                route_scopes: &route_scopes,
             },
             &|line| log::info!("{line}"),
         )
