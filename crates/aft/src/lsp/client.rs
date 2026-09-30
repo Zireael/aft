@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
@@ -389,6 +389,17 @@ pub struct ServerDiagnosticCapabilities {
     pub refresh_support: bool,
 }
 
+/// rust-analyzer analysis state saved when AFT requests a workspace reload,
+/// so it can be put back if the server rejects the request.
+#[derive(Debug)]
+pub(crate) struct RustWorkspaceState {
+    quiescent: bool,
+    quiescent_at: Option<Instant>,
+    failure: Option<String>,
+    warning: Option<String>,
+    loaded_at: SystemTime,
+}
+
 /// A client connected to one language server process.
 pub struct LspClient {
     pub(crate) runtime_note: Option<String>,
@@ -430,6 +441,14 @@ pub struct LspClient {
     rust_flycheck_running: HashSet<String>,
     /// When the most recent rust-analyzer check run ended.
     rust_flycheck_finished_at: Option<Instant>,
+    /// Wall-clock time at which this server last started reading the
+    /// workspace's Cargo manifests: the spawn, or the latest workspace reload
+    /// AFT requested. A manifest or lockfile modified after this moment is
+    /// newer than what rust-analyzer loaded, so its workspace view (including
+    /// a load that failed because `Cargo.lock` was stale) is out of date.
+    /// Wall-clock rather than `Instant` because it is compared with file
+    /// modification times.
+    workspace_loaded_at: SystemTime,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -561,6 +580,7 @@ impl LspClient {
         }
 
         let spawned_at = Instant::now();
+        let workspace_loaded_at = SystemTime::now();
         let command_display = truncate_to_bytes(
             &std::iter::once(binary.display().to_string())
                 .chain(args.iter().cloned())
@@ -711,6 +731,7 @@ impl LspClient {
             rust_analyzer_quiescent_at: None,
             rust_flycheck_running: HashSet::new(),
             rust_flycheck_finished_at: None,
+            workspace_loaded_at,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
@@ -887,6 +908,46 @@ impl LspClient {
             self.rust_analyzer_quiescent = false;
         }
         self.rust_analyzer_failure = failure;
+    }
+
+    /// When this server last started loading the workspace manifests.
+    pub(crate) fn workspace_loaded_at(&self) -> SystemTime {
+        self.workspace_loaded_at
+    }
+
+    /// Enter the state of a workspace reload that was just requested at
+    /// `requested_at`: the previous analysis result (a failure or warning, and
+    /// quiescence) describes the old manifests, so it is dropped and the
+    /// server counts as warming until rust-analyzer reports quiescence for the
+    /// new load. Returns the dropped state so a reload the server refused can
+    /// be undone with [`Self::restore_rust_workspace_state`].
+    pub(crate) fn begin_rust_workspace_reload(
+        &mut self,
+        requested_at: SystemTime,
+    ) -> RustWorkspaceState {
+        let previous = RustWorkspaceState {
+            quiescent: self.rust_analyzer_quiescent,
+            quiescent_at: self.rust_analyzer_quiescent_at,
+            failure: self.rust_analyzer_failure.take(),
+            warning: self.rust_analyzer_warning.take(),
+            loaded_at: self.workspace_loaded_at,
+        };
+        self.rust_analyzer_quiescent = false;
+        self.rust_analyzer_quiescent_at = None;
+        self.workspace_loaded_at = requested_at;
+        previous
+    }
+
+    /// Put back the analysis state saved by
+    /// [`Self::begin_rust_workspace_reload`] when the server rejected the
+    /// reload request: no new load is running, so no quiescence report would
+    /// ever end the warming state.
+    pub(crate) fn restore_rust_workspace_state(&mut self, previous: RustWorkspaceState) {
+        self.rust_analyzer_quiescent = previous.quiescent;
+        self.rust_analyzer_quiescent_at = previous.quiescent_at;
+        self.rust_analyzer_failure = previous.failure;
+        self.rust_analyzer_warning = previous.warning;
+        self.workspace_loaded_at = previous.loaded_at;
     }
 
     /// Record a rust-analyzer server-status transition. Returns true only for

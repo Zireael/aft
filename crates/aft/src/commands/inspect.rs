@@ -1092,6 +1092,17 @@ fn run_blocking_inspect_body(
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
+    // A rust-analyzer that was already running may hold a workspace load
+    // (possibly a failed one) made from manifests that have changed since,
+    // for example a stale Cargo.lock fixed with `cargo update` in a shell.
+    // Ask it to reload before waiting, so the wait below observes the new
+    // load instead of returning the old result.
+    let reload_scope_roots = parse_scope(req, ctx, &project_root)
+        .map(|scope| scope.roots)
+        .unwrap_or_default();
+    for server in &start_outcomes.successful {
+        ctx.lsp_reload_rust_workspace_if_manifests_changed(server, &reload_scope_roots);
+    }
     if !deadline.has_work_budget() {
         let failed_phase = start_outcomes
             .successful
@@ -2253,9 +2264,12 @@ fn render_inspect_text(
     lines.join("\n")
 }
 
-/// Say how many scoped files a blocking scoped inspect had its language
-/// servers analyze, and how many it left out because of the file cap, so a
-/// partial answer over a large scope reads as "examined N of M".
+/// Say how many scoped files a blocking scoped inspect obtained authoritative
+/// diagnostics for, and how many it left out because of the file cap. The
+/// count is of files with authoritative diagnostics, not of files handed to a
+/// server: a file a server was asked about but never certified (its workspace
+/// failed to load, say) is a gap, and counting it here would read as success
+/// next to the gap line.
 fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<String, Value>) {
     let Some(coverage) = summary
         .get("diagnostics")
@@ -2267,8 +2281,8 @@ fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<Str
     if files == 0 {
         return;
     }
-    let examined = coverage
-        .get("examined")
+    let authoritative = coverage
+        .get("authoritative")
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let not_examined = coverage
@@ -2277,7 +2291,7 @@ fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<Str
         .unwrap_or(0);
     let noun = if files == 1 { "file" } else { "files" };
     let mut line =
-        format!("diagnostics: language servers analyzed {examined} of {files} scoped {noun}");
+        format!("diagnostics: authoritative results for {authoritative} of {files} scoped {noun}");
     if not_examined > 0 {
         let cap = coverage
             .get("file_cap")
@@ -2385,10 +2399,19 @@ fn render_uncovered_file_groups(
             .unwrap_or("unavailable");
         let producer = group.get("producer").and_then(Value::as_str);
         let root = group.get("root").and_then(Value::as_str);
+        // A cause that is the failure of a producer already printed on its
+        // own "producer ... failed" line refers to that line by producer
+        // name: a multi-line cargo error printed twice buries everything else.
+        let reason = match producer {
+            Some(producer) if producer_failure_is_rendered(section, producer, reason) => {
+                format!("producer {producer} failed, reason above")
+            }
+            _ => reason.to_string(),
+        };
         let cause = match (producer, root) {
             (Some(producer), Some(root)) => format!("{producer} in {root}: {reason}"),
             (Some(producer), None) => format!("{producer}: {reason}"),
-            (None, _) => reason.to_string(),
+            (None, _) => reason,
         };
         lines.push(format!(
             "Incomplete {category}: no authoritative diagnostics for {count} {files} ({cause})"
@@ -2408,6 +2431,22 @@ fn render_uncovered_file_groups(
     if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, &list_key) {
         lines.push(trailer);
     }
+}
+
+/// True when `section` carries a failed-producer gap for `producer` with
+/// exactly `reason`; `render_incomplete_categories` prints such a gap with
+/// its full reason on its own line.
+fn producer_failure_is_rendered(section: &Value, producer: &str, reason: &str) -> bool {
+    section
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|gap| {
+            gap.get("kind").and_then(Value::as_str) == Some("failed_producer")
+                && gap.get("producer").and_then(Value::as_str) == Some(producer)
+                && gap.get("reason").and_then(Value::as_str) == Some(reason)
+        })
 }
 
 fn render_complexity_category(
@@ -3095,9 +3134,13 @@ fn render_diagnostics_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
-    if let Some(line) =
-        crate::subc_format::format_diagnostics_summary(Some(&Value::Object(summary.clone())))
-    {
+    // Non-file gaps already have their reasons printed by
+    // `render_incomplete_categories`, so the diagnostics summary line names
+    // each such producer without repeating its reason.
+    if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
+        Some(&Value::Object(summary.clone())),
+        true,
+    ) {
         lines.push(line);
     }
     let trailer = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics");
@@ -4610,7 +4653,7 @@ mod fresh_payload_tests {
         assert_eq!(
             group_lines,
             vec![
-                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install)",
+                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: producer typescript failed, reason above)",
                 "Incomplete diagnostics: no authoritative diagnostics for 4 files (biome in tools: running, but has not reported on these files)",
             ],
             "{text}"
@@ -4677,6 +4720,98 @@ mod fresh_payload_tests {
                     "files": 4,
                 },
             ])
+        );
+    }
+
+    /// A producer whose workspace failed to load (rust-analyzer run with
+    /// `--locked` over a stale Cargo.lock) leaves the one scoped file without
+    /// diagnostics. The multi-line cargo error is printed once, on the
+    /// producer line; the file-group line and the status line name the
+    /// producer instead of repeating it, and the coverage line counts files
+    /// with authoritative diagnostics (none), so it cannot read as success
+    /// beside the gap.
+    #[test]
+    fn failed_producer_error_renders_once_and_coverage_counts_authoritative_files() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let cargo_error =
+            "Failed to read Cargo metadata with dependencies for `/repo/Cargo.toml`: \
+            `cargo metadata` exited with an error:\n\nerror: cannot update the lock file \
+            /tmp/rust-analyzer1-0/Cargo.lock because --locked was passed to prevent this";
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({
+                "errors": null,
+                "warnings": null,
+                "info": null,
+                "hints": null,
+                "items": [],
+                "by_producer": {},
+                "complete": false,
+                "gaps": [
+                    { "kind": "failed_producer", "producer": "rust", "reason": cargo_error },
+                    {
+                        "kind": "uncovered_file",
+                        "file": "src/lib.rs",
+                        "reason": "no LSP producer has a current diagnostic report for this file",
+                        "cause": { "producer": "rust", "root": ".", "reason": cargo_error },
+                    },
+                ],
+                "coverage": {
+                    "files": 1,
+                    "examined": 1,
+                    "authoritative": 0,
+                    "not_examined": 0,
+                    "file_cap": 200,
+                },
+            }),
+        );
+        let roots = [PathBuf::from("/repo/src/lib.rs")];
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            Some(&roots),
+        );
+        let text = payload["text"].as_str().expect("text");
+
+        assert_eq!(
+            text.matches("--locked was passed").count(),
+            1,
+            "the producer error must be printed once: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Incomplete diagnostics: producer rust failed ({cargo_error})"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Incomplete diagnostics: no authoritative diagnostics for 1 file (rust in .: producer rust failed, reason above)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "diagnostics: unknown (producer rust failed, reason above; 1 file without an authoritative report)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("diagnostics: authoritative results for 0 of 1 scoped file"),
+            "{text}"
+        );
+        assert!(!text.contains("analyzed 1 of 1"), "{text}");
+        // The structured gap keeps the full reason for programmatic readers.
+        assert_eq!(
+            payload["summary"]["diagnostics"]["uncovered_file_groups"][0]["reason"],
+            cargo_error
         );
     }
 

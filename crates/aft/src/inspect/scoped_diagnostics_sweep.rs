@@ -75,6 +75,9 @@ pub(crate) fn producer_keys_for_file(
 pub(crate) struct ScopedSweep {
     /// Scoped files that at least one running producer handles.
     pub(crate) eligible: usize,
+    /// The eligible files themselves, so the summary can count how many of
+    /// them ended up with authoritative diagnostics.
+    pub(crate) eligible_files: Vec<PathBuf>,
     /// Eligible files the sweep asked a server to analyze (at most the cap).
     pub(crate) examined: usize,
     /// Eligible files past the cap, with the producer that would have
@@ -175,6 +178,11 @@ pub(crate) fn sweep_scoped_files(
     }
     sweep.examined = selected.len();
     sweep.eligible = selected.len() + sweep.not_examined.len();
+    sweep.eligible_files = selected
+        .iter()
+        .map(|(file, _)| file.clone())
+        .chain(sweep.not_examined.keys().cloned())
+        .collect();
 
     // Open (and pull where supported) one file at a time. The manager lock is
     // taken per step and never held while a server works on a pull, so other

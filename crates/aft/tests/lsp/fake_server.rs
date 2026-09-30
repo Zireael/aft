@@ -239,6 +239,48 @@ fn push_diagnostics_enabled() -> bool {
     std::env::var("AFT_FAKE_LSP_DISABLE_PUSH").ok().as_deref() != Some("1")
 }
 
+/// With AFT_FAKE_LSP_SERVER_STATUS=cargo_lock the fake behaves like
+/// rust-analyzer run with `--locked`: when it loads the workspace (at
+/// `initialized` and on `rust-analyzer/reloadWorkspace`) it reads the root's
+/// Cargo.lock and, if the file contains the word `stale`, reports the locked
+/// `cargo metadata` failure; otherwise it reports a healthy, quiescent
+/// workspace. Like rust-analyzer, it never re-reads the lockfile on its own.
+fn cargo_lock_status_mode() -> bool {
+    std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("cargo_lock")
+}
+
+fn cargo_lock_is_stale(root: Option<&std::path::Path>) -> bool {
+    root.and_then(|root| std::fs::read_to_string(root.join("Cargo.lock")).ok())
+        .is_some_and(|lock| lock.contains("stale"))
+}
+
+/// Report the result of the last workspace load. Like rust-analyzer, a status
+/// sent while a new load is running (`quiescent: false`) still carries the
+/// previous load's health and message.
+fn write_cargo_lock_status(
+    writer: &mut impl Write,
+    stale: bool,
+    quiescent: bool,
+) -> io::Result<()> {
+    let status = if stale {
+        json!({
+            "health": "warning",
+            "quiescent": quiescent,
+            "message": "Failed to read Cargo metadata with dependencies: `cargo metadata` exited with an error: error: cannot update the lock file Cargo.lock because --locked was passed to prevent this",
+        })
+    } else {
+        json!({
+            "health": "ok",
+            "quiescent": quiescent,
+            "message": "workspace analysis is ready",
+        })
+    };
+    write_notification(
+        writer,
+        &Notification::new("experimental/serverStatus", Some(status)),
+    )
+}
+
 fn delay_changed_diagnostics_if_requested() {
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_CHANGE_DELAY_SIGNAL") {
         let _ = std::fs::write(signal_path, b"waiting");
@@ -261,11 +303,32 @@ fn main() -> io::Result<()> {
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_STARTED_SIGNAL") {
         std::fs::write(signal_path, b"started")?;
     }
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
+    // Messages are read on their own thread so the main loop can also act on
+    // a timer: a cargo_lock-mode workspace reload finishes a while after it
+    // was requested, and other requests (a `didOpen`) are answered meanwhile,
+    // as rust-analyzer answers them during a load.
+    let (message_tx, message_rx) = std::sync::mpsc::channel::<io::Result<Option<ServerMessage>>>();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        loop {
+            let message = read_message(&mut reader);
+            let last = !matches!(message, Ok(Some(_)));
+            if message_tx.send(message).is_err() || last {
+                break;
+            }
+        }
+    });
+    // In cargo_lock mode, the time at which the workspace reload in progress
+    // finishes and its final status is sent; `None` when no reload runs.
+    let mut reload_finishes_at: Option<std::time::Instant> = None;
     let mut should_register_watched_files = false;
+    // The workspace root from `initialize`, for modes that read project files.
+    let mut workspace_root: Option<std::path::PathBuf> = None;
+    // Whether the last cargo_lock-mode workspace load saw a stale lockfile.
+    let mut last_load_stale = false;
     // Emulates rust-analyzer's `cargo check` ("flycheck"): with
     // AFT_FAKE_LSP_FLYCHECK=<ms> a check run begins at `initialized` and, on
     // the first opened document, ends <ms> later after publishing the opened
@@ -278,7 +341,28 @@ fn main() -> io::Result<()> {
         .as_deref()
         == Some("1");
 
-    while let Some(message) = read_message(&mut reader)? {
+    loop {
+        let received = match reload_finishes_at {
+            Some(finishes_at) => match message_rx
+                .recv_timeout(finishes_at.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(received) => received,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    reload_finishes_at = None;
+                    last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
+                    write_cargo_lock_status(&mut writer, last_load_stale, true)?;
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match message_rx.recv() {
+                Ok(received) => received,
+                Err(_) => break,
+            },
+        };
+        let Some(message) = received? else {
+            break;
+        };
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
@@ -379,6 +463,12 @@ fn main() -> io::Result<()> {
                     //   (no env)                           → push-only with watched-files support
                     let pull_enabled =
                         std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
+                    workspace_root = params
+                        .as_ref()
+                        .and_then(|value| value.get("rootUri"))
+                        .and_then(Value::as_str)
+                        .and_then(|uri| url::Url::parse(uri).ok())
+                        .and_then(|uri| uri.to_file_path().ok());
                     let workspace_pull =
                         std::env::var("AFT_FAKE_LSP_WORKSPACE").ok().as_deref() == Some("1");
                     let no_watched_files = std::env::var("AFT_FAKE_LSP_NO_WATCHED_FILES")
@@ -452,6 +542,46 @@ fn main() -> io::Result<()> {
                 "shutdown" => {
                     if !ignore_shutdown {
                         write_response(&mut writer, id, Value::Null)?;
+                    }
+                }
+                "rust-analyzer/reloadWorkspace" => {
+                    // rust-analyzer answers once the reload is queued, then
+                    // reports the load through server status.
+                    write_response(&mut writer, id, Value::Null)?;
+                    write_notification(
+                        &mut writer,
+                        &Notification::new("custom/reloadWorkspace", None),
+                    )?;
+                    if cargo_lock_status_mode() {
+                        // The load reads the lockfile when it finishes (see
+                        // the timer above); until then, status repeats the
+                        // previous load's result.
+                        write_cargo_lock_status(&mut writer, last_load_stale, false)?;
+                        reload_finishes_at =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+                    } else {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new(
+                                "experimental/serverStatus",
+                                Some(json!({
+                                    "health": "ok",
+                                    "quiescent": false,
+                                    "message": "reloading the workspace",
+                                })),
+                            ),
+                        )?;
+                        write_notification(
+                            &mut writer,
+                            &Notification::new(
+                                "experimental/serverStatus",
+                                Some(json!({
+                                    "health": "ok",
+                                    "quiescent": true,
+                                    "message": "workspace analysis is ready",
+                                })),
+                            ),
+                        )?;
                     }
                 }
                 "textDocument/hover" => {
@@ -738,7 +868,10 @@ fn main() -> io::Result<()> {
             ServerMessage::Notification { method, params } => match method.as_str() {
                 "initialized" => {
                     let server_status_mode = std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok();
-                    if server_status_mode.as_deref() != Some("disabled") {
+                    if cargo_lock_status_mode() {
+                        last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
+                        write_cargo_lock_status(&mut writer, last_load_stale, true)?;
+                    } else if server_status_mode.as_deref() != Some("disabled") {
                         let warming = matches!(
                             server_status_mode.as_deref(),
                             Some("1" | "publish_then_quiescent" | "empty_then_quiescent")

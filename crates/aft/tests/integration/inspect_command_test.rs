@@ -3622,7 +3622,7 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     );
     assert_eq!(
         response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 1, "examined": 1, "not_examined": 0, "file_cap": 200}),
+        json!({"files": 1, "examined": 1, "authoritative": 1, "not_examined": 0, "file_cap": 200}),
         "response: {response:#}"
     );
     assert!(
@@ -3812,7 +3812,7 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
 
     assert_eq!(
         response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 201, "examined": 200, "not_examined": 1, "file_cap": 200}),
+        json!({"files": 201, "examined": 200, "authoritative": 200, "not_examined": 1, "file_cap": 200}),
         "response: {response:#}"
     );
     let uncovered = uncovered_files(&response);
@@ -3822,8 +3822,11 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
         "response: {response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
+    // The coverage line counts files with authoritative diagnostics: the 200
+    // opened and answered, but not the one file past the cap, which is the
+    // single uncovered file asserted above.
     assert!(
-        text.contains("language servers analyzed 200 of 201 scoped files (1 not examined"),
+        text.contains("authoritative results for 200 of 201 scoped files (1 not examined"),
         "{text}"
     );
 }
@@ -4857,12 +4860,24 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
         ),
         "{text}"
     );
+    // The remedy is printed once, on the TypeScript producer's failure line;
+    // the group line names that producer instead of repeating the reason.
+    let remedy = "no node_modules in web: the project's dependencies are not installed; \
+                  run your package manager's install";
+    assert_eq!(
+        text.matches(remedy).count(),
+        1,
+        "the cause must name the install remedy exactly once: {text}"
+    );
     assert!(
-        group_lines[0].contains(
-            "no node_modules in web: the project's dependencies are not installed; \
-             run your package manager's install"
-        ),
-        "the cause must name the install remedy: {text}"
+        text.lines().any(|line| line
+            .starts_with("Incomplete diagnostics: producer typescript failed (")
+            && line.contains(remedy)),
+        "the producer line must carry the install remedy: {text}"
+    );
+    assert!(
+        group_lines[0].ends_with("(typescript in web: producer typescript failed, reason above)"),
+        "{text}"
     );
     let listed = text
         .lines()
@@ -5040,6 +5055,128 @@ fn scoped_rust_inspect_preserves_stale_cargo_lock() {
     assert!(
         gap["reason"].as_str().unwrap().contains("--locked"),
         "metadata failure must explain why diagnostics are unavailable: {response:#}"
+    );
+}
+
+/// A rust-analyzer run with `--locked` over a stale Cargo.lock reports a
+/// failed workspace load and keeps it: it re-reads the lockfile only when the
+/// client reports a change or asks for a reload. After the lockfile is fixed
+/// outside AFT (as `cargo update` in a shell does), the next scoped inspect
+/// must make the server reload and report the new load, not the old failure.
+/// The fake server reads Cargo.lock only when it loads the workspace, which is
+/// exactly the behavior that made the failure stick.
+#[test]
+fn scoped_rust_inspect_recovers_after_a_stale_cargo_lock_is_fixed() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"lock-recovery\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "Cargo.lock", "# stale lockfile\n");
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "cargo_lock");
+
+    let stale = scoped_diagnostics_inspect(&ctx, "inspect-lock-stale", "src/main.rs");
+    assert_eq!(failed_producers(&stale), vec!["rust"], "{stale:#}");
+    let text = stale["text"].as_str().expect("rendered text");
+    assert_eq!(
+        text.matches("--locked was passed").count(),
+        1,
+        "the producer failure must be printed once: {text}"
+    );
+
+    // Modification times must land after the server's load for the change to
+    // count; a short pause keeps coarse file-system clocks from tying.
+    thread::sleep(Duration::from_millis(50));
+    fs::write(root.join("Cargo.lock"), "# fixed lockfile\n").unwrap();
+
+    let fixed = scoped_diagnostics_inspect(&ctx, "inspect-lock-fixed", "src/main.rs");
+    assert!(
+        failed_producers(&fixed).is_empty(),
+        "the fixed lockfile must not keep reporting the old failure: {fixed:#}"
+    );
+    assert!(uncovered_files(&fixed).is_empty(), "{fixed:#}");
+    assert_eq!(fixed["summary"]["diagnostics"]["errors"], 1, "{fixed:#}");
+    assert!(
+        diagnostic_messages_for(&fixed, "src/main.rs")
+            .iter()
+            .any(|message| message.contains("test diagnostic error")),
+        "{fixed:#}"
+    );
+}
+
+/// The same sequence against a real rust-analyzer: a scoped inspect over a
+/// workspace whose Cargo.lock is stale for `--locked` fails, and after
+/// `cargo update` fixes the lockfile the next scoped inspect reports the new
+/// load instead of the old `cargo metadata` error.
+#[test]
+fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        eprintln!("SKIP scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed (or rustup component unavailable)");
+        return;
+    }
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlocal-dep = { path = \"dep\" }\n");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub fn value() -> u8 { local_dep::value() }\n",
+    );
+    let manifest = write_file(
+        &root,
+        "dep/Cargo.toml",
+        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "dep/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    // A sibling crate moves its version: the lockfile is now stale.
+    fs::write(
+        manifest,
+        "[package]\nname = \"local-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let ctx = configured_context(&root);
+
+    let stale = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-stale", "src/lib.rs");
+    assert!(
+        failed_producers(&stale).contains(&"rust".to_string()),
+        "{stale:#}"
+    );
+    // rust-analyzer re-fetches its workspace once on its own shortly after
+    // startup; fix the lockfile only after that, so recovery cannot come
+    // from that startup fetch.
+    thread::sleep(Duration::from_secs(3));
+    let updated = std::process::Command::new("cargo")
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("run cargo update");
+    assert!(updated.status.success(), "{updated:?}");
+
+    let fixed = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-fixed", "src/lib.rs");
+    assert!(
+        failed_producers(&fixed).is_empty(),
+        "the fixed lockfile must not keep reporting the old failure: {fixed:#}"
+    );
+    assert!(
+        !fixed["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--locked was passed"),
+        "{fixed:#}"
     );
 }
 

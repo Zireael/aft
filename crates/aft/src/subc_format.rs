@@ -2281,6 +2281,18 @@ fn render_inspect_diagnostics(data: &Value) -> String {
 }
 
 pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
+    format_diagnostics_summary_with(summary, false)
+}
+
+/// `format_diagnostics_summary` for a body that has already printed every
+/// non-file gap with its full reason (the inspect text does, on its
+/// "Incomplete diagnostics: producer ... failed (...)" lines). There the
+/// summary names each such producer and points at that line instead of
+/// repeating a reason that can be a multi-line cargo error.
+pub(crate) fn format_diagnostics_summary_with(
+    summary: Option<&Value>,
+    gap_reasons_rendered_above: bool,
+) -> Option<String> {
     let section = summary?.get("diagnostics")?.as_object()?;
     if section.get("complete").and_then(Value::as_bool) == Some(false) {
         let all_gaps = section
@@ -2299,11 +2311,14 @@ pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<Stri
             .iter()
             .filter(|gap| gap.get("kind").and_then(Value::as_str) != Some("uncovered_file"))
             .map(|gap| {
+                let producer = gap.get("producer").and_then(Value::as_str);
+                if let (true, Some(producer)) = (gap_reasons_rendered_above, producer) {
+                    return format!("producer {producer} failed, reason above");
+                }
                 format!(
                     "{}: {}",
-                    gap.get("producer")
-                        .or_else(|| gap.get("file"))
-                        .and_then(Value::as_str)
+                    producer
+                        .or_else(|| gap.get("file").and_then(Value::as_str))
                         .unwrap_or("unknown producer"),
                     gap.get("reason")
                         .and_then(Value::as_str)

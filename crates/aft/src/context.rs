@@ -8985,6 +8985,22 @@ impl AppContext {
         )
     }
 
+    /// Make a running rust-analyzer reload its workspace when its Cargo
+    /// manifests, lockfile, toolchain file, or Cargo config changed since it
+    /// last loaded them (see
+    /// [`crate::lsp::manager::reload_rust_workspace_if_manifests_changed`]).
+    pub fn lsp_reload_rust_workspace_if_manifests_changed(
+        &self,
+        server: &crate::lsp::roots::ServerKey,
+        scope_roots: &[PathBuf],
+    ) -> bool {
+        crate::lsp::manager::reload_rust_workspace_if_manifests_changed(
+            &self.lsp_manager,
+            server,
+            scope_roots,
+        )
+    }
+
     /// Notify LSP servers that a file was written.
     /// Call this after write_format_validate in command handlers.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {

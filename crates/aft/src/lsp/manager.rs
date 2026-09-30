@@ -3636,10 +3636,17 @@ impl LspManager {
             && message.contains("cargo metadata")
             && message.contains("lock file")
             && message.contains("--locked was passed");
-        let failure =
-            (health == Some("error") || locked_metadata_failure).then(|| message.to_string());
+        let reports_failure = health == Some("error") || locked_metadata_failure;
+        let quiescent = params.get("quiescent").and_then(serde_json::Value::as_bool) == Some(true);
+        // rust-analyzer recomputes health only when a workspace load finishes.
+        // A status sent while it is still working (`quiescent: false`, as right
+        // after a reload starts) repeats the previous load's failure, so a
+        // failure is final only once the server is quiescent. Taking it earlier
+        // made an inspect that had just asked for a reload stop waiting and
+        // report the failure the reload was meant to replace.
+        let failure = (reports_failure && quiescent).then(|| message.to_string());
         if let Some(client) = self.clients.get_mut(&key) {
-            client.rust_analyzer_warning = (health == Some("warning") && failure.is_none())
+            client.rust_analyzer_warning = (health == Some("warning") && !reports_failure)
                 .then(|| format!("rust-analyzer warning: {message}"));
             client.set_diagnostic_failure(failure.clone());
         }
@@ -3648,7 +3655,7 @@ impl LspManager {
             self.diagnostics.clear_server_instance(&key);
             return;
         }
-        if params.get("quiescent").and_then(serde_json::Value::as_bool) != Some(true) {
+        if !quiescent {
             return;
         }
         let became_quiescent = self
@@ -3657,6 +3664,109 @@ impl LspManager {
             .is_some_and(|client| client.set_rust_analyzer_quiescent(true));
         if became_quiescent {
             self.diagnostics.promote_provisional_for_server(&key);
+        }
+    }
+
+    /// The newest Cargo manifest, lockfile, toolchain file, or Cargo config
+    /// of a running rust-analyzer's workspace that was modified after the
+    /// server last started loading the workspace, if any.
+    ///
+    /// rust-analyzer re-reads these files only when the client reports a
+    /// change to them or asks for a reload. Changes made outside AFT (for
+    /// example `cargo update` run in a shell) are reported by neither, so
+    /// without this check a load that failed on a stale `Cargo.lock` stays
+    /// failed after the lockfile is fixed, and every later inspect repeats
+    /// the old error.
+    ///
+    /// The workspace root's files are always checked. Member-crate manifests
+    /// are checked for the directories between the workspace root and each
+    /// of `scope_roots`, which covers the crate that owns a scoped file
+    /// without walking the whole workspace on every inspect.
+    pub(crate) fn rust_manifest_changed_since_load(
+        &self,
+        key: &ServerKey,
+        scope_roots: &[PathBuf],
+    ) -> Option<PathBuf> {
+        if key.kind != ServerKind::Rust {
+            return None;
+        }
+        let loaded_at = self.clients.get(key)?.workspace_loaded_at();
+        rust_workspace_manifest_paths(&key.root, scope_roots)
+            .into_iter()
+            .filter_map(|path| {
+                let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+                (modified > loaded_at).then_some((modified, path))
+            })
+            .max_by_key(|(modified, _)| *modified)
+            .map(|(_, path)| path)
+    }
+
+    /// Ask a running rust-analyzer to reload its workspace. Events already
+    /// queued are applied first, so a status report that describes the old
+    /// load cannot land after the reset. The server's previous analysis
+    /// result is then dropped and it counts as warming until it reports
+    /// quiescence for the new load; a blocking inspect waits for that report
+    /// instead of repeating the old failure. Returns the pending request and
+    /// the dropped state, which [`Self::finish_rust_workspace_reload`] puts
+    /// back if the server rejects the request.
+    pub(crate) fn begin_rust_workspace_reload(
+        &mut self,
+        key: &ServerKey,
+    ) -> Result<
+        Option<(
+            crate::lsp::client::PendingLspRequest,
+            crate::lsp::client::RustWorkspaceState,
+        )>,
+        LspError,
+    > {
+        if key.kind != ServerKind::Rust {
+            return Ok(None);
+        }
+        self.drain_events();
+        let Some(client) = self.clients.get_mut(key) else {
+            return Ok(None);
+        };
+        let previous = client.begin_rust_workspace_reload(std::time::SystemTime::now());
+        match client.start_request::<RustAnalyzerReloadWorkspace>(()) {
+            Ok(pending) => {
+                // Reports from the old load cannot certify files under the
+                // new manifests; the reloaded server republishes them.
+                self.diagnostics.clear_server_instance(key);
+                self.latest_pull_for_rust
+                    .retain(|(server, _), _| server != key);
+                self.latest_push_for_pull_servers
+                    .retain(|(server, _), _| server != key);
+                Ok(Some((pending, previous)))
+            }
+            Err(error) => {
+                client.restore_rust_workspace_state(previous);
+                Err(error)
+            }
+        }
+    }
+
+    /// Complete a reload started by [`Self::begin_rust_workspace_reload`].
+    /// A rejected request leaves no new load running, so the saved state is
+    /// restored rather than leaving the server warming forever.
+    pub(crate) fn finish_rust_workspace_reload(
+        &mut self,
+        key: &ServerKey,
+        result: &Result<serde_json::Value, LspError>,
+        previous: crate::lsp::client::RustWorkspaceState,
+    ) {
+        let Err(error) = result else {
+            slog_info!(
+                "lsp_protocol server=rust root={} method=rust-analyzer/reloadWorkspace event=accepted",
+                key.root.display()
+            );
+            return;
+        };
+        crate::slog_warn!(
+            "rust-analyzer in {} did not accept a workspace reload: {error}",
+            key.root.display()
+        );
+        if let Some(client) = self.clients.get_mut(key) {
+            client.restore_rust_workspace_state(previous);
         }
     }
 
@@ -4698,6 +4808,91 @@ impl Drop for ReservationGuard<'_> {
             self.manager.lock().release_start_reservation(&key);
         }
     }
+}
+
+/// rust-analyzer's own LSP request (not part of the LSP specification) that
+/// re-runs `cargo metadata` and rebuilds its crate graph from the current
+/// manifests.
+enum RustAnalyzerReloadWorkspace {}
+
+impl lsp_types::request::Request for RustAnalyzerReloadWorkspace {
+    type Params = ();
+    type Result = ();
+    const METHOD: &'static str = "rust-analyzer/reloadWorkspace";
+}
+
+/// rust-analyzer answers a reload request as soon as it has queued the
+/// reload; the load itself is reported later through server status.
+const RUST_RELOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The files whose contents decide how Cargo, and so rust-analyzer, loads
+/// the workspace at `root`: the manifest and Cargo config of the root and of
+/// every directory between it and each scope root, plus the root's lockfile
+/// and toolchain files.
+fn rust_workspace_manifest_paths(root: &Path, scope_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    for scope in scope_roots {
+        for dir in scope.ancestors() {
+            if dir == root || !dir.starts_with(root) {
+                break;
+            }
+            if !dirs.iter().any(|known| known == dir) {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for dir in &dirs {
+        paths.push(dir.join("Cargo.toml"));
+        paths.push(dir.join(".cargo").join("config"));
+        paths.push(dir.join(".cargo").join("config.toml"));
+    }
+    for name in ["Cargo.lock", "rust-toolchain", "rust-toolchain.toml"] {
+        paths.push(root.join(name));
+    }
+    paths
+}
+
+/// Make a running rust-analyzer reload its workspace when a manifest,
+/// lockfile, toolchain file, or Cargo config changed after its last load
+/// (see [`LspManager::rust_manifest_changed_since_load`]). Returns true when
+/// a reload was requested and accepted, after which the server counts as
+/// warming until it reports quiescence for the new load. The manager lock is
+/// not held while waiting for the server's answer.
+pub fn reload_rust_workspace_if_manifests_changed(
+    manager: &Arc<parking_lot::Mutex<LspManager>>,
+    key: &ServerKey,
+    scope_roots: &[PathBuf],
+) -> bool {
+    let started = {
+        let mut lsp = manager.lock();
+        let Some(changed) = lsp.rust_manifest_changed_since_load(key, scope_roots) else {
+            return false;
+        };
+        slog_info!(
+            "lsp_protocol server=rust root={} method=rust-analyzer/reloadWorkspace event=requested changed={}",
+            key.root.display(),
+            changed.display()
+        );
+        match lsp.begin_rust_workspace_reload(key) {
+            Ok(Some(started)) => started,
+            Ok(None) => return false,
+            Err(error) => {
+                crate::slog_warn!(
+                    "could not ask rust-analyzer in {} to reload its workspace: {error}",
+                    key.root.display()
+                );
+                return false;
+            }
+        }
+    };
+    let (pending, previous) = started;
+    let result = pending.wait(RUST_RELOAD_REQUEST_TIMEOUT);
+    let accepted = result.is_ok();
+    manager
+        .lock()
+        .finish_rust_workspace_reload(key, &result, previous);
+    accepted
 }
 
 /// Walk the inspected area and record, per server key, the first file a server

@@ -186,11 +186,25 @@ pub(crate) fn run_diagnostics_category(
         // every scoped file is either covered by an authoritative report or
         // named as a gap, so the payload is honest without waiting on global
         // quiescence signals that may describe files outside the scope.
+        let uncovered = collection
+            .scope_coverage_gaps
+            .iter()
+            .map(|gap| gap.file.clone())
+            .collect::<HashSet<_>>();
         let mut payload = collection.into_payload(snapshot);
         if let Some(sweep) = sweep.as_mut() {
+            // Files with authoritative diagnostics, counted the same way the
+            // gap list is built, so the coverage line and the gap lines
+            // cannot disagree about how many scoped files were covered.
+            let authoritative = sweep
+                .eligible_files
+                .iter()
+                .filter(|file| !uncovered.contains(*file))
+                .count();
             payload["coverage"] = serde_json::json!({
                 "files": sweep.eligible,
                 "examined": sweep.examined,
+                "authoritative": authoritative,
                 "not_examined": sweep.not_examined.len(),
                 "file_cap": SCOPED_SWEEP_FILE_CAP,
             });
