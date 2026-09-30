@@ -5268,9 +5268,10 @@ fn assert_removed_field_reported(response: &Value) {
 
 /// An agent edits a use site (which leaves it open in rust-analyzer), then
 /// removes a struct field with an AFT edit. rust-analyzer re-runs `cargo
-/// check` only on a save and analyzes an open document for a pull only when
-/// asked, so without both the next inspect certified the use site from
-/// reports made before the removal.
+/// check` only when told of a save, and analyzes an open document only when
+/// asked for its diagnostics. Unless AFT sends the save and asks again, the
+/// next inspect certifies the use site from diagnostics made before the
+/// removal.
 #[test]
 fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer() {
     if !crate::helpers::real_rust_analyzer_available(
@@ -5317,7 +5318,8 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_
 
 /// The same removal made by another program (a plain file write the project
 /// watcher reports): rust-analyzer hears of it only as a watched-file change,
-/// which does not start `cargo check`, so AFT announces it as a save.
+/// which does not start `cargo check`, so AFT sends rust-analyzer a save
+/// notification for the changed file to start one.
 #[test]
 fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer() {
     if !crate::helpers::real_rust_analyzer_available(
@@ -5329,14 +5331,15 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     let ctx = configured_context(&root);
     let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
     *ctx.watcher_rx().lock() = Some(watcher_rx);
-    // Only the use site is examined first, so AFT holds no report for
-    // `src/s.rs` and treats its change as news to announce, not as a file of
-    // its own to resync.
+    // Only the use site is examined first, so AFT has no diagnostics for
+    // `src/s.rs`. Its change then reaches rust-analyzer only through the
+    // watcher path, not through the resync AFT does for files it has
+    // diagnostics for.
     let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs");
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
 
     fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
-    // What the live watcher delivers for the rewritten file.
+    // Feed the event the project file watcher would report for the write.
     watcher_tx
         .send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![
             s.clone()

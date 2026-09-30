@@ -1575,7 +1575,8 @@ impl LspManager {
                     ),
                 })?;
                 log_did_open_sent(&key, &canonical_path, &language_id);
-                // The content was just written to disk: a save, as above.
+                // The content was just written to disk: tell the server it
+                // was saved, so rust-analyzer re-runs `cargo check`.
                 send_did_save(client, &uri, content)?;
             }
             self.documents
@@ -1884,8 +1885,9 @@ impl LspManager {
     /// itself was announced as saved when it was written, and its document
     /// still matches the disk, so AFT's own edits do not restart the check.
     fn announce_external_rust_save(&mut self, key: &ServerKey, changed: &[PathBuf]) {
-        // Deciding whether AFT already announced a file reads and hashes it;
-        // past this many candidates, announce without looking further.
+        // Deciding whether AFT already announced a file reads and hashes it.
+        // To bound that work, look at this many changed files at most; if all
+        // of them were announced and more remain, announce the first one.
         const SCAN_CAP: usize = 64;
         let documents = self.documents.get(key);
         let mut rust_files = changed

@@ -183,9 +183,9 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|(server, reason)| (server_id(server), reason.clone()))
         .collect();
-    // A producer that settled but whose check was still running is not
-    // indexing: its gap is kept apart so it is not mistaken for a warming
-    // server (whose provisional rows would then be shown).
+    // A producer whose `cargo check` was still running is not indexing. Its
+    // gap moves from `indexing_gaps` to `checking_producers`, so it is not
+    // treated as a warming server, whose provisional rows would be shown.
     collection.indexing_gaps.retain(|producer, reason| {
         let checking = reason == RUST_CHECK_RUNNING_REASON;
         if checking {

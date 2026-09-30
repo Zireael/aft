@@ -1160,11 +1160,11 @@ impl LspClient {
                 if is_check {
                     self.rust_flycheck_running.insert(token.to_string());
                     self.rust_flycheck_started_at = Some(Instant::now());
-                    // The check a save asked for has begun (a run that began
-                    // for another reason also checks the saved contents).
-                    // A deferred save not sent yet is still owed: the run
-                    // may have begun before the watcher's change reached
-                    // rust-analyzer.
+                    // A check run reads the files from disk, so any run that
+                    // begins after a save was sent covers the saved contents,
+                    // whatever started it. A save deferred and not sent yet is
+                    // still owed: this run may have begun before rust-analyzer
+                    // received the watcher's change.
                     if self
                         .rust_save
                         .as_ref()

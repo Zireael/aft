@@ -2316,8 +2316,9 @@ pub(crate) fn format_diagnostics_summary_with(
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("unavailable");
-                // A producer still checking has not failed, and its reason
-                // already names the server.
+                // A `checking_producer` gap is a server whose `cargo check`
+                // is still running, not a failure; its reason already names
+                // the server, so it is shown as it is.
                 if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
                     return reason.to_string();
                 }
