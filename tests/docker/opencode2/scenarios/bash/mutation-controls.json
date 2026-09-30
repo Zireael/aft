@@ -91,6 +91,12 @@
       "mutated_input": "bash/T6 complete fixture",
       "expected_failure": "complete T6 fixture rendered a truncation trailer",
       "unaffected_positive_control": "bash/T6 incomplete fixture"
+    },
+    {
+      "id": "bash-linked-worktree-root",
+      "mutated_input": "the plugin roots an OpenCode 2 session at the Location's project.canonical (the main checkout) instead of the session's linked worktree",
+      "expected_failure": "bash/T1/linked_worktree shape comparison: cwd_leaf main-checkout, expected project",
+      "unaffected_positive_control": "bash/T1/happy"
     }
   ]
 }

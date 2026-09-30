@@ -97,6 +97,16 @@ export interface ToolRuntime {
   directory: string;
   /** Opaque OpenCode session identifier. Missing in CLI tests / some hosts. */
   sessionID?: string;
+  /**
+   * True when `directory` is the directory the host placed this session in, so
+   * it, not `worktree`, is the root to use while no session directory is
+   * cached. OpenCode 2 sets this: its `directory` is the session's Location
+   * directory, while its `worktree` is the project's main checkout, which is
+   * the wrong root for a session in a linked git worktree (issue #387).
+   * OpenCode 1 leaves it unset because its `directory` can be the launch cwd
+   * of a resumed session rather than the session's project.
+   */
+  directoryIsSessionRoot?: boolean;
   /** Effect-owned cancellation is explicit so V1 ToolContext signals remain unchanged. */
   effectAbort?: AbortSignal;
 }
@@ -130,6 +140,12 @@ function canonicalizeDirectory(dir: string): string {
  * stored directory wins. This is the workaround for OpenCode's bug where
  * `ctx.directory` is set to `process.cwd()` rather than the resumed
  * session's actual project directory.
+ *
+ * With no cached directory, an OpenCode 2 runtime (`directoryIsSessionRoot`)
+ * resolves to its `directory`, never to `worktree`: there `worktree` is the
+ * main checkout, which for a session in a linked git worktree is the one
+ * wrong answer (issue #387). `worktree` keeps that meaning for the permission
+ * checks that treat the main checkout as part of the project.
  */
 export function projectRootFor(runtime: ToolRuntime): string {
   // Workaround: if OpenCode handed us a session ID and the session has a
@@ -140,7 +156,9 @@ export function projectRootFor(runtime: ToolRuntime): string {
     return canonicalizeDirectory(cached);
   }
 
-  const raw = runtime.worktree ?? runtime.directory;
+  const raw = runtime.directoryIsSessionRoot
+    ? runtime.directory
+    : (runtime.worktree ?? runtime.directory);
   return canonicalizeDirectory(raw);
 }
 

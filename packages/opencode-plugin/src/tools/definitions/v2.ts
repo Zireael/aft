@@ -48,6 +48,8 @@ export interface V2PermissionRequest {
 
 export interface V2DefinitionRuntime extends V2ExecutionContext {
   directory: string;
+  /** Always true here; see `ToolRuntime.directoryIsSessionRoot` in `tools/_shared.ts`. */
+  directoryIsSessionRoot: true;
   effectAbort: AbortSignal;
   worktree: string;
   abort: AbortSignal;
@@ -276,6 +278,11 @@ function runtimeFor(
   signal: AbortSignal,
   consumers: V2ToolConsumers,
 ): V2DefinitionRuntime {
+  // `directory` is the Location the host runs this session in (a linked git
+  // worktree when the session was created there); `worktree` is the project's
+  // main checkout and keeps that meaning for permission checks. Tool paths and
+  // the bash working directory must resolve against the session's directory,
+  // so the runtime says that `directory`, not `worktree`, is its root.
   const directory = location.directory;
   const worktree = location.project?.canonical ?? location.project?.directory ?? directory;
   return {
@@ -283,6 +290,7 @@ function runtimeFor(
     messageID: context.messageID,
     agent: context.agent,
     directory,
+    directoryIsSessionRoot: true,
     worktree,
     abort: signal,
     effectAbort: signal,

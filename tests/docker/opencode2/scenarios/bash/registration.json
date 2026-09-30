@@ -62,6 +62,87 @@
     },
     {
       "schema_version": 1,
+      "id": "bash/T1/linked_worktree",
+      "tool": "bash",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Read the worktree-only file and print the working directory.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-read",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "linked-worktree-read",
+                "name": "read",
+                "arguments": {
+                  "filePath": "only-in-worktree.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "read only observes the worktree file"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "call-pwd",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "linked-worktree-pwd",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'cwd=%s\\n' \"$(pwd -P)\""
+                },
+                "non_mutating_evidence": {
+                  "reason": "pwd only reports the working directory"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-read",
+        "call-pwd",
+        "finish"
+      ],
+      "compare_call_id": "linked-worktree-pwd",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "cwd_leaf",
+            "pattern": "^(?=[\\s\\S]*cwd=[^\\n]*/(?<value>[^/\\n]+)(?:\\n|$))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "cwd_leaf": "project"
+        }
+      },
+      "metadata": {
+        "linked_worktree": true,
+        "issue": "https://github.com/cortexkit/aft/issues/387",
+        "premise": "The scenario's project directory is a linked git worktree of a main checkout beside it, and the host session is created in the worktree. The bash extension builds that layout before the host starts and afterwards checks the full paths: the read returns the worktree-only file's content and pwd prints the worktree, not the main checkout."
+      }
+    },
+    {
+      "schema_version": 1,
       "id": "bash/T2/invalid_arguments",
       "tool": "bash",
       "trajectory": "T2",

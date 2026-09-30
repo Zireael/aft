@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { HostEvent } from "../../harness/event-stream.js";
 import {
   assertBashAftExecutionIdentity,
@@ -12,6 +15,16 @@ import {
 import { loadScenarios, materializeParityScenarios } from "../../harness/scenario-loader.js";
 import type { RecordedMockExchange, ScenarioDefinition } from "../../harness/types.js";
 import extension, { judgeMessageDetachEvent } from "./bash.extension.js";
+import {
+  judgeLinkedWorktreeResults,
+  MAIN_CHECKOUT_DIRECTORY,
+  PWD_CALL_ID,
+  PWD_MARKER,
+  prepareLinkedWorktree,
+  READ_CALL_ID,
+  WORKTREE_ONLY_CONTENT,
+  WORKTREE_ONLY_FILE,
+} from "./linked-worktree.js";
 
 const loaded = materializeParityScenarios(await loadScenarios(resolve(import.meta.dir)));
 const scenarios = new Map(loaded.map((scenario) => [scenario.id, scenario]));
@@ -57,7 +70,7 @@ const refusal =
 
 describe("bash OpenCode 2 scenarios", () => {
   test("load through the harness loader and satisfy the slice validator", async () => {
-    expect(loaded.length).toBe(17);
+    expect(loaded.length).toBe(19);
     await extension.validate?.({
       repo_root: resolve(import.meta.dir, "../../../../../.."),
       platform: "linux",
@@ -391,5 +404,119 @@ describe("a message sent mid-wait must end that wait promptly", () => {
         "run",
       ),
     ).not.toThrow();
+  });
+});
+
+describe("linked worktree row (issue #387)", () => {
+  async function git(args: string[], cwd: string): Promise<string> {
+    const child = Bun.spawnSync(["git", ...args], { cwd });
+    if (child.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${child.stderr.toString()}`);
+    return child.stdout.toString().trim();
+  }
+
+  /**
+   * A project in the state the harness leaves it before any extension runs: a
+   * git repository with one commit, plus the AFT config written after it.
+   */
+  async function harnessProject(): Promise<{ root: string; project: string }> {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "bash-linked-worktree-")));
+    const project = join(root, "project");
+    await mkdir(project);
+    await writeFile(join(project, "sample.txt"), "alpha\n");
+    await git(["init", "-q"], project);
+    await git(["add", "-A"], project);
+    await git(
+      ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "baseline"],
+      project,
+    );
+    // Written after the baseline commit, as the harness writes the AFT config.
+    await mkdir(join(project, ".cortexkit"));
+    await writeFile(join(project, ".cortexkit", "aft.jsonc"), "{}\n");
+    return { root, project };
+  }
+
+  function toolResults(results: Record<string, string>): RecordedMockExchange[] {
+    return [
+      {
+        index: 2,
+        label: "finish",
+        request: {
+          messages: Object.entries(results).map(([id, content]) => ({
+            role: "tool",
+            tool_call_id: id,
+            content,
+          })),
+        },
+        response: {},
+        observed_at: "1970-01-01T00:00:00.000Z",
+      },
+    ];
+  }
+
+  test("the setup makes the project a linked worktree of a main checkout beside it", async () => {
+    const { root, project } = await harnessProject();
+    try {
+      const mainCheckout = await prepareLinkedWorktree(project);
+      expect(mainCheckout).toBe(join(root, MAIN_CHECKOUT_DIRECTORY));
+      const list = await git(["worktree", "list", "--porcelain"], project);
+      const worktrees = list
+        .split("\n")
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length));
+      // The first entry is the main worktree, which OpenCode 2 reports as the
+      // Location's project.canonical.
+      expect(worktrees).toEqual([mainCheckout, project]);
+      expect(await readFile(join(project, WORKTREE_ONLY_FILE), "utf8")).toBe(
+        `${WORKTREE_ONLY_CONTENT}\n`,
+      );
+      expect(existsSync(join(mainCheckout, WORKTREE_ONLY_FILE))).toBe(false);
+      expect(await readFile(join(mainCheckout, "sample.txt"), "utf8")).toBe("alpha\n");
+      expect(await readFile(join(project, "sample.txt"), "utf8")).toBe("alpha\n");
+      expect(await readFile(join(project, ".cortexkit", "aft.jsonc"), "utf8")).toBe("{}\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the judge accepts the worktree and rejects the main checkout or a failed read", async () => {
+    const { root, project } = await harnessProject();
+    try {
+      const mainCheckout = await prepareLinkedWorktree(project);
+      const readOk = `1: ${WORKTREE_ONLY_CONTENT}\n`;
+      await judgeLinkedWorktreeResults(
+        project,
+        toolResults({ [READ_CALL_ID]: readOk, [PWD_CALL_ID]: `${PWD_MARKER}${project}\n` }),
+      );
+      await expect(
+        judgeLinkedWorktreeResults(
+          project,
+          toolResults({ [READ_CALL_ID]: readOk, [PWD_CALL_ID]: `${PWD_MARKER}${mainCheckout}\n` }),
+        ),
+      ).rejects.toThrow("(the main checkout)");
+      await expect(
+        judgeLinkedWorktreeResults(
+          project,
+          toolResults({
+            [READ_CALL_ID]: `file not found: ${join(mainCheckout, WORKTREE_ONLY_FILE)}`,
+            [PWD_CALL_ID]: `${PWD_MARKER}${project}\n`,
+          }),
+        ),
+      ).rejects.toThrow("did not return the worktree file's content");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the registered comparison projects the last segment of the printed directory", () => {
+    const row = scenario("bash/T1/linked_worktree");
+    const comparison = row.comparison;
+    if (comparison?.mode !== "shape") throw new Error("expected a shape comparison");
+    const rule = comparison.rules[0];
+    if (rule.kind !== "field") throw new Error("expected a field rule");
+    const leaf = (text: string) => new RegExp(rule.pattern).exec(text)?.groups?.value;
+    expect(leaf(`${PWD_MARKER}/runs/x/project\n`)).toBe("project");
+    expect(leaf(`${PWD_MARKER}/runs/x/${MAIN_CHECKOUT_DIRECTORY}`)).toBe(MAIN_CHECKOUT_DIRECTORY);
+    expect(comparison.expected).toEqual({ cwd_leaf: "project" });
+    expect(scenario("bash/T7/linked_worktree").metadata?.linked_worktree).toBe(true);
   });
 });

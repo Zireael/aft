@@ -6,11 +6,18 @@ import type {
   HarnessExtension,
   HarnessRuntimeEvent,
   HarnessValidationContext,
+  RecordedMockExchange,
   ScenarioDefinition,
   ScenarioLifecycleContext,
+  ScenarioResult,
 } from "../../harness/types.js";
+import {
+  isLinkedWorktreeScenario,
+  judgeLinkedWorktreeResults,
+  prepareLinkedWorktree,
+} from "./linked-worktree.js";
 const here = dirname(fileURLToPath(import.meta.url));
-const expectedIds = ["bash/T1/happy","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T7/happy"];
+const expectedIds = ["bash/T1/happy","bash/T1/linked_worktree","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/message_aborts_sync_watch","bash/T5/message_detaches_wait","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T7/happy","bash/T7/linked_worktree"];
 async function validate(context: HarnessValidationContext): Promise<void> {
   const scenarios = context.scenarios.filter((scenario) => scenario.tool === "bash");
   const actual = scenarios.map((scenario) => scenario.id).sort();
@@ -110,9 +117,43 @@ export function judgeMessageDetachEvent(
 // because rows run concurrently and share this extension.
 const messageSentAt = new Map<string, number>();
 
+// Every model request the host sent during a linked-worktree row, keyed by the
+// row's forensic directory like messageSentAt. The host hands each tool result
+// back inside the next model request, so these hold the results the row judges.
+const linkedWorktreeExchanges = new Map<string, RecordedMockExchange[]>();
+
+async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
+  if (!isLinkedWorktreeScenario(context.scenario)) return;
+  linkedWorktreeExchanges.set(context.forensic_dir, []);
+  await prepareLinkedWorktree(context.project_root);
+}
+
 function observe(context: ScenarioLifecycleContext, event: HarnessRuntimeEvent): void {
   judgeMessageDetachEvent(context.scenario, event, messageSentAt, context.forensic_dir);
   if (event.kind === "host_exit") messageSentAt.delete(context.forensic_dir);
+  if (event.kind === "mock_exchange") {
+    linkedWorktreeExchanges.get(context.forensic_dir)?.push(event.exchange);
+  }
 }
-const extension: HarnessExtension = { name: "bash-scenarios-v1", validate, observe };
+
+async function afterScenario(
+  context: ScenarioLifecycleContext,
+  result: ScenarioResult,
+): Promise<void> {
+  const exchanges = linkedWorktreeExchanges.get(context.forensic_dir);
+  if (!exchanges) return;
+  linkedWorktreeExchanges.delete(context.forensic_dir);
+  // Skip the full-path check when the row has already failed, so the failure
+  // that happened first stays the one the report names.
+  if (result.status !== "passed") return;
+  await judgeLinkedWorktreeResults(context.project_root, exchanges);
+}
+
+const extension: HarnessExtension = {
+  name: "bash-scenarios-v1",
+  validate,
+  beforeScenario,
+  observe,
+  afterScenario,
+};
 export default extension;

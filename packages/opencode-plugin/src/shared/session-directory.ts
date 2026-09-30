@@ -19,11 +19,61 @@
  * `packages/opencode/src/session/registry.ts`. Until then this
  * workaround makes AFT robust against the wrong cwd.
  */
+import { Effect } from "effect";
+
 import { sessionWarn } from "../logger.js";
 
 interface SessionInfo {
   directory?: string;
 }
+
+/**
+ * OpenCode 2 passes its plugin context where OpenCode 1 passes the SDK client
+ * (`entry/server-runtime.mjs` hands the context over as `client`). That context
+ * has a different session API, verified against the `v2` branch of the OpenCode repository:
+ *
+ * - `session.get` takes `{ sessionID }` and returns an Effect of `Session.Info`
+ *   (packages/client/src/effect/api/api.ts `SessionGetOperation`,
+ *   packages/plugin/src/effect/plugin.ts `Context`). Calling it the OpenCode 1
+ *   way builds an Effect that never runs, and awaiting an Effect yields the
+ *   Effect itself, so no directory was ever read.
+ * - `Session.Info` has no `directory`; the session's working directory is
+ *   `location.directory`, a required `Location.Ref`
+ *   (packages/schema/src/session.ts `Info`, packages/schema/src/location.ts
+ *   `Ref`). For a session created in a linked git worktree it is that worktree.
+ *
+ * It is told apart from an OpenCode 1 SDK client by having a string
+ * `location.directory` next to a `session.get` function; the OpenCode 2 entry
+ * refuses to boot without that `location`, and `subagent-detect.ts` uses the
+ * same test for its own session lookup.
+ */
+interface V2SessionInfo {
+  location?: { directory?: unknown };
+}
+
+interface V2PluginContextShape {
+  location: { directory: string };
+  session: {
+    get(input: { sessionID: string }): Effect.Effect<V2SessionInfo | undefined, unknown>;
+  };
+}
+
+function isV2PluginContext(client: unknown): client is V2PluginContextShape {
+  if (!client || typeof client !== "object") return false;
+  const candidate = client as { location?: { directory?: unknown }; session?: { get?: unknown } };
+  return (
+    typeof candidate.location?.directory === "string" &&
+    typeof candidate.session?.get === "function"
+  );
+}
+
+/**
+ * How long an OpenCode 2 session lookup may run. The lookup is awaited before
+ * the first tool call of a session is routed, so a host that never answers
+ * must not hold that call; after this long the call proceeds with the
+ * Location's directory instead.
+ */
+export const V2_SESSION_LOOKUP_TIMEOUT_MS = 3_000;
 
 interface OpenCodeClientShape {
   session?: {
@@ -71,6 +121,8 @@ export async function getSessionDirectory(
     return cached.directory;
   }
 
+  if (isV2PluginContext(client)) return lookupV2SessionDirectory(client, sessionId);
+
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
   if (!sessionApi || typeof sessionApi.get !== "function") {
@@ -104,6 +156,46 @@ export async function getSessionDirectory(
     return null;
   }
 
+  setCache(sessionId, dir);
+  return dir;
+}
+
+/**
+ * OpenCode 2 lookup: run the context's `session.get` Effect under a timeout and
+ * read `location.directory`.
+ *
+ * Unlike the OpenCode 1 path, a failure or timeout is cached (as `null`), so it
+ * is logged once per session and never retried. The fallback is already right:
+ * with no cached directory, `projectRootFor` uses the tool call's Location
+ * directory for OpenCode 2 runtimes, and OpenCode 2 runs every session inside
+ * the Location created for that session's own directory. Retrying would only
+ * add up to the timeout to every later tool call while the host misbehaves.
+ */
+async function lookupV2SessionDirectory(
+  context: V2PluginContextShape,
+  sessionId: string,
+): Promise<string | null> {
+  let dir: string | null = null;
+  let failure: string | undefined;
+  try {
+    const session = await Effect.runPromise(
+      Effect.timeout(
+        context.session.get({ sessionID: sessionId }) as Effect.Effect<V2SessionInfo | undefined>,
+        V2_SESSION_LOOKUP_TIMEOUT_MS,
+      ),
+    );
+    const directory = session?.location?.directory;
+    if (typeof directory === "string" && directory.length > 0) dir = directory;
+    else failure = "the session record has no location.directory";
+  } catch (err) {
+    failure = err instanceof Error ? err.message || err.name : String(err);
+  }
+  if (failure !== undefined) {
+    sessionWarn(
+      sessionId,
+      `[aft-plugin] OpenCode 2 session lookup failed (${failure}); tool paths and bash use the Location directory ${context.location.directory} for this session`,
+    );
+  }
   setCache(sessionId, dir);
   return dir;
 }
