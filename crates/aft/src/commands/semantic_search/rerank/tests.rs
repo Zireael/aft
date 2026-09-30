@@ -733,11 +733,17 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
         let slot = slot::BackendSlot::with_constructor(constructor.clone());
         let off = RerankSettings::resolve(&inputs.search).backend == RerankBackendKind::Off;
         // First read: an unseen config starts a build and reads as not ready
-        // (or off).
+        // (or off). The build runs on another thread and can finish before
+        // `read` re-reads the slot, so `Ready` is also correct here, but only
+        // once that build has run.
+        let builds_before = builds.load(Ordering::SeqCst);
         match slot.read(inputs.clone()) {
             slot::Installed::Off => assert!(off),
             slot::Installed::NotReady(_) => assert!(!off),
-            slot::Installed::Ready(_) => panic!("installed before any build ran"),
+            slot::Installed::Ready(_) => assert!(
+                !off && builds.load(Ordering::SeqCst) > builds_before,
+                "installed before any build ran"
+            ),
         }
         if !off {
             wait_for(|| is_ready(&slot.read(inputs.clone())));
