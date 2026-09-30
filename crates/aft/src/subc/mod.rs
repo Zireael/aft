@@ -13048,12 +13048,30 @@ mod tests {
     /// large roots) and the cold-build limiter is saturated. Tails are
     /// admitted only a few at a time, so a database open that lives only in
     /// the tail leaves most roots refusing bash and edits for as long as the
-    /// storm lasts. Every root must get its database within a few seconds of
-    /// its bind reply.
+    /// storm lasts. Every root must get its database while the tails are still
+    /// held, and for as long as a root waits, a database open it is waiting
+    /// on must be running.
+    ///
+    /// The bound is on that second part rather than on the raw time to ready:
+    /// the dedicated open thread runs the roots' opens one after another, so
+    /// the last root's wait is the sum of 32 SQLite opens, and on a runner
+    /// busy with other tests' disk and CPU work each open can take hundreds of
+    /// milliseconds instead of a few. That makes the total a measure of the
+    /// machine's load. Time a root spends with no open running for it is the
+    /// failure this test exists to catch (the open waiting for a configure
+    /// tail, or its dispatch waiting for anything), and it stays near zero on
+    /// a loaded machine.
     #[test]
     fn every_root_gets_its_database_within_seconds_of_bind_during_a_restart_storm() {
         const ROOTS: usize = 32;
-        const READY_BOUND: Duration = Duration::from_secs(5);
+        // Longest a root may wait with no database open running for it.
+        // Between two opens the thread only takes the next request off its
+        // channel, which takes microseconds.
+        const UNACCOUNTED_WAIT_BOUND: Duration = Duration::from_secs(1);
+        // Catches an open that never finishes (for example one blocked on the
+        // held configure tails); a healthy storm finishes in well under this
+        // even on a heavily loaded runner.
+        const HANG_BOUND: Duration = Duration::from_secs(30);
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
         let mut roots = Vec::new();
@@ -13120,14 +13138,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
 
-        let mut ready_after = Vec::new();
-        let mut late = Vec::new();
-        for (index, root) in roots.iter().enumerate() {
-            let acked = acked_at[index].unwrap();
-            let remaining = READY_BOUND.saturating_sub(acked.elapsed());
-            match wait_for_database_ready(&root.ctx, remaining) {
-                Some(_) => ready_after.push(acked.elapsed()),
-                None => late.push(index),
+        // Poll every root until all are ready. A waiting root fails the test
+        // as soon as its wait is not accounted for by open work (see
+        // `unaccounted_database_wait`), or when it hangs.
+        let mut ready_at: Vec<Option<Instant>> = vec![None; ROOTS];
+        let mut failure = None;
+        while failure.is_none() && ready_at.iter().any(Option::is_none) {
+            for (index, root) in roots.iter().enumerate() {
+                if ready_at[index].is_none()
+                    && root.ctx.database_runtime_refusal("probe", "bash").is_none()
+                    && root.ctx.db().is_some()
+                {
+                    ready_at[index] = Some(Instant::now());
+                }
+            }
+            let now = Instant::now();
+            let opens = crate::database_open::recorded_opens_for_test();
+            for (index, root) in roots.iter().enumerate() {
+                if ready_at[index].is_some() {
+                    continue;
+                }
+                let acked = acked_at[index].unwrap();
+                let unaccounted =
+                    unaccounted_database_wait(&opens, &root.canonical_root, acked, now);
+                if unaccounted > UNACCOUNTED_WAIT_BOUND || now - acked > HANG_BOUND {
+                    failure = Some(format!(
+                        "root {index} still refused bash {:?} after its bind reply while \
+                         configure tails were held; {unaccounted:?} of that wait had no \
+                         database open running for it. {}",
+                        now - acked,
+                        describe_database_opens(&opens, &roots, &acked_at),
+                    ));
+                    break;
+                }
+            }
+            if failure.is_none() {
+                std::thread::sleep(Duration::from_millis(2));
             }
         }
 
@@ -13137,18 +13183,104 @@ mod tests {
         for tail in tails {
             let _ = tail.blocking_recv();
         }
-        assert!(
-            late.is_empty(),
-            "{} of {ROOTS} roots still refused bash {READY_BOUND:?} after their bind reply \
-             while configure tails were held: roots {late:?}",
-            late.len()
-        );
+        if let Some(failure) = failure {
+            panic!("{failure}");
+        }
+        let opens = crate::database_open::recorded_opens_for_test();
+        let mut ready_after = Vec::new();
+        let mut worst_unaccounted = Duration::ZERO;
+        for (index, root) in roots.iter().enumerate() {
+            let acked = acked_at[index].unwrap();
+            let ready = ready_at[index].unwrap();
+            ready_after.push(ready - acked);
+            worst_unaccounted = worst_unaccounted.max(unaccounted_database_wait(
+                &opens,
+                &root.canonical_root,
+                acked,
+                ready,
+            ));
+        }
         ready_after.sort();
         eprintln!(
-            "restart storm: {ROOTS} roots ready, median {:?}, slowest {:?} after bind reply",
+            "restart storm: {ROOTS} roots ready, median {:?}, slowest {:?} after bind reply; \
+             longest wait with no open running {worst_unaccounted:?}",
             ready_after[ROOTS / 2],
             ready_after[ROOTS - 1]
         );
+    }
+
+    /// How much of a root's wait from `from` to `to` had no database open
+    /// running that it could be waiting on: neither an open on the dedicated
+    /// database-open thread (which runs every root's open, one at a time, so
+    /// a root queued there waits while other roots' opens run) nor the root's
+    /// own open on any thread. A root whose open only its configure tail runs,
+    /// or whose dispatch waits for something else, accumulates this time;
+    /// a root that is merely queued behind slow opens on a loaded machine does
+    /// not.
+    fn unaccounted_database_wait(
+        opens: &[crate::database_open::RecordedOpen],
+        root: &Path,
+        from: Instant,
+        to: Instant,
+    ) -> Duration {
+        let mut busy = opens
+            .iter()
+            .filter(|open| {
+                open.runner == crate::database_open::DatabaseOpenRunner::Lane || open.root == root
+            })
+            .filter_map(|open| {
+                let start = open.started_at.max(from);
+                let end = open.finished_at.unwrap_or(to).min(to);
+                (start < end).then_some((start, end))
+            })
+            .collect::<Vec<_>>();
+        busy.sort();
+        let mut covered = Duration::ZERO;
+        let mut cursor = from;
+        for (start, end) in busy {
+            let start = start.max(cursor);
+            if end > start {
+                covered += end - start;
+                cursor = end;
+            }
+        }
+        to.saturating_duration_since(from).saturating_sub(covered)
+    }
+
+    /// Every recorded open of the storm's roots relative to that root's bind
+    /// reply, for a failure message that shows where the time went.
+    fn describe_database_opens(
+        opens: &[crate::database_open::RecordedOpen],
+        roots: &[ConfiguredRoot],
+        acked_at: &[Option<Instant>],
+    ) -> String {
+        let mut lines = Vec::new();
+        for (index, root) in roots.iter().enumerate() {
+            let Some(acked) = acked_at[index] else {
+                continue;
+            };
+            let mut any = false;
+            for open in opens.iter().filter(|open| open.root == root.canonical_root) {
+                any = true;
+                lines.push(format!(
+                    "root {index}: via {:?}, dispatched {:?} and started {:?} after bind reply, \
+                     floor check {:?}, open {:?}, finished {:?} after bind reply, outcome {:?}",
+                    open.runner,
+                    open.dispatched_at
+                        .map(|dispatched| dispatched.saturating_duration_since(acked)),
+                    open.started_at.saturating_duration_since(acked),
+                    open.floor_check,
+                    open.open,
+                    open.finished_at
+                        .map(|finished| finished.saturating_duration_since(acked)),
+                    open.outcome,
+                ));
+            }
+            if !any {
+                lines.push(format!("root {index}: no open started"));
+            }
+        }
+        format!("Opens:\n{}", lines.join("\n"))
     }
 
     /// A rebind can put a working root back into "initializing": here the
