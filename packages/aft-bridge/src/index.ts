@@ -203,6 +203,7 @@ export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
   containsStandaloneDetachKeyword,
   shouldInterruptWaitsForMessage,
+  standaloneDetachKeywordRanges,
   stripStandaloneDetachKeywords,
 } from "./message-detach.js";
 export type {

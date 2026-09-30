@@ -22,6 +22,23 @@ export function containsStandaloneDetachKeyword(messageText: string): boolean {
   return STANDALONE_DETACH_KEYWORD_PATTERN.test(messageText);
 }
 
+/**
+ * The `[start, end)` character ranges of the standalone detach tokens that
+ * `stripStandaloneDetachKeywords` removes, in order. A host whose message
+ * carries offsets into its text (for example mention positions) uses these to
+ * move those offsets to where the same characters sit after the strip.
+ */
+export function standaloneDetachKeywordRanges(messageText: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  for (const match of messageText.matchAll(STANDALONE_DETACH_KEYWORDS_PATTERN)) {
+    // The pattern also consumes the one boundary character before the token,
+    // which the strip keeps, so the token starts after that capture.
+    const start = (match.index ?? 0) + (match[1]?.length ?? 0);
+    ranges.push([start, start + BASH_WAIT_DETACH_MAGIC_KEYWORD.length]);
+  }
+  return ranges;
+}
+
 /** Remove every standalone detach token, keeping the surrounding text. */
 export function stripStandaloneDetachKeywords(messageText: string): string {
   return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");

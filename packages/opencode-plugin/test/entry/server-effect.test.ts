@@ -352,4 +352,69 @@ describe("V2 server effect", () => {
 
     expect(events).toEqual([]);
   });
+
+  // OpenCode 2 has no chat.message hook, so without this registration a new
+  // message could not detach a waiting bash there.
+  test("registers a session prompt hook that detaches through the Location's pool and live config", async () => {
+    const events: string[] = [];
+    const detached: string[] = [];
+    const hooks: Array<{ name: string; callback: (event: unknown) => Effect.Effect<void> }> = [];
+    let setConfig: ((next: Record<string, unknown>) => void) | undefined;
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        if (command === "bash_wait_detach") detached.push(String(params.session_id));
+        return { success: true, detached: true };
+      },
+    };
+    const dependencies = {
+      ...testDependencies(events),
+      loadConfig: () => ({ bash: { detach_on_user_message: false } }),
+      acquireBridge: async (directory: string) => ({
+        directory,
+        setConfigureOverride: () => {},
+        getActiveBridgeForRoot: (root: string) => {
+          events.push(`active-root:${root}`);
+          return bridge;
+        },
+        activeBridges: () => [bridge],
+      }),
+      startLiveConfigReload: (options: { setConfig(next: Record<string, unknown>): void }) => {
+        setConfig = options.setConfig;
+        return { stop: () => {} };
+      },
+    };
+    const host = hostContext("/work/a", events, [], "/canonical/a");
+    const context = {
+      ...host.context,
+      location: host.context.location,
+      session: {
+        hook: (name: string, callback: (event: unknown) => Effect.Effect<void>) =>
+          Effect.sync(() => {
+            hooks.push({ name, callback });
+            return { dispose: Effect.void };
+          }),
+      },
+    };
+
+    await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(context)));
+
+    expect(hooks.map((hook) => hook.name)).toEqual(["prompt"]);
+    const prompt = hooks[0]?.callback;
+    if (!prompt) return;
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The config the Location booted with keeps plain messages from detaching.
+    await Effect.runPromise(prompt({ sessionID: "s1", prompt: { text: "still there?" } }));
+    await settle();
+    expect(detached).toEqual([]);
+
+    // A live reload that turns the setting on applies to the next message.
+    setConfig?.({ bash: { detach_on_user_message: true } });
+    const event = { sessionID: "s1", prompt: { text: "still there? &detach" } };
+    await Effect.runPromise(prompt(event));
+    await settle();
+    expect(detached).toEqual(["s1"]);
+    expect(event.prompt.text).toBe("still there? ");
+    expect(events).toContain("active-root:/canonical/a");
+  });
 });

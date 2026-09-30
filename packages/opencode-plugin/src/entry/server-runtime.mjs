@@ -18,6 +18,7 @@ import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
+import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
   buildAftToolDefinitions,
@@ -34,6 +35,7 @@ const defaults = {
   registerTools: registerAftTools,
   registerRpc: registerAftRpc,
   registerConfigErrorRpc: registerAftConfigErrorRpc,
+  registerPromptHook: registerV2PromptDetachHook,
   toolConsumers: (context) => ({
     ...hoistedV2ToolConsumers(context),
     ...createV2RuntimeConsumer(context),
@@ -127,7 +129,7 @@ async function bootLocation(context, location, dependencies) {
     },
     notify,
   });
-  return { consumers, pool, tools, liveConfigReload };
+  return { consumers, pool, tools, liveConfigReload, toolContext, canonicalDirectory };
 }
 
 /**
@@ -206,6 +208,14 @@ export function makeServerEffect(overrides = {}) {
       );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
+      // OpenCode 2 has no chat.message hook; its session prompt hook is where a
+      // new message detaches a waiting bash, as chat.message does on OpenCode 1.
+      // The config is read through the tool context so live reloads apply.
+      yield* dependencies.registerPromptHook(context, {
+        pool: runtime.pool,
+        projectRoot: runtime.canonicalDirectory,
+        getConfig: () => runtime.toolContext.config,
+      });
       yield* dependencies.registerTools(
         context,
         location,

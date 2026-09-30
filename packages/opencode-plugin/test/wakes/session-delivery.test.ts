@@ -52,7 +52,9 @@ describe("V2 session delivery", () => {
         sessionID: "session-v2",
         text: wake.text,
         delivery: "steer",
-        metadata: { task_ids: ["bash-aborted-then-completed"] },
+        // The delivery always marks its wake as AFT's own, even when the
+        // caller passes no metadata, so the prompt hook can recognise it.
+        metadata: { source: "aft", task_ids: ["bash-aborted-then-completed"] },
       },
     ]);
     expect(host.prompts[0]).not.toHaveProperty("resume");
