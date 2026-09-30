@@ -492,11 +492,11 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 12786,
+      "line": 12797,
       "column": 26,
       "token": "filePath",
       "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
-      "location": "line 12786, column 26",
+      "location": "line 12797, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
