@@ -4604,6 +4604,8 @@ fn execute_degraded_grep_fallback(
             // The degraded walk's time budget is reported through
             // `walk_truncated` above.
             scan_deadline_reached: false,
+            files_read_directly: files_searched,
+            walk_bound: walk_budget_reached.then_some(crate::search_index::WalkBound::TimeBudget),
         },
         file_cap_reached,
         file_limit: DEGRADED_GREP_FILE_LIMIT,
@@ -7454,6 +7456,8 @@ mod tests {
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
             scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         };
         let text = format_grep_lexical_unavailable_text(
             "Semantic index is loading.",

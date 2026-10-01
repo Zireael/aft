@@ -291,7 +291,7 @@ maybeDescribe(describeName, () => {
         // the watcher's next drain removes it.
         const converged = (text: string) =>
           !text.includes("building/retrying") &&
-          !text.includes("[index: building]") &&
+          !text.includes("[index: building") &&
           !text.includes("were not on disk in this checkout");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);

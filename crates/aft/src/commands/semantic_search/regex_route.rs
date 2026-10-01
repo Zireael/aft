@@ -322,6 +322,8 @@ pub(crate) fn rank_collection(collection: GrepFileCollection, query: &str) -> Ra
             // The collection's time bound is reported through
             // `examination_capped` above.
             scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         },
         files,
     }

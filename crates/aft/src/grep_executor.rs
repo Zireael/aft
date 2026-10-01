@@ -18,7 +18,7 @@ use crate::search_index::{
     build_path_filters, decompose_grep_pattern, read_searchable_text, resolve_search_scope,
     sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
     GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
-    RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -37,7 +37,8 @@ pub struct FallbackWalkOutcome {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct FallbackWalkProgress {
-    walk_truncated: bool,
+    /// The limit that stopped the walk early; `None` when it reached every file.
+    bound: Option<WalkBound>,
     skipped_foreign_mounts: usize,
 }
 
@@ -479,6 +480,8 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
         scan_deadline_reached: false,
+        files_read_directly: 0,
+        walk_bound: None,
     }
 }
 
@@ -519,11 +522,12 @@ fn grep_explicit_file(
         Some(deadline),
     );
     let engine_capped = engine_capped.load(Ordering::Relaxed);
+    let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
-        files_searched: files_searched.load(Ordering::Relaxed),
+        files_searched,
         files_with_matches: files_with_matches.load(Ordering::Relaxed),
         index_status,
         truncated: truncated.load(Ordering::Relaxed),
@@ -533,6 +537,8 @@ fn grep_explicit_file(
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
         scan_deadline_reached: engine_capped && Instant::now() >= deadline,
+        files_read_directly: files_searched,
+        walk_bound: None,
     }
 }
 
@@ -553,6 +559,8 @@ pub fn merge_grep_results(
     let mut skipped_foreign_mounts = 0usize;
     let mut missing_on_disk = 0usize;
     let mut scan_deadline_reached = false;
+    let mut files_read_directly = 0usize;
+    let mut walk_bound = None;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -567,6 +575,8 @@ pub fn merge_grep_results(
         skipped_foreign_mounts += result.skipped_foreign_mounts;
         missing_on_disk += result.missing_on_disk;
         scan_deadline_reached |= result.scan_deadline_reached;
+        files_read_directly += result.files_read_directly;
+        walk_bound = walk_bound.or(result.walk_bound);
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -595,6 +605,8 @@ pub fn merge_grep_results(
         skipped_foreign_mounts,
         missing_on_disk,
         scan_deadline_reached,
+        files_read_directly,
+        walk_bound,
     }
 }
 
@@ -752,29 +764,6 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
     }
 }
 
-fn for_each_bounded_fallback_walk_file<F>(
-    filter_root: &Path,
-    search_root: &Path,
-    filters: &PathFilters,
-    project_root: &Path,
-    path_exclusion: Option<GrepPathExclusion>,
-    mut on_file: F,
-) -> FallbackWalkProgress
-where
-    F: FnMut(&PathBuf),
-{
-    for_each_bounded_fallback_walk_file_with_limits(
-        filter_root,
-        search_root,
-        filters,
-        project_root,
-        path_exclusion,
-        MAX_FALLBACK_WALK_FILES,
-        FALLBACK_WALK_BUDGET,
-        &mut on_file,
-    )
-}
-
 fn for_each_bounded_fallback_walk_file_with_limits<F>(
     filter_root: &Path,
     search_root: &Path,
@@ -796,13 +785,13 @@ where
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if crate::executor::current_job_cancelled() {
             return FallbackWalkProgress {
-                walk_truncated: true,
+                bound: Some(WalkBound::Cancelled),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
             };
         }
         if started.elapsed() >= budget {
             return FallbackWalkProgress {
-                walk_truncated: true,
+                bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
             };
         }
@@ -820,7 +809,7 @@ where
             files_seen += 1;
             if files_seen > max_files {
                 return FallbackWalkProgress {
-                    walk_truncated: true,
+                    bound: Some(WalkBound::FileLimit(max_files)),
                     skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 };
             }
@@ -828,7 +817,7 @@ where
         }
     }
     FallbackWalkProgress {
-        walk_truncated: false,
+        bound: None,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
     }
 }
@@ -876,6 +865,35 @@ fn fallback_grep(
     index_status: IndexStatus,
     path_exclusion: Option<GrepPathExclusion>,
 ) -> GrepResult {
+    fallback_grep_with_limits(
+        project_root,
+        search_root,
+        filter_root,
+        pattern,
+        filters,
+        max_results,
+        index_status,
+        path_exclusion,
+        MAX_FALLBACK_WALK_FILES,
+        FALLBACK_WALK_BUDGET,
+    )
+}
+
+/// [`fallback_grep`] with explicit walk limits: at most `max_files` eligible
+/// files, and `budget` of wall-clock time for walking and searching them.
+#[allow(clippy::too_many_arguments)]
+fn fallback_grep_with_limits(
+    project_root: &Path,
+    search_root: &Path,
+    filter_root: &Path,
+    pattern: &CompiledPattern,
+    filters: &PathFilters,
+    max_results: usize,
+    index_status: IndexStatus,
+    path_exclusion: Option<GrepPathExclusion>,
+    max_files: usize,
+    budget: Duration,
+) -> GrepResult {
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
     let files_with_matches = AtomicUsize::new(0);
@@ -883,7 +901,7 @@ fn fallback_grep(
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
     let stop_scan = Arc::new(AtomicBool::new(false));
-    let scan_deadline = Instant::now() + FALLBACK_WALK_BUDGET;
+    let scan_deadline = Instant::now() + budget;
     let job_cancellation = crate::executor::current_job_cancellation();
 
     let mut matches = Vec::new();
@@ -930,13 +948,15 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    let progress = for_each_bounded_fallback_walk_file(
+    let progress = for_each_bounded_fallback_walk_file_with_limits(
         filter_root,
         search_root,
         filters,
         project_root,
         path_exclusion,
-        |path| {
+        max_files,
+        budget,
+        &mut |path: &PathBuf| {
             if stop_scan.load(Ordering::Relaxed) {
                 return;
             }
@@ -947,28 +967,33 @@ fn fallback_grep(
         },
     );
     flush_batch(&mut batch, &mut matches);
-    let mut walk_truncated = progress.walk_truncated;
+    let mut walk_bound = progress.bound;
     if Instant::now() >= scan_deadline {
-        walk_truncated = true;
+        // Files handed to the search after the deadline were skipped, so the
+        // walk is incomplete even when its own loop finished.
+        walk_bound = walk_bound.or(Some(WalkBound::TimeBudget));
         engine_capped.store(true, Ordering::Relaxed);
     }
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
+    let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
-        files_searched: files_searched.load(Ordering::Relaxed),
+        files_searched,
         files_with_matches: files_with_matches.load(Ordering::Relaxed),
         index_status,
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: true,
         engine_capped: engine_capped.load(Ordering::Relaxed),
-        walk_truncated,
+        walk_truncated: walk_bound.is_some(),
         skipped_foreign_mounts: progress.skipped_foreign_mounts,
         missing_on_disk: 0,
         // The walk's own time budget is reported through `walk_truncated`.
         scan_deadline_reached: false,
+        files_read_directly: files_searched,
+        walk_bound,
     }
 }
 
@@ -1269,6 +1294,8 @@ mod tests {
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
             scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         }
     }
 
@@ -1328,6 +1355,135 @@ mod tests {
         assert_eq!(visible.matches[0].file, source_file);
         assert!(!visible.truncated);
         assert!(!visible.engine_capped);
+    }
+
+    /// A tempdir holding `count` small text files, none containing `absent_token`.
+    fn walk_fixture(count: usize) -> tempfile::TempDir {
+        let project = tempfile::tempdir().expect("project");
+        for index in 0..count {
+            std::fs::write(
+                project.path().join(format!("file_{index}.txt")),
+                format!("line {index} — nothing to see\n"),
+            )
+            .expect("fixture file");
+        }
+        project
+    }
+
+    fn literal(pattern: &str) -> CompiledPattern {
+        match crate::pattern_compile::compile(
+            pattern,
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal: {other:?}"),
+        }
+    }
+
+    /// The grep tool's reply text for `result`, as `handle_grep` builds it.
+    fn grep_tool_text(result: &GrepResult, project_root: &Path) -> String {
+        let page_matches: Vec<&GrepMatch> = result.matches.iter().collect();
+        let page = crate::commands::grep::render_grep_page(
+            &page_matches,
+            project_root,
+            crate::commands::grep::GREP_MAX_OUTPUT_BYTES,
+        );
+        let mut text = crate::commands::grep::grep_page_text(result, &page, 0, false);
+        if let Some(note) = crate::commands::grep::walk_coverage_note(result) {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
+        text
+    }
+
+    #[test]
+    fn complete_fallback_walk_while_index_builds_says_every_file_was_searched() {
+        let project = walk_fixture(3);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            10,
+            FALLBACK_WALK_BUDGET,
+        );
+        assert_eq!(result.walk_bound, None);
+        assert!(!result.walk_truncated);
+        assert_eq!(result.files_read_directly, 3);
+
+        let text = grep_tool_text(&result, project.path());
+        assert_eq!(
+            text,
+            "Found 0 match across 0 file [index: building; searched all 3 files directly]"
+        );
+    }
+
+    #[test]
+    fn bounded_fallback_walk_while_index_builds_says_it_is_incomplete() {
+        let project = walk_fixture(5);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            2,
+            FALLBACK_WALK_BUDGET,
+        );
+        assert_eq!(result.walk_bound, Some(WalkBound::FileLimit(2)));
+        assert!(result.walk_truncated);
+        assert_eq!(result.files_read_directly, 2);
+
+        let text = grep_tool_text(&result, project.path());
+        assert!(
+            text.starts_with(
+                "Found 0 match across 0 file [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("(checked 2 of more than 2 files (index building);"),
+            "{text}"
+        );
+        assert!(
+            text.contains("retry once the index is ready"),
+            "the note must name an exhaustive alternative: {text}"
+        );
+        assert!(!text.contains("searched all"), "{text}");
+    }
+
+    #[test]
+    fn walk_time_budget_marks_the_walk_incomplete() {
+        let project = walk_fixture(3);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            10,
+            Duration::ZERO,
+        );
+        assert_eq!(result.walk_bound, Some(WalkBound::TimeBudget));
+        let text = grep_tool_text(&result, project.path());
+        assert!(
+            text.contains("incomplete: checked 0 files before the walk's time budget ran out"),
+            "{text}"
+        );
+        assert!(text.contains("ran out of its time budget"), "{text}");
     }
 
     #[test]

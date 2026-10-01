@@ -1077,6 +1077,26 @@ pub struct GrepResult {
     /// True when the scan stopped at its wall-clock budget before every
     /// candidate file was searched, so matches may be missing.
     pub scan_deadline_reached: bool,
+    /// Files read straight from disk rather than through the trigram index:
+    /// the files a fallback walk searched, or a file named as the search path.
+    pub files_read_directly: usize,
+    /// Why a fallback walk stopped before reaching every file, when it did.
+    /// `None` for an index answer and for a walk that covered every file.
+    pub walk_bound: Option<WalkBound>,
+}
+
+/// The limit that stopped a fallback directory walk early. Files the walk
+/// never reached were not searched, so a missing match is not evidence of
+/// absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkBound {
+    /// The walk's wall-clock budget ran out.
+    TimeBudget,
+    /// The walk found more eligible files than it may search; the value is
+    /// that file limit.
+    FileLimit(usize),
+    /// The request was cancelled while the walk was running.
+    Cancelled,
 }
 
 /// Bounds on how much work [`SearchIndexSnapshot::collect_grep_matches_by_file`]
@@ -2956,6 +2976,8 @@ impl SearchIndexSnapshot {
             skipped_foreign_mounts: 0,
             missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
             scan_deadline_reached,
+            files_read_directly: 0,
+            walk_bound: None,
         };
         let post_filter = candidate_filter + post_filter_started.elapsed();
         let phases = GrepQueryPhaseTimings {
@@ -3098,6 +3120,8 @@ impl SearchIndexSnapshot {
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
             scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         }
     }
 
