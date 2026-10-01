@@ -2881,11 +2881,14 @@ fn render_symbol_category(
     let suffix = dead_code_language_suffix(section);
     let skipped_suffix = dead_code_skipped_language_suffix(section);
     let generated_suffix = generated_count_suffix(section);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
-        lines.push(format!("{label}: 0{generated_suffix}{skipped_suffix}"));
+        lines.push(format!(
+            "{label}: 0{generated_suffix}{skipped_suffix}{excluded}"
+        ));
     } else {
         lines.push(format!(
-            "{label}: {count}{suffix}{generated_suffix}{skipped_suffix}:"
+            "{label}: {count}{suffix}{generated_suffix}{skipped_suffix}{excluded}:"
         ));
         if let Some(items) = category_items(summary, details, key) {
             for item in items.iter().filter(|item| !item_is_generated(item)) {
@@ -2900,6 +2903,43 @@ fn render_symbol_category(
     }
     render_generated_symbol_usage(lines, summary, details, key);
     render_test_only_usage(lines, summary, details, key);
+}
+
+/// The headline clause for findings a category withheld because they live in
+/// test trees or fixtures (`excluded_test_count` in `excluded_test_files`
+/// files). Empty when nothing was withheld, so product-only counts never hide
+/// that more exists.
+fn excluded_test_clause(section: &Value) -> String {
+    let count = section
+        .get("excluded_test_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if count == 0 {
+        return String::new();
+    }
+    let files = section
+        .get("excluded_test_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let file_label = if files == 1 { "file" } else { "files" };
+    format!(
+        " · excluded {} in {} test/fixture {file_label} (pass includeTests to see them)",
+        thousands(count),
+        thousands(files)
+    )
+}
+
+/// `2940` as `2,940`.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 fn generated_count_suffix(section: &Value) -> String {
@@ -3092,11 +3132,12 @@ fn render_group_category(
         return;
     }
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
-        lines.push(format!("{label}: 0"));
+        lines.push(format!("{label}: 0{excluded}"));
         return;
     }
-    lines.push(format!("{label}: {count} (top by cost):"));
+    lines.push(format!("{label}: {count}{excluded} (top by cost):"));
     if let Some(items) = category_items(summary, details, key) {
         for item in items.iter().filter(|item| !item_is_generated(item)) {
             let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
@@ -3139,14 +3180,15 @@ fn render_duplicates_category(
     } else {
         format!(" (generated: {generated_count})")
     };
+    let excluded = excluded_test_clause(section);
     let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
         if count == 0 {
-            lines.push(format!("{label}: 0{generated_suffix}"));
+            lines.push(format!("{label}: 0{generated_suffix}{excluded}"));
             render_generated_duplicate_usage(lines, summary, details, key);
             return;
         }
         lines.push(format!(
-            "{label}: {count}{}{generated_suffix} (top by cost):",
+            "{label}: {count}{}{generated_suffix}{excluded} (top by cost):",
             duplicate_suppression_clause(section)
         ));
         render_duplicate_rows(lines, summary, details, key);
@@ -3184,7 +3226,7 @@ fn render_duplicates_category(
         String::new()
     };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{suffix}",
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{excluded}{suffix}",
         plural_group(group_count),
     ));
     if count > 0 {
@@ -3331,7 +3373,12 @@ fn render_todos(
         return;
     };
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
+        // Zero product TODOs prints nothing, unless some were withheld.
+        if !excluded.is_empty() {
+            lines.push(format!("TODOs: 0{excluded}"));
+        }
         return;
     }
     let by_kind = section
@@ -3351,9 +3398,9 @@ fn render_todos(
         })
         .unwrap_or_default();
     if by_kind.is_empty() {
-        lines.push(format!("TODOs: {count}"));
+        lines.push(format!("TODOs: {count}{excluded}"));
     } else {
-        lines.push(format!("TODOs: {count} ({by_kind})"));
+        lines.push(format!("TODOs: {count} ({by_kind}){excluded}"));
     }
     // Detail rows only when explicitly drilled into (sections: ["todos"]) — the
     // scanner populates details["todos"] only then, keeping the default summary
@@ -4963,6 +5010,89 @@ mod fresh_payload_tests {
                     "files": 4,
                 },
             ])
+        );
+    }
+
+    /// Findings withheld from a category's count because they live in test
+    /// trees or fixtures are still reported, as a clause on that category's
+    /// summary line.
+    #[test]
+    fn withheld_test_findings_are_counted_on_each_category_headline() {
+        let summary = serde_json::json!({
+            "dead_code": {"count": 865, "excluded_test_count": 2940, "excluded_test_files": 21},
+            "unused_exports": {"count": 0, "excluded_test_count": 0, "excluded_test_files": 0},
+            "duplicates": {"count": 0, "excluded_test_count": 3, "excluded_test_files": 1},
+            "todos": {"count": 0, "excluded_test_count": 4, "excluded_test_files": 2},
+        });
+        let text = render_inspect_text(summary.as_object().unwrap(), &Map::new(), None);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(
+            lines.contains(&"Dead code: 865 · excluded 2,940 in 21 test/fixture files (pass includeTests to see them):"),
+            "{text}"
+        );
+        assert!(lines.contains(&"Unused exports: 0"), "{text}");
+        assert!(
+            lines.contains(&"Duplicates: 0 · excluded 3 in 1 test/fixture file (pass includeTests to see them)"),
+            "{text}"
+        );
+        assert!(
+            lines.contains(
+                &"TODOs: 0 · excluded 4 in 2 test/fixture files (pass includeTests to see them)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A scanner that did not finish within the inspect wait budget is named
+    /// on its incomplete line, instead of the generic "unknown producer".
+    #[test]
+    fn unfinished_scanner_gap_names_its_scanner() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Todos,
+            serde_json::json!({
+                "unavailable": true, "complete": false,
+                "gaps": [{"kind": "analysis_incomplete", "producer": "todos scanner",
+                    "reason": "analysis did not finish within its wait budget; retry aft_inspect"}]
+            }),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            None,
+        );
+        let text = payload["text"].as_str().expect("text");
+        assert!(
+            text.contains("Incomplete todos: todos scanner did not finish (analysis did not finish within its wait budget; retry aft_inspect)"),
+            "{text}"
+        );
+        assert!(!text.contains("unknown producer"), "{text}");
+    }
+
+    #[test]
+    fn runtime_notes_that_differ_only_by_path_collapse_to_one_line() {
+        let notes = [
+            "TypeScript 5.9.3: project installation (/r/a/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/b/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/c/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.4.0: project installation (/r/d/node_modules/typescript/lib/tsserver.js)",
+            "rust-analyzer warning: proc macros unavailable",
+        ]
+        .map(String::from);
+        assert_eq!(
+            collapse_runtime_notes(&notes),
+            vec![
+                "TypeScript 5.9.3: project installation ×3 (first: /r/a/node_modules/typescript/lib/tsserver.js)",
+                "TypeScript 5.4.0: project installation (/r/d/node_modules/typescript/lib/tsserver.js)",
+                "rust-analyzer warning: proc macros unavailable",
+            ]
         );
     }
 
