@@ -119,8 +119,65 @@ fn write_epoch_as_detached_writer(target: &Target) -> parking_lot::RwLockWriteGu
     guard
 }
 
-/// Scheduling succeeds once ownership has moved to the detached worker. Direct
-/// standalone callers have no actor epoch and retain the synchronous API.
+/// The standalone (stdin/stdout) runtime's stand-in for a root actor's epoch.
+///
+/// The subc daemon runs configure maintenance as executor jobs inside a root
+/// actor, so [`schedule`] detaches a view publication there. The standalone
+/// runtime serves requests and maintenance on one thread with no actor; without
+/// this, the first publication of a large checkout ran inline on that thread
+/// and every request waited for it. Standalone maintenance installs this
+/// epoch with [`install_standalone_scope`], so publications detach, and each
+/// standalone request holds its read side through [`standalone_request_gate`],
+/// so a detached publication's commit (the write side) never runs in the
+/// middle of a request or a maintenance unit.
+struct StandaloneEpoch {
+    epoch: Arc<RwLock<()>>,
+    detached_writers: Arc<AtomicUsize>,
+}
+
+static STANDALONE_EPOCH: LazyLock<StandaloneEpoch> = LazyLock::new(|| StandaloneEpoch {
+    epoch: Arc::new(RwLock::new(())),
+    detached_writers: Arc::new(AtomicUsize::new(0)),
+});
+
+/// Held while a standalone request or maintenance unit runs. The read is
+/// recursive because a request can dispatch a nested request (`tool_call`).
+/// The writer is never starved: requests and maintenance run one at a time on
+/// the standalone thread, so between two of them no read is held and a waiting
+/// publication commits; at most it waits for the one request in flight.
+pub struct StandaloneGate {
+    _read: parking_lot::RwLockReadGuard<'static, ()>,
+}
+
+pub fn standalone_request_gate() -> StandaloneGate {
+    StandaloneGate {
+        _read: STANDALONE_EPOCH.epoch.read_recursive(),
+    }
+}
+
+/// Lets view publications scheduled by standalone configure maintenance on
+/// `ctx` detach instead of running inline, for as long as the returned value
+/// lives. It also holds the request gate, as a maintenance unit is serialized
+/// with publication commits the same way a request is.
+pub struct StandaloneScope {
+    _scope: ActorScope,
+    _gate: StandaloneGate,
+}
+
+pub fn install_standalone_scope(ctx: Arc<AppContext>) -> StandaloneScope {
+    StandaloneScope {
+        _gate: standalone_request_gate(),
+        _scope: ActorScope::install(
+            ctx,
+            Arc::clone(&STANDALONE_EPOCH.epoch),
+            Arc::clone(&STANDALONE_EPOCH.detached_writers),
+        ),
+    }
+}
+
+/// Scheduling succeeds once ownership has moved to the detached worker.
+/// Callers outside any actor scope (tests and one-shot tools that drain
+/// configure maintenance themselves) retain the synchronous API.
 pub(crate) fn schedule(
     ctx: &AppContext,
     mut paths: BTreeSet<Vec<u8>>,

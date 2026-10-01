@@ -1,5 +1,8 @@
 mod single_flight;
 pub(crate) mod view_publication;
+pub use view_publication::{
+    install_standalone_scope, standalone_request_gate, StandaloneGate, StandaloneScope,
+};
 
 #[cfg(test)]
 mod tests;

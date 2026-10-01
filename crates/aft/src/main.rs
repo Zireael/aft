@@ -1192,6 +1192,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     // when it was admitted, so a live config reload switches over between
     // requests, never in the middle of one (path restriction, sandbox).
     let _config_pin = ctx.pin_config();
+    // A detached view publication commits only between standalone requests,
+    // never in the middle of one (uncontended in subc mode).
+    let _publication_gate = aft::executor::standalone_request_gate();
     #[cfg(test)]
     dispatch_config_probe_for_test(ctx);
     let mut response = dispatch_command(req, ctx);

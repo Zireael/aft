@@ -54,6 +54,7 @@ fn request(
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put,
+        callgraph: true,
     }
 }
 
@@ -504,4 +505,68 @@ fn killed_off_barrier_build_preserves_pointer_and_sweeps_generation() {
     }
     assert!(view.derived_path(&initial).unwrap().is_file());
     assert!(view.load_manifest(&initial).is_ok());
+}
+
+/// With the call graph off, a publication extracts no callgraph payload and
+/// its source entries carry no callgraph key; once the call graph is turned
+/// on, a later publication that changes other files still extracts the
+/// unchanged ones it never extracted.
+#[test]
+fn callgraph_off_publication_extracts_nothing_and_on_fills_it_in() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    for index in 0..5 {
+        fs::write(
+            project.path().join(format!("file_{index}.rs")),
+            format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    commit(project.path(), "base");
+    let family = "callgraph-off-family";
+    let mut off = request(
+        storage.path(),
+        project.path(),
+        family,
+        "off-view",
+        BTreeSet::new(),
+        true,
+    );
+    off.callgraph = false;
+    let report = publish_checkout(&off).unwrap();
+    assert!(report.published);
+    assert_eq!(report.blob_puts, 0, "no callgraph payload is extracted");
+    let manifest = report.manifest.unwrap();
+    let callgraph_keys = |manifest: &aft::views::Manifest| {
+        manifest
+            .entries()
+            .filter(|(_, entry)| {
+                matches!(entry, ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
+            })
+            .count()
+    };
+    assert_eq!(callgraph_keys(&manifest), 0);
+
+    fs::write(
+        project.path().join("file_0.rs"),
+        "pub fn value_0() -> usize { 100 }\n",
+    )
+    .unwrap();
+    commit(project.path(), "edit");
+    let on = request(
+        storage.path(),
+        project.path(),
+        family,
+        "off-view",
+        BTreeSet::from([b"file_0.rs".to_vec()]),
+        true,
+    );
+    let report = publish_checkout(&on).unwrap();
+    assert!(report.published);
+    assert_eq!(
+        report.blob_puts, 5,
+        "the four unchanged files are extracted too"
+    );
+    assert_eq!(callgraph_keys(&report.manifest.unwrap()), 5);
 }

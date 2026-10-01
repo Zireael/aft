@@ -6252,6 +6252,8 @@ impl AppContext {
                 semantic_keys,
                 require_semantic: semantic_search,
                 allow_blob_put,
+                // Nothing reads a view's call graph while the index is off.
+                callgraph: self.config().indexes.callgraph,
             },
             phase,
         )

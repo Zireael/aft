@@ -58,6 +58,7 @@ fn view_projection_fixture() -> (
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put: true,
+        callgraph: true,
     };
     (project, storage, job, request)
 }

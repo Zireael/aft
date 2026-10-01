@@ -460,11 +460,15 @@ impl StandaloneConfigureMaintenance {
         crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
     }
 
-    pub fn drain_prefix(&mut self, ctx: &AppContext) -> bool {
+    pub fn drain_prefix(&mut self, ctx: &Arc<AppContext>) -> bool {
+        // A view publication scheduled here detaches instead of running on the
+        // standalone request thread; see `install_standalone_scope`.
+        let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
         crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
     }
 
-    pub fn drain_one(&mut self, ctx: &AppContext) -> bool {
+    pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
+        let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
         crate::commands::configure::drain_deferred_configure_maintenance_unit(ctx, &mut self.inner)
     }
 }

@@ -530,6 +530,7 @@ fn bench_incremental_cutoff_crossover() {
                 semantic_keys: Default::default(),
                 require_semantic: false,
                 allow_blob_put: true,
+                callgraph: true,
             })
             .unwrap();
         println!(
@@ -601,6 +602,7 @@ fn bench_incremental_cutoff_crossover() {
                 semantic_keys: Default::default(),
                 require_semantic: false,
                 allow_blob_put: true,
+                callgraph: true,
             })
             .unwrap();
         targets.push((label, report.manifest.expect("synthetic manifest")));
