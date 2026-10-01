@@ -9,7 +9,8 @@
   "slices": [
     "issue-382-param-help",
     "gh-shim-auth-status",
-    "worker-blocking-waits"
+    "worker-blocking-waits",
+    "issue-380-oc2-prompt-server"
   ],
-  "note": "Tool parameter descriptions (#382 part 1, bash_watch timeout text) regenerate the fenced subc_tool_schemas.json; descriptions only, no ranking code. The gh shim auth status answer and the worker wait/role changes touch no search path. Ranked rows must stay byte-identical."
+  "note": "Tool parameter descriptions (#382 part 1, bash_watch timeout text) regenerate the fenced subc_tool_schemas.json; descriptions only, no ranking code. The gh shim auth status answer and the worker wait/role changes touch no search path; the OpenCode 2 prompt-server discovery (#380) touches only the plugin permissions path and config. Ranked rows must stay byte-identical."
 }
