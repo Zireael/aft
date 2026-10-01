@@ -176,12 +176,12 @@ pub(crate) fn sweep_scoped_files(
         .map(|(file, _)| file.clone())
         .chain(sweep.not_examined.keys().cloned())
         .collect();
-    // A check owed to an earlier request that never began is asked for again
-    // now, so it can run while the files are opened.
+    // A check an earlier request expected and that never began is asked for
+    // again now, so it can run while the files are opened.
     {
         let mut lsp = ctx.lsp();
         for key in involved.iter().filter(|key| key.kind == ServerKind::Rust) {
-            lsp.rearm_unreported_rust_check(key, true);
+            lsp.rearm_unreported_rust_check(key);
         }
     }
 
@@ -308,12 +308,12 @@ pub(crate) fn sweep_scoped_files(
             let mut checking = Vec::new();
             let mut unreported = Vec::new();
             for key in &rust_producers {
-                match lsp.rust_check_state(key, true) {
+                match lsp.rust_check_state(key) {
                     RustCheckState::Current => {}
                     RustCheckState::Running => checking.push(key.clone()),
-                    // Not waited for: the check it owes did not begin in
-                    // time, so its results are unknown however long the
-                    // sweep waits.
+                    // Not waited for: the check expected from it did not
+                    // begin in time, so its results are unknown however long
+                    // the sweep waits.
                     RustCheckState::Unreported => unreported.push(key.clone()),
                 }
             }

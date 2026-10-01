@@ -3,7 +3,7 @@ use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -82,6 +82,10 @@ struct RustSaveRequest {
     last_sent_at: Option<Instant>,
     /// How many times it has been sent.
     sends: u8,
+    /// The reader's check-begin count when the save was first sent (see
+    /// `LspClient::rust_check_begins_read`); `None` until then. Only a begin
+    /// read after that send is a run of the saved contents.
+    begins_read_at_send: Option<u64>,
 }
 
 /// How a server asked to be told about saved documents
@@ -111,6 +115,35 @@ fn parse_save_notification(capabilities: &Value) -> Option<SaveNotification> {
     }
 }
 
+/// Whether a rust-analyzer `$/progress` notification is about a check run:
+/// rust-analyzer names their token `rust-analyzer/flycheck/N` and titles them
+/// with the check command (`cargo check`, `cargo clippy`).
+fn is_rust_check_progress(token: &str, title: Option<&str>) -> bool {
+    token.contains("flycheck")
+        || title.is_some_and(|title| {
+            title.starts_with("cargo check")
+                || title.starts_with("cargo clippy")
+                || title.contains("flycheck")
+        })
+}
+
+/// Whether `$/progress` parameters announce the beginning of a check run.
+fn is_rust_check_begin(params: Option<&Value>) -> bool {
+    let Some(params) = params else {
+        return false;
+    };
+    let token = match params.get("token") {
+        Some(Value::String(token)) => token.clone(),
+        Some(Value::Number(token)) => token.to_string(),
+        _ => return false,
+    };
+    params.pointer("/value/kind").and_then(Value::as_str) == Some("begin")
+        && is_rust_check_progress(
+            &token,
+            params.pointer("/value/title").and_then(Value::as_str),
+        )
+}
+
 /// Which `cargo check` runs rust-analyzer will make, read from the
 /// initialization options AFT starts it with. Returns `(on_save, on_load)`:
 /// whether a save starts a check (`checkOnSave`, on unless set to `false`),
@@ -122,7 +155,8 @@ fn parse_save_notification(capabilities: &Value) -> Option<SaveNotification> {
 fn rust_check_triggers(initialization_options: Option<&Value>) -> (bool, bool) {
     let disabled = |value: Option<&Value>| match value {
         Some(Value::Bool(enabled)) => !enabled,
-        // The pre-2023 shape, `checkOnSave: { enable: false }`.
+        // Older rust-analyzer configurations spell it as an object:
+        // `checkOnSave: { enable: false }`.
         Some(Value::Object(options)) => options.get("enable") == Some(&Value::Bool(false)),
         _ => false,
     };
@@ -646,8 +680,10 @@ pub struct LspClient {
     rust_analyzer_failure: Option<String>,
     /// Non-fatal analyzer health warning; published diagnostics remain usable.
     pub(crate) rust_analyzer_warning: Option<String>,
-    /// Since when rust-analyzer owes the `cargo check` of the whole workspace
-    /// it starts on becoming quiescent (or that AFT asked for again; see
+    /// Since when AFT has been expecting rust-analyzer to begin a `cargo
+    /// check` of the whole workspace: the one it starts on becoming
+    /// quiescent after loading the workspace, or one AFT asked for again with
+    /// `rust-analyzer/runFlycheck` (see
     /// [`LspClient::rearm_unreported_rust_check`]). Cleared when any check
     /// begins. While set, the published diagnostics lack the compiler's
     /// errors.
@@ -666,6 +702,17 @@ pub struct LspClient {
     /// while this is set the published compiler errors describe the files as
     /// they were before the save.
     rust_save: Option<RustSaveRequest>,
+    /// How many check-run begin notifications the reader thread has read from
+    /// the server so far, counted as they arrive rather than when events are
+    /// drained. Events wait in the channel until a caller drains them, so a
+    /// begin drained after a save was sent may have been sent by the server
+    /// before the save, for a run of the files before the edit; comparing
+    /// this count, taken when the save is sent, with
+    /// `rust_check_begins_drained` tells the two apart.
+    rust_check_begins_read: Arc<AtomicU64>,
+    /// How many check-run begin notifications have been drained (see
+    /// [`LspClient::record_rust_progress`]).
+    rust_check_begins_drained: u64,
     /// How the server asked to hear about saves (`textDocumentSync.save` in
     /// its initialize response). `None` until `initialize` succeeds, and when
     /// the server did not ask.
@@ -861,6 +908,8 @@ impl LspClient {
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
+        let rust_check_begins_read = Arc::new(AtomicU64::new(0));
+        let reader_check_begins = Arc::clone(&rust_check_begins_read);
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -884,6 +933,9 @@ impl LspClient {
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
+                        if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
+                            reader_check_begins.fetch_add(1, Ordering::SeqCst);
+                        }
                         let _ = event_tx.send(LspEvent::Notification {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
@@ -968,6 +1020,8 @@ impl LspClient {
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
             rust_save: None,
+            rust_check_begins_read,
+            rust_check_begins_drained: 0,
             save_notification: None,
             rust_checks_on_save: false,
             rust_checks_on_load: false,
@@ -1181,7 +1235,8 @@ impl LspClient {
             loaded_at: self.workspace_loaded_at,
         };
         self.rust_analyzer_quiescent = false;
-        // The reloaded workspace owes its own check once it is quiescent.
+        // rust-analyzer checks the reloaded workspace once it is quiescent
+        // again; that check is expected from then on.
         self.rust_workspace_check_owed_since = None;
         self.workspace_loaded_at = requested_at;
         previous
@@ -1224,28 +1279,29 @@ impl LspClient {
         }
         match kind {
             "begin" => {
-                let is_check = token.contains("flycheck")
-                    || title.is_some_and(|title| {
-                        title.starts_with("cargo check")
-                            || title.starts_with("cargo clippy")
-                            || title.contains("flycheck")
-                    });
-                if is_check {
+                if is_rust_check_progress(token, title) {
+                    self.rust_check_begins_drained += 1;
                     self.rust_flycheck_running.insert(token.to_string());
                     self.rust_flycheck_started_at = Some(Instant::now());
-                    // A run reads the files from disk as they are now, so it
-                    // also stands for the workspace check owed since the
-                    // server became quiescent.
+                    // A check run reads the files from disk as they are now,
+                    // so it gives the results the expected workspace check
+                    // would have, whatever started it.
                     self.rust_workspace_check_owed_since = None;
-                    // A check run reads the files from disk, so any run that
-                    // begins after a save was sent covers the saved contents,
-                    // whatever started it. A save deferred and not sent yet is
-                    // still owed: this run may have begun before rust-analyzer
+                    // For the same reason a run the server announced after a
+                    // save was sent covers the saved contents, whatever
+                    // started it. Order is judged by when the reader read the
+                    // announcement, not by when it is drained here: a run
+                    // announced before the save sits in the event channel
+                    // until a caller drains it, and checked the files before
+                    // the edit. A save deferred and not sent yet is still
+                    // expected: this run may have begun before rust-analyzer
                     // received the watcher's change.
+                    let ordinal = self.rust_check_begins_drained;
                     if self
                         .rust_save
                         .as_ref()
-                        .is_some_and(|save| save.last_sent_at.is_some())
+                        .and_then(|save| save.begins_read_at_send)
+                        .is_some_and(|read_at_send| ordinal > read_at_send)
                     {
                         self.rust_save = None;
                     }
@@ -1284,6 +1340,7 @@ impl LspClient {
                 due_at: None,
                 last_sent_at: Some(now),
                 sends: 1,
+                begins_read_at_send: Some(self.rust_check_begins_read.load(Ordering::SeqCst)),
             });
         }
     }
@@ -1304,6 +1361,7 @@ impl LspClient {
                 due_at: Some(now + EXTERNAL_SAVE_DELAY),
                 last_sent_at: None,
                 sends: 0,
+                begins_read_at_send: None,
             });
         }
     }
@@ -1329,10 +1387,12 @@ impl LspClient {
     /// Record that the save returned by [`Self::take_rust_save_to_send`]
     /// was sent.
     pub(crate) fn mark_rust_save_sent(&mut self, now: Instant) {
+        let begins_read = self.rust_check_begins_read.load(Ordering::SeqCst);
         if let Some(save) = self.rust_save.as_mut() {
             save.due_at = None;
             save.last_sent_at = Some(now);
             save.sends = save.sends.saturating_add(1);
+            save.begins_read_at_send.get_or_insert(begins_read);
         }
     }
 
@@ -1341,14 +1401,14 @@ impl LspClient {
     ///
     /// [`RustCheckState::Running`] while a check run is in progress, ended
     /// less than `publish_settle` ago (rust-analyzer can announce the end
-    /// before it publishes the final batch), or is owed and still within its
-    /// deadline: a save asked for one (until it begins, the published
+    /// before it publishes the final batch), or is expected and still within
+    /// its deadline: a save asked for one (until it begins, the published
     /// compiler errors describe the files before the save, including errors
-    /// already fixed), or, with `await_workspace_check`, the server became
-    /// quiescent and has not begun the workspace check it starts then.
+    /// already fixed), or the server became quiescent and has not begun the
+    /// workspace check it starts then.
     ///
-    /// [`RustCheckState::Unreported`] once an owed check has not begun by its
-    /// deadline: [`SAVE_CHECK_START_GRACE`] after the last of
+    /// [`RustCheckState::Unreported`] once an expected check has not begun by
+    /// its deadline: [`SAVE_CHECK_START_GRACE`] after the last of
     /// [`MAX_SAVE_SENDS`] sends of a save, or
     /// [`WORKSPACE_CHECK_START_DEADLINE`] after quiescence. A late start and
     /// a check that never comes look the same from here, and in neither case
@@ -1357,12 +1417,11 @@ impl LspClient {
     ///
     /// [`RustCheckState::Current`] otherwise, for other servers, for a server
     /// still warming (that state is tracked separately), and when the
-    /// server's settings run no check that would be owed (see
+    /// server's settings run no check that would be expected (see
     /// [`rust_check_triggers`]).
     pub(crate) fn rust_check_state(
         &self,
         now: Instant,
-        await_workspace_check: bool,
         publish_settle: Duration,
     ) -> RustCheckState {
         if !matches!(&self.kind, ServerKind::Rust) || !self.rust_analyzer_quiescent {
@@ -1385,15 +1444,12 @@ impl LspClient {
                 RustCheckState::Unreported
             };
         }
-        if await_workspace_check {
-            if let Some(owed_since) = self.rust_workspace_check_owed_since {
-                return if now.saturating_duration_since(owed_since) < WORKSPACE_CHECK_START_DEADLINE
-                {
-                    RustCheckState::Running
-                } else {
-                    RustCheckState::Unreported
-                };
-            }
+        if let Some(owed_since) = self.rust_workspace_check_owed_since {
+            return if now.saturating_duration_since(owed_since) < WORKSPACE_CHECK_START_DEADLINE {
+                RustCheckState::Running
+            } else {
+                RustCheckState::Unreported
+            };
         }
         match self.rust_flycheck_finished_at {
             Some(finished) if now.saturating_duration_since(finished) < publish_settle => {
@@ -1403,20 +1459,16 @@ impl LspClient {
         }
     }
 
-    /// Ask again for an owed check that [`Self::rust_check_state`] reports as
-    /// [`RustCheckState::Unreported`], so a new caller gets a fresh deadline
-    /// instead of an unknown answer that no retry could change. A save is
-    /// queued to be sent again by [`Self::take_rust_save_to_send`]. For the
-    /// workspace check (only with `await_workspace_check`) this returns true:
-    /// the caller sends [`RustAnalyzerRunFlycheck`], which starts one.
-    pub(crate) fn rearm_unreported_rust_check(
-        &mut self,
-        now: Instant,
-        await_workspace_check: bool,
-    ) -> bool {
-        if self.rust_check_state(now, await_workspace_check, Duration::ZERO)
-            != RustCheckState::Unreported
-        {
+    /// When a check was expected and did not begin by its deadline
+    /// ([`Self::rust_check_state`] reports [`RustCheckState::Unreported`]),
+    /// ask rust-analyzer for it again, so a new caller waits with a fresh
+    /// deadline. Without this, a check that never began would leave every
+    /// later request unknown, and the "retry" each of them suggests could
+    /// never succeed. A save is queued to be sent again by
+    /// [`Self::take_rust_save_to_send`]. For the workspace check this returns
+    /// true: the caller sends [`RustAnalyzerRunFlycheck`], which starts one.
+    pub(crate) fn rearm_unreported_rust_check(&mut self, now: Instant) -> bool {
+        if self.rust_check_state(now, Duration::ZERO) != RustCheckState::Unreported {
             return false;
         }
         if let Some(save) = self.rust_save.as_mut() {

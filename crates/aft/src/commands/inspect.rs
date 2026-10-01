@@ -1325,7 +1325,7 @@ fn wait_for_root_quiescence(
     let mut blocked = false;
     let rust_check_state = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
         if wait_for_rust_check {
-            lsp.rust_check_state(server, true)
+            lsp.rust_check_state(server)
         } else {
             RustCheckState::Current
         }
@@ -1333,7 +1333,7 @@ fn wait_for_root_quiescence(
     if wait_for_rust_check {
         let mut lsp = ctx.lsp();
         for server in expected {
-            lsp.rearm_unreported_rust_check(server, true);
+            lsp.rearm_unreported_rust_check(server);
         }
     }
     loop {
@@ -1342,7 +1342,7 @@ fn wait_for_root_quiescence(
         }
         accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
         let settled = root_producers_settled(ctx, expected);
-        // A check that is owed and did not begin by its deadline is not
+        // A check that was expected and did not begin by its deadline is not
         // waited for: its results are unknown however long this waits.
         let checking = {
             let lsp = ctx.lsp();

@@ -5562,6 +5562,53 @@ fn scoped_rust_inspect_never_certifies_a_save_that_started_no_check() {
     );
 }
 
+/// rust-analyzer's events wait in AFT's queue until a request drains them. A
+/// check that began before an edit's save, for the files before the edit, can
+/// therefore be drained only after the save was sent; it must not count as
+/// the save's check. Here the fake's first check runs (and finds the error)
+/// while nothing drains its events, the error is then fixed by an edit whose
+/// save starts no check, and inspect must report the result as unknown
+/// instead of certifying the old check.
+#[test]
+fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_save() {
+    let (_temp_dir, root, lib) = single_crate_fixture("check-before-save");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1000");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
+
+    // Start the server without waiting for its first check, then give that
+    // check time to run while nothing drains the server's events.
+    let config = ctx.config().clone();
+    let started = ctx.lsp().ensure_server_for_file(&lib, &config);
+    assert!(!started.is_empty(), "the fake rust server must start");
+    thread::sleep(Duration::from_secs(3));
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "check-before-save-fix",
+            "command": "edit_match",
+            "file": lib.display().to_string(),
+            "match": "// fake_compile_error\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+
+    let after = scoped_diagnostics_inspect(&ctx, "check-before-save-after", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&after),
+        "only a check announced before the save ran, so the result must be unknown: {after:#}"
+    );
+}
+
 /// rust-analyzer owes a check of the whole workspace once it is quiescent.
 /// When that check never begins (the fake drops it), inspect stops waiting
 /// at a deadline and reports the diagnostics as unknown instead of hanging

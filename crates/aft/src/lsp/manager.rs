@@ -2232,37 +2232,26 @@ impl LspManager {
 
     /// Whether this rust-analyzer's published diagnostics carry the
     /// compiler's results for the files as they are now. See
-    /// [`LspClient::rust_check_state`]; `await_workspace_check` also waits
-    /// for the check the server starts on becoming quiescent.
-    pub(crate) fn rust_check_state(
-        &self,
-        server_key: &ServerKey,
-        await_workspace_check: bool,
-    ) -> RustCheckState {
+    /// [`LspClient::rust_check_state`].
+    pub(crate) fn rust_check_state(&self, server_key: &ServerKey) -> RustCheckState {
         self.clients
             .get(server_key)
             .map_or(RustCheckState::Current, |client| {
-                client.rust_check_state(
-                    Instant::now(),
-                    await_workspace_check,
-                    FLYCHECK_PUBLISH_SETTLE,
-                )
+                client.rust_check_state(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
             })
     }
 
-    /// Ask rust-analyzer again for a check that was owed and never began
-    /// (see [`LspClient::rearm_unreported_rust_check`]). Callers do this when
-    /// they start waiting, so each new request gets a fresh deadline rather
-    /// than repeating the last request's unknown answer.
-    pub(crate) fn rearm_unreported_rust_check(
-        &mut self,
-        server_key: &ServerKey,
-        await_workspace_check: bool,
-    ) {
+    /// Ask rust-analyzer again for a check that was expected and did not
+    /// begin by its deadline (see
+    /// [`LspClient::rearm_unreported_rust_check`]). Callers do this when they
+    /// start waiting, so each new request waits for the check with a fresh
+    /// deadline instead of answering "unknown" at once because an earlier
+    /// request's check never began.
+    pub(crate) fn rearm_unreported_rust_check(&mut self, server_key: &ServerKey) {
         let Some(client) = self.clients.get_mut(server_key) else {
             return;
         };
-        if client.rearm_unreported_rust_check(Instant::now(), await_workspace_check) {
+        if client.rearm_unreported_rust_check(Instant::now()) {
             let sent = client.send_notification::<RustAnalyzerRunFlycheck>(
                 serde_json::json!({ "textDocument": null }),
             );

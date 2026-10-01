@@ -444,10 +444,13 @@ fn collect_directory_diagnostics(
 }
 
 /// Wait, until `deadline`, for the given rust-analyzer servers to finish
-/// loading the workspace and then a running or just-requested `cargo check`.
+/// loading the workspace and then a running or expected `cargo check`: one a
+/// save asked for, or the one rust-analyzer starts on becoming quiescent
+/// (until it reports, the published diagnostics lack every compiler error,
+/// and an edit made meanwhile races with it).
 /// While either is under way their published diagnostics describe an older
-/// state of the files. A check a save asked for that did not begin in time
-/// is not waited for but still returned as busy: its results are unknown. The
+/// state of the files. A check that was expected and did not begin in time is
+/// not waited for but still returned as busy: its results are unknown. The
 /// manager lock is held only to drain events and read the state, never across
 /// a sleep. Returns the servers still busy when the wait ended, each with the
 /// reason to report.
@@ -456,14 +459,10 @@ fn wait_for_rust_check(
     servers: &[ServerKey],
     deadline: Instant,
 ) -> Vec<(ServerKey, &'static str)> {
-    // Not the first check after the workspace loads: `lsp_diagnostics` has
-    // never waited for that one. A check that has begun, or that a save asked
-    // for, is awaited.
-    const AWAIT_WORKSPACE_CHECK: bool = false;
     {
         let mut lsp = ctx.lsp();
         for key in servers {
-            lsp.rearm_unreported_rust_check(key, AWAIT_WORKSPACE_CHECK);
+            lsp.rearm_unreported_rust_check(key);
         }
     }
     loop {
@@ -480,7 +479,7 @@ fn wait_for_rust_check(
                     waiting = true;
                     continue;
                 }
-                match lsp.rust_check_state(key, AWAIT_WORKSPACE_CHECK) {
+                match lsp.rust_check_state(key) {
                     RustCheckState::Current => {}
                     state => {
                         busy.push((
