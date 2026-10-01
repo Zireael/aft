@@ -7115,30 +7115,7 @@ async fn handle_tool_call(
             schema_pin: call.schema_pin,
         })
     } else {
-        match serde_json::from_slice::<RouteRequest>(&frame.body) {
-            Ok(request) => request,
-            Err(error) => {
-                let management_envelope = serde_json::from_slice::<Value>(&frame.body).ok();
-                let Some(operation) = management_envelope
-                    .as_ref()
-                    .and_then(|value| value.get("op"))
-                    .and_then(Value::as_str)
-                else {
-                    return Err(SubcError::Json(error));
-                };
-                RouteRequest::ToolCall(ToolCallRequest {
-                    name: operation.to_string(),
-                    arguments: management_envelope
-                        .and_then(|value| value.get("params").cloned())
-                        .unwrap_or_else(|| json!({})),
-                    edit_slot_survives: None,
-                    preview: false,
-                    worker_session: false,
-                    call_key: None,
-                    schema_pin: None,
-                })
-            }
-        }
+        decode_legacy_route_request(envelope)?
     };
     if matches!(
         route_request,
@@ -8267,6 +8244,34 @@ async fn signal_fatal_teardown(
     }
     shutdown.notify_one();
 }
+// Keep the management fallback only when typed legacy decoding fails. Ordinary
+// tool calls move their already-parsed arguments into the request without a clone.
+fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcError> {
+    let management = envelope.get("op").and_then(Value::as_str).map(|op| {
+        (
+            op.to_owned(),
+            envelope.get("params").cloned().unwrap_or_else(|| json!({})),
+        )
+    });
+    match serde_json::from_value::<RouteRequest>(envelope) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            let Some((name, arguments)) = management else {
+                return Err(SubcError::Json(error));
+            };
+            Ok(RouteRequest::ToolCall(ToolCallRequest {
+                name,
+                arguments,
+                edit_slot_survives: None,
+                preview: false,
+                worker_session: false,
+                call_key: None,
+                schema_pin: None,
+            }))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RouteRequest {

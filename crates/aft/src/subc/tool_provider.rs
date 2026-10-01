@@ -341,6 +341,59 @@ mod tests {
     }
 
     #[test]
+    fn admission_requires_session() {
+        let error = admit(&call("status", json!({})), &[], true, "", true, true).unwrap_err();
+        assert_eq!(error.code, errors::INVALID_REQUEST);
+        assert_eq!(error.detail.unwrap()["field"], "session");
+    }
+
+    #[test]
+    fn admission_refuses_arguments_outside_served_schema() {
+        let error = admit(
+            &call("status", json!({"not_served": true})),
+            &[],
+            true,
+            "session",
+            true,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, errors::INVALID_REQUEST);
+        assert_eq!(error.detail.unwrap()["field"], "not_served");
+    }
+
+    #[test]
+    fn admission_disables_companions_regardless_of_task_spelling() {
+        for name in ["bash_status", "bash_kill", "bash_write"] {
+            for arguments in [
+                json!({"task_id":"x"}),
+                json!({"taskId":"x"}),
+                json!({"task_id":"x", "taskId":"x"}),
+            ] {
+                let error = admit(
+                    &call(name, arguments),
+                    &[name.into()],
+                    true,
+                    "session",
+                    true,
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(error.code, errors::TOOL_DISABLED, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn admission_refuses_malformed_schema_pin() {
+        let mut request = call("status", json!({}));
+        request.schema_pin = Some("malformed".into());
+        let error = admit(&request, &[], true, "session", true, true).unwrap_err();
+        assert_eq!(error.code, errors::INVALID_REQUEST);
+        assert_eq!(error.detail.unwrap()["field"], "schema_pin");
+    }
+
+    #[test]
     fn slice_a_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/tool_provider_conformance.json"
@@ -419,6 +472,31 @@ mod tests {
         }
     }
 
+    const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
+
+    #[test]
+    #[ignore = "explicit fixture regeneration, not a verification gate"]
+    fn regenerate_tool_provider_catalog() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tool_provider_catalog.json");
+        let mut fixtures: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for fixture in fixtures.as_array_mut().unwrap() {
+            let disabled: Vec<String> =
+                serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
+            fixture["reply"] = catalog(
+                fixture["request"].clone(),
+                &disabled,
+                fixture["powershell_available"].as_bool().unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn full_catalog_goldens_and_digest_only_have_exact_identity() {
         let fixtures: Value = serde_json::from_str(include_str!(
@@ -434,8 +512,9 @@ mod tests {
             assert!(
                 serde_json::to_vec(&actual).unwrap()
                     == serde_json::to_vec(&fixture["reply"]).unwrap(),
-                "full catalog bytes differ for {}",
-                fixture["name"]
+                "full catalog bytes differ for {}; regenerate with: {}",
+                fixture["name"],
+                REGENERATE_CATALOG
             );
             assert_eq!(actual["generation"], actual["catalog_digest"]);
             let mut digest_request = request;
@@ -675,6 +754,7 @@ mod route_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static ACTIONS: AtomicUsize = AtomicUsize::new(0);
+    static EXCHANGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn exchange(
         body: Value,
@@ -905,7 +985,133 @@ mod route_tests {
     }
 
     #[tokio::test]
+    async fn legacy_provider_calls_are_unsupported_without_actions() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let mut failures = Vec::new();
+        for op in ["tool.call", "tool.withdraw"] {
+            let reply = exchange(
+                json!({"op":op, "name":"status", "arguments":{}}),
+                RouteRole::Legacy,
+                "session",
+                vec![],
+            )
+            .await;
+            let actions = ACTIONS.load(Ordering::SeqCst);
+            if reply.header.ty != FrameType::Error {
+                failures.push(format!(
+                    "{op}: expected Error unsupported_operation, got {:?}; actions={actions}",
+                    reply.header.ty
+                ));
+            } else {
+                let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+                if error.code != "unsupported_operation" || actions != 0 {
+                    failures.push(format!("{op}: code={}, actions={actions}", error.code));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
+
+    #[tokio::test]
+    async fn legacy_route_keeps_ordinary_management_and_opaque_pin_behavior() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        for body in [
+            json!({"name":"status", "arguments":{}}),
+            json!({"name":"status", "arguments":{}, "call_key":"legacy-key", "schema_pin":"opaque-pin"}),
+        ] {
+            let reply = exchange(body, RouteRole::Legacy, "session", vec![]).await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let response: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(response["isError"], false);
+            assert_eq!(response["structuredContent"]["success"], true);
+        }
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 2);
+        let reply = exchange(
+            json!({"op": crate::commands::health_digest::HEALTH_DIGEST_OPERATION, "params":{}}),
+            RouteRole::Legacy,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+    }
+
+    #[test]
+    fn legacy_value_decoding_collapses_duplicate_fields_unlike_base_bytes() {
+        let bytes = br#"{"name":"write","name":"status","arguments":{}}"#;
+        assert!(serde_json::from_slice::<RouteRequest>(bytes).is_err());
+        let envelope: Value = serde_json::from_slice(bytes).unwrap();
+        let RouteRequest::ToolCall(call) = decode_legacy_route_request(envelope).unwrap() else {
+            panic!("expected tool call")
+        };
+        assert_eq!(call.name, "status");
+    }
+
+    #[test]
+    fn legacy_decoding_preserves_base_commit_identity() {
+        // Legacy decoding uses op/params only after the untagged request fails.
+        // A legacy schema_pin is an opaque token, not a parsed v1 schema pin.
+        let health = crate::commands::health_digest::HEALTH_DIGEST_OPERATION;
+        let cases = [
+            (
+                json!({"name":"status","arguments":{"extra":"雪"},"preview":true,"worker_session":true,"edit_slot_survives":true}),
+                "status",
+                json!({"extra":"雪"}),
+                true,
+            ),
+            (
+                json!({"op":health,"params":{"limit":3}}),
+                health,
+                json!({"limit":3}),
+                false,
+            ),
+            (
+                json!({"name":"status","arguments":{},"call_key":"legacy-key","schema_pin":"opaque-pin"}),
+                "status",
+                json!({}),
+                false,
+            ),
+        ];
+        for (body, name, arguments, flags) in cases {
+            let decoded = decode_legacy_route_request(body.clone()).unwrap();
+            let RouteRequest::ToolCall(call) = decoded else {
+                panic!("expected tool call")
+            };
+            assert_eq!(call.name, name);
+            assert_eq!(call.arguments, arguments);
+            assert_eq!(call.preview, flags);
+            assert_eq!(call.worker_session, flags);
+            assert_eq!(call.edit_slot_survives, flags.then_some(true));
+            assert_eq!(
+                call.call_key.as_deref(),
+                body.get("call_key").and_then(Value::as_str)
+            );
+            assert_eq!(
+                call.schema_pin.as_deref(),
+                body.get("schema_pin").and_then(Value::as_str)
+            );
+            if let Ok(base) =
+                serde_json::from_slice::<RouteRequest>(&serde_json::to_vec(&body).unwrap())
+            {
+                assert_eq!(
+                    format!("{base:?}"),
+                    format!("{:?}", RouteRequest::ToolCall(call))
+                );
+            } else {
+                assert_eq!(name, health);
+            }
+        }
+        assert!(matches!(
+            decode_legacy_route_request(json!({"op":"bg_events", "name":"status"})).unwrap(),
+            RouteRequest::BgEvents(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn recognized_operations_and_v1_refusals_never_dispatch_legacy_actions() {
+        let _guard = EXCHANGE_LOCK.lock().await;
         ACTIONS.store(0, Ordering::SeqCst);
         for op in [
             "role.describe",
