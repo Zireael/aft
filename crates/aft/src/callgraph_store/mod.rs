@@ -495,6 +495,81 @@ mod write_amplification_tests {
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
+    /// A store built before the latest resolver change carries the previous
+    /// build-output version in its fingerprint. It must not be served (that
+    /// would keep the old resolutions forever); a cold build replaces it and
+    /// stamps the current fingerprint.
+    #[test]
+    fn store_stamped_with_previous_build_output_version_is_rebuilt_not_reused() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fingerprint-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let source = root.join("src/lib.rs");
+        let dir = root.join(".store");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let published_path =
+            |dir: &Path| resolve_ready_target(dir, &project_key).map(|(path, _generation)| path);
+
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        drop(store);
+        let path = published_path(&dir).expect("control: a current build is published");
+        assert!(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .is_some(),
+            "control: a store with the current fingerprint is served"
+        );
+
+        let previous = schema_fingerprint_for("v10-rust-macro-templates");
+        assert_ne!(previous, schema_fingerprint());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET v = ?1 WHERE k = 'fingerprint'",
+                params![previous],
+            )
+            .unwrap();
+
+        assert!(
+            !db_path_ready(&path),
+            "an old-fingerprint store is not ready"
+        );
+        assert!(
+            published_path(&dir).is_none(),
+            "no ready generation may be resolved from an old-fingerprint store"
+        );
+        assert!(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .is_none(),
+            "readers must not reuse an old-fingerprint store"
+        );
+        assert!(
+            project_dead_code_snapshot(&path).is_err(),
+            "dead-code projection must refuse an old-fingerprint store"
+        );
+
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        drop(store);
+        let rebuilt = published_path(&dir).expect("the rebuild is published");
+        let fingerprint: String = open_readonly_connection(&rebuilt)
+            .unwrap()
+            .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fingerprint, schema_fingerprint());
+    }
+
     #[test]
     fn callgraph_readonly_open_is_retryable_while_legacy_writer_is_locked() {
         let temp = tempdir().unwrap();
@@ -9305,16 +9380,30 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Build-output version folded into the store fingerprint. Bump it whenever
+/// the BUILD OUTPUT changes (new edge sources, broader call extraction, new
+/// resolution rules) even if the table SHAPE is unchanged: a store stamped
+/// with another version is not ready, so every root rebuilds once and picks up
+/// the new edges instead of serving resolutions from an older binary.
+///
+/// - v10: calls inside `macro_rules!` templates are extracted, and
+///   macro-template call and unparsed macro mention refs are stored.
+/// - v11: Rust paths resolve child modules first (`registry::f()` inside
+///   `mod.rs`), use lists bind `{self, ..}` and aliased entries, use paths may
+///   start with a workspace crate or an earlier `use`, imported calls follow
+///   re-exports to the definition, and a file-level function wins over
+///   imports from nested scopes.
+const BUILD_OUTPUT_VERSION: &str = "v11-rust-path-resolution";
+
 fn schema_fingerprint() -> String {
-    // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
-    // edge sources, broader call extraction) even if the table SHAPE is
-    // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // Rust scoped aliases, inline modules, reexports, and turbofish calls now add edges.
-    // Content version v10 (the `raw-ref:v10-...` suffix below): calls inside
-    // `macro_rules!` templates are extracted, and macro-template call and
-    // unparsed macro mention refs are stored.
+    schema_fingerprint_for(BUILD_OUTPUT_VERSION)
+}
+
+fn schema_fingerprint_for(build_output_version: &str) -> String {
+    // Rust scoped aliases, inline modules, reexports, and turbofish calls add
+    // edges since earlier versions; the version string names the latest change.
     let input =
-        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v10-rust-macro-templates");
+        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:{build_output_version}");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 

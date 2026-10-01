@@ -687,6 +687,73 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
 }
 
 #[test]
+fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "import { used } from './lib';\nused();\n",
+    );
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    // A borrow-only root (a worktree) keeps its own inspect store but may only
+    // read, never build, the shared call graph; no main-checkout store exists.
+    ctx.set_cache_writer_capabilities(false, true);
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-borrow-only",
+            "command": "inspect",
+            "sections": ["dead_code", "unused_exports", "duplicates"],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let dead_code = &response["summary"]["dead_code"];
+    assert_eq!(dead_code["unavailable"], true, "{response:#}");
+    assert_eq!(dead_code["complete"], false, "{response:#}");
+    assert!(
+        dead_code.get("count").is_none() && dead_code.get("by_language").is_none(),
+        "an unavailable analysis must carry no count: {response:#}"
+    );
+    assert_eq!(
+        dead_code["gaps"][0]["reason"],
+        "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout",
+        "{response:#}"
+    );
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("dead code: unavailable in this worktree (call graph is borrow-only)"),
+        "the named gap must be rendered: {text}"
+    );
+    assert!(
+        !text.lines().any(|line| line.starts_with("Dead code: ")),
+        "no dead-code count may be rendered: {text}"
+    );
+    assert_eq!(
+        ctx.status_bar_count_values().dead_code,
+        None,
+        "the status bar must not receive a dead-code count"
+    );
+
+    // These analyses need no call graph and are computed locally even in a
+    // borrow-only root, so they do report real numbers.
+    assert_eq!(
+        response["summary"]["unused_exports"]["count"], 1,
+        "{response:#}"
+    );
+    assert!(
+        response["summary"]["duplicates"]["count"].is_u64(),
+        "{response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     let (_temp_dir, root) = fixture_project();
     write_file(

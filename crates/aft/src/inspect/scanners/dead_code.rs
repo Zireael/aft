@@ -713,6 +713,27 @@ pub(crate) fn callgraph_unavailable_aggregate_with_reason(
     aggregate
 }
 
+/// Gap reason for dead code in a borrow-only root.
+pub(crate) const BORROW_ONLY_DEAD_CODE_REASON: &str =
+    "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout";
+
+/// Dead-code aggregate for a borrow-only root with no readable call graph. It
+/// carries no `count`: the analysis did not run, so there is nothing to count,
+/// and a zero would read as "no dead code". It is marked unavailable with a
+/// named gap so every surface reports it as incomplete.
+pub(crate) fn borrow_only_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
+    let mut aggregate = callgraph_unavailable_aggregate_with_reason(scanned_files, None);
+    aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_borrow_only"]);
+    aggregate["callgraph_unavailable_reason"] = json!(BORROW_ONLY_DEAD_CODE_REASON);
+    aggregate["unavailable"] = json!(true);
+    aggregate["complete"] = json!(false);
+    aggregate["gaps"] = json!([{
+        "kind": "tier2_unavailable",
+        "reason": BORROW_ONLY_DEAD_CODE_REASON,
+    }]);
+    aggregate
+}
+
 pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
     project_root: &Path,
     snapshot: &CallgraphSnapshot,

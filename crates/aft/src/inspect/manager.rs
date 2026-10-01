@@ -851,7 +851,7 @@ impl InspectManager {
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
-        if !job.inspect_writer || !job.callgraph_writer {
+        if job_is_borrow_only(job) {
             InspectBuilderState::BuildDenied.as_str().to_string()
         } else {
             self.tier2_builder_state_detail(job.category)
@@ -2481,6 +2481,11 @@ impl InspectManager {
         let phase_started = Instant::now();
         let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
+        let expected_dead_code_files = if job.category == InspectCategory::DeadCode {
+            current_by_relative.keys().cloned().collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         let cached_relative = cached_records
             .iter()
             .map(freshness_record_relative_key)
@@ -2828,30 +2833,63 @@ impl InspectManager {
             }
             phases.snapshot += snapshot_started.elapsed();
         }
-        if options.require_callgraph_snapshot
-            && aggregate_job.category == InspectCategory::DeadCode
+        if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            if let Some(reason) = callgraph_path_identity_gap(job) {
+            if options.require_callgraph_snapshot {
+                if let Some(reason) = callgraph_path_identity_gap(job) {
+                    return Ok(InspectScanSuccess {
+                        scanned_files: scan_files,
+                        contributions: Vec::new(),
+                        aggregate: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
+                            job.scope_files.len(),
+                            Some(&reason),
+                        ),
+                    });
+                }
+            }
+            // A borrow-only root (a worktree reading the main checkout's
+            // stores) may not build a call graph, so retrying cannot help.
+            // Say so by name, with no count, instead of an empty aggregate that
+            // reads as zero dead code or a gap that only says "retry".
+            if job.config.indexes.callgraph && job_is_borrow_only(job) {
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
                     contributions: Vec::new(),
-                    aggregate: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
-                        job.scope_files.len(),
-                        Some(&reason),
-                    ),
+                    aggregate:
+                        crate::inspect::scanners::dead_code::borrow_only_unavailable_aggregate(
+                            job.scope_files.len(),
+                        ),
                 });
             }
-            return Err(format!(
-                "tier2 dead_code aggregate did not complete; builder_state={}",
-                self.builder_state_detail_for_job(job)
-            ));
+            if options.require_callgraph_snapshot {
+                return Err(format!(
+                    "tier2 dead_code aggregate did not complete; builder_state={}",
+                    self.builder_state_detail_for_job(job)
+                ));
+            }
         }
         let rollup_started = Instant::now();
         if crate::executor::current_job_cancelled() {
             return Err("tier2 pass cancelled before rollup".to_string());
         }
         let contributions = load_contributions(cache, &aggregate_job)?;
+        if aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job.callgraph_snapshot.is_some()
+        {
+            // Files scanned while no call graph was ready produce no dead-code
+            // facts. If the graph became ready before this rollup, rolling up
+            // the partial set would report those files' findings as absent (an
+            // empty set reads as zero dead code). Refuse instead; the missing
+            // files have no freshness record, so the next pass rescans them.
+            let missing = dead_code_files_without_facts(&expected_dead_code_files, &contributions);
+            if missing > 0 {
+                return Err(format!(
+                    "tier2 dead_code aggregate did not complete; dead-code facts are missing for {missing} of {} files (scanned before the call graph was ready)",
+                    expected_dead_code_files.len()
+                ));
+            }
+        }
         let aggregate = if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_some()
         {
@@ -4377,6 +4415,29 @@ fn relative_cache_key(project_root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
+}
+
+/// Whether the job runs in a borrow-only root, which may read but never build
+/// the call graph and inspect stores (the same predicate the builder registry
+/// reports as `build_denied (borrow-only)`).
+fn job_is_borrow_only(job: &InspectJob) -> bool {
+    !job.inspect_writer || !job.callgraph_writer
+}
+
+/// How many project files have no dead-code facts among `contributions`.
+fn dead_code_files_without_facts(
+    expected_files: &BTreeSet<String>,
+    contributions: &[FileContribution],
+) -> usize {
+    let covered = contributions
+        .iter()
+        .filter_map(|contribution| contribution.contribution.get("file")?.as_str())
+        .map(|file| file.replace('\\', "/"))
+        .collect::<BTreeSet<_>>();
+    expected_files
+        .iter()
+        .filter(|file| !covered.contains(&file.replace('\\', "/")))
+        .count()
 }
 
 fn load_contributions(
@@ -7589,6 +7650,44 @@ export function bannerUnused() {}
                 .all(|file| !file.ends_with("src/dead.ts")),
             "watcher deletion should be applied to the persisted callgraph store: {:#?}",
             projected.files
+        );
+    }
+
+    /// Dead-code facts gathered while no call graph was ready are empty; a
+    /// rollup over them must be refused, not reported as zero findings.
+    #[test]
+    fn dead_code_fact_coverage_counts_files_without_facts() {
+        let expected = ["src/a.rs", "src/b.rs", "src/c.rs"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let contribution = |file: &str| {
+            FileContribution::new(
+                InspectCategory::DeadCode,
+                PathBuf::from(file),
+                crate::cache_freshness::FileFreshness {
+                    mtime: std::time::SystemTime::UNIX_EPOCH,
+                    size: 0,
+                    content_hash: blake3::hash(b""),
+                },
+                serde_json::json!({ "file": file, "exports": [] }),
+            )
+        };
+        assert_eq!(dead_code_files_without_facts(&expected, &[]), 3);
+        assert_eq!(
+            dead_code_files_without_facts(&expected, &[contribution("src/a.rs")]),
+            2
+        );
+        assert_eq!(
+            dead_code_files_without_facts(
+                &expected,
+                &[
+                    contribution("src/a.rs"),
+                    contribution("src/b.rs"),
+                    contribution("src/c.rs"),
+                ],
+            ),
+            0
         );
     }
 
