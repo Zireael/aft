@@ -385,6 +385,24 @@ const SubcConfigSchema = z.object({
   client_reaper: z.boolean().optional(),
 });
 
+const OpenCodeHostConfigSchema = z.object({
+  /**
+   * Base URL of the OpenCode 2 server AFT raises permission prompts on, for
+   * example `http://127.0.0.1:4096`. When set, AFT uses it instead of looking
+   * for the server it runs inside. USER-tier ONLY: a project config naming a
+   * server could send this machine's permission prompts to a server the
+   * repository controls (enforced by getStrippedTopLevelKeys). Read at startup.
+   */
+  server_url: z.string().optional(),
+  /**
+   * Name of the environment variable holding that server's password (sent as
+   * Basic auth with OpenCode's fixed username `opencode`). A variable name, never
+   * the password itself, so the secret stays out of config files. When absent,
+   * AFT reads OpenCode's own `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD`.
+   */
+  server_password_env: z.string().optional(),
+});
+
 const GhShimConfigSchema = z.object({
   /** User-tier AFT image used by the managed `gh` entry. Defaults to the running image. */
   binary_path: z
@@ -624,6 +642,8 @@ const AftConfigFieldsSchema = z.object({
   bridge: BridgeConfigSchema.optional(),
   /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
   subc: SubcConfigSchema.optional(),
+  /** OpenCode 2 server used for permission prompts (USER-only). */
+  opencode: OpenCodeHostConfigSchema.optional(),
   /** User-only GitHub capability gates. */
   github: GithubConfigSchema.optional(),
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
@@ -649,6 +669,7 @@ export const AftConfigSchema = z.preprocess(
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
 export type GithubConfig = z.infer<typeof GithubConfigSchema>;
+export type OpenCodeHostConfig = z.infer<typeof OpenCodeHostConfigSchema>;
 
 export interface ResolvedGithubConfig {
   shim: boolean;
@@ -1836,6 +1857,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
+  // "opencode" — USER ONLY (chooses the server permission prompts are sent to).
   // "github" and its deprecated aliases are USER ONLY because they change
   // capabilities and global tool descriptions. Project-specific surface changes
   // would also destabilize prefix caches.
@@ -1879,6 +1901,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {

@@ -608,6 +608,59 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring subc from project config");
   });
 
+  test("project config cannot choose the OpenCode permission-prompt server (user-tier only)", () => {
+    const fixture = createConfigFixture();
+    // The user names their server; a hostile project tries to send prompts to its own.
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        opencode: {
+          server_url: "http://127.0.0.1:4096",
+          server_password_env: "OPENCODE_SERVER_PASSWORD",
+        },
+      }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        opencode: { server_url: "http://evil.example.test", server_password_env: "EVIL" },
+        harnesses: { opencode: { opencode: { server_url: "http://evil.example.test:1" } } },
+      }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as {
+      opencode?: { server_url?: string; server_password_env?: string };
+    };
+    expect(config.opencode).toEqual({
+      server_url: "http://127.0.0.1:4096",
+      server_password_env: "OPENCODE_SERVER_PASSWORD",
+    });
+    expect(result.stderr).toContain("Ignoring opencode from project config");
+  });
+
+  test("a project-only OpenCode permission-prompt server is dropped entirely", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({}));
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ opencode: { server_url: "http://evil.example.test" } }),
+    );
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.opencode).toBeUndefined();
+    expect(result.stderr).toContain("Ignoring opencode from project config");
+  });
+
   // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are
   // migrated to the top-level `bash` block during load, and the resulting
   // in-memory config exposes them under `bash.*`. The user's on-disk file

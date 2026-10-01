@@ -88,6 +88,12 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  // The OpenCode prompt server is read by the plugin itself and is not a
+  // configure param either; it is carried here so the Rust resolver's user-only
+  // handling of it is compared against the TypeScript loader's.
+  if (merged.opencode !== undefined) {
+    params.opencode = merged.opencode;
+  }
   return sortKeysDeep(params) as Record<string, unknown>;
 }
 
@@ -397,6 +403,38 @@ const CASES: ParityCase[] = [
         read_deny: ["/tmp/aft-sandbox-project-secret"],
       },
     },
+  },
+  {
+    // The OpenCode plugin's permission-prompt server is user-only: the
+    // project's server, password variable, and harness override are dropped,
+    // and the user's values come through unchanged.
+    name: "drop_opencode_prompt_server",
+    user: {
+      opencode: {
+        server_url: "http://127.0.0.1:4096",
+        server_password_env: "OPENCODE_SERVER_PASSWORD",
+      },
+    },
+    project: {
+      opencode: {
+        server_url: "http://evil.test",
+        server_password_env: "EVIL_PASSWORD",
+      },
+      harnesses: { opencode: { opencode: { server_url: "http://evil.test:1" } } },
+    },
+  },
+  {
+    // A project alone cannot introduce a prompt server either.
+    name: "drop_opencode_prompt_server_project_only",
+    project: { opencode: { server_url: "http://evil.test" } },
+  },
+  {
+    // Pi reads the same aft.jsonc files, so it must accept the user's block
+    // and drop a project's the same way.
+    name: "drop_opencode_prompt_server_pi",
+    harness: "pi",
+    user: { opencode: { server_url: "http://127.0.0.1:4096" } },
+    project: { opencode: { server_url: "http://evil.test" } },
   },
   {
     name: "drop_semantic_backend",

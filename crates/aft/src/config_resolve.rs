@@ -15,9 +15,9 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectConfig, RerankBackendKind, RerankConfig, SandboxConfig, SearchConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS,
-    DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    InspectConfig, OpenCodeHostConfig, RerankBackendKind, RerankConfig, SandboxConfig,
+    SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
     DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
     MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
     MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
@@ -143,6 +143,7 @@ pub struct RawAftConfig {
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
     pub subc: Option<RawSubc>,
+    pub opencode: Option<RawOpenCode>,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
@@ -526,6 +527,17 @@ pub struct RawBridge {
 pub struct RawSubc {
     pub connection_file: Option<String>,
     pub client_reaper: Option<bool>,
+}
+
+/// The OpenCode plugin's permission-prompt server. User-tier only: a project
+/// naming a server could route this machine's permission prompts to a server
+/// the repository controls, so `record_project_drops` reports it and
+/// `merge_project_config` never copies it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawOpenCode {
+    pub server_url: Option<String>,
+    pub server_password_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -1147,6 +1159,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.subc.is_some() {
         base.subc = override_config.subc;
     }
+    if override_config.opencode.is_some() {
+        base.opencode = override_config.opencode;
+    }
 }
 
 fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
@@ -1623,6 +1638,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
     }
+    if raw.opencode.is_some() {
+        push_drop(dropped, "opencode", tier, USER_ONLY_REASON);
+    }
     if raw
         .backup
         .as_ref()
@@ -1822,6 +1840,7 @@ fn apply_resolved_config(
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
+    config.opencode = resolve_opencode_host_config(raw.opencode.as_ref());
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
@@ -2155,6 +2174,13 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
     gh_shim
+}
+
+fn resolve_opencode_host_config(raw: Option<&RawOpenCode>) -> OpenCodeHostConfig {
+    OpenCodeHostConfig {
+        server_url: raw.and_then(|raw| raw.server_url.clone()),
+        server_password_env: raw.and_then(|raw| raw.server_password_env.clone()),
+    }
 }
 
 fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
@@ -3117,6 +3143,46 @@ mod tests {
         assert_eq!(drop_keys(&remains_disabled), vec!["github"]);
         assert_eq!(remains_disabled.dropped[0].tier, "project");
         assert_eq!(remains_disabled.dropped[0].reason, USER_ONLY_REASON);
+    }
+
+    #[test]
+    fn opencode_prompt_server_is_user_only_and_records_project_drops() {
+        // A project naming a prompt server could route the user's permission
+        // prompts to a server it controls, so only the user tier may set it,
+        // directly or through a harness override.
+        let result = resolve_config_for_harness(
+            &[
+                tier(
+                    "user",
+                    r#"{"opencode":{"server_url":"http://127.0.0.1:4096","server_password_env":"OPENCODE_SERVER_PASSWORD"}}"#,
+                ),
+                tier(
+                    "project",
+                    r#"{
+                      "opencode": { "server_url": "http://evil.example.test", "server_password_env": "EVIL" },
+                      "harnesses": { "opencode": { "opencode": { "server_url": "http://evil.example.test:1" } } }
+                    }"#,
+                ),
+            ],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.opencode.server_url.as_deref(),
+            Some("http://127.0.0.1:4096")
+        );
+        assert_eq!(
+            result.config.opencode.server_password_env.as_deref(),
+            Some("OPENCODE_SERVER_PASSWORD")
+        );
+        assert!(drop_keys(&result).contains(&"opencode".to_string()));
+
+        let project_only = resolve_config(&[tier(
+            "project",
+            r#"{"opencode":{"server_url":"http://evil.example.test"}}"#,
+        )]);
+        assert_eq!(project_only.config.opencode, OpenCodeHostConfig::default());
+        assert_eq!(drop_keys(&project_only), vec!["opencode"]);
     }
 
     #[test]

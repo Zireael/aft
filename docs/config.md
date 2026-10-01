@@ -414,6 +414,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "write": false   // Create and edit conversation comments (implies read).
   },
 
+  // User-only. OpenCode 2 server AFT raises permission prompts on. Absent by
+  // default: AFT then finds the server it runs inside. See "OpenCode 2
+  // permission prompts" below.
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "server_password_env": "OPENCODE_SERVER_PASSWORD"  // a variable NAME, never the password
+  },
+
   // Git co-authorship for commits made by AFT-spawned agent children.
   // "off" (default) | "auto" | an explicit "Name <email>" identity.
   // User and project tiers are accepted; normal project-over-user precedence applies.
@@ -469,6 +477,34 @@ Every enabled GitHub resource read fetches live data; a prior read never satisfi
 ```
 
 If no fallback copy exists, the live-fetch error is returned unchanged. Successful structured `gh` mutations invalidate matching fallback copies, and concurrent reads of the same resource share one in-flight live fetch.
+
+## OpenCode 2 permission prompts
+
+When OpenCode 2's permission rules resolve a tool call to "ask" (a `bash` command your rules ask about, an edit outside the project, and so on), AFT raises the prompt through the OpenCode server's HTTP API. It has to find that server first, and it must be the server AFT is running inside: OpenCode 2 loads the AFT plugin into its server process, so the server showing your session is the very process AFT runs in, and that process's ID identifies it.
+
+Without any setting, AFT finds it on its own:
+
+- a service registration (`$XDG_STATE_HOME/opencode/service*.json`) is used only if the process ID recorded in it is the ID of the server process AFT runs in. A TUI's managed background service registers itself too; a plain `opencode serve` running beside it never sends its prompts there;
+- otherwise AFT reads its own process's `opencode serve` flags (`--hostname`, default `127.0.0.1`; `--port`, default `4096` or the next free port after it) and the password OpenCode itself adopted from `OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD`. The username is always `opencode`.
+
+Every candidate is checked once with an authenticated call to `/api/info`, which reports the ID of the process serving it; that must be the server process AFT runs in before any prompt is sent.
+
+Some servers cannot be found this way: `opencode --standalone` runs a private server on a random port and hides its password from plugins, and `opencode serve` started without `OPENCODE_SERVER_PASSWORD` generates a password nobody else can read. Prompts then fail closed (the call is refused, never allowed), and the refusal and the plugin log say why and how to fix it. The fix is either to start OpenCode with `OPENCODE_SERVER_PASSWORD` set, or to name the server explicitly:
+
+```jsonc
+{
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "server_password_env": "OPENCODE_SERVER_PASSWORD"
+  }
+}
+```
+
+`server_url` replaces discovery. `server_password_env` names the environment variable that holds the server's password, never the password itself; when it is absent AFT uses `OPENCODE_PASSWORD`, then `OPENCODE_SERVER_PASSWORD`. Both are read when OpenCode starts.
+
+**OpenChamber and other UIs** that start `opencode serve` for you: set `server_url` to the same host and port you gave the UI (`OPENCODE_HOST` / `OPENCODE_PORT` for OpenChamber), and make sure the server is started with a password AFT can read (for example `OPENCODE_SERVER_PASSWORD` in the environment the UI starts it in).
+
+The `opencode` block is honored only in your user config. A project config that sets it is ignored with a warning, because a repository could otherwise send your permission prompts to a server it controls.
 
 ## Git co-authorship
 

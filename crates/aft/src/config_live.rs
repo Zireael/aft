@@ -832,6 +832,10 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("github.read", github.read);
     later!("github.write", github.write);
     later!("gh_shim.binary_path", gh_shim.binary_path);
+    // The OpenCode plugin reads the server it raises permission prompts on
+    // once, at startup.
+    later!("opencode.server_url", opencode.server_url);
+    later!("opencode.server_password_env", opencode.server_password_env);
     live!("git.co_author", git.co_author);
 
     // `aft_search_registered` is derived from `disabled_tools`, which is
@@ -893,6 +897,7 @@ fn classification_is_exhaustive(config: &Config) {
         worktree: _,
         github,
         gh_shim: _,
+        opencode: _,
         git: _,
         experimental_lsp_ty: _,
         lsp_servers: _,

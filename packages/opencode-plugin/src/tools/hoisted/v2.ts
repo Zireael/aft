@@ -1,5 +1,10 @@
 import { requestPermission, type V2PermissionHostContext } from "../../permissions/v2.js";
-import { createV2PromptChannel, type V2PromptChannel } from "../../permissions/v2-service.js";
+import {
+  createV2PromptChannel,
+  discoverPromptServer,
+  type V2PromptChannel,
+  type V2PromptServerSettings,
+} from "../../permissions/v2-service.js";
 import type { V2ToolConsumers } from "../definitions/v2.js";
 
 export const V2_BUILTIN_REPLACEMENTS = ["read", "edit", "write", "apply_patch"] as const;
@@ -41,4 +46,14 @@ export function hoistedV2ToolConsumers(
     requestPermission: (request, context) =>
       requestPermission(host as V2PermissionHostContext, request, context, prompt),
   };
+}
+
+/**
+ * The prompt channel for a Location, honoring the user's `opencode` setting.
+ *
+ * The setting is the user-tier `opencode` block of the AFT config the Location
+ * booted with; a project config cannot supply it.
+ */
+export function v2PromptChannelFor(settings: V2PromptServerSettings | undefined): V2PromptChannel {
+  return createV2PromptChannel(() => discoverPromptServer(settings));
 }

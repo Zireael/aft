@@ -17,7 +17,7 @@ import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
-import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
+import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
@@ -36,8 +36,10 @@ const defaults = {
   registerRpc: registerAftRpc,
   registerConfigErrorRpc: registerAftConfigErrorRpc,
   registerPromptHook: registerV2PromptDetachHook,
-  toolConsumers: (context) => ({
-    ...hoistedV2ToolConsumers(context),
+  // The prompt server comes from the user-only `opencode` block of the
+  // Location's config; without it AFT finds the server it runs inside.
+  toolConsumers: (context, config) => ({
+    ...hoistedV2ToolConsumers(context, v2PromptChannelFor(config?.opencode)),
     ...createV2RuntimeConsumer(context),
   }),
   acquireBridge,
@@ -77,7 +79,7 @@ async function bootLocation(context, location, dependencies) {
     dependencies,
   );
   const canonicalDirectory = location.project?.canonical ?? directory;
-  const consumers = dependencies.toolConsumers(context);
+  const consumers = dependencies.toolConsumers(context, config);
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);

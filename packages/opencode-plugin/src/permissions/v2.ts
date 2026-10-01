@@ -297,8 +297,8 @@ function promptUnavailableMessage(
   return (
     `The ${JSON.stringify(request.permission)} operation needs interactive approval: this ` +
     `session's permission rules resolve it to "ask" for ${JSON.stringify(resource)}, and AFT ` +
-    `could not reach the OpenCode service to raise a prompt (${observed}). Start OpenCode's ` +
-    "background service and retry, or run it without a prompt by adding " +
+    `could not reach the OpenCode service to raise a prompt (${observed}). Once the server is ` +
+    "reachable, retry; or run it without a prompt by adding " +
     `{"action": ${JSON.stringify(request.permission)}, "resource": ${JSON.stringify(resource)}, ` +
     '"effect": "allow"} to the "permissions" list of the agent or session in your OpenCode config.'
   );

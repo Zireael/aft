@@ -128,6 +128,16 @@ export interface GhShimConfig {
   binary_path?: string;
 }
 
+/**
+ * OpenCode 2 server used for permission prompts. Only the OpenCode plugin reads
+ * it; Pi accepts it because both plugins share the same aft.jsonc files.
+ * USER-tier ONLY: a project could otherwise send prompts to its own server.
+ */
+export interface OpenCodeHostConfig {
+  server_url?: string;
+  server_password_env?: string;
+}
+
 export interface GithubConfig {
   /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
   shim?: boolean;
@@ -456,6 +466,8 @@ export interface AftConfig {
   search?: SearchConfig;
   bridge?: BridgeConfig;
   subc?: SubcConfig;
+  /** OpenCode 2 server used for permission prompts (user-only; read by the OpenCode plugin). */
+  opencode?: OpenCodeHostConfig;
   github?: GithubConfig;
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
   gh_shim?: GhShimConfig;
@@ -837,6 +849,11 @@ const GhShimConfigSchema = z.object({
     .optional(),
 });
 
+const OpenCodeHostConfigSchema = z.object({
+  server_url: z.string().optional(),
+  server_password_env: z.string().optional(),
+});
+
 const GithubConfigSchema = z.object({
   /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
   shim: z.boolean().optional(),
@@ -978,6 +995,7 @@ const AftConfigFieldsSchema = z.object({
   search: SearchConfigSchema.optional(),
   bridge: BridgeConfigSchema.optional(),
   subc: SubcConfigSchema.optional(),
+  opencode: OpenCodeHostConfigSchema.optional(),
   github: GithubConfigSchema.optional(),
   gh_shim: GhShimConfigSchema.optional(),
   git: GitConfigSchema.optional(),
@@ -1894,6 +1912,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
