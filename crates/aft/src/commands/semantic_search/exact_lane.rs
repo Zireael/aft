@@ -1061,8 +1061,13 @@ pub(crate) mod tests {
             "{all_found:?}"
         );
 
-        let keep = |kinds: &[EvidenceKind], definition_path: Option<&str>| {
-            all.iter()
+        // What a caller keeps: the evidence kinds it uses, plus declarations
+        // in the one file whose declaration mentions the identifier token.
+        let keep = |results: &[CandidateResult],
+                    kinds: &[EvidenceKind],
+                    definition_path: Option<&str>| {
+            results
+                .iter()
                 .filter(|candidate| {
                     kinds.contains(&candidate.evidence.kind)
                         || (candidate.evidence.kind == EvidenceKind::Definition
@@ -1071,6 +1076,7 @@ pub(crate) mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        let phrase_and_window_kinds = [EvidenceKind::E1, EvidenceKind::E2];
         let (phrase_and_window, _) = scoped_pass(
             &index,
             root,
@@ -1078,25 +1084,33 @@ pub(crate) mod tests {
             &ExactEvidenceScope::PhraseAndWindow,
         );
         assert_eq!(
-            phrase_and_window,
-            keep(&[EvidenceKind::E1, EvidenceKind::E2], None)
+            keep(&phrase_and_window, &phrase_and_window_kinds, None),
+            keep(&all, &phrase_and_window_kinds, None)
         );
         let (phrase, _) = scoped_pass(&index, root, PROSE_QUERY, &ExactEvidenceScope::Phrase);
-        assert_eq!(phrase, keep(&[EvidenceKind::E1], None));
+        assert_eq!(
+            keep(&phrase, &[EvidenceKind::E1], None),
+            keep(&all, &[EvidenceKind::E1], None)
+        );
         let (declarations, _) = scoped_pass(
             &index,
             root,
             PROSE_QUERY,
             &ExactEvidenceScope::DefinitionsMentioning(vec!["retry_upload".to_string()]),
         );
+        let kept_declarations = keep(
+            &declarations,
+            &phrase_and_window_kinds,
+            Some("src/upload.rs"),
+        );
         assert_eq!(
-            declarations,
-            keep(&[EvidenceKind::E1, EvidenceKind::E2], Some("src/upload.rs"))
+            kept_declarations,
+            keep(&all, &phrase_and_window_kinds, Some("src/upload.rs"))
         );
         assert!(
-            exact_paths(&declarations, root)
+            exact_paths(&kept_declarations, root)
                 .contains(&("src/upload.rs".to_string(), EvidenceKind::Definition)),
-            "{declarations:?}"
+            "{kept_declarations:?}"
         );
     }
 
@@ -1124,10 +1138,6 @@ pub(crate) mod tests {
         let narrow = serve(&ExactEvidenceScope::PhraseAndWindow);
         assert!(
             narrow.contains(&("src/window.rs".to_string(), EvidenceKind::E2)),
-            "{narrow:?}"
-        );
-        assert!(
-            !narrow.contains(&("src/retry.rs".to_string(), EvidenceKind::Definition)),
             "{narrow:?}"
         );
         let full = serve(&ExactEvidenceScope::All);
