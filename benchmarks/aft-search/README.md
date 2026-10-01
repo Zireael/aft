@@ -394,6 +394,13 @@ uv run --with onnxruntime==1.24.4 --with tokenizers==0.22.2 --with numpy \
   python3 capture_split_query_vectors.py --allow-vector-authoring
 ```
 
+Tuning rows added later (920009-920011, concept answers that call the named
+symbol) carry their vectors in `split-tuning-vectors.bin`, bound only by the
+tuning manifest, so the gate's pack and manifest stay byte-identical:
+`capture_split_query_vectors.py --allow-vector-authoring --tuning-only`.
+Set `AFT_SEARCH_SPLIT_TRACE=1` in the engine's environment to record each split
+row's `split_trace` (how every leading result was placed) in the score.
+
 Descriptor suggestion for a change adding benchmark rows and harness support: `slice_class: non_ranking`,
 `kind: harness`, `targeted_mechanism: none`, `fixtures: ["harness-goldens"]`.
 For the subsequent engine implementation change: `slice_class: ranking`, `kind: ranking`,

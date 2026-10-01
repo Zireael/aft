@@ -56,11 +56,16 @@ def main() -> None:
         census(920006, "R4", 7972, "test harness spawns a fake daemon then drops the socket and asserts the module thread result", "run_subc_mode_for_test", original["followup-census:7972"]["answer_key_basis"], include_tests=True),
         census(920007, "R7", 14964, "stale diagnostics", "mark_file_diagnostics_stale|Error", "The retained stale identifier query opens context.rs; the pin's diagnostic invalidation coordination is in that file."),
         census(920008, "R2", 7958, "Shutdown control request handler sequence after receiving shutdown and bounded timeout on each step", "drain_on_shutdown|Result", original["followup-census:7958"]["answer_key_basis"]),
+        # Concept answers that call the named symbol (tuning rows for the
+        # split-query call-graph bridge).
+        row(920009, "R4", "terminate background bash tasks of a project root after its directory disappears, before artifact eviction", "kill_running_tasks_for_root", "crates/aft/src/subc/mod.rs", "At the pin bash_background/registry.rs:3205 defines kill_running_tasks_for_root; subc/mod.rs:1383 calls it when a deleted root is reclaimed, the concept the query describes.", answer_relation="caller"),
+        row(920010, "R4", "drain completions reply returns the pending watch pattern matches for the session", "pending_pattern_matches_for_session", "crates/aft/src/commands/bash_drain_completions.rs", "At the pin bash_background/registry.rs:971 defines pending_pattern_matches_for_session; commands/bash_drain_completions.rs:19 calls it to build the drain reply.", answer_relation="caller"),
+        row(920011, "R4", "health rollup publishes the active build suspensions read from the breaker", "active_suspensions_for_root_at|Error", "crates/aft/src/subc/health.rs", "At the pin build_breaker.rs:403 defines active_suspensions_for_root_at; subc/health.rs:875 calls it in the health rollup and publishes the suspensions.", answer_relation="caller"),
     ]
     for item in tuning:
         item["tuning_only"] = True
     (HERE / "split-tuning-manifest.json").write_bytes(canonical_json({"schema": manifest["schema"], "evidence_sha": manifest["evidence_sha"], "tuning_only": True, "rows": tuning}))
-    print("gate:12 R1=2 R2=2 R3=1 R4=2 R5=2 R6=1 R7=2; tuning:8")
+    print("gate:12 R1=2 R2=2 R3=1 R4=2 R5=2 R6=1 R7=2; tuning:11")
 
 
 if __name__ == "__main__":

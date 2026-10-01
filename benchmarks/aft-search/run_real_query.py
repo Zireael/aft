@@ -478,6 +478,9 @@ def score_manifest_rows(
                 "answer_kind": row["answer_kind"],
                 "split_kind": row["split_kind"],
                 **({"pattern_summary": responses[0].get("pattern_summary"), "summary_text": str(responses[0].get("text", "")).splitlines()[:8]} if split else {}),
+                # Diagnostics only, present when the engine runs with
+                # AFT_SEARCH_SPLIT_TRACE set: what placed each leading result.
+                **({"split_trace": responses[0]["split_trace"]} if split and responses[0].get("split_trace") else {}),
                 "prose_only": {"requests": prose_requests, "ranked_paths": prose_paths, "metrics": prose_metrics},
                 "paired_mrr_delta": metrics["mrr_at_10"] - prose_metrics["mrr_at_10"],
                 **({"semantic_state": "building", "envelope_complete": responses[0].get("complete")} if row.get("semantic_state") == "building" else {}),
