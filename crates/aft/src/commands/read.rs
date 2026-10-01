@@ -305,6 +305,7 @@ impl Drop for ImageDecoderPermit {
     }
 }
 
+#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
 fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,

@@ -198,6 +198,7 @@ impl Counter {
     }
 }
 
+#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
 fn saturating_add(value: &AtomicU64, delta: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(delta))

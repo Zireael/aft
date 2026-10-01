@@ -2514,6 +2514,7 @@ impl App {
         self.active_watchers.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     pub(crate) fn watcher_stopped(&self) {
         self.active_watchers
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -2532,6 +2533,7 @@ impl App {
         self.active_actor_roots.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     pub(crate) fn actor_root_unregistered(&self) {
         self.active_actor_roots
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -4643,6 +4645,7 @@ impl AppContext {
     }
 
     /// Sets when the drain should look at the view disk limits again.
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     pub(crate) fn schedule_view_disk_limits(&self, after: Duration) {
         let next = now_epoch_ms().saturating_add(after.as_millis() as u64);
         // Never re-arms a root whose views were turned off meanwhile.

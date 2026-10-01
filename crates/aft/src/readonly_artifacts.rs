@@ -222,6 +222,7 @@ impl Drop for BackgroundSearchPermit {
     }
 }
 
+#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
 pub(crate) fn open_search_index_background_with_limit(
     project_root: &Path,
     cache_dir: PathBuf,

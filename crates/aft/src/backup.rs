@@ -2223,6 +2223,7 @@ impl BackupStore {
         Some(Ok(loaded_any))
     }
 
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     fn update_counter_from_entries(&self, entries: &[BackupEntry]) {
         if let Some(next_counter) = entries
             .iter()
