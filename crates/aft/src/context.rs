@@ -12236,7 +12236,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn inline_ready_without_published_pointer_settles_and_preserves_pending_paths() {
-        let _env_guard = callgraph_build_wait_ms(2_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -12256,10 +12255,48 @@ mod callgraph_store_for_ops_tests {
         let pointer = ctx
             .callgraph_store_dir()
             .join(format!("{project_key}.current"));
-        let _remove_pointer_guard = install_callgraph_pointer_removal_arm(pointer);
-
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let delayed_start = std::env::var("AFT_TEST_INLINE_READY_BUILD_DELAY_MS")
+            .ok()
+            .map(|value| {
+                let delay = Duration::from_millis(value.parse().expect("build delay milliseconds"));
+                let (reached, release) =
+                    install_callgraph_build_start_gate(ctx.callgraph_project_root().unwrap());
+                (delay, reached, release)
+            });
         assert!(matches!(
-            ctx.callgraph_store_for_ops(),
+            ctx.schedule_callgraph_store_warm(),
+            CallgraphStoreAccess::Building
+        ));
+        if let Some((delay, reached, release)) = delayed_start {
+            reached
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker did not reach delayed build start");
+            std::thread::sleep(delay);
+            release.send(()).expect("release delayed build");
+        }
+        let events = ctx
+            .callgraph_store_rx()
+            .lock()
+            .take()
+            .expect("build receiver");
+        let ready = events
+            .recv_timeout(Duration::from_secs(60))
+            .expect("callgraph build did not publish its completion");
+        assert!(matches!(&ready, CallGraphStoreBuildEvent::Ready { .. }));
+
+        // A query receiving Ready must clear its build receiver even if reopening
+        // the published store fails, without discarding pending watcher paths. Wait
+        // for the build event first so extraction and disk I/O cannot use up the
+        // query's wait window. Remove the pointer before the query so it cannot
+        // return a disk reader without consuming Ready; the event retains the
+        // built store's writer lease until the query drops it.
+        std::fs::remove_file(pointer).expect("remove published pointer");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ready).expect("queue Ready event");
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60)),
             CallgraphStoreAccess::Building
         ));
         assert!(
