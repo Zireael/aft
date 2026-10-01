@@ -2849,9 +2849,9 @@ impl InspectManager {
                 }
             }
             // A borrow-only root (a worktree reading the main checkout's
-            // stores) may not build a call graph, so retrying cannot help.
-            // Say so by name, with no count, instead of an empty aggregate that
-            // reads as zero dead code or a gap that only says "retry".
+            // stores) cannot build the call graph dead code needs, so retrying
+            // cannot help. Return an unavailable result that names this cause
+            // and carries no count, so it is not mistaken for zero dead code.
             if job.config.indexes.callgraph && job_is_borrow_only(job) {
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
@@ -4417,9 +4417,9 @@ fn relative_cache_key(project_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-/// Whether the job runs in a borrow-only root, which may read but never build
-/// the call graph and inspect stores (the same predicate the builder registry
-/// reports as `build_denied (borrow-only)`).
+/// Whether the job runs in a borrow-only root: one that may not write the
+/// inspect store or build the call-graph store (a worktree that reads the main
+/// checkout's stores). Builder state reports this as `build_denied`.
 fn job_is_borrow_only(job: &InspectJob) -> bool {
     !job.inspect_writer || !job.callgraph_writer
 }

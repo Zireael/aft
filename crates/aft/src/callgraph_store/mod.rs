@@ -9386,13 +9386,15 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 /// with another version is not ready, so every root rebuilds once and picks up
 /// the new edges instead of serving resolutions from an older binary.
 ///
-/// - v10: calls inside `macro_rules!` templates are extracted, and
-///   macro-template call and unparsed macro mention refs are stored.
-/// - v11: Rust paths resolve child modules first (`registry::f()` inside
-///   `mod.rs`), use lists bind `{self, ..}` and aliased entries, use paths may
-///   start with a workspace crate or an earlier `use`, imported calls follow
-///   re-exports to the definition, and a file-level function wins over
-///   imports from nested scopes.
+/// - v10: calls written inside `macro_rules!` templates are stored as call
+///   references, and identifiers inside macro bodies that could not be parsed
+///   are stored as mentions.
+/// - v11: more Rust calls resolve to their definition (stored as call edges):
+///   paths resolve child modules first (`registry::f()` inside `mod.rs`), use
+///   lists bind `{self, ..}` and aliased entries, use paths may start with a
+///   workspace crate or an earlier `use`, imported calls follow re-exports to
+///   the definition, and a file-level function wins over imports from nested
+///   scopes. Stores built before v11 hold the old, partly unresolved edges.
 const BUILD_OUTPUT_VERSION: &str = "v11-rust-path-resolution";
 
 fn schema_fingerprint() -> String {
@@ -9400,8 +9402,9 @@ fn schema_fingerprint() -> String {
 }
 
 fn schema_fingerprint_for(build_output_version: &str) -> String {
-    // Rust scoped aliases, inline modules, reexports, and turbofish calls add
-    // edges since earlier versions; the version string names the latest change.
+    // The version string names the latest change to what a build stores; older
+    // changes (scoped aliases, inline modules, re-exports, turbofish calls) are
+    // covered because any change of the string forces a rebuild.
     let input =
         format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:{build_output_version}");
     hash_to_hex(blake3::hash(input.as_bytes()))
