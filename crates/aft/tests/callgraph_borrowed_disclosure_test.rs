@@ -1,12 +1,16 @@
 //! A checkout that borrows another checkout's callgraph must say so whenever
-//! the borrowed graph can differ from its own files.
+//! the borrowed graph can differ from its own files, and must count only the
+//! files that really differ.
 //!
-//! The owner repository is on a commit where `target` is called by
-//! `newCaller`. A linked worktree at the previous commit, where `target` is
-//! called by `oldCaller` and `legacyHelper` still exists, reads the owner's
-//! graph: its answers must be marked incomplete and name both commits. A
-//! linked worktree at the owner's commit with no edits of its own reads a
-//! graph that fits it, so its answers stay unmarked, as do the owner's.
+//! The owner repository moves to a newer commit while it runs, so the shared
+//! search snapshot it wrote at startup no longer describes it; the callgraph
+//! does. A linked worktree at an older commit reads the owner's graph: its
+//! answers are marked incomplete, name both commits and count the files that
+//! differ between the commits. A linked worktree at the owner's commit with no
+//! edits on either side reads a graph that fits it, so its answers stay
+//! unmarked, as do the owner's. Edits in a worktree are counted and located in
+//! that worktree; uncommitted edits in the owner are counted and located in
+//! the borrowed checkout.
 
 #[path = "helpers/mod.rs"]
 mod test_helpers;
@@ -47,8 +51,10 @@ fn write(root: &Path, relative: &str, contents: &str) {
 }
 
 /// Two commits: `old` has `oldCaller` calling `target` and a `legacyHelper`;
-/// `new` replaces the caller with `newCaller` and drops `legacyHelper`.
-/// Returns the repository root and both commit ids.
+/// `new` replaces the caller with `newCaller` and drops `legacyHelper`. Both
+/// carry `util.ts`, which never changes, and a binary file, which the search
+/// index holds without hashing. Returns the repository root and both commit
+/// ids.
 fn repository(parent: &Path) -> (PathBuf, String, String) {
     let root = parent.join("owner");
     std::fs::create_dir_all(&root).unwrap();
@@ -67,6 +73,14 @@ fn repository(parent: &Path) -> (PathBuf, String, String) {
         "src/old_caller.ts",
         "import { target } from './target';\nexport function oldCaller() { return target(); }\n",
     );
+    write(
+        &root,
+        "src/util.ts",
+        "import { target } from './target';\nexport function util() { return 3; }\n",
+    );
+    let blob = root.join("assets/blob.bin");
+    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    std::fs::write(blob, b"\0\x01\x02binary\0").unwrap();
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-qm", "old callers"]);
     let old = git(&root, &["rev-parse", "HEAD"]);
@@ -86,6 +100,31 @@ fn repository(parent: &Path) -> (PathBuf, String, String) {
     git(&root, &["commit", "-qm", "new callers"]);
     let new = git(&root, &["rev-parse", "HEAD"]);
     (root, old, new)
+}
+
+/// Append a function calling `target` to a source file.
+fn append_caller(root: &Path, relative: &str, caller: &str) {
+    let path = root.join(relative);
+    let mut contents = std::fs::read_to_string(&path).unwrap();
+    contents.push_str(&format!(
+        "export function {caller}() {{ return target(); }}\n"
+    ));
+    std::fs::write(path, contents).unwrap();
+}
+
+fn linked_worktree(owner_root: &Path, path: &Path, commit: &str) -> PathBuf {
+    git(
+        owner_root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            path.to_str().unwrap(),
+            commit,
+        ],
+    );
+    std::fs::canonicalize(path).unwrap()
 }
 
 fn request(value: Value) -> RawRequest {
@@ -215,32 +254,57 @@ fn assert_unmarked(response: &Response, who: &str) {
     );
 }
 
+/// Ask until the callers include every name in `expected`, applying watcher
+/// events between attempts so edits on disk reach the graph.
+fn callers_including(ctx: &AppContext, root: &Path, expected: &[&str]) -> Response {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let response = callers(ctx, root, "target");
+        let found = caller_symbols(&response);
+        if response.success && expected.iter().all(|name| found.iter().any(|f| f == name)) {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "callers of target never included {expected:?}: {response:?}"
+        );
+        aft::runtime_drain::drain_watcher_events(ctx);
+        aft::runtime_drain::drain_search_index_events(ctx);
+        aft::runtime_drain::drain_callgraph_store_events(ctx);
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn first_line(response: &Response) -> String {
+    rendered(response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[test]
 fn borrowed_callgraph_answers_disclose_a_checkout_mismatch_and_only_then() {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("storage");
-    let (owner_root, old_commit, new_commit) = repository(temp.path());
+    let (owner_root, old_commit, _) = repository(temp.path());
 
     let owner = configure(&owner_root, &storage);
     let owner_answer = populated_callers(&owner, &owner_root, "target");
     assert_eq!(caller_symbols(&owner_answer), vec!["newCaller".to_string()]);
     assert_unmarked(&owner_answer, "owner");
 
-    // A worktree on the older commit reads the owner's graph, whose callers
-    // and symbols belong to the newer commit.
-    let old_worktree = temp.path().join("old-worktree");
-    git(
-        &owner_root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            old_worktree.to_str().unwrap(),
-            &old_commit,
-        ],
-    );
-    let old_worktree = std::fs::canonicalize(old_worktree).unwrap();
+    // The owner commits while it runs. Its callgraph follows; the shared
+    // search snapshot it wrote at startup does not, so a count taken against
+    // that snapshot would blame every worktree at this commit for the change.
+    append_caller(&owner_root, "src/target.ts", "lateHelper");
+    git(&owner_root, &["commit", "-qam", "late helper"]);
+    let new_commit = git(&owner_root, &["rev-parse", "HEAD"]);
+    callers_including(&owner, &owner_root, &["newCaller", "lateHelper"]);
+
+    // A worktree on the oldest commit reads the owner's graph, whose callers
+    // and symbols belong to the newest commit.
+    let old_worktree = linked_worktree(&owner_root, &temp.path().join("old-worktree"), &old_commit);
     let old = configure(&old_worktree, &storage);
 
     let answer = populated_callers(&old, &old_worktree, "target");
@@ -253,55 +317,96 @@ fn borrowed_callgraph_answers_disclose_a_checkout_mismatch_and_only_then() {
     );
     assert_eq!(borrowed["owner_head"], json!(new_commit));
     assert_eq!(borrowed["checkout_head"], json!(old_commit));
-    let text = rendered(&answer);
-    let first_line = text.lines().next().unwrap_or_default();
+    // Between the commits target.ts changed, old_caller.ts exists only here
+    // and new_caller.ts only in the graph; util.ts and the binary file are
+    // the same in both. Across commits a difference is not attributed to
+    // either checkout's edits, so `edits_in` stays empty.
+    assert_eq!(borrowed["changed_files"], json!(3), "{:#}", answer.data);
+    assert_eq!(borrowed["edits_in"], Value::Null, "{:#}", answer.data);
     assert_eq!(
-        first_line,
+        first_line(&answer),
         format!(
-            "callgraph: borrowed from {} at {}; this checkout is at {} with {}, so callers and line numbers may not match this tree",
+            "callgraph: borrowed from {} at {}; this checkout is at {} with 3 files that differ from the borrowed graph, so callers and line numbers may not match this tree",
             owner_root.display(),
             &new_commit[..7],
             &old_commit[..7],
-            match borrowed["changed_files"].as_u64() {
-                Some(1) => "1 changed file".to_string(),
-                Some(count) => format!("{count} changed files"),
-                None => "an unknown number of changed files".to_string(),
-            }
         ),
-        "rendered: {text}"
+        "rendered: {}",
+        rendered(&answer)
     );
-    // The overlay has compared the owner's snapshot with this checkout:
-    // old_caller.ts and target.ts differ, new_caller.ts is missing here.
-    assert_eq!(borrowed["changed_files"], json!(3), "{:#}", answer.data);
 
     let missing = callers(&old, &old_worktree, "legacyHelper");
     assert!(!missing.success, "legacyHelper resolved: {missing:?}");
     assert_eq!(missing.data["code"], "symbol_not_found");
     let message = missing.data["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("may exist in this checkout but not in the borrowed graph"),
+        message.contains("may exist in this checkout but not in the borrowed graph; use grep or aft_zoom on this checkout to confirm"),
         "not-found message lacks the borrowed-graph hint: {message}"
     );
     assert!(message.contains(&old_commit[..7]) && message.contains(&new_commit[..7]));
     assert!(!message.contains('\n'));
 
-    // A worktree on the owner's commit with no edits of its own reads a graph
-    // that describes it exactly.
-    let same_worktree = temp.path().join("same-worktree");
-    git(
-        &owner_root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "--detach",
-            same_worktree.to_str().unwrap(),
-            &new_commit,
-        ],
-    );
-    let same_worktree = std::fs::canonicalize(same_worktree).unwrap();
+    // A worktree on the owner's commit, with no edits on either side, reads a
+    // graph that describes it exactly.
+    let same_worktree =
+        linked_worktree(&owner_root, &temp.path().join("same-worktree"), &new_commit);
     let same = configure(&same_worktree, &storage);
     let same_answer = populated_callers(&same, &same_worktree, "target");
-    assert_eq!(caller_symbols(&same_answer), vec!["newCaller".to_string()]);
+    let mut same_callers = caller_symbols(&same_answer);
+    same_callers.sort();
+    assert_eq!(same_callers, vec!["lateHelper", "newCaller"]);
     assert_unmarked(&same_answer, "same-commit worktree");
+    let fits = aft::commands::callgraph_borrowed::borrowed_callgraph(&same)
+        .expect("the same-commit worktree borrows the owner's graph");
+    assert_eq!(fits.changed_files, Some(0), "{fits:?}");
+    assert!(!fits.can_differ(), "{fits:?}");
+
+    // Two edits in a worktree on the owner's commit are counted, and placed
+    // in that worktree.
+    let edited_worktree = linked_worktree(
+        &owner_root,
+        &temp.path().join("edited-worktree"),
+        &new_commit,
+    );
+    append_caller(&edited_worktree, "src/util.ts", "worktreeEdit1");
+    append_caller(&edited_worktree, "src/new_caller.ts", "worktreeEdit2");
+    let edited = configure(&edited_worktree, &storage);
+    let edited_answer = populated_callers(&edited, &edited_worktree, "target");
+    let borrowed = &edited_answer.data["borrowed_callgraph"];
+    assert_eq!(
+        borrowed["changed_files"],
+        json!(2),
+        "{:#}",
+        edited_answer.data
+    );
+    assert_eq!(borrowed["edits_in"], json!("this_checkout"));
+    assert!(
+        first_line(&edited_answer).contains(&format!(
+            "this checkout is at {} with 2 files that differ from the borrowed graph (edits in this checkout), so callers",
+            &new_commit[..7]
+        )),
+        "rendered: {}",
+        rendered(&edited_answer)
+    );
+
+    // Three uncommitted edits in the owner reach its graph, so the clean
+    // same-commit worktree now differs from it in exactly those files, and
+    // the edits are placed in the borrowed checkout.
+    append_caller(&owner_root, "src/target.ts", "ownerEdit1");
+    append_caller(&owner_root, "src/new_caller.ts", "ownerEdit2");
+    append_caller(&owner_root, "src/util.ts", "ownerEdit3");
+    let owner_edits = ["ownerEdit1", "ownerEdit2", "ownerEdit3"];
+    callers_including(&owner, &owner_root, &owner_edits);
+    let stale = callers_including(&same, &same_worktree, &owner_edits);
+    assert_eq!(stale.data["complete"], json!(false), "{:#}", stale.data);
+    let borrowed = &stale.data["borrowed_callgraph"];
+    assert_eq!(borrowed["changed_files"], json!(3), "{:#}", stale.data);
+    assert_eq!(borrowed["edits_in"], json!("borrowed_checkout"));
+    assert!(
+        first_line(&stale).contains(
+            "with 3 files that differ from the borrowed graph (edits in the borrowed checkout), so callers"
+        ),
+        "rendered: {}",
+        rendered(&stale)
+    );
 }

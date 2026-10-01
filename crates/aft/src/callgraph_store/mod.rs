@@ -5938,6 +5938,23 @@ impl CallGraphStore {
         indexed_file_count(&conn)
     }
 
+    /// Size and content hash of every stored file, keyed by root-relative
+    /// path with `/` separators: the source snapshot the graph describes.
+    /// Files over the hash size cap, or whose stored hash does not parse,
+    /// carry the zero hash, so only their size is known.
+    pub fn file_identities(&self) -> Result<HashMap<String, (u64, blake3::Hash)>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        Ok(stored_file_identities(&conn)?
+            .into_iter()
+            .map(|(path, (size, hash))| {
+                let hash = hash_from_hex(&hash).unwrap_or_else(cache_freshness::zero_hash);
+                (path, (size, hash))
+            })
+            .collect())
+    }
+
     /// Compare the stored per-file size and content hash with the files on
     /// disk, for when watcher events were lost. At most `max_examined` walked
     /// files are compared; the bound is applied to the walk itself, so a huge
@@ -6591,6 +6608,12 @@ impl ReadonlyCallGraphStore {
 
     pub fn indexed_file_count(&self) -> Result<usize> {
         self.inner.indexed_file_count()
+    }
+
+    /// This reader's stored file identities; see
+    /// [`CallGraphStore::file_identities`].
+    pub fn file_identities(&self) -> Result<HashMap<String, (u64, blake3::Hash)>> {
+        self.inner.file_identities()
     }
 
     /// Compare this reader's stored files with the disk; see

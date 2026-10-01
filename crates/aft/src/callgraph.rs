@@ -3628,6 +3628,19 @@ fn find_alias_original(raw_import: &str, local_name: &str) -> Option<String> {
 // Worktree file discovery
 // ---------------------------------------------------------------------------
 
+/// Directories the callgraph walk always skips, whatever .gitignore says.
+const WALK_EXCLUDED_DIR_NAMES: [&str; 9] = [
+    "node_modules",
+    "target",
+    "venv",
+    ".venv",
+    ".git",
+    "__pycache__",
+    ".tox",
+    "dist",
+    "build",
+];
+
 /// Walk project files respecting .gitignore, excluding common non-source dirs.
 ///
 /// Returns an iterator of file paths for supported source file types.
@@ -3647,11 +3660,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules" | "target" | "venv" | ".venv" | ".git" | "__pycache__"
-                        | ".tox" | "dist" | "build"
-                );
+                return !WALK_EXCLUDED_DIR_NAMES.contains(&name.as_ref());
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         })
@@ -3662,6 +3671,37 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .filter(|entry| detect_language(entry.path()).is_some())
         .map(|entry| entry.into_path())
+}
+
+/// Whether [`walk_project_files`] can yield the file at this root-relative
+/// path (`/` or `\` separators), judged from the path alone: a supported
+/// source type, no hidden component, no always-excluded directory and no OS
+/// metadata file name. Ignore files are not consulted; callers pass paths
+/// that an ignore-respecting walk has already produced.
+pub fn walk_could_include(relative: &str) -> bool {
+    let components: Vec<&str> = relative
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect();
+    let Some((file_name, directories)) = components.split_last() else {
+        return false;
+    };
+    if components
+        .iter()
+        .any(|component| component.starts_with('.'))
+    {
+        return false;
+    }
+    if directories
+        .iter()
+        .any(|directory| WALK_EXCLUDED_DIR_NAMES.contains(directory))
+    {
+        return false;
+    }
+    if crate::os_metadata::is_os_metadata_file_name(std::ffi::OsStr::new(file_name)) {
+        return false;
+    }
+    detect_language(Path::new(file_name)).is_some()
 }
 
 // ---------------------------------------------------------------------------

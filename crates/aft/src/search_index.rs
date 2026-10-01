@@ -2199,32 +2199,24 @@ impl SearchIndex {
         self.git_head.as_deref()
     }
 
-    /// Number of distinct files whose served content no longer comes from the
-    /// loaded snapshot: base files edited or deleted since the load, plus files
-    /// the snapshot never had. For a borrowed snapshot reconciled with this
-    /// checkout (see `reconcile_borrowed_snapshot_with_disk`) this is how many
-    /// files here differ from what the owning checkout indexed. It only reads
-    /// the in-RAM delta, never the disk. Git metadata is not counted: a linked
-    /// worktree's `.git` pointer file is indexed as a file the owner's snapshot
-    /// lacks, yet git never tracks a `.git` path, so it is no content change.
-    pub(crate) fn overlay_changed_file_count(&self) -> usize {
-        // Only the final component is checked: a checkout may itself live
-        // under a directory named `.git`, and its files must still count.
-        let is_git_metadata = |path: &Path| path.file_name().is_some_and(|name| name == ".git");
-        let mut changed: HashSet<&Path> = self
-            .delta
-            .superseded_paths
+    /// Size and content hash of every file the index currently serves, keyed
+    /// by its path relative to the index root with `/` separators. For a
+    /// borrowed snapshot reconciled with this checkout (see
+    /// `reconcile_borrowed_snapshot_with_disk`) and kept current by watcher
+    /// events, these describe this checkout's files without reading the disk.
+    /// Files held unindexed (binary, or over the size limit) carry the zero
+    /// hash: their content was never hashed, so only their size is known.
+    pub(crate) fn live_file_identities(&self) -> HashMap<String, (u64, blake3::Hash)> {
+        self.files
             .iter()
-            .map(PathBuf::as_path)
-            .filter(|path| !is_git_metadata(path))
-            .collect();
-        for entry in self.files.iter().skip(self.base_file_count as usize) {
-            // A removed delta file keeps its slot with an empty path.
-            if !entry.path.as_os_str().is_empty() && !is_git_metadata(&entry.path) {
-                changed.insert(entry.path.as_path());
-            }
-        }
-        changed.len()
+            // A removed file keeps its slot with an empty path.
+            .filter(|entry| !entry.path.as_os_str().is_empty())
+            .filter_map(|entry| {
+                let relative = entry.path.strip_prefix(&self.project_root).ok()?;
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                Some((relative, (entry.size, entry.content_hash)))
+            })
+            .collect()
     }
 
     /// Count source files whose current stat no longer matches this persisted
@@ -8331,48 +8323,52 @@ mod tests {
     }
 
     #[test]
-    fn overlay_changed_file_count_counts_each_edited_deleted_or_added_file_once() {
+    fn live_file_identities_track_edits_deletions_and_additions_by_relative_path() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
-        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(project.join("sub")).expect("create project dir");
         let project = fs::canonicalize(project).expect("canonicalize project");
-        let edited = project.join("edited.txt");
+        let edited = project.join("sub/edited.txt");
         let deleted = project.join("deleted.txt");
-        let kept = project.join("kept.txt");
+        let binary = project.join("blob.bin");
         fs::write(&edited, "abc old").expect("write edited");
         fs::write(&deleted, "abc gone").expect("write deleted");
-        fs::write(&kept, "abc kept").expect("write kept");
+        fs::write(&binary, b"\0\x01\x02binary").expect("write binary");
 
         let mut built = SearchIndex::build(&project);
         let cache_dir = dir.path().join("cache");
         assert!(built.write_to_disk(&cache_dir, None));
         let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base");
-        assert_eq!(index.overlay_changed_file_count(), 0);
+        let identity = |text: &str| {
+            (
+                text.len() as u64,
+                cache_freshness::hash_bytes(text.as_bytes()),
+            )
+        };
+        let live = index.live_file_identities();
+        assert_eq!(live.len(), 3, "{live:?}");
+        assert_eq!(live["sub/edited.txt"], identity("abc old"));
+        assert_eq!(live["deleted.txt"], identity("abc gone"));
+        // A binary file is tracked but never hashed.
+        assert_eq!(live["blob.bin"].1, cache_freshness::zero_hash());
 
         // Editing a file twice supersedes its base entry and then its first
-        // delta entry; it is still one changed file.
+        // delta entry; only the newest content is reported.
         fs::write(&edited, "abc new").expect("edit once");
         index.update_file(&edited);
         fs::write(&edited, "abc newer").expect("edit twice");
         index.update_file(&edited);
-        assert_eq!(index.overlay_changed_file_count(), 1);
-
         fs::remove_file(&deleted).expect("delete file");
         index.remove_file(&deleted);
-        assert_eq!(index.overlay_changed_file_count(), 2);
-
         let added = project.join("added.txt");
         fs::write(&added, "abc added").expect("write added");
         index.update_file(&added);
-        assert_eq!(index.overlay_changed_file_count(), 3);
 
-        // A linked worktree's `.git` pointer file is git metadata, not a
-        // changed file.
-        let pointer = project.join(".git");
-        fs::write(&pointer, "gitdir: /elsewhere/.git/worktrees/linked\n").expect("write .git");
-        index.update_file(&pointer);
-        assert!(index.path_to_id.contains_key(&pointer));
-        assert_eq!(index.overlay_changed_file_count(), 3);
+        let live = index.live_file_identities();
+        assert_eq!(live.len(), 3, "{live:?}");
+        assert_eq!(live["sub/edited.txt"], identity("abc newer"));
+        assert_eq!(live["added.txt"], identity("abc added"));
+        assert!(!live.contains_key("deleted.txt"));
     }
 
     #[test]
