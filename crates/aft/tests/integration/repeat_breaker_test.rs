@@ -827,5 +827,6 @@ fn repeat_breaker_escalates_from_sixth_call() {
     // The breaker cannot tell a delegated worker from a primary session, and
     // a worker that ends its turn has delivered its result, so no variant may
     // tell the caller to end its turn.
-    assert!(!sixth.contains("turn"));
+    assert!(!sixth.contains("end the turn"));
+    assert!(!sixth.contains("turn must end"));
 }

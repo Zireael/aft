@@ -2223,8 +2223,8 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(calls[0].params.wait).toBe(true);
     expect(calls[0].params.timeout).toBeUndefined();
     expect(calls[0].params.worker_session).toBe(true);
-    // The 30-minute default no longer bounds the call, so neither may the
-    // transport: it waits as long as a timer can.
+    // The 30-minute default no longer bounds the call, so the transport
+    // timeout is the longest delay a JavaScript timer supports.
     expect(calls[0].options?.transportTimeoutMs).toBe(LONGEST_TIMER_DELAY_MS);
   });
 

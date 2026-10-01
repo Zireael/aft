@@ -279,8 +279,8 @@ describe("Pi bash wait:true caller role", () => {
     expect(params.wait).toBe(true);
     expect(params.timeout).toBeUndefined();
     expect(params.worker_session).toBe(true);
-    // The 30-minute default no longer bounds the call, so neither may the
-    // transport: it waits as long as a timer can.
+    // The 30-minute default no longer bounds the call, so the transport
+    // timeout is the longest delay a JavaScript timer supports.
     expect(options?.transportTimeoutMs).toBe(LONGEST_TIMER_DELAY_MS);
   });
 

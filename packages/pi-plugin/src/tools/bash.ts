@@ -116,8 +116,8 @@ function orchestratedTransportTimeoutMs(
   foregroundWaitMs: number,
   noHardKill = false,
 ): number {
-  // A command with no hard kill can hold the call for as long as it runs, so
-  // the transport must not time out first.
+  // A command without a hard-kill timeout can hold the call open until it
+  // finishes, so the transport timeout must not expire first.
   if (noHardKill) return LONGEST_TIMER_DELAY_MS;
   const waitBudget =
     blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
@@ -888,7 +888,7 @@ export function registerBashTool(
       if (response.status === "running" && taskId) {
         trackBgTask(resolveSessionId(extCtx), taskId);
         const handoff = (response.output as string | undefined) ?? "";
-        // The engine's hand-off text promises a completion reminder, which a
+        // The engine's background hand-off text promises a completion reminder, which a
         // worker never receives once its turn ends.
         return bashResult(isWorker ? withoutCompletionReminderPromise(handoff) : handoff, {
           task_id: taskId,

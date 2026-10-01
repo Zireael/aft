@@ -23,7 +23,7 @@ pub fn append_repeat_breaker_reminder(
     // drift. Both variants point legitimate waiting toward a background watch
     // instead of treating output churn as progress.
     //
-    // The wording never tells the caller to end its turn. Rust cannot tell a
+    // Neither instruction below tells the caller to end its turn. Rust cannot tell a
     // delegated worker (subagent) from a primary session here, and a worker
     // that ends its turn has delivered its result: it cannot be woken again
     // when the awaited task finishes. Both roles can wait with a watch.

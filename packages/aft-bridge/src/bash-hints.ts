@@ -15,7 +15,7 @@ export type WatchCallerRole = "worker" | "primary";
 /** Sync bash_watch deadline used by a primary session that passes no timeout. */
 export const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS = 30_000;
 
-/** Largest bash_watch timeout either plugin's schema accepts. */
+/** Largest bash_watch timeout accepted by the OpenCode and Pi plugins' tool schemas. */
 export const MAX_WATCH_TIMEOUT_MS = 1_800_000;
 
 /**
@@ -164,8 +164,8 @@ export function watchTimeoutSteer(role: WatchCallerRole, timeoutParam = "timeout
 export const WATCH_UNAVAILABLE_GIVE_UP_MS = 120_000;
 
 /**
- * What a delegated worker is told whenever its task is still running and its
- * watch returned anyway. It cannot be woken after its turn ends, so the only
+ * What a delegated worker is told whenever its watch returned while its task
+ * is still running. A worker cannot be woken after its turn ends, so the only
  * right move is to wait again.
  */
 export const WORKER_KEEP_WAITING =
