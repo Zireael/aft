@@ -42,13 +42,13 @@ const BORROWED_SEMANTIC_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 #[derive(Default)]
-struct BorrowedSearchLoadProbe {
-    starts: std::sync::atomic::AtomicUsize,
-    held: std::sync::atomic::AtomicBool,
+pub(crate) struct BorrowedSearchLoadProbe {
+    pub(crate) starts: std::sync::atomic::AtomicUsize,
+    pub(crate) held: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
-static BORROWED_SEARCH_LOAD_PROBES: std::sync::LazyLock<
+pub(crate) static BORROWED_SEARCH_LOAD_PROBES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<BorrowedSearchLoadProbe>>>,
 > = std::sync::LazyLock::new(Default::default);
 

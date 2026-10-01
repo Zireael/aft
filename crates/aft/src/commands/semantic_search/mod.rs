@@ -6750,6 +6750,80 @@ mod tests {
     }
 
     #[test]
+    fn external_readiness_resamples_degraded_borrowed_load_before_once_lock_freezes_it() {
+        use crate::readonly_artifacts::{
+            with_borrowed_search_load_limits_for_test, BorrowedSearchLoadProbe,
+            BORROWED_SEARCH_LOAD_PROBES,
+        };
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn borrowed_needle() {}\n").unwrap();
+        let mut index = SearchIndex::build(&root);
+        index.write_to_disk(
+            &crate::search_index::resolve_cache_dir(&root, Some(storage.path())),
+            None,
+        );
+        let ctx = test_context(&root);
+        let probe = Arc::new(BorrowedSearchLoadProbe::default());
+        probe.held.store(true, Ordering::SeqCst);
+        BORROWED_SEARCH_LOAD_PROBES
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Arc::clone(&probe));
+        struct ReleaseProbe(PathBuf, Arc<BorrowedSearchLoadProbe>);
+        impl Drop for ReleaseProbe {
+            fn drop(&mut self) {
+                self.1.held.store(false, Ordering::SeqCst);
+                BORROWED_SEARCH_LOAD_PROBES.lock().unwrap().remove(&self.0);
+            }
+        }
+        let _release = ReleaseProbe(root.clone(), Arc::clone(&probe));
+        let initial = with_borrowed_search_load_limits_for_test(100_000, Duration::ZERO, || {
+            ctx.open_borrowed_search_index(&root, Some(storage.path()))
+        });
+        assert!(matches!(initial, ReadOnlyArtifact::Degraded(_)));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while probe.starts.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "borrowed loader did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let source = ExternalReadinessSource::new(&ctx, &root, Some(storage.path()));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                let fresh = with_first_search_index_load_wait_budget_for_test(
+                    Duration::from_secs(2),
+                    || matches!(source.load().search, ReadOnlyArtifact::Fresh(_)),
+                );
+                done_tx.send(fresh).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            // A held loader cannot supply a ready artifact. Admission must keep
+            // waiting rather than memoizing the degraded observation in OnceLock.
+            let premature = done_rx.recv_timeout(Duration::from_millis(100));
+            assert!(matches!(premature, Err(crossbeam_channel::RecvTimeoutError::Timeout)),
+                "OnceLock froze a degraded borrowed observation before the loader was released: {premature:?}");
+            probe.held.store(false, Ordering::SeqCst);
+            assert!(
+                done_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+                "resampling must retain the completed borrowed index"
+            );
+        });
+        assert_eq!(
+            extensions::ReadinessSource::sample(&source).trigram.status,
+            IndexStatus::Ready
+        );
+        assert_eq!(
+            probe.starts.load(Ordering::SeqCst),
+            1,
+            "resampling must reuse the same load"
+        );
+    }
+
+    #[test]
     fn external_readiness_reports_building_before_bounded_borrow() {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
