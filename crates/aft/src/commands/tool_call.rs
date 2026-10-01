@@ -104,6 +104,7 @@ pub fn handle_with_dispatch(
         // A later session that explicitly disables hashline has no configure
         // response, so its first tool call emits that session's one-shot warning.
         report_registration_downgrade,
+        standard_edit_grammar: false,
         // Standalone tool calls use the `disabled_tools` list configure resolved
         // when the session connected (the root config).
         disabled_tools: None,

@@ -207,6 +207,7 @@ mod push;
 mod readiness;
 mod stall_watchdog;
 mod standing;
+mod tool_provider;
 mod wire;
 
 use self::health::{
@@ -1004,6 +1005,7 @@ struct RouteIdentityData {
     project_root: PathBuf,
     harness: String,
     session: String,
+    role: tool_provider::RouteRole,
     trust: BindTrust,
     spawn_principal: AuthenticatedPrincipal,
     consumer_elicitation_capable: bool,
@@ -2808,6 +2810,7 @@ async fn handle_bash_elicitation_reply(
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
+                false,
             );
             return Ok(());
         }
@@ -6193,6 +6196,7 @@ async fn handle_control_request(
                 project_root: PathBuf::from(&bind_project_root),
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
+                role: tool_provider::route_role(None).expect("0.27 binds have no role versions"),
                 trust: bind_trust,
                 spawn_principal: AuthenticatedPrincipal::RouteBind {
                     trust: bind_trust.sandbox_trust(),
@@ -6840,6 +6844,106 @@ fn log_route_bind_rejection(code: &str, message: &str) {
     }
 }
 
+async fn send_provider_error(
+    tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    frame: &Frame,
+    error: subc_protocol::ErrorBody,
+) -> Result<(), SubcError> {
+    let body = serde_json::to_vec(&error).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Error,
+        frame.header.flags,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "v1 refusal").await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_provider_read(
+    tx: &WriterSender,
+    frame: &Frame,
+    identity: RouteIdentity,
+    executor: &Arc<Executor>,
+    active: &ActiveToolCalls,
+    metrics: &Arc<DispatchPathMetrics>,
+    operation: &str,
+    body: Value,
+) -> Result<(), SubcError> {
+    let route = route_key(frame.header.channel, frame.header.epoch);
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+    let flags = frame.header.flags;
+    let operation = operation.to_string();
+    let job_operation = operation.clone();
+    let request_id = format!("subc-{}-{}", route.channel, corr);
+    let job_id = request_id.clone();
+    // No database, index, build, or configuration lookup occurs on this lane.
+    let rx = submit_active_tool_call(
+        executor,
+        active,
+        route,
+        corr,
+        identity.root.clone(),
+        Lane::PureRead,
+        request_id.clone(),
+        RouteDetachPolicy::CancelOnDetach,
+        &operation,
+        RequestFrameMeta { ver, flags },
+        Box::new(move |_| {
+            let result = if job_operation == "role.describe" {
+                Ok(tool_provider::describe())
+            } else {
+                tool_provider::catalog(
+                    body,
+                    &identity.disabled_tools,
+                    crate::bash_background::powershell_available(),
+                )
+            };
+            Response::success(
+                job_id,
+                match result {
+                    Ok(answer) => json!({"answer": answer}),
+                    Err(error) => json!({"error": error}),
+                },
+            )
+        }),
+    );
+    let tx = tx.clone();
+    let metrics = metrics.clone();
+    let active = active.clone();
+    tokio::spawn(async move {
+        let response = await_executor_response(rx, request_id).await;
+        if !claim_active_tool_call(&active, route, corr) {
+            return;
+        }
+        let (ty, body) = if let Some(error) = response.data.get("error") {
+            (FrameType::Error, error.clone())
+        } else if let Some(answer) = response.data.get("answer") {
+            (FrameType::Response, answer.clone())
+        } else {
+            (
+                FrameType::Error,
+                json!({"code": "executor_failure", "message": "provider read did not complete", "detail": response.data}),
+            )
+        };
+        if let Ok(body) = serde_json::to_vec(&body) {
+            if let Ok(frame) =
+                Frame::build_with_version(ver, ty, flags, route.channel, route.epoch, corr, body)
+            {
+                let _ = send_reliable_writer_frame(&tx, &metrics, frame, "v1 read reply").await;
+            }
+        }
+        finish_active_tool_call(&active, route, corr);
+    });
+    Ok(())
+}
+
 /// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
@@ -6914,28 +7018,126 @@ async fn handle_tool_call(
         }
     }
 
-    let route_request = match serde_json::from_slice::<RouteRequest>(&frame.body) {
-        Ok(request) => request,
-        Err(error) => {
-            let management_envelope = serde_json::from_slice::<Value>(&frame.body).ok();
-            let Some(operation) = management_envelope
-                .as_ref()
-                .and_then(|value| value.get("op"))
-                .and_then(Value::as_str)
-            else {
-                return Err(SubcError::Json(error));
+    let envelope = serde_json::from_slice::<Value>(&frame.body).map_err(SubcError::Json)?;
+    let operation = envelope.get("op").and_then(Value::as_str).or_else(|| {
+        envelope
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| tool_provider::recognized_operation(name))
+    });
+    if let Some(operation) =
+        operation.filter(|operation| tool_provider::recognized_operation(operation))
+    {
+        if matches!(operation, "role.describe" | "tool.catalog") {
+            let body = if envelope.get("op").is_some() {
+                let mut body = envelope.clone();
+                body.as_object_mut()
+                    .expect("operation envelope is an object")
+                    .remove("op");
+                body
+            } else {
+                envelope
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}))
             };
-            RouteRequest::ToolCall(ToolCallRequest {
-                name: operation.to_string(),
-                arguments: management_envelope
-                    .and_then(|value| value.get("params").cloned())
-                    .unwrap_or_else(|| json!({})),
-                edit_slot_survives: None,
-                preview: false,
-                worker_session: false,
-                call_key: None,
-                schema_pin: None,
-            })
+            return submit_provider_read(
+                tx,
+                frame,
+                identity,
+                executor,
+                active_tool_calls,
+                metrics,
+                operation,
+                body,
+            )
+            .await;
+        }
+        if operation != "tool.call" || identity.role != tool_provider::RouteRole::ToolProviderV1 {
+            let error = subc_protocol::ErrorBody::new(
+                "unsupported_operation",
+                "operation is not admitted on this route",
+            );
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
+    }
+    let route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+        let call = match serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
+            envelope,
+        ) {
+            Ok(call) => call,
+            Err(error) => {
+                return send_provider_error(
+                    tx,
+                    metrics,
+                    frame,
+                    cortexkit_role_tool_provider::errors::invalid_request(
+                        "arguments",
+                        error.to_string(),
+                    ),
+                )
+                .await
+            }
+        };
+        if let Err(error) = tool_provider::admit(
+            &call,
+            &identity.disabled_tools,
+            crate::bash_background::powershell_available(),
+            &identity.session,
+            identity.scope.is_some(),
+            !matches!(identity.trust, BindTrust::Untrusted),
+        ) {
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
+        let mut arguments = call.arguments;
+        if matches!(call.name.as_str(), "bash" | "powershell") {
+            let args = arguments
+                .as_object_mut()
+                .expect("admission validated arguments");
+            args.insert("foreground_orchestrate".into(), json!(true));
+            args.insert("block_to_completion".into(), json!(true));
+            args.insert(
+                "shell".into(),
+                json!(if call.name == "powershell" {
+                    "powershell"
+                } else {
+                    "bash"
+                }),
+            );
+        }
+        RouteRequest::ToolCall(ToolCallRequest {
+            name: call.name,
+            arguments,
+            edit_slot_survives: None,
+            preview: false,
+            worker_session: false,
+            call_key: call.call_key,
+            schema_pin: call.schema_pin,
+        })
+    } else {
+        match serde_json::from_slice::<RouteRequest>(&frame.body) {
+            Ok(request) => request,
+            Err(error) => {
+                let management_envelope = serde_json::from_slice::<Value>(&frame.body).ok();
+                let Some(operation) = management_envelope
+                    .as_ref()
+                    .and_then(|value| value.get("op"))
+                    .and_then(Value::as_str)
+                else {
+                    return Err(SubcError::Json(error));
+                };
+                RouteRequest::ToolCall(ToolCallRequest {
+                    name: operation.to_string(),
+                    arguments: management_envelope
+                        .and_then(|value| value.get("params").cloned())
+                        .unwrap_or_else(|| json!({})),
+                    edit_slot_survives: None,
+                    preview: false,
+                    worker_session: false,
+                    call_key: None,
+                    schema_pin: None,
+                })
+            }
         }
     };
     if matches!(
@@ -7348,6 +7550,7 @@ async fn handle_tool_call(
             None,
             repeat,
             call.worker_session,
+            identity.role == tool_provider::RouteRole::ToolProviderV1,
         );
         return Ok(());
     }
@@ -7360,7 +7563,8 @@ async fn handle_tool_call(
         diagnostics_on_edit,
         preview: call.preview,
         edit_slot_survives: call.edit_slot_survives,
-        report_registration_downgrade: true,
+        report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
+        standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
         worker_session: call.worker_session,
     };
@@ -9257,6 +9461,7 @@ pub(crate) mod test_support {
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: session_id.to_string(),
+            role: tool_provider::RouteRole::Legacy,
             trust,
             spawn_principal: AuthenticatedPrincipal::RouteBind {
                 trust: trust.sandbox_trust(),
@@ -12708,6 +12913,7 @@ mod tests {
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: "b2-session".to_string(),
+            role: tool_provider::RouteRole::Legacy,
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
@@ -12791,6 +12997,7 @@ mod tests {
             project_root: root.as_path().to_path_buf(),
             harness: "opencode".to_string(),
             session: "ack-latency-session".to_string(),
+            role: tool_provider::RouteRole::Legacy,
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,

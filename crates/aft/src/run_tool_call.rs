@@ -209,6 +209,8 @@ pub struct ToolCallContext {
     /// Whether configure's immediate registration-downgrade warning was discarded
     /// by this transport and must be reported on the first tool call instead.
     pub report_registration_downgrade: bool,
+    /// A v1 route serves the standard edit schema without changing plugin bindings.
+    pub standard_edit_grammar: bool,
     /// The session's `disabled_tools` as resolved when it connected. A subc
     /// route carries its own bind-time list because routes with different
     /// harnesses can share one root context; `None` uses the configure
@@ -334,20 +336,20 @@ pub(crate) fn prepare_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let surface_downgraded = ensure_hashline_registration(
-        app_ctx,
-        &ctx.project_root,
-        session,
-        ctx.edit_slot_survives,
-        ctx.report_registration_downgrade,
-    );
+    let surface_downgraded = !ctx.standard_edit_grammar
+        && ensure_hashline_registration(
+            app_ctx,
+            &ctx.project_root,
+            session,
+            ctx.edit_slot_survives,
+            ctx.report_registration_downgrade,
+        );
     let binding_guard = app_ctx.hashline_bindings().capture(binding_root, session);
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
-        effective_hashline: crate::hashline::integration::effective_for_capture(
-            binding_guard.as_ref(),
-        ),
+        effective_hashline: !ctx.standard_edit_grammar
+            && crate::hashline::integration::effective_for_capture(binding_guard.as_ref()),
     };
     let translated_bare_name = match bare_name {
         // The public tool is registered as `aft_inspect`, while hoisted plugin
@@ -799,6 +801,7 @@ mod tests {
                 preview,
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
+                standard_edit_grammar: false,
                 disabled_tools: None,
                 worker_session: false,
             }

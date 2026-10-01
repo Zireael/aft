@@ -89,6 +89,30 @@ pub fn refusal(
     disabled: &[String],
 ) -> Option<Response> {
     let tool = gating_name(call_name, arguments)?;
+    refusal_for_tool(request_id, call_name, tool, disabled)
+}
+
+/// v1 checks the requested name regardless of task_id/taskId argument spelling.
+/// Legacy plugin task polling may bypass disables; v1 agent calls never do.
+pub(crate) fn refusal_by_name(
+    request_id: &str,
+    call_name: &str,
+    disabled: &[String],
+) -> Option<Response> {
+    refusal_for_tool(
+        request_id,
+        call_name,
+        canonical_tool_name(call_name)?,
+        disabled,
+    )
+}
+
+fn refusal_for_tool(
+    request_id: &str,
+    call_name: &str,
+    tool: &str,
+    disabled: &[String],
+) -> Option<Response> {
     if !disabled.iter().any(|name| name == tool) {
         return None;
     }

@@ -1143,6 +1143,7 @@ mod tests {
                 project_root: root.as_path().to_path_buf(),
                 harness: "opencode".to_string(),
                 session: session.clone(),
+                role: super::super::tool_provider::RouteRole::Legacy,
                 trust: BindTrust::FirstParty,
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,

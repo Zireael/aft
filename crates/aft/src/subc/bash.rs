@@ -158,7 +158,9 @@ async fn observe_deferred_bash_wait(
 /// executor and off the module loop's thread: promotion writes task metadata.
 fn detach_held_bash_in_background(target: drain::BashDetachTarget) {
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
+        if target.server_completion {
+            let _ = target.registry.kill(&target.task_id, &target.session_id);
+        } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
             log::warn!(
                 "subc attach: could not hand bash task {} to the background after answering its call: {error}",
                 target.task_id
@@ -194,6 +196,17 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         );
         let frame = match (reason, routes.get(&route)) {
             (_, None) => None,
+            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
+                Some(build_error_frame(
+                    target.ver,
+                    route.channel,
+                    route.epoch,
+                    corr,
+                    target.flags,
+                    "cancelled",
+                    "server-owned call ended during module drain",
+                )?)
+            }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
                 let response = Response::success(
                     &target.request_id,
@@ -430,6 +443,7 @@ pub(super) fn submit_deferred_bash(
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
+    server_completion: bool,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -593,7 +607,7 @@ pub(super) fn submit_deferred_bash(
                     .and_then(Value::as_str)
                     .unwrap_or("pipes");
                 let is_pty = mode == "pty" || settings.pty;
-                if is_pty || settings.background {
+                if !server_completion && (is_pty || settings.background) {
                     let response = bash_background_launch_response(
                         &request_id_for_spawn,
                         &task_id,
@@ -624,7 +638,7 @@ pub(super) fn submit_deferred_bash(
                 // standalone path (bash_orchestrate) does: without this, a
                 // bash_wait_detach signal finds no active wait and wait:true
                 // blocks through user messages.
-                let detach_on_user_message = settings.wait;
+                let detach_on_user_message = settings.wait && !server_completion;
                 ctx.bash_background()
                     .register_foreground_task(&session_for_spawn, &task_id);
                 if detach_on_user_message {
@@ -733,6 +747,7 @@ pub(super) fn submit_deferred_bash(
                     cancel,
                     claim,
                     repeat,
+                    server_completion,
                 )
                 .await;
             }
@@ -783,6 +798,7 @@ async fn run_deferred_bash_wait(
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
+    server_completion: bool,
 ) {
     let Some(wait_ctx) = executor.actor_context(&root) else {
         send_bash_deferred_completion(
@@ -811,6 +827,7 @@ async fn run_deferred_bash_wait(
             session_id: session_id.clone(),
             wait_mode: detach_on_user_message,
             worker_session,
+            server_completion,
             registry: registry.clone(),
             request_id: request_id.clone(),
             ver,
@@ -845,6 +862,7 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        if server_completion { let _ = registry.kill(&task_id, &session_id); }
                         release_wait_registration(
                             &registry,
                             &session_id,
@@ -889,7 +907,7 @@ async fn run_deferred_bash_wait(
                 // a background task so its request can answer before the drain
                 // deadline. The command keeps running and its completion is
                 // delivered like any promoted task's.
-                let drain_detach_due = cancel.drain.is_active();
+                let drain_detach_due = cancel.drain.is_active() && !server_completion;
                 if !target_finished && !detach_pending && !promotion_due && !drain_detach_due {
                     continue;
                 }
@@ -1432,7 +1450,7 @@ mod grant_path_tests {
         );
         let dispatch = submit.find("dispatch(raw_req, ctx)").unwrap();
         let mode_branch = submit
-            .find("if is_pty || settings.background")
+            .find("if !server_completion && (is_pty || settings.background)")
             .expect("background/PTY branch");
         let foreground_wait = submit
             .find("select_foreground_wait_window_ms")
@@ -1472,6 +1490,73 @@ mod grant_path_tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
+        for (background, pty) in [(false, false), (true, false), (false, true)] {
+            let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");
+            let ctx = super::super::test_support::test_ctx();
+            ctx.update_config(|config| config.foreground_wait_window_ms = 10);
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (completion_tx, mut completion_rx) = mpsc::channel(8);
+            let (touch_tx, _touch_rx) = mpsc::channel(8);
+            let started = Instant::now();
+            submit_deferred_bash(
+                &executor,
+                &completion_tx,
+                &touch_tx,
+                &metrics,
+                running_bash_stub,
+                root.clone(),
+                root.as_path().into(),
+                "v1-session".into(),
+                "v1-shell".into(),
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                1,
+                Flags::new(false, Priority::Interactive, false),
+                PROTOCOL_VERSION,
+                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
+                crate::subc_format::FormatContext::default(),
+                BashWaitCancel {
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                BindTrust::FirstParty,
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "returned before command completion"
+            );
+            let response = completion.response_for_test();
+            assert_ne!(
+                response.data.get("status").and_then(Value::as_str),
+                Some("running")
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), completion_rx.recv())
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1531,6 +1616,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                false,
                 false,
             );
         }
@@ -1661,6 +1747,7 @@ mod grant_path_tests {
             None,
             None,
             None,
+            false,
             false,
         );
 

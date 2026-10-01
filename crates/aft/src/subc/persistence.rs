@@ -35,6 +35,36 @@ impl DatabaseWaits {
         let Ok(body) = serde_json::from_slice::<Value>(&decoded.frame.body) else {
             return Err(decoded);
         };
+        if body
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(tool_provider::recognized_operation)
+            || body
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(tool_provider::recognized_operation)
+        {
+            return Err(decoded);
+        }
+        if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+            let Ok(call) = serde_json::from_value::<
+                cortexkit_role_tool_provider::call::ToolCallRequest,
+            >(body.clone()) else {
+                return Err(decoded);
+            };
+            if tool_provider::admit(
+                &call,
+                &identity.disabled_tools,
+                crate::bash_background::powershell_available(),
+                &identity.session,
+                identity.scope.is_some(),
+                !matches!(identity.trust, BindTrust::Untrusted),
+            )
+            .is_err()
+            {
+                return Err(decoded);
+            }
+        }
         let Some(name) = body
             .get("name")
             .or_else(|| body.get("op"))
