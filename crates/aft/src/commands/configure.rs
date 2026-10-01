@@ -3203,6 +3203,24 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if callgraph_disabled_for_home {
         next_config.indexes.callgraph = false;
     }
+    // With views on, a plain folder of repositories is a parent folder: it is
+    // served from its child repositories' own indexes and, like HOME, builds
+    // none of its own. The planes the user asked for are kept for the parent.
+    if !home_match
+        && next_config.views.enabled
+        && crate::views::parent::prepare(
+            &canonical_cache_root,
+            crate::views::parent::RequestedPlanes {
+                trigram: next_config.indexes.trigram,
+                semantic: next_config.indexes.semantic,
+                callgraph: next_config.indexes.callgraph,
+            },
+        )
+    {
+        next_config.indexes.trigram = false;
+        next_config.indexes.semantic = false;
+        next_config.indexes.callgraph = false;
+    }
 
     let requested_fingerprint =
         configure_fingerprint(&canonical_cache_root, &harness, req.session(), &next_config);
@@ -6867,7 +6885,15 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
-            if ctx.config().views.enabled && !job.home_match {
+            let parent_folder = crate::views::parent::activate(
+                &job.canonical_cache_root,
+                &job.storage_root,
+                &ctx.config().semantic,
+            );
+            if parent_folder {
+                // A parent folder owns no view; its session reads the children's.
+                ctx.clear_view_runtime();
+            } else if ctx.config().views.enabled && !job.home_match {
                 if let Err(error) = open_view_runtime_for_configure(ctx, job) {
                     ctx.clear_view_runtime();
                     slog_warn!("content-addressed view load failed: {}", error);

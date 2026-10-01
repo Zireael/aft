@@ -1,0 +1,1039 @@
+//! Multi-repo parent folders with views on: a session opened in a plain
+//! folder of repositories builds no index of its own and answers grep, glob,
+//! `aft_search`, the call graph tools and inspect from its children's own
+//! published indexes, loaded once and kept warm.
+//!
+//! The fixtures build every child index through the real configure path of a
+//! session bound to that child, then drop that session, so the parent reads
+//! exactly what a child's own sessions leave on disk. The earlier parent
+//! folder attempt failed by loading child indexes inside each call; the tests
+//! below pin the measured failures: per-call loads, children reported stale
+//! when unchanged, stores refused because of SQLite journal files, a large
+//! child's semantic index refused by a size cap, and parent latency far above
+//! a child's.
+
+use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use aft::config::Config;
+use aft::context::AppContext;
+use aft::parser::TreeSitterProvider;
+use aft::protocol::{RawRequest, Response};
+use serde_json::{json, Value};
+
+const DEADLINE: Duration = Duration::from_secs(180);
+const MODEL: &str = "parent-folder-mock";
+const COMMON: &str = "PARENT_FOLDER_COMMON_TOKEN";
+
+fn fast_refresh() {
+    aft::views::parent::set_default_refresh_interval(Duration::from_millis(100));
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+    let output = command.args(args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn write(root: &Path, path: &str, text: &str) {
+    let path = root.join(path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn commit_all(root: &Path, message: &str) {
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", message]);
+}
+
+fn init_repo(root: &Path, files: &[(&str, String)]) {
+    std::fs::create_dir_all(root).unwrap();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "parent@example.test"]);
+    git(root, &["config", "user.name", "Parent Test"]);
+    for (path, text) in files {
+        write(root, path, text);
+    }
+    commit_all(root, "initial");
+}
+
+fn request(value: Value) -> RawRequest {
+    serde_json::from_value(value).unwrap()
+}
+
+fn data(response: Response) -> Value {
+    response.data
+}
+
+/// Deterministic embeddings over HTTP for the semantic tests.
+struct MockEmbedder {
+    base_url: String,
+    addr: SocketAddr,
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockEmbedder {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = Arc::clone(&running);
+        let handle = thread::spawn(move || {
+            while thread_running.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                thread::spawn(move || {
+                    let _ = serve(&mut stream);
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://{addr}"),
+            addr,
+            running,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MockEmbedder {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn vector(text: &str) -> Vec<f32> {
+    blake3::hash(text.as_bytes()).as_bytes()[..8]
+        .iter()
+        .map(|byte| f32::from(*byte) / 255.0 - 0.5)
+        .collect()
+}
+
+fn serve(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut body_start = None;
+    let mut length = 0usize;
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if body_start.is_none() {
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                body_start = Some(end + 4);
+                for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+        if body_start.is_some_and(|start| bytes.len() >= start + length) {
+            break;
+        }
+    }
+    let body = body_start
+        .and_then(|start| bytes.get(start..start + length))
+        .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        .unwrap_or_else(|| json!({ "input": [] }));
+    let inputs = match &body["input"] {
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        Value::String(value) => vec![value.clone()],
+        _ => Vec::new(),
+    };
+    let data = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| json!({ "embedding": vector(input), "index": index }))
+        .collect::<Vec<_>>();
+    let body = json!({ "data": data }).to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+#[derive(Clone, Copy)]
+struct Planes {
+    trigram: bool,
+    callgraph: bool,
+    semantic: bool,
+}
+
+const TRIGRAM_ONLY: Planes = Planes {
+    trigram: true,
+    callgraph: false,
+    semantic: false,
+};
+
+fn config_doc(views: bool, planes: Planes, embedder: Option<&MockEmbedder>) -> Value {
+    let mut doc = json!({
+        "search_index": planes.trigram,
+        "semantic_search": planes.semantic,
+        "callgraph_store": planes.callgraph,
+        "views": { "enabled": views },
+    });
+    if let Some(embedder) = embedder {
+        doc["semantic"] = json!({
+            "backend": "openai_compatible",
+            "model": MODEL,
+            "base_url": embedder.base_url,
+            "timeout_ms": 5_000,
+            "max_batch_size": 64,
+            "max_files": 2_000
+        });
+    }
+    doc
+}
+
+fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    let configured = aft::commands::configure::handle_configure(
+        &request(json!({
+            "id": "configure-parent-folder",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": crate::helpers::user_config(doc),
+        })),
+        &ctx,
+    );
+    assert!(configured.success, "configure failed: {configured:?}");
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    ctx
+}
+
+fn drain(ctx: &AppContext) {
+    aft::runtime_drain::drain_watcher_events(ctx);
+    aft::runtime_drain::drain_search_index_events(ctx);
+    aft::runtime_drain::drain_semantic_index_events(ctx);
+    aft::runtime_drain::drain_semantic_refresh_events(ctx);
+}
+
+fn trigram_artifact(root: &Path, storage: &Path) -> PathBuf {
+    let key = aft::search_index::artifact_cache_key(root);
+    aft::search_index::resolve_cache_dir_with_key(&key, Some(storage)).join("cache.bin")
+}
+
+/// Waits until the child session's trigram index is ready and persisted.
+fn wait_trigram(ctx: &AppContext, root: &Path, storage: &Path) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(ctx);
+        let ready = ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|index| index.ready);
+        if ready && trigram_artifact(root, storage).is_file() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child trigram index never persisted: {}",
+            root.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn callgraph_view(root: &Path, storage: &Path) -> aft::views::ViewStore {
+    aft::views::ViewStore::open(storage, &aft::path_identity::project_scope_key(root)).unwrap()
+}
+
+/// Waits until the child's content-addressed view publishes a generation
+/// other than `previous`.
+fn wait_callgraph_view(
+    ctx: &AppContext,
+    root: &Path,
+    storage: &Path,
+    previous: Option<&str>,
+) -> String {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        drain(ctx);
+        aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
+        if let Some(generation) = callgraph_view(root, storage).current_generation().unwrap() {
+            if Some(generation.as_str()) != previous {
+                return generation;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child call graph view never published: {}",
+            root.display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn grep(ctx: &AppContext, pattern: &str) -> Value {
+    data(aft::commands::grep::handle_grep(
+        &request(json!({
+            "id": "parent-grep",
+            "command": "grep",
+            "pattern": pattern,
+            "max_results": 5_000,
+        })),
+        ctx,
+    ))
+}
+
+fn glob(ctx: &AppContext, pattern: &str) -> Value {
+    data(aft::commands::glob::handle_glob(
+        &request(json!({"id": "parent-glob", "command": "glob", "pattern": pattern})),
+        ctx,
+    ))
+}
+
+/// `(path relative to base, line)` for every grep match.
+fn grep_rows(answer: &Value, base: &Path, prefix: &Path) -> BTreeSet<(String, u64)> {
+    answer["matches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("grep failed: {answer:#}"))
+        .iter()
+        .map(|row| {
+            let file = PathBuf::from(row["file"].as_str().unwrap());
+            let relative = file.strip_prefix(base).unwrap_or(&file).to_path_buf();
+            (
+                prefix.join(relative).to_string_lossy().replace('\\', "/"),
+                row["line"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn glob_rows(answer: &Value, base: &Path, prefix: &Path) -> BTreeSet<String> {
+    answer["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("glob failed: {answer:#}"))
+        .iter()
+        .map(|file| {
+            let file = PathBuf::from(file.as_str().unwrap());
+            let relative = file.strip_prefix(base).unwrap_or(&file).to_path_buf();
+            prefix.join(relative).to_string_lossy().replace('\\', "/")
+        })
+        .collect()
+}
+
+fn gap_kinds(answer: &Value) -> Vec<String> {
+    answer["gaps"]
+        .as_array()
+        .map(|gaps| {
+            gaps.iter()
+                .map(|gap| gap["kind"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn child_files(index: usize) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "src/lib.rs",
+            format!(
+                "pub fn unique_needle_{index}() -> u32 {{\n    {index}\n}}\n\n// {COMMON} in lib {index}\n"
+            ),
+        ),
+        ("src/util.rs", format!("pub fn helper() {{}}\n// {COMMON}\n")),
+        ("notes.txt", format!("notes for repository {index}\n")),
+    ]
+}
+
+struct Folder {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+    storage: PathBuf,
+    children: Vec<PathBuf>,
+}
+
+fn folder(count: usize) -> Folder {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let children = (0..count)
+        .map(|index| root.join(format!("repo-{index:02}")))
+        .collect::<Vec<_>>();
+    for (index, child) in children.iter().enumerate() {
+        init_repo(child, &child_files(index));
+    }
+    // A file directly in the parent folder belongs to no child repository.
+    write(
+        &root,
+        "README.md",
+        &format!("{COMMON} in the parent folder\n"),
+    );
+    Folder {
+        _temp: temp,
+        root,
+        storage,
+        children,
+    }
+}
+
+/// Median of `runs` timings of `query`, in milliseconds.
+fn median_ms(runs: usize, mut query: impl FnMut()) -> f64 {
+    let mut samples = (0..runs)
+        .map(|_| {
+            let started = Instant::now();
+            query();
+            started.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+fn parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
+    let session = aft::views::parent::session_for(ctx).expect("parent session active");
+    assert!(
+        session.wait_rounds(1, DEADLINE),
+        "parent folder never finished its first load"
+    );
+    session
+}
+
+/// 32 repositories: the merged grep and glob answers equal the union of each
+/// child's own answers with the child's folder as path prefix; repeated
+/// queries load nothing; unchanged children are never reported stale; and the
+/// parent's grep latency stays in the same order as one child's.
+#[test]
+fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
+    fast_refresh();
+    let folder = folder(32);
+    let mut expected_grep = BTreeSet::new();
+    let mut expected_glob = BTreeSet::new();
+    let mut child_median = 0.0;
+    let chunks = folder.children.chunks(8).collect::<Vec<_>>();
+    for chunk in chunks {
+        let built = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|child| {
+                    let storage = folder.storage.clone();
+                    let root = folder.root.clone();
+                    scope.spawn(move || {
+                        let ctx = configure(child, &storage, config_doc(true, TRIGRAM_ONLY, None));
+                        wait_trigram(&ctx, child, &storage);
+                        let prefix = child.strip_prefix(&root).unwrap().to_path_buf();
+                        let rows = grep_rows(&grep(&ctx, COMMON), child, &prefix);
+                        let files = glob_rows(&glob(&ctx, "**/*.rs"), child, &prefix);
+                        (ctx, rows, files)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (ctx, rows, files) in built {
+            if child_median == 0.0 {
+                child_median = median_ms(15, || {
+                    grep(&ctx, COMMON);
+                });
+            }
+            expected_grep.extend(rows);
+            expected_glob.extend(files);
+        }
+    }
+    assert_eq!(expected_grep.len(), 64, "every child contributes two lines");
+
+    let parent = configure(
+        &folder.root,
+        &folder.storage,
+        config_doc(true, TRIGRAM_ONLY, None),
+    );
+    let session = parent_session(&parent);
+    assert_eq!(session.children().len(), 32);
+    assert!(session.children().iter().all(|child| child.trigram_ready()));
+
+    let answer = grep(&parent, COMMON);
+    assert_eq!(
+        grep_rows(&answer, &folder.root, Path::new("")),
+        expected_grep,
+        "merged grep must equal the union of the child answers"
+    );
+    // Only the parent's own README is outside every child; no child is named.
+    assert_eq!(gap_kinds(&answer), vec!["outside_child_repositories"]);
+    assert_eq!(answer["complete"], false);
+    assert_eq!(answer["gaps"][0]["path"], "README.md");
+    let globbed = glob(&parent, "**/*.rs");
+    assert_eq!(
+        glob_rows(&globbed, &folder.root, Path::new("")),
+        expected_glob,
+        "merged glob must equal the union of the child answers"
+    );
+
+    let loads = session
+        .children()
+        .iter()
+        .map(|child| child.loads())
+        .collect::<Vec<_>>();
+    let rounds = session.rounds();
+    let parent_median = median_ms(15, || {
+        grep(&parent, COMMON);
+    });
+    // Let at least one refresh round pass: refreshing reconciles in RAM and
+    // must not reload an unchanged child either.
+    assert!(session.wait_rounds(rounds + 2, DEADLINE));
+    let after = session
+        .children()
+        .iter()
+        .map(|child| child.loads())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        loads, after,
+        "queries and refreshes must not reload children"
+    );
+    assert!(loads.iter().all(|count| *count == 1), "{loads:?}");
+    eprintln!(
+        "parent folder grep timing: parent median {parent_median:.2} ms over 32 children, child median {child_median:.2} ms"
+    );
+    assert!(
+        parent_median <= child_median * 32.0 + 100.0,
+        "parent grep {parent_median:.2} ms is not in the order of a child grep {child_median:.2} ms"
+    );
+
+    // The parent wrote no index of its own.
+    assert!(!trigram_artifact(&folder.root, &folder.storage).exists());
+    assert!(!folder
+        .storage
+        .join("views")
+        .join(aft::path_identity::project_scope_key(&folder.root))
+        .exists());
+}
+
+/// Child edits made with no child session running reach the parent through
+/// its in-RAM reconciliation, the child's artifact is never written, and an
+/// unchanged child is answered without any gap.
+#[test]
+fn parent_follows_child_edits_and_never_writes_child_artifacts() {
+    fast_refresh();
+    let folder = folder(3);
+    std::fs::remove_file(folder.root.join("README.md")).unwrap();
+    for child in &folder.children {
+        let ctx = configure(child, &folder.storage, config_doc(true, TRIGRAM_ONLY, None));
+        wait_trigram(&ctx, child, &folder.storage);
+    }
+    let artifact = trigram_artifact(&folder.children[1], &folder.storage);
+    let before = std::fs::read(&artifact).unwrap();
+
+    let parent = configure(
+        &folder.root,
+        &folder.storage,
+        config_doc(true, TRIGRAM_ONLY, None),
+    );
+    let session = parent_session(&parent);
+    let answer = grep(&parent, COMMON);
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    assert!(answer.get("gaps").is_none(), "{answer:#}");
+
+    write(
+        &folder.children[1],
+        "src/fresh.rs",
+        "pub fn fresh() {}\n// FRESH_PARENT_EDIT_NEEDLE\n",
+    );
+    write(
+        &folder.children[1],
+        "src/util.rs",
+        "pub fn helper() {}\n// edited, FRESH_PARENT_EDIT_NEEDLE\n",
+    );
+    let rounds = session.rounds();
+    assert!(session.wait_rounds(rounds + 2, DEADLINE));
+    let answer = grep(&parent, "FRESH_PARENT_EDIT_NEEDLE");
+    assert_eq!(
+        grep_rows(&answer, &folder.root, Path::new("")),
+        BTreeSet::from([
+            ("repo-01/src/fresh.rs".to_string(), 2),
+            ("repo-01/src/util.rs".to_string(), 2),
+        ])
+    );
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    // The edit replaced a line holding the common token.
+    let common = grep_rows(&grep(&parent, COMMON), &folder.root, Path::new(""));
+    assert!(!common.contains(&("repo-01/src/util.rs".to_string(), 2)));
+    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+    assert_eq!(session.children()[1].loads(), 1);
+}
+
+/// The call graph is served from a child's view while the child's SQLite
+/// journal files exist, paths carry the child prefix, a child without a view
+/// and a file outside every child are named gaps, and the generation the
+/// parent serves survives the child's generation sweep.
+#[test]
+fn parent_callgraph_reads_child_views_and_protects_served_generation() {
+    fast_refresh();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    let graph = root.join("graph");
+    let plain = root.join("plain");
+    init_repo(
+        &graph,
+        &[(
+            "src/lib.rs",
+            "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
+                .to_string(),
+        )],
+    );
+    init_repo(&plain, &[("src/lib.rs", "pub fn alone() {}\n".to_string())]);
+    write(&root, "loose.rs", "pub fn loose() {}\n");
+    let with_graph = Planes {
+        trigram: true,
+        callgraph: true,
+        semantic: false,
+    };
+    // The child session stays alive, so its view databases keep their
+    // `-wal`/`-shm` journal files while the parent reads them.
+    let child = configure(&graph, &storage, config_doc(true, with_graph, None));
+    let first = wait_callgraph_view(&child, &graph, &storage, None);
+    // `plain` is never bound to a session, so it has no view at all.
+    let view_dir = callgraph_view(&graph, &storage).view_dir().to_path_buf();
+    // Hold the derived database open in WAL mode, as a live child process
+    // does: SQLite then keeps its `-wal` and `-shm` journal files beside it.
+    let derived = std::fs::read_dir(&view_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("derived") && name.ends_with(".sqlite"))
+        })
+        .expect("published view has a derived database");
+    let holder = rusqlite::Connection::open(&derived).unwrap();
+    let mode: String = holder
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    let _: i64 = holder
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    let journals = std::fs::read_dir(&view_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with("-wal") || name.ends_with("-shm")
+        })
+        .count();
+    assert!(journals > 0, "fixture must leave SQLite journal files");
+
+    let parent = configure(&root, &storage, config_doc(true, with_graph, None));
+    let session = parent_session(&parent);
+    let graph_child = session
+        .children()
+        .iter()
+        .find(|child| child.root == graph)
+        .unwrap()
+        .clone();
+    assert!(
+        graph_child.callgraph_ready(),
+        "journal files must not lock the parent out"
+    );
+    assert_eq!(
+        graph_child.callgraph_generation().as_deref(),
+        Some(first.as_str())
+    );
+
+    let callers = data(
+        aft::views::parent::route(
+            &request(json!({
+                "id": "parent-callers",
+                "command": "callers",
+                "file": "graph/src/lib.rs",
+                "symbol": "target",
+            })),
+            &parent,
+        )
+        .expect("callers is routed for a parent folder"),
+    );
+    let text = callers.to_string();
+    assert!(text.contains("graph/src/lib.rs"), "{callers:#}");
+    assert!(text.contains("caller"), "{callers:#}");
+
+    let missing = aft::views::parent::route(
+        &request(json!({
+            "id": "parent-callers-plain",
+            "command": "callers",
+            "file": "plain/src/lib.rs",
+            "symbol": "alone",
+        })),
+        &parent,
+    )
+    .unwrap();
+    assert!(!missing.success);
+    assert_eq!(missing.data["complete"], false);
+    assert_eq!(missing.data["gaps"][0]["kind"], "parent_child_unavailable");
+    assert_eq!(missing.data["gaps"][0]["path"], "plain");
+    let outside = aft::views::parent::route(
+        &request(json!({
+            "id": "parent-callers-outside",
+            "command": "callers",
+            "file": "loose.rs",
+            "symbol": "loose",
+        })),
+        &parent,
+    )
+    .unwrap();
+    assert_eq!(
+        outside.data["gaps"][0]["kind"],
+        "outside_child_repositories"
+    );
+
+    // Hold the served generation, let the child publish a new one, and sweep
+    // the child's view: the parent's read marker keeps the old generation.
+    session.pause_refresh(true);
+    drop(holder);
+    drop(child);
+    write(
+        &graph,
+        "src/lib.rs",
+        "pub fn target() -> u32 {\n    2\n}\n\npub fn caller() -> u32 {\n    target()\n}\n",
+    );
+    commit_all(&graph, "second");
+    let child = configure(&graph, &storage, config_doc(true, with_graph, None));
+    let second = wait_callgraph_view(&child, &graph, &storage, Some(&first));
+    let manifest = view_dir.join(format!("manifest-{first}.json"));
+    assert!(manifest.is_file());
+    callgraph_view(&graph, &storage)
+        .sweep_generations()
+        .unwrap();
+    assert!(
+        manifest.is_file(),
+        "a generation the parent serves must survive the child's sweep"
+    );
+    // Control: once the parent follows the child, the old generation is no
+    // longer protected and the same sweep collects it.
+    session.pause_refresh(false);
+    let deadline = Instant::now() + DEADLINE;
+    while graph_child.callgraph_generation().as_deref() != Some(second.as_str()) {
+        assert!(Instant::now() < deadline, "parent never followed the child");
+        thread::sleep(Duration::from_millis(20));
+    }
+    callgraph_view(&graph, &storage)
+        .sweep_generations()
+        .unwrap();
+    assert!(!manifest.exists(), "an unprotected old generation is swept");
+    drop(child);
+}
+
+/// `aft_search` merges the children's semantic views by score under the
+/// parent prefix, even when a child also has a legacy semantic artifact larger
+/// than the borrowed reader's size cap: the parent reads the child's
+/// per-checkout view, which has no such cap.
+#[test]
+fn parent_search_merges_child_semantic_views_without_a_size_cap() {
+    fast_refresh();
+    let embedder = MockEmbedder::start();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    init_repo(
+        &alpha,
+        &[(
+            "src/retry.rs",
+            "pub fn retry_with_backoff(attempts: u32) -> u64 {\n    2u64.pow(attempts)\n}\n"
+                .to_string(),
+        )],
+    );
+    init_repo(
+        &beta,
+        &[(
+            "src/cache.rs",
+            "pub struct LruCache {\n    capacity: usize,\n}\n\nimpl LruCache {\n    pub fn evict_oldest(&mut self) -> Option<String> {\n        None\n    }\n}\n"
+                .to_string(),
+        )],
+    );
+    let semantic = Planes {
+        trigram: true,
+        callgraph: false,
+        semantic: true,
+    };
+    // The child sessions stay alive so they fold their fills into published
+    // generations, which is what the parent serves.
+    let mut sessions = Vec::new();
+    for child in [&alpha, &beta] {
+        let ctx = configure(child, &storage, config_doc(true, semantic, Some(&embedder)));
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            drain(&ctx);
+            let filled = ctx.checkout_semantic_runtime().is_some_and(|runtime| {
+                runtime
+                    .search(&vector("probe"), 1, &|_| true)
+                    .is_ok_and(|answer| answer.complete() && !answer.results.is_empty())
+            });
+            if filled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child semantic view never filled"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        sessions.push(ctx);
+    }
+    // A legacy semantic artifact above the borrowed reader's 64 MiB cap. The
+    // file is sparse, so it costs no disk space.
+    let key = aft::search_index::artifact_cache_key(&alpha);
+    let legacy = storage.join("semantic").join(&key).join("semantic.bin");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::File::create(&legacy)
+        .unwrap()
+        .set_len(65 * 1024 * 1024)
+        .unwrap();
+
+    let parent = configure(&root, &storage, config_doc(true, semantic, Some(&embedder)));
+    let session = parent_session(&parent);
+    let deadline = Instant::now() + DEADLINE;
+    while !session
+        .children()
+        .iter()
+        .all(|child| child.semantic_ready())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "children semantic views never loaded"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let search = || {
+        data(
+            aft::views::parent::route(
+                &request(json!({
+                    "id": "parent-search",
+                    "command": "semantic_search",
+                    "query": "retry with exponential backoff",
+                    "top_k": 10,
+                })),
+                &parent,
+            )
+            .unwrap(),
+        )
+    };
+    // Until a child folds its fills into a published generation, the parent
+    // names that child's unreflected files as a gap; it never fills them.
+    let mut answer = search();
+    while answer["complete"] != true {
+        assert!(
+            Instant::now() < deadline,
+            "parent search never became complete: {answer:#}"
+        );
+        for ctx in &sessions {
+            drain(ctx);
+        }
+        thread::sleep(Duration::from_millis(50));
+        answer = search();
+    }
+    let files = answer["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{answer:#}"))
+        .iter()
+        .filter(|row| row["source"] == "semantic")
+        .map(|row| row["file"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(files.contains("alpha/src/retry.rs"), "{answer:#}");
+    assert!(files.contains("beta/src/cache.rs"), "{answer:#}");
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    let scores = answer["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["source"] == "semantic")
+        .map(|row| row["score"].as_f64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        scores.windows(2).all(|pair| pair[0] >= pair[1]),
+        "{scores:?}"
+    );
+}
+
+/// More children than the cap: the first 64 are served and the rest are one
+/// named gap that says how many were skipped. Children with no index yet are
+/// named gaps too, and nothing is built for them.
+#[test]
+fn over_cap_parent_names_skipped_and_unindexed_children() {
+    fast_refresh();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    for index in 0..66 {
+        // Discovery needs only the `.git` marker; these children never built
+        // an index.
+        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+    }
+    let parent = configure(&root, &storage, config_doc(true, TRIGRAM_ONLY, None));
+    let session = parent_session(&parent);
+    assert_eq!(
+        session.children().len(),
+        aft::views::parent::DEFAULT_MAX_CHILD_REPOS
+    );
+    let answer = grep(&parent, "anything");
+    assert_eq!(answer["complete"], false);
+    let gaps = answer["gaps"].as_array().unwrap();
+    let over_cap = gaps
+        .iter()
+        .find(|gap| gap["kind"] == "parent_children_over_cap")
+        .unwrap_or_else(|| panic!("{answer:#}"));
+    assert!(over_cap["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("2 child repositories beyond the 64-repository cap"));
+    assert!(over_cap["reason"].as_str().unwrap().contains("repo-65"));
+    assert_eq!(
+        gaps.iter()
+            .filter(|gap| gap["kind"] == "parent_child_unavailable")
+            .count(),
+        64
+    );
+    // Nothing was built for the children: no trigram artifact anywhere.
+    for index in 0..66 {
+        let child = root.join(format!("repo-{index:02}"));
+        assert!(!trigram_artifact(&child, &storage).exists());
+    }
+}
+
+/// Views stay off by default; with views off a parent folder keeps today's
+/// behaviour and no parent session starts.
+#[test]
+fn views_off_folder_is_not_a_parent_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    init_repo(&root.join("child"), &child_files(0));
+    let ctx = configure(&root, &storage, config_doc(false, TRIGRAM_ONLY, None));
+    assert!(aft::views::parent::session_for(&ctx).is_none());
+    assert!(aft::views::parent::session_for_root(&root).is_none());
+    let answer = grep(&ctx, COMMON);
+    assert!(!gap_kinds(&answer)
+        .iter()
+        .any(|kind| kind.starts_with("parent") || kind == "outside_child_repositories"));
+    assert!(!Config::default().views.enabled);
+}
+
+/// A real process restart: a new `aft` process bound to the parent folder
+/// serves the child from the index the child's own session persisted,
+/// without the child ever being bound in the new process, and without
+/// writing the child's artifact.
+#[test]
+fn parent_folder_survives_a_real_process_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    let child = root.join("child");
+    init_repo(
+        &child,
+        &[(
+            "src/lib.rs",
+            "pub fn restart_needle_fn() {}\n// RESTART_PARENT_NEEDLE\n".to_string(),
+        )],
+    );
+    let configure_request = |root: &Path| {
+        json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        })
+        .to_string()
+    };
+    let grep_request = json!({
+        "id": "grep",
+        "command": "grep",
+        "pattern": "RESTART_PARENT_NEEDLE",
+    })
+    .to_string();
+    let wait_for_match = |aft: &mut crate::helpers::AftProcess| -> Value {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let response = aft.send(&grep_request);
+            let answer = response.clone();
+            let found = answer["matches"]
+                .as_array()
+                .is_some_and(|matches| !matches.is_empty());
+            if found && answer.get("gaps").is_none() {
+                return answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parent never answered: {response:#}"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let mut first = crate::helpers::AftProcess::spawn();
+    let configured = first.send(&configure_request(&child));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let artifact = trigram_artifact(&child, &storage);
+    let deadline = Instant::now() + DEADLINE;
+    while !artifact.is_file() {
+        assert!(Instant::now() < deadline, "child index never persisted");
+        first.send(&grep_request);
+        thread::sleep(Duration::from_millis(100));
+    }
+    let configured = first.send(&configure_request(&root));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let answer = wait_for_match(&mut first);
+    assert!(answer["matches"][0]["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("src/lib.rs"));
+    assert!(first.shutdown().success());
+    let before = std::fs::read(&artifact).unwrap();
+
+    let mut second = crate::helpers::AftProcess::spawn();
+    let configured = second.send(&configure_request(&root));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let answer = wait_for_match(&mut second);
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    assert!(second.shutdown().success());
+    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+}

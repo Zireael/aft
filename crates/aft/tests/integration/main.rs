@@ -115,6 +115,7 @@ mod parser_test;
 mod pascal_test;
 mod per_checkout_6;
 mod per_checkout_7;
+mod per_checkout_9;
 mod per_checkout_callgraph;
 mod per_checkout_first_load;
 mod per_checkout_registry;

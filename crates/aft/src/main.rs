@@ -1204,6 +1204,11 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 
 fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
+    // A parent folder session answers index-backed commands from its child
+    // repositories' own indexes (grep and glob fan out inside their handlers).
+    if let Some(response) = aft::views::parent::route(&req, ctx) {
+        return response;
+    }
     match req.command.as_str() {
         "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
         "version" => Response::success(

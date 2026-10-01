@@ -38,6 +38,8 @@ pub mod callgraph;
 pub mod first_load;
 pub mod intent;
 pub mod live_delta;
+/// Multi-repo parent folders served from their children's views.
+pub mod parent;
 pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;

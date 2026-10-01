@@ -83,6 +83,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     let total_started = Instant::now();
+    let mut parent_gaps = Vec::new();
     let (
         mut files,
         walk_truncated,
@@ -92,7 +93,20 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_has_files,
         scope_probe,
         skipped_foreign_mounts,
-    ) = if search_roots.len() == 1 {
+    ) = if let Some(answer) = crate::views::parent::glob_fan_out(ctx, &search_roots, pattern) {
+        // A parent folder session answers from its child repositories' indexes.
+        parent_gaps = answer.gaps;
+        (
+            answer.files,
+            false,
+            "index",
+            answer.entries_visited,
+            Duration::ZERO,
+            answer.scope_has_files,
+            Duration::ZERO,
+            0,
+        )
+    } else if search_roots.len() == 1 {
         let discovery = glob_root(
             ctx,
             &project_root,
@@ -202,6 +216,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
+    crate::views::parent::attach_gaps(&mut body, parent_gaps);
 
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());

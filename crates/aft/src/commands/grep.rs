@@ -124,8 +124,17 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         path_exclusion: None,
     };
-    let (result, phases) =
-        grep_executor::execute_profiled_with_filters(ctx, &compiled, &scope, &params, &filters);
+    // A parent folder session answers from its child repositories' indexes.
+    let (result, phases, parent_gaps) =
+        match crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters) {
+            Some(answer) => answer,
+            None => {
+                let (result, phases) = grep_executor::execute_profiled_with_filters(
+                    ctx, &compiled, &scope, &params, &filters,
+                );
+                (result, phases, Vec::new())
+            }
+        };
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
     let scope_presence = phases
@@ -233,6 +242,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
+    crate::views::parent::attach_gaps(&mut body, parent_gaps);
 
     if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
         body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();
