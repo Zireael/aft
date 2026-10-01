@@ -4532,13 +4532,22 @@ fn blocking_inspect_names_a_quiescent_rust_producer_before_any_check_begins() {
     .expect("inspect response serializes");
 
     assert_eq!(response["success"], true, "response: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
+    // The request completed, but Rust diagnostics are unknown, so the terminal
+    // is partial (a completed result that names the unknown producer) rather
+    // than fresh.
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert!(
+        response["partial_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("rust")),
+        "{response:#}"
+    );
     let phases = response["wait_stamp"]["phases"]
         .as_array()
         .unwrap_or_else(|| panic!("wait_stamp.phases missing: {response:#}"));
     assert!(
         phases.iter().any(|phase| phase["id"] == "lsp_quiescence"),
-        "quiescence must complete before the fresh terminal: {response:#}"
+        "quiescence must complete before the completed terminal: {response:#}"
     );
     assert!(
         phases
