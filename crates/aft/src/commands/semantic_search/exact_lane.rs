@@ -1121,10 +1121,14 @@ pub(crate) mod tests {
                 .expect("exact search");
             exact_paths(&outcome.results, project.path())
         };
-        let narrow = serve(&ExactEvidenceScope::Phrase);
-        assert_eq!(
-            narrow,
-            vec![("docs/guide.md".to_string(), EvidenceKind::E1)]
+        let narrow = serve(&ExactEvidenceScope::PhraseAndWindow);
+        assert!(
+            narrow.contains(&("src/window.rs".to_string(), EvidenceKind::E2)),
+            "{narrow:?}"
+        );
+        assert!(
+            !narrow.contains(&("src/retry.rs".to_string(), EvidenceKind::Definition)),
+            "{narrow:?}"
         );
         let full = serve(&ExactEvidenceScope::All);
         assert!(
