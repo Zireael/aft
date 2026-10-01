@@ -492,11 +492,44 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 13491,
+      "line": 13703,
       "column": 26,
       "token": "filePath",
       "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
-      "location": "line 13491, column 26",
+      "location": "line 13703, column 26",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 843,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"file.rs\", \"edits\": [{\"oldString\":\"old\", \"newString\":\"new\"}]});",
+      "location": "line 843, column 21",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 1125,
+      "column": 133,
+      "token": "filePath",
+      "text": "let body = json!({\"op\": op, \"params\": if malformed {json!(false)} else {json!({})}, \"name\": \"write\", \"arguments\": {\"filePath\": \"action\", \"content\": \"mutate\"}});",
+      "location": "line 1125, column 133",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 1155,
+      "column": 60,
+      "token": "filePath",
+      "text": "let request = json!({\"name\":\"write\", \"arguments\":{\"filePath\":\"action\",\"content\":\"mutate\",\"foreground_orchestrate\":true}});",
+      "location": "line 1155, column 60",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -1556,6 +1589,13 @@
     },
     {
       "path": "crates/aft/tests/fixtures/subc_parity/translate/zoom_single_symbol_translate/input.json",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
+      "path": "crates/aft/tests/fixtures/tool_provider_catalog.json",
       "token": "filePath",
       "location": "file-level",
       "class": "compatibility-fixture",
