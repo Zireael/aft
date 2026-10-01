@@ -4,10 +4,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "../config.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV } from "../session-kind.js";
 import {
+  applyWorkflowHints,
   buildHintsFromConfig,
   buildWorkflowHints,
   HASHLINE_TAG_SOURCE_HINT,
   registerWorkflowHints,
+  WORKFLOW_HINTS_SECTION,
+  type WorkflowHintsStartEvent,
+  type WorkflowHintsStartResult,
 } from "../workflow-hints.js";
 
 describe("Pi hashline tag-source guidance", () => {
@@ -236,6 +240,108 @@ describe("Pi registerWorkflowHints", () => {
       process.env[MAGIC_CONTEXT_SUBAGENT_ENV] = "1";
       registerWorkflowHints(pi, config, surface);
       expect(handlers).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+      else process.env[MAGIC_CONTEXT_SUBAGENT_ENV] = previous;
+    }
+  });
+});
+
+describe("Pi applyWorkflowHints across hosts", () => {
+  const hints = buildHintsFromConfig({}, new Set()) ?? "";
+
+  test("a host with prompt sections gets a section and no forced prompt", () => {
+    const sections: Record<string, string> = { other_extension: "kept" };
+    const event = {
+      systemPrompt: "rendered prompt",
+      systemPromptOptions: { sections },
+    };
+    expect(applyWorkflowHints(event, hints)).toBeUndefined();
+    expect(WORKFLOW_HINTS_SECTION).toMatch(/^[a-z][a-z0-9_-]*$/);
+    expect(sections).toEqual({ other_extension: "kept", [WORKFLOW_HINTS_SECTION]: hints });
+  });
+
+  test("a run an earlier handler already forced gets the hints appended to the forced text", () => {
+    const sections: Record<string, string> = {};
+    const event = {
+      systemPrompt: "forced by another extension",
+      systemPromptOptions: { sections, forceSystemPrompt: "forced by another extension" },
+    };
+    expect(applyWorkflowHints(event, hints)).toEqual({
+      systemPrompt: `forced by another extension\n\n${hints}`,
+    });
+    expect(sections[WORKFLOW_HINTS_SECTION]).toBe(hints);
+  });
+
+  test("an array prompt keeps every block and gains the hints as its last block", () => {
+    const blocks = ["first block, with a comma", "second block"];
+    const result = applyWorkflowHints({ systemPrompt: blocks }, hints);
+    expect(result).toEqual({ systemPrompt: [...blocks, hints] });
+    const returned = result?.systemPrompt as string[];
+    // No block may hold a comma-joined copy of the blocks, which is what
+    // interpolating the array into a template string produces.
+    expect(returned.some((block) => block.includes(blocks.join(",")))).toBe(false);
+    expect(blocks).toEqual(["first block, with a comma", "second block"]);
+  });
+
+  test("a string prompt without sections is appended to as before", () => {
+    expect(applyWorkflowHints({ systemPrompt: "existing prompt" }, hints)).toEqual({
+      systemPrompt: `existing prompt\n\n${hints}`,
+    });
+  });
+
+  test("older Pi options without sections are left untouched", () => {
+    const systemPromptOptions = {
+      cwd: "/project",
+    } as WorkflowHintsStartEvent["systemPromptOptions"];
+    expect(
+      applyWorkflowHints({ systemPrompt: "existing prompt", systemPromptOptions }, hints),
+    ).toEqual({ systemPrompt: `existing prompt\n\n${hints}` });
+    expect(systemPromptOptions).toEqual({ cwd: "/project" } as typeof systemPromptOptions);
+  });
+
+  test("the registered handler writes byte-identical section text on every run", () => {
+    const previous = process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+    const handlers: Array<(event: WorkflowHintsStartEvent) => WorkflowHintsStartResult> = [];
+    const pi = {
+      on: (
+        _event: string,
+        handler: (event: WorkflowHintsStartEvent) => WorkflowHintsStartResult,
+      ) => {
+        handlers.push(handler);
+      },
+    } as unknown as ExtensionAPI;
+    try {
+      delete process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
+      registerWorkflowHints(
+        pi,
+        {},
+        {
+          outline: true,
+          zoom: true,
+          semantic: true,
+          navigate: true,
+          inspect: true,
+          hoistGrep: true,
+          hoistBash: true,
+          hoistEdit: true,
+          hoistRead: true,
+          bashStatus: true,
+          bashWatch: true,
+          bashWrite: true,
+        },
+      );
+      // Pi hands each run a fresh copy of the sections.
+      const runs = [0, 1, 2].map(() => {
+        const sections: Record<string, string> = {};
+        expect(
+          handlers[0]?.({ systemPrompt: "", systemPromptOptions: { sections } }),
+        ).toBeUndefined();
+        return sections[WORKFLOW_HINTS_SECTION];
+      });
+      expect(runs[0]).toBe(hints);
+      expect(runs[1]).toBe(runs[0]);
+      expect(runs[2]).toBe(runs[0]);
     } finally {
       if (previous === undefined) delete process.env[MAGIC_CONTEXT_SUBAGENT_ENV];
       else process.env[MAGIC_CONTEXT_SUBAGENT_ENV] = previous;

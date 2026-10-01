@@ -212,12 +212,81 @@ interface ToolSurfaceFlags {
 }
 
 /**
+ * Name of the prompt section that carries the hints on hosts with structured
+ * system prompt sections. Pi renders it as
+ * `<aft_workflow_hints>\n…\n</aft_workflow_hints>` and requires names to match
+ * `^[a-z][a-z0-9_-]*$`.
+ */
+export const WORKFLOW_HINTS_SECTION = "aft_workflow_hints";
+
+/**
+ * The parts of a `before_agent_start` event the hints handler reads, across
+ * the hosts the plugin runs on:
+ * - upstream Pi 0.86.0 and later expose `systemPromptOptions.sections`, a
+ *   per-run copy that handlers may mutate, and `forceSystemPrompt`, which is
+ *   set once any handler has returned `systemPrompt` for this run;
+ * - older upstream Pi passes `systemPromptOptions` without `sections` (and it
+ *   is the session's base options object, so it must not be mutated);
+ * - oh-my-pi (OMP) passes `systemPrompt` as an array with one entry per
+ *   provider system block and has no `systemPromptOptions`.
+ */
+export interface WorkflowHintsStartEvent {
+  systemPrompt: string | readonly string[];
+  systemPromptOptions?: {
+    sections?: Record<string, string>;
+    forceSystemPrompt?: string;
+  };
+}
+
+export type WorkflowHintsStartResult = { systemPrompt: string | string[] } | undefined;
+
+/**
+ * Add the hints block to one `before_agent_start` run.
+ *
+ * Where the host has prompt sections, the block goes into its own section and
+ * nothing is returned. Returning `systemPrompt` would force the whole prompt
+ * for the run: Pi then sends one collapsed system message and drops the
+ * transcript-backed mid-conversation tool and prompt changes, so every later
+ * tool activation rewrites the whole prompt cache. As a section, the block is
+ * diffed like any other part of the prompt and, being identical on every run,
+ * is sent once and stays in the cached prefix.
+ *
+ * Hosts without sections only accept a returned replacement prompt, so the
+ * block is appended to the prompt they passed in: as a new last entry when the
+ * prompt is an array of system blocks (OMP), keeping the existing blocks
+ * intact, or after a blank line when it is a single string (older Pi).
+ */
+export function applyWorkflowHints(
+  event: WorkflowHintsStartEvent,
+  hintsBlock: string,
+): WorkflowHintsStartResult {
+  const options = event.systemPromptOptions;
+  const sections = options?.sections;
+  if (sections !== null && typeof sections === "object") {
+    sections[WORKFLOW_HINTS_SECTION] = hintsBlock;
+    // An earlier handler already forced this run's prompt, and Pi sends forced
+    // text exactly as given, so the section above would not reach the model.
+    // Append to the forced text instead; the run is forced either way, so this
+    // costs nothing extra. Keeping the section set as well means the recorded
+    // transcript sections do not change between forced and unforced runs.
+    if (options?.forceSystemPrompt !== undefined) {
+      return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
+    }
+    return undefined;
+  }
+  if (Array.isArray(event.systemPrompt)) {
+    return { systemPrompt: [...event.systemPrompt, hintsBlock] };
+  }
+  return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
+}
+
+/**
  * Register the workflow-hints extension on Pi via `before_agent_start`.
  *
- * Pi assembles a fresh system prompt for every turn, then fires
- * `before_agent_start` with the assembled prompt. Our handler appends the
- * AFT workflow hints block to that prompt. If multiple extensions return a
- * `systemPrompt`, Pi chains them — so we always append (never replace).
+ * Pi fires `before_agent_start` once per user prompt with the prompt it
+ * assembled; {@link applyWorkflowHints} adds the hints block to it without
+ * dropping other extensions' contributions. The block is built once here, so
+ * it is byte-identical on every run of the session.
  * Magic Context's short-lived Pi children don't need these workflow hints.
  */
 export function registerWorkflowHints(
@@ -246,15 +315,12 @@ export function registerWorkflowHints(
 
   log(`Workflow hints injected (${hintsBlock.length} chars)`);
 
-  // Pi's `before_agent_start` handler can return `systemPrompt` to chain
-  // an additional system prompt onto the assembled one. We always APPEND
-  // — never overwrite — so other extensions' prompt contributions survive.
+  // The installed Pi typings predate prompt sections and OMP's array prompt,
+  // so the handler is registered against the cross-host event shape.
   (
     pi.on as (
       event: "before_agent_start",
-      handler: (event: { systemPrompt: string }) => unknown,
+      handler: (event: WorkflowHintsStartEvent) => WorkflowHintsStartResult,
     ) => void
-  )("before_agent_start", (event) => {
-    return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
-  });
+  )("before_agent_start", (event) => applyWorkflowHints(event, hintsBlock));
 }
