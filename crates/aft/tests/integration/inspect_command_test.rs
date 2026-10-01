@@ -703,6 +703,10 @@ fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
     // A borrow-only root (a worktree) keeps its own inspect store but may only
     // read, never build, the shared call graph; no main-checkout store exists.
     ctx.set_cache_writer_capabilities(false, true);
+    // An earlier count (from before the root became borrow-only) must not
+    // survive as if it were current.
+    ctx.update_status_bar_tier2(Some(7), None, None, None, false);
+    assert_eq!(ctx.status_bar_count_values().dead_code, Some(7));
 
     let response = inspect(
         &ctx,
@@ -738,8 +742,15 @@ fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
     assert_eq!(
         ctx.status_bar_count_values().dead_code,
         None,
-        "the status bar must not receive a dead-code count"
+        "the status bar must show dead code as unknown, not the earlier count"
     );
+    // The background refresh path reads counts from the inspect store; it must
+    // not bring the old number back either.
+    aft::runtime_drain::drain_inspect_events(&ctx);
+    ctx.update_status_bar_tier2(None, None, None, None, false);
+    // A `None` count renders as `D?` in the agent bar (see
+    // response_finalize::agent_bar_marks_missing_categories_instead_of_zeroing_them).
+    assert_eq!(ctx.status_bar_count_values().dead_code, None);
 
     // These analyses need no call graph and are computed locally even in a
     // borrow-only root, so they do report real numbers.

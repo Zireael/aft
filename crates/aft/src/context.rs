@@ -4026,6 +4026,15 @@ impl AppContext {
         todos: Option<usize>,
         stale: bool,
     ) {
+        // A `None` count keeps the last known value, which is right while a
+        // category is merely pending. In a borrow-only root, though, dead code
+        // is known to be unavailable: keeping an earlier number would show an
+        // old count as current, so the bar shows it as unknown (`?`) instead.
+        let dead_code_unavailable = self
+            .config()
+            .project_root
+            .as_deref()
+            .is_some_and(|root| self.inspect_manager.dead_code_borrow_only_unavailable(root));
         let mut tier2 = self
             .status_bar_tier2
             .write()
@@ -4037,7 +4046,9 @@ impl AppContext {
             tier2.todos,
             tier2.stale,
         );
-        if let Some(dead_code) = dead_code {
+        if dead_code_unavailable {
+            tier2.dead_code = None;
+        } else if let Some(dead_code) = dead_code {
             tier2.dead_code = Some(dead_code);
         }
         if let Some(unused_exports) = unused_exports {
