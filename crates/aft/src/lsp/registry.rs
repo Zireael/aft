@@ -823,7 +823,100 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         // the second filter lets `typescript-native` be disabled on its own.
         .map(|server| select_typescript_server(server, path, config))
         .filter(|server| !is_disabled(server, config))
+        .filter(|server| !biome_config_excludes(server, path))
         .collect()
+}
+
+/// Biome analyzes only the files its configuration's `files.includes` lists
+/// and publishes nothing for the rest. Treating Biome as a producer for an
+/// excluded file (this repository's biome.json lists only package sources,
+/// so every `.json` under `crates/` is excluded) left that file a permanent
+/// "published no diagnostics" gap in every scoped inspect. A configuration
+/// without `files.includes`, or one that cannot be read, includes every file.
+fn biome_config_excludes(server: &ServerDef, path: &Path) -> bool {
+    if server.kind != ServerKind::Biome {
+        return false;
+    }
+    let Some(root) = server.workspace_root_for_file(path) else {
+        return false;
+    };
+    let Some(config_path) = ["biome.json", "biome.jsonc"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|candidate| candidate.is_file())
+    else {
+        return false;
+    };
+    let Some(includes) = biome_includes(&config_path) else {
+        return false;
+    };
+    let path = crate::inspect::job::canonicalize_normalized(path);
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return false;
+    };
+    !includes.includes(relative)
+}
+
+/// A Biome `files.includes` list: a file is included when a positive pattern
+/// matches it and no later `!` pattern does.
+struct BiomeIncludes {
+    patterns: Vec<(bool, globset::GlobMatcher)>,
+}
+
+impl BiomeIncludes {
+    fn includes(&self, relative: &Path) -> bool {
+        let mut included = false;
+        for (negated, matcher) in &self.patterns {
+            if matcher.is_match(relative) {
+                included = !negated;
+            }
+        }
+        included
+    }
+}
+
+/// Parsed `files.includes` of one Biome configuration, memoized by path and
+/// modification time so a walk over thousands of files reads it once.
+fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
+    type Memo = parking_lot::Mutex<
+        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<Arc<BiomeIncludes>>)>,
+    >;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let modified = std::fs::metadata(config_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some((at, includes)) = memo.lock().get(config_path) {
+        if *at == modified {
+            return includes.clone();
+        }
+    }
+    let parsed = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|source| {
+            serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&source)).ok()
+        })
+        .and_then(|config| {
+            let patterns = config.pointer("/files/includes")?.as_array()?;
+            let patterns = patterns
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|pattern| {
+                    let negated = pattern.starts_with('!');
+                    let glob = pattern.trim_start_matches('!');
+                    let matcher = globset::GlobBuilder::new(glob)
+                        .literal_separator(true)
+                        .build()
+                        .ok()?
+                        .compile_matcher();
+                    Some((negated, matcher))
+                })
+                .collect::<Vec<_>>();
+            Some(Arc::new(BiomeIncludes { patterns }))
+        });
+    memo.lock()
+        .insert(config_path.to_path_buf(), (modified, parsed.clone()));
+    parsed
 }
 
 const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
@@ -1244,6 +1337,30 @@ mod tests {
         assert_eq!(server_root("cli"), root);
         assert_eq!(server_root("plugin"), root);
         assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    /// Biome is not a producer for a file its `files.includes` leaves out, so
+    /// such a file is not an eternal "no diagnostics published" gap.
+    #[test]
+    fn biome_is_not_a_producer_for_files_its_config_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(
+            &root.join("biome.json"),
+            r#"{"files":{"includes":["packages/**/*.ts","!packages/gen/**"]}}"#,
+        );
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let has_biome = |relative: &str| {
+            let file = root.join(relative);
+            write_file(&file, "");
+            matching_kinds(file.to_str().unwrap(), &config).contains(&ServerKind::Biome)
+        };
+        assert!(has_biome("packages/app/src/index.ts"));
+        assert!(!has_biome("crates/app/schema.json"));
+        assert!(!has_biome("packages/gen/out.ts"));
     }
 
     /// A Python script with no project file above it is served from the
