@@ -348,9 +348,41 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/rerank/mod.rs",
-        enclosing_item: "rerank_canonical_head",
+        enclosing_item: "rerank_head",
         location_or_primitive: "page take",
         reason: "re-cuts the served page from the reranked canonical list with the same offset and topK as the block builder; the search surface computes the envelope and paging trailer from that page afterwards",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/mod.rs",
+        enclosing_item: "rerank_positions",
+        location_or_primitive: "rerank candidate take",
+        reason: "selects which first-block entries a reranker may reorder (at most the configured rerank top_n); nothing is dropped from the list, so the served page and its paging trailer are unchanged in length",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/pool_export.rs",
+        enclosing_item: "entries",
+        location_or_primitive: "benchmark pool export take",
+        reason: "benchmark-only export, written only when AFT_RERANK_POOL_EXPORT is set, of a fixed number of first-block candidates to a file; it is never part of a tool response",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/tests.rs",
+        enclosing_item: "onnx_cost_profile_when_available",
+        location_or_primitive: "test candidate text truncate",
+        reason: "test-only cost profile that trims each candidate's text to a byte budget before timing the local reranker; no tool response is produced",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/exact_lane.rs",
+        enclosing_item: "copied_worktree_exact_fallback_reproduction",
+        location_or_primitive: "test walk-list truncate",
+        reason: "ignored manual reproduction test that replays the former 1,000-file fallback walk cap to compare it with the current walk; no tool response is produced",
+    },
+    // Checkpoint and restore results name their first files and then say how
+    // many more there are; the checkpoint itself always covers every file.
+    ExclusionEntry {
+        file: "subc_format.rs",
+        enclosing_item: "checkpoint_path_lines",
+        location_or_primitive: "checkpoint path lines take",
+        reason: "summary of a checkpoint or restore result naming its first few files with its own '… and N more' count; the operation covers every file and no paging applies",
     },
     ExclusionEntry {
         file: "commands/bash_status.rs",
