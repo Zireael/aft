@@ -2942,7 +2942,8 @@ mod tests {
             "{message}"
         );
 
-        // A running configure that did not finish is not a reader's doing.
+        // A bind whose configure is still running when the deadline passes was
+        // not held back by readers, so it keeps the generic code.
         let (code, message) =
             route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
         assert_eq!(code, "actor_not_ready");

@@ -12427,31 +12427,21 @@ mod tests {
         reader_started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the reader starts");
-        // A bind that must change the root, so it waits for the reader.
-        let (bind, bind_token) = executor.submit_bind_cancellable_async(
+        // A plain (not repeatable) bind is never started beside readers, so it
+        // stays queued behind the reader, as a bind that must change the root
+        // does.
+        let (bind, bind_token) = executor.submit_cancellable_async(
             root.clone(),
+            Lane::Mutating,
             "subc-bind-11".to_string(),
-            Arc::new(|_| {
-                if crate::executor::request_exclusive_rerun() {
-                    return Response::error("subc-bind-11", "configure_needs_exclusive", "rerun");
-                }
-                Response::success("subc-bind-11", json!({}))
-            }),
+            Box::new(|_| Response::success("subc-bind-11", json!({}))),
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !executor
             .try_bind_blocker_snapshot(&root, "subc-bind-11")
-            .is_some_and(|snapshot| {
-                snapshot
-                    .blockers
-                    .iter()
-                    .any(|blocker| blocker == "rerun_as_exclusive_writer")
-            })
+            .is_some_and(|snapshot| snapshot.configure_state == "queued")
         {
-            assert!(
-                Instant::now() < deadline,
-                "the bind never queued for exclusive use"
-            );
+            assert!(Instant::now() < deadline, "the bind never queued");
             std::thread::sleep(Duration::from_millis(2));
         }
 
@@ -12504,7 +12494,7 @@ mod tests {
                 && message.contains("age_ms="),
             "{body}"
         );
-        // The overdue bind was cancelled, not left queued behind the reader.
+        // Refusing the bind also cancelled its queued configure job.
         assert_eq!(bind_response.data["code"], "request_cancelled");
     }
 

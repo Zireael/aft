@@ -1629,9 +1629,10 @@ impl Executor {
             .map(|state| state.mutating_job_state_label(root_id, request_id))
     }
 
-    /// Snapshot RouteBind blockers, waiting for the scheduler lock. For the
-    /// bind-deadline refusal, which names its blocker and is about to take
-    /// the same lock to cancel the bind anyway.
+    /// Snapshot RouteBind blockers, waiting for the scheduler lock if it is
+    /// held. The module's bind-deadline refusal uses it to name what held the
+    /// bind; it takes the same lock right after to cancel the bind, so
+    /// waiting here costs nothing extra.
     pub fn bind_blocker_snapshot(
         &self,
         root_id: &ProjectRootId,
