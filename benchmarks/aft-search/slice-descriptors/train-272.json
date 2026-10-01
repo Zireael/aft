@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "tool-provider-slice-a"
+  ],
+  "note": "Tool-provider v1 catalog and prompt text for Broca behind the per-route role_versions marker; legacy routes byte-identical; Windows-safe harness paths. No ranking-fence files."
+}
