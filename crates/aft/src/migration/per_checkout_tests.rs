@@ -1,0 +1,406 @@
+use std::path::{Path, PathBuf};
+
+use super::*;
+use crate::semantic_index::{EmbedTextCaps, SemanticIndex, SemanticIndexFingerprint};
+
+const POLICY: TrigramPolicy = TrigramPolicy {
+    max_file_size: 1 << 20,
+};
+
+fn write_tree(root: &Path, files: &[(&str, &[u8])]) {
+    for (path, bytes) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+fn fixture() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("checkout");
+    fs::create_dir_all(&root).unwrap();
+    write_tree(
+        &root,
+        &[
+            (
+                "src/alpha.rs",
+                b"pub fn alpha_total(values: &[u32]) -> u32 {\n    values.iter().sum()\n}\n",
+            ),
+            (
+                "src/beta.rs",
+                b"pub struct BetaCache {\n    entries: Vec<String>,\n}\n",
+            ),
+            (
+                "notes/readme.md",
+                b"# Notes\n\nSome prose about the alpha total.\n",
+            ),
+            ("assets/blob.bin", &[0, 159, 146, 150, 0, 1, 2, 3, 0, 0]),
+        ],
+    );
+    let root = fs::canonicalize(&root).unwrap();
+    (dir, root)
+}
+
+fn legacy_cache(root: &Path, cache_dir: &Path, max_file_size: u64) -> Vec<u8> {
+    let mut index = crate::search_index::SearchIndex::build_with_limit(root, max_file_size);
+    assert!(index.write_to_disk(cache_dir, None), "legacy cache written");
+    fs::read(cache_dir.join("cache.bin")).unwrap()
+}
+
+/// The canonical conversion of a legacy cache equals what a cold build of
+/// the same files produces: every payload, and the segment byte for byte.
+#[test]
+fn trigram_conversion_equals_a_cold_segment() {
+    let (dir, root) = fixture();
+    let bytes = legacy_cache(&root, &dir.path().join("cache"), POLICY.max_file_size);
+    let bundle = convert_trigram(&bytes, &POLICY).unwrap();
+    let members = bundle
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.rel_path.as_bytes().to_vec()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(members.contains(&"src/alpha.rs".to_owned()), "{members:?}");
+    assert!(
+        members.contains(&"notes/readme.md".to_owned()),
+        "{members:?}"
+    );
+    for entry in &bundle.entries {
+        let source =
+            fs::read(root.join(segment_store::rel_path_to_os(&entry.rel_path).unwrap())).unwrap();
+        assert_eq!(entry.content, ContentHash::of(&source));
+        assert_eq!(
+            entry.payload,
+            TrigramPayload::extract(&source, &POLICY).encode(),
+            "payload of {:?}",
+            entry.rel_path
+        );
+    }
+    let imported = trigram_segment(&bundle, &POLICY).unwrap();
+    let rel_paths = bundle
+        .entries
+        .iter()
+        .map(|entry| entry.rel_path.clone())
+        .collect::<Vec<_>>();
+    let cold = segment_store::build_from_files(&root, &rel_paths, &POLICY).unwrap();
+    assert_eq!(imported.id, cold.id);
+    assert_eq!(imported.bytes, cold.bytes);
+}
+
+/// Anything not provably equal to a cold build is rejected, never relabelled.
+#[test]
+fn incompatible_trigram_caches_are_rejected() {
+    let (dir, root) = fixture();
+    let bytes = legacy_cache(&root, &dir.path().join("cache"), POLICY.max_file_size);
+    let other_limit = TrigramPolicy {
+        max_file_size: 4096,
+    };
+    assert!(convert_trigram(&bytes, &other_limit)
+        .unwrap_err()
+        .contains("max_file_size"));
+    let mut version = bytes.clone();
+    version[4] ^= 0xff;
+    assert!(convert_trigram(&version, &POLICY)
+        .unwrap_err()
+        .contains("version"));
+    let mut flipped = bytes.clone();
+    let middle = 40 + (bytes.len() - 40) / 3;
+    flipped[middle] ^= 0x01;
+    assert!(convert_trigram(&flipped, &POLICY)
+        .unwrap_err()
+        .contains("checksum"));
+    assert!(convert_trigram(&bytes[..bytes.len() - 7], &POLICY).is_err());
+}
+
+fn deterministic(text: &str) -> Vec<f32> {
+    blake3::hash(text.as_bytes()).as_bytes()[..16]
+        .iter()
+        .map(|byte| (f32::from(*byte) - 127.5) / 127.5)
+        .collect()
+}
+
+fn fingerprint() -> SemanticIndexFingerprint {
+    SemanticIndexFingerprint {
+        backend: "test".to_owned(),
+        model: "deterministic".to_owned(),
+        base_url: "none".to_owned(),
+        dimension: 16,
+        chunking_version: 2,
+        embed_text_caps: EmbedTextCaps::default(),
+        ..SemanticIndexFingerprint::default()
+    }
+}
+
+fn producer() -> SemanticProducer {
+    let fingerprint = fingerprint();
+    SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps)
+}
+
+fn legacy_semantic(root: &Path) -> Vec<u8> {
+    let files = ["src/alpha.rs", "src/beta.rs", "notes/readme.md"]
+        .iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+    let mut index = SemanticIndex::build(
+        root,
+        &files,
+        &mut |texts: Vec<String>| Ok(texts.iter().map(|text| deterministic(text)).collect()),
+        64,
+    )
+    .unwrap();
+    index.set_fingerprint(fingerprint());
+    index.to_bytes()
+}
+
+/// An imported semantic payload is byte-equal to the payload a cold fill
+/// stores for the same file and producer; a file edited since the snapshot
+/// is left for the plane to embed.
+#[test]
+fn semantic_conversion_equals_cold_fill_payloads() {
+    let (_dir, root) = fixture();
+    let snapshot = legacy_semantic(&root);
+    fs::write(root.join("src/beta.rs"), b"pub struct BetaCache;\n").unwrap();
+    let producer = producer();
+    let (bundle, skipped) = convert_semantic(&snapshot, &root, &producer).unwrap();
+    let converted = bundle
+        .entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.rel_path.as_bytes().to_vec()).unwrap())
+        .collect::<Vec<_>>();
+    // Only files the semantic plane chunks are imported; the plane never
+    // embeds the others either.
+    let expected = ["notes/readme.md", "src/alpha.rs"]
+        .into_iter()
+        .filter(|path| {
+            crate::views::semantic::applies_to(&RelPath::new(path.as_bytes().to_vec()).unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert!(expected.contains(&"src/alpha.rs"));
+    assert_eq!(converted, expected);
+    assert!(skipped >= 1, "the edited file is not imported");
+    let payload_producer = crate::semantic_index::ViewPayloadProducer {
+        chunker_version: &producer.chunker_version,
+        template_version: &producer.template_version,
+        model_fingerprint: &producer.model_fingerprint,
+    };
+    for entry in &bundle.entries {
+        let relative = segment_store::rel_path_to_os(&entry.rel_path).unwrap();
+        let source = fs::read(root.join(&relative)).unwrap();
+        let chunks =
+            crate::semantic_index::chunk_view_file(&root, &relative, &source, producer.caps)
+                .unwrap()
+                .unwrap();
+        let mut embed =
+            |texts: Vec<String>| Ok(texts.iter().map(|text| deterministic(text)).collect());
+        let runs = crate::semantic_index::embed_view_files(vec![chunks], &mut embed, 64).unwrap();
+        assert_eq!(
+            entry.payload,
+            runs[0].encode_view_payload(&payload_producer),
+            "payload of {relative:?}"
+        );
+        assert_eq!(
+            entry.key,
+            *producer.key(&source, &entry.rel_path).as_bytes()
+        );
+    }
+}
+
+#[test]
+fn a_snapshot_of_another_model_is_rejected() {
+    let (_dir, root) = fixture();
+    let snapshot = legacy_semantic(&root);
+    let mut other = fingerprint();
+    other.model = "another".to_owned();
+    let other = SemanticProducer::current(other.as_string(), other.embed_text_caps);
+    assert!(convert_semantic(&snapshot, &root, &other).is_err());
+}
+
+fn owner_of(pid: u32, start_time: u64, token: &str) -> ClaimOwner {
+    ClaimOwner {
+        pid,
+        start_time,
+        token: token.to_owned(),
+    }
+}
+
+/// A live owner holds the row; an abandoned claim of this very process (its
+/// import returned) is taken over with the next attempt.
+#[test]
+fn a_live_claim_is_single_flight_and_an_abandoned_one_is_taken_over() {
+    let storage = tempfile::tempdir().unwrap();
+    let ledger = ImportLedger::open(storage.path(), "key").unwrap();
+    let first = ClaimOwner::new();
+    let active = ActiveClaim::register(&first);
+    assert!(matches!(
+        ledger.claim(Artifact::Trigram, &first).unwrap(),
+        Claim::Owned(ImportRow { attempt: 1, .. })
+    ));
+    let second = ClaimOwner::new();
+    let _second_active = ActiveClaim::register(&second);
+    assert!(matches!(
+        ledger.claim(Artifact::Trigram, &second).unwrap(),
+        Claim::Busy(holder) if holder == first
+    ));
+    drop(active);
+    match ledger.claim(Artifact::Trigram, &second).unwrap() {
+        Claim::Owned(row) => {
+            assert_eq!(row.attempt, 2);
+            assert_eq!(row.owner.as_ref(), Some(&second));
+        }
+        _ => panic!("an abandoned claim must be taken over"),
+    }
+    // The superseded owner can no longer move the row.
+    assert!(matches!(
+        ledger.advance(
+            Artifact::Trigram,
+            &first,
+            ImportState::Claimed,
+            ImportState::Staged,
+            Advance::default()
+        ),
+        Err(ImportError::LostClaim(Artifact::Trigram))
+    ));
+}
+
+#[test]
+fn a_dead_process_claim_is_taken_over() {
+    let storage = tempfile::tempdir().unwrap();
+    let ledger = ImportLedger::open(storage.path(), "key").unwrap();
+    // No process has pid u32::MAX - 1, so this owner is dead.
+    let dead = owner_of(u32::MAX - 1, 1, "dead");
+    assert!(matches!(
+        ledger.claim(Artifact::Semantic, &dead).unwrap(),
+        Claim::Owned(_)
+    ));
+    let me = ClaimOwner::new();
+    let _active = ActiveClaim::register(&me);
+    assert!(matches!(
+        ledger.claim(Artifact::Semantic, &me).unwrap(),
+        Claim::Owned(ImportRow { attempt: 2, .. })
+    ));
+}
+
+#[test]
+fn a_ledger_from_a_newer_build_is_refused_by_name() {
+    let storage = tempfile::tempdir().unwrap();
+    let dir = ledger_dir(storage.path(), "newer");
+    fs::create_dir_all(&dir).unwrap();
+    let connection = rusqlite::Connection::open(dir.join(LEDGER_FILE)).unwrap();
+    connection.execute_batch(SCHEMA).unwrap();
+    connection
+        .execute(
+            "INSERT INTO ledger_meta (singleton, format_version) VALUES (1, ?1)",
+            params![LEDGER_FORMAT_VERSION + 1],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        ImportLedger::open(storage.path(), "newer"),
+        Err(ImportError::NewerLedger(version)) if version == LEDGER_FORMAT_VERSION + 1
+    ));
+}
+
+#[test]
+fn a_staged_bundle_roundtrips_and_detects_corruption() {
+    let bundle = Bundle {
+        entries: vec![BundleEntry {
+            rel_path: RelPath::new(b"a.rs".to_vec()).unwrap(),
+            content: ContentHash::of(b"a"),
+            size: 1,
+            key: [7; 32],
+            payload: vec![1, 2, 3],
+        }],
+    };
+    let bytes = bundle.encode(Artifact::Trigram);
+    assert_eq!(Bundle::decode(&bytes, Artifact::Trigram).unwrap(), bundle);
+    assert!(Bundle::decode(&bytes, Artifact::Semantic).is_err());
+    let mut corrupt = bytes.clone();
+    corrupt[12] ^= 1;
+    assert!(Bundle::decode(&corrupt, Artifact::Trigram).is_err());
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    files
+}
+
+/// The sweeps an older binary runs (the orphan index and artifact-owner
+/// sweeps, and the views-on generation sweep of the old layout) never reach
+/// the v2 stores or the import ledger. The import itself leaves the legacy
+/// set byte-identical, so an offline rollback finds it.
+#[test]
+fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
+    let (dir, root) = fixture();
+    let storage = dir.path().join("storage");
+    let key = "legacykey";
+    legacy_cache(
+        &root,
+        &storage.join("index").join(key),
+        POLICY.max_file_size,
+    );
+    let semantic_dir = storage.join("semantic").join(key);
+    fs::create_dir_all(&semantic_dir).unwrap();
+    fs::write(semantic_dir.join("semantic.bin"), legacy_semantic(&root)).unwrap();
+    let legacy_before = [
+        snapshot_tree(&storage.join("index")),
+        snapshot_tree(&storage.join("semantic")),
+    ];
+    let producer = producer();
+    let request = ImportRequest {
+        storage: storage.clone(),
+        family: key.to_owned(),
+        legacy_key: key.to_owned(),
+        scope: "scope".to_owned(),
+        root: root.clone(),
+        producers: Producers {
+            trigram: POLICY.fingerprint_hex(),
+            semantic: Some(producer.id()),
+            callgraph: "callgraph-test".to_owned(),
+        },
+        trigram_policy: Some(POLICY),
+        semantic: Some(producer),
+    };
+    let report = run_import(&request, None).unwrap();
+    assert_eq!(report.outcome, ImportOutcome::Completed);
+    assert!(report.published.is_some());
+    assert_eq!(
+        [
+            snapshot_tree(&storage.join("index")),
+            snapshot_tree(&storage.join("semantic")),
+        ],
+        legacy_before,
+        "the import never writes the legacy set"
+    );
+
+    let v2_before = [
+        snapshot_tree(&storage.join("blobs").join("v2")),
+        snapshot_tree(&storage.join("views").join("v2")),
+        snapshot_tree(&storage.join("migration")),
+    ];
+    crate::search_index::sweep_orphaned_index_dirs(&storage);
+    let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(&storage);
+    let old_view = crate::views::ViewStore::open(&storage, "scope").unwrap();
+    old_view.sweep_generations().unwrap();
+    assert_eq!(
+        [
+            snapshot_tree(&storage.join("blobs").join("v2")),
+            snapshot_tree(&storage.join("views").join("v2")),
+            snapshot_tree(&storage.join("migration")),
+        ],
+        v2_before
+    );
+}

@@ -5811,6 +5811,14 @@ fn start_checkout_semantic_lane(
                 // to that configure, so it starts either way; a newer lane
                 // replaces it through the epoch check.
                 let _ = wait_for_semantic_artifact_start(&start_rx, &gate_root);
+                // A legacy (pre-view) set for this root is imported first, on
+                // this background thread, so the lane's first load seeds from
+                // it rather than embedding every file again.
+                let current = {
+                    let slot = weak_slot.clone();
+                    move || slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+                };
+                crate::migration::per_checkout::import_for_semantic_lane(&config, &current);
                 crate::views::semantic_runtime::run_worker(weak_slot, epoch, wake, config);
             });
         });

@@ -211,6 +211,14 @@ fn main() {
         }
     }
 
+    // `aft cache prune-legacy` is the only command that deletes legacy
+    // (pre-view) index sets. Like `backups`, it runs before logging and the
+    // application start, so it never opens a store it may be moving aside.
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::prune_legacy::run(args));
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();

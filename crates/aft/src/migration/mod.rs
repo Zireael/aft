@@ -13,6 +13,9 @@
 //! `migration-state.json`; later attempts observe that marker rather than
 //! repeatedly scheduling the same rebuild.
 
+pub mod per_checkout;
+pub mod prune_legacy;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
