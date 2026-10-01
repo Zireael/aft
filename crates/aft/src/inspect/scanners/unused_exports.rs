@@ -22,8 +22,8 @@ use crate::parser::{detect_language, LangId};
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 const DRILL_DOWN_LIMIT: usize = 100;
-/// Item reason for an export whose symbol is referenced only inside its own
-/// file: no other module imports it, so the `export` is unused.
+/// Reason code on an unused-export item whose symbol is referenced only inside
+/// its declaring file: no other module imports it, so the `export` is unused.
 pub(crate) const ONLY_SAME_FILE_REFERENCES_REASON: &str = "used_only_in_own_file";
 
 #[derive(Debug, Clone)]
@@ -347,8 +347,7 @@ fn run_unused_exports_oxc_scan(
                         }
                     } else if export.only_same_file_references {
                         // Only the declaring file uses the symbol, so the
-                        // export itself is unused (the same notion fallow and
-                        // other unused-export tools report).
+                        // export is unused even though the symbol is live.
                         if test_tree {
                             excluded.record(&file.relative_file);
                             continue;
@@ -1762,8 +1761,8 @@ export function bannerUnused() {}
         assert_only_product_counted(&aggregate);
     }
 
-    /// fallow and similar tools report an export that only its own file uses:
-    /// the symbol is live but the `export` keyword serves nobody.
+    /// An export used only within its own file has a live symbol, but the
+    /// `export` keyword serves no other file, so it is an unused export.
     #[test]
     fn oxc_scan_reports_exports_used_only_in_their_own_file() {
         let (_temp_dir, root, paths) = fixture_project(&[

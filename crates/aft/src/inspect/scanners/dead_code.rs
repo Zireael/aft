@@ -1792,8 +1792,9 @@ fn aggregate_materialized_dead_code_contributions(
         excluded.record_many(file, *findings);
     }
     excluded.write_into(&mut aggregate);
-    // Per-file breakdown so the incremental rollup can keep an exact tally
-    // per fragment; `fold_dead_code_fragments` does not copy it forward.
+    // Per-file breakdown of the withheld findings. The incremental rollup
+    // stores it in each file's fragment so a later partial re-render keeps an
+    // exact total; the folded aggregate it produces omits this field.
     aggregate["excluded_test_by_file"] = json!(excluded_by_file);
     aggregate
 }
