@@ -648,6 +648,21 @@ fn start_semantic(session: &ParentSession) {
     };
 }
 
+/// Size and modification time of a view's pointer database and its WAL.
+fn pointer_stat(view_dir: &Path) -> Vec<u8> {
+    let mut stat = Vec::new();
+    for name in ["pointer.sqlite", "pointer.sqlite-wal"] {
+        if let Ok(metadata) = std::fs::metadata(view_dir.join(name)) {
+            stat.extend_from_slice(&metadata.len().to_le_bytes());
+            if let Ok(modified) = metadata.modified() {
+                stat.extend_from_slice(format!("{modified:?}").as_bytes());
+            }
+        }
+        stat.push(0);
+    }
+    stat
+}
+
 fn refresh_semantic(session: &ParentSession, child: &Child) {
     let semantic = match &*read(&session.semantic) {
         Plane::Ready(semantic) => Arc::clone(semantic),
@@ -659,9 +674,19 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
     };
     // Read the view's current-generation pointer first, without the family
     // registry: an unchanged pointer means this session already serves the
-    // generation, and the check costs one small read-only database read.
-    let current_name = super::super::registry::view_dir(&session.storage, &child.scope)
-        .ok()
+    // generation. Before even opening the pointer database, compare the size
+    // and mtime of it and its WAL with the last read: a publication commits
+    // through the WAL, so unchanged files mean an unchanged pointer, and the
+    // idle check costs two stats instead of opening SQLite.
+    let view_dir = super::super::registry::view_dir(&session.storage, &child.scope).ok();
+    let stat = view_dir.as_deref().map(pointer_stat);
+    if read(&child.semantic).ready().is_some()
+        && stat.is_some()
+        && *lock(&child.semantic_pointer_stat) == stat
+    {
+        return;
+    }
+    let current_name = view_dir
         .and_then(super::super::ViewStore::existing_dir)
         .and_then(|store| store.current_generation_read_only().ok().flatten());
     let Some(current_name) = current_name else {
@@ -673,6 +698,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         .ready()
         .is_some_and(|current| current.generation.name() == current_name)
     {
+        *lock(&child.semantic_pointer_stat) = stat;
         return;
     }
     let reader = match child.reader(&session.storage) {
@@ -725,6 +751,7 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         return;
     }
     let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();
+    *lock(&child.semantic_pointer_stat) = stat;
     let previous = std::mem::replace(
         &mut *write(&child.semantic),
         Plane::Ready(Arc::new(SemanticChild {

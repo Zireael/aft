@@ -647,6 +647,9 @@ pub struct Child {
     ignore_files: Mutex<worker::IgnoreCache>,
     /// The family registry reader registration, created once on first use.
     reader: Mutex<Option<Arc<ReaderRegistration>>>,
+    /// Size and mtime of the child's semantic view pointer database and its
+    /// WAL when the worker last read the pointer; see `worker::refresh_semantic`.
+    pub(crate) semantic_pointer_stat: Mutex<Option<Vec<u8>>>,
     /// HEAD fingerprint, cached against the `.git/HEAD` bytes it came from.
     head: Mutex<Option<(Vec<u8>, String)>>,
     loads: AtomicUsize,
@@ -673,6 +676,7 @@ impl Child {
             pending: Mutex::new(BTreeSet::new()),
             ignore_files: Mutex::new(worker::IgnoreCache::default()),
             reader: Mutex::new(None),
+            semantic_pointer_stat: Mutex::new(None),
             head: Mutex::new(None),
             loads: AtomicUsize::new(0),
             applied: AtomicUsize::new(0),
