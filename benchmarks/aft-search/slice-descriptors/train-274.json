@@ -1,0 +1,40 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/exact_lane.rs",
+    "crates/aft/src/commands/semantic_search/memo.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+    "crates/aft/src/commands/semantic_search/rerank/onnx.rs",
+    "crates/aft/src/commands/semantic_search/rerank/pool_export.rs",
+    "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/src/subc_tool_schemas.json"
+  ],
+  "slices": [
+    "daemon-exit-tail",
+    "views-slice-7-legacy-prune",
+    "load-sensitive-test-batch",
+    "pi-lazy-session-start",
+    "views-slice-9-parent-folders",
+    "inspect-reliability",
+    "unscoped-inspect-cargo-check-race",
+    "honest-code-health-counts",
+    "import-quote-style",
+    "exact-pass-fallback-walk",
+    "grep-coverage-while-indexing",
+    "borrowed-callgraph-count",
+    "exact-pass-candidate-files",
+    "rerank-policy",
+    "tool-provider-nextest-binary",
+    "checkpoint-namespace",
+    "standalone-deferred-wake",
+    "test-executable-fold"
+  ],
+  "note": "Combined train. The exact pass now reads only files that can hold kept evidence and keys fallback-walk memo entries apart from ready-index entries; grep and the regex route report fallback-walk coverage; the rerank policy (exact tier frozen, non-exact block-0 entries only, identifier queries skipped, name and line candidate text) ships behind search.rerank, which stays off by default; subc_tool_schemas.json gains description changes only. None of these changes what a ranked row contains with the shipped configuration, so every reference row must stay byte-identical. The remaining slices touch no ranking code."
+}
