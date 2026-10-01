@@ -46,6 +46,14 @@ pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
+/// `view_disk_limits_next_ms` while views are disabled: never due.
+const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
 
 thread_local! {
     /// Config snapshots pinned by the requests running on this thread, keyed
@@ -2798,6 +2806,12 @@ pub struct AppContext {
     checkout_driver: crate::views::first_load::InstalledDriver,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
+    /// Wall-clock milliseconds at which the completion drain should next
+    /// check this root's view disk limits; [`VIEW_DISK_LIMITS_OFF`] while
+    /// views are disabled. An atomic so the scheduler's work probe can read
+    /// it without a lock; only the drain and configuration publication
+    /// write it.
+    view_disk_limits_next_ms: AtomicU64,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
@@ -3403,6 +3417,11 @@ impl AppContext {
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
         let compression_aggregates = bash_background.compression_aggregate_cache();
+        let view_disk_limits_next_ms = AtomicU64::new(if config.views.enabled {
+            0
+        } else {
+            VIEW_DISK_LIMITS_OFF
+        });
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
@@ -3433,6 +3452,7 @@ impl AppContext {
             view_runtime: RwLock::new(None),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             checkout_semantic: Arc::default(),
+            view_disk_limits_next_ms,
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
@@ -4601,7 +4621,8 @@ impl AppContext {
     /// The family registry behind this project root's per-checkout view,
     /// when views are enabled and the root's checkout semantic runtime is
     /// loaded. `None` with views off, so the disk-limit checks below never
-    /// run for users who did not enable views.
+    /// run for users who did not enable views. Takes locks; the drain calls
+    /// it, never the work probe.
     pub(crate) fn checkout_view_registry(&self) -> Option<crate::views::registry::FamilyRegistry> {
         if !self.config().views.enabled {
             return None;
@@ -4612,13 +4633,40 @@ impl AppContext {
         }
     }
 
-    /// True when the repository family of this root's per-checkout view has
-    /// not had its disk limits checked recently (see
-    /// `views::eviction::enforcement_due`); the completion drain then starts
-    /// the check (`runtime_drain::drain_view_disk_limits`).
+    /// True when this root's view disk limits are due a check, which the
+    /// completion drain then starts (`runtime_drain::drain_view_disk_limits`).
+    /// Lock-free and free of I/O: one atomic load and a clock read, because
+    /// the module loop calls this probe for every root on every tick.
     pub fn view_disk_limits_due(&self) -> bool {
-        self.checkout_view_registry()
-            .is_some_and(|registry| crate::views::eviction::enforcement_due(&registry))
+        let next = self.view_disk_limits_next_ms.load(Ordering::Acquire);
+        next != VIEW_DISK_LIMITS_OFF && now_epoch_ms() >= next
+    }
+
+    /// Sets when the drain should look at the view disk limits again.
+    pub(crate) fn schedule_view_disk_limits(&self, after: Duration) {
+        let next = now_epoch_ms().saturating_add(after.as_millis() as u64);
+        // Never re-arms a root whose views were turned off meanwhile.
+        let _ = self.view_disk_limits_next_ms.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| (current != VIEW_DISK_LIMITS_OFF).then_some(next),
+        );
+    }
+
+    /// Follows a configuration publication: views turned on make a check due
+    /// now unless one is already scheduled; views off disarm it entirely.
+    fn arm_view_disk_limits(&self, views_enabled: bool) {
+        if views_enabled {
+            let _ = self.view_disk_limits_next_ms.compare_exchange(
+                VIEW_DISK_LIMITS_OFF,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else {
+            self.view_disk_limits_next_ms
+                .store(VIEW_DISK_LIMITS_OFF, Ordering::Release);
+        }
     }
 
     pub fn configure_tail_has_work(&self) -> bool {
@@ -5572,6 +5620,7 @@ impl AppContext {
             replace_pinned_config(self.config_pin_key(), &next);
         }
         self.reconcile_rerank_backend(&next);
+        self.arm_view_disk_limits(next.views.enabled);
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self

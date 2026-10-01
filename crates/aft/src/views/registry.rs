@@ -84,13 +84,16 @@ CREATE TABLE IF NOT EXISTS sweep_lease (
 "#;
 
 /// Live sessions of registered views, one row per [`ViewRegistration`] that a
-/// process still holds. Disk-limit eviction never removes a view with a row
-/// whose owner process is alive.
+/// process still holds, and the disk use each view had at the last
+/// measurement. Disk-limit eviction never removes a view with a session row
+/// whose owner process is alive, and admission of a new view decides from
+/// the recorded disk use so that it never has to walk a directory.
 ///
-/// The table is created with `IF NOT EXISTS` by every writer that needs it,
-/// without a schema version bump: releases that predate it never read it, and
-/// their views stay protected while in use by their pins and read markers.
-const SESSION_SCHEMA: &str = r#"
+/// The tables are created with `IF NOT EXISTS` by every writer that needs
+/// them, without a schema version bump: releases that predate them never
+/// read them, and their views stay protected while in use by their pins and
+/// read markers.
+pub(crate) const RUNTIME_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS view_sessions (
     session_id TEXT NOT NULL PRIMARY KEY,
     scope TEXT NOT NULL,
@@ -99,6 +102,17 @@ CREATE TABLE IF NOT EXISTS view_sessions (
     opened_at_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS view_sessions_scope ON view_sessions (scope);
+CREATE TABLE IF NOT EXISTS view_usage (
+    scope TEXT NOT NULL PRIMARY KEY,
+    bytes INTEGER NOT NULL,
+    held INTEGER NOT NULL,
+    measured_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS family_usage (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    file_bytes INTEGER NOT NULL,
+    measured_at_ms INTEGER NOT NULL
+);
 "#;
 
 /// `members.state` of a view whose disk-limit eviction has begun. Eviction
@@ -212,6 +226,9 @@ struct RegistryInner {
     /// The disk limits this process applies to the family; see
     /// `views::eviction`. Shared by every handle on this registry file.
     budget: Mutex<super::eviction::DiskBudget>,
+    /// Sessions that ended while the connection was busy; see
+    /// `ViewSession::drop`. Never held while waiting for `connection`.
+    ended_sessions: Mutex<Vec<EndedSession>>,
 }
 
 impl fmt::Debug for RegistryInner {
@@ -288,6 +305,7 @@ impl FamilyRegistry {
             path: path.clone(),
             connection: Mutex::new(connection),
             budget: Mutex::new(super::eviction::DiskBudget::default()),
+            ended_sessions: Mutex::new(Vec::new()),
         });
         {
             let mut connection = lock(&inner.connection);
@@ -299,7 +317,7 @@ impl FamilyRegistry {
                 connection.pragma_update(None, "synchronous", "FULL")?;
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute_batch(REGISTRY_SCHEMA)?;
-                tx.execute_batch(SESSION_SCHEMA)?;
+                tx.execute_batch(RUNTIME_SCHEMA)?;
                 tx.execute(
                     "INSERT OR IGNORE INTO registry_meta (singleton, schema_version, gc_epoch)
                      VALUES (1, ?1, 0)",
@@ -317,6 +335,15 @@ impl FamilyRegistry {
 
     pub fn family(&self) -> &str {
         &self.inner.family
+    }
+
+    /// The registry connection, after writing any session ends queued while
+    /// it was busy, so that nothing read through it sees a session that has
+    /// already ended in this process.
+    fn connection(&self) -> MutexGuard<'_, TrackedConnection> {
+        let connection = lock(&self.inner.connection);
+        flush_ended_sessions(&self.inner, &connection);
+        connection
     }
 
     pub fn storage(&self) -> &Path {
@@ -351,9 +378,9 @@ impl FamilyRegistry {
             owner.start_time,
             SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        let mut connection = lock(&self.inner.connection);
+        let mut connection = self.connection();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(SESSION_SCHEMA)?;
+        tx.execute_batch(RUNTIME_SCHEMA)?;
         let previous: Option<String> = tx
             .query_row(
                 "SELECT state FROM members WHERE scope = ?1",
@@ -424,7 +451,7 @@ impl FamilyRegistry {
 
     /// Every recorded view session, live or not.
     pub fn sessions(&self) -> RegistryResult<Vec<SessionRecord>> {
-        let connection = lock(&self.inner.connection);
+        let connection = self.connection();
         read_sessions(&connection, None)
     }
 
@@ -438,7 +465,7 @@ impl FamilyRegistry {
             .filter(|session| !crate::pins::owner_is_live(&session.owner))
             .map(|session| session.session_id)
             .collect::<Vec<_>>();
-        let connection = lock(&self.inner.connection);
+        let connection = self.connection();
         for session_id in &dead {
             connection.execute(
                 "DELETE FROM view_sessions WHERE session_id = ?1",
@@ -459,7 +486,7 @@ impl FamilyRegistry {
             owner.start_time,
             READER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        lock(&self.inner.connection).execute(
+        self.connection().execute(
             "INSERT INTO readers (reader_id, label, owner_pid, owner_start, registered_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -478,17 +505,17 @@ impl FamilyRegistry {
     }
 
     pub fn members(&self) -> RegistryResult<Vec<MemberRecord>> {
-        read_members(&lock(&self.inner.connection))
+        read_members(&self.connection())
     }
 
     pub fn member(&self, scope: &str) -> RegistryResult<Option<MemberRecord>> {
-        Ok(read_members(&lock(&self.inner.connection))?
+        Ok(read_members(&self.connection())?
             .into_iter()
             .find(|member| member.scope == scope))
     }
 
     pub fn readers(&self) -> RegistryResult<Vec<ReaderRecord>> {
-        let connection = lock(&self.inner.connection);
+        let connection = self.connection();
         let mut statement = connection.prepare(
             "SELECT reader_id, label, owner_pid, owner_start, registered_at_ms
              FROM readers ORDER BY reader_id",
@@ -508,7 +535,7 @@ impl FamilyRegistry {
     }
 
     pub fn gc_epoch(&self) -> RegistryResult<u64> {
-        let epoch: i64 = lock(&self.inner.connection).query_row(
+        let epoch: i64 = self.connection().query_row(
             "SELECT gc_epoch FROM registry_meta WHERE singleton = 1",
             [],
             |row| row.get(0),
@@ -518,7 +545,7 @@ impl FamilyRegistry {
 
     /// Records a successful publication of `scope`.
     pub fn note_publish(&self, scope: &str) -> RegistryResult<()> {
-        lock(&self.inner.connection).execute(
+        self.connection().execute(
             "UPDATE members SET last_publish_ms = ?2 WHERE scope = ?1",
             params![scope, now_ms() as i64],
         )?;
@@ -530,7 +557,7 @@ impl FamilyRegistry {
     /// owner process is gone is taken over.
     pub(crate) fn begin_sweep(&self) -> RegistryResult<Option<SweepLease>> {
         let owner = current_owner();
-        let mut connection = lock(&self.inner.connection);
+        let mut connection = self.connection();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let holder: Option<(i64, i64)> = tx
             .query_row(
@@ -581,6 +608,15 @@ impl FamilyRegistry {
         }))
     }
 
+    /// Runs `body` on the registry connection without opening a
+    /// transaction, for reads that take no write lock.
+    pub(crate) fn read<T>(
+        &self,
+        body: impl FnOnce(&rusqlite::Connection) -> RegistryResult<T>,
+    ) -> RegistryResult<T> {
+        body(&self.connection())
+    }
+
     /// Runs `body` inside one IMMEDIATE transaction on the registry. This is
     /// the handoff barrier: registration takes the same write lock, so no view
     /// can (re)register between the body's checks and its effects.
@@ -588,7 +624,7 @@ impl FamilyRegistry {
         &self,
         body: impl FnOnce(&rusqlite::Transaction<'_>) -> RegistryResult<T>,
     ) -> RegistryResult<T> {
-        let mut connection = lock(&self.inner.connection);
+        let mut connection = self.connection();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let value = body(&tx)?;
         tx.commit()?;
@@ -617,7 +653,7 @@ impl FamilyRegistry {
             .filter(|reader| !crate::pins::owner_is_live(&reader.owner))
             .map(|reader| reader.reader_id)
             .collect::<Vec<_>>();
-        let connection = lock(&self.inner.connection);
+        let connection = self.connection();
         for reader_id in &dead {
             connection.execute(
                 "DELETE FROM readers WHERE reader_id = ?1",
@@ -651,7 +687,7 @@ impl SweepLease {
             return;
         }
         self.released = true;
-        let _ = lock(&self.registry.inner.connection).execute(
+        let _ = self.registry.connection().execute(
             "DELETE FROM sweep_lease WHERE singleton = 1 AND owner_pid = ?1 AND owner_start = ?2",
             params![i64::from(self.owner.pid), self.owner.start_time as i64],
         );
@@ -687,16 +723,61 @@ struct ViewSession {
     scope: String,
 }
 
+/// A session that ended but whose row is not deleted yet.
+#[derive(Debug)]
+struct EndedSession {
+    session_id: String,
+    scope: String,
+    ended_at_ms: u64,
+}
+
 impl Drop for ViewSession {
+    /// Never waits for the registry connection. The last clone of a
+    /// registration can be dropped anywhere, including inside a barrier body
+    /// on this thread, which holds that connection's mutex; blocking on it
+    /// here would deadlock. So the end is queued, and written now only if
+    /// the connection is free. Otherwise a short-lived thread writes it as
+    /// soon as the holder lets go, and every later use of the connection in
+    /// this process writes queued ends first, before reading anything.
     fn drop(&mut self) {
-        let connection = lock(&self.registry.inner.connection);
+        let ended = EndedSession {
+            session_id: std::mem::take(&mut self.session_id),
+            scope: std::mem::take(&mut self.scope),
+            ended_at_ms: now_ms(),
+        };
+        lock(&self.registry.inner.ended_sessions).push(ended);
+        match self.registry.inner.connection.try_lock() {
+            Ok(connection) => flush_ended_sessions(&self.registry.inner, &connection),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                flush_ended_sessions(&self.registry.inner, &poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let registry = self.registry.clone();
+                // If no thread can be started, the queued end is written by
+                // this process's next use of the registry; until then the
+                // row names a live process and keeps the view protected,
+                // which errs on the safe side.
+                let _ = std::thread::Builder::new()
+                    .name("aft-view-session-end".to_string())
+                    .spawn(move || drop(registry.connection()));
+            }
+        }
+    }
+}
+
+/// Writes every queued session end: deletes its row and records its end as
+/// the member's latest use. Called with the connection mutex held and no
+/// transaction open on it.
+fn flush_ended_sessions(inner: &RegistryInner, connection: &rusqlite::Connection) {
+    let ended = std::mem::take(&mut *lock(&inner.ended_sessions));
+    for session in ended {
         let _ = connection.execute(
             "DELETE FROM view_sessions WHERE session_id = ?1",
-            params![self.session_id],
+            params![session.session_id],
         );
         let _ = connection.execute(
             "UPDATE members SET last_bind_ms = MAX(last_bind_ms, ?2) WHERE scope = ?1",
-            params![self.scope, now_ms() as i64],
+            params![session.scope, session.ended_at_ms as i64],
         );
     }
 }
@@ -863,7 +944,7 @@ impl ReaderRegistration {
 
 impl Drop for ReaderRegistration {
     fn drop(&mut self) {
-        let _ = lock(&self.registry.inner.connection).execute(
+        let _ = self.registry.connection().execute(
             "DELETE FROM readers WHERE reader_id = ?1",
             params![self.reader_id],
         );
@@ -1099,6 +1180,45 @@ mod tests {
         let second = registry.begin_sweep().unwrap().unwrap();
         assert_eq!(second.epoch(), 2);
         assert_eq!(registry.gc_epoch().unwrap(), 2);
+    }
+
+    /// Dropping the last clone of a registration inside a barrier body, on
+    /// the thread that holds the registry connection, returns instead of
+    /// waiting for that connection; the session ends as soon as the barrier
+    /// is released, and the end time becomes the view's last use.
+    #[test]
+    fn dropping_the_last_registration_inside_a_barrier_returns_and_ends_the_session() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
+        let view = registry
+            .register_view("scope-a", &storage.path().join("root"))
+            .unwrap();
+        assert_eq!(registry.sessions().unwrap().len(), 1);
+        registry
+            .with_barrier(|tx| {
+                tx.execute("UPDATE members SET last_bind_ms = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let registry = registry.clone();
+            move || {
+                registry
+                    .with_barrier(move |_| {
+                        drop(view);
+                        Ok(())
+                    })
+                    .unwrap();
+                done_tx.send(()).unwrap();
+            }
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("dropping the last registration inside a barrier deadlocked");
+        worker.join().unwrap();
+        assert!(registry.sessions().unwrap().is_empty());
+        assert!(registry.member("scope-a").unwrap().unwrap().last_bind_ms > 1);
     }
 
     /// A pin started while another holder has the barrier waits for it. When

@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use crate::blob_store::v2::{family_dir, FamilyPlane, FamilyStoreReader};
 use crate::gc::family::{self, FamilySweepPolicy, FamilySweepReport, SweepBounds};
@@ -290,9 +290,18 @@ fn past(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Directory walks started on this thread, so a test can prove that a
+    /// path such as admission walks nothing.
+    static TREE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Total file bytes under `dir`, each file once, up to `MAX_WALK_DEPTH`
 /// levels. Symlinks are not followed and count nothing.
 fn tree_bytes(dir: &Path, deadline: Option<Instant>) -> std::io::Result<(u64, bool)> {
+    #[cfg(test)]
+    TREE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let mut bytes = 0u64;
     let mut read = 0usize;
     let mut complete = true;
@@ -432,6 +441,8 @@ pub fn measure(registry: &FamilyRegistry, deadline: Option<Instant>) -> Registry
     }
     usage.family_store = measure_family_store(registry, deadline)?;
     usage.complete &= usage.family_store.complete;
+    // Best effort: a failed record only leaves admission an older one.
+    let _ = record_usage(registry, &usage);
     Ok(usage)
 }
 
@@ -713,20 +724,41 @@ pub fn enforce(
     }
 
     report.after = measure(registry, deadline)?;
-    report.over_hard = over_hard(&report.after, budget, 0);
+    report.over_hard = over_hard((&report.after).into(), budget, 0);
     Ok(report)
 }
 
+/// Totals that decide admission and refusal, from a fresh measurement or
+/// from the last recorded one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UsageTotals {
+    pub view_store_bytes: u64,
+    pub held_view_bytes: u64,
+    pub largest_view_bytes: u64,
+    pub family_store_file_bytes: u64,
+}
+
+impl From<&DiskUsage> for UsageTotals {
+    fn from(usage: &DiskUsage) -> Self {
+        Self {
+            view_store_bytes: usage.view_store_bytes,
+            held_view_bytes: usage.held_view_bytes,
+            largest_view_bytes: usage.largest_view(),
+            family_store_file_bytes: usage.family_store.file_bytes,
+        }
+    }
+}
+
 /// The named reasons new work that adds `reserve` view-store bytes would be
-/// queued under `budget`, given `usage`.
-fn over_hard(usage: &DiskUsage, budget: DiskBudget, reserve: u64) -> Vec<String> {
+/// queued under `budget`, given `totals`.
+fn over_hard(totals: UsageTotals, budget: DiskBudget, reserve: u64) -> Vec<String> {
     let mut reasons = Vec::new();
-    if usage.view_store_bytes.saturating_add(reserve) > budget.view_store_hard {
+    if totals.view_store_bytes.saturating_add(reserve) > budget.view_store_hard {
         reasons.push(format!(
             "queued: view store disk: {} of {} bytes are held by active sessions or protected \
              generations, hard limit {} bytes{}",
-            usage.held_view_bytes,
-            usage.view_store_bytes,
+            totals.held_view_bytes,
+            totals.view_store_bytes,
             budget.view_store_hard,
             if reserve > 0 {
                 format!(", a new view reserves {reserve} bytes")
@@ -735,43 +767,133 @@ fn over_hard(usage: &DiskUsage, budget: DiskBudget, reserve: u64) -> Vec<String>
             }
         ));
     }
-    if usage.family_store.file_bytes > budget.family_store_hard {
+    if totals.family_store_file_bytes > budget.family_store_hard {
         reasons.push(format!(
             "queued: family store disk: {} bytes in use after collecting unreferenced keys, \
              hard limit {} bytes",
-            usage.family_store.file_bytes, budget.family_store_hard
+            totals.family_store_file_bytes, budget.family_store_hard
         ));
     }
     reasons
 }
 
-/// Admission of a new view under the family's hard limits. A new view's
-/// first generation will add about as many bytes as the largest view the
-/// family has, so that much is reserved. When the reserve does not fit, one
-/// enforcement pass runs first; when it still does not fit because what
-/// remains is held, the view is refused with the named reason and the caller
-/// retries later. Views already registered are never refused.
+/// Records `usage` in the registry, replacing the previous record, so that
+/// admission can decide without measuring. Views that left the registry
+/// drop out of the totals because admission joins on the member rows.
+fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<()> {
+    let now = crate::pins::now_ms() as i64;
+    registry.with_barrier(|tx| {
+        tx.execute_batch(super::registry::RUNTIME_SCHEMA)?;
+        tx.execute("DELETE FROM view_usage", [])?;
+        for view in &usage.views {
+            tx.execute(
+                "INSERT INTO view_usage (scope, bytes, held, measured_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    view.scope,
+                    i64::try_from(view.bytes).unwrap_or(i64::MAX),
+                    view.hold.is_some(),
+                    now
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO family_usage (singleton, file_bytes, measured_at_ms) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET file_bytes = excluded.file_bytes,
+                 measured_at_ms = excluded.measured_at_ms",
+            params![
+                i64::try_from(usage.family_store.file_bytes).unwrap_or(i64::MAX),
+                now
+            ],
+        )?;
+        Ok(())
+    })
+}
+
+/// The totals of the last recorded measurement, read with two queries over
+/// at most one row per member and no filesystem access. `None` when the
+/// family has never been measured.
+pub fn recorded_totals(registry: &FamilyRegistry) -> RegistryResult<Option<UsageTotals>> {
+    registry.read(|connection| {
+        let measured = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'family_usage'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !measured {
+            return Ok(None);
+        }
+        let Some(family_store_file_bytes) = connection
+            .query_row(
+                "SELECT file_bytes FROM family_usage WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let (view_store_bytes, held_view_bytes, largest_view_bytes) = connection.query_row(
+            "SELECT COALESCE(SUM(usage.bytes), 0),
+                    COALESCE(SUM(CASE WHEN usage.held THEN usage.bytes ELSE 0 END), 0),
+                    COALESCE(MAX(usage.bytes), 0)
+             FROM view_usage AS usage JOIN members ON members.scope = usage.scope",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        Ok(Some(UsageTotals {
+            view_store_bytes: view_store_bytes.max(0) as u64,
+            held_view_bytes: held_view_bytes.max(0) as u64,
+            largest_view_bytes: largest_view_bytes.max(0) as u64,
+            family_store_file_bytes: family_store_file_bytes.max(0) as u64,
+        }))
+    })
+}
+
+/// Admission of a new view under the family's hard limits, on the path that
+/// registers it, which may be a bind. It never measures and never evicts
+/// inline: it reads the last recorded totals (one row per member, no
+/// directory walk), and a new view's first generation is assumed to add as
+/// many bytes as the largest recorded view. If that does not fit, an
+/// enforcement pass starts in the background and the view is refused now
+/// with the named reason; registering again after the pass may succeed. A
+/// family never measured is admitted. Views already registered are never
+/// refused.
 pub fn admit_new_view(registry: &FamilyRegistry) -> RegistryResult<()> {
     let budget = registry.disk_budget();
-    let usage = measure(registry, None)?;
-    let reserve = usage.largest_view();
-    if over_hard(&usage, budget, reserve).is_empty() {
+    // A family never measured is admitted; the periodic pass measures it.
+    let Some(totals) = recorded_totals(registry)? else {
         return Ok(());
-    }
-    let report = enforce(registry, EnforceOptions::default()).map_err(|error| match error {
-        EvictionError::Registry(error) => error,
-        EvictionError::Io(error) => RegistryError::Io(error),
-    })?;
-    let reasons = over_hard(&report.after, budget, report.after.largest_view());
+    };
+    let reasons = over_hard(totals, budget, totals.largest_view_bytes);
     if reasons.is_empty() {
         return Ok(());
     }
+    let started = spawn_enforcement(registry.clone(), true);
+    let reason = format!(
+        "{}; {}",
+        reasons.join("; "),
+        if started {
+            "an eviction pass has started, register again after it"
+        } else {
+            "an eviction pass is already running, register again after it"
+        }
+    );
     crate::slog_warn!(
         "view admission refused family={} {}",
         registry.family(),
-        reasons.join("; ")
+        reason
     );
-    Err(RegistryError::AdmissionQueued(reasons.join("; ")))
+    Err(RegistryError::AdmissionQueued(reason))
 }
 
 fn last_runs() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
@@ -784,15 +906,18 @@ fn in_flight() -> &'static Mutex<BTreeSet<PathBuf>> {
     RUNNING.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+fn is_running(key: &Path) -> bool {
+    in_flight()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key)
+}
+
 /// True when this process has not checked `registry`'s limits within
 /// [`ENFORCEMENT_INTERVAL`] and no check is running.
 pub fn enforcement_due(registry: &FamilyRegistry) -> bool {
     let key = registry.path().to_path_buf();
-    if in_flight()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&key)
-    {
+    if is_running(&key) {
         return false;
     }
     last_runs()
@@ -805,7 +930,14 @@ pub fn enforcement_due(registry: &FamilyRegistry) -> bool {
 /// Starts one background enforcement pass for `registry` when one is due.
 /// Returns whether a pass was started.
 pub fn spawn_enforcement_if_due(registry: FamilyRegistry) -> bool {
-    if !enforcement_due(&registry) {
+    spawn_enforcement(registry, false)
+}
+
+/// Starts one background enforcement pass, unless one is already running
+/// for the family in this process. Without `force` it also waits out
+/// [`ENFORCEMENT_INTERVAL`] since the last pass.
+fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> bool {
+    if !force && !enforcement_due(&registry) {
         return false;
     }
     let key = registry.path().to_path_buf();
@@ -852,6 +984,19 @@ pub fn spawn_enforcement_if_due(registry: FamilyRegistry) -> bool {
         return false;
     }
     true
+}
+
+/// Waits until no background pass for `registry` runs in this process.
+#[cfg(test)]
+pub(crate) fn wait_for_background_enforcement(registry: &FamilyRegistry) {
+    let started = Instant::now();
+    while is_running(registry.path()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "background enforcement did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn log_report(registry: &FamilyRegistry, report: &EnforcementReport) {
@@ -1188,7 +1333,10 @@ mod tests {
 
     /// When everything over the hard limit is held, nothing is deleted and a
     /// new view is refused with the named reason; an existing view still
-    /// re-binds. Once a session ends, the new view is admitted by evicting it.
+    /// re-binds. Admission decides from the last recorded measurement and
+    /// never evicts inline: a refusal starts a background pass, and once a
+    /// session has ended, that pass evicts it and the next registration of
+    /// the new view is admitted.
     #[test]
     fn held_bytes_over_the_hard_limit_refuse_new_views_by_name() {
         let storage = tempfile::tempdir().unwrap();
@@ -1216,9 +1364,14 @@ mod tests {
         };
         assert!(reason.starts_with("queued: view store disk"), "{reason}");
         assert!(reason.contains("held by active sessions"), "{reason}");
+        assert!(reason.contains("eviction pass"), "{reason}");
         assert!(!registered(&registry, "c"));
+        wait_for_background_enforcement(&registry);
         let after = measure(&registry, None).unwrap();
-        assert_eq!(after.view_store_bytes, usage.view_store_bytes);
+        assert_eq!(
+            after.view_store_bytes, usage.view_store_bytes,
+            "the background pass deleted nothing held"
+        );
         let rebound = registry
             .register_view("a", &storage.path().join("a"))
             .expect("an existing view re-binds over the limit");
@@ -1226,9 +1379,70 @@ mod tests {
 
         let b = sessions.pop().unwrap();
         drop(b);
+        // The last record still shows b held, so this attempt is refused
+        // too, and its background pass now finds b idle and evicts it.
+        assert!(matches!(
+            registry.register_view("c", &new_root),
+            Err(RegistryError::AdmissionQueued(_))
+        ));
+        wait_for_background_enforcement(&registry);
+        assert!(!registered(&registry, "b"), "b was evicted to admit c");
         let admitted = registry.register_view("c", &new_root).unwrap();
         assert!(registered(&registry, "c"));
-        assert!(!registered(&registry, "b"), "b was evicted to admit c");
+        drop(admitted);
+    }
+
+    /// Admission on the registration path reads recorded totals only: with
+    /// a family of many views it walks no directory, whether it admits or
+    /// refuses, and a refusal leaves the eviction to a background pass.
+    #[test]
+    fn admission_walks_no_directory_even_for_a_large_family() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for index in 0..40u64 {
+            idle_view(&registry, &format!("idle-{index:02}"), index, 8);
+        }
+        let usage = measure(&registry, None).unwrap();
+        assert_eq!(usage.views.len(), 40);
+        let walks = || TREE_WALKS.with(std::cell::Cell::get);
+
+        let before = walks();
+        let admitted = registry
+            .register_view("admitted", &storage.path().join("admitted"))
+            .unwrap();
+        assert_eq!(walks(), before, "admitting walked a directory");
+
+        registry.set_disk_budget(budget(0, usage.largest_view() * 3));
+        let before = walks();
+        let refused = registry
+            .register_view("refused", &storage.path().join("refused"))
+            .unwrap_err();
+        assert_eq!(walks(), before, "refusing walked a directory");
+        assert!(
+            matches!(&refused, RegistryError::AdmissionQueued(reason)
+                if reason.starts_with("queued: view store disk")),
+            "{refused}"
+        );
+        assert_eq!(
+            registry.members().unwrap().len(),
+            41,
+            "nothing was evicted on the registration path"
+        );
+
+        wait_for_background_enforcement(&registry);
+        let members = registry.members().unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.scope.as_str())
+                .collect::<Vec<_>>(),
+            ["admitted"],
+            "the background pass evicted every idle view"
+        );
+        let retried = registry
+            .register_view("refused", &storage.path().join("refused"))
+            .expect("admitted after the background pass");
+        drop(retried);
         drop(admitted);
     }
 

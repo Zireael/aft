@@ -1016,12 +1016,24 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
 /// Starts a background check of the disk limits of the repository family
 /// whose per-checkout view this root has loaded, when one is due (see
 /// `views::eviction`). It runs on its own thread so eviction and the family
-/// sweep never hold up a drain.
+/// sweep never hold up a drain. With views on but no checkout loaded yet,
+/// it looks again shortly; with views off it is never due.
 pub fn drain_view_disk_limits(ctx: &AppContext) {
-    if let Some(registry) = ctx.checkout_view_registry() {
-        crate::views::eviction::spawn_enforcement_if_due(registry);
+    if !ctx.view_disk_limits_due() {
+        return;
+    }
+    match ctx.checkout_view_registry() {
+        Some(registry) => {
+            ctx.schedule_view_disk_limits(crate::views::eviction::ENFORCEMENT_INTERVAL);
+            crate::views::eviction::spawn_enforcement_if_due(registry);
+        }
+        None => ctx.schedule_view_disk_limits(VIEW_DISK_LIMITS_UNLOADED_RETRY),
     }
 }
+
+/// How soon the drain looks again for a views-on root whose checkout view
+/// has not loaded yet.
+const VIEW_DISK_LIMITS_UNLOADED_RETRY: Duration = Duration::from_secs(30);
 
 pub fn drain_semantic_index_events(ctx: &AppContext) {
     drain_view_disk_limits(ctx);
