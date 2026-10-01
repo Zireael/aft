@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+  "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -163,7 +163,7 @@
                   ]
                 },
                 "path": {
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
                   "type": "string"
                 },
                 "name": {
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -277,7 +277,7 @@
                   "type": "string"
                 },
                 "content": {
-                  "description": "The full content to write to the file",
+                  "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
                   "type": "string"
                 }
               },
@@ -377,7 +377,7 @@
             }
           },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -508,7 +508,7 @@
             }
           },
           "bash_watch": {
-            "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+            "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -542,7 +542,7 @@
                   "type": "boolean"
                 },
                 "timeoutMs": {
-                  "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default).",
+                  "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given.",
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 1800000
@@ -710,7 +710,7 @@
                   ]
                 },
                 "path": {
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
                   "type": "string"
                 },
                 "name": {
@@ -1072,7 +1072,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1149,7 +1149,7 @@
                   "type": "string"
                 },
                 "content": {
-                  "description": "The full content to write to the file",
+                  "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
                   "type": "string"
                 }
               },
@@ -1249,7 +1249,7 @@
             }
           },
           "bash": {
-            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1380,7 +1380,7 @@
             }
           },
           "bash_watch": {
-            "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+            "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1414,7 +1414,7 @@
                   "type": "boolean"
                 },
                 "timeoutMs": {
-                  "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default).",
+                  "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given.",
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 1800000
@@ -1582,7 +1582,7 @@
                   ]
                 },
                 "path": {
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
                   "type": "string"
                 },
                 "name": {
@@ -2004,7 +2004,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2161,7 +2161,7 @@
                 },
                 "path": {
                   "type": "string",
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root."
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root."
                 },
                 "name": {
                   "type": "string",
@@ -2195,7 +2195,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -2221,7 +2221,7 @@
           "bash": {
             "name": "bash",
             "label": "bash",
-            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "promptSnippet": "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
             "promptGuidelines": [
               "DO NOT use bash for code search or exploration — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
@@ -2342,7 +2342,7 @@
           "bash_watch": {
             "name": "bash_watch",
             "label": "bash_watch",
-            "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+            "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
             "promptSnippet": "Wait for or watch a background bash task",
             "parameters": {
               "type": "object",
@@ -2386,7 +2386,7 @@
                       "type": "string"
                     }
                   ],
-                  "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default)."
+                  "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given."
                 },
                 "once": {
                   "type": "boolean"
@@ -2555,7 +2555,7 @@
                 },
                 "content": {
                   "type": "string",
-                  "description": "Full file contents to write"
+                  "description": "Full file contents to write; for issue://N / pr://N, the comment body to post"
                 }
               }
             }
@@ -2591,7 +2591,7 @@
                 },
                 "appendContent": {
                   "type": "string",
-                  "description": "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, other edit modes are ignored."
+                  "description": "Append text to the end of the file (creates the file if missing, parent dirs auto-created). Mixing with other edit modes is rejected."
                 },
                 "edits": {
                   "type": "array",
@@ -3022,7 +3022,7 @@
                 },
                 "path": {
                   "type": "string",
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root."
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root."
                 },
                 "name": {
                   "type": "string",
@@ -3176,7 +3176,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "396ea08c60db01da80c9a99fcb6d14c710122e89",
+      "source_commit": "073d9c3a3dd51e7107ecdb5d517018baf4c5fb3d",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -3203,7 +3203,7 @@
           "bash": {
             "name": "bash",
             "label": "bash",
-            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+            "description": "Execute shell commands. Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`. Commands run in the foreground and return inline; `wait: true` blocks until a long command finishes instead of auto-promoting; Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use `background: true` yourself ONLY when you have other useful work to do while it runs; then `bash_watch` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately `bash_watch` it (that wastes a turn for what foreground returns in one), and never loop `bash_status` to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. `pty: true` runs interactive programs (REPLs, TUIs), implies background, and is driven with `bash_status({ output_mode: \"screen\" })` plus `bash_write`.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
             "promptSnippet": "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)",
             "promptGuidelines": [
               "DO NOT use bash for code search or exploration — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
@@ -3324,7 +3324,7 @@
           "bash_watch": {
             "name": "bash_watch",
             "label": "bash_watch",
-            "description": "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+            "description": "Watch a background bash task. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
             "promptSnippet": "Wait for or watch a background bash task",
             "parameters": {
               "type": "object",
@@ -3368,7 +3368,7 @@
                       "type": "string"
                     }
                   ],
-                  "description": "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default)."
+                  "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given."
                 },
                 "once": {
                   "type": "boolean"
@@ -3537,7 +3537,7 @@
                 },
                 "content": {
                   "type": "string",
-                  "description": "Full file contents to write"
+                  "description": "Full file contents to write; for issue://N / pr://N, the comment body to post"
                 }
               }
             }
@@ -3573,7 +3573,7 @@
                 },
                 "appendContent": {
                   "type": "string",
-                  "description": "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, other edit modes are ignored."
+                  "description": "Append text to the end of the file (creates the file if missing, parent dirs auto-created). Mixing with other edit modes is rejected."
                 },
                 "edits": {
                   "type": "array",
@@ -4072,7 +4072,7 @@
                 },
                 "path": {
                   "type": "string",
-                  "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root."
+                  "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root."
                 },
                 "name": {
                   "type": "string",
