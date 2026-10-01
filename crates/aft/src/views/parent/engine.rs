@@ -293,39 +293,32 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         return Response::success(&req.id, body);
     }
     let wanted = offset.saturating_add(top_k);
-    // The model is lent to each engine in turn: the query is embedded once
-    // (the model caches it) and no child starts a model of its own.
+    // When semantic search runs, the session's one model is lent to each
+    // engine in turn: the query is embedded once (the model caches it) and no
+    // child starts a model of its own, so those engines run one after
+    // another. Without a model to lend, the children's engines are
+    // independent and run in parallel.
     let semantic = read(&session.semantic).clone();
-    let mut model = semantic
+    let model = semantic
         .ready()
         .and_then(|semantic| lock(&semantic.model).take());
     if let Some(reason) = semantic.gap_reason("semantic") {
-        if session.planes.semantic {
-            gaps.push("parent_semantic_unavailable", ".".into(), reason);
-        }
+        // A normal answer without semantic search is incomplete too; the
+        // parent says why once instead of once per child.
+        gaps.push("parent_semantic_unavailable", ".".into(), reason);
     }
-    let mut lists = Vec::new();
-    let mut first: Option<Value> = None;
-    let mut more_available = false;
-    let mut engine_capped = false;
-    let mut fully_degraded = true;
-    let mut semantic_statuses = Vec::new();
-    for child in session.children() {
-        if !(child.root.starts_with(&scope) || scope.starts_with(&child.root)) {
-            continue;
-        }
-        if let Some(reason) = read(&child.semantic).gap_reason("semantic") {
-            if session.planes.semantic {
-                gaps.child(&child, reason);
-            }
-        }
+    let children = session
+        .children()
+        .into_iter()
+        .filter(|child| child.root.starts_with(&scope) || scope.starts_with(&child.root))
+        .collect::<Vec<_>>();
+    let run = |child: &Child, lent: Option<crate::semantic_index::EmbeddingModel>| {
         let mut engine = lock(&child.engine);
         let Some(engine) = engine.as_mut() else {
             let reason = read(&child.trigram)
                 .gap_reason("trigram")
                 .unwrap_or_else(|| "the search engine of this repository is still loading".into());
-            gaps.child(&child, reason);
-            continue;
+            return (Err(reason), lent);
         };
         let mut params = json!({
             "id": req.id,
@@ -339,29 +332,74 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         }
         let child_req: RawRequest = match serde_json::from_value(params) {
             Ok(request) => request,
-            Err(error) => {
-                gaps.child(&child, format!("aft_search: {error}"));
+            Err(error) => return (Err(format!("aft_search: {error}")), lent),
+        };
+        let lending = lent.is_some();
+        if lending {
+            *engine.ctx.semantic_embedding_model().lock() = lent;
+        }
+        let response =
+            crate::commands::semantic_search::handle_semantic_search(&child_req, &engine.ctx);
+        let returned = if lending {
+            engine.ctx.semantic_embedding_model().lock().take()
+        } else {
+            None
+        };
+        if !response.success {
+            return (
+                Err(format!(
+                    "aft_search failed in this repository: {}",
+                    response.data["message"].as_str().unwrap_or("unknown error")
+                )),
+                returned,
+            );
+        }
+        (Ok(response.data), returned)
+    };
+    let outcomes = if model.is_some() {
+        let mut model = model;
+        let mut outcomes = Vec::new();
+        for child in &children {
+            let (outcome, returned) = run(child, model.take());
+            model = returned;
+            outcomes.push(outcome);
+        }
+        if let Some(semantic) = semantic.ready() {
+            *lock(&semantic.model) = model;
+        }
+        outcomes
+    } else {
+        use rayon::prelude::*;
+        children
+            .par_iter()
+            .map(|child| run(child, None).0)
+            .collect::<Vec<_>>()
+    };
+
+    let mut lists = Vec::new();
+    let mut first: Option<Value> = None;
+    let mut more_available = false;
+    let mut engine_capped = false;
+    let mut fully_degraded = true;
+    let mut semantic_statuses = Vec::new();
+    for (child, outcome) in children.iter().zip(outcomes) {
+        if session.planes.semantic && semantic.ready().is_some() {
+            if let Some(reason) = read(&child.semantic).gap_reason("semantic") {
+                gaps.child(child, reason);
+            }
+        }
+        let data = match outcome {
+            Ok(data) => data,
+            Err(reason) => {
+                gaps.child(child, reason);
                 continue;
             }
         };
-        *engine.ctx.semantic_embedding_model().lock() = model.take();
-        let response =
-            crate::commands::semantic_search::handle_semantic_search(&child_req, &engine.ctx);
-        model = engine.ctx.semantic_embedding_model().lock().take();
-        if !response.success {
+        // Without semantic search every child's answer is incomplete for the
+        // reason already named once above.
+        if data["complete"] == false && semantic.ready().is_some() {
             gaps.child(
-                &child,
-                format!(
-                    "aft_search failed in this repository: {}",
-                    response.data["message"].as_str().unwrap_or("unknown error")
-                ),
-            );
-            continue;
-        }
-        let data = response.data;
-        if data["complete"] == false {
-            gaps.child(
-                &child,
+                child,
                 format!(
                     "aft_search: this repository's answer is incomplete (semantic status: {})",
                     data["semantic_status"].as_str().unwrap_or("unknown")
@@ -380,15 +418,12 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
             .unwrap_or_default()
             .into_iter()
             .map(|mut row| {
-                prefix_row(&mut row, session.root(), &child);
+                prefix_row(&mut row, session.root(), child);
                 row
             })
             .collect::<VecDeque<_>>();
         lists.push(rows);
         first.get_or_insert(data);
-    }
-    if let Some(semantic) = semantic.ready() {
-        *lock(&semantic.model) = model;
     }
     gaps.scope(session, &scope);
 
@@ -411,6 +446,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         },
         crate::list_surfaces::search::SEARCH_NARROW,
     );
+    semantic_statuses.sort();
     semantic_statuses.dedup();
     let semantic_status = match semantic_statuses.as_slice() {
         [single] => single.clone(),
