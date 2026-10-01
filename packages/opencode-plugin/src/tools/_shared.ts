@@ -158,9 +158,12 @@ export function projectRootFor(runtime: ToolRuntime): string {
     return canonicalizeDirectory(cached);
   }
 
-  const raw = runtime.directoryIsSessionRoot
-    ? runtime.directory
-    : (runtime.worktree ?? runtime.directory);
+  // A failed lookup has no session root to trust. Keep its fallback local to
+  // this call rather than binding a linked-worktree session to the main checkout.
+  const raw =
+    runtime.directoryIsSessionRoot || cached === null
+      ? runtime.directory
+      : (runtime.worktree ?? runtime.directory);
   return canonicalizeDirectory(raw);
 }
 
@@ -278,16 +281,21 @@ export async function callBridge(
   // OpenCode sets `runtime.directory = process.cwd()` even for resumed
   // sessions, so we can't trust it as the workspace root. Subsequent
   // calls in the same session hit the cache and skip the lookup.
-  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
-    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
-  }
+  // Both host lookups are bounded; run them together so their timeout budgets
+  // do not add up before a tool can reach the bridge.
+  const [workerSession] = await Promise.all([
+    isWorkerRuntime(ctx, runtime),
+    runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined
+      ? getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory)
+      : Promise.resolve(),
+  ]);
 
   const merged: Record<string, unknown> = { ...params };
   if (runtime.sessionID) {
     merged.session_id = runtime.sessionID;
   }
   // The caller's role travels with every request, beside the session.
-  if (await isWorkerRuntime(ctx, runtime)) {
+  if (workerSession) {
     merged[WORKER_SESSION_FIELD] = true;
   }
   const timeoutMs = timeoutForCommand(command);
@@ -333,12 +341,16 @@ export async function callToolCall(
   rawArgs: Record<string, unknown> = {},
   options?: ToolCallOptions,
 ): Promise<ToolCallResult> {
-  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
-    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
-  }
+  // Run the worker-role and session-directory lookups together so their
+  // timeout budgets do not add up before the tool call proceeds.
+  const [workerSession] = await Promise.all([
+    isWorkerRuntime(ctx, runtime),
+    runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined
+      ? getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory)
+      : Promise.resolve(),
+  ]);
 
   const timeoutMs = timeoutForCommand(name);
-  const workerSession = await isWorkerRuntime(ctx, runtime);
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,

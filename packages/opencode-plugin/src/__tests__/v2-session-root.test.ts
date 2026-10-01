@@ -68,7 +68,7 @@ describe("OpenCode 2 session directory lookup", () => {
     expect(getSessionDirectoryCached("ses_v2")).toBe("/work/linked");
   });
 
-  test("a failed lookup is cached as null and not retried, so it is logged once", async () => {
+  test("a failed lookup is cached as null and not immediately retried", async () => {
     let calls = 0;
     const context = v2Context({ directory: "/work/linked" }, () => {
       calls++;
@@ -88,6 +88,7 @@ describe("OpenCode 2 session directory lookup", () => {
       const started = Date.now();
       expect(await getSessionDirectory(context, "ses_hang", "/work/linked")).toBeNull();
       expect(Date.now() - started).toBeGreaterThanOrEqual(V2_SESSION_LOOKUP_TIMEOUT_MS - 50);
+      expect(Date.now() - started).toBeLessThan(1_500);
       expect(getSessionDirectoryCached("ses_hang")).toBeNull();
     },
     V2_SESSION_LOOKUP_TIMEOUT_MS + 5_000,

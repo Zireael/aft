@@ -68,12 +68,14 @@ function isV2PluginContext(client: unknown): client is V2PluginContextShape {
 }
 
 /**
- * How long an OpenCode 2 session lookup may run. The lookup is awaited before
- * the first tool call of a session is routed, so a host that never answers
- * must not hold that call; after this long the call proceeds with the
- * Location's directory instead.
+ * How long a session lookup may run on either host version. Tool routing
+ * awaits this lookup, so an unresponsive host must not hold the call forever.
+ * After this budget the call proceeds with its own directory instead.
  */
-export const V2_SESSION_LOOKUP_TIMEOUT_MS = 3_000;
+export const LOOKUP_TIMEOUT_MS = 1_000;
+export const V2_SESSION_LOOKUP_TIMEOUT_MS = LOOKUP_TIMEOUT_MS;
+/** A failed lookup is provisional; retry later without querying on every call. */
+export const FAILED_LOOKUP_RETRY_MS = 30_000;
 
 interface OpenCodeClientShape {
   session?: {
@@ -86,14 +88,15 @@ interface OpenCodeClientShape {
 }
 
 interface CacheEntry {
-  /** Resolved directory, or `null` if lookup failed and we should not retry. */
+  /** Resolved directory, or `null` while a failed lookup is cooling down. */
   directory: string | null;
-  /** Wall-clock timestamp of the cache entry, used only for LRU eviction. */
+  /** When the answer was recorded; failed lookups become retryable after 30 seconds. */
   recordedAt: number;
 }
 
 const CACHE_MAX_ENTRIES = 200;
 const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<string | null>>();
 
 /**
  * Resolve the project directory the session was created with from the SDK's
@@ -114,19 +117,63 @@ export async function getSessionDirectory(
   if (!sessionId) return null;
 
   const cached = cache.get(sessionId);
-  if (cached) {
+  if (
+    cached &&
+    (cached.directory !== null || Date.now() - cached.recordedAt < FAILED_LOOKUP_RETRY_MS)
+  ) {
     // Refresh LRU position
     cache.delete(sessionId);
     cache.set(sessionId, cached);
     return cached.directory;
   }
 
+  const pending = inflight.get(sessionId);
+  if (pending) return pending;
+  const lookup = boundedLookup(client, sessionId, fallbackDirectory).finally(() => {
+    inflight.delete(sessionId);
+  });
+  inflight.set(sessionId, lookup);
+  return lookup;
+}
+
+/** Ignore late answers: a timed-out lookup must not overwrite a later retry. */
+async function boundedLookup(
+  client: unknown,
+  sessionId: string,
+  fallbackDirectory: string,
+): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        sessionWarn(
+          sessionId,
+          `[aft-plugin] session lookup did not answer within ${LOOKUP_TIMEOUT_MS}ms; using the call's directory for now`,
+        );
+        resolve(null);
+      }, LOOKUP_TIMEOUT_MS);
+    });
+    const directory = await Promise.race([
+      lookupSessionDirectory(client, sessionId, fallbackDirectory),
+      timeout,
+    ]);
+    setCache(sessionId, directory);
+    return directory;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function lookupSessionDirectory(
+  client: unknown,
+  sessionId: string,
+  fallbackDirectory: string,
+): Promise<string | null> {
   if (isV2PluginContext(client)) return lookupV2SessionDirectory(client, sessionId);
 
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
   if (!sessionApi || typeof sessionApi.get !== "function") {
-    setCache(sessionId, null);
     return null;
   }
 
@@ -148,7 +195,7 @@ export async function getSessionDirectory(
       dir = session.directory;
     }
   } catch (err) {
-    // Don't poison the cache on transient errors — but do log once.
+    // The bounded caller caches failures briefly so a struggling host is not polled per call.
     sessionWarn(
       sessionId,
       `[aft-plugin] session.get lookup failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -156,7 +203,6 @@ export async function getSessionDirectory(
     return null;
   }
 
-  setCache(sessionId, dir);
   return dir;
 }
 
@@ -164,12 +210,10 @@ export async function getSessionDirectory(
  * OpenCode 2 lookup: run the context's `session.get` Effect under a timeout and
  * read `location.directory`.
  *
- * Unlike the OpenCode 1 path, a failure or timeout is cached (as `null`), so it
- * is logged once per session and never retried. The fallback is already right:
- * with no cached directory, `projectRootFor` uses the tool call's Location
- * directory for OpenCode 2 runtimes, and OpenCode 2 runs every session inside
- * the Location created for that session's own directory. Retrying would only
- * add up to the timeout to every later tool call while the host misbehaves.
+ * The outer bounded lookup applies the same retry policy as OpenCode 1.
+ * The Effect timeout also interrupts the abandoned V2 lookup; fallback remains
+ * the tool call's runtime.directory (the host's Location directory), never
+ * the main checkout.
  */
 async function lookupV2SessionDirectory(
   context: V2PluginContextShape,
@@ -196,7 +240,6 @@ async function lookupV2SessionDirectory(
       `[aft-plugin] OpenCode 2 session lookup failed (${failure}); tool paths and bash use the Location directory ${context.location.directory} for this session`,
     );
   }
-  setCache(sessionId, dir);
   return dir;
 }
 
@@ -226,6 +269,10 @@ export function getSessionDirectoryCached(
   if (!sessionId) return undefined;
   const cached = cache.get(sessionId);
   if (!cached) return undefined;
+  if (cached.directory === null && Date.now() - cached.recordedAt >= FAILED_LOOKUP_RETRY_MS) {
+    cache.delete(sessionId);
+    return undefined;
+  }
   return cached.directory;
 }
 
@@ -240,7 +287,7 @@ export function warmSessionDirectory(
   fallbackDirectory: string,
 ): void {
   if (!sessionId) return;
-  if (cache.has(sessionId)) return;
+  if (getSessionDirectoryCached(sessionId) !== undefined) return;
   void getSessionDirectory(client, sessionId, fallbackDirectory);
 }
 
@@ -302,5 +349,6 @@ export async function verifySessionDirectory(
 /** Test-only: clear the cache between unit tests. */
 export function _resetSessionDirectoryCacheForTest(): void {
   cache.clear();
+  inflight.clear();
   verifyCache.clear();
 }

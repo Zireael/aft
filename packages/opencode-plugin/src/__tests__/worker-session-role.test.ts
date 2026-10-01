@@ -37,10 +37,10 @@ function harness(parentID: string | undefined, hang = false) {
     pool: { getBridge: () => bridge } as unknown as BridgePool,
     client: {
       session: {
-        // With `hang`, only the first lookup (the session-directory one,
-        // which callBridge awaits first) answers; the role lookup never does.
+        // callBridge starts the role lookup first, alongside the directory
+        // lookup. Only the role lookup hangs; directory resolution still works.
         get: async (input: { path: { id: string } }) =>
-          hang && ++lookups > 1
+          hang && ++lookups === 1
             ? new Promise<never>(() => {})
             : { data: { id: input.path.id, parentID, directory: PROJECT_CWD } },
       },
