@@ -314,10 +314,10 @@ fn main() {
                     flushed,
                     aft::subc::exit_elapsed().as_millis()
                 );
-                // The flush above measures persistence of the shutdown phases.
-                // This final process_exit line needs its own flush because the
-                // file writer runs on a thread that process termination stops.
-                aft::slog_info!(
+                // A bounded queue flush can expire on a slow writer. Take its
+                // sink and persist the terminal marker directly so later writes
+                // cannot rotate it away before either kind of process exit.
+                let terminal = format!(
                     "subc exit phase=process_exit mode={} elapsed_ms={}",
                     if native_idle {
                         "return"
@@ -326,7 +326,9 @@ fn main() {
                     },
                     aft::subc::exit_elapsed().as_millis()
                 );
-                aft::logging::flush_durable_log(aft::subc::exit_log_flush_wait());
+                if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
+                    eprintln!("[aft] terminal log persistence failed: {error}; {terminal}");
+                }
                 if !native_idle {
                     aft::ort_lifecycle::exit_without_native_teardown(0);
                 }

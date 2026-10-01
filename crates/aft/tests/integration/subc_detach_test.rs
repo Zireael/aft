@@ -557,12 +557,26 @@ fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
     drain_with_live_lsp_servers("", false, true);
 }
 
+#[test]
+fn subc_drain_with_slow_writer_persists_terminal_line() {
+    drain_with_live_lsp_servers_and_writer("", false, false, "1000");
+}
+
 /// Binds 34 roots that each start a fake rust-analyzer which never answers
 /// Shutdown, drains the module and checks that it exits within the drain
 /// budget with no language server left behind. `server_env` holds extra
 /// `NAME=value` assignments for the fake servers; `under_load` keeps every
 /// CPU busy from the drain until the module has exited.
 fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
+    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40");
+}
+
+fn drain_with_live_lsp_servers_and_writer(
+    server_env: &str,
+    under_load: bool,
+    active_ort: bool,
+    writer_delay: &str,
+) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -620,6 +634,7 @@ fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: b
             Some(bin_dir.path()),
             active_ort,
             true,
+            writer_delay,
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -670,6 +685,10 @@ fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: b
             elapsed.as_millis()
         );
         let log = std::fs::read_to_string(&stderr_path).unwrap();
+        if writer_delay == "1000" {
+            assert!(log.contains("phase=log_flush_done flushed=false"),
+                "slow writer must exhaust the async flush budget: {}", log_tail(&log));
+        }
         // Print the `subc exit phase=` and LSP shutdown summary lines, so a run
         // near the 2 s limit shows how long each exit phase took.
         for line in log
@@ -714,12 +733,19 @@ fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: b
             .and_then(|value| value.trim().parse::<u128>().ok())
             .expect("shutdown summary reports elapsed_ms");
         if !under_load {
-            // The deliberate CPU hog can delay loop teardown and the observer;
-            // the quiet variants isolate overlap, while both retain the 2 s cap.
+            // Compare the combined phase to its sequential cost, not the entire
+            // process exit to LSP time. Log persistence and observer scheduling
+            // are outside these phases and retain the separate two-second cap.
+            let combined_ms = log.lines()
+                .find(|line| line.contains("phase=lsp_done elapsed_ms="))
+                .and_then(|line| line.rsplit("elapsed_ms=").next())
+                .and_then(|value| value.parse::<u128>().ok())
+                .expect("combined shutdown elapsed time");
+            let sequential_ms = lsp_elapsed_ms + 450;
             assert!(
-                elapsed.as_millis() < lsp_elapsed_ms.max(500) + 300,
-                "index and LSP waits added instead of overlapping: exit={} ms, lsp={lsp_elapsed_ms} ms; {}",
-                elapsed.as_millis(), log_tail(&log)
+                combined_ms + 225 < sequential_ms,
+                "shutdown did not save half the index wait by overlapping: combined={combined_ms} ms, sequential={sequential_ms} ms; {}",
+                log_tail(&log)
             );
         }
         let lsp_ceiling = aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150);
@@ -824,6 +850,7 @@ impl ModuleProcess {
             bin_dir,
             false,
             false,
+            "40",
         )
     }
 
@@ -835,6 +862,7 @@ impl ModuleProcess {
         bin_dir: Option<&Path>,
         active_ort: bool,
         busy_index: bool,
+        writer_delay: &str,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -865,7 +893,7 @@ impl ModuleProcess {
         if busy_index {
             command.env("AFT_CACHE_DIR", data_home);
             command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
-            command.env("AFT_TEST_LOG_WRITER_DELAY_MS", "40");
+            command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
         }
         if let Some(bin_dir) = bin_dir {
             command.env(
