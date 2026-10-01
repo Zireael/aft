@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "hyphenated-literal-rows",
+    "split-rows-not-applicable-gate",
+    "rust-analyzer-check-state",
+    "opencode-session-directory-bound"
+  ],
+  "note": "Adds 8 hyphenated-literal real-query rows with the reference re-recorded on the unchanged engine (all 68 existing rows byte-identical), and skips joined split rows when the engine reports it ignores pattern. Also carries rust-analyzer check-state and OpenCode session-directory fixes outside the ranking fence. The hyphenated-literal engine change lands in a later ranking train. No ranking-fence files."
+}
