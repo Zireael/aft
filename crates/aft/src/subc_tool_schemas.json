@@ -210,7 +210,7 @@
         "type": "string"
       },
       "content": {
-        "description": "The full content to write to the file",
+        "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
         "type": "string"
       }
     },
@@ -840,7 +840,7 @@
         ]
       },
       "path": {
-        "description": "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
+        "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
         "type": "string"
       },
       "name": {

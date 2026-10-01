@@ -312,7 +312,9 @@ const WriteParams = Type.Object({
   path: Type.String({
     description: "Path to the file to write (absolute or relative to project root)",
   }),
-  content: Type.String({ description: "Full file contents to write" }),
+  content: Type.String({
+    description: "Full file contents to write; for issue://N / pr://N, the comment body to post",
+  }),
 });
 
 const BatchEditParams = Type.Object({
@@ -362,7 +364,7 @@ const EditParams = Type.Object({
   appendContent: Type.Optional(
     Type.String({
       description:
-        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, other edit modes are ignored.",
+        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). Mixing with other edit modes is rejected.",
     }),
   ),
   edits: Type.Optional(

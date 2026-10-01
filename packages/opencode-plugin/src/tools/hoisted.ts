@@ -529,7 +529,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       filePath: z
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
-      content: z.string().describe("The full content to write to the file"),
+      content: z
+        .string()
+        .describe(
+          "The full content to write to the file; for issue://N / pr://N, the comment body to post",
+        ),
     },
     execute: async (args, context): Promise<ToolResult> => {
       const argsRecord = args as Record<string, unknown>;
