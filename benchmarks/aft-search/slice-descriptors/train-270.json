@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "grep-long-line-and-deadline",
+    "bind-beside-readers",
+    "load-flake-fixes"
+  ],
+  "note": "grep builds line details once per matched line (same matches, columns and text) and gains a 10 s scan deadline reported as incomplete; the aft_search regex route shares the line-detail fix. Rankings are unchanged, so ranked rows must stay byte-identical. Bind-beside-readers and the test-isolation fixes touch no ranking code."
+}
