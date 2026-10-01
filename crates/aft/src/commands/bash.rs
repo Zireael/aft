@@ -841,7 +841,7 @@ mod tests {
         let ctx = spawn_test_context(project.path(), storage.path());
         let mut request = spawn_test_request("hard-kill", "sleep 30", false);
         for (key, value) in extra.as_object().unwrap() {
-            // The role sits beside `session_id`, outside the bash arguments,
+            // `worker_session` sits beside `session_id`, outside the bash arguments,
             // as the plugins send it.
             if key == crate::protocol::WORKER_SESSION_FIELD {
                 request.params[key] = value.clone();

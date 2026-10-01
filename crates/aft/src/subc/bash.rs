@@ -515,8 +515,8 @@ pub(super) fn submit_deferred_bash(
                         Value::Array(grants.into_iter().map(Value::String).collect()),
                     );
                 }
-                // The caller's role comes from the call body, never from the
-                // agent's arguments: an agent must not be able to claim it is a
+                // `worker_session` comes from the plugin-set field of the subc
+                // call body, never from the agent's arguments: an agent must not be able to claim it is a
                 // worker to lift the default hard kill on its command.
                 translated
                     .args

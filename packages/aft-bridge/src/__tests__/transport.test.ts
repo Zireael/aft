@@ -72,7 +72,7 @@ describe("BinaryBridge toolCall transport", () => {
       session_id: "session-123",
       worker_session: true,
     });
-    // The role is request metadata, not a transport option.
+    // worker_session is part of the request, not a transport option.
     expect(bridge.calls[0]?.options).toBeUndefined();
   });
 });

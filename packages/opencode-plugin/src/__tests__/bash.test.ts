@@ -2342,7 +2342,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
             success: true,
             status: "running",
             task_id: "bash-sub-bg",
-            // The engine words the hand-off for a worker (worker_session).
+            // The engine's reply to a worker says the task won't wake it.
             output:
               "Background task started: bash-sub-bg. It won't wake you when it finishes, so wait for it before you report a result.",
           };
@@ -2371,7 +2371,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(result as string).not.toContain("timeoutMs: 60000");
     expect(calls.find((c) => c.command === "bash")?.params.background).toBe(true);
     expect(calls.find((c) => c.command === "bash")?.params.notify_on_completion).toBe(true);
-    // The engine can only word its reply for a worker if it is told the role.
+    // The engine can only word its reply for a worker if the request carries worker_session.
     expect(calls.find((c) => c.command === "bash")?.params.worker_session).toBe(true);
   });
 

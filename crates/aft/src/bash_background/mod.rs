@@ -207,7 +207,7 @@ impl BgTaskStatus {
     }
 }
 
-/// When a background bash task is killed for running too long.
+/// When a background bash task is killed for running too long (its hard kill).
 ///
 /// Every spawn names one explicitly, so no caller can drop the default by
 /// passing an empty timeout by accident.

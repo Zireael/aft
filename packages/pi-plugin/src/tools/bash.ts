@@ -886,8 +886,8 @@ export function registerBashTool(
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
         trackBgTask(resolveSessionId(extCtx), taskId);
-        // AFT words the hand-off text for the caller's role, which callBridge
-        // sends with every request.
+        // The Rust engine words this hand-off text for the caller's role
+        // (worker_session, which callBridge adds to every request).
         return bashResult((response.output as string | undefined) ?? "", { task_id: taskId });
       }
 

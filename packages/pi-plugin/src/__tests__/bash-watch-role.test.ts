@@ -298,7 +298,7 @@ describe("Pi bash wait:true caller role", () => {
 
   test("a worker's requests carry its role and the engine's hand-off text is shown as is", async () => {
     const sent: Array<Record<string, unknown>> = [];
-    // The engine words the hand-off for the worker it was told about.
+    // The engine's reply to a request with worker_session says the task won't wake it.
     const handOff =
       "Background task started: bash-bg. It won't wake you when it finishes, so wait for it before you report a result.";
     const tool = registeredTool("bash", (_command, params) => {
