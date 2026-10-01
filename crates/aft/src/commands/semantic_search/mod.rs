@@ -4535,6 +4535,9 @@ fn execute_degraded_grep_fallback(
             walk_truncated: walk_budget_reached,
             skipped_foreign_mounts,
             missing_on_disk: 0,
+            // The degraded walk's time budget is reported through
+            // `walk_truncated` above.
+            scan_deadline_reached: false,
         },
         file_cap_reached,
         file_limit: DEGRADED_GREP_FILE_LIMIT,
@@ -7186,6 +7189,7 @@ mod tests {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
         };
         let text = format_grep_lexical_unavailable_text(
             "Semantic index is loading.",

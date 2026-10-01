@@ -156,6 +156,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut body = serde_json::json!({
         "text": text,
         "complete": scope_presence.is_some() && !result.walk_truncated
+            && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
             && result.missing_on_disk == 0,
         "no_files_matched_scope": !scope_has_files,
@@ -178,6 +179,16 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
             text
+        ));
+    }
+    if result.scan_deadline_reached {
+        // The scan ran out of time with candidate files still unread, so a
+        // missing match here is not evidence of absence.
+        body["scan_deadline_reached"] = serde_json::Value::Bool(true);
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Search stopped at its {}-second time budget before every candidate file was searched; matches may be missing. Narrow with path or include.)",
+            body["text"].as_str().unwrap_or_default(),
+            crate::grep_executor::FALLBACK_WALK_BUDGET.as_secs()
         ));
     }
     if scope_presence.is_none() {
@@ -230,11 +241,12 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let service_ms = total_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     match result.index_status {
         crate::search_index::IndexStatus::Ready => {
-            let status = if result.truncated || result.walk_truncated {
-                "partial"
-            } else {
-                "ok"
-            };
+            let status =
+                if result.truncated || result.walk_truncated || result.scan_deadline_reached {
+                    "partial"
+                } else {
+                    "ok"
+                };
             ctx.note_index_query(
                 crate::logging::IndexPlane::Search,
                 "grep",
@@ -633,6 +645,7 @@ mod tests {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
         }
     }
 

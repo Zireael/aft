@@ -1069,6 +1069,9 @@ pub struct GrepResult {
     /// them: stale index entries. They can never produce a match; the count
     /// only discloses that the index listed them.
     pub missing_on_disk: usize,
+    /// True when the scan stopped at its wall-clock budget before every
+    /// candidate file was searched, so matches may be missing.
+    pub scan_deadline_reached: bool,
 }
 
 /// Bounds on how much work [`SearchIndexSnapshot::collect_grep_matches_by_file`]
@@ -2694,7 +2697,8 @@ impl SearchIndexSnapshot {
             search_root,
             max_results,
             path_exclusion,
-            Some((max_files, budget)),
+            Some(max_files),
+            budget,
         )
         .0
     }
@@ -2759,9 +2763,15 @@ impl SearchIndexSnapshot {
             max_results,
             path_exclusion,
             None,
+            INDEXED_GREP_SCAN_BUDGET,
         )
     }
 
+    /// Indexed grep over `search_root`. `max_files` bounds how many candidate
+    /// files are read; `scan_budget` bounds the wall-clock time of the scan,
+    /// checked before each file and at each match occurrence inside it. A scan
+    /// that runs out of budget returns what it found with `engine_capped` and
+    /// `scan_deadline_reached` set, never an empty success.
     fn search_grep_profiled_with_filters_and_query_and_limits(
         &self,
         pattern: &CompiledPattern,
@@ -2770,7 +2780,8 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         max_results: usize,
         path_exclusion: Option<GrepPathExclusion>,
-        verification_limits: Option<(usize, Duration)>,
+        max_files: Option<usize>,
+        scan_budget: Duration,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
@@ -2808,15 +2819,12 @@ impl SearchIndexSnapshot {
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
-        let verification_started = Instant::now();
+        let deadline = GrepScanDeadline::after(scan_budget);
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
-            let Some((max_files, budget)) = verification_limits else {
+            let Some(max_files) = max_files else {
                 return true;
             };
-            if verification_started.elapsed() >= budget {
-                return false;
-            }
             verification_claims.fetch_add(1, Ordering::Relaxed) < max_files
         };
 
@@ -2831,6 +2839,7 @@ impl SearchIndexSnapshot {
                         &total_matches,
                         stop_after,
                         job_cancellation.as_ref(),
+                        &deadline,
                     ) {
                         engine_capped.store(true, Ordering::Relaxed);
                         return Vec::new();
@@ -2855,6 +2864,7 @@ impl SearchIndexSnapshot {
                         &missing_on_disk,
                         Some(&stop_scan),
                         job_cancellation.as_ref(),
+                        &deadline,
                     )
                 })
                 .reduce(Vec::new, |mut left, mut right| {
@@ -2886,15 +2896,23 @@ impl SearchIndexSnapshot {
                     &missing_on_disk,
                     None,
                     job_cancellation.as_ref(),
+                    &deadline,
                 ));
 
-                if should_stop_search(&truncated, &total_matches, stop_after) {
+                if should_stop_search(&truncated, &total_matches, stop_after) || deadline.reached()
+                {
                     engine_capped.store(true, Ordering::Relaxed);
                     break;
                 }
             }
             matches
         };
+        let scan_deadline_reached = deadline.reached();
+        if scan_deadline_reached && max_files.is_some() {
+            // Bounded callers read `truncated` as "more may exist"; running out
+            // of time leaves candidate files unread just as the file bound does.
+            truncated.store(true, Ordering::Relaxed);
+        }
         let pread_verify = pread_started.elapsed();
 
         let post_filter_started = Instant::now();
@@ -2932,6 +2950,7 @@ impl SearchIndexSnapshot {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: missing_on_disk.load(Ordering::Relaxed),
+            scan_deadline_reached,
         };
         let post_filter = candidate_filter + post_filter_started.elapsed();
         let phases = GrepQueryPhaseTimings {
@@ -3073,6 +3092,7 @@ impl SearchIndexSnapshot {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
         }
     }
 
@@ -3303,6 +3323,18 @@ fn posting_matches_filter(posting: &Posting, filter: Option<PostingFilter>) -> b
     true
 }
 
+/// What happened to one match occurrence handed to a candidate-file scan.
+enum MatchVisit {
+    /// The scan must end: a stop flag, the result cap, cancellation or the
+    /// deadline.
+    Stop,
+    /// The occurrence is on a line that already produced a match.
+    SameLine,
+    /// The occurrence was the first on its line; the next line starts at
+    /// `next_line_start`.
+    Recorded { next_line_start: usize },
+}
+
 fn search_candidate_file(
     file: &FileEntry,
     matcher: &SearchMatcher,
@@ -3317,6 +3349,7 @@ fn search_candidate_file(
     missing_on_disk: &AtomicUsize,
     stop_scan: Option<&Arc<AtomicBool>>,
     job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: &GrepScanDeadline,
 ) -> Vec<SharedGrepMatch> {
     if grep_scan_should_stop(
         stop_scan,
@@ -3324,6 +3357,7 @@ fn search_candidate_file(
         total_matches,
         stop_after,
         job_cancellation,
+        deadline,
     ) {
         engine_capped.store(true, Ordering::Relaxed);
         return Vec::new();
@@ -3353,134 +3387,92 @@ fn search_candidate_file(
     let shared_path = Arc::new(file.path.clone());
     let mut matches = Vec::new();
     let mut line_starts = None;
-    let mut seen_lines = HashSet::new();
+    // Grep reports one match per line: the first one. Occurrences arrive in
+    // increasing offset order, so any occurrence before the start of the line
+    // after the last reported one is on that same line. Checking that offset
+    // first means a line with many occurrences (minified code, single-line
+    // JSON, lockfiles) costs one line lookup and one line text in total, not
+    // one per occurrence.
+    let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
 
-    match matcher {
-        SearchMatcher::Literal(literal) if !literal.case_insensitive_ascii => {
-            let needle = &literal.needle;
-            let finder = memchr::memmem::Finder::new(needle);
-            let mut start = 0;
-
-            while let Some(position) = finder.find(&content[start..]) {
-                if grep_scan_should_stop(
-                    stop_scan,
-                    truncated,
-                    total_matches,
-                    stop_after,
-                    job_cancellation,
-                ) {
-                    engine_capped.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                let offset = start + position;
-                start = offset + 1;
-
-                let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
-                let (line, column, line_text) = line_details_bytes(&content, line_starts, offset);
-                if !seen_lines.insert(line) {
-                    continue;
-                }
-
-                matched_this_file = true;
-                let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                if match_number > max_results {
-                    truncated.store(true, Ordering::Relaxed);
-                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
-                    break;
-                }
-
-                let end = offset + needle.len();
-                matches.push(SharedGrepMatch {
-                    file: shared_path.clone(),
-                    line,
-                    column,
-                    line_text,
-                    match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
-                });
+    {
+        let mut visit = |offset: usize, end: usize| -> MatchVisit {
+            if grep_scan_should_stop(
+                stop_scan,
+                truncated,
+                total_matches,
+                stop_after,
+                job_cancellation,
+                deadline,
+            ) {
+                engine_capped.store(true, Ordering::Relaxed);
+                return MatchVisit::Stop;
             }
-        }
-        SearchMatcher::Literal(literal) => {
-            let needle = &literal.needle;
-            let search_content = content.to_ascii_lowercase();
-            let finder = memchr::memmem::Finder::new(needle);
-            let mut start = 0;
-
-            while let Some(position) = finder.find(&search_content[start..]) {
-                if grep_scan_should_stop(
-                    stop_scan,
-                    truncated,
-                    total_matches,
-                    stop_after,
-                    job_cancellation,
-                ) {
-                    engine_capped.store(true, Ordering::Relaxed);
-                    break;
-                }
-
-                let offset = start + position;
-                start = offset + 1;
-
-                let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
-                let (line, column, line_text) = line_details_bytes(&content, line_starts, offset);
-                if !seen_lines.insert(line) {
-                    continue;
-                }
-
-                matched_this_file = true;
-                let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                if match_number > max_results {
-                    truncated.store(true, Ordering::Relaxed);
-                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
-                    break;
-                }
-
-                let end = offset + needle.len();
-                matches.push(SharedGrepMatch {
-                    file: shared_path.clone(),
-                    line,
-                    column,
-                    line_text,
-                    match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
-                });
+            if offset < reported_line_end {
+                return MatchVisit::SameLine;
             }
-        }
-        SearchMatcher::Regex(regex) => {
-            for matched in regex.find_iter(&content) {
-                if grep_scan_should_stop(
-                    stop_scan,
-                    truncated,
-                    total_matches,
-                    stop_after,
-                    job_cancellation,
-                ) {
-                    engine_capped.store(true, Ordering::Relaxed);
-                    break;
-                }
 
-                let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
-                let (line, column, line_text) =
-                    line_details_bytes(&content, line_starts, matched.start());
-                if !seen_lines.insert(line) {
-                    continue;
-                }
+            let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(&content));
+            let (line, column, line_text, next_line_start) =
+                line_details_bytes(&content, line_starts, offset);
+            reported_line_end = next_line_start;
 
-                matched_this_file = true;
-                let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                if match_number > max_results {
-                    truncated.store(true, Ordering::Relaxed);
-                    signal_grep_scan_cap(stop_scan, total_matches, stop_after);
-                    break;
-                }
+            matched_this_file = true;
+            let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+            if match_number > max_results {
+                truncated.store(true, Ordering::Relaxed);
+                signal_grep_scan_cap(stop_scan, total_matches, stop_after);
+                return MatchVisit::Stop;
+            }
 
-                matches.push(SharedGrepMatch {
-                    file: shared_path.clone(),
-                    line,
-                    column,
-                    line_text,
-                    match_text: String::from_utf8_lossy(matched.as_bytes()).into_owned(),
-                });
+            matches.push(SharedGrepMatch {
+                file: shared_path.clone(),
+                line,
+                column,
+                line_text,
+                match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
+            });
+            MatchVisit::Recorded { next_line_start }
+        };
+
+        match matcher {
+            SearchMatcher::Literal(literal) => {
+                let needle = &literal.needle;
+                let lowered;
+                let haystack: &[u8] = if literal.case_insensitive_ascii {
+                    lowered = content.to_ascii_lowercase();
+                    &lowered
+                } else {
+                    &content
+                };
+                let finder = memchr::memmem::Finder::new(needle);
+                let mut start = 0;
+
+                while let Some(position) = finder.find(&haystack[start..]) {
+                    let offset = start + position;
+                    start = match visit(offset, offset + needle.len()) {
+                        MatchVisit::Stop => break,
+                        MatchVisit::SameLine => offset + 1,
+                        // The finder reports every occurrence, overlapping
+                        // ones included, so resuming at the next line finds
+                        // exactly the occurrence a one-byte step would have
+                        // reported next, without visiting the rest of this
+                        // line.
+                        MatchVisit::Recorded { next_line_start } => next_line_start.max(offset + 1),
+                    };
+                }
+            }
+            SearchMatcher::Regex(regex) => {
+                // Regex matches are not skipped ahead: a later match on the
+                // same line can run past its newline, and where the next
+                // non-overlapping match starts depends on it. Same-line
+                // matches are still dropped before any line text is built.
+                for matched in regex.find_iter(&content) {
+                    if let MatchVisit::Stop = visit(matched.start(), matched.end()) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3507,16 +3499,19 @@ fn matching_lines_in_content(
     let mut matches = Vec::new();
     let mut matched_lines = 0usize;
     let mut line_starts: Option<Vec<usize>> = None;
-    let mut last_line: Option<u32> = None;
-    let mut record = |start: usize, end: usize| {
-        let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(content));
-        let (line, column, line_text) = line_details_bytes(content, line_starts, start);
-        // Offsets arrive in increasing order, so a repeated line is always the
-        // line just recorded; only its first match is kept, as grep does.
-        if last_line == Some(line) {
-            return;
+    // Start of the line after the last recorded one. Offsets arrive in
+    // increasing order, so an offset before it is on the line just recorded;
+    // only that line's first match is kept, as grep does, and the repeat is
+    // dropped before any line text is built for it.
+    let mut reported_line_end = 0usize;
+    let mut record = |start: usize, end: usize| -> Option<usize> {
+        if start < reported_line_end {
+            return None;
         }
-        last_line = Some(line);
+        let line_starts = line_starts.get_or_insert_with(|| line_starts_bytes(content));
+        let (line, column, line_text, next_line_start) =
+            line_details_bytes(content, line_starts, start);
+        reported_line_end = next_line_start;
         matched_lines += 1;
         let grep_match = GrepMatch {
             file: path.to_path_buf(),
@@ -3528,6 +3523,7 @@ fn matching_lines_in_content(
         if matched_lines <= max_lines || keep_past_limit(&grep_match) {
             matches.push(grep_match);
         }
+        Some(next_line_start)
     };
     match matcher {
         SearchMatcher::Literal(literal) => {
@@ -3543,8 +3539,12 @@ fn matching_lines_in_content(
             let mut start = 0;
             while let Some(position) = finder.find(&haystack[start..]) {
                 let offset = start + position;
-                start = offset + 1;
-                record(offset, offset + needle.len());
+                // Resume at the next line once this one is recorded: the rest
+                // of the line can only repeat it (see `search_candidate_file`).
+                start = record(offset, offset + needle.len())
+                    .map_or(offset + 1, |next_line_start| {
+                        next_line_start.max(offset + 1)
+                    });
             }
         }
         SearchMatcher::Regex(regex) => {
@@ -3564,16 +3564,60 @@ fn should_stop_search(
     truncated.load(Ordering::Relaxed) && total_matches.load(Ordering::Relaxed) >= stop_after
 }
 
+/// Wall-clock bound on one indexed grep scan whose caller sets none. A grep
+/// holds its root's reader slot while it runs, and a configure for that root
+/// waits for readers, so an unbounded scan locks every later bind on the root
+/// out of its tools. It gets the same budget as the index-unavailable walk.
+pub(crate) const INDEXED_GREP_SCAN_BUDGET: Duration = crate::grep_executor::FALLBACK_WALK_BUDGET;
+
+/// The wall-clock point a grep scan must stop at, and whether the scan
+/// stopped there. The scan loops check it per candidate file and per match
+/// occurrence, so one huge file cannot carry a scan past it.
+pub(crate) struct GrepScanDeadline {
+    /// `None` when the budget is too large to represent as an instant, which
+    /// leaves the scan unbounded in time.
+    at: Option<Instant>,
+    reached: AtomicBool,
+}
+
+impl GrepScanDeadline {
+    pub(crate) fn after(budget: Duration) -> Self {
+        Self {
+            at: Instant::now().checked_add(budget),
+            reached: AtomicBool::new(false),
+        }
+    }
+
+    /// True once the deadline has passed; records that the scan hit it.
+    fn passed(&self) -> bool {
+        if self.reached.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.at.is_some_and(|at| Instant::now() >= at) {
+            self.reached.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Whether a scan stopped because of this deadline.
+    pub(crate) fn reached(&self) -> bool {
+        self.reached.load(Ordering::Relaxed)
+    }
+}
+
 fn grep_scan_should_stop(
     stop_scan: Option<&Arc<AtomicBool>>,
     truncated: &AtomicBool,
     total_matches: &AtomicUsize,
     stop_after: usize,
     job_cancellation: Option<&crate::executor::JobCancellation>,
+    deadline: &GrepScanDeadline,
 ) -> bool {
     job_cancellation.is_some_and(|token| token.cancel_requested_before_commit())
         || stop_scan.is_some_and(|flag| flag.load(Ordering::Relaxed))
         || should_stop_search(truncated, total_matches, stop_after)
+        || deadline.passed()
 }
 
 fn signal_grep_scan_cap(
@@ -7484,27 +7528,80 @@ fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
     starts
 }
 
-fn line_details_bytes(content: &[u8], line_starts: &[usize], offset: usize) -> (u32, u32, String) {
+#[cfg(test)]
+thread_local! {
+    /// Called on every `line_details_bytes` call on this thread, so tests can
+    /// count line-detail work or act at a chosen point inside a scan.
+    static LINE_DETAILS_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Line number, 1-based character column and printable text of the line
+/// holding `offset`, plus the byte offset where the next line starts (the
+/// end of `content` for the last line). The text is bounded the way grep
+/// prints it, see [`bounded_grep_line_text_bytes`].
+fn line_details_bytes(
+    content: &[u8],
+    line_starts: &[usize],
+    offset: usize,
+) -> (u32, u32, String, usize) {
+    #[cfg(test)]
+    LINE_DETAILS_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow_mut().as_mut() {
+            probe();
+        }
+    });
+
     let line_index = match line_starts.binary_search(&offset) {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
     };
     let line_start = line_starts.get(line_index).copied().unwrap_or(0);
-    let line_end = content[line_start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|length| line_start + length)
-        .unwrap_or(content.len());
+    // Every entry after the first in `line_starts` follows a newline, so the
+    // next entry, when there is one, is one byte past this line's newline.
+    let (line_end, next_line_start) = match line_starts.get(line_index + 1) {
+        Some(&next) => (next - 1, next),
+        None => (content.len(), content.len()),
+    };
     let mut line_slice = &content[line_start..line_end];
     if line_slice.ends_with(b"\r") {
         line_slice = &line_slice[..line_slice.len() - 1];
     }
-    let line_text = String::from_utf8_lossy(line_slice).into_owned();
+    let line_text = bounded_grep_line_text_bytes(line_slice);
     let column = String::from_utf8_lossy(&content[line_start..offset])
         .chars()
         .count() as u32
         + 1;
-    (line_index as u32 + 1, column, line_text)
+    (line_index as u32 + 1, column, line_text, next_line_start)
+}
+
+/// The text grep keeps for a matching line. A line of at most
+/// `GREP_MAX_LINE_CHARS` characters is kept whole. A longer line is kept as
+/// exactly what the grep renderer prints for it: its first
+/// `GREP_MAX_LINE_CHARS` characters and the truncation marker. Every renderer
+/// cuts at that length or shorter, so the printed output is the same as for
+/// the whole line, while a match on a multi-megabyte minified line no longer
+/// decodes and copies the whole line.
+pub(crate) fn bounded_grep_line_text(line: &str) -> String {
+    use crate::commands::grep::{GREP_LINE_TRUNCATED_MARKER, GREP_MAX_LINE_CHARS};
+    match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
+        None => line.to_string(),
+        Some((cut, _)) => format!("{}{}", &line[..cut], GREP_LINE_TRUNCATED_MARKER),
+    }
+}
+
+/// [`bounded_grep_line_text`] for raw line bytes, decoded lossily as the
+/// whole line would be. Only a prefix of the line is decoded: a UTF-8
+/// character is at most 4 bytes and an invalid byte decodes to one
+/// replacement character, so the first `(GREP_MAX_LINE_CHARS + 2) * 4` bytes
+/// hold at least `GREP_MAX_LINE_CHARS + 1` characters that decode exactly as
+/// in the whole line (only a sequence cut by the prefix end, at most its last
+/// 3 bytes, can decode differently). A line longer than that prefix therefore
+/// always has more than `GREP_MAX_LINE_CHARS` characters and is cut.
+fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
+    const PREFIX_BYTES: usize = (crate::commands::grep::GREP_MAX_LINE_CHARS + 2) * 4;
+    let prefix = &line[..line.len().min(PREFIX_BYTES)];
+    bounded_grep_line_text(&String::from_utf8_lossy(prefix))
 }
 
 fn to_glob_path(path: &Path) -> String {
@@ -9686,6 +9783,291 @@ mod tests {
     #[test]
     fn ready_index_keeps_literal_backslash_dot_candidate() {
         assert_ready_indexed_literal_match(r"foo\.bar");
+    }
+
+    /// Clears the line-details probe when a test ends, even on panic.
+    struct LineDetailsProbeGuard;
+
+    impl Drop for LineDetailsProbeGuard {
+        fn drop(&mut self) {
+            LINE_DETAILS_PROBE.with(|probe| *probe.borrow_mut() = None);
+        }
+    }
+
+    fn install_line_details_probe(probe: impl FnMut() + 'static) -> LineDetailsProbeGuard {
+        LINE_DETAILS_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+        LineDetailsProbeGuard
+    }
+
+    fn compile_grep_pattern(
+        pattern: &str,
+        literal: bool,
+        case_insensitive: bool,
+    ) -> CompiledPattern {
+        match pattern_compile::compile(
+            pattern,
+            CompileOpts {
+                literal,
+                case_insensitive,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(compiled) => compiled,
+            other => panic!("compile {pattern:?}: {other:?}"),
+        }
+    }
+
+    /// Indexed grep over `root` with an explicit scan budget, run on the
+    /// calling thread when there are at most 10 candidate files.
+    fn indexed_grep_with_budget(
+        index: &SearchIndex,
+        root: &Path,
+        pattern: &CompiledPattern,
+        max_results: usize,
+        budget: Duration,
+    ) -> GrepResult {
+        let query = decompose_grep_pattern(pattern);
+        index
+            .snapshot()
+            .search_grep_profiled_with_filters_and_query_and_limits(
+                pattern,
+                &query,
+                &PathFilters::default(),
+                root,
+                max_results,
+                None,
+                None,
+                budget,
+            )
+            .0
+    }
+
+    /// A project holding one file whose first line is about 1 MiB long with
+    /// 100,000 occurrences of `needle`, the first at column 7.
+    fn long_line_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let mut content = String::from("start ");
+        for _ in 0..100_000 {
+            content.push_str("needle-pad");
+        }
+        content.push_str("\nlast line without the word\n");
+        fs::write(project.join("minified.js"), content).expect("write long line");
+        (dir, project)
+    }
+
+    #[test]
+    fn long_line_with_many_occurrences_builds_line_details_once_per_arm() {
+        let (_dir, project) = long_line_project();
+        let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
+        let arms = [
+            ("literal", compile_grep_pattern("needle", true, false)),
+            (
+                "case-insensitive literal",
+                compile_grep_pattern("NEEDLE", true, true),
+            ),
+            ("regex", compile_grep_pattern("ne+dle-pad", false, false)),
+        ];
+        match (&arms[0].1, &arms[1].1, &arms[2].1) {
+            (
+                CompiledPattern::Literal(sensitive),
+                CompiledPattern::Literal(insensitive),
+                CompiledPattern::Regex { .. },
+            ) => {
+                assert!(!sensitive.case_insensitive_ascii);
+                assert!(insensitive.case_insensitive_ascii);
+            }
+            other => panic!("patterns must cover all three matcher arms: {other:?}"),
+        }
+
+        for (arm, pattern) in &arms {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let probe_calls = calls.clone();
+            let _probe = install_line_details_probe(move || probe_calls.set(probe_calls.get() + 1));
+            // The budget only lets a regressed, per-occurrence scan end; the
+            // assertion is on the work done, not on the time taken.
+            let result =
+                indexed_grep_with_budget(&index, &project, pattern, 100, Duration::from_secs(2));
+
+            assert_eq!(
+                calls.get(),
+                1,
+                "{arm}: line details must be built once per matched line, not once per occurrence"
+            );
+            assert!(!result.scan_deadline_reached, "{arm}: scan hit its budget");
+            assert_eq!(result.total_matches, 1, "{arm}");
+            assert_eq!(result.matches.len(), 1, "{arm}");
+            let matched = &result.matches[0];
+            assert_eq!((matched.line, matched.column), (1, 7), "{arm}");
+            assert!(
+                matched.line_text.starts_with("start needle-pad"),
+                "{arm}: {:?}",
+                &matched.line_text[..40]
+            );
+            assert_eq!(
+                matched.line_text,
+                bounded_grep_line_text(&format!("start {}", "needle-pad".repeat(100_000))),
+                "{arm}: the kept line text is the bounded form of the whole line"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_lines_in_content_builds_line_details_once_per_matched_line() {
+        let mut content = String::from("start ");
+        content.push_str(&"needle-pad".repeat(100_000));
+        content.push_str("\nsecond needle line needle\n");
+        let content = content.into_bytes();
+        let patterns = [
+            compile_grep_pattern("needle", true, false),
+            compile_grep_pattern("NEEDLE", true, true),
+            compile_grep_pattern("ne+dle", false, false),
+        ];
+        for pattern in &patterns {
+            let matcher = match pattern {
+                CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
+                CompiledPattern::Regex { compiled, .. } => SearchMatcher::Regex(compiled.clone()),
+            };
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let probe_calls = calls.clone();
+            let _probe = install_line_details_probe(move || probe_calls.set(probe_calls.get() + 1));
+
+            let (lines, count) =
+                matching_lines_in_content(Path::new("m.js"), &content, &matcher, 10, &|_| false);
+
+            assert_eq!(calls.get(), 2, "one line-details call per matched line");
+            assert_eq!(count, 2);
+            let found: Vec<(u32, u32)> =
+                lines.iter().map(|line| (line.line, line.column)).collect();
+            assert_eq!(found, vec![(1, 7), (2, 8)]);
+        }
+    }
+
+    #[test]
+    fn grep_scan_stops_at_its_deadline_across_many_large_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        let body = "let value = needle_marker + 1;\n".repeat(8_000);
+        for file in 0..24 {
+            fs::write(project.join(format!("large_{file}.js")), &body).expect("write file");
+        }
+        let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
+        let pattern = compile_grep_pattern("needle_marker", true, false);
+
+        let started = Instant::now();
+        let result =
+            indexed_grep_with_budget(&index, &project, &pattern, 1_000_000, Duration::ZERO);
+
+        assert!(
+            result.scan_deadline_reached,
+            "a spent budget must be reported by name, not as a complete result"
+        );
+        assert!(result.engine_capped);
+        assert!(
+            result.files_searched < 24,
+            "no candidate file may be read after the deadline: searched {}",
+            result.files_searched
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The same scan with room to finish reads every file and is complete.
+        let full = indexed_grep_with_budget(
+            &index,
+            &project,
+            &pattern,
+            1_000_000,
+            INDEXED_GREP_SCAN_BUDGET,
+        );
+        assert!(!full.scan_deadline_reached);
+        assert_eq!(full.files_searched, 24);
+        assert_eq!(full.total_matches, 24 * 8_000);
+    }
+
+    #[test]
+    fn grep_scan_stops_at_its_deadline_inside_one_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        fs::write(project.join("many.txt"), "needle line\n".repeat(1_000)).expect("write file");
+        let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
+        let pattern = compile_grep_pattern("needle", true, false);
+        // The first reported line outlasts the whole budget, so the deadline
+        // has passed before the scan reaches the second line of the file.
+        let budget = Duration::from_millis(100);
+        let mut slept = false;
+        let _probe = install_line_details_probe(move || {
+            if !slept {
+                slept = true;
+                std::thread::sleep(budget * 2);
+            }
+        });
+
+        let result = indexed_grep_with_budget(&index, &project, &pattern, 10_000, budget);
+
+        assert!(result.scan_deadline_reached);
+        assert!(result.engine_capped);
+        assert_eq!(
+            result.matches.len(),
+            1,
+            "the scan must stop inside the file"
+        );
+    }
+
+    #[test]
+    fn grep_scan_stops_on_cancellation_inside_one_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+        fs::write(project.join("many.txt"), "needle line\n".repeat(1_000)).expect("write file");
+        let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
+        let pattern = compile_grep_pattern("needle", true, false);
+        let token = crate::executor::JobCancellation::new();
+        let _job = crate::executor::install_job_cancellation(token.clone());
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let probe_calls = calls.clone();
+        // Cancel the way a client does, while the scan is in the middle of
+        // the file: after its third matched line.
+        let _probe = install_line_details_probe(move || {
+            probe_calls.set(probe_calls.get() + 1);
+            if probe_calls.get() == 3 {
+                token.request_cancel();
+            }
+        });
+
+        let result =
+            indexed_grep_with_budget(&index, &project, &pattern, 10_000, INDEXED_GREP_SCAN_BUDGET);
+
+        assert_eq!(calls.get(), 3, "no line is examined after the cancel");
+        assert_eq!(result.matches.len(), 3);
+        assert!(result.engine_capped);
+        assert!(!result.scan_deadline_reached);
+    }
+
+    #[test]
+    fn bounded_line_text_renders_exactly_like_the_whole_line() {
+        use crate::commands::grep::{truncate_grep_line, truncate_line_text, GREP_MAX_LINE_CHARS};
+
+        let mut invalid = "é".repeat(GREP_MAX_LINE_CHARS - 1).into_bytes();
+        invalid.extend_from_slice(&[0xff, 0xe2, 0x82, b'x']);
+        invalid.extend_from_slice(&"tail".repeat(2_000).into_bytes());
+        let lines: Vec<Vec<u8>> = vec![
+            b"short line".to_vec(),
+            Vec::new(),
+            "a".repeat(GREP_MAX_LINE_CHARS).into_bytes(),
+            "a".repeat(GREP_MAX_LINE_CHARS + 1).into_bytes(),
+            "é".repeat(GREP_MAX_LINE_CHARS + 1).into_bytes(),
+            "€".repeat(5_000).into_bytes(),
+            "needle-pad".repeat(100_000).into_bytes(),
+            invalid,
+        ];
+        for line in &lines {
+            let whole = String::from_utf8_lossy(line).into_owned();
+            let bounded = bounded_grep_line_text_bytes(line);
+            assert_eq!(truncate_grep_line(&bounded), truncate_grep_line(&whole));
+            assert_eq!(truncate_line_text(&bounded), truncate_line_text(&whole));
+            if whole.chars().count() <= GREP_MAX_LINE_CHARS {
+                assert_eq!(bounded, whole, "a line within the bound is kept whole");
+            }
+            assert!(bounded.chars().count() <= GREP_MAX_LINE_CHARS + 20);
+        }
     }
 
     #[test]

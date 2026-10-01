@@ -478,6 +478,7 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         walk_truncated: false,
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
+        scan_deadline_reached: false,
     }
 }
 
@@ -500,6 +501,9 @@ fn grep_explicit_file(
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
     let job_cancellation = crate::executor::current_job_cancellation();
+    // A single named file gets the walk's time budget too: one huge file
+    // with a slow pattern must not hold the request open indefinitely.
+    let deadline = Instant::now() + FALLBACK_WALK_BUDGET;
 
     let matches = fallback_search_file(
         &file.to_path_buf(),
@@ -512,8 +516,9 @@ fn grep_explicit_file(
         &truncated,
         &engine_capped,
         job_cancellation.as_ref(),
-        None,
+        Some(deadline),
     );
+    let engine_capped = engine_capped.load(Ordering::Relaxed);
 
     GrepResult {
         total_matches: total_matches.load(Ordering::Relaxed),
@@ -523,10 +528,11 @@ fn grep_explicit_file(
         index_status,
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: false,
-        engine_capped: engine_capped.load(Ordering::Relaxed),
+        engine_capped,
         walk_truncated: false,
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
+        scan_deadline_reached: engine_capped && Instant::now() >= deadline,
     }
 }
 
@@ -546,6 +552,7 @@ pub fn merge_grep_results(
     let mut walk_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
     let mut missing_on_disk = 0usize;
+    let mut scan_deadline_reached = false;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -559,6 +566,7 @@ pub fn merge_grep_results(
         walk_truncated |= result.walk_truncated;
         skipped_foreign_mounts += result.skipped_foreign_mounts;
         missing_on_disk += result.missing_on_disk;
+        scan_deadline_reached |= result.scan_deadline_reached;
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -586,6 +594,7 @@ pub fn merge_grep_results(
         walk_truncated,
         skipped_foreign_mounts,
         missing_on_disk,
+        scan_deadline_reached,
     }
 }
 
@@ -914,6 +923,8 @@ fn fallback_grep(
         walk_truncated,
         skipped_foreign_mounts: progress.skipped_foreign_mounts,
         missing_on_disk: 0,
+        // The walk's own time budget is reported through `walk_truncated`.
+        scan_deadline_reached: false,
     }
 }
 
@@ -943,7 +954,8 @@ fn fallback_search_file(
     files_searched.fetch_add(1, Ordering::Relaxed);
 
     let line_starts = line_starts(&content);
-    let mut seen_lines = HashSet::new();
+    // Start of the line after the last reported one; see `search_literal_in_text`.
+    let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
     let mut matches = Vec::new();
 
@@ -956,7 +968,7 @@ fn fallback_search_file(
             max_results,
             stop_after,
             total_matches,
-            &mut seen_lines,
+            &mut reported_line_end,
             truncated,
             engine_capped,
             &mut matched_this_file,
@@ -978,11 +990,16 @@ fn fallback_search_file(
                     break;
                 }
 
-                let (line, column, line_text) =
-                    line_details(&content, &line_starts, matched.start());
-                if !seen_lines.insert(line) {
+                // Regex matches are not skipped ahead: a later match on the
+                // same line can run past its newline, and where the next
+                // non-overlapping match starts depends on it. Same-line
+                // matches are still dropped before any line text is built.
+                if matched.start() < reported_line_end {
                     continue;
                 }
+                let (line, column, line_text, next_line_start) =
+                    line_details_with_next(&content, &line_starts, matched.start());
+                reported_line_end = next_line_start;
 
                 matched_this_file = true;
                 let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1017,7 +1034,7 @@ fn search_literal_in_text(
     max_results: usize,
     stop_after: usize,
     total_matches: &AtomicUsize,
-    seen_lines: &mut HashSet<u32>,
+    reported_line_end: &mut usize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
     matched_this_file: &mut bool,
@@ -1045,11 +1062,21 @@ fn search_literal_in_text(
         }
 
         let offset = start + position;
-        start = offset + 1;
-        let (line, column, line_text) = line_details(content, line_starts, offset);
-        if !seen_lines.insert(line) {
+        // Grep reports the first match on each line. Occurrences arrive in
+        // increasing offset order, so one before `reported_line_end` is on the
+        // line already reported (a line with many occurrences then costs one
+        // line lookup, not one per occurrence).
+        if offset < *reported_line_end {
+            start = offset + 1;
             continue;
         }
+        let (line, column, line_text, next_line_start) =
+            line_details_with_next(content, line_starts, offset);
+        *reported_line_end = next_line_start;
+        // The finder reports every occurrence, overlapping ones included, so
+        // resuming at the next line finds exactly the occurrence a one-byte
+        // step would have reported next.
+        start = next_line_start.max(offset + 1);
 
         *matched_this_file = true;
         let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1136,22 +1163,38 @@ pub fn truncate_at_char_boundary(content: &str, max_bytes: usize) -> &str {
     &content[..end]
 }
 
+/// Line number, 1-based character column and printable text of the line
+/// holding `offset`. The text is bounded the way grep prints it, see
+/// [`crate::search_index::bounded_grep_line_text`].
 pub fn line_details(content: &str, line_starts: &[usize], offset: usize) -> (u32, u32, String) {
+    let (line, column, line_text, _) = line_details_with_next(content, line_starts, offset);
+    (line, column, line_text)
+}
+
+/// [`line_details`] plus the byte offset where the next line starts (the end
+/// of `content` for the last line).
+fn line_details_with_next(
+    content: &str,
+    line_starts: &[usize],
+    offset: usize,
+) -> (u32, u32, String, usize) {
     let offset = floor_char_boundary_str(content, offset);
     let line_index = match line_starts.binary_search(&offset) {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
     };
     let line_start = line_starts.get(line_index).copied().unwrap_or(0);
-    let line_end = content[line_start..]
-        .find('\n')
-        .map(|length| line_start + length)
-        .unwrap_or(content.len());
-    let line_text = content[line_start..line_end]
-        .trim_end_matches('\r')
-        .to_string();
+    // Every entry after the first in `line_starts` follows a newline, so the
+    // next entry, when there is one, is one byte past this line's newline.
+    let (line_end, next_line_start) = match line_starts.get(line_index + 1) {
+        Some(&next) => (next - 1, next),
+        None => (content.len(), content.len()),
+    };
+    let line_text = crate::search_index::bounded_grep_line_text(
+        content[line_start..line_end].trim_end_matches('\r'),
+    );
     let column = content[line_start..offset].chars().count() as u32 + 1;
-    (line_index as u32 + 1, column, line_text)
+    (line_index as u32 + 1, column, line_text, next_line_start)
 }
 
 #[cfg(test)]
@@ -1181,6 +1224,7 @@ mod tests {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
         }
     }
 
@@ -1449,6 +1493,45 @@ mod tests {
         };
         for matched in compiled.find_iter(content.as_bytes()) {
             let _ = line_details(content, &starts, matched.start());
+        }
+    }
+
+    #[test]
+    fn explicit_file_grep_reports_one_match_for_a_long_line_in_every_arm() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("minified.js");
+        let line = format!("start {}", "needle-pad".repeat(100_000));
+        std::fs::write(&file, format!("{line}\nsecond needle line\n")).expect("write file");
+        let compile = |pattern: &str, literal: bool, case_insensitive: bool| {
+            match crate::pattern_compile::compile(
+                pattern,
+                crate::pattern_compile::CompileOpts {
+                    literal,
+                    case_insensitive,
+                    ..crate::pattern_compile::CompileOpts::default()
+                },
+            ) {
+                crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+                other => panic!("compile {pattern:?}: {other:?}"),
+            }
+        };
+        for pattern in [
+            compile("needle", true, false),
+            compile("NEEDLE", true, true),
+            compile("ne+dle", false, false),
+        ] {
+            let result = grep_explicit_file(&file, &pattern, 100, IndexStatus::Fallback);
+            let found: Vec<(u32, u32)> = result
+                .matches
+                .iter()
+                .map(|matched| (matched.line, matched.column))
+                .collect();
+            assert_eq!(found, vec![(1, 7), (2, 8)], "{pattern:?}");
+            assert_eq!(
+                result.matches[0].line_text,
+                crate::search_index::bounded_grep_line_text(&line)
+            );
+            assert!(!result.scan_deadline_reached);
         }
     }
 

@@ -319,6 +319,9 @@ pub(crate) fn rank_collection(collection: GrepFileCollection, query: &str) -> Ra
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: collection.missing_on_disk,
+            // The collection's time bound is reported through
+            // `examination_capped` above.
+            scan_deadline_reached: false,
         },
         files,
     }
