@@ -2591,14 +2591,15 @@ fn render_incomplete_categories(
                 continue;
             }
             if gap.get("kind").and_then(Value::as_str) == Some("analysis_incomplete") {
-                // A scanner, not a language server, did not finish.
-                let producer = gap
-                    .get("producer")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| format!("{category} scan"), str::to_owned);
-                lines.push(format!(
-                    "Incomplete {category}: {producer} did not finish ({reason})"
-                ));
+                // A scanner, not a language server, did not finish. An
+                // aggregate gap that names no scanner keeps just its category
+                // and reason rather than an invented producer name.
+                match gap.get("producer").and_then(Value::as_str) {
+                    Some(producer) => lines.push(format!(
+                        "Incomplete {category}: {producer} did not finish ({reason})"
+                    )),
+                    None => lines.push(format!("Incomplete {category}: {reason}")),
+                }
                 continue;
             }
             if let Some(producer) = gap.get("producer").and_then(Value::as_str) {
