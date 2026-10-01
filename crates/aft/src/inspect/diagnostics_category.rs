@@ -99,13 +99,14 @@ struct DiagnosticsCollection {
     /// Whether the producer wait has ended. Settlement alone does not prove
     /// diagnostics authority: a quiescent server may not have reported yet.
     producers_settled: bool,
+    /// Empty results certified by a completed Rust check or, for non-Rust
+    /// producers, by a successfully initialized client with no analysis pending.
+    /// Unscoped inspect does not open files to populate an empty working set.
+    authoritative_empty_producers: BTreeSet<String>,
     /// Why each server, by server id and workspace root, had not finished
     /// its initial indexing when the blocking wait ran out. Keyed by root as
     /// well as id so each gap row names the workspace it is about.
     indexing_gaps: BTreeMap<(String, PathBuf), String>,
-    /// Server ids and roots of settled producers that have not published an
-    /// authoritative diagnostic report, so their files cannot be certified.
-    unreported_producers: BTreeSet<(String, PathBuf)>,
     /// Server ids and roots of rust-analyzer producers whose `cargo check` had not
     /// finished when the wait ran out. Their published reports lack the
     /// compiler's newest results, so totals cannot be certified.
@@ -124,8 +125,12 @@ struct DiagnosticsCollection {
 /// no per-file work.
 ///
 /// The authority halves differ by design. An unscoped request makes a
-/// full-root claim, so each started producer needs an authoritative report
-/// and a current compiler check, or a named gap. A scoped request
+/// full-root claim. Rust needs current reports or a completed current compiler
+/// check; an idle pre-begin Current state is not check authority. Non-Rust
+/// producers retain the settlement contract: an authoritative report or a
+/// non-warming successful client certifies the warm working set, not unopened
+/// files. This applies to TypeScript, Biome, oxlint, pyright, YAML and bash.
+/// A scoped request
 /// makes per-file claims: every scoped file must either carry an
 /// authoritative producer report or appear as a named gap, because a
 /// settled producer cannot prove that a specific file nothing ever analyzed
@@ -252,7 +257,6 @@ pub(crate) fn run_diagnostics_category(
     if collection.is_reportable()
         || !collection.indexing_gaps.is_empty()
         || !collection.checking_producers.is_empty()
-        || !collection.unreported_producers.is_empty()
     {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
@@ -297,9 +301,10 @@ fn collect_warm_working_set(
                 )
             })
             .collect();
-        // The started set remains an obligation even if a client has exited.
-        // Quiescence ends the startup wait, but only an authoritative report
-        // can certify diagnostics. Recheck authority after draining events:
+        // Every producer inspect started remains an obligation even if its
+        // client exits. Rust finishing its startup analysis does not mean the
+        // compiler check has finished. A completed current check certifies zero
+        // without reports. Recheck after draining events:
         // progress can arrive after the earlier quiescence wait returned.
         let mut producers = if expected_producers.is_empty() {
             lsp.active_server_keys()
@@ -327,18 +332,33 @@ fn collect_warm_working_set(
                 && !lsp.server_is_warming(server)
             {
                 let reported = lsp.has_authoritative_report_for_server(server);
-                if server.kind == ServerKind::Rust
-                    && (!reported || lsp.rust_check_state(server) != RustCheckState::Current)
-                {
-                    collection.checking_producers.insert(key.clone());
+                if server.kind == ServerKind::Rust {
+                    if lsp.rust_check_state(server) != RustCheckState::Current
+                        || (!reported && !lsp.rust_check_completed_current(server))
+                    {
+                        collection.checking_producers.insert(key.clone());
+                    } else if !reported {
+                        collection
+                            .authoritative_empty_producers
+                            .insert(server_id(server));
+                    }
+                } else if !reported && lsp.has_client(server) {
+                    collection
+                        .authoritative_empty_producers
+                        .insert(server_id(server));
                 } else if !reported {
-                    collection.unreported_producers.insert(key.clone());
+                    let reason = "producer exited without an authoritative diagnostic result; retry aft_inspect";
+                    collection
+                        .producer_failures
+                        .insert(server_id(server), reason.into());
+                    // Keyed by server as well, so the gap row names the
+                    // workspace root like every other failed-producer row.
+                    collection
+                        .producer_failures_by_key
+                        .insert(server.clone(), reason.into());
                 }
             }
-            if !lsp.producer_has_settled(server)
-                && !collection.checking_producers.contains(&key)
-                && !collection.unreported_producers.contains(&key)
-            {
+            if !lsp.producer_has_settled(server) && !collection.checking_producers.contains(&key) {
                 collection.servers_pending.insert(key);
             }
         }
@@ -682,7 +702,6 @@ impl DiagnosticsCollection {
             && self.producer_failures.is_empty()
             && self.scope_coverage_gaps.is_empty()
             && self.checking_producers.is_empty()
-            && self.unreported_producers.is_empty()
     }
 
     /// Whether collection can return a payload after the producer wait.
@@ -723,6 +742,9 @@ impl DiagnosticsCollection {
         });
 
         let mut by_producer: BTreeMap<String, Vec<CollectedDiagnostic>> = BTreeMap::new();
+        for producer in self.authoritative_empty_producers {
+            by_producer.entry(producer).or_default();
+        }
         for (producer, _, diagnostics) in self.producer_reports {
             if !self.producer_failures.contains_key(&producer) {
                 by_producer.entry(producer).or_default().extend(diagnostics);
@@ -793,14 +815,6 @@ impl DiagnosticsCollection {
                 "kind": "failed_producer", "producer": producer,
                 "root": display_root(snapshot, &root),
                 "reason": reason,
-            }));
-        }
-        for (producer, root) in self.unreported_producers {
-            gaps.push(serde_json::json!({
-                "kind": "unreported_producer",
-                "producer": producer,
-                "root": display_root(snapshot, &root),
-                "reason": "producer has no authoritative diagnostic report; retry aft_inspect",
             }));
         }
         for (producer, root) in self.checking_producers {
@@ -1128,7 +1142,7 @@ mod payload_count_tests {
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config::default(),
         );
-        let expected = [ServerKind::Rust, ServerKind::TypeScript].map(|kind| ServerKey {
+        let expected = [ServerKind::Rust].map(|kind| ServerKey {
             kind,
             root: PathBuf::from("/repo"),
         });
@@ -1137,14 +1151,11 @@ mod payload_count_tests {
         let payload = collection.into_payload(&snapshot());
         assert!(payload["errors"].is_null(), "{payload:#}");
         let gaps = payload["gaps"].as_array().expect("named gaps");
-        assert_eq!(gaps.len(), 2, "{payload:#}");
+        assert_eq!(gaps.len(), 1, "{payload:#}");
         assert!(gaps
             .iter()
             .any(|gap| gap["producer"] == "rust" && gap["kind"] == "checking_producer"));
-        assert!(gaps
-            .iter()
-            .any(|gap| gap["producer"] == "typescript" && gap["kind"] == "unreported_producer"));
-        for producer in ["rust", "typescript"] {
+        for producer in ["rust"] {
             assert!(payload["by_producer"]
                 .as_object()
                 .unwrap()

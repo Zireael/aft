@@ -539,3 +539,60 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+/// Unscoped inspect observes diagnostics already collected, without opening
+/// every TypeScript file. For an empty working set, successful initialization
+/// certifies that empty result, unlike Rust's whole-workspace compiler check.
+#[test]
+fn unscoped_typescript_5_inspect_keeps_the_empty_working_set_contract() {
+    let Some(ts5) = installed(
+        TS5_ENV,
+        "unscoped_typescript_5_inspect_keeps_the_empty_working_set_contract",
+    ) else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("app");
+    typescript_package(&root, &ts5);
+    write(
+        &root.join("src/clean.ts"),
+        "export const answer: number = 42;\n",
+    );
+    let mut aft = spawn_configured(&root, &[ts5.join(".bin")]);
+    let response = aft.send(
+        &json!({
+            "id": "real-ts5-unscoped", "command": "inspect", "sections": "diagnostics"
+        })
+        .to_string(),
+    );
+    eprintln!("real TypeScript 5 unscoped: {response:#}");
+    assert_eq!(response["success"], true, "{response:#}");
+    assert!(
+        response["wait_stamp"]["phases"]
+            .as_array()
+            .expect("completed phases")
+            .iter()
+            .any(|phase| phase["id"] == "lsp_start" && phase["producer"] == "typescript"),
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_ne!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert!(
+        !response["gaps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|gap| gap["categories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|category| category == "diagnostics")),
+        "{response:#}"
+    );
+}

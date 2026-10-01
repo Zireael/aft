@@ -4421,10 +4421,10 @@ fn blocking_inspect_indexing_gap_names_elapsed_wait_and_retry() {
     assert!(reason.contains("retry aft_inspect"), "{reason}");
 }
 
-/// Quiescence ends the startup wait but cannot certify clean diagnostics
-/// when the producer has never published an authoritative report.
+/// This fake neither begins a compiler check nor publishes diagnostics.
+/// Quiescence alone is not evidence of a completed clean Rust check.
 #[test]
-fn blocking_inspect_names_producers_that_quiesce_without_reports() {
+fn blocking_inspect_names_a_quiescent_rust_producer_before_any_check_begins() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -5707,6 +5707,10 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
     let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
     configure_fake_rust_lsp(&ctx);
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
+    // Hold begin after the already-flushed quiescent status to expose the
+    // idle Current observation without relying on machine contention.
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_FLYCHECK_BEGIN_DELAY_MS", "500");
 
     let response = inspect_tool_call(
         &ctx,
@@ -5741,6 +5745,97 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         .as_object()
         .expect("producer counts")
         .contains_key("rust"));
+}
+
+/// With no opened files, a clean compiler check may publish no reports.
+/// Its matching check-begin and check-end events still certify zero crate errors.
+#[test]
+fn unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-real-clean");
+    generate_fixture_lockfile(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "unscoped-real-clean", "command": "inspect", "sections": "diagnostics"
+        }),
+    );
+    eprintln!("real Rust clean unscoped: {response:#}");
+    assert!(
+        !ctx.lsp().has_any_diagnostic_reports(),
+        "the clean zero-report authority path must execute"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["rust"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_ne!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert_ne!(response["complete"], false, "{response:#}");
+}
+
+/// Unscoped inspect must collect a compiler error without relying on didOpen
+/// diagnostics for the broken source file.
+#[test]
+fn unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, lib) = single_crate_fixture("unscoped-real-error");
+    fs::write(
+        &lib,
+        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) { (v, v) }\n",
+    )
+    .unwrap();
+    generate_fixture_lockfile(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "unscoped-real-error", "command": "inspect", "sections": "diagnostics"
+        }),
+    );
+    eprintln!("real Rust compile error unscoped: {response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(
+        diagnostic_sources_for(&response, "src/lib.rs")
+            .iter()
+            .any(|(source, message)| source == "rustc" && message.contains("moved value")),
+        "{response:#}"
+    );
+}
+
+fn generate_fixture_lockfile(root: &Path) {
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root)
+        .output()
+        .expect("cargo is required for real Rust fixtures");
+    assert!(generated.status.success(), "{generated:?}");
 }
 
 #[test]

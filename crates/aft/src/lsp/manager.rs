@@ -2248,6 +2248,15 @@ impl LspManager {
             })
     }
 
+    /// A completed compiler check can certify an empty Rust result without
+    /// publishDiagnostics. No progress is not enough: the client requires
+    /// matching begin/end events after the latest workspace load and save.
+    pub(crate) fn rust_check_completed_current(&self, server_key: &ServerKey) -> bool {
+        self.clients.get(server_key).is_some_and(|client| {
+            client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+        })
+    }
+
     /// Ask rust-analyzer again for a check that was expected and did not
     /// begin by its deadline (see
     /// [`LspClient::rearm_unreported_rust_check`]). Callers do this when they

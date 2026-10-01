@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -649,6 +649,7 @@ pub(crate) struct RustWorkspaceState {
     failure: Option<String>,
     warning: Option<String>,
     loaded_at: SystemTime,
+    check_begins_at_load: u64,
 }
 
 /// A client connected to one language server process.
@@ -692,7 +693,13 @@ pub struct LspClient {
     /// "flycheck") that have begun and not yet ended. Compiler errors reach
     /// the diagnostics store only when such a run finishes, so while one is
     /// running the published Rust diagnostics are missing those errors.
-    rust_flycheck_running: HashSet<String>,
+    rust_flycheck_running: HashMap<String, u64>,
+    /// Begin ordinal of the latest completed check. A matching begin/end is
+    /// evidence even when a clean compiler run publishes no diagnostic rows.
+    rust_completed_check_begin: Option<u64>,
+    /// A check begun before reloading the Cargo workspace cannot certify the
+    /// reloaded manifests, even if its queued notification is processed later.
+    rust_check_begins_at_load: u64,
     /// When the most recent rust-analyzer check run ended.
     rust_flycheck_finished_at: Option<Instant>,
     /// When the most recent rust-analyzer check run began.
@@ -1016,7 +1023,9 @@ impl LspClient {
             rust_analyzer_failure: None,
             rust_analyzer_warning: None,
             rust_workspace_check_owed_since: None,
-            rust_flycheck_running: HashSet::new(),
+            rust_flycheck_running: HashMap::new(),
+            rust_completed_check_begin: None,
+            rust_check_begins_at_load: 0,
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
             rust_save: None,
@@ -1233,12 +1242,14 @@ impl LspClient {
             failure: self.rust_analyzer_failure.take(),
             warning: self.rust_analyzer_warning.take(),
             loaded_at: self.workspace_loaded_at,
+            check_begins_at_load: self.rust_check_begins_at_load,
         };
         self.rust_analyzer_quiescent = false;
         // rust-analyzer checks the reloaded workspace once it is quiescent
         // again; that check is expected from then on.
         self.rust_workspace_check_owed_since = None;
         self.workspace_loaded_at = requested_at;
+        self.rust_check_begins_at_load = self.rust_check_begins_read.load(Ordering::Acquire);
         previous
     }
 
@@ -1252,6 +1263,7 @@ impl LspClient {
         self.rust_analyzer_failure = previous.failure;
         self.rust_analyzer_warning = previous.warning;
         self.workspace_loaded_at = previous.loaded_at;
+        self.rust_check_begins_at_load = previous.check_begins_at_load;
     }
 
     /// Record a rust-analyzer server-status transition. Returns true only for
@@ -1281,12 +1293,16 @@ impl LspClient {
             "begin" => {
                 if is_rust_check_progress(token, title) {
                     self.rust_check_begins_drained += 1;
-                    self.rust_flycheck_running.insert(token.to_string());
+                    let ordinal = self.rust_check_begins_drained;
+                    self.rust_flycheck_running
+                        .insert(token.to_string(), ordinal);
                     self.rust_flycheck_started_at = Some(Instant::now());
                     // A check run reads the files from disk as they are now,
                     // so it gives the results the expected workspace check
                     // would have, whatever started it.
-                    self.rust_workspace_check_owed_since = None;
+                    if ordinal > self.rust_check_begins_at_load {
+                        self.rust_workspace_check_owed_since = None;
+                    }
                     // For the same reason a run the server announced after a
                     // save was sent covers the saved contents, whatever
                     // started it. Order is judged by when the reader read the
@@ -1296,7 +1312,6 @@ impl LspClient {
                     // the edit. A save deferred and not sent yet is still
                     // expected: this run may have begun before rust-analyzer
                     // received the watcher's change.
-                    let ordinal = self.rust_check_begins_drained;
                     if self
                         .rust_save
                         .as_ref()
@@ -1308,8 +1323,12 @@ impl LspClient {
                 }
             }
             "end" => {
-                if self.rust_flycheck_running.remove(token) {
+                if let Some(begin) = self.rust_flycheck_running.remove(token) {
                     self.rust_flycheck_finished_at = Some(Instant::now());
+                    self.rust_completed_check_begin = Some(
+                        self.rust_completed_check_begin
+                            .map_or(begin, |previous| previous.max(begin)),
+                    );
                 }
             }
             _ => {}
@@ -1457,6 +1476,25 @@ impl LspClient {
             }
             _ => RustCheckState::Current,
         }
+    }
+
+    /// Authority for a clean whole-workspace compiler result without reports.
+    /// Current alone also describes absence of progress, so require a real
+    /// matching begin/end after the latest load. Current additionally proves
+    /// no save is owed, no check is running, and final publishes have settled;
+    /// save begin ordinals reject a check announced before that save.
+    pub(crate) fn rust_check_completed_current(
+        &self,
+        now: Instant,
+        publish_settle: Duration,
+    ) -> bool {
+        matches!(&self.kind, ServerKind::Rust)
+            && self.rust_analyzer_quiescent
+            && self.rust_analyzer_failure.is_none()
+            && self
+                .rust_completed_check_begin
+                .is_some_and(|begin| begin > self.rust_check_begins_at_load)
+            && self.rust_check_state(now, publish_settle) == RustCheckState::Current
     }
 
     /// When a check was expected and did not begin by its deadline
@@ -2355,6 +2393,65 @@ mod tests {
             registry,
         )
         .expect("spawn long-lived LSP stand-in")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_check_authority_requires_a_begin_after_the_latest_load_and_save() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = spawn_long_lived_client(
+            "exec sleep 60",
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        client.kind = ServerKind::Rust;
+        client.rust_analyzer_quiescent = true;
+        client.rust_checks_on_save = true;
+        assert_eq!(
+            client.rust_check_state(Instant::now(), Duration::ZERO),
+            RustCheckState::Current
+        );
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.rust_check_begins_read.store(1, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "begin", Some("cargo check"));
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::from_secs(1)));
+
+        // A begin read before the save must not become its authority merely
+        // because the event channel is drained after sending the save.
+        let uri = "file:///test/lib.rs".parse().unwrap();
+        client.rust_check_begins_read.store(2, Ordering::SeqCst);
+        client.record_save_sent(&uri);
+        client.record_rust_progress("rust-analyzer/flycheck/1", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.rust_check_begins_read.store(3, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/2", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+
+        // Reloading the workspace requires a check begun after the reload;
+        // an earlier completed check no longer certifies the new manifests.
+        client.rust_check_begins_read.store(4, Ordering::SeqCst);
+        let previous = client.begin_rust_workspace_reload(SystemTime::now());
+        client.set_rust_analyzer_quiescent(true);
+        client.record_rust_progress("rust-analyzer/flycheck/3", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.restore_rust_workspace_state(previous);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.begin_rust_workspace_reload(SystemTime::now());
+        client.set_rust_analyzer_quiescent(true);
+        client.rust_check_begins_read.store(5, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/4", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
     }
 
     #[cfg(unix)]

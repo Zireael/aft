@@ -1162,6 +1162,16 @@ fn main() -> io::Result<()> {
                         )?;
                     }
                     if let Some(mode) = flycheck_mode.as_deref() {
+                        // Keep quiescence observable before progress begins so
+                        // inspect tests can exercise that event boundary without
+                        // generating CPU load on a shared test machine.
+                        if let Some(delay_ms) =
+                            std::env::var("AFT_FAKE_LSP_FLYCHECK_BEGIN_DELAY_MS")
+                                .ok()
+                                .and_then(|value| value.parse::<u64>().ok())
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        }
                         write_flycheck_progress(&mut writer, "begin")?;
                         flycheck_running = mode != "never";
                     }
