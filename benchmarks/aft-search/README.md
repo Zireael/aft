@@ -377,6 +377,22 @@ For the subsequent engine implementation change: `slice_class: ranking`, `kind: 
 `targeted_mechanism: split_query_pattern_fusion`; its MRR@10 must strictly improve,
 with exact/concept recall, shape floors, page invariance and paired checks intact.
 
+### Hyphenated-literal rows
+
+Rows `followup-census:900010`–`900017` (mechanism
+`phrase_present_not_surfaced`, shape `identifier`) are single kebab-case
+literals an agent searches for by name: a hash domain tag
+(`aft-ignore-rules-v1`), a log reason code (`drop-no-compatible-handler`), an
+LSP binary name (`haskell-language-server-wrapper`), a request id
+(`doctor-removal-status`), a digest constant (`aft-escalation-payload-v3`), a
+cargo directive (`rerun-if-changed`) and two thread names (`aft-lsp-idle-reap`,
+`aft-mem-sampler`). Each occurs in exactly one file at the pin, and that file
+is the answer. They measure whether a hyphenated query is searched as one
+string: an engine that splits it into its parts lets a field named after one
+part, or three lines mentioning all parts, count as exact evidence and
+outrank the file that holds the literal. Identifier-shaped queries run no
+semantic lane, so the rows need no query vectors.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
@@ -388,6 +404,19 @@ commit message which change moved the rows and why it was the right direction.
 
 Re-records so far:
 
+- 2026-10-01, when the eight hyphenated-literal rows were added (see
+  Hyphenated-literal rows above). Recorded in a Linux aarch64 container on a
+  release build of the unchanged engine (`aft 0.58.1`, binary sha256
+  `0b2b34cce5ba...`), with `run_search_quality.py --mode record-reference
+  --manifest-changed`. The same binary with the old manifest reproduced all 68
+  reference rows byte-for-byte, and with the new manifest those 68 rows are
+  byte-equal again. `paged` real-query MRR@10 0.297672 -> 0.272290 (76 rows),
+  hit@5 0.426471 -> 0.381579, census-weighted MRR 0.436247 -> 0.308773; the
+  `phrase_present_not_surfaced` mechanism 0.666667 -> 0.178571 and the
+  `identifier` shape 0.283333 -> 0.182540. No old row moved: the changes are
+  solely the new rows, whose answer ranks are, in row-ID order, 6, miss, miss,
+  miss, miss, 7, miss, 7 (MRR@10 0.056548 across the eight). Exact recall
+  stayed 1.000 and concept recall 0.639423, re-measured in the recording run.
 - 2026-09-29, when 12 query/pattern rows were added (see Split query/pattern
   rows above). Recorded in Linux x86_64 on the unchanged local-main release
   build `d361e160d142` (`aft 0.58.0`, binary sha256
