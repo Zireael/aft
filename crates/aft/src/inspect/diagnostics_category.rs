@@ -19,8 +19,9 @@ use crate::lsp::roots::ServerKey;
 use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 
 /// Why diagnostics are unknown while rust-analyzer's `cargo check` (started
-/// by an edit's save, or by the server's first analysis) has not finished:
-/// the compiler errors it has published describe the files before the edit.
+/// by an edit's save, or by the server's first analysis) has not finished,
+/// or was expected and did not begin in time: the compiler errors it has
+/// published describe the files before the edit, or are missing.
 pub(crate) const RUST_CHECK_RUNNING_REASON: &str =
     "rust-analyzer: cargo check still running; retry";
 

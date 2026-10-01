@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::context::AppContext;
-use crate::lsp::client::{FLYCHECK_PUBLISH_SETTLE, FLYCHECK_START_GRACE};
+use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::PullFileOutcome;
 use crate::lsp::registry::{servers_for_file, ServerKind};
@@ -35,9 +35,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const NO_PUBLISH_REASON: &str =
     "opened for analysis, but the server published no diagnostics within the inspect budget; retry aft_inspect";
 
-/// Why Rust files are incomplete while rust-analyzer's check is running.
+/// Why Rust files are incomplete while rust-analyzer's check of the current
+/// files is running, or was expected and never began.
 pub(crate) const STILL_CHECKING_REASON: &str =
-    "still checking: rust-analyzer's cargo check had not finished within the inspect budget, so compiler errors may be missing; retry aft_inspect";
+    "still checking: rust-analyzer's cargo check of the current files had not finished within the inspect budget, so compiler errors may be missing or out of date; retry aft_inspect";
 
 /// The servers that would analyze `file`, keyed the way the language-server
 /// manager keys running servers (server kind plus workspace root).
@@ -175,6 +176,14 @@ pub(crate) fn sweep_scoped_files(
         .map(|(file, _)| file.clone())
         .chain(sweep.not_examined.keys().cloned())
         .collect();
+    // A check owed to an earlier request that never began is asked for again
+    // now, so it can run while the files are opened.
+    {
+        let mut lsp = ctx.lsp();
+        for key in involved.iter().filter(|key| key.kind == ServerKind::Rust) {
+            lsp.rearm_unreported_rust_check(key, true);
+        }
+    }
 
     // Open (and pull where supported) one file at a time. The manager lock is
     // taken per step and never held while a server works on a pull, so other
@@ -287,7 +296,7 @@ pub(crate) fn sweep_scoped_files(
         .filter(|key| key.kind == ServerKind::Rust)
         .collect::<Vec<_>>();
     loop {
-        let checking = {
+        let (checking, unreported) = {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
             waiting.retain(|(file, key, before)| {
@@ -296,15 +305,22 @@ pub(crate) fn sweep_scoped_files(
                         .diagnostic_epoch(key, file)
                         .is_some_and(|epoch| before.is_none_or(|before| epoch > before))
             });
-            rust_producers
-                .iter()
-                .filter(|key| {
-                    lsp.rust_flycheck_pending(key, FLYCHECK_START_GRACE, FLYCHECK_PUBLISH_SETTLE)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+            let mut checking = Vec::new();
+            let mut unreported = Vec::new();
+            for key in &rust_producers {
+                match lsp.rust_check_state(key, true) {
+                    RustCheckState::Current => {}
+                    RustCheckState::Running => checking.push(key.clone()),
+                    // Not waited for: the check it owes did not begin in
+                    // time, so its results are unknown however long the
+                    // sweep waits.
+                    RustCheckState::Unreported => unreported.push(key.clone()),
+                }
+            }
+            (checking, unreported)
         };
         if waiting.is_empty() && checking.is_empty() {
+            sweep.still_checking = unreported.into_iter().collect();
             break;
         }
         let now = Instant::now();
@@ -314,7 +330,7 @@ pub(crate) fn sweep_scoped_files(
                     .unanswered
                     .insert(file, (key, NO_PUBLISH_REASON.to_string()));
             }
-            sweep.still_checking = checking.into_iter().collect();
+            sweep.still_checking = checking.into_iter().chain(unreported).collect();
             break;
         }
         std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));

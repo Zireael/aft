@@ -15,6 +15,7 @@ use crate::inspect::{
     format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
 };
+use crate::lsp::client::RustCheckState;
 use crate::lsp::manager::{
     ApplicabilityResolutionError, ApplicableServerFailure, ApplicableServerSnapshot,
     ApplicableServerStartOutcomes, NotApplicableServer,
@@ -1322,23 +1323,34 @@ fn wait_for_root_quiescence(
     let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
     let mut accepted_snapshots = Vec::new();
     let mut blocked = false;
-    let rust_check_pending = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
-        wait_for_rust_check && lsp.rust_check_pending(server)
+    let rust_check_state = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
+        if wait_for_rust_check {
+            lsp.rust_check_state(server, true)
+        } else {
+            RustCheckState::Current
+        }
     };
+    if wait_for_rust_check {
+        let mut lsp = ctx.lsp();
+        for server in expected {
+            lsp.rearm_unreported_rust_check(server, true);
+        }
+    }
     loop {
         if inspect_cancellation_requested() {
             return Err("inspect request cancelled during LSP quiescence".to_string());
         }
         accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
-        if root_producers_settled(ctx, expected) && {
+        let settled = root_producers_settled(ctx, expected);
+        // A check that is owed and did not begin by its deadline is not
+        // waited for: its results are unknown however long this waits.
+        let checking = {
             let lsp = ctx.lsp();
-            !expected
+            expected
                 .iter()
-                .any(|server| rust_check_pending(&*lsp, server))
-        } {
-            return Ok((accepted_snapshots, blocked, Vec::new()));
-        }
-        if Instant::now() >= wait_until {
+                .any(|server| rust_check_state(&lsp, server) == RustCheckState::Running)
+        };
+        if (settled && !checking) || Instant::now() >= wait_until {
             let lsp = ctx.lsp();
             let gaps = expected
                 .iter()
@@ -1351,7 +1363,7 @@ fn wait_for_root_quiescence(
                     started.elapsed().as_secs_f64()
                 ),
                         ))
-                    } else if rust_check_pending(&*lsp, server) {
+                    } else if rust_check_state(&lsp, server) != RustCheckState::Current {
                         Some((
                             server.clone(),
                             crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON

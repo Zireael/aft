@@ -235,6 +235,41 @@ fn write_flycheck_progress(writer: &mut impl Write, kind: &str) -> io::Result<()
     )
 }
 
+fn fake_compile_error() -> Value {
+    json!({
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": 0, "character": 4 }
+        },
+        "severity": 1,
+        "code": "E0425",
+        "source": "rustc",
+        "message": "fake compile error"
+    })
+}
+
+/// Add the `file://` URI of every `.rs` file under `dir`, skipping hidden
+/// directories and `target`.
+fn collect_rust_file_uris(dir: &std::path::Path, uris: &mut std::collections::BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if !name.starts_with('.') && name != "target" {
+                collect_rust_file_uris(&path, uris);
+            }
+        } else if name.ends_with(".rs") {
+            if let Ok(uri) = url::Url::from_file_path(&path) {
+                uris.insert(uri.to_string());
+            }
+        }
+    }
+}
+
 fn push_diagnostics_enabled() -> bool {
     std::env::var("AFT_FAKE_LSP_DISABLE_PUSH").ok().as_deref() != Some("1")
 }
@@ -293,7 +328,126 @@ fn delay_changed_diagnostics_if_requested() {
     }
 }
 
+/// Read one `Content-Length` framed message from `reader`, returning the
+/// whole frame (headers included) and its body. `None` at end of input.
+fn read_raw_frame(reader: &mut impl io::BufRead) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let mut frame = Vec::new();
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        frame.extend_from_slice(line.as_bytes());
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse::<usize>().ok();
+            }
+        }
+    }
+    let length =
+        length.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame without length"))?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    frame.extend_from_slice(&body);
+    Ok(Some((frame, body)))
+}
+
+/// AFT_FAKE_LSP_PROXY=<program>: run the real server `<program>` (with this
+/// process's arguments) and relay its messages unchanged, except that with
+/// AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS=<ms> the first `cargo check` run it
+/// announces reaches the client <ms> late. From that announcement until the
+/// delay is over, the run's progress and every published diagnostics report
+/// are held back (in order); responses and other notifications pass at once.
+/// To the client this is a rust-analyzer that is quiescent and answering
+/// requests but has not started its check yet, as a server starved of CPU
+/// looks: the check announcement comes seconds after quiescence.
+fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
+    use std::sync::{Arc, Mutex};
+    let delay = std::env::var("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
+    let mut child = std::process::Command::new(program)
+        .args(std::env::args_os().skip(1))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let child_stdout = child.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut io::stdin().lock(), &mut child_stdin);
+    });
+
+    struct Hold {
+        /// Frames held back while the delay runs.
+        queue: Vec<Vec<u8>>,
+        /// Whether frames of the held kind are being held now.
+        active: bool,
+        /// Whether the delay has already been applied once.
+        used: bool,
+    }
+    let hold = Arc::new(Mutex::new(Hold {
+        queue: Vec::new(),
+        active: false,
+        used: false,
+    }));
+    let write_frame = |frame: &[u8]| -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(frame)?;
+        stdout.flush()
+    };
+    let mut reader = BufReader::new(child_stdout);
+    while let Some((frame, body)) = read_raw_frame(&mut reader)? {
+        let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let method = message.get("method").and_then(Value::as_str);
+        let check_progress = method == Some("$/progress")
+            && message
+                .pointer("/params/token")
+                .and_then(Value::as_str)
+                .is_some_and(|token| token.contains("flycheck"));
+        let held_kind = check_progress || method == Some("textDocument/publishDiagnostics");
+        let mut state = hold.lock().expect("hold lock");
+        if let Some(delay) = delay {
+            let begins_check = check_progress
+                && message
+                    .pointer("/params/value/kind")
+                    .and_then(Value::as_str)
+                    == Some("begin");
+            if begins_check && !state.used {
+                state.used = true;
+                state.active = true;
+                let hold = Arc::clone(&hold);
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    let mut state = hold.lock().expect("hold lock");
+                    let mut stdout = io::stdout().lock();
+                    for frame in state.queue.drain(..) {
+                        let _ = stdout.write_all(&frame);
+                    }
+                    let _ = stdout.flush();
+                    state.active = false;
+                });
+            }
+        }
+        if held_kind && state.active {
+            state.queue.push(frame);
+        } else {
+            write_frame(&frame)?;
+        }
+    }
+    let status = child.wait()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 fn main() -> io::Result<()> {
+    if let Some(program) = std::env::var_os("AFT_FAKE_LSP_PROXY") {
+        return run_proxy(program);
+    }
     // AFT_FAKE_LSP_IGNORE_SIGTERM=1: keep running through SIGTERM, like a
     // server with its own handler that is busy or wedged, so only a kill that
     // cannot be ignored stops it.
@@ -346,21 +500,107 @@ fn main() -> io::Result<()> {
     // the run begins and never ends.
     let flycheck_mode = std::env::var("AFT_FAKE_LSP_FLYCHECK").ok();
     let mut flycheck_running = false;
+    // Emulates rust-analyzer's check on save: with
+    // AFT_FAKE_LSP_CHECK_ON_SAVE=<ms> the fake asks for save notifications
+    // and runs a check <ms> after each trigger: becoming quiescent at
+    // `initialized` ("load"), a `didSave` ("save"), and
+    // `rust-analyzer/runFlycheck` ("run"). AFT_FAKE_LSP_CHECK_DROP lists the
+    // triggers (comma separated) that start no check, as a server that drops
+    // one. A check begins, publishes for every open document its opened
+    // diagnostics plus, when the file on disk contains `fake_compile_error`,
+    // one compiler error, and ends.
+    let check_on_save_delay = std::env::var("AFT_FAKE_LSP_CHECK_ON_SAVE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
+    let dropped_checks = std::env::var("AFT_FAKE_LSP_CHECK_DROP").unwrap_or_default();
+    let schedule_check = |trigger: &str| -> Option<std::time::Instant> {
+        let delay = check_on_save_delay?;
+        (!dropped_checks
+            .split(',')
+            .any(|dropped| dropped.trim() == trigger))
+        .then(|| std::time::Instant::now() + delay)
+    };
+    let mut check_begins_at: Option<std::time::Instant> = None;
+    // Open documents with their latest version and the diagnostics the fake
+    // last published for them from its own analysis, for the emulated check.
+    let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
+        std::collections::BTreeMap::new();
+    // Files the last emulated check found a compiler error in. Like
+    // rust-analyzer, every later report for such a file still carries the
+    // error until a new check runs.
+    let mut check_errors: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let ignore_shutdown = std::env::var("AFT_FAKE_LSP_IGNORE_SHUTDOWN")
         .ok()
         .as_deref()
         == Some("1");
 
     loop {
-        let received = match reload_finishes_at {
-            Some(finishes_at) => match message_rx
-                .recv_timeout(finishes_at.saturating_duration_since(std::time::Instant::now()))
+        let next_timer = [reload_finishes_at, check_begins_at]
+            .into_iter()
+            .flatten()
+            .min();
+        let received = match next_timer {
+            Some(fires_at) => match message_rx
+                .recv_timeout(fires_at.saturating_duration_since(std::time::Instant::now()))
             {
                 Ok(received) => received,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    reload_finishes_at = None;
-                    last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
-                    write_cargo_lock_status(&mut writer, last_load_stale, true)?;
+                    let now = std::time::Instant::now();
+                    if reload_finishes_at.is_some_and(|at| at <= now) {
+                        reload_finishes_at = None;
+                        last_load_stale = cargo_lock_is_stale(workspace_root.as_deref());
+                        write_cargo_lock_status(&mut writer, last_load_stale, true)?;
+                    }
+                    if check_begins_at.is_some_and(|at| at <= now) {
+                        check_begins_at = None;
+                        write_flycheck_progress(&mut writer, "begin")?;
+                        // Like `cargo check`, read every Rust file from disk
+                        // and publish for each file it reported on before
+                        // or reports on now, and for every open document.
+                        let mut files = std::collections::BTreeSet::new();
+                        if let Some(root) = &workspace_root {
+                            collect_rust_file_uris(root, &mut files);
+                        }
+                        files.extend(open_documents.keys().cloned());
+                        files.extend(check_errors.iter().cloned());
+                        let previous_errors = std::mem::take(&mut check_errors);
+                        check_errors = files
+                            .iter()
+                            .filter(|uri| {
+                                url::Url::parse(uri)
+                                    .ok()
+                                    .and_then(|uri| uri.to_file_path().ok())
+                                    .and_then(|path| std::fs::read_to_string(path).ok())
+                                    .is_some_and(|text| text.contains("fake_compile_error"))
+                            })
+                            .cloned()
+                            .collect();
+                        for uri in &files {
+                            let open = open_documents.get(uri);
+                            if open.is_none()
+                                && !previous_errors.contains(uri)
+                                && !check_errors.contains(uri)
+                            {
+                                continue;
+                            }
+                            let (mut checked, version) =
+                                open.cloned().unwrap_or_else(|| (json!([]), Value::Null));
+                            if check_errors.contains(uri) {
+                                checked
+                                    .as_array_mut()
+                                    .expect("diagnostics are an array")
+                                    .push(fake_compile_error());
+                            }
+                            write_publish_diagnostics_versioned(
+                                &mut writer,
+                                Value::String(uri.clone()),
+                                checked,
+                                version,
+                            )?;
+                        }
+                        write_flycheck_progress(&mut writer, "end")?;
+                    }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -495,6 +735,14 @@ fn main() -> io::Result<()> {
                             "prepareProvider": true
                         }
                     });
+                    if check_on_save_delay.is_some() {
+                        // rust-analyzer asks for saves without their text.
+                        capabilities["textDocumentSync"] = json!({
+                            "openClose": true,
+                            "change": 1,
+                            "save": { "includeText": false }
+                        });
+                    }
 
                     if !no_watched_files {
                         // Default: advertise didChangeWatchedFiles so the capability gate
@@ -917,6 +1165,9 @@ fn main() -> io::Result<()> {
                         write_flycheck_progress(&mut writer, "begin")?;
                         flycheck_running = mode != "never";
                     }
+                    if let Some(at) = schedule_check("load") {
+                        check_begins_at = Some(at);
+                    }
                     if should_register_watched_files {
                         // AFT_FAKE_LSP_WATCHED_GLOBS replaces the catch-all
                         // watcher with a JSON array of FileSystemWatcher values.
@@ -952,6 +1203,10 @@ fn main() -> io::Result<()> {
                 "textDocument/didOpen" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let Some(uri) = uri.as_str() {
+                        open_documents
+                            .insert(uri.to_string(), (opened_diagnostics(), version.clone()));
+                    }
 
                     write_custom_notification(
                         &mut writer,
@@ -960,10 +1215,17 @@ fn main() -> io::Result<()> {
                         version.clone(),
                     )?;
                     if push_diagnostics_enabled() {
+                        let mut diagnostics = opened_diagnostics();
+                        if uri.as_str().is_some_and(|uri| check_errors.contains(uri)) {
+                            diagnostics
+                                .as_array_mut()
+                                .expect("diagnostics are an array")
+                                .push(fake_compile_error());
+                        }
                         write_publish_diagnostics_versioned(
                             &mut writer,
                             uri.clone(),
-                            opened_diagnostics(),
+                            diagnostics,
                             version.clone(),
                         )?;
                     } else {
@@ -1013,6 +1275,10 @@ fn main() -> io::Result<()> {
                 "textDocument/didChange" => {
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if let Some(uri) = uri.as_str() {
+                        open_documents
+                            .insert(uri.to_string(), (changed_diagnostics(), version.clone()));
+                    }
                     delay_changed_diagnostics_if_requested();
                     if std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref() == Some("1") {
                         write_notification(
@@ -1034,16 +1300,36 @@ fn main() -> io::Result<()> {
                         version.clone(),
                     )?;
                     if push_diagnostics_enabled() {
+                        let mut diagnostics = changed_diagnostics();
+                        if uri.as_str().is_some_and(|uri| check_errors.contains(uri)) {
+                            diagnostics
+                                .as_array_mut()
+                                .expect("diagnostics are an array")
+                                .push(fake_compile_error());
+                        }
                         write_publish_diagnostics_versioned(
                             &mut writer,
                             uri,
-                            changed_diagnostics(),
+                            diagnostics,
                             version,
                         )?;
                     }
                 }
+                "textDocument/didSave" => {
+                    if let Some(at) = schedule_check("save") {
+                        check_begins_at = Some(at);
+                    }
+                }
+                "rust-analyzer/runFlycheck" => {
+                    if let Some(at) = schedule_check("run") {
+                        check_begins_at = Some(at);
+                    }
+                }
                 "textDocument/didClose" => {
                     let uri = document_uri(&params);
+                    if let Some(uri) = uri.as_str() {
+                        open_documents.remove(uri);
+                    }
                     write_custom_notification(
                         &mut writer,
                         "custom/documentClosed",

@@ -19,8 +19,8 @@ use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::client::{
-    LspClient, LspEvent, SaveNotification, ServerExitReport, ServerPhase, ServerState,
-    FLYCHECK_PUBLISH_SETTLE, FLYCHECK_START_GRACE,
+    LspClient, LspEvent, RustAnalyzerRunFlycheck, RustCheckState, SaveNotification,
+    ServerExitReport, ServerPhase, ServerState, FLYCHECK_PUBLISH_SETTLE,
 };
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
@@ -405,7 +405,7 @@ where
 /// answers a pull with its own analysis only and pushes the compiler's errors
 /// separately, so storing the pulled report alone drops them. Use this only
 /// after waiting for a running check to finish (see
-/// [`LspManager::rust_check_pending`]); otherwise the stored compiler errors
+/// [`LspManager::rust_check_state`]); otherwise the stored compiler errors
 /// can describe the files before an edit.
 pub fn pull_file_diagnostics_with_cargo_check_unlocked<G>(
     lock: impl Fn() -> G,
@@ -2230,25 +2230,53 @@ impl LspManager {
         self.clients.contains_key(server_key)
     }
 
-    /// Whether rust-analyzer's `cargo check` results may still be missing
-    /// from this server's published diagnostics. See
-    /// [`LspClient::rust_flycheck_pending`].
-    pub(crate) fn rust_flycheck_pending(
+    /// Whether this rust-analyzer's published diagnostics carry the
+    /// compiler's results for the files as they are now. See
+    /// [`LspClient::rust_check_state`]; `await_workspace_check` also waits
+    /// for the check the server starts on becoming quiescent.
+    pub(crate) fn rust_check_state(
         &self,
         server_key: &ServerKey,
-        start_grace: Duration,
-        publish_settle: Duration,
-    ) -> bool {
-        self.clients.get(server_key).is_some_and(|client| {
-            client.rust_flycheck_pending(Instant::now(), start_grace, publish_settle)
-        })
+        await_workspace_check: bool,
+    ) -> RustCheckState {
+        self.clients
+            .get(server_key)
+            .map_or(RustCheckState::Current, |client| {
+                client.rust_check_state(
+                    Instant::now(),
+                    await_workspace_check,
+                    FLYCHECK_PUBLISH_SETTLE,
+                )
+            })
     }
 
-    /// [`Self::rust_flycheck_pending`] with the standard grace periods: true
-    /// while rust-analyzer's `cargo check` results may still be missing or
-    /// out of date.
-    pub(crate) fn rust_check_pending(&self, server_key: &ServerKey) -> bool {
-        self.rust_flycheck_pending(server_key, FLYCHECK_START_GRACE, FLYCHECK_PUBLISH_SETTLE)
+    /// Ask rust-analyzer again for a check that was owed and never began
+    /// (see [`LspClient::rearm_unreported_rust_check`]). Callers do this when
+    /// they start waiting, so each new request gets a fresh deadline rather
+    /// than repeating the last request's unknown answer.
+    pub(crate) fn rearm_unreported_rust_check(
+        &mut self,
+        server_key: &ServerKey,
+        await_workspace_check: bool,
+    ) {
+        let Some(client) = self.clients.get_mut(server_key) else {
+            return;
+        };
+        if client.rearm_unreported_rust_check(Instant::now(), await_workspace_check) {
+            let sent = client.send_notification::<RustAnalyzerRunFlycheck>(
+                serde_json::json!({ "textDocument": null }),
+            );
+            match sent {
+                Ok(()) => slog_info!(
+                    "lsp_protocol server=rust root={} method=rust-analyzer/runFlycheck event=sent",
+                    server_key.root.display()
+                ),
+                Err(error) => {
+                    crate::slog_warn!("rust-analyzer/runFlycheck failed: {error}")
+                }
+            }
+        }
+        self.send_due_rust_saves();
     }
 
     /// Runtime notes (the SDK a server started with) for the given servers

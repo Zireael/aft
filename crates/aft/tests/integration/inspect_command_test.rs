@@ -5416,6 +5416,187 @@ fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
     );
 }
 
+/// Whether a scoped inspect reported rust-analyzer's `cargo check` as still
+/// running instead of certifying the files. Then the answer must be marked
+/// incomplete and say that diagnostics are unknown.
+fn reported_check_still_running(response: &Value) -> bool {
+    let still_checking = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(response["complete"], false, "{response:#}");
+        let text = response["text"].as_str().expect("rendered text");
+        assert!(
+            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            "{text}"
+        );
+    }
+    still_checking
+}
+
+/// rust-analyzer starts its first `cargo check` just after it reports
+/// quiescence, but a server short of CPU (several of them sharing a CI
+/// runner) can announce that check seconds later. A relay in front of the
+/// real server holds the first check's announcement, and every diagnostics
+/// report, back for three seconds while requests are still answered. The
+/// compiler error (`use of moved value` comes only from the compiler) must be
+/// reported, or the check named as still running; certifying the file from
+/// rust-analyzer's own analysis alone is the stale answer this guards against.
+#[test]
+fn scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _s) = field_removal_crate();
+    write_file(
+        &root,
+        "src/moves.rs",
+        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v, v)\n}\n",
+    );
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub mod moves;\npub mod s;\npub mod user;\n",
+    );
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "3000");
+
+    let response = scoped_diagnostics_inspect(&ctx, "late-first-check", "src");
+    if reported_check_still_running(&response) {
+        return;
+    }
+    assert!(
+        diagnostic_sources_for(&response, "src/moves.rs")
+            .iter()
+            .any(|(_, message)| message.contains("moved value")),
+        "the compiler error of the late check is missing: {response:#}"
+    );
+}
+
+/// The same late start against the fake, which emulates rust-analyzer's
+/// check on save: it begins its first check three seconds after reporting
+/// quiescence, longer than inspect used to wait for one, and the check finds
+/// a compiler error. The inspect must wait for it and report the error.
+///
+/// These fake-check tests give inspect a 40 s budget: the scoped sweep gets
+/// about half of it, which must outlast the waits they exercise (up to the
+/// ten seconds rust-analyzer gets to begin its first check).
+#[test]
+fn scoped_rust_inspect_waits_for_a_first_cargo_check_that_begins_late() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("late-first-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
+
+    let response = scoped_diagnostics_inspect(&ctx, "late-first-check", "src/lib.rs");
+
+    assert!(
+        !reported_check_still_running(&response),
+        "the check begins well within the budget: {response:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&response, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the late check is missing: {response:#}"
+    );
+}
+
+/// A save whose check never begins (the fake drops checks asked for by a
+/// save) leaves the published compiler results describing the file before
+/// the edit. Once inspect stops waiting for that check it must say the
+/// diagnostics are unknown, not certify the old results.
+#[test]
+fn scoped_rust_inspect_never_certifies_a_save_that_started_no_check() {
+    let (_temp_dir, root, lib) = single_crate_fixture("save-without-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
+
+    let before = scoped_diagnostics_inspect(&ctx, "save-without-check-before", "src/lib.rs");
+    assert!(!reported_check_still_running(&before), "{before:#}");
+    assert!(
+        diagnostic_messages_for(&before, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the first check reports the error: {before:#}"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "save-without-check-fix",
+            "command": "edit_match",
+            "file": lib.display().to_string(),
+            "match": "// fake_compile_error\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+
+    let after = scoped_diagnostics_inspect(&ctx, "save-without-check-after", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&after),
+        "no check ran after the save, so the result must be unknown: {after:#}"
+    );
+}
+
+/// rust-analyzer owes a check of the whole workspace once it is quiescent.
+/// When that check never begins (the fake drops it), inspect stops waiting
+/// at a deadline and reports the diagnostics as unknown instead of hanging
+/// or certifying them. The next inspect asks for the check again
+/// (`rust-analyzer/runFlycheck`), which the fake runs, and reports its
+/// compiler error.
+#[test]
+fn scoped_rust_inspect_reports_an_unstarted_first_check_as_unknown_then_asks_again() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("first-check-dropped");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "load");
+
+    let first = scoped_diagnostics_inspect(&ctx, "first-check-dropped", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&first),
+        "no check has run, so the result must be unknown: {first:#}"
+    );
+
+    let retried = scoped_diagnostics_inspect(&ctx, "first-check-retried", "src/lib.rs");
+    assert!(!reported_check_still_running(&retried), "{retried:#}");
+    assert!(
+        diagnostic_messages_for(&retried, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the check asked for again reports the error: {retried:#}"
+    );
+}
+
 /// An unscoped inspect makes a whole-project claim, so it too must wait for
 /// rust-analyzer's `cargo check`. The fake's check never finishes: the
 /// answer names the running check instead of certifying the published

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::context::AppContext;
-use crate::lsp::client::FLYCHECK_PUBLISH_SETTLE;
+use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
     EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
@@ -446,47 +446,55 @@ fn collect_directory_diagnostics(
 /// Wait, until `deadline`, for the given rust-analyzer servers to finish
 /// loading the workspace and then a running or just-requested `cargo check`.
 /// While either is under way their published diagnostics describe an older
-/// state of the files. The manager lock is held only to drain events and read
-/// the state, never across a sleep. Returns the servers still busy when the
-/// wait ended, each with the reason to report.
+/// state of the files. A check a save asked for that did not begin in time
+/// is not waited for but still returned as busy: its results are unknown. The
+/// manager lock is held only to drain events and read the state, never across
+/// a sleep. Returns the servers still busy when the wait ended, each with the
+/// reason to report.
 fn wait_for_rust_check(
     ctx: &AppContext,
     servers: &[ServerKey],
     deadline: Instant,
 ) -> Vec<(ServerKey, &'static str)> {
+    // Not the first check after the workspace loads: `lsp_diagnostics` has
+    // never waited for that one. A check that has begun, or that a save asked
+    // for, is awaited.
+    const AWAIT_WORKSPACE_CHECK: bool = false;
+    {
+        let mut lsp = ctx.lsp();
+        for key in servers {
+            lsp.rearm_unreported_rust_check(key, AWAIT_WORKSPACE_CHECK);
+        }
+    }
     loop {
-        let busy: Vec<(ServerKey, &'static str)> = {
+        let (busy, waiting) = {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
-            servers
-                .iter()
-                .filter_map(|key| {
-                    // A server that reported a failed load is not loading;
-                    // its failure is reported through its status instead.
-                    if lsp.producer_failure(key).is_none() && lsp.server_is_warming(key) {
-                        Some((key.clone(), RUST_INDEXING_REASON))
-                    } else if lsp.rust_flycheck_pending(
-                        key,
-                        // Not the first check after the workspace loads:
-                        // `lsp_diagnostics` has never waited for that one,
-                        // and a server that does not check would make every
-                        // call just after startup incomplete. A check that
-                        // has begun, or that a save asked for, is awaited.
-                        Duration::ZERO,
-                        FLYCHECK_PUBLISH_SETTLE,
-                    ) {
-                        Some((
+            let mut busy = Vec::new();
+            let mut waiting = false;
+            for key in servers {
+                // A server that reported a failed load is not loading;
+                // its failure is reported through its status instead.
+                if lsp.producer_failure(key).is_none() && lsp.server_is_warming(key) {
+                    busy.push((key.clone(), RUST_INDEXING_REASON));
+                    waiting = true;
+                    continue;
+                }
+                match lsp.rust_check_state(key, AWAIT_WORKSPACE_CHECK) {
+                    RustCheckState::Current => {}
+                    state => {
+                        busy.push((
                             key.clone(),
                             crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON,
-                        ))
-                    } else {
-                        None
+                        ));
+                        waiting |= state == RustCheckState::Running;
                     }
-                })
-                .collect()
+                }
+            }
+            (busy, waiting)
         };
         let now = Instant::now();
-        if busy.is_empty() || now >= deadline {
+        if !waiting || now >= deadline {
             return busy;
         }
         thread::sleep(

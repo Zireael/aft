@@ -38,11 +38,13 @@ const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
 
-/// rust-analyzer starts its first `cargo check` as soon as it becomes
-/// quiescent. When no check has been seen yet, callers that need compiler
-/// errors wait this long after quiescence for one to begin before treating
-/// checking as disabled.
-pub(crate) const FLYCHECK_START_GRACE: Duration = Duration::from_secs(1);
+/// rust-analyzer starts a `cargo check` of the whole workspace each time it
+/// becomes quiescent after loading the workspace; 1.98 announces it about
+/// 200 ms later, but a server short of CPU has taken over a second. Until it
+/// begins, the published diagnostics lack every compiler error, so callers
+/// that need them wait for it. When none has begun this long after
+/// quiescence, the results stay unknown (never clean) until a check runs.
+const WORKSPACE_CHECK_START_DEADLINE: Duration = Duration::from_secs(10);
 
 /// rust-analyzer can report the end of a check run just before it publishes
 /// the run's last diagnostics; callers keep reading events this long after
@@ -51,9 +53,10 @@ pub(crate) const FLYCHECK_PUBLISH_SETTLE: Duration = Duration::from_millis(300);
 
 /// How long after a `textDocument/didSave` a rust-analyzer check run is
 /// expected to begin. rust-analyzer 1.98 announces the run about 150 ms after
-/// the save; the margin covers a busy server. When checking on save is turned
-/// off no run ever begins, and callers stop waiting for one this long after
-/// the last of [`MAX_SAVE_SENDS`] sends.
+/// the save; the margin covers a busy server. When no run has begun this long
+/// after the last of [`MAX_SAVE_SENDS`] sends, callers stop waiting and report
+/// the compiler results as unknown: they still describe the files before the
+/// save.
 const SAVE_CHECK_START_GRACE: Duration = Duration::from_secs(3);
 
 /// A save that started no check run within this long is sent again: a
@@ -61,7 +64,7 @@ const SAVE_CHECK_START_GRACE: Duration = Duration::from_secs(3);
 /// makes it drop the check.
 const SAVE_RESEND_AFTER: Duration = Duration::from_millis(1500);
 
-/// How many times one save is sent before AFT stops expecting a check.
+/// How many times one save is sent before AFT stops waiting for its check.
 const MAX_SAVE_SENDS: u8 = 3;
 
 /// How long after the file watcher reports a Rust source change the save
@@ -106,6 +109,55 @@ fn parse_save_notification(capabilities: &Value) -> Option<SaveNotification> {
         ),
         _ => None,
     }
+}
+
+/// Which `cargo check` runs rust-analyzer will make, read from the
+/// initialization options AFT starts it with. Returns `(on_save, on_load)`:
+/// whether a save starts a check (`checkOnSave`, on unless set to `false`),
+/// and whether a check of the whole workspace also runs each time the
+/// workspace finishes loading (additionally needs `check.workspace`, on
+/// unless `false`). Measured with rust-analyzer 1.98: with `checkOnSave`
+/// off neither runs, and with `check.workspace` off only the on-save check
+/// does. Both also need the server to accept save notifications.
+fn rust_check_triggers(initialization_options: Option<&Value>) -> (bool, bool) {
+    let disabled = |value: Option<&Value>| match value {
+        Some(Value::Bool(enabled)) => !enabled,
+        // The pre-2023 shape, `checkOnSave: { enable: false }`.
+        Some(Value::Object(options)) => options.get("enable") == Some(&Value::Bool(false)),
+        _ => false,
+    };
+    let on_save = !disabled(initialization_options.and_then(|options| options.get("checkOnSave")));
+    let on_load = on_save
+        && !disabled(
+            initialization_options.and_then(|options| options.pointer("/check/workspace")),
+        );
+    (on_save, on_load)
+}
+
+/// Whether rust-analyzer's published diagnostics carry the compiler's
+/// results for the files as they are now. See
+/// [`LspClient::rust_check_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustCheckState {
+    /// No check is running or expected: the published compiler results are
+    /// current.
+    Current,
+    /// A check is running, has just ended, or is expected to begin soon:
+    /// wait for it.
+    Running,
+    /// A check was expected and has not begun within its deadline. The
+    /// published compiler results may describe older files, so they are
+    /// unknown; waiting longer is unlikely to help.
+    Unreported,
+}
+
+/// rust-analyzer's own notification (not part of the LSP specification)
+/// that starts a `cargo check`; with no document it checks the workspace.
+pub(crate) enum RustAnalyzerRunFlycheck {}
+
+impl lsp_types::notification::Notification for RustAnalyzerRunFlycheck {
+    type Params = Value;
+    const METHOD: &'static str = "rust-analyzer/runFlycheck";
 }
 
 /// Spawn on a process-lifetime thread on Linux: PR_SET_PDEATHSIG observes the
@@ -559,7 +611,7 @@ pub struct ServerDiagnosticCapabilities {
 #[derive(Debug)]
 pub(crate) struct RustWorkspaceState {
     quiescent: bool,
-    quiescent_at: Option<Instant>,
+    workspace_check_owed_since: Option<Instant>,
     failure: Option<String>,
     warning: Option<String>,
     loaded_at: SystemTime,
@@ -594,11 +646,12 @@ pub struct LspClient {
     rust_analyzer_failure: Option<String>,
     /// Non-fatal analyzer health warning; published diagnostics remain usable.
     pub(crate) rust_analyzer_warning: Option<String>,
-    /// When rust-analyzer last reported that its workspace analysis became
-    /// quiescent. rust-analyzer starts its first `cargo check` right after
-    /// that moment, so a caller that needs check results waits briefly past
-    /// it for the check to announce itself.
-    rust_analyzer_quiescent_at: Option<Instant>,
+    /// Since when rust-analyzer owes the `cargo check` of the whole workspace
+    /// it starts on becoming quiescent (or that AFT asked for again; see
+    /// [`LspClient::rearm_unreported_rust_check`]). Cleared when any check
+    /// begins. While set, the published diagnostics lack the compiler's
+    /// errors.
+    rust_workspace_check_owed_since: Option<Instant>,
     /// `$/progress` tokens of rust-analyzer check runs (`cargo check`,
     /// "flycheck") that have begun and not yet ended. Compiler errors reach
     /// the diagnostics store only when such a run finishes, so while one is
@@ -617,6 +670,12 @@ pub struct LspClient {
     /// its initialize response). `None` until `initialize` succeeds, and when
     /// the server did not ask.
     save_notification: Option<SaveNotification>,
+    /// Whether rust-analyzer runs `cargo check` when told of a save, and
+    /// whether it checks the whole workspace each time it finishes loading
+    /// it (see [`rust_check_triggers`]). Both false until `initialize`
+    /// succeeds, and for other servers.
+    rust_checks_on_save: bool,
+    rust_checks_on_load: bool,
     /// Wall-clock time at which this server last started reading the
     /// workspace's Cargo manifests: the spawn, or the latest workspace reload
     /// AFT requested. A manifest or lockfile modified after this moment is
@@ -904,12 +963,14 @@ impl LspClient {
             rust_analyzer_quiescent,
             rust_analyzer_failure: None,
             rust_analyzer_warning: None,
-            rust_analyzer_quiescent_at: None,
+            rust_workspace_check_owed_since: None,
             rust_flycheck_running: HashSet::new(),
             rust_flycheck_finished_at: None,
             rust_flycheck_started_at: None,
             rust_save: None,
             save_notification: None,
+            rust_checks_on_save: false,
+            rust_checks_on_load: false,
             workspace_loaded_at,
             supports_watched_files: false,
             watched_file_registrations,
@@ -1013,6 +1074,7 @@ impl LspClient {
                 }
             ]
         });
+        let (checks_on_save, checks_on_load) = rust_check_triggers(initialization_options.as_ref());
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
         }
@@ -1042,6 +1104,12 @@ impl LspClient {
             .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
         self.save_notification = parse_save_notification(&caps_value);
+        // rust-analyzer checks on save only when it hears of saves. Another
+        // server run for Rust that does not ask for them runs no checks AFT
+        // could wait for.
+        let checks = matches!(&self.kind, ServerKind::Rust) && self.save_notification.is_some();
+        self.rust_checks_on_save = checks && checks_on_save;
+        self.rust_checks_on_load = checks && checks_on_load;
 
         // Capture initialize-time (static) workspace/didChangeWatchedFiles
         // support. Runtime client/registerCapability subscriptions are recorded
@@ -1107,13 +1175,14 @@ impl LspClient {
     ) -> RustWorkspaceState {
         let previous = RustWorkspaceState {
             quiescent: self.rust_analyzer_quiescent,
-            quiescent_at: self.rust_analyzer_quiescent_at,
+            workspace_check_owed_since: self.rust_workspace_check_owed_since,
             failure: self.rust_analyzer_failure.take(),
             warning: self.rust_analyzer_warning.take(),
             loaded_at: self.workspace_loaded_at,
         };
         self.rust_analyzer_quiescent = false;
-        self.rust_analyzer_quiescent_at = None;
+        // The reloaded workspace owes its own check once it is quiescent.
+        self.rust_workspace_check_owed_since = None;
         self.workspace_loaded_at = requested_at;
         previous
     }
@@ -1124,7 +1193,7 @@ impl LspClient {
     /// ever end the warming state.
     pub(crate) fn restore_rust_workspace_state(&mut self, previous: RustWorkspaceState) {
         self.rust_analyzer_quiescent = previous.quiescent;
-        self.rust_analyzer_quiescent_at = previous.quiescent_at;
+        self.rust_workspace_check_owed_since = previous.workspace_check_owed_since;
         self.rust_analyzer_failure = previous.failure;
         self.rust_analyzer_warning = previous.warning;
         self.workspace_loaded_at = previous.loaded_at;
@@ -1138,7 +1207,11 @@ impl LspClient {
             return false;
         }
         self.rust_analyzer_quiescent = true;
-        self.rust_analyzer_quiescent_at = Some(Instant::now());
+        // rust-analyzer starts a check of the whole workspace on becoming
+        // quiescent, after any check a save started during the load.
+        if self.rust_checks_on_load {
+            self.rust_workspace_check_owed_since = Some(Instant::now());
+        }
         true
     }
 
@@ -1160,6 +1233,10 @@ impl LspClient {
                 if is_check {
                     self.rust_flycheck_running.insert(token.to_string());
                     self.rust_flycheck_started_at = Some(Instant::now());
+                    // A run reads the files from disk as they are now, so it
+                    // also stands for the workspace check owed since the
+                    // server became quiescent.
+                    self.rust_workspace_check_owed_since = None;
                     // A check run reads the files from disk, so any run that
                     // begins after a save was sent covers the saved contents,
                     // whatever started it. A save deferred and not sent yet is
@@ -1198,9 +1275,9 @@ impl LspClient {
     /// Record that a `textDocument/didSave` for `uri` was just sent. For
     /// rust-analyzer this starts a new `cargo check`, and the check results
     /// published so far describe the files before the save; see
-    /// [`Self::rust_flycheck_pending`].
+    /// [`Self::rust_check_state`].
     pub(crate) fn record_save_sent(&mut self, uri: &lsp_types::Uri) {
-        if matches!(&self.kind, ServerKind::Rust) {
+        if self.rust_checks_on_save {
             let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
                 uri: uri.clone(),
@@ -1220,7 +1297,7 @@ impl LspClient {
     /// [`EXTERNAL_SAVE_DELAY`] has passed. The check counts as requested from
     /// now on.
     pub(crate) fn owe_rust_save(&mut self, uri: &lsp_types::Uri) {
-        if matches!(&self.kind, ServerKind::Rust) {
+        if self.rust_checks_on_save {
             let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
                 uri: uri.clone(),
@@ -1259,30 +1336,40 @@ impl LspClient {
         }
     }
 
-    /// Whether rust-analyzer's check results may still be missing from the
-    /// published diagnostics or describe older file contents: a check run is
-    /// in progress, one ended less than `publish_settle` ago (rust-analyzer
-    /// can announce the end before it publishes the final batch), a save asked
-    /// for a check that has not begun yet (until it does, the published
+    /// Whether rust-analyzer's published diagnostics carry the compiler's
+    /// results for the files as they are now.
+    ///
+    /// [`RustCheckState::Running`] while a check run is in progress, ended
+    /// less than `publish_settle` ago (rust-analyzer can announce the end
+    /// before it publishes the final batch), or is owed and still within its
+    /// deadline: a save asked for one (until it begins, the published
     /// compiler errors describe the files before the save, including errors
-    /// already fixed), or the server became quiescent less than `start_grace`
-    /// ago and no check run has been seen yet (the first run starts right
-    /// after quiescence). A save stops counting once it has been sent
-    /// [`MAX_SAVE_SENDS`] times and [`SAVE_CHECK_START_GRACE`] has passed
-    /// since the last send without a check beginning, as when checking on
-    /// save is turned off. False for other servers and for a server that is
-    /// still warming (that state is tracked separately).
-    pub(crate) fn rust_flycheck_pending(
+    /// already fixed), or, with `await_workspace_check`, the server became
+    /// quiescent and has not begun the workspace check it starts then.
+    ///
+    /// [`RustCheckState::Unreported`] once an owed check has not begun by its
+    /// deadline: [`SAVE_CHECK_START_GRACE`] after the last of
+    /// [`MAX_SAVE_SENDS`] sends of a save, or
+    /// [`WORKSPACE_CHECK_START_DEADLINE`] after quiescence. A late start and
+    /// a check that never comes look the same from here, and in neither case
+    /// do the published results describe the current files, so they are
+    /// never reported as current.
+    ///
+    /// [`RustCheckState::Current`] otherwise, for other servers, for a server
+    /// still warming (that state is tracked separately), and when the
+    /// server's settings run no check that would be owed (see
+    /// [`rust_check_triggers`]).
+    pub(crate) fn rust_check_state(
         &self,
         now: Instant,
-        start_grace: Duration,
+        await_workspace_check: bool,
         publish_settle: Duration,
-    ) -> bool {
+    ) -> RustCheckState {
         if !matches!(&self.kind, ServerKind::Rust) || !self.rust_analyzer_quiescent {
-            return false;
+            return RustCheckState::Current;
         }
         if !self.rust_flycheck_running.is_empty() {
-            return true;
+            return RustCheckState::Running;
         }
         if let Some(save) = &self.rust_save {
             let awaiting = match save.last_sent_at {
@@ -1292,15 +1379,54 @@ impl LspClient {
                         || now.saturating_duration_since(sent) < SAVE_CHECK_START_GRACE
                 }
             };
-            if awaiting {
-                return true;
+            return if awaiting {
+                RustCheckState::Running
+            } else {
+                RustCheckState::Unreported
+            };
+        }
+        if await_workspace_check {
+            if let Some(owed_since) = self.rust_workspace_check_owed_since {
+                return if now.saturating_duration_since(owed_since) < WORKSPACE_CHECK_START_DEADLINE
+                {
+                    RustCheckState::Running
+                } else {
+                    RustCheckState::Unreported
+                };
             }
         }
-        if let Some(finished) = self.rust_flycheck_finished_at {
-            return now.saturating_duration_since(finished) < publish_settle;
+        match self.rust_flycheck_finished_at {
+            Some(finished) if now.saturating_duration_since(finished) < publish_settle => {
+                RustCheckState::Running
+            }
+            _ => RustCheckState::Current,
         }
-        self.rust_analyzer_quiescent_at
-            .is_some_and(|at| now.saturating_duration_since(at) < start_grace)
+    }
+
+    /// Ask again for an owed check that [`Self::rust_check_state`] reports as
+    /// [`RustCheckState::Unreported`], so a new caller gets a fresh deadline
+    /// instead of an unknown answer that no retry could change. A save is
+    /// queued to be sent again by [`Self::take_rust_save_to_send`]. For the
+    /// workspace check (only with `await_workspace_check`) this returns true:
+    /// the caller sends [`RustAnalyzerRunFlycheck`], which starts one.
+    pub(crate) fn rearm_unreported_rust_check(
+        &mut self,
+        now: Instant,
+        await_workspace_check: bool,
+    ) -> bool {
+        if self.rust_check_state(now, await_workspace_check, Duration::ZERO)
+            != RustCheckState::Unreported
+        {
+            return false;
+        }
+        if let Some(save) = self.rust_save.as_mut() {
+            save.due_at = Some(now);
+            save.last_sent_at = None;
+            save.sends = 0;
+            return false;
+        }
+        self.rust_workspace_check_owed_since = Some(now);
+        true
     }
 
     /// Whether the server advertised initialize-time
