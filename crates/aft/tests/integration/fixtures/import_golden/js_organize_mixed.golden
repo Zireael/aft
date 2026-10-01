@@ -1,5 +1,5 @@
-import { a } from 'alpha';
+import { a } from "alpha";
 
-import { b } from './b';
+import { b } from "./b";
 
 export const x = 1;

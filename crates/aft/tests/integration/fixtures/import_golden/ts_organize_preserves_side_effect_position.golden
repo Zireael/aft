@@ -1,4 +1,4 @@
-import { init } from './a';
-import './b';
+import { init } from "./a";
+import "./b";
 
 export const x = init;

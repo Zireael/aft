@@ -702,6 +702,7 @@ fn organized_from_statement(imp: &ImportStatement, lang: LangId) -> OrganizedImp
         namespace_import: imp.namespace_import.clone(),
         kind: imp.kind,
         attribute_clause: imports::es_import_attribute_clause(imp).map(str::to_string),
+        quote: imports::quotes::statement_quote(&imp.raw_text),
         raw_override,
     }
 }
@@ -741,6 +742,7 @@ struct OrganizedImport {
     namespace_import: Option<String>,
     kind: ImportKind,
     attribute_clause: Option<String>,
+    quote: Option<char>,
     /// When set, the import is rendered verbatim from this string instead of
     /// being regenerated from the structured fields. Used by dialect-sensitive
     /// languages (e.g. Scala) where re-rendering would normalize across
@@ -827,6 +829,7 @@ fn organize_generic_group(
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
             attribute_clause: attribute_clause.map(str::to_string),
+            quote: imports::quotes::statement_quote(&imp.raw_text),
             raw_override: None,
         });
     }
@@ -878,6 +881,7 @@ fn organize_raw_preserving_group(
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
             attribute_clause: imports::es_import_attribute_clause(imp).map(str::to_string),
+            quote: imports::quotes::statement_quote(&imp.raw_text),
             raw_override: Some(imp.raw_text.trim().to_string()),
         })
         .collect();
@@ -1061,6 +1065,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     namespace_import: None,
                     kind: up.kind,
                     attribute_clause: None,
+                    quote: None,
                     raw_override: None,
                 });
             }
@@ -1094,6 +1099,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             namespace_import: None,
             kind,
             attribute_clause: None,
+            quote: None,
             raw_override: None,
         });
     }
@@ -1213,7 +1219,7 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
             }
         }
         LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-            imports::generate_import_line_with_namespace_and_attribute_clause(
+            imports::generate_import_line_with_namespace_and_attribute_clause_and_quote(
                 lang,
                 &imp.module_path,
                 &imp.names,
@@ -1221,6 +1227,7 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
                 imp.namespace_import.as_deref(),
                 imp.kind == ImportKind::Type,
                 imp.attribute_clause.as_deref(),
+                imp.quote,
             )
         }
         _ => {

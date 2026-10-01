@@ -7,6 +7,8 @@
 //!
 //! Currently supports: TypeScript, TSX, JavaScript, Python, Rust, Go.
 
+pub(crate) mod quotes;
+
 use std::ops::Range;
 
 use tree_sitter::{Node, Parser, Tree};
@@ -1292,6 +1294,28 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
     type_only: bool,
     attribute_clause: Option<&str>,
 ) -> String {
+    generate_import_line_with_namespace_and_attribute_clause_and_quote(
+        lang,
+        module_path,
+        names,
+        default_import,
+        namespace_import,
+        type_only,
+        attribute_clause,
+        None,
+    )
+}
+
+pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_quote(
+    lang: LangId,
+    module_path: &str,
+    names: &[String],
+    default_import: Option<&str>,
+    namespace_import: Option<&str>,
+    type_only: bool,
+    attribute_clause: Option<&str>,
+    quote: Option<char>,
+) -> String {
     if matches!(
         lang,
         LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
@@ -1303,6 +1327,7 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
             namespace_import,
             type_only,
             attribute_clause,
+            quote.unwrap_or('\''),
         );
     }
 
@@ -1413,7 +1438,10 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
     let byte_range = node.byte_range();
 
     // Find the source module (string/string_fragment child of the import)
-    let module_path = extract_module_path(source, node)?;
+    let module_path = node
+        .child_by_field_name("source")
+        .and_then(|module| decode_js_attribute_atom(&source[module.byte_range()]))
+        .or_else(|| extract_module_path(source, node))?;
 
     // Determine if this is a type-only import: `import type ...`
     let is_type_only = has_type_keyword(node);
@@ -1801,6 +1829,7 @@ fn generate_ts_import_line(
         namespace_import,
         type_only,
         None,
+        '\'',
     )
 }
 
@@ -1811,6 +1840,7 @@ fn generate_ts_import_line_with_attribute_clause(
     namespace_import: Option<&str>,
     type_only: bool,
     attribute_clause: Option<&str>,
+    quote: char,
 ) -> String {
     let line = generate_ts_import_line_base(
         module_path,
@@ -1818,6 +1848,7 @@ fn generate_ts_import_line_with_attribute_clause(
         default_import,
         namespace_import,
         type_only,
+        quote,
     );
     let Some(attribute_clause) = attribute_clause else {
         return line;
@@ -1833,32 +1864,34 @@ fn generate_ts_import_line_base(
     default_import: Option<&str>,
     namespace_import: Option<&str>,
     type_only: bool,
+    quote: char,
 ) -> String {
+    let module_path = quotes::module_literal(module_path, quote);
     let type_prefix = if type_only { "type " } else { "" };
 
     // Side-effect import
     if names.is_empty() && default_import.is_none() && namespace_import.is_none() {
-        return format!("import '{module_path}';");
+        return format!("import {module_path};");
     }
 
     // Namespace import only
     if names.is_empty() && default_import.is_none() {
         if let Some(namespace) = namespace_import {
-            return format!("import {type_prefix}* as {namespace} from '{module_path}';");
+            return format!("import {type_prefix}* as {namespace} from {module_path};");
         }
     }
 
     // Default + namespace import
     if names.is_empty() {
         if let (Some(def), Some(namespace)) = (default_import, namespace_import) {
-            return format!("import {type_prefix}{def}, * as {namespace} from '{module_path}';");
+            return format!("import {type_prefix}{def}, * as {namespace} from {module_path};");
         }
     }
 
     // Default import only
     if names.is_empty() && namespace_import.is_none() {
         if let Some(def) = default_import {
-            return format!("import {type_prefix}{def} from '{module_path}';");
+            return format!("import {type_prefix}{def} from {module_path};");
         }
     }
 
@@ -1867,7 +1900,7 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{{ {names_str} }} from '{module_path}';");
+        return format!("import {type_prefix}{{ {names_str} }} from {module_path};");
     }
 
     // Namespace + named imports
@@ -1877,7 +1910,7 @@ fn generate_ts_import_line_base(
             sort_named_specifiers(&mut sorted_names);
             let names_str = sorted_names.join(", ");
             return format!(
-                "import {type_prefix}{{ {names_str} }}, * as {namespace} from '{module_path}';"
+                "import {type_prefix}{{ {names_str} }}, * as {namespace} from {module_path};"
             );
         }
     }
@@ -1888,7 +1921,7 @@ fn generate_ts_import_line_base(
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
         return format!(
-            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from '{module_path}';"
+            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from {module_path};"
         );
     }
 
@@ -1897,11 +1930,11 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{def}, {{ {names_str} }} from '{module_path}';");
+        return format!("import {type_prefix}{def}, {{ {names_str} }} from {module_path};");
     }
 
     // Shouldn't reach here, but handle gracefully
-    format!("import '{module_path}';")
+    format!("import {module_path};")
 }
 
 // ---------------------------------------------------------------------------

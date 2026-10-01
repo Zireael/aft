@@ -259,7 +259,7 @@ fn add_import_ts_allows_parent_relative_module() {
     );
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import { Config } from '../config';"),
+        content.contains("import { Config } from \"../config\";"),
         "single-parent ES relative imports must remain allowed:\n{content}"
     );
 
@@ -627,7 +627,7 @@ fn add_import_empty_file() {
 
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import { useState } from 'react';"),
+        content.contains("import { useState } from \"react\";"),
         "should contain the import at top. content:\n{}",
         content
     );
@@ -3461,5 +3461,36 @@ fn rust_complex_use_lists_survive_edits_and_compile() {
         assert_eq!(response["success"], true, "{response}");
         assert_rust_library_compiles(&file);
         aft.shutdown();
+    }
+}
+
+#[test]
+fn es_import_commands_preserve_quotes() {
+    for (extension, source) in [
+        ("ts", "import { z, a } from \"z\";\nimport { b } from 'b';\n"),
+        ("tsx", "import { z, a } from \"z\";\nimport { b } from 'b';\n"),
+        ("js", "import { z, a } from \"z\";\nimport { b } from 'b';\n"),
+        ("vue", "<script setup lang=\"ts\">\nimport { z, a } from \"z\";\nimport { b } from 'b';\n</script>\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("quotes.{extension}"));
+        fs::write(&file, source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_import(&mut aft, "quote-add", file.to_str().unwrap(), "c", Some(&["c"]), None, false);
+        assert_eq!(response["success"], true, "{response}");
+        assert!(fs::read_to_string(&file).unwrap().contains("import { c } from \"c\";"));
+        let response = aft.send(&serde_json::json!({
+            "id": "quote-remove", "command": "remove_import", "file": file,
+            "module": "z", "name": "z"
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        assert!(fs::read_to_string(&file).unwrap().contains("import { a } from \"z\";"));
+        let response = aft.send(&serde_json::json!({
+            "id": "quote-organize", "command": "organize_imports", "file": file
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        let organized = fs::read_to_string(&file).unwrap();
+        assert!(organized.contains("import { a } from \"z\";"));
+        assert!(organized.contains("import { b } from 'b';"));
     }
 }
