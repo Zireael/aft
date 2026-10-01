@@ -852,10 +852,6 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis);
     while let Ok(message) = rx.recv() {
-        #[cfg(debug_assertions)]
-        if let Some(delay) = test_delay {
-            thread::sleep(delay);
-        }
         let mut lines = Vec::new();
         let mut reconfigure = None;
         let mut flushed = None;
@@ -879,6 +875,15 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
             }
             LogMessage::Reconfigure(storage_root) => reconfigure = Some(storage_root),
             LogMessage::Flush(done) => flushed = Some(done),
+        }
+        // The delay is applied after the batch is collected, so a flush request
+        // is always acknowledged at least one full delay after it was queued.
+        // Delaying before collection instead let a request that arrived late in
+        // a sleep ride along with that batch, which made a slow writer look
+        // fast at random.
+        #[cfg(debug_assertions)]
+        if let Some(delay) = test_delay {
+            thread::sleep(delay);
         }
         // Exit can take the sink while the worker is delayed. Serialize terminal
         // writes with rotation and reconfiguration, but not with queue waits.
