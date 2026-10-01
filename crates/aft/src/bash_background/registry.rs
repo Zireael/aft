@@ -75,11 +75,13 @@ pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
-/// How long a second kill waits for one already in flight on the same task
-/// before answering with whatever state the task is in: the SIGTERM grace
-/// period plus time for the SIGKILL, the reap and the terminal write.
+/// How long a reader that must answer with a settled status (`bash_status`,
+/// a second kill) waits for a kill already in flight on the same task: the
+/// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
+/// terminal write. A kill still in flight after that (a signal stuck in the
+/// kernel) is reported as in flight rather than waited out.
 const KILL_IN_FLIGHT_WAIT: Duration =
-    Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 5);
+    Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
 
 /// What a kill does after it releases the task's state lock. See
 /// [`BgTaskRegistry::kill_with_status_reason`].
@@ -146,7 +148,7 @@ static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGa
 
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
-fn install_kill_signal_gate_for_test(
+pub(crate) fn install_kill_signal_gate_for_test(
     task_id: &str,
 ) -> (
     crossbeam_channel::Receiver<()>,
@@ -499,6 +501,10 @@ pub(crate) struct BgTask {
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// Notified, with `state` locked, when a kill clears
+    /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
+    /// status wait on it instead of holding `state` across the kill.
+    kill_settled: std::sync::Condvar,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
     /// the route that started it (or of the row it was replayed from). The
     /// root context is shared by routes from several harnesses, so this can
@@ -1220,6 +1226,12 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        // When a watchdog pass is publishing this terminal state, record that
+        // pass before the completion becomes visible below, so a reader that
+        // sees the completion also sees which pass observed it.
+        if let Some(pass) = super::watchdog::current_pass() {
+            self.record_completion_pass_cause(&task.task_id, pass);
+        }
         let should_sample = {
             let mut state = task
                 .state
@@ -2359,6 +2371,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -2561,6 +2574,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
@@ -2720,6 +2734,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -4042,6 +4057,9 @@ impl BgTaskRegistry {
         ).ok()
     }
 
+    /// A snapshot of the task as it is now, including `killing` while a kill
+    /// is signaling it. Never waits for a kill, so pending-response polls and
+    /// other loop-driven readers can call it.
     pub fn status(
         &self,
         task_id: &str,
@@ -4049,6 +4067,50 @@ impl BgTaskRegistry {
         project_root: Option<&Path>,
         storage_dir: Option<&Path>,
         preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            storage_dir,
+            preview_bytes,
+            Duration::ZERO,
+        )
+    }
+
+    /// The status `bash_status` answers with. A kill in flight publishes
+    /// `killing` while it signals and reaps without the state lock; callers
+    /// of `bash_status` never saw that state before kills released the lock,
+    /// and treat any non-running status as final. So this waits (without the
+    /// state lock, bounded by [`KILL_IN_FLIGHT_WAIT`]) for an in-flight kill
+    /// to publish its outcome, and only reports `killing` if the kill is
+    /// still in flight when the bound expires.
+    pub fn status_settled(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: Option<&Path>,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            storage_dir,
+            preview_bytes,
+            KILL_IN_FLIGHT_WAIT,
+        )
+    }
+
+    fn status_with_kill_wait(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: Option<&Path>,
+        preview_bytes: usize,
+        kill_wait: Duration,
     ) -> Option<BgTaskSnapshot> {
         validate_task_id(task_id).ok()?;
         let terminal_db_fallback_allowed = storage_dir
@@ -4079,9 +4141,15 @@ impl BgTaskRegistry {
                 storage_dir?,
                 preview_bytes,
                 terminal_db_fallback_allowed,
+                kill_wait,
             );
         };
         let _ = self.poll_task(&task);
+        // After a wait, poll again: a PTY's exit marker may have landed while
+        // the kill settled, and this reader can publish it itself.
+        if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
+            let _ = self.poll_task(&task);
+        }
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
@@ -4261,6 +4329,7 @@ impl BgTaskRegistry {
         storage_dir: &Path,
         preview_bytes: usize,
         allow_terminal_db_fallback: bool,
+        kill_wait: Duration,
     ) -> Option<BgTaskSnapshot> {
         let fallback_row = if allow_terminal_db_fallback {
             self.lookup_relaxed_task_from_db(task_id, project_root)
@@ -4272,6 +4341,9 @@ impl BgTaskRegistry {
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
         if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
             let _ = self.poll_task(&task);
+            if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
+                let _ = self.poll_task(&task);
+            }
             return Some(self.snapshot_with_terminal_cache(&task, preview_bytes));
         }
         let row = fallback_row?;
@@ -5201,6 +5273,40 @@ impl BgTaskRegistry {
         false
     }
 
+    /// True for a PTY task whose child has exited (its waiter wrote the exit
+    /// marker) before its completion wake was sent, which happens once the
+    /// PTY reader has drained the output as well. The watchdog uses this to
+    /// leave such a task to that wake instead of finalizing it on a periodic
+    /// tick.
+    pub(crate) fn pty_exit_awaiting_reader(&self, task: &BgTask) -> bool {
+        task.state.lock().is_ok_and(|state| match &state.runtime {
+            TaskRuntime::Pty(Some(pty)) => {
+                pty.exit_observed.load(Ordering::SeqCst)
+                    && !pty.coordinator.woken.load(Ordering::SeqCst)
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether a watchdog wake is queued and not yet consumed by a pass.
+    pub(crate) fn wake_pending(&self) -> bool {
+        !self.inner.wake_rx.is_empty()
+    }
+
+    /// Record the first watchdog pass that observed `task_id` terminal. A
+    /// periodic pass that runs while a wake is already queued is serving that
+    /// wake's completion signal, so it is recorded as a wake pass.
+    pub(crate) fn record_completion_pass_cause(&self, task_id: &str, cause: WatchdogPassCause) {
+        let cause = if cause == WatchdogPassCause::Tick && self.wake_pending() {
+            WatchdogPassCause::Wake
+        } else {
+            cause
+        };
+        if let Ok(mut causes) = self.inner.completion_pass_cause.lock() {
+            causes.entry(task_id.to_string()).or_insert(cause);
+        }
+    }
+
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
         self.inner
             .watchdog_tasks
@@ -5254,6 +5360,7 @@ impl BgTaskRegistry {
             started,
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: if mode == BgMode::Pty {
@@ -5679,6 +5786,7 @@ impl BgTaskRegistry {
                     .lock()
                     .map_err(|_| "background task lock poisoned".to_string())?;
                 state.kill_in_flight = false;
+                task.kill_settled.notify_all();
                 // A terminal state published while the signal was in flight
                 // (the task's own exit marker, read by the watchdog) stands.
                 if !state.metadata.status.is_terminal() {
@@ -5794,6 +5902,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.kill_in_flight = false;
+        task.kill_settled.notify_all();
         // The PTY may already have been finalized from its exit marker while
         // the signal was in flight, which drops the runtime.
         if let TaskRuntime::Pty(Some(pty)) = &mut state.runtime {
@@ -5844,18 +5953,7 @@ impl BgTaskRegistry {
     /// Bounded by the longest a kill should take; past that the caller
     /// answers with whatever state the task is in.
     fn await_kill_in_flight(&self, task: &Arc<BgTask>) {
-        let deadline = Instant::now() + KILL_IN_FLIGHT_WAIT;
-        loop {
-            let settled = task
-                .state
-                .lock()
-                .map(|state| !state.kill_in_flight || state.metadata.status.is_terminal())
-                .unwrap_or(true);
-            if settled || Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let _ = task.wait_for_kill_settled(KILL_IN_FLIGHT_WAIT);
     }
 
     fn finalize_from_marker(
@@ -5900,6 +5998,8 @@ impl BgTaskRegistry {
                 .map_err(|e| format!("failed to persist terminal state: {e}"))?;
             state.metadata = updated;
             task.mark_terminal_now();
+            // A reader waiting out an in-flight kill can answer now.
+            task.kill_settled.notify_all();
             match &mut state.runtime {
                 // Reap the exited direct child instead of dropping it, so it
                 // does not linger as a `<defunct>` zombie (issue #91). The
@@ -7759,6 +7859,42 @@ impl BgTask {
             .lock()
             .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false)
+    }
+
+    /// Whether a kill has released the state lock to signal and reap this
+    /// task and has not published its outcome yet.
+    pub(crate) fn kill_in_flight(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.kill_in_flight)
+            .unwrap_or(false)
+    }
+
+    /// Wait, without holding `state`, until a kill on this task has settled
+    /// or the task is terminal, for at most `bound`. Returns at once when no
+    /// kill is under way. A piped kill settles when it publishes its outcome.
+    /// A PTY kill only signals: the PTY's waiter writes the exit marker and
+    /// the watchdog publishes the terminal state from it, so a PTY task
+    /// stays `killing` until then and is waited out the same way.
+    /// Returns whether it waited.
+    fn wait_for_kill_settled(&self, bound: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let unsettled = |state: &mut BgTaskState| {
+            !state.metadata.status.is_terminal()
+                && (state.kill_in_flight
+                    || (state.metadata.mode == BgMode::Pty
+                        && state.metadata.status == BgTaskStatus::Killing))
+        };
+        let mut state = state;
+        if !unsettled(&mut state) {
+            return false;
+        }
+        let _ = self
+            .kill_settled
+            .wait_timeout_while(state, bound, unsettled);
+        true
     }
 
     fn mark_terminal_now(&self) {
@@ -10959,6 +11095,130 @@ mod tests {
         let completions = completions_for(&registry, &task_id);
         assert_eq!(completions.len(), 1, "exactly one completion");
         assert_eq!(completions[0].status, BgTaskStatus::Killed);
+    }
+
+    /// `bash_status` answers with a settled status: during a kill held in
+    /// flight by the test gate it waits for the kill's outcome instead of
+    /// answering `killing`, and with no kill in flight it does not wait.
+    #[cfg(unix)]
+    #[test]
+    fn status_settled_waits_out_an_in_flight_kill_and_only_then() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+
+        let idle_started = Instant::now();
+        let idle = registry
+            .status_settled(&task_id, "session", None, None, 0)
+            .expect("status without a kill");
+        assert_eq!(idle.info.status, BgTaskStatus::Running);
+        assert!(
+            idle_started.elapsed() < KILL_IN_FLIGHT_WAIT / 2,
+            "no kill in flight, so no wait: {:?}",
+            idle_started.elapsed()
+        );
+
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let status_registry = registry.clone();
+        let status_task_id = task_id.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = done_tx.send(status_registry.status_settled(
+                &status_task_id,
+                "session",
+                None,
+                None,
+                0,
+            ));
+        });
+        let answered_early = done_rx.recv_timeout(Duration::from_millis(300)).ok();
+        release.send(()).expect("release the kill");
+        let snapshot = match answered_early {
+            Some(snapshot) => snapshot,
+            None => done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("status answered once the kill settled"),
+        }
+        .expect("task status");
+        killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+        reader.join().expect("status thread");
+        assert_eq!(
+            snapshot.info.status,
+            BgTaskStatus::Killed,
+            "a status taken while the kill is in flight answers with its outcome"
+        );
+    }
+
+    /// A PTY task whose child has exited while its reader is still draining
+    /// output is completed by the reader's wake, not by a periodic watchdog
+    /// pass that happens to land first. The reader is held at end-of-file by a
+    /// test gate across at least one periodic pass.
+    #[cfg(unix)]
+    #[test]
+    fn exited_pty_is_completed_by_the_reader_wake_not_a_periodic_pass() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done; printf done'",
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let release_reader = super::super::pty_process::install_pty_reader_gate_for_test(&task_id);
+        fs::write(dir.path().join("ready"), "").unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !registry.pty_exit_awaiting_reader(&task) {
+            assert!(
+                Instant::now() < deadline,
+                "the child never exited with its reader held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Periodic passes run every 500 ms, so at least one sees the exited
+        // task while its reader is held.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            registry.completion_pass_cause(&task_id),
+            None,
+            "a periodic pass completed the task before its reader finished"
+        );
+        assert!(!task.is_terminal());
+
+        release_reader.send(()).expect("release the reader");
+        let completion = wait_for_pending_completion(&registry, "session", &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Completed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry.completion_pass_cause(&task_id).is_none() {
+            assert!(Instant::now() < deadline, "no pass recorded the completion");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            registry.completion_pass_cause(&task_id),
+            Some(WatchdogPassCause::Wake)
+        );
     }
 
     /// A task can finish on its own while a kill is in flight. If its own

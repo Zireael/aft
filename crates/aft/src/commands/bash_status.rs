@@ -71,7 +71,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     if ctx.bash_background().has_erased_watch_reference(&task_id) {
         return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
     }
-    match ctx.bash_background().status(
+    // Settled: a kill in flight is waited out (bounded) so callers that stop
+    // polling at the first non-running status see its terminal outcome.
+    match ctx.bash_background().status_settled(
         &task_id,
         req.session(),
         ctx.config().project_root.as_deref(),
