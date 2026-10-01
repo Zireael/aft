@@ -1127,3 +1127,93 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
     assert!(started.elapsed() < Duration::from_secs(5));
     assert!(aft.shutdown().success());
 }
+
+/// A search against an already-ready index is answered as soon as its worker
+/// finishes, not at the standalone loop's next periodic poll of pending
+/// responses. The poll interval is stretched to a minute here, so a response
+/// that waited for the poll instead of being woken by its worker would miss
+/// the ten-second bound on every search below.
+#[test]
+fn standalone_search_on_ready_index_answers_without_waiting_for_the_pending_poll() {
+    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let project = temp_dir.path().join("project");
+    let storage = temp_dir.path().join("storage");
+    fs::create_dir_all(project.join("src")).expect("create project");
+    fs::write(
+        project.join("src/lib.rs"),
+        "/// Rebuilds the trigram index after a watched file changes.\n\
+         pub fn rebuild_trigram_index(changed: &str) -> usize { changed.len() }\n\
+         pub struct PendingReplyQueue { pub depth: usize }\n",
+    )
+    .expect("write source");
+    fs::write(
+        project.join("src/render.rs"),
+        "/// Formats ranked search rows for the agent.\n\
+         pub fn render_ranked_rows(rows: &[String]) -> String { rows.join(\"\\n\") }\n",
+    )
+    .expect("write source");
+
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_PENDING_POLL_INTERVAL_MS",
+        std::ffi::OsStr::new("60000"),
+    )]);
+    let configure = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "configure-ready-search",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.display().to_string(),
+            "storage_dir": storage.display().to_string(),
+            "config": user_config(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))
+        }))
+        .expect("serialize configure request"),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let ready_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let status = aft.send(r#"{"id":"ready-poll","command":"status"}"#);
+        if status["search_index"]["status"] == "ready" {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "search index never became ready: {status:#}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let queries = [
+        "how is the trigram index rebuilt after a file changes",
+        "where are ranked search rows formatted",
+        "rebuild_trigram_index",
+        "PendingReplyQueue",
+        "render_ranked_rows",
+    ];
+    for (index, query) in queries.iter().enumerate() {
+        let id = format!("ready-search-{index}");
+        let response = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": id,
+                "command": "semantic_search",
+                "query": query,
+                "top_k": 5
+            }))
+            .expect("serialize search request"),
+            Duration::from_secs(10),
+        );
+        assert_eq!(response["id"], id, "unexpected frame: {response:#}");
+        assert_eq!(
+            response["success"], true,
+            "search {query:?} failed: {response:#}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}

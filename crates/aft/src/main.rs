@@ -410,12 +410,23 @@ fn main() {
     // SemanticIndexEvent::Ready) get processed and their status_changed
     // push frames emitted. Without the wake, the sidebar can stay stuck
     // on "loading" indefinitely until the next request happens to arrive.
+    //
+    // A deferred request's worker also wakes this loop through
+    // `deferred_wake_rx` once its response is ready, so the response is written
+    // straight away. The pending poll interval below is only a fallback for
+    // deferred responses whose producers do not send that wake.
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
-    const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let pending_poll_interval = standalone_pending_poll_interval();
     let mut pending = PendingResponses::default();
     let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
     let mut queued_lines = VecDeque::new();
-    let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    let (line_tx, line_rx) = crossbeam_channel::unbounded::<io::Result<String>>();
+    let (deferred_wake_tx, deferred_wake_rx) = crossbeam_channel::bounded::<()>(1);
+    // Holding a sender here keeps the wake channel connected for the whole
+    // loop even if the process-wide slot was already taken, so waiting on it
+    // can never spin on a disconnected receiver.
+    let _deferred_wake_keepalive = deferred_wake_tx.clone();
+    let _ = DEFERRED_RESPONSE_WAKER.set(deferred_wake_tx);
     let mut graceful_stdin_shutdown = false;
     // While an edit waits on its type checker (see
     // `dispatch_with_offloaded_validation`), `validation_gate` holds that
@@ -461,14 +472,24 @@ fn main() {
         } else if pending.is_empty() {
             DRAIN_INTERVAL
         } else {
-            PENDING_POLL_INTERVAL
+            pending_poll_interval
         };
         let line_result = if let Some(result) = queued_lines.pop_front() {
             result
         } else {
-            match line_rx.recv_timeout(recv_timeout) {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) if gated => {
+            match wait_for_loop_input(&line_rx, &deferred_wake_rx, recv_timeout) {
+                LoopInput::Line(result) => result,
+                LoopInput::DeferredResponseReady => {
+                    // A deferred worker finished: write its response now
+                    // instead of at the next poll. Runtime drains keep their
+                    // own schedule (the timeout branches below).
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Timeout if gated => {
                     // Runtime drains stay paused while the edit finishes,
                     // exactly as they were while an edit ran inline; only the
                     // edit's own deferred response is polled.
@@ -478,7 +499,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) if gated => {
+                LoopInput::Disconnected if gated => {
                     // Stdin closed with requests still held behind the edit:
                     // finish the edit and replay them before shutting down.
                     thread::sleep(VALIDATION_GATE_POLL_INTERVAL);
@@ -488,7 +509,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                LoopInput::Timeout => {
                     // Periodic drain so push frames flow even without requests.
                     // The request-critical configure prefix runs before a cooperative
                     // suffix step; storage-wide sweeps run on separate threads.
@@ -512,7 +533,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                LoopInput::Disconnected => {
                     // Human-readable reason line; the phase markers below cover the
                     // shutdown sequence itself. protocol_test asserts this banner.
                     aft::slog_info!("stdin closed, shutting down");
@@ -814,8 +835,64 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     );
 }
 
+/// Default interval at which the standalone loop polls deferred responses that
+/// did not wake it.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn standalone_pending_poll_interval() -> Duration {
+    // Test seam: stretching the fallback poll lets a test prove that a deferred
+    // response is written because its worker woke the loop, not because the
+    // poll came round.
+    std::env::var("AFT_TEST_PENDING_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(PENDING_POLL_INTERVAL)
+}
+
+/// Wakes the standalone loop when a deferred worker has its response ready.
+/// It is set only by the standalone loop; elsewhere (the subc daemon, unit
+/// tests) waking is a no-op and those callers poll as before.
+static DEFERRED_RESPONSE_WAKER: std::sync::OnceLock<crossbeam_channel::Sender<()>> =
+    std::sync::OnceLock::new();
+
+fn wake_standalone_loop_for_deferred_response() {
+    if let Some(waker) = DEFERRED_RESPONSE_WAKER.get() {
+        // A full slot already holds an unread wake, and one wake makes the
+        // loop poll every pending response, so dropping this one loses nothing.
+        let _ = waker.try_send(());
+    }
+}
+
+/// What the standalone loop woke up for.
+enum LoopInput {
+    /// A line read from stdin.
+    Line(io::Result<String>),
+    /// A deferred worker finished and its response can be written.
+    DeferredResponseReady,
+    /// Nothing arrived within the wait; time for periodic work.
+    Timeout,
+    /// Stdin closed and every line it produced has been received.
+    Disconnected,
+}
+
+fn wait_for_loop_input(
+    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
+    deferred_wake_rx: &crossbeam_channel::Receiver<()>,
+    timeout: Duration,
+) -> LoopInput {
+    crossbeam_channel::select! {
+        recv(line_rx) -> line => match line {
+            Ok(line) => LoopInput::Line(line),
+            Err(_) => LoopInput::Disconnected,
+        },
+        recv(deferred_wake_rx) -> _ => LoopInput::DeferredResponseReady,
+        default(timeout) => LoopInput::Timeout,
+    }
+}
+
 fn collect_queued_lines(
-    line_rx: &mpsc::Receiver<io::Result<String>>,
+    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
     queued_lines: &mut VecDeque<io::Result<String>>,
 ) -> usize {
     while let Ok(line) = line_rx.try_recv() {
@@ -1430,6 +1507,7 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
         let _config_pin = ctx.pin_config_to(admitted_config);
         let response = log_ctx::with_session(worker_session_id, || dispatch(req, &ctx));
         let _ = tx.send(response);
+        wake_standalone_loop_for_deferred_response();
     });
 
     DispatchOutcome::Deferred(PendingResponse {
