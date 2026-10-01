@@ -616,6 +616,30 @@ fn run(args: &[OsString]) -> i32 {
     let now = unix_seconds();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    // Agents run `gh auth status` to learn whether they can write. Upstream
+    // `gh` would describe the operator's login, which is not the identity a
+    // governed write uses, so the shim answers from its own local state. This
+    // comes before the manifest arms below because it only reports and never
+    // runs anything.
+    if is_local_auth_status(args) {
+        return dispatch_auth_status(
+            args,
+            &paths,
+            now,
+            read_user_config_doc().as_deref(),
+            || {
+                // The same resolver a write uses when it names no repository:
+                // `GH_REPO`, else the working directory's origin remote.
+                TargetRepository {
+                    gh_repo: gh_repo_env(),
+                    ..TargetRepository::default()
+                }
+                .repository_key(&cwd)
+            },
+            delegate,
+        );
+    }
+
     // Presence-based regressed-manifest arm. Decide from the installed artifact
     // BEFORE any rung probe so a governed refusal never depends on daemon
     // reachability: a validation failure after a prior valid manifest makes
@@ -1271,6 +1295,296 @@ fn operator_credentials_refusal_text(command: &str, credential_use: CredentialUs
     format!(
         "`{command}` {effect}. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
     )
+}
+
+/// How the shim answers `gh auth status`.
+#[derive(Debug, Eq, PartialEq)]
+enum AuthStatusAnswer {
+    /// Governance is not in force here: the operator turned the shim off, or
+    /// no signed manifest is installed (a public installation). The real `gh`
+    /// then reports the operator's own login, exactly as without the shim.
+    PassThrough,
+    /// A flag or argument the shim does not answer. It is refused by name
+    /// rather than handed to the real `gh`, whose output would describe the
+    /// operator's login instead of the identity governed writes use.
+    UnsupportedFlag(String),
+    /// The locally rendered report. The exit status is 0 when governed writes
+    /// are available in this repository and 1 otherwise, mirroring the "not
+    /// logged in" status of upstream `gh` so scripts can test it.
+    Report { text: String, exit_code: i32 },
+}
+
+/// True for `gh auth status` without a token flag. The token forms (`-t`,
+/// `--show-token`) stay on the operator-credential refusal path, and
+/// `--help` stays with the real `gh`, which only prints help.
+fn is_local_auth_status(args: &[OsString]) -> bool {
+    if has_exact_flag(args, "--help") {
+        return false;
+    }
+    let Some((verb, Some(subcommand), head_index)) = command_head(args) else {
+        return false;
+    };
+    verb == "auth" && subcommand == "status" && !shows_token(&args[head_index..])
+}
+
+/// Refusal text for an `auth status` argument the shim does not answer, or
+/// `None` when the invocation is `auth status` optionally followed by
+/// `-h`/`--hostname github.com`.
+fn auth_status_argument_refusal(args: &[OsString]) -> Option<String> {
+    const ANSWERED: &str = "the shim answers `gh auth status` itself, optionally with `--hostname github.com`, and does not pass other forms to the real gh, whose answer would describe the operator's login rather than the identity governed writes use";
+    let mut positionals = 0;
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        let Some(value) = argument.to_str() else {
+            return Some(format!(
+                "`auth status` was given an argument that is not valid UTF-8; {ANSWERED}"
+            ));
+        };
+        let host = if value == "-h" || value == "--hostname" {
+            match arguments.next().and_then(|host| host.to_str()) {
+                Some(host) => Some(host),
+                None => {
+                    return Some(format!(
+                        "`auth status {value}` needs a host name; {ANSWERED}"
+                    ))
+                }
+            }
+        } else {
+            value.strip_prefix("--hostname=")
+        };
+        if let Some(host) = host {
+            if !host.eq_ignore_ascii_case("github.com") {
+                return Some(format!(
+                    "`auth status --hostname {host}` asks about a host the shim does not govern (it governs github.com only); {ANSWERED}"
+                ));
+            }
+            continue;
+        }
+        if value.starts_with('-') {
+            return Some(format!(
+                "`auth status {}` is not supported by the shim; {ANSWERED}",
+                refused_flag_name(value)
+            ));
+        }
+        // The first two positionals are `auth` and `status` themselves.
+        positionals += 1;
+        if positionals > 2 {
+            return Some(format!(
+                "`auth status` takes no argument, but was given `{value}`; {ANSWERED}"
+            ));
+        }
+    }
+    None
+}
+
+/// Run `gh auth status` through `answer_auth_status`: print the report (to
+/// stdout when governed writes are available, to stderr otherwise, as
+/// upstream `gh` does), refuse an unsupported form, or delegate when
+/// governance is not in force.
+fn dispatch_auth_status<R, F>(
+    args: &[OsString],
+    paths: &StatePaths,
+    now: u64,
+    config_doc: Option<&str>,
+    resolve_repository: R,
+    delegate_to_upstream: F,
+) -> i32
+where
+    R: FnOnce() -> Option<String>,
+    F: FnOnce(&[OsString]) -> i32,
+{
+    match answer_auth_status(args, paths, now, config_doc, resolve_repository) {
+        AuthStatusAnswer::PassThrough => delegate_to_upstream(args),
+        AuthStatusAnswer::UnsupportedFlag(text) => refuse(RefusalCode::UnsupportedFlag, &text),
+        AuthStatusAnswer::Report { text, exit_code } => {
+            if exit_code == 0 {
+                print!("{text}");
+            } else {
+                eprint!("{text}");
+            }
+            exit_code
+        }
+    }
+}
+
+/// Answer `gh auth status` from local state only: the user config, the
+/// installed manifest, and the last recorded rung. It never runs the real
+/// `gh` and never contacts the governance daemon or GitHub, so the routing
+/// line reports the last determination, as `gh --status` does, rather than
+/// probing. `resolve_repository` yields the canonical `owner/name` a write
+/// that names no repository would target from the working directory.
+fn answer_auth_status<R>(
+    args: &[OsString],
+    paths: &StatePaths,
+    now: u64,
+    config_doc: Option<&str>,
+    resolve_repository: R,
+) -> AuthStatusAnswer
+where
+    R: FnOnce() -> Option<String>,
+{
+    // With the shim turned off, or no manifest installed, writes already run
+    // as the operator through the real `gh`, so its own answer is the true one.
+    if gh_shim_enabled_from_config_doc(config_doc.unwrap_or("")) == Some(false) {
+        return AuthStatusAnswer::PassThrough;
+    }
+    let manifest = resolve_manifest(paths, now);
+    if matches!(manifest, ManifestResolution::Dormant) {
+        return AuthStatusAnswer::PassThrough;
+    }
+    if let Some(text) = auth_status_argument_refusal(args) {
+        return AuthStatusAnswer::UnsupportedFlag(text);
+    }
+
+    let repository = resolve_repository();
+    let mut unavailable = Vec::new();
+
+    let manifest_line = match &manifest {
+        ManifestResolution::Active(manifest) => {
+            format!("version {}, signature verified", manifest.manifest_version)
+        }
+        ManifestResolution::Regressed { manifest, problem } => {
+            unavailable.push(format!(
+                "the installed routing manifest failed verification ({}), so governed writes are refused until a valid manifest is installed",
+                problem.status_label()
+            ));
+            format!(
+                "failed verification: {} (last valid version {} is cached)",
+                problem.status_label(),
+                manifest.manifest_version
+            )
+        }
+        ManifestResolution::Invalid(problem) => {
+            unavailable.push(format!(
+                "the installed routing manifest failed verification ({})",
+                problem.status_label()
+            ));
+            format!("failed verification: {}", problem.status_label())
+        }
+        ManifestResolution::Dormant => unreachable!("a dormant shim passes auth status through"),
+    };
+
+    let identity_line = match (&manifest, repository.as_deref()) {
+        (_, None) => {
+            unavailable.push(
+                "no repository: this directory has no github.com origin remote and GH_REPO is unset, so no bot binding applies here (a write that names a bound repository with --repo uses that repository's bot)"
+                    .to_string(),
+            );
+            "X Governed writes: none (no repository)".to_string()
+        }
+        (ManifestResolution::Active(manifest), Some(repository)) => {
+            match manifest.bindings.get(repository) {
+                Some(agent_id) => format!(
+                    "\u{2713} Governed writes: as {agent_id} (the signed routing manifest binds {repository} to it)"
+                ),
+                None => {
+                    unavailable.push(format!(
+                        "{repository} is not bound to a bot in the signed routing manifest, so writes there are refused unless the operator approves them with GH_SHIM_BYPASS=operator"
+                    ));
+                    format!(
+                        "X Governed writes: none ({repository} is unbound; writes are refused unless the operator bypass applies)"
+                    )
+                }
+            }
+        }
+        (_, Some(_)) => "X Governed writes: none (the routing manifest did not verify)".to_string(),
+    };
+
+    let routing_line = match auth_status_routing_problem(paths, config_doc, now) {
+        Ok(description) => format!("ready ({description})"),
+        Err((description, reason)) => {
+            unavailable.push(reason);
+            format!("unavailable ({description})")
+        }
+    };
+
+    let mut text = String::new();
+    text.push_str(
+        "github.com (answered by the AFT gh shim from local state; the real gh was not run)\n",
+    );
+    text.push_str(&format!(
+        "  Repository: {}\n",
+        repository.as_deref().unwrap_or("none")
+    ));
+    text.push_str(&format!("  {identity_line}\n"));
+    text.push_str(&format!("  - Routing manifest: {manifest_line}\n"));
+    text.push_str(&format!("  - Governed routing: {routing_line}\n"));
+    // Reads are classified mechanical and handed to the real `gh` unchanged
+    // (see `classify` and `is_unbound_safe`), so they use whatever login the
+    // operator's `gh` holds; the bot identity applies to governed writes only.
+    text.push_str(
+        "  - Reads: run by the real gh under the operator's own gh login, not the bot identity\n",
+    );
+    for reason in &unavailable {
+        text.push_str(&format!("Governed writes unavailable: {reason}\n"));
+    }
+    AuthStatusAnswer::Report {
+        text,
+        exit_code: i32::from(!unavailable.is_empty()),
+    }
+}
+
+/// Whether governed routing is ready, judged from the configured connection
+/// file and the last recorded rung without probing the daemon. `Ok` carries
+/// a description of the ready state; `Err` carries a description and the
+/// reason governed writes are unavailable. Neither names a token, an
+/// installation, or the connection file's contents.
+fn auth_status_routing_problem(
+    paths: &StatePaths,
+    config_doc: Option<&str>,
+    now: u64,
+) -> Result<String, (String, String)> {
+    let Some(connection_file) = connection_file_from_config_doc(config_doc.unwrap_or("")) else {
+        return Err((
+            "no governance connection file is configured".to_string(),
+            "governed routing is not configured: the user aft.jsonc names no subc.connection_file"
+                .to_string(),
+        ));
+    };
+    if !connection_file.is_file() {
+        return Err((
+            "the configured governance connection file is missing".to_string(),
+            "governed routing is unavailable: the configured governance connection file does not exist, so the governance daemon is not running"
+                .to_string(),
+        ));
+    }
+    let Some(record) = load_rung_record(paths) else {
+        return Err((
+            "connection file present; no rung recorded yet".to_string(),
+            "governed routing has not been confirmed on this machine yet (no rung recorded); the next governed write probes the governance daemon"
+                .to_string(),
+        ));
+    };
+    let age = now.saturating_sub(record.as_of_unix_secs);
+    if record.rung == Rung::R3 {
+        return Ok(format!(
+            "last rung R3, recorded {age}s ago; connection file present"
+        ));
+    }
+    // Name the determination inputs that kept the rung below R3. Only input
+    // names and diagnostic words are printed: one input's value can name
+    // where an ambient credential was found, so its value is left out.
+    let causes = record
+        .inputs
+        .iter()
+        .filter(|(_, value)| !matches!(value.as_str(), "ready" | "absent"))
+        .map(|(key, value)| match (key.as_str(), value.as_str()) {
+            ("connection_file", diagnostic) => format!("connection_file {diagnostic}"),
+            (key, _) => key.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let causes = if causes.is_empty() {
+        "no recorded cause".to_string()
+    } else {
+        causes.join(", ")
+    };
+    let rung = record.rung.label();
+    Err((
+        format!("last rung {rung}: {causes}, recorded {age}s ago; connection file present"),
+        format!(
+            "governed routing is unavailable: the last rung recorded was {rung} ({causes}), not R3"
+        ),
+    ))
 }
 
 /// The third positional word (`add` in `gh repo deploy-key add key.pub`).
@@ -11631,6 +11945,366 @@ INHERITED FLAGS
         assert_eq!(
             operator_credentials_refusal_text("auth token", CredentialUse::RevealsToken),
             "`auth token` prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line."
+        );
+    }
+
+    /// State for a local `gh auth status` answer: a state directory, a
+    /// connection file that is only a placeholder (nothing listens behind
+    /// it, so any probe would fail), and the user config naming it.
+    struct AuthStatusFixture {
+        _directory: tempfile::TempDir,
+        paths: StatePaths,
+        config_doc: String,
+    }
+
+    impl AuthStatusFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("create auth status state directory");
+            let paths = StatePaths::from_root(directory.path().join("state"));
+            let connection_file = directory.path().join("subc-connection.json");
+            fs::write(&connection_file, b"{}").expect("write placeholder connection file");
+            let config_doc = json!({ "subc": { "connection_file": connection_file } }).to_string();
+            Self {
+                _directory: directory,
+                paths,
+                config_doc,
+            }
+        }
+
+        fn record_rung(&self, rung: Rung, inputs: &[(&str, &str)]) {
+            fs::create_dir_all(&self.paths.root).expect("state root");
+            let record = RungRecord {
+                rung,
+                as_of_unix_secs: TEST_NOW - 30,
+                inputs: inputs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+                manifest_version: Some(12),
+                recorded_by_image_path: None,
+                recorded_by_version: None,
+                recorded_by_repo_key: None,
+                last_reachable_unix_secs: None,
+            };
+            fs::write(&self.paths.rung, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+
+        fn record_r3(&self) {
+            self.record_rung(
+                Rung::R3,
+                &[
+                    ("connection_file", "ready"),
+                    ("catalog_gh_route", "ready"),
+                    ("agent_credentials_present", "absent"),
+                ],
+            );
+        }
+
+        fn answer(&self, raw: &[&str], repository: Option<&str>) -> AuthStatusAnswer {
+            answer_auth_status(
+                &os_args(raw),
+                &self.paths,
+                TEST_NOW,
+                Some(&self.config_doc),
+                || repository.map(str::to_string),
+            )
+        }
+
+        /// Dispatch through the same seam `run` uses, failing the test if
+        /// the real `gh` would have been spawned.
+        fn dispatch_without_upstream(&self, raw: &[&str], repository: Option<&str>) -> i32 {
+            dispatch_auth_status(
+                &os_args(raw),
+                &self.paths,
+                TEST_NOW,
+                Some(&self.config_doc),
+                || repository.map(str::to_string),
+                |_| panic!("`gh auth status` ran the real gh"),
+            )
+        }
+    }
+
+    fn auth_status_report(answer: AuthStatusAnswer) -> (String, i32) {
+        match answer {
+            AuthStatusAnswer::Report { text, exit_code } => (text, exit_code),
+            other => panic!("expected a local auth status report, got {other:?}"),
+        }
+    }
+
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
+    #[test]
+    fn auth_status_names_the_bound_bot_and_exits_zero_from_local_state_only() {
+        let fixture = AuthStatusFixture::new();
+        write_signed_manifest(&fixture.paths, v12_fixture_manifest(), TEST_NOW);
+        fixture.record_r3();
+        let rung_before = fs::read(&fixture.paths.rung).unwrap();
+
+        for raw in [
+            &["auth", "status"][..],
+            &["auth", "status", "-h", "github.com"],
+            &["auth", "status", "--hostname", "github.com"],
+            &["auth", "status", "--hostname=github.com"],
+        ] {
+            let (text, exit_code) = auth_status_report(fixture.answer(raw, Some("cortexkit/aft")));
+            assert_eq!(
+                text,
+                "github.com (answered by the AFT gh shim from local state; the real gh was not run)\n  Repository: cortexkit/aft\n  \u{2713} Governed writes: as alfonso-aft (the signed routing manifest binds cortexkit/aft to it)\n  - Routing manifest: version 12, signature verified\n  - Governed routing: ready (last rung R3, recorded 30s ago; connection file present)\n  - Reads: run by the real gh under the operator's own gh login, not the bot identity\n",
+                "{raw:?}"
+            );
+            assert_eq!(exit_code, 0, "{raw:?}");
+            assert_eq!(
+                fixture.dispatch_without_upstream(raw, Some("cortexkit/aft")),
+                0
+            );
+        }
+        // Nothing probed the daemon: a probe records its stage and refreshes
+        // the rung record, and neither happened.
+        assert!(!fixture.paths.last_probe.exists());
+        assert_eq!(fs::read(&fixture.paths.rung).unwrap(), rung_before);
+        assert!(!fixture.paths.bypass_audit.exists());
+    }
+
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
+    #[test]
+    fn auth_status_on_an_unbound_repository_names_the_operator_bypass_and_exits_one() {
+        let fixture = AuthStatusFixture::new();
+        write_signed_manifest(&fixture.paths, v12_fixture_manifest(), TEST_NOW);
+        fixture.record_r3();
+
+        let (text, exit_code) =
+            auth_status_report(fixture.answer(&["auth", "status"], Some("earendil-works/pi")));
+        assert_eq!(exit_code, 1);
+        assert_eq!(
+            text,
+            "github.com (answered by the AFT gh shim from local state; the real gh was not run)\n  Repository: earendil-works/pi\n  X Governed writes: none (earendil-works/pi is unbound; writes are refused unless the operator bypass applies)\n  - Routing manifest: version 12, signature verified\n  - Governed routing: ready (last rung R3, recorded 30s ago; connection file present)\n  - Reads: run by the real gh under the operator's own gh login, not the bot identity\nGoverned writes unavailable: earendil-works/pi is not bound to a bot in the signed routing manifest, so writes there are refused unless the operator approves them with GH_SHIM_BYPASS=operator\n"
+        );
+        assert_eq!(
+            fixture.dispatch_without_upstream(&["auth", "status"], Some("earendil-works/pi")),
+            1
+        );
+    }
+
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
+    #[test]
+    fn auth_status_outside_a_repository_or_without_routing_names_the_reason_and_exits_one() {
+        let fixture = AuthStatusFixture::new();
+        write_signed_manifest(&fixture.paths, v12_fixture_manifest(), TEST_NOW);
+
+        // No rung recorded yet: routing is unconfirmed, and nothing probes.
+        let (text, exit_code) =
+            auth_status_report(fixture.answer(&["auth", "status"], Some("cortexkit/aft")));
+        assert_eq!(exit_code, 1);
+        assert!(text.contains("\u{2713} Governed writes: as alfonso-aft"));
+        assert!(text.ends_with("Governed writes unavailable: governed routing has not been confirmed on this machine yet (no rung recorded); the next governed write probes the governance daemon\n"), "{text}");
+        assert!(!fixture.paths.last_probe.exists());
+
+        // The last rung fell short of R3: its cause is named, while the value
+        // naming where an ambient credential was found is not printed.
+        fixture.record_rung(
+            Rung::R2,
+            &[
+                ("connection_file", "ready"),
+                ("agent_credentials_present", "env:GH_TOKEN"),
+            ],
+        );
+        let (text, exit_code) =
+            auth_status_report(fixture.answer(&["auth", "status"], Some("cortexkit/aft")));
+        assert_eq!(exit_code, 1);
+        assert!(text.contains("  - Governed routing: unavailable (last rung R2: agent_credentials_present, recorded 30s ago; connection file present)\n"), "{text}");
+        assert!(text.ends_with("Governed writes unavailable: governed routing is unavailable: the last rung recorded was R2 (agent_credentials_present), not R3\n"), "{text}");
+        assert!(!text.contains("GH_TOKEN"), "{text}");
+
+        // Outside any repository there is no binding to name.
+        fixture.record_r3();
+        let (text, exit_code) = auth_status_report(fixture.answer(&["auth", "status"], None));
+        assert_eq!(exit_code, 1);
+        assert!(
+            text.contains("  Repository: none\n  X Governed writes: none (no repository)\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("Governed writes unavailable: no repository: this directory has no github.com origin remote and GH_REPO is unset, so no bot binding applies here (a write that names a bound repository with --repo uses that repository's bot)\n"), "{text}");
+
+        // No connection file configured: routing cannot be reached at all.
+        let (text, exit_code) = auth_status_report(answer_auth_status(
+            &os_args(&["auth", "status"]),
+            &fixture.paths,
+            TEST_NOW,
+            Some("{}"),
+            || Some("cortexkit/aft".to_string()),
+        ));
+        assert_eq!(exit_code, 1);
+        assert!(text.ends_with("Governed writes unavailable: governed routing is not configured: the user aft.jsonc names no subc.connection_file\n"), "{text}");
+    }
+
+    #[test]
+    fn auth_status_with_an_invalid_manifest_names_the_failure_and_exits_one() {
+        let fixture = AuthStatusFixture::new();
+        write_envelope_fixture(&fixture.paths, "not a signed manifest");
+        fixture.record_r3();
+
+        let (text, exit_code) =
+            auth_status_report(fixture.answer(&["auth", "status"], Some("cortexkit/aft")));
+        assert_eq!(exit_code, 1);
+        assert!(text.contains("  X Governed writes: none (the routing manifest did not verify)\n  - Routing manifest: failed verification: invalid ("), "{text}");
+        assert!(text.contains("\nGoverned writes unavailable: the installed routing manifest failed verification (invalid ("), "{text}");
+        assert_eq!(
+            fixture.dispatch_without_upstream(&["auth", "status"], Some("cortexkit/aft")),
+            1
+        );
+    }
+
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
+    #[test]
+    fn auth_status_with_a_regressed_manifest_refuses_the_cached_binding() {
+        let fixture = AuthStatusFixture::new();
+        write_signed_manifest(&fixture.paths, v12_fixture_manifest(), TEST_NOW);
+        fixture.record_r3();
+        // Accept the valid manifest once so a last-valid copy is cached, then
+        // replace it with one that fails verification.
+        assert!(matches!(
+            resolve_manifest(&fixture.paths, TEST_NOW),
+            ManifestResolution::Active(_)
+        ));
+        write_envelope_fixture(&fixture.paths, "not a signed manifest");
+
+        let (text, exit_code) =
+            auth_status_report(fixture.answer(&["auth", "status"], Some("cortexkit/aft")));
+        assert_eq!(exit_code, 1);
+        assert!(!text.contains("as alfonso-aft"), "{text}");
+        assert!(text.contains("(last valid version 12 is cached)"), "{text}");
+        assert!(
+            text.contains("so governed writes are refused until a valid manifest is installed\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn auth_status_passes_through_when_no_manifest_is_installed_or_the_shim_is_off() {
+        use std::cell::Cell;
+
+        // Dormant: no manifest, a public installation. The real `gh` answers
+        // with the user's own login, and every form passes through unread.
+        let fixture = AuthStatusFixture::new();
+        for raw in [&["auth", "status"][..], &["auth", "status", "--active"]] {
+            assert_eq!(
+                fixture.answer(raw, Some("cortexkit/aft")),
+                AuthStatusAnswer::PassThrough
+            );
+        }
+        let delegated = Cell::new(0);
+        let status = dispatch_auth_status(
+            &os_args(&["auth", "status"]),
+            &fixture.paths,
+            TEST_NOW,
+            Some(&fixture.config_doc),
+            || panic!("a pass-through resolves no repository"),
+            |ran| {
+                assert_eq!(ran, os_args(&["auth", "status"]));
+                delegated.set(delegated.get() + 1);
+                73
+            },
+        );
+        assert_eq!((status, delegated.get()), (73, 1));
+
+        // Operator hard-off: byte-transparent pass-through even though an
+        // installed manifest would otherwise be answered locally.
+        write_envelope_fixture(&fixture.paths, "not a signed manifest");
+        assert!(matches!(
+            fixture.answer(&["auth", "status"], Some("cortexkit/aft")),
+            AuthStatusAnswer::Report { .. }
+        ));
+        let disabled = json!({ "github": { "shim": false } }).to_string();
+        assert_eq!(
+            answer_auth_status(
+                &os_args(&["auth", "status"]),
+                &fixture.paths,
+                TEST_NOW,
+                Some(&disabled),
+                || panic!("a pass-through resolves no repository"),
+            ),
+            AuthStatusAnswer::PassThrough
+        );
+    }
+
+    #[test]
+    fn auth_status_token_forms_stay_refused_and_unknown_flags_are_refused_by_name() {
+        // The token forms and help never reach the local answer; the token
+        // forms keep their operator-credential refusal.
+        for raw in [
+            &["auth", "status", "-t"][..],
+            &["auth", "status", "--show-token"],
+            &["auth", "status", "-at"],
+            &["auth", "status", "-h", "github.com", "--show-token"],
+        ] {
+            assert!(!is_local_auth_status(&os_args(raw)), "{raw:?}");
+            assert_eq!(
+                operator_credential_use(&os_args(raw)),
+                Some(("auth status".to_string(), CredentialUse::RevealsToken)),
+                "{raw:?}"
+            );
+        }
+        for raw in [
+            &["auth", "status", "--help"][..],
+            &["auth", "token"],
+            &["auth"],
+            &["issue", "status"],
+        ] {
+            assert!(!is_local_auth_status(&os_args(raw)), "{raw:?}");
+        }
+        assert!(is_local_auth_status(&os_args(&["auth", "status"])));
+        assert!(is_local_auth_status(&os_args(&[
+            "auth", "status", "--json", "hosts"
+        ])));
+
+        let refusal = |raw: &[&str]| auth_status_argument_refusal(&os_args(raw));
+        for raw in [
+            &["auth", "status"][..],
+            &["auth", "status", "-h", "github.com"],
+            &["auth", "status", "--hostname", "GitHub.com"],
+            &["auth", "status", "--hostname=github.com"],
+        ] {
+            assert_eq!(refusal(raw), None, "{raw:?}");
+        }
+        let answered = "the shim answers `gh auth status` itself, optionally with `--hostname github.com`, and does not pass other forms to the real gh, whose answer would describe the operator's login rather than the identity governed writes use";
+        for (raw, prefix) in [
+            (
+                &["auth", "status", "--json", "hosts"][..],
+                "`auth status --json` is not supported by the shim",
+            ),
+            (
+                &["auth", "status", "--json=hosts"],
+                "`auth status --json` is not supported by the shim",
+            ),
+            (
+                &["auth", "status", "-a"],
+                "`auth status -a` is not supported by the shim",
+            ),
+            (
+                &["auth", "status", "--active"],
+                "`auth status --active` is not supported by the shim",
+            ),
+            (
+                &["auth", "status", "-h", "ghe.example.com"],
+                "`auth status --hostname ghe.example.com` asks about a host the shim does not govern (it governs github.com only)",
+            ),
+            (
+                &["auth", "status", "-h"],
+                "`auth status -h` needs a host name",
+            ),
+            (
+                &["auth", "status", "extra"],
+                "`auth status` takes no argument, but was given `extra`",
+            ),
+        ] {
+            assert_eq!(refusal(raw), Some(format!("{prefix}; {answered}")), "{raw:?}");
+        }
+
+        // With governance in force the refusal happens without running gh.
+        let fixture = AuthStatusFixture::new();
+        write_envelope_fixture(&fixture.paths, "not a signed manifest");
+        assert_eq!(
+            fixture.dispatch_without_upstream(&["auth", "status", "--json", "hosts"], None),
+            REFUSAL_EXIT_STATUS
         );
     }
 

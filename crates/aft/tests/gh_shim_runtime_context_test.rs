@@ -3266,14 +3266,14 @@ fn gh_shim_unknown_verbs_on_an_unbound_target_are_refused_and_run_audited_under_
 #[test]
 fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
     let fixture = UnboundTargetFixture::new();
-    let groups: [&[&str]; 15] = [
+    let groups: [&[&str]; 14] = [
         // Reads.
         &["issue", "view", "12", "--repo", "earendil-works/pi"],
         &["run", "download", "7", "--repo", "earendil-works/pi"],
         &["search", "issues", "flaky", "--repo", "earendil-works/pi"],
         &["status"],
-        // Local machine only.
-        &["auth", "status"],
+        // Local machine only. (`auth status` is answered by the shim itself
+        // once a manifest is installed; see the auth status test below.)
         &["config", "get", "editor"],
         &["config", "set", "editor", "vim"],
         &["alias", "list"],
@@ -3305,6 +3305,55 @@ fn gh_shim_safe_list_groups_pass_through_on_an_unbound_target() {
     }
     assert_eq!(fixture.upstream_runs(), Some(expected));
     assert!(fixture.audit_records().is_empty());
+}
+
+#[test]
+fn gh_shim_auth_status_answers_locally_with_the_governed_identity() {
+    let fixture = UnboundTargetFixture::new();
+    write_recently_reachable_r3_cache(&fixture.state_home, unix_seconds(), 30);
+    let rung_path = fixture
+        .state_home
+        .join("cortexkit/aft/gh-shim/rung-cache.json");
+    let rung_before = fs::read(&rung_path).expect("read rung cache");
+
+    // In the bound checkout the bot the manifest names is the write identity.
+    let bound = fixture.run(&["auth", "status"], &fixture.bound_project, false);
+    let stdout = String::from_utf8_lossy(&bound.stdout);
+    assert_eq!(bound.status.code(), Some(0), "{stdout}");
+    assert!(bound.stderr.is_empty());
+    assert!(stdout.contains("  Repository: cortexkit/aft\n"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "Governed writes: as alfonso-aft (the signed routing manifest binds cortexkit/aft to it)"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  - Governed routing: ready (last rung R3"),
+        "{stdout}"
+    );
+
+    // Outside any repository there is no binding, and the exit status says so.
+    let outside = fixture.run(
+        &["auth", "status", "-h", "github.com"],
+        &fixture.outside,
+        false,
+    );
+    let stderr = String::from_utf8_lossy(&outside.stderr);
+    assert_eq!(outside.status.code(), Some(1), "{stderr}");
+    assert!(outside.stdout.is_empty());
+    assert!(
+        stderr.contains("\nGoverned writes unavailable: no repository: "),
+        "{stderr}"
+    );
+
+    // Neither answer ran upstream gh or probed the governance daemon.
+    assert_eq!(fixture.upstream_runs(), None, "upstream gh must not run");
+    assert_eq!(fs::read(&rung_path).expect("read rung cache"), rung_before);
+    assert!(!fixture
+        .state_home
+        .join("cortexkit/aft/gh-shim/last-probe.json")
+        .exists());
 }
 
 fn operator_credentials_refusal(command: &str, effect: &str) -> String {
