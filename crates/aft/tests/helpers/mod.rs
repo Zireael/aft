@@ -391,13 +391,7 @@ impl AftProcess {
     }
 
     fn spawn_inner_without(envs: &[(&str, &std::ffi::OsStr)], removed: &[&str]) -> Self {
-        // Nextest remaps archive binaries into its extraction directory, so its
-        // runtime variable must win over Cargo's compile-time binary path.
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
-            .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = aft_binary::aft_binary();
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
@@ -1492,3 +1486,5 @@ pub fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
     }
     std::path::PathBuf::from(display)
 }
+
+mod aft_binary;

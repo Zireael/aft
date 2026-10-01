@@ -30,6 +30,9 @@ use tokio::{
     sync::Mutex as AsyncMutex,
 };
 
+#[path = "helpers/aft_binary.rs"]
+mod aft_binary;
+
 struct Subject;
 struct Process {
     child: Mutex<Child>,
@@ -96,7 +99,7 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
     std::fs::create_dir_all(root).map_err(|error| {
         HarnessError::new(format!("creating provider cwd {}: {error}", root.display()))
     })?;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    let mut command = Command::new(aft_binary::aft_binary());
     // CreateProcess uses the parent's cwd when none is supplied. Always launch
     // inside this fixture, independently of the test runner's working directory.
     command.current_dir(root);
@@ -134,6 +137,15 @@ fn provider_command_uses_existing_fixture_cwd_and_xdg_directories() {
     let root = dir.path().join("not-yet-created");
     let command = provider_command(&root, &root.join("connection.json")).unwrap();
     assert_eq!(command.get_current_dir(), Some(root.as_path()));
+    if let Some(binary) = std::env::var_os("NEXTEST_BIN_EXE_aft") {
+        if std::env::var_os("AFT_TEST_AFT_BINARY").is_none() {
+            assert_eq!(
+                command.get_program(),
+                binary,
+                "use nextest's relocated executable"
+            );
+        }
+    }
     assert!(root.is_dir());
     let directories: Vec<_> = command
         .get_envs()
@@ -209,10 +221,10 @@ impl Harness for Subject {
         let child = command.spawn().map_err(|error| {
             HarnessError::new(format!(
                 "launching {} with --subc {} in cwd {} (exe_exists={}, cwd_exists={}): {error}",
-                env!("CARGO_BIN_EXE_aft"),
+                command.get_program().to_string_lossy(),
                 connection_path.display(),
                 root.display(),
-                Path::new(env!("CARGO_BIN_EXE_aft")).is_file(),
+                Path::new(command.get_program()).is_file(),
                 root.is_dir()
             ))
         })?;
