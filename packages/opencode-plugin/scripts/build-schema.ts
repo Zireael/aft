@@ -671,7 +671,8 @@ function buildSchema(): Record<string, unknown> {
               endpoint: {
                 type: "string",
                 minLength: 1,
-                description: "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
+                description:
+                  "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
               },
               api_key_env: {
                 type: "string",
