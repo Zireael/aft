@@ -22,10 +22,12 @@ import {
   isBashTransportDeadError,
   isRouteOpenReloadWindowError,
   SUBC_MODULE_RESTART_DISPOSITION,
+  SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
 } from "../error-contract.js";
 import {
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
+  SubcRouteClosedMidCallError,
   SubcTransportShuttingDownError,
 } from "../subc-transport.js";
 
@@ -106,6 +108,16 @@ describe("isBashTransportDeadError", () => {
     expect(isBashTransportDeadError(beforeDispatch)).toBe(true);
     expect(classifyBashHostFallbackError(whilePending)).toBeUndefined();
     expect(isBashTransportDeadError(whilePending)).toBe(false);
+  });
+
+  test("rejects a request in flight when the plugin closed its route", () => {
+    const error = new SubcRouteClosedMidCallError(
+      "session closed",
+      new SubcError("route closed by closeRoute", "route_closed"),
+    );
+
+    expect(classifyBashHostFallbackError(error)).toBeUndefined();
+    expect(isBashTransportDeadError(error)).toBe(false);
   });
 
   test("rejects a managed outcome-unknown call because dispatch may have executed", () => {
@@ -310,14 +322,35 @@ describe("adaptToolError", () => {
     expect(adapted.message).toContain(SUBC_MODULE_RESTART_DISPOSITION);
   });
 
-  test("a local closeRoute with the route_closed code is NOT a GOODBYE", () => {
-    // Same code, different mechanism: closeRoute is a deliberate local close
-    // with a known outcome; the unknown-outcome guidance would be wrong.
+  test("a local closeRoute with the route_closed code is NOT a GOODBYE, but its outcome is unknown", () => {
+    // Same code, different mechanism: closeRoute is the plugin closing its own
+    // route, so the module-restart wording would be wrong. subc-client only
+    // raises this rejection for a request already pending (and written) on the
+    // route, so it still carries the unknown-outcome guidance of its own.
     const local = new SubcError("route closed by closeRoute", "route_closed");
 
     const adapted = adaptToolError("write", local);
 
     expect(adapted).toBe(local);
     expect(local.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
+    expect(local.message).toContain(SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION);
+  });
+
+  test("a bash call whose route the plugin closed mid-call never gets re-run guidance", () => {
+    const midCall = new SubcRouteClosedMidCallError(
+      "transport shutting down",
+      new SubcError("route closed by closeRoute", "route_closed"),
+    );
+
+    adaptToolError("bash", midCall);
+    adaptToolError("bash", midCall);
+
+    expect(midCall.message).toStartWith(
+      "the command may have run; the route closed mid-call: transport shutting down",
+    );
+    expect(midCall.message.split(SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION)).toHaveLength(2);
+    expect(midCall.message).toContain("UNKNOWN");
+    expect(midCall.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+    expect(midCall.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
   });
 });

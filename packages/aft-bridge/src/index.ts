@@ -189,6 +189,7 @@ export {
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
+  SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
   toolErrorFromResponse,
 } from "./error-contract.js";
 // --- feature-based configuration policy (shared with crates/aft feature_config.rs) ---
@@ -327,6 +328,8 @@ export {
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,
+  type SubcLocalRouteCloseReason,
+  SubcRouteClosedMidCallError,
   SubcTransportPool,
   type SubcTransportPoolOptions,
   SubcTransportShuttingDownError,

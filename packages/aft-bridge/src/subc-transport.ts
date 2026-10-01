@@ -67,6 +67,69 @@ export class SubcTransportShuttingDownError extends SubcCallError {
   }
 }
 
+/**
+ * Why the plugin itself closed a route that still carried a request. Each value
+ * is shown to the agent, so it names the plugin-side event in plain words.
+ */
+export type SubcLocalRouteCloseReason =
+  | "transport shutting down"
+  | "session closed"
+  | "project root closed"
+  | "route replaced"
+  | "route closed by the plugin";
+
+/**
+ * The plugin closed one of its own routes (pool shutdown, session close,
+ * project-root close, or a sibling call on the same session discarding the
+ * shared route) while this call's request was already in flight on it.
+ *
+ * subc-client records a request as pending and starts writing its frame in the
+ * same synchronous step, and its `closeRoute` rejects exactly those pending
+ * requests. So a request rejected that way was written, or queued to be
+ * written, and the daemon may have run it: the outcome is unknown. The call
+ * must not be blind-retried, and bash must not re-run it on the host.
+ */
+export class SubcRouteClosedMidCallError extends SubcCallError {
+  readonly reason: SubcLocalRouteCloseReason;
+
+  constructor(reason: SubcLocalRouteCloseReason, cause: unknown) {
+    super(
+      "outcome_unknown",
+      `the command may have run; the route closed mid-call: ${reason}`,
+      "route_closed",
+      cause,
+    );
+    this.name = "SubcRouteClosedMidCallError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * subc-client's rejection of a request that was pending on a route when
+ * `closeRoute` tore that route down. The client raises it for nothing else: a
+ * route closed with no request pending produces no error at all, and a request
+ * started on an already-closed route fails with `StaleRouteHandleError`.
+ */
+export function isLocalRouteCloseRejection(error: unknown): error is SubcError {
+  return error instanceof SubcError && error.message.includes("route closed by closeRoute");
+}
+
+/** The route-close reason that matches a session's teardown, if it was torn down. */
+function teardownCloseReason(
+  teardown: SessionRecord["teardownReason"],
+): SubcLocalRouteCloseReason | null {
+  switch (teardown) {
+    case "shutdown":
+      return "transport shutting down";
+    case "session_closed":
+      return "session closed";
+    case "root_reaped":
+      return "project root closed";
+    default:
+      return null;
+  }
+}
+
 class ReconnectKeyChangedError extends Error {
   constructor() {
     super(
@@ -909,6 +972,11 @@ interface RouteEntry {
   handle: RouteHandle | null;
   /** Tombstone: a teardown raced the open — the resolving open must self-close. */
   closed: boolean;
+  /**
+   * Why the plugin closed this route, recorded before the close so a request
+   * still in flight on it can report the reason with its unknown outcome.
+   */
+  closedBy: SubcLocalRouteCloseReason | null;
 }
 
 /**
@@ -918,6 +986,31 @@ interface RouteEntry {
  * or count toward the half-open-socket failure budget (B-#3/B-#4).
  */
 class RouteTornDownError extends Error {}
+
+/**
+ * True when a call stopped at a teardown before its request was handed to the
+ * client (a closed session, or a route that opened after the teardown), so the
+ * request provably never reached AFT.
+ */
+export function isSubcRouteTornDownError(error: unknown): boolean {
+  return error instanceof RouteTornDownError;
+}
+
+/**
+ * Turn subc-client's bare rejection of a request that was in flight on a route
+ * the plugin closed into an outcome-unknown error that names the close reason.
+ * Any other error passes through unchanged.
+ */
+function routeClosedMidCallError(
+  error: unknown,
+  entry: RouteEntry,
+  record: SessionRecord,
+): unknown {
+  if (!isLocalRouteCloseRejection(error)) return error;
+  const reason =
+    entry.closedBy ?? teardownCloseReason(record.teardownReason) ?? "route closed by the plugin";
+  return new SubcRouteClosedMidCallError(reason, error);
+}
 
 /**
  * Re-lift the route reply into the flat {@link ToolCallResult} shape the standalone
@@ -1681,6 +1774,7 @@ export class SubcTransportPool implements AftTransportPool {
     if (detached.bgSub) cleanup.push(detached.bgSub.stop());
     const routeEntry = detached.routeEntry;
     const route = routeEntry?.handle;
+    if (routeEntry) routeEntry.closedBy = teardownCloseReason(detached.record.teardownReason);
     if (routeEntry && route !== null && route !== undefined) {
       try {
         cleanup.push(
@@ -1893,6 +1987,9 @@ export class SubcTransportPool implements AftTransportPool {
       const clearRouteEntry = (entry: RouteEntry): void => {
         if (record.routeEntry !== entry) return;
         entry.closed = true;
+        // Other calls on this session may still have requests in flight on
+        // the shared route; they learn that it was discarded, not torn down.
+        entry.closedBy ??= "route replaced";
         record.routeEntry = null;
         if (entry.handle != null) safeCloseRoute(entry.client, entry.handle);
       };
@@ -1984,7 +2081,8 @@ export class SubcTransportPool implements AftTransportPool {
           );
           if (reopened) this.resetRouteReopenBackoff();
           return reply;
-        } catch (error) {
+        } catch (requestError) {
+          const error = routeClosedMidCallError(requestError, routeAndEntry.entry, record);
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;
           // A route that was bound before a module reload started gets its
@@ -2127,6 +2225,7 @@ export class SubcTransportPool implements AftTransportPool {
       opening: null,
       handle: null,
       closed: false,
+      closedBy: null,
     };
     this.assertRootCanAttach(record.canonicalRoot);
     const opening = client

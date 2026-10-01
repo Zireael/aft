@@ -19,9 +19,12 @@ import {
   isBridgeTransportTimeout,
 } from "./bridge.js";
 import {
+  isLocalRouteCloseRejection,
   isSubcClientClosedError,
+  isSubcRouteTornDownError,
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
+  SubcRouteClosedMidCallError,
   SubcTransportShuttingDownError,
 } from "./subc-transport.js";
 
@@ -83,6 +86,25 @@ export const BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION =
   "The standalone AFT transport failed after this call may have been sent, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
 
 /**
+ * Agent-facing guidance for a call whose route the plugin closed while the
+ * request was already in flight (transport shutdown, session close, project
+ * root close, or the session's route being replaced). The request had been
+ * handed to the socket, so it may have run even though no reply came back.
+ */
+export const SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION =
+  "The plugin closed this call's route while the call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
+
+/**
+ * A request that was in flight when the plugin closed its own route: the
+ * subc pool's named error, or subc-client's bare rejection when it reaches here
+ * without passing through the pool. subc-client raises that rejection only for
+ * a request already pending on the route, so either shape has an unknown outcome.
+ */
+function isRouteClosedMidCallError(error: unknown): boolean {
+  return error instanceof SubcRouteClosedMidCallError || isLocalRouteCloseRejection(error);
+}
+
+/**
  * A route GOODBYE delivered against an in-flight request.
  *
  * COUPLING: subc-client raises this as a bare `SubcError` carrying no code
@@ -98,9 +120,10 @@ function isRouteGoodbyeError(error: unknown): boolean {
   // stamps code "route_closed". Match both so a client upgrade cannot
   // silently stop the unknown-outcome disposition from being appended — a
   // false negative here recreates the blind re-run this contract exists to
-  // prevent. "route closed by closeRoute" (same code in newer clients) is a
-  // deliberate local close, not a daemon GOODBYE: outcome-known, excluded by
-  // the message check on the coded arm.
+  // prevent. "route closed by closeRoute" (same code in newer clients) is the
+  // plugin closing its own route, not a daemon GOODBYE; it gets its own
+  // unknown-outcome guidance (see isRouteClosedMidCallError), so the message
+  // check on the coded arm keeps it out of the module-restart wording.
   if (error.code === undefined) {
     return error.message.includes("route closed by subc");
   }
@@ -190,18 +213,22 @@ function classifySubcPreDispatchError(error: Error): BashHostFallbackCause | und
  * response always wins because it proves AFT executed enough of the request to
  * return a logical result.
  *
- * A raw `SubcError("route closed by closeRoute", "route_closed")` is intentionally
- * absent. The raw request path creates it after a request is pending but exposes
- * no queued/write marker, so its outcome may be unknown. A future transport can
- * safely admit that case by using subc-client's managed request path and passing
- * through `SubcCallError.kind === "not_sent"`.
+ * A request rejected by a local `closeRoute` is intentionally absent: subc-client
+ * rejects only requests already pending on the route, and it starts writing a
+ * request's frame as it records it pending, so the request may have run. The
+ * subc pool reports it as `SubcRouteClosedMidCallError` (outcome unknown). A
+ * teardown that stopped the call before its request reached the client
+ * (`isSubcRouteTornDownError`, or `StaleRouteHandleError` from the client) is
+ * provably pre-dispatch.
  */
 export function classifyBashHostFallbackError(error: unknown): BashHostFallbackCause | undefined {
   if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
     return undefined;
   }
   if (error instanceof BridgeTransportUnknownOutcomeError) return undefined;
+  if (isRouteClosedMidCallError(error)) return undefined;
   if (error instanceof SubcTransportShuttingDownError) return "transport down";
+  if (isSubcRouteTornDownError(error)) return "route closed before dispatch";
 
   const subcPreDispatch = classifySubcPreDispatchError(error);
   if (subcPreDispatch !== undefined) return subcPreDispatch;
@@ -253,6 +280,16 @@ export function adaptToolError(command: string, error: unknown): unknown {
     error.message = error.message
       ? `${error.message} ${SUBC_MODULE_RESTART_DISPOSITION}`
       : SUBC_MODULE_RESTART_DISPOSITION;
+    return error;
+  }
+
+  // Also ahead of the bash branch, for the same reason: the request was in
+  // flight when the plugin closed its route, so it may already have run.
+  if (isRouteClosedMidCallError(error)) {
+    if (error.message.includes(SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION)) return error;
+    error.message = error.message
+      ? `${error.message} ${SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION}`
+      : SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION;
     return error;
   }
 
