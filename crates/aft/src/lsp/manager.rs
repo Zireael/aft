@@ -360,7 +360,11 @@ enum DocumentPullState {
     Done(PullFileOutcome),
     InFlight {
         request: crate::lsp::client::PendingLspRequest,
-        timeout: Duration,
+        /// When to stop waiting, fixed when the request is sent. An
+        /// absolute time, so a caller that sends several pulls and then
+        /// waits for them in turn never waits past the budget each one was
+        /// sent with.
+        wait_until: Instant,
     },
     Replied(Result<serde_json::Value, LspError>),
 }
@@ -375,9 +379,12 @@ impl DocumentPull {
             DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         );
         self.state = match state {
-            DocumentPullState::InFlight { request, timeout } => {
-                DocumentPullState::Replied(request.wait(timeout))
-            }
+            DocumentPullState::InFlight {
+                request,
+                wait_until,
+            } => DocumentPullState::Replied(
+                request.wait(wait_until.saturating_duration_since(Instant::now())),
+            ),
             settled => settled,
         };
         self
@@ -2992,7 +2999,10 @@ impl LspManager {
             None => Err(LspError::ServerNotReady("server not found".into())),
         };
         pull.state = match started {
-            Ok(request) => DocumentPullState::InFlight { request, timeout },
+            Ok(request) => DocumentPullState::InFlight {
+                request,
+                wait_until: Instant::now() + timeout,
+            },
             Err(err) => DocumentPullState::Replied(Err(err)),
         };
         pull

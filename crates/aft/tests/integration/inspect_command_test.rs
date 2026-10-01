@@ -3816,6 +3816,36 @@ fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics()
     }
 }
 
+/// Pulls are sent several files at a time and then waited for in turn; each
+/// wait must end at the request budget, not restart its own timeout. With a
+/// server that never answers within the budget, a scope of many files still
+/// returns close to the configured diagnostics deadline.
+#[test]
+fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull-budget");
+    for index in 0..40 {
+        write_file(&root, &format!("src/m{index:02}.rs"), "pub fn g() {}\n");
+    }
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+
+    let started = std::time::Instant::now();
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-budget", "src");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(25),
+        "a 10s inspect took {elapsed:?}: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "unanswered pulls are gaps: {response:#}"
+    );
+}
+
 /// A scope with more files than one inspect opens reports how many it
 /// examined, and names the rest with that cause instead of opening them.
 #[test]
