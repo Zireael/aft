@@ -742,8 +742,36 @@ synthetic "file-summary" chunk that captures filename, parent directory, leading
 comment, and export list — this lifts recall for filename-shaped concept queries like
 *"the bridge spawn helper"*.
 
-Parameters: `query` (required — natural language description), `topK` (optional — default 10),
-`path` (optional — search a different project root, see below).
+Parameters: `query` (natural language description, or a single auto-routed string), `pattern`
+(a regex for names or text that must appear), `topK` (optional — default 10), `path` (optional —
+search a different project root, see below). At least one of `query` and `pattern` is required;
+an empty or whitespace `pattern` counts as absent.
+
+**Query and pattern together.** When you know a name the answer must contain but also want the
+file that explains a concept, give both:
+
+```json
+{ "query": "how is the config file loaded", "pattern": "load_config|ConfigLoader" }
+```
+
+`pattern` uses grep's regex syntax and is case-sensitive, like grep. The ranking starts from
+exactly the ranking `query` alone would return, and the pattern only adds bounded evidence to
+it. Each top-level alternative of the pattern (`a|b`, and the branches of a single group such as
+`^pub struct (A|B)`) is judged on its own; one that matches more than 50 files, or that nothing
+declares, adds nothing. A leading result moves up a little for its own lines that match a
+selective alternative, a little more if it declares the name. An alternative's definition is
+placed right after the best-placed leading result that mentions the name (a caller always
+does), never above it, and marked with `supports`. With no such result, the definition is added
+only when the query has no semantic lane (identifier-shaped prose, or the semantic index is
+still building) or when it is relevant to the query on its own (semantic or lexical score);
+otherwise the summary line still names it. The reply
+opens with a pattern summary line: how many files matched, how many
+the query also found, up to three definition sites (or "no definition found"), and "examined N
+of M candidate files" when the pattern's examination hit its bound. Each result carries
+`matched_by` (`query`, `pattern` or `both`). A reply is marked incomplete when either input
+was bounded. An invalid regex is refused with grep's `invalid_pattern` error and position.
+`pattern` alone ranks the files it matches, definitions first, one result per file. `pattern`
+cannot yet be combined with `path`.
 
 #### Cross-project search
 

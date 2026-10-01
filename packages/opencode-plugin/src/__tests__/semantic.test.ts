@@ -156,6 +156,54 @@ describe("semanticTools", () => {
     expect((tools.aft_search.args as Record<string, unknown>).hint).toBeUndefined();
   });
 
+  test("forwards pattern beside query, or alone, and treats a blank pattern as absent", async () => {
+    const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
+      success: true,
+      text: "ok",
+    }));
+    const sdkCtx = createMockSdkContext(projectRoot);
+
+    await tools.aft_search.execute(
+      { query: "how is config loaded", pattern: "load_config|Config " },
+      sdkCtx,
+    );
+    await tools.aft_search.execute({ pattern: "^export" }, sdkCtx);
+    await tools.aft_search.execute({ query: "needle", pattern: "   " }, sdkCtx);
+
+    expect(toolCallCalls.map((call) => call.rawArgs)).toEqual([
+      // The regex is sent as written, trailing space included.
+      { query: "how is config loaded", pattern: "load_config|Config " },
+      { pattern: "^export" },
+      { query: "needle" },
+    ]);
+  });
+
+  test("refuses a request with neither query nor pattern", async () => {
+    const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({ success: true }));
+    const sdkCtx = createMockSdkContext(projectRoot);
+
+    await expect(tools.aft_search.execute({}, sdkCtx)).rejects.toThrow("`query` must be");
+    await expect(tools.aft_search.execute({ query: " ", pattern: "" }, sdkCtx)).rejects.toThrow(
+      "at least one of `query` or `pattern`",
+    );
+    await expect(tools.aft_search.execute({ query: "x", pattern: 3 }, sdkCtx)).rejects.toThrow(
+      "`pattern` must be a string",
+    );
+    expect(toolCallCalls).toEqual([]);
+  });
+
+  test("surfaces the backend's invalid_pattern refusal", async () => {
+    const { tools } = createMockSemanticHarness({}, () => ({
+      success: false,
+      code: "invalid_pattern",
+      message: "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+    }));
+
+    await expect(
+      tools.aft_search.execute({ pattern: "[" }, createMockSdkContext(projectRoot)),
+    ).rejects.toThrow("unclosed character class");
+  });
+
   test("returns ONLY the clean text (no structured JSON dump) and sends params", async () => {
     const sdkCtx = createMockSdkContext(projectRoot);
     const bridgeResponse = {
