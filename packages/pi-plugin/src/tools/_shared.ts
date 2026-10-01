@@ -173,6 +173,9 @@ export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport 
   if (!existsSync(cwd)) {
     throw new Error(`project directory no longer exists: ${cwd} (stale restored session?)`);
   }
+  // A tool call is a session using AFT: make sure the deferred startup (which
+  // hands cached LSP server paths to new bridges) has run before this spawn.
+  ctx.startSessionWork?.();
   return ctx.pool.getBridge(cwd);
 }
 
