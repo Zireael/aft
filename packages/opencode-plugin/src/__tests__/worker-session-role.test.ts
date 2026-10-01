@@ -8,13 +8,14 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
-import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
+import { _resetSubagentCacheForTest, LOOKUP_TIMEOUT_MS } from "../shared/subagent-detect.js";
 import { callBridge, callToolCall } from "../tools/_shared.js";
 import type { PluginContext } from "../types.js";
 
 const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
-function harness(parentID: string | undefined) {
+function harness(parentID: string | undefined, hang = false) {
+  let lookups = 0;
   const sends: Array<Record<string, unknown>> = [];
   const toolCalls: Array<Record<string, unknown> | undefined> = [];
   const bridge = {
@@ -36,9 +37,12 @@ function harness(parentID: string | undefined) {
     pool: { getBridge: () => bridge } as unknown as BridgePool,
     client: {
       session: {
-        get: async (input: { path: { id: string } }) => ({
-          data: { id: input.path.id, parentID, directory: PROJECT_CWD },
-        }),
+        // With `hang`, only the first lookup (the session-directory one,
+        // which callBridge awaits first) answers; the role lookup never does.
+        get: async (input: { path: { id: string } }) =>
+          hang && ++lookups > 1
+            ? new Promise<never>(() => {})
+            : { data: { id: input.path.id, parentID, directory: PROJECT_CWD } },
       },
     },
     config: {},
@@ -70,5 +74,17 @@ describe("caller role on every bridge request", () => {
     await callToolCall(ctx, runtime("ses_role_primary"), "read", { filePath: "a.ts" });
     expect(sends[0]).not.toHaveProperty("worker_session");
     expect(toolCalls[0]).not.toHaveProperty("workerSession");
+  });
+
+  // A slow host must not delay ordinary tool calls (each one asks for the
+  // role): the lookup is abandoned after LOOKUP_TIMEOUT_MS and the call goes
+  // ahead as a primary session.
+  test("a host that never answers delays a bridge call by at most the lookup timeout", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends } = harness("ses_parent", true);
+    const started = performance.now();
+    await callBridge(ctx, runtime("ses_role_hang"), "bash_status", { task_id: "t" });
+    expect(performance.now() - started).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
+    expect(sends[0]).not.toHaveProperty("worker_session");
   });
 });

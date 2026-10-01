@@ -1,7 +1,13 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { Effect } from "effect";
-import { _resetSubagentCacheForTest, resolveIsSubagent } from "../shared/subagent-detect.js";
+import {
+  _resetSubagentCacheForTest,
+  _setSubagentClockForTest,
+  FAILED_LOOKUP_RETRY_MS,
+  LOOKUP_TIMEOUT_MS,
+  resolveIsSubagent,
+} from "../shared/subagent-detect.js";
 
 afterEach(() => {
   _resetSubagentCacheForTest();
@@ -113,7 +119,12 @@ describe("subagent-detect", () => {
     expect(calls).toBe(1);
   });
 
-  test("does not cache on SDK error — next call retries", async () => {
+  // A failed lookup answers "primary" for a while instead of asking a
+  // struggling host on every call, then retries so the real answer is still
+  // found. (It used to retry on the very next call.)
+  test("after an SDK error, calls within the retry window make no lookup; a later call retries", async () => {
+    let clock = 1_000_000;
+    _setSubagentClockForTest(() => clock);
     let calls = 0;
     let shouldThrow = true;
     const client = {
@@ -129,10 +140,17 @@ describe("subagent-detect", () => {
     expect(first).toBe(false); // error path defaults to false
     expect(calls).toBe(1);
 
-    // Next call retries because the error wasn't cached
     shouldThrow = false;
-    const second = await resolveIsSubagent(client, "ses_y", "/cwd");
-    expect(second).toBe(true);
+    clock += FAILED_LOOKUP_RETRY_MS - 1;
+    expect(await resolveIsSubagent(client, "ses_y", "/cwd")).toBe(false);
+    expect(calls).toBe(1);
+
+    clock += 1;
+    expect(await resolveIsSubagent(client, "ses_y", "/cwd")).toBe(true);
+    expect(calls).toBe(2);
+    // A real answer is kept for good.
+    clock += FAILED_LOOKUP_RETRY_MS * 10;
+    expect(await resolveIsSubagent(client, "ses_y", "/cwd")).toBe(true);
     expect(calls).toBe(2);
   });
 
@@ -201,14 +219,72 @@ describe("subagent-detect", () => {
       expect(await resolveIsSubagent(context, "ses_root", "/cwd")).toBe(false);
     });
 
-    test("a failed lookup is not cached, so the next call can still find the parent", async () => {
+    test("a failed lookup counts as primary only until the retry window passes", async () => {
+      let clock = 1_000_000;
+      _setSubagentClockForTest(() => clock);
       const records: Record<string, { id: string; parentID?: string }> = {};
       const { context, inputs } = v2Context(records);
       expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(false);
       records.ses_late = { id: "ses_late", parentID: "ses_parent" };
+      expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(false);
+      expect(inputs).toHaveLength(1);
+      clock += FAILED_LOOKUP_RETRY_MS;
       expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(true);
       expect(inputs).toHaveLength(2);
     });
+
+    test("an OpenCode 2 lookup that never answers is abandoned after the timeout", async () => {
+      const context = {
+        location: { directory: "/cwd" },
+        session: { get: () => Effect.never },
+      };
+      const started = performance.now();
+      expect(await resolveIsSubagent(context, "ses_v2_hang", "/cwd")).toBe(false);
+      expect(performance.now() - started).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
+    });
+  });
+
+  test("concurrent first calls share one host lookup", async () => {
+    let calls = 0;
+    let release: (() => void) | undefined;
+    const client = {
+      session: {
+        get: async (_input: { path: { id: string } }) => {
+          calls += 1;
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return { data: { id: "ses_burst", parentID: "ses_parent" } };
+        },
+      },
+    };
+    const results = Promise.all(
+      Array.from({ length: 5 }, () => resolveIsSubagent(client, "ses_burst", "/cwd")),
+    );
+    await Promise.resolve();
+    release?.();
+    expect(await results).toEqual([true, true, true, true, true]);
+    expect(calls).toBe(1);
+  });
+
+  test("a host lookup that never answers lets the call proceed as primary within the timeout", async () => {
+    let calls = 0;
+    const client = {
+      session: {
+        get: (_input: { path: { id: string } }) => {
+          calls += 1;
+          return new Promise<never>(() => {});
+        },
+      },
+    };
+    const started = performance.now();
+    expect(await resolveIsSubagent(client, "ses_hang", "/cwd")).toBe(false);
+    const elapsed = performance.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(LOOKUP_TIMEOUT_MS - 50);
+    expect(elapsed).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
+    // The timeout counts as a failure: no new lookup inside the retry window.
+    expect(await resolveIsSubagent(client, "ses_hang", "/cwd")).toBe(false);
+    expect(calls).toBe(1);
   });
 
   test("caches negative result (primary session) so repeat calls are O(1)", async () => {
