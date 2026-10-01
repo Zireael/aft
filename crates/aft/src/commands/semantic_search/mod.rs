@@ -1807,6 +1807,7 @@ fn handle_external_semantic_or_hybrid_search(
         ctx,
         &external_root,
         &params.query,
+        public_query(req),
         params.include_tests,
         std::mem::take(&mut semantic_results),
         page_request,
@@ -2712,11 +2713,23 @@ fn path_scope_contains(path_scope: &HashSet<PathBuf>, path: &Path) -> bool {
     path_scope.contains(&path)
 }
 
+/// The query exactly as the caller sent it. Routes may rewrite the query they
+/// rank (the code-literal route strips its quotes, and a zero-result
+/// escalation reruns a regex or literal query as natural language); the
+/// reranker's prose gate classifies this original text instead.
+fn public_query(req: &RawRequest) -> &str {
+    req.params
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
     project_root: &Path,
     query: &str,
+    public_query: &str,
     include_tests: bool,
     semantic_results: Vec<SemanticResult>,
     page_request: paging::ValidatedPageRequest,
@@ -3249,6 +3262,7 @@ fn run_engine_ranking(
             backend: rerank::installed_backend(ctx),
             project_root,
             prose: Some(query),
+            public_query,
             path_scope: path_scope.as_ref(),
         },
     )?;
@@ -3459,6 +3473,7 @@ fn handle_engine_only_search(
         ctx,
         project_root,
         &params.query,
+        public_query(req),
         params.include_tests,
         Vec::new(),
         page_request,
@@ -3867,6 +3882,7 @@ fn handle_semantic_or_hybrid_search(
         ctx,
         project_root,
         &params.query,
+        public_query(req),
         params.include_tests,
         semantic_results,
         page_request,
@@ -4066,6 +4082,7 @@ fn zero_result_escalation_response(
         ctx,
         project_root,
         query,
+        public_query(req),
         include_tests,
         Vec::new(),
         page_request,
@@ -4253,6 +4270,7 @@ fn semantic_unavailable_or_fallback_response(
             ctx,
             project_root,
             &params.query,
+            public_query(req),
             params.include_tests,
             Vec::new(),
             page_request,

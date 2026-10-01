@@ -12,7 +12,8 @@
 //!   embedding worker and its model mutex, so a slow rerank can never make a
 //!   query embedding fail as busy.
 //! - Intra-op threads come from a budget shared with the embedder (see
-//!   [`rerank_intra_threads`]).
+//!   [`rerank_intra_threads`]), and they do not busy-wait between operators
+//!   (see [`SessionTuning`]).
 //! - Requests carry their deadline to the worker; a request whose deadline has
 //!   passed when the worker picks it up is dropped without inference, and a
 //!   batch stops between sub-batches once the deadline passes.
@@ -135,11 +136,15 @@ pub(crate) const ALLOWED_MODELS: &[AllowedModel] = &[
 /// 512-token input; longer pairs are cut from the longer side
 /// first.
 pub(crate) const MAX_PAIR_TOKENS: usize = 512;
-/// Largest `batch × tokens²` one inference may use. The attention tensors of a
-/// base-size cross-encoder scale with it; 2M units is about 7 full-length
-/// pairs or 20 pairs of 316 tokens per inference, which keeps the temporary
-/// memory of one inference to a few hundred MB.
-pub(crate) const MAX_RERANK_ATTENTION_UNITS: usize = 2_000_000;
+/// Largest `batch × tokens²` one inference may use. The working memory of one
+/// inference (attention tensors and the runtime's arena, which keeps its
+/// high-water mark) scales with it. Measured with gte-reranker-modernbert-base
+/// on 20 engine-built candidates of about 300 tokens: 2M units held about
+/// 1.1 GB above the loaded model, 1M about 0.6 GB, and 500k about 0.27 GB, at
+/// the same CPU time per call. 500k is about 2 full-length pairs or 5 pairs of
+/// 316 tokens per inference, and the extra sub-batches also let a call stop
+/// sooner once its deadline has passed.
+pub(crate) const MAX_RERANK_ATTENTION_UNITS: usize = 500_000;
 /// Largest model (graph plus external weights) the backend will load. The
 /// largest allowed model, bge-reranker-v2-m3 in fp32, is about 2.3 GB.
 pub(crate) const MAX_MODEL_FILE_BYTES: u64 = 2_500 * 1024 * 1024;
@@ -560,6 +565,37 @@ fn model_bytes(files: &ModelFiles) -> u64 {
         .sum()
 }
 
+/// Session options that decide the reranker's CPU and memory cost. The cost
+/// profiling test varies them; production uses `SessionTuning::default()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionTuning {
+    /// Whether idle intra-op threads busy-wait for work. ONNX Runtime spins by
+    /// default; on a loaded machine the spinning threads compete with the
+    /// threads doing the work, and measured on gte-reranker-modernbert-base it
+    /// about doubled the CPU time of a call (18 s against 8.5 s for 20
+    /// candidates) without making it faster. So it is off.
+    pub(crate) intra_op_spinning: bool,
+    pub(crate) memory_pattern: bool,
+    /// Use ONNX Runtime's CPU memory arena (it keeps freed blocks for reuse).
+    pub(crate) cpu_arena: bool,
+    /// Ask the arena to release its unused blocks at the end of every run.
+    pub(crate) arena_shrinkage: bool,
+    /// Largest `batch × tokens²` one inference may use.
+    pub(crate) attention_units: usize,
+}
+
+impl Default for SessionTuning {
+    fn default() -> Self {
+        Self {
+            intra_op_spinning: false,
+            memory_pattern: true,
+            cpu_arena: true,
+            arena_shrinkage: false,
+            attention_units: MAX_RERANK_ATTENTION_UNITS,
+        }
+    }
+}
+
 /// A loaded cross-encoder session and its tokenizer.
 pub(crate) struct OnnxPairScorer {
     /// Released explicitly in `Drop` under the ORT exit gate.
@@ -567,10 +603,23 @@ pub(crate) struct OnnxPairScorer {
     tokenizer: Tokenizer,
     wants_token_type_ids: bool,
     pad_id: i64,
+    /// Per-run options; set only when ONNX Runtime's CPU memory arena is
+    /// shrunk after every run.
+    run_options: Option<ort::session::RunOptions>,
+    attention_units: usize,
 }
 
 impl OnnxPairScorer {
     pub(crate) fn load(name: &str, files: &ModelFiles, threads: usize) -> Result<Self, String> {
+        Self::load_with(name, files, threads, SessionTuning::default())
+    }
+
+    pub(crate) fn load_with(
+        name: &str,
+        files: &ModelFiles,
+        threads: usize,
+        tuning: SessionTuning,
+    ) -> Result<Self, String> {
         super::note_io();
         let bytes = model_bytes(files);
         if bytes > MAX_MODEL_FILE_BYTES {
@@ -587,6 +636,14 @@ impl OnnxPairScorer {
             .map_err(|error| format!("set ONNX optimization level: {error}"))?
             .with_intra_threads(threads)
             .map_err(|error| format!("set ONNX intra-op threads: {error}"))?
+            .with_intra_op_spinning(tuning.intra_op_spinning)
+            .map_err(|error| format!("set ONNX intra-op spinning: {error}"))?
+            .with_memory_pattern(tuning.memory_pattern)
+            .map_err(|error| format!("set ONNX memory pattern: {error}"))?
+            .with_execution_providers([ort::ep::CPU::default()
+                .with_arena_allocator(tuning.cpu_arena)
+                .build()])
+            .map_err(|error| format!("set ONNX CPU provider: {error}"))?
             .commit_from_file(&files.model)
             .map_err(crate::semantic_index::format_embedding_init_error)?;
         let mut tokenizer = Tokenizer::from_file(&files.tokenizer)
@@ -599,6 +656,16 @@ impl OnnxPairScorer {
             }))
             .map_err(|error| format!("set tokenizer truncation: {error}"))?;
         tokenizer.with_padding(None);
+        let run_options = if tuning.arena_shrinkage {
+            let mut options = ort::session::RunOptions::new()
+                .map_err(|error| format!("create ONNX run options: {error}"))?;
+            options
+                .add_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+                .map_err(|error| format!("set ONNX arena shrinkage: {error}"))?;
+            Some(options)
+        } else {
+            None
+        };
         let wants_token_type_ids = session
             .inputs()
             .iter()
@@ -615,6 +682,8 @@ impl OnnxPairScorer {
             tokenizer,
             wants_token_type_ids,
             pad_id,
+            run_options,
+            attention_units: tuning.attention_units,
         })
     }
 
@@ -664,10 +733,11 @@ impl OnnxPairScorer {
                     .into(),
             ));
         }
-        let outputs = self
-            .session
-            .run(inputs)
-            .map_err(|error| format!("rerank inference failed: {error}"))?;
+        let outputs = match &self.run_options {
+            Some(options) => self.session.run_with_options(inputs, options),
+            None => self.session.run(inputs),
+        }
+        .map_err(|error| format!("rerank inference failed: {error}"))?;
         let output = outputs
             .values()
             .next()
@@ -696,6 +766,31 @@ impl OnnxPairScorer {
     }
 }
 
+// Only the Unix-only cost profiling test uses this, to report how many tokens
+// each truncated (query, document) pair has and how pairs split into batches.
+#[cfg(all(test, unix))]
+impl OnnxPairScorer {
+    /// Tokens in each (query, doc) pair after truncation, as scoring sees them.
+    pub(crate) fn pair_token_lengths(
+        &self,
+        query: &str,
+        docs: &[String],
+    ) -> Result<Vec<usize>, String> {
+        let pairs = docs
+            .iter()
+            .map(|doc| (query, doc.as_str()))
+            .collect::<Vec<_>>();
+        let encodings = self
+            .tokenizer
+            .encode_batch(pairs, true)
+            .map_err(|error| format!("tokenize: {error}"))?;
+        Ok(encodings
+            .iter()
+            .map(|encoding| encoding.get_ids().len())
+            .collect())
+    }
+}
+
 impl PairScorer for OnnxPairScorer {
     fn score_pairs(
         &mut self,
@@ -715,7 +810,7 @@ impl PairScorer for OnnxPairScorer {
             .encode_batch(pairs, true)
             .map_err(|error| RerankError::Failed(format!("tokenize: {error}")))?;
         let mut scores = Vec::with_capacity(encodings.len());
-        for range in attention_batches(&encodings, MAX_RERANK_ATTENTION_UNITS) {
+        for range in attention_batches(&encodings, self.attention_units) {
             if Instant::now() >= deadline {
                 return Err(RerankError::Timeout);
             }

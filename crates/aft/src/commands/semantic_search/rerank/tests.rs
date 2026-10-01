@@ -72,9 +72,12 @@ impl NumberedBackend {
 }
 
 fn file_number(text: &str) -> f32 {
+    // The first line is `path:line`.
     let first_line = text.lines().next().unwrap_or_default();
-    first_line
-        .rsplit('_')
+    let path = first_line
+        .rsplit_once(':')
+        .map_or(first_line, |(path, _)| path);
+    path.rsplit('_')
         .next()
         .and_then(|tail| tail.trim_end_matches(".rs").parse::<f32>().ok())
         .unwrap_or(-1.0)
@@ -218,19 +221,53 @@ fn candidate_text_is_bounded_relative_and_repeatable() {
         "{}",
         first.len()
     );
-    assert!(first.starts_with("src/long.rs\n"), "{first}");
+    assert!(
+        first.starts_with("src/long.rs:3\ncompute_the_answer\n"),
+        "{first}"
+    );
     assert!(!first.contains('\r'));
     assert!(!first.contains("\n\n"), "blank lines are skipped");
+    // Without a code identifier in the prose, the name line is the file stem.
+    let prose_only = candidate_text(project.path(), &whole, "how is the value computed");
+    assert_eq!(prose_only.lines().nth(1), Some("long"), "{prose_only}");
 
     let symbol = CandidateResult::new_exact(
-        file,
+        file.clone(),
         Some(super::super::comparator::SymbolOffsetRange::new(0, 14)),
         super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
     );
     assert_eq!(
         candidate_text(project.path(), &symbol, "anything"),
-        "src/long.rs\nfn header() {}"
+        "src/long.rs:1\nheader\nfn header() {}"
     );
+
+    // A symbol deep in the file names its own line and declared name, and the
+    // first two lines survive a body that fills the budget.
+    let decorated = project.path().join("src/decorated.rs");
+    let mut source =
+        String::from("// leading comment\n\n#[inline]\npub(crate) fn decorated_entry_point() {\n");
+    for line in 0..200 {
+        source.push_str(&format!(
+            "    let value_{line} = compute_the_answer({line});\n"
+        ));
+    }
+    source.push_str("}\n");
+    std::fs::write(&decorated, &source).unwrap();
+    let start = source.find("#[inline]").unwrap();
+    let symbol = CandidateResult::new_exact(
+        decorated,
+        Some(super::super::comparator::SymbolOffsetRange::new(
+            start,
+            source.len(),
+        )),
+        super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+    );
+    let text = candidate_text(project.path(), &symbol, "anything");
+    assert!(
+        text.starts_with("src/decorated.rs:3\ndecorated_entry_point\n#[inline]\n"),
+        "{text}"
+    );
+    assert!(text.len() <= CANDIDATE_TEXT_BUDGET_BYTES, "{}", text.len());
 }
 
 // ---- served path ---------------------------------------------------------
@@ -248,6 +285,9 @@ fn page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
 }
 
 const PROBE: &str = "rerank_probe_token";
+/// A prose question about the probe files. The reranker only reorders queries
+/// the router classifies as prose, so the served-path tests ask this.
+const PROBE_QUESTION: &str = "where is the rerank probe token handled";
 
 /// A lexical-only project with `count` files that all contain the probe.
 fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
@@ -256,7 +296,7 @@ fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
     for number in 0..count {
         let file = project.path().join(format!("src/file_{number:02}.rs"));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let source = format!("pub fn {PROBE}_{number:02}() {{ /* {PROBE} */ }}\n");
+        let source = format!("pub fn {PROBE}_{number:02}() {{ /* rerank probe */ }}\n");
         std::fs::write(&file, &source).unwrap();
         index.index_file(&file, source.as_bytes());
     }
@@ -279,7 +319,11 @@ fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
 
 /// (file names of one page, the serialized response).
 fn page(ctx: &AppContext, top_k: usize, offset: usize) -> (Vec<String>, String) {
-    let response = handle_semantic_search(&page_request(PROBE, top_k, offset), ctx);
+    page_for(ctx, PROBE_QUESTION, top_k, offset)
+}
+
+fn page_for(ctx: &AppContext, query: &str, top_k: usize, offset: usize) -> (Vec<String>, String) {
+    let response = handle_semantic_search(&page_request(query, top_k, offset), ctx);
     assert!(response.success, "search failed: {response:?}");
     let value = serde_json::to_value(&response).unwrap();
     let files = value["results"]
@@ -358,7 +402,7 @@ fn served_stream_is_identical_across_page_sizes_and_offsets_around_the_head() {
     });
     // Every page reused the order computed by the first request.
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.queries.lock().unwrap()[0], PROBE);
+    assert_eq!(backend.queries.lock().unwrap()[0], PROBE_QUESTION);
 }
 
 #[test]
@@ -415,10 +459,13 @@ fn tiny_list(project: &Path, count: usize) -> CanonicalList {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, format!("fn item_{index}() {{}}\n")).unwrap();
             BlockEntry {
-                result: CandidateResult::new_exact(
+                result: CandidateResult::new_non_exact(
                     path,
                     None,
-                    EvidenceDescriptor::for_e1(1, true, false),
+                    EvidenceDescriptor::for_non_exact(false, false),
+                    1.0,
+                    1.0,
+                    super::super::plan_table::SearchLaneKind::Lexical,
                 ),
                 tier_index: 0,
                 admitted_contributions: Vec::new(),
@@ -452,6 +499,7 @@ fn head_request<'a>(
         backend: slot::Installed::Off,
         project_root: project,
         prose,
+        public_query: prose.unwrap_or_default(),
         path_scope: scope,
     }
 }
@@ -496,6 +544,232 @@ fn pattern_only_requests_are_never_reranked() {
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
 }
 
+/// Scores benchmark pools with the production local ONNX scorer, outside any
+/// search deadline. `AFT_RERANK_SCORE_POOLS` names a JSON list of
+/// `{"query", "texts"}` objects and `AFT_RERANK_SCORE_OUTPUT` the file the
+/// scores are written to (one list per pool, in input order).
+/// `AFT_RERANK_ONNX_TEST_CACHE_DIR` must hold the pinned
+/// gte-reranker-modernbert-base. Runs only when all three are set.
+#[test]
+fn score_pools_with_local_onnx_when_asked() {
+    let (Some(input), Some(output), Some(cache_dir)) = (
+        std::env::var_os("AFT_RERANK_SCORE_POOLS"),
+        std::env::var_os("AFT_RERANK_SCORE_OUTPUT"),
+        std::env::var_os("AFT_RERANK_ONNX_TEST_CACHE_DIR").map(PathBuf::from),
+    ) else {
+        return;
+    };
+    #[derive(serde::Deserialize)]
+    struct Pool {
+        query: String,
+        texts: Vec<String>,
+    }
+    let pools: Vec<Pool> = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+    let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
+    let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
+    let mut scorer = onnx::OnnxPairScorer::load(model.name, &files, onnx::rerank_intra_threads())
+        .expect("load model");
+    let scores = pools
+        .iter()
+        .map(|pool| {
+            scorer
+                .score_pairs(
+                    &pool.query,
+                    &pool.texts,
+                    Instant::now() + Duration::from_secs(600),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(output, serde_json::to_vec(&scores).unwrap()).unwrap();
+}
+
+/// Prints the reranker gate's decision for each query in the JSON list named
+/// by `AFT_RERANK_GATE_QUERIES`, one line per query: `prose` or `skip`, the
+/// query, the router's shape and the query-shape kind, so a benchmark can
+/// label its rows with the live classification. Runs only when the variable
+/// is set.
+#[test]
+fn print_gate_decisions_when_asked() {
+    let Some(path) = std::env::var_os("AFT_RERANK_GATE_QUERIES") else {
+        return;
+    };
+    let queries: Vec<String> =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).expect("a JSON list of strings");
+    for query in queries {
+        let decision = if is_prose_query(&query) {
+            "prose"
+        } else {
+            "skip"
+        };
+        let (shape, _) = crate::search_b2::install_defaults()
+            .classify(&super::super::extensions::RawQuery::new(&query));
+        let kind = crate::query_shape::classify(&query).kind;
+        println!(
+            "gate\t{decision}\t{}\t{shape:?}\t{kind:?}",
+            serde_json::to_string(&query).unwrap()
+        );
+    }
+}
+
+#[test]
+fn only_queries_the_router_reads_as_prose_are_reranked() {
+    for prose in [
+        // natural language
+        "where is the session cache invalidated",
+        // mixed: prose words around a code identifier
+        "how does LSPManager handle a timeout",
+        // short mixed and short natural language
+        "LSPManager initialization timeout",
+        "permanent key dict",
+        "process group already terminated",
+    ] {
+        assert!(is_prose_query(prose), "{prose} should be reranked");
+    }
+    for not_prose in [
+        "useState",
+        "handle_grep",
+        "LSPManager",
+        "crates/aft/src/commands/grep.rs",
+        "ERR_PNPM_",
+        r"fn\s+parse_\w+",
+        "remove_file|Error",
+        "\"exact phrase here\"",
+    ] {
+        assert!(
+            !is_prose_query(not_prose),
+            "{not_prose} should not be reranked"
+        );
+    }
+    // Prose the router reads as a code literal or a log excerpt still has prose.
+    for prose in [
+        "subc module drain on shutdown: what does it wait for (lsp shutdown, watcher stop)",
+        "profile sample file removed on symbolization failure download error decoding",
+    ] {
+        assert!(is_prose_query(prose), "{prose} should be reranked");
+    }
+}
+
+#[test]
+fn a_query_that_is_not_prose_never_reaches_the_backend() {
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 5);
+    let before = names(&list);
+    let backend = NumberedBackend::new(Vec::new());
+    let selected = Ok(SelectedBackend {
+        backend: backend.clone(),
+        fail_closed: false,
+    });
+    let search = SearchConfig::default();
+    let settings = RerankSettings::resolve(&search);
+    for query in ["item_3", "src/file_03.rs", r"item_\d+"] {
+        let outcome = rerank_block_zero(
+            &mut list,
+            &selected,
+            &settings,
+            &head_request(&search, project.path(), Some(query), None),
+        )
+        .unwrap();
+        assert_eq!(outcome, HeadOutcome::NotApplicable, "{query}");
+    }
+    assert_eq!(names(&list), before);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_identifier_search_keeps_the_fused_order_and_carries_no_note() {
+    let (_project, ctx) = probe_project(30);
+    let fused = (0..3)
+        .flat_map(|page_index| page_for(&ctx, PROBE, 10, page_index * 10).0)
+        .collect::<Vec<_>>();
+    assert!(!fused.is_empty());
+    // A backend that would fail every call: if the search reached it, the
+    // response would carry a skip note.
+    let backend = NumberedBackend::new(vec![RerankError::Timeout; 8]);
+    with_backend(backend.clone(), false, || {
+        let mut served = Vec::new();
+        for page_index in 0..3 {
+            let (files, text) = page_for(&ctx, PROBE, 10, page_index * 10);
+            assert!(!text.contains("rerank skipped"), "{text}");
+            served.extend(files);
+        }
+        assert_eq!(served, fused);
+    });
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_quoted_literal_is_not_reranked_after_its_route_strips_the_quotes() {
+    // The code-literal route removes the quotes and ranks the phrase inside,
+    // which reads as prose; the gate must still see the quoted query.
+    let (_project, ctx) = probe_project(30);
+    let quoted = "\"rerank probe token handled\"";
+    let (fused, _) = page_for(&ctx, quoted, 30, 0);
+    assert!(!fused.is_empty());
+    let backend = NumberedBackend::new(vec![RerankError::Timeout; 8]);
+    with_backend(backend.clone(), false, || {
+        let (served, text) = page_for(&ctx, quoted, 30, 0);
+        assert!(!text.contains("rerank skipped"), "{text}");
+        assert_eq!(served, fused);
+    });
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn exact_entries_keep_their_order_and_positions_and_only_non_exact_entries_move() {
+    use super::super::evidence_descriptor::EvidenceDescriptor;
+    let project = tempfile::tempdir().unwrap();
+    let mut list = tiny_list(project.path(), 6);
+    for index in [0, 2] {
+        let entry = &mut list.blocks[0].entries[index];
+        entry.result = CandidateResult::new_exact(
+            entry.result.path.clone(),
+            None,
+            EvidenceDescriptor::for_e1(1, true, false),
+        );
+    }
+    let backend = NumberedBackend::new(Vec::new());
+    let selected = Ok(SelectedBackend {
+        backend: backend.clone(),
+        fail_closed: false,
+    });
+    let search = SearchConfig::default();
+    let settings = RerankSettings::resolve(&search);
+    let outcome = rerank_block_zero(
+        &mut list,
+        &selected,
+        &settings,
+        &head_request(
+            &search,
+            project.path(),
+            Some("where are the items made"),
+            None,
+        ),
+    )
+    .unwrap();
+    assert_eq!(outcome, HeadOutcome::Reordered);
+    // The backend prefers high file numbers: the four non-exact entries are
+    // reversed among the positions they held; the exact ones never move.
+    assert_eq!(
+        names(&list),
+        [
+            "file_00.rs",
+            "file_05.rs",
+            "file_02.rs",
+            "file_04.rs",
+            "file_03.rs",
+            "file_01.rs"
+        ]
+    );
+    let indices = list
+        .entries()
+        .map(|entry| entry.r3_order_index)
+        .collect::<Vec<_>>();
+    assert_eq!(indices, (0..6).collect::<Vec<_>>());
+    // One backend call scored the four non-exact entries.
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn path_scope_preference_is_kept_by_the_reorder() {
     let project = tempfile::tempdir().unwrap();
@@ -515,7 +789,12 @@ fn path_scope_preference_is_kept_by_the_reorder() {
         &mut list,
         &selected,
         &settings,
-        &head_request(&search, project.path(), Some("scoped"), Some(&scope)),
+        &head_request(
+            &search,
+            project.path(),
+            Some("which files are in scope here"),
+            Some(&scope),
+        ),
     )
     .unwrap();
     assert_eq!(
@@ -555,7 +834,12 @@ fn a_fail_closed_backend_turns_a_miss_into_a_search_error() {
         &mut list,
         &selected,
         &settings,
-        &head_request(&search, project.path(), Some("fixture miss"), None),
+        &head_request(
+            &search,
+            project.path(),
+            Some("where is the fixture miss reported"),
+            None,
+        ),
     )
     .expect_err("a fixture miss must fail the search");
     assert!(error.contains("no recorded score"), "{error}");
@@ -578,7 +862,12 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
             fail_closed: false,
         }),
         &settings,
-        &head_request(&search, project.path(), Some("record me"), None),
+        &head_request(
+            &search,
+            project.path(),
+            Some("where are the recorded scores kept"),
+            None,
+        ),
     )
     .unwrap();
 
@@ -598,7 +887,12 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
             fail_closed: true,
         }),
         &settings,
-        &head_request(&search, project.path(), Some("record me"), None),
+        &head_request(
+            &search,
+            project.path(),
+            Some("where are the recorded scores kept"),
+            None,
+        ),
     )
     .unwrap();
     assert_eq!(names(&replayed_list), names(&recorded_list));
@@ -1157,6 +1451,147 @@ fn real_onnx_model_scores_twenty_pairs_when_available() {
     assert_eq!(scores.len(), 20);
 }
 
+/// CPU time this process has used, user plus system, in seconds.
+#[cfg(unix)]
+fn process_cpu_seconds() -> f64 {
+    // SAFETY: getrusage only writes the struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+/// Resident memory of this process in MB, as `ps` reports it.
+#[cfg(unix)]
+fn process_rss_mb() -> f64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(0.0)
+        / 1024.0
+}
+
+/// Cost profile of the local ONNX reranker on realistic candidates: the
+/// engine's own candidate texts for source files of this crate, scored for a
+/// series of distinct queries the way consecutive searches would be. Prints
+/// token lengths, attention batches, and per-call wall time, CPU time and
+/// resident memory. Runs only when `AFT_RERANK_ONNX_TEST_CACHE_DIR` names a
+/// cache holding the pinned gte-reranker-modernbert-base. The session options
+/// can be varied with `AFT_RERANK_PROFILE_SPINNING`,
+/// `AFT_RERANK_PROFILE_MEMORY_PATTERN`, `AFT_RERANK_PROFILE_CPU_ARENA` and
+/// `AFT_RERANK_PROFILE_ARENA_SHRINKAGE` (`0` or `1`) and
+/// `AFT_RERANK_PROFILE_ATTENTION_UNITS`, the thread count with
+/// `AFT_RERANK_PROFILE_THREADS`, and the candidate count and text budget with
+/// `AFT_RERANK_PROFILE_DOCS` and `AFT_RERANK_PROFILE_BYTES`.
+#[cfg(unix)]
+#[test]
+fn onnx_cost_profile_when_available() {
+    use super::super::evidence_descriptor::EvidenceDescriptor;
+
+    let Some(cache_dir) = std::env::var_os("AFT_RERANK_ONNX_TEST_CACHE_DIR").map(PathBuf::from)
+    else {
+        eprintln!("skipped: AFT_RERANK_ONNX_TEST_CACHE_DIR is not set");
+        return;
+    };
+    let flag =
+        |name: &str, default: bool| std::env::var(name).map_or(default, |value| value != "0");
+    let number = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let defaults = onnx::SessionTuning::default();
+    let tuning = onnx::SessionTuning {
+        intra_op_spinning: flag("AFT_RERANK_PROFILE_SPINNING", defaults.intra_op_spinning),
+        memory_pattern: flag("AFT_RERANK_PROFILE_MEMORY_PATTERN", defaults.memory_pattern),
+        cpu_arena: flag("AFT_RERANK_PROFILE_CPU_ARENA", defaults.cpu_arena),
+        arena_shrinkage: flag(
+            "AFT_RERANK_PROFILE_ARENA_SHRINKAGE",
+            defaults.arena_shrinkage,
+        ),
+        attention_units: number(
+            "AFT_RERANK_PROFILE_ATTENTION_UNITS",
+            defaults.attention_units,
+        ),
+    };
+    let doc_count = number("AFT_RERANK_PROFILE_DOCS", DEFAULT_TOP_N);
+    let byte_budget = number("AFT_RERANK_PROFILE_BYTES", CANDIDATE_TEXT_BUDGET_BYTES);
+    let threads = number("AFT_RERANK_PROFILE_THREADS", onnx::rerank_intra_threads());
+
+    let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
+    let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
+    let rss_before_load = process_rss_mb();
+    let mut scorer = onnx::OnnxPairScorer::load_with(model.name, &files, threads, tuning)
+        .expect("load test model");
+    let rss_loaded = process_rss_mb();
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = std::fs::read_dir(root.join("src"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .collect::<Vec<_>>();
+    sources.sort();
+    let queries = [
+        "where is the session cache invalidated after a config change",
+        "how are background bash tasks restored after restart",
+        "how does the semantic index persist across configure runs",
+        "where are lsp diagnostics polled for server responses",
+        "how are imports organized after edits",
+        "which code writes the backup before an edit is applied",
+        "how does the watcher invalidate stale files",
+        "where is the search result page cut and paged",
+        "how are tool call timeouts reported to the agent",
+        "where is the project root resolved from the request path",
+        "how is the callgraph store refreshed after a file change",
+        "where are outline symbols extracted from tree-sitter",
+    ];
+    eprintln!(
+        "profile: threads={threads} {tuning:?} docs={doc_count} bytes={byte_budget} rss_before_load_mb={rss_before_load:.0} rss_loaded_mb={rss_loaded:.0}"
+    );
+    for (index, query) in queries.iter().enumerate() {
+        // A sliding window over the files, so consecutive calls see
+        // different texts and lengths, as consecutive searches do.
+        let docs = (0..doc_count)
+            .map(|offset| {
+                let path = sources[(index * 7 + offset) % sources.len()].clone();
+                let result = CandidateResult::new_exact(
+                    path,
+                    None,
+                    EvidenceDescriptor::for_e1(1, true, false),
+                );
+                let mut text = candidate_text(root, &result, query);
+                let mut cut = byte_budget.min(text.len());
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+                text
+            })
+            .collect::<Vec<_>>();
+        let lengths = scorer.pair_token_lengths(query, &docs).unwrap();
+        let batches = onnx::attention_batches_for_lengths(&lengths, tuning.attention_units);
+        let cpu = process_cpu_seconds();
+        let started = Instant::now();
+        scorer
+            .score_pairs(query, &docs, Instant::now() + Duration::from_secs(120))
+            .unwrap();
+        let wall = started.elapsed().as_secs_f64();
+        let cpu = process_cpu_seconds() - cpu;
+        eprintln!(
+            "call={index:02} tokens_total={} tokens_max={} batches={:?} wall_s={wall:.3} cpu_s={cpu:.3} rss_mb={:.0}",
+            lengths.iter().sum::<usize>(),
+            lengths.iter().max().unwrap(),
+            batches.iter().map(|range| range.len()).collect::<Vec<_>>(),
+            process_rss_mb()
+        );
+    }
+}
 #[test]
 fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
     let (endpoint, server) =

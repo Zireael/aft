@@ -2,6 +2,9 @@
 //!
 //! A reranker scores the prose `query` against a short text built for each of
 //! the first entries of the canonical list and reorders only those entries.
+//! Only queries the live router classifies as prose are reranked (see
+//! [`is_prose_query`]); identifier, path, literal and regex queries keep the
+//! fused order exactly as with reranking off.
 //! Backends implement [`RerankBackend`]; everything that decides *what* is
 //! reranked (how many entries, which tiers, the candidate text, the defaults
 //! and clamps of the `search.rerank` config block) lives in this module so it
@@ -18,6 +21,7 @@
 
 pub(crate) mod fixture;
 pub(crate) mod onnx;
+pub(crate) mod pool_export;
 pub(crate) mod remote;
 pub(crate) mod slot;
 pub(crate) mod synapse;
@@ -55,7 +59,7 @@ pub(crate) const CANDIDATE_TEXT_BUDGET_BYTES: usize = 1_024;
 /// Names the candidate-text construction below. Bump it whenever that
 /// construction changes, so memoized orders and recorded fixture scores made
 /// with the old text are never reused.
-pub(crate) const TEXT_POLICY_REVISION: &str = "path+symbol+lines/v1";
+pub(crate) const TEXT_POLICY_REVISION: &str = "path:line+name+lines/v2";
 /// Lines of context kept above the best matching line of a whole-file result.
 const FILE_CONTEXT_LINES_ABOVE: usize = 2;
 /// Upper bound on committed outcomes kept in memory. Entries are tiny (at most
@@ -214,6 +218,9 @@ pub(crate) struct RerankRequest<'a> {
     pub(crate) project_root: &'a Path,
     /// The prose question. `None` (a pattern-only search) means no rerank.
     pub(crate) prose: Option<&'a str>,
+    /// The query as the caller sent it, before any route rewrote it. Only a
+    /// query this classifies as prose is reranked (see [`is_prose_query`]).
+    pub(crate) public_query: &'a str,
     /// Files the caller asked to prefer. Scope order is kept: a reranked entry
     /// never crosses from outside the scope to inside it or back.
     pub(crate) path_scope: Option<&'a HashSet<PathBuf>>,
@@ -222,12 +229,71 @@ pub(crate) struct RerankRequest<'a> {
 /// What happened to the head of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HeadOutcome {
-    /// Reranking is off, has no prose, or has fewer than two entries to order.
+    /// Reranking is off, the request has no prose, the query is not prose
+    /// (see [`is_prose_query`]), or there are fewer than two entries to order.
     NotApplicable,
     /// The committed permutation was applied (it may be the identity).
     Reordered,
     /// Fused order kept; the reason is shown to the agent.
     Skipped(String),
+}
+
+/// Whether a query has prose for the reranker to judge. Reranking is skipped
+/// entirely when the whole query is an identifier or a literal with no prose.
+///
+/// A cross-encoder judges how well a passage answers a question, and a lone
+/// identifier, path, error code, quoted literal or regex is not one; on the
+/// search-quality benchmark (benchmarks/aft-search) every reranker tried
+/// lifted natural-language and mixed questions while roughly halving the MRR
+/// of identifier-shaped ones. So a
+/// query is skipped when the router reads it as an identifier, a path, a
+/// regex or a whole quoted literal, or when the query-shape classifier finds
+/// no prose words in it (identifier, error code, path or regex). Anything
+/// with prose words is reranked, including prose the router reads as a code
+/// literal or log excerpt (a question with a parenthesised list, or with the
+/// word "error"). Both classifiers read the query the caller sent, not the
+/// lane plan or the text a route ranks, because the code-literal route strips
+/// its quotes and zero-result escalation hands a regex or literal query a
+/// natural-language plan.
+pub(crate) fn is_prose_query(query: &str) -> bool {
+    use super::extensions::RawQuery;
+    use super::plan_table::SearchShape;
+    use crate::query_shape::QueryKind;
+
+    let (shape, _) = crate::search_b2::install_defaults().classify(&RawQuery::new(query));
+    if matches!(
+        shape,
+        SearchShape::Identifier | SearchShape::Path | SearchShape::Regex
+    ) || is_whole_quoted(query)
+    {
+        return false;
+    }
+    matches!(
+        crate::query_shape::classify(query).kind,
+        QueryKind::NaturalLanguage | QueryKind::Mixed
+    )
+}
+
+/// A query that is one quoted literal from end to end, such as `"not found"`.
+fn is_whole_quoted(query: &str) -> bool {
+    let trimmed = query.trim();
+    let mut characters = trimmed.chars();
+    match (characters.next(), characters.next_back()) {
+        (Some(open), Some(close)) => open == close && matches!(open, '"' | '\'' | '`'),
+        _ => false,
+    }
+}
+
+/// The prose a request may be reranked against: present, not blank, and sent
+/// by the caller as a query [`is_prose_query`] accepts. `None` means the
+/// request is not reranked at all, exactly as with reranking off: no backend
+/// call, no committed outcome and no note.
+fn rerank_prose<'a>(request: &RerankRequest<'a>) -> Option<&'a str> {
+    request
+        .prose
+        .map(str::trim)
+        .filter(|prose| !prose.is_empty())
+        .filter(|_| is_prose_query(request.public_query))
 }
 
 /// Rerank the head of the canonical list in `reply`, then re-cut the page
@@ -241,6 +307,27 @@ pub(crate) fn rerank_canonical_head(
     top_k: usize,
     request: RerankRequest<'_>,
 ) -> Result<Option<String>, String> {
+    let export = pool_export::start(
+        &reply.canonical_list,
+        &request,
+        RerankSettings::resolve(request.search).top_n,
+    );
+    let outcome = rerank_head(reply, offset, top_k, &request);
+    if let Some(export) = export {
+        export.finish(&reply.canonical_list, request.project_root, &outcome);
+    }
+    outcome
+}
+
+fn rerank_head(
+    reply: &mut BlockReply,
+    offset: usize,
+    top_k: usize,
+    request: &RerankRequest<'_>,
+) -> Result<Option<String>, String> {
+    if rerank_prose(request).is_none() {
+        return Ok(None);
+    }
     let selected = match &request.backend {
         slot::Installed::Off => return Ok(None),
         slot::Installed::Ready(selected) => Ok(selected.clone()),
@@ -252,7 +339,7 @@ pub(crate) fn rerank_canonical_head(
         }
     };
     let settings = RerankSettings::resolve(request.search);
-    match rerank_block_zero(&mut reply.canonical_list, &selected, &settings, &request)? {
+    match rerank_block_zero(&mut reply.canonical_list, &selected, &settings, request)? {
         HeadOutcome::NotApplicable => Ok(None),
         HeadOutcome::Reordered => {
             reply.page = reply
@@ -276,11 +363,7 @@ pub(crate) fn rerank_block_zero(
     settings: &RerankSettings,
     request: &RerankRequest<'_>,
 ) -> Result<HeadOutcome, String> {
-    let Some(prose) = request
-        .prose
-        .map(str::trim)
-        .filter(|prose| !prose.is_empty())
-    else {
+    let Some(prose) = rerank_prose(request) else {
         return Ok(HeadOutcome::NotApplicable);
     };
     let selected = match selected {
@@ -294,18 +377,22 @@ pub(crate) fn rerank_block_zero(
         return Ok(HeadOutcome::NotApplicable);
     };
     let fingerprint = selected.backend.fingerprint();
-    let depth = settings
-        .top_n
-        .min(selected.backend.max_batch())
-        .min(block.entries.len());
+    // Only non-exact entries are reranked. Exact-tier entries keep the
+    // engine's own order (definitions first) and their positions, so the
+    // reranker can neither reorder them nor move anything across them.
+    let positions = rerank_positions(block, settings.top_n.min(selected.backend.max_batch()));
+    let depth = positions.len();
     if depth < 2 {
         return Ok(HeadOutcome::NotApplicable);
     }
 
-    let prefix = &block.entries[..depth];
-    let segments = prefix
+    let members = positions
         .iter()
-        .map(|entry| segment_of(&entry.result, request.path_scope))
+        .map(|position| &block.entries[*position])
+        .collect::<Vec<_>>();
+    let segments = members
+        .iter()
+        .map(|entry| in_scope(&entry.result, request.path_scope))
         .collect::<Vec<_>>();
     let identity = memo_identity(
         &list.key,
@@ -313,13 +400,13 @@ pub(crate) fn rerank_block_zero(
         request.path_scope,
         &fingerprint,
         depth,
-        prefix.iter().map(|entry| &entry.result),
+        members.iter().map(|entry| &entry.result),
     );
 
     let outcome = match memo().lookup(&identity) {
         Some(committed) => committed,
         None => {
-            let texts = prefix
+            let texts = members
                 .iter()
                 .map(|entry| candidate_text(request.project_root, &entry.result, prose))
                 .collect::<Vec<_>>();
@@ -352,7 +439,7 @@ pub(crate) fn rerank_block_zero(
     match outcome {
         CommittedOutcome::Skipped(reason) => Ok(HeadOutcome::Skipped(reason)),
         CommittedOutcome::Reordered(order) => {
-            apply_permutation(&mut block.entries[..depth], &order);
+            apply_permutation(&mut block.entries, &positions, &order);
             Ok(HeadOutcome::Reordered)
         }
     }
@@ -385,12 +472,25 @@ fn validate_scores(scores: &[f32], expected: usize) -> Result<(), RerankError> {
     Ok(())
 }
 
-/// Entries may only move within a run of equal segments: the exact tier stays
-/// ahead of the non-exact tier, and path-scope preference stays in force.
-fn segment_of(result: &CandidateResult, path_scope: Option<&HashSet<PathBuf>>) -> (bool, bool) {
-    let exact = result.evidence.tier == EvidenceTier::Exact;
-    let in_scope = path_scope.is_some_and(|scope| scope.contains(&result.path));
-    (exact, in_scope)
+/// Positions in `block` of the entries a reranker may reorder: the first
+/// `limit` non-exact entries. The first block holds every candidate found
+/// within the shallowest retrieval depth, whatever page is requested, so this
+/// set is the same for every page of a list.
+pub(crate) fn rerank_positions(block: &super::blocks::FrozenBlock, limit: usize) -> Vec<usize> {
+    block
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.result.evidence.tier != EvidenceTier::Exact)
+        .map(|(position, _)| position)
+        .take(limit)
+        .collect()
+}
+
+/// Entries may only move within a run of equal path-scope membership, so
+/// path-scope preference stays in force.
+fn in_scope(result: &CandidateResult, path_scope: Option<&HashSet<PathBuf>>) -> bool {
+    path_scope.is_some_and(|scope| scope.contains(&result.path))
 }
 
 /// `order[i]` is the prior position of the entry placed at position `i`.
@@ -416,18 +516,24 @@ pub(crate) fn permutation<S: PartialEq>(scores: &[f32], segments: &[S]) -> Vec<u
     order
 }
 
-/// Reorder the prefix `entries` by `order`. The `r3_order_index` values stay
-/// at their positions (only the entries move), so every entry after the prefix
-/// keeps its index.
-fn apply_permutation(entries: &mut [super::blocks::BlockEntry], order: &[usize]) {
-    let indices = entries
+/// Reorder the entries at `positions` by `order` (`order[k]` is the index,
+/// within `positions`, of the entry placed at `positions[k]`). Every other
+/// entry, and every `r3_order_index`, stays where it is: only the reranked
+/// entries move, and only among the positions they already held.
+fn apply_permutation(
+    entries: &mut [super::blocks::BlockEntry],
+    positions: &[usize],
+    order: &[usize],
+) {
+    let original = positions
         .iter()
-        .map(|entry| entry.r3_order_index)
+        .map(|position| entries[*position].clone())
         .collect::<Vec<_>>();
-    let original = entries.to_vec();
-    for (position, prior) in order.iter().enumerate() {
+    for (slot, prior) in order.iter().enumerate() {
+        let position = positions[slot];
+        let index = entries[position].r3_order_index;
         let mut entry = original[*prior].clone();
-        entry.r3_order_index = indices[position];
+        entry.r3_order_index = index;
         entries[position] = entry;
     }
 }
@@ -440,33 +546,55 @@ fn short_reason(reason: &str) -> String {
     }
 }
 
-/// The text a backend scores for one entry: its project-relative path, then
-/// lines from the file. A symbol entry contributes its own lines, starting with
-/// its declaration line. A whole-file entry contributes the lines around its
-/// best match for the prose (the same match the rendered snippet uses), or the
-/// file head when nothing matches. Blank lines are skipped and the whole text
-/// is cut to `CANDIDATE_TEXT_BUDGET_BYTES` at a character boundary. The result
-/// depends only on the project root, the entry, the prose and the file, never
-/// on which page is being served.
+/// The text a backend scores for one entry, in three parts:
+///
+/// 1. `path:line`: the project-relative path and the 1-based line the entry
+///    points at (a symbol's first line; for a whole-file entry, the line that
+///    best matches the prose, the same match the rendered snippet uses, or 1).
+/// 2. A name line: the symbol's declared name for a symbol entry; for a
+///    whole-file entry, the first code identifier of the prose that occurs in
+///    the file, or else the file stem.
+/// 3. The body: a symbol entry's own lines; a whole-file entry's lines from
+///    just above its best match (or the file head).
+///
+/// In an evaluation of gte-reranker-modernbert on aft_search result pools, a
+/// reranker given only the path and the body ranked the declaring file lower
+/// on 4 of 5 identifier queries; the name and line give it what the agent
+/// sees in the result list. Blank lines are
+/// skipped and the body is cut so the whole text fits
+/// `CANDIDATE_TEXT_BUDGET_BYTES` at a character boundary; the first two lines
+/// are always kept whole. The result depends only on the project root, the
+/// entry, the prose and the file, never on which page is being served.
 pub(crate) fn candidate_text(project_root: &Path, result: &CandidateResult, prose: &str) -> String {
-    let mut text = display_path(project_root, &result.path);
     let source = std::fs::read(&result.path)
         .map(|bytes| String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
         .unwrap_or_default();
-    let body: Vec<&str> = match result.symbol_range {
+    let (line, name, body): (usize, String, Vec<&str>) = match result.symbol_range {
         Some(range) => {
             let start = floor_char_boundary(&source, range.start.min(source.len()));
             let end = floor_char_boundary(&source, range.end.min(source.len())).max(start);
-            source[start..end].lines().collect()
+            let lines = source[start..end].lines().collect::<Vec<_>>();
+            let name = declared_name(&lines).unwrap_or_else(|| file_stem(&result.path));
+            (source[..start].matches('\n').count(), name, lines)
         }
         None => {
-            let first = super::matching_line_from_source(&result.path, prose, None)
-                .map_or(0, |(line, _)| {
-                    (line as usize).saturating_sub(FILE_CONTEXT_LINES_ABOVE)
-                });
-            source.lines().skip(first).collect()
+            let matched = super::matching_line_from_source(&result.path, prose, None)
+                .map(|(line, _)| line as usize);
+            let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
+            let name =
+                matched_identifier(prose, &source).unwrap_or_else(|| file_stem(&result.path));
+            (
+                matched.unwrap_or(0),
+                name,
+                source.lines().skip(first).collect(),
+            )
         }
     };
+    let mut text = format!(
+        "{}:{}\n{name}",
+        display_path(project_root, &result.path),
+        line + 1
+    );
     for line in body {
         let line = line.trim_end();
         if line.trim().is_empty() {
@@ -494,6 +622,90 @@ fn display_path(project_root: &Path, path: &Path) -> String {
         })
         .unwrap_or_else(|| path.to_path_buf());
     relative.to_string_lossy().replace('\\', "/")
+}
+
+/// Longest name kept on a candidate's name line.
+const MAX_NAME_BYTES: usize = 120;
+
+fn bounded_name(name: &str) -> String {
+    name[..floor_char_boundary(name, name.len().min(MAX_NAME_BYTES))].to_string()
+}
+
+fn file_stem(path: &Path) -> String {
+    bounded_name(
+        &path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_default(),
+    )
+}
+
+/// The name a symbol's source declares: the identifier after the first
+/// declaration keyword on its first line of code (attributes, decorators and
+/// comments are skipped), or else the first identifier on that line that is
+/// not a modifier or keyword.
+fn declared_name(lines: &[&str]) -> Option<String> {
+    static DECLARATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(?:fn|struct|enum|trait|union|type|mod|const|static|class|interface|function|def|func|let|var|macro_rules!)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
+        )
+        .expect("declaration pattern")
+    });
+    static IDENTIFIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*").expect("identifier pattern")
+    });
+    const NOT_A_NAME: &[&str] = &[
+        "pub",
+        "crate",
+        "async",
+        "unsafe",
+        "extern",
+        "export",
+        "default",
+        "abstract",
+        "public",
+        "private",
+        "protected",
+        "static",
+        "final",
+        "impl",
+        "for",
+        "where",
+        "declare",
+        "readonly",
+    ];
+    let code = lines.iter().map(|line| line.trim()).find(|line| {
+        !line.is_empty()
+            && !["#[", "#!", "@", "//", "/*", "*", "#", "--", "\"\"\""]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+    })?;
+    if let Some(captures) = DECLARATION.captures(code) {
+        return Some(bounded_name(&captures[1]));
+    }
+    IDENTIFIER
+        .find_iter(code)
+        .map(|found| found.as_str())
+        .find(|word| !NOT_A_NAME.contains(word))
+        .map(bounded_name)
+}
+
+/// The first code identifier of the prose (a word with an underscore, `::`,
+/// `$`, or an inner capital) that occurs in `source`.
+fn matched_identifier(prose: &str, source: &str) -> Option<String> {
+    prose
+        .split(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '_' | ':' | '$'))
+        })
+        .map(|word| word.trim_matches(':'))
+        .filter(|word| {
+            word.contains('_')
+                || word.contains("::")
+                || word.contains('$')
+                || word.chars().skip(1).any(char::is_uppercase)
+        })
+        .find(|word| source.contains(word))
+        .map(bounded_name)
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {

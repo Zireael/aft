@@ -151,10 +151,15 @@ def burn_in_queries() -> list[str]:
     They are the rows of `split-tuning-manifest.json`, which exist for tuning
     and never enter a scored suite. Their query vectors are in the vector pack
     the concept and real-query replays serve from, so the fixture embedding
-    server can embed them instead of refusing an unknown text.
+    server can embed them instead of refusing an unknown text. Queries naming
+    a log level come last: AFT's router reads a query with three or more words
+    and a word such as "error" as a log excerpt, which the reranker never
+    scores, so it could not tell whether the backend is installed.
     """
     manifest = json.loads((Path(__file__).resolve().parent / "split-tuning-manifest.json").read_text())
-    return [str(row["query"]) for row in manifest["rows"]]
+    queries = [str(row["query"]) for row in manifest["rows"]]
+    log_words = {"info", "warn", "error", "debug", "trace", "panicked"}
+    return sorted(queries, key=lambda query: bool(log_words & set(query.lower().split())))
 
 
 def warm_up(
@@ -177,10 +182,13 @@ def warm_up(
     so an outcome remembered for one of them affects no row. Returns None when
     no reranker is configured.
 
-    A query that does not reach the reranker (a regex route, fewer than two
-    candidates) also carries no note, so a scored row can still meet a backend
-    that is not ready; the request log records every row's note, which is
-    where that is checked.
+    A query that does not reach the reranker also carries no note: one AFT
+    does not classify as prose, or one with fewer than two results to order
+    (a burn-in query can find almost nothing in a small repository). So a
+    query counts as having reached the reranker only when it returned at least
+    two results; otherwise the next burn-in query is tried. A scored row can
+    still meet a backend that is not ready if no burn-in query qualifies; the
+    request log records every row's note, which is where that is checked.
     """
     if rerank_block() is None:
         return None
@@ -204,14 +212,19 @@ def _warm_up(
     for query in queries:
         while True:
             began = time.monotonic()
-            note = skip_note(search(query))
+            response = search(query)
+            note = skip_note(response)
             elapsed_ms = round((time.monotonic() - began) * 1000.0, 3)
             if note != _NOT_READY:
                 break
             if time.monotonic() > deadline:
                 raise TimeoutError(f"rerank_backend_not_ready_after:{timeout}s")
             time.sleep(0.2)
-        steps.append({"query": query, "note": note, "elapsed_ms": elapsed_ms})
+        results = response.get("results")
+        result_count = len(results) if isinstance(results, list) else 0
+        steps.append({"query": query, "note": note, "elapsed_ms": elapsed_ms, "results": result_count})
+        if note is None and result_count < 2:
+            continue
         if note is None:
             break
         time.sleep(drain_seconds)
