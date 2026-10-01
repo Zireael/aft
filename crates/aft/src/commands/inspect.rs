@@ -1082,19 +1082,22 @@ fn run_blocking_inspect_body(
 
     let mut start_outcomes = ApplicableServerStartOutcomes::default();
     let startup_deadline = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
-    for server in &applicability.server_keys {
-        let phase_entry = InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server);
-        let phase = phase_log.start(phase_entry.clone());
-        let outcome = ctx.lsp_start_applicable_server_until(
-            &applicability,
-            server,
-            &ctx.config(),
-            startup_deadline,
-        );
-        if inspect_cancellation_requested() {
+    let starts = applicability
+        .server_keys
+        .iter()
+        .map(|server| {
+            let phase = phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server));
+            (server, phase)
+        })
+        .collect::<Vec<_>>();
+    let outcomes = start_applicable_servers_concurrently(ctx, &applicability, startup_deadline);
+    if inspect_cancellation_requested() {
+        for (_, phase) in starts {
             phase.fail("inspect request cancelled");
-            return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
         }
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    for ((server, phase), outcome) in starts.into_iter().zip(outcomes) {
         let deadline_exceeded = outcome.deadline_exceeded.is_some();
         finish_start_phases(vec![(server.clone(), phase)], &outcome);
         start_outcomes.successful.extend(outcome.successful);
@@ -1460,6 +1463,65 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
         "lsp_quiescence_timeout"
     } else {
         "inspect_not_fresh"
+    }
+}
+
+/// Start every applicable producer at once, each bounded by the same startup
+/// deadline, and return one outcome per server in `server_keys` order.
+///
+/// Starting them one after another made the startup budget a sum: on a busy
+/// machine a project with a dozen servers spent it on the first few
+/// handshakes, and every later server was reported as "startup wait budget
+/// exhausted" without ever having been tried. Each start already runs its
+/// spawn and `initialize` handshake without the manager lock, so starts of
+/// different servers do not wait on each other.
+fn start_applicable_servers_concurrently(
+    ctx: &AppContext,
+    applicability: &ApplicableServerSnapshot,
+    startup_deadline: Instant,
+) -> Vec<ApplicableServerStartOutcomes> {
+    let config = ctx.config();
+    let start = |server: &crate::lsp::roots::ServerKey| {
+        ctx.lsp_start_applicable_server_until(applicability, server, &config, startup_deadline)
+    };
+    std::thread::scope(|scope| {
+        let handles = applicability
+            .server_keys
+            .iter()
+            .map(|server| {
+                let spawned = std::thread::Builder::new()
+                    .name("aft-inspect-lsp-start".into())
+                    .spawn_scoped(scope, move || start(server));
+                (server, spawned)
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(server, spawned)| match spawned {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| start_panicked_outcome(server, "server start panicked")),
+                // Without a thread the start can still run here; it is only
+                // slower, not wrong.
+                Err(_) => start(server),
+            })
+            .collect()
+    })
+}
+
+fn start_panicked_outcome(
+    server: &crate::lsp::roots::ServerKey,
+    reason: &str,
+) -> ApplicableServerStartOutcomes {
+    ApplicableServerStartOutcomes {
+        failures: vec![ApplicableServerFailure {
+            server_key: server.clone(),
+            result: crate::lsp::manager::ServerAttemptResult::SpawnFailed {
+                binary: String::new(),
+                reason: reason.to_string(),
+            },
+        }],
+        ..ApplicableServerStartOutcomes::default()
     }
 }
 

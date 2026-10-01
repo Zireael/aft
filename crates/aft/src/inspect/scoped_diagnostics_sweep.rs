@@ -27,7 +27,12 @@ use crate::lsp::roots::ServerKey;
 /// makes the server hold and analyze it, so a scope over a whole large tree
 /// is bounded; files past the cap are reported as not examined, with a
 /// count, rather than silently skipped.
-pub(crate) const SCOPED_SWEEP_FILE_CAP: usize = 200;
+pub(crate) const SCOPED_SWEEP_FILE_CAP: usize = 1000;
+
+/// How many files' pull requests are in flight at once. Enough to keep a
+/// server's worker threads busy without queueing the whole scope behind one
+/// slow file.
+const PULL_WINDOW: usize = 16;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -185,23 +190,26 @@ pub(crate) fn sweep_scoped_files(
         }
     }
 
-    // Open (and pull where supported) one file at a time. The manager lock is
-    // taken per step and never held while a server works on a pull, so other
+    // Open the files and start their pulls a window at a time, then collect
+    // the replies. A server answers pulls concurrently, so waiting for one
+    // reply before sending the next request made a scope of a few hundred
+    // files spend the whole budget on round trips. The manager lock is taken
+    // per step and never held while a server works on a pull, so other
     // requests (a concurrent `read`, another tool call) are not held off.
     let mut waiting: Vec<(PathBuf, ServerKey, Option<u64>)> = Vec::new();
     let mut pulled: Vec<(PathBuf, ServerKey, Vec<StoredDiagnostic>)> = Vec::new();
     let mut retry_pulls: Vec<(PathBuf, ServerKey, Option<u64>, String)> = Vec::new();
-    for (file, keys) in &selected {
-        if Instant::now() >= deadline || cancellation_requested() {
-            for key in keys {
-                sweep
-                    .unanswered
-                    .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
+    for window in selected.chunks(PULL_WINDOW) {
+        let mut in_flight = Vec::new();
+        for (file, keys) in window {
+            if Instant::now() >= deadline || cancellation_requested() {
+                for key in keys {
+                    sweep
+                        .unanswered
+                        .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
+                }
+                continue;
             }
-            continue;
-        }
-        let mut to_pull: Vec<(ServerKey, Option<u64>)> = Vec::new();
-        {
             let mut lsp = ctx.lsp();
             let before = keys
                 .iter()
@@ -250,42 +258,53 @@ pub(crate) fn sweep_scoped_files(
                 {
                     continue;
                 }
-                if pulls {
-                    to_pull.push((key, epoch_before));
-                } else {
+                if !pulls {
                     waiting.push((file.clone(), key, epoch_before));
+                    continue;
+                }
+                match lsp.begin_document_pull(&key, file, deadline) {
+                    Ok(pull) => in_flight.push((file.clone(), key, epoch_before, pull)),
+                    Err(err) => {
+                        retry_pulls.push((file.clone(), key, epoch_before, err.to_string()))
+                    }
                 }
             }
         }
-        for (key, epoch_before) in to_pull {
-            match pull_unlocked(ctx, &key, file, deadline) {
-                Ok((PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics)) => {
+        for (file, key, epoch_before, pull) in in_flight {
+            let pull = pull.wait();
+            let outcome = {
+                let mut lsp = ctx.lsp();
+                let outcome = lsp.finish_document_pull(pull);
+                let diagnostics = matches!(
+                    outcome,
+                    PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged
+                )
+                .then(|| lsp.server_file_diagnostics(&key, &file))
+                .flatten();
+                (outcome, diagnostics)
+            };
+            match outcome {
+                (PullFileOutcome::Full { .. } | PullFileOutcome::Unchanged, diagnostics) => {
                     if let Some(diagnostics) = diagnostics {
-                        pulled.push((file.clone(), key, diagnostics));
+                        pulled.push((file, key, diagnostics));
                     }
                 }
                 // The server declined the pull for this file; it pushes
                 // instead, which the wait below collects.
-                Ok((
-                    PullFileOutcome::PullNotSupported | PullFileOutcome::PartialNotSupported,
-                    _,
-                )) => {
-                    waiting.push((file.clone(), key, epoch_before));
+                (PullFileOutcome::PullNotSupported | PullFileOutcome::PartialNotSupported, _) => {
+                    waiting.push((file, key, epoch_before));
                 }
-                Ok((PullFileOutcome::RequestFailed { reason }, _))
+                (PullFileOutcome::RequestFailed { reason }, _)
                     if reason.starts_with("pull_rejected_push_fallback") =>
                 {
-                    waiting.push((file.clone(), key, epoch_before));
+                    waiting.push((file, key, epoch_before));
                 }
                 // Usually a timeout while the server is busy (for example
                 // compiling for `cargo check`). A server that answers pulls
                 // may push nothing for the file, so waiting for a push is not
                 // enough: ask again once the wait below is over.
-                Ok((PullFileOutcome::RequestFailed { reason }, _)) => {
-                    retry_pulls.push((file.clone(), key, epoch_before, reason));
-                }
-                Err(err) => {
-                    retry_pulls.push((file.clone(), key, epoch_before, err.to_string()));
+                (PullFileOutcome::RequestFailed { reason }, _) => {
+                    retry_pulls.push((file, key, epoch_before, reason));
                 }
             }
         }

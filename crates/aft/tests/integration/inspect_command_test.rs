@@ -3628,7 +3628,7 @@ fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
     );
     assert_eq!(
         response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 1, "examined": 1, "authoritative": 1, "not_examined": 0, "file_cap": 200}),
+        json!({"files": 1, "examined": 1, "authoritative": 1, "not_examined": 0, "file_cap": 1000}),
         "response: {response:#}"
     );
     assert!(
@@ -3808,8 +3808,8 @@ fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics()
 #[test]
 fn scoped_blocking_inspect_caps_the_files_it_opens() {
     let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cap");
-    for index in 0..200 {
-        write_file(&root, &format!("src/m{index:03}.rs"), "pub fn g() {}\n");
+    for index in 0..1000 {
+        write_file(&root, &format!("src/m{index:04}.rs"), "pub fn g() {}\n");
     }
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
@@ -3818,7 +3818,7 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
 
     assert_eq!(
         response["summary"]["diagnostics"]["coverage"],
-        json!({"files": 201, "examined": 200, "authoritative": 200, "not_examined": 1, "file_cap": 200}),
+        json!({"files": 1001, "examined": 1000, "authoritative": 1000, "not_examined": 1, "file_cap": 1000}),
         "response: {response:#}"
     );
     let uncovered = uncovered_files(&response);
@@ -3828,11 +3828,11 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
         "response: {response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
-    // The coverage line counts files with authoritative diagnostics: the 200
+    // The coverage line counts files with authoritative diagnostics: the 1000
     // opened and answered, but not the one file past the cap, which is the
     // single uncovered file asserted above.
     assert!(
-        text.contains("authoritative results for 200 of 201 scoped files (1 not examined"),
+        text.contains("authoritative results for 1000 of 1001 scoped files (1 not examined"),
         "{text}"
     );
 }
