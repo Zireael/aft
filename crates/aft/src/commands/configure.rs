@@ -3210,7 +3210,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // served from its child repositories' own indexes and, like HOME, builds
     // none of its own. The index types the user enabled are passed to the
     // parent session, which serves those same types from the children.
-    if !home_match
+    // The decision is a probe bounded by a short wall-clock budget; the full
+    // walk for every child runs on the parent session's worker.
+    let parent_folder = !home_match
         && next_config.views.enabled
         && crate::views::parent::prepare(
             &canonical_cache_root,
@@ -3219,8 +3221,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 semantic: next_config.indexes.semantic,
                 callgraph: next_config.indexes.callgraph,
             },
-        )
-    {
+        );
+    let parent_semantic = next_config.semantic.clone();
+    if parent_folder {
         next_config.indexes.trigram = false;
         next_config.indexes.semantic = false;
         next_config.indexes.callgraph = false;
@@ -3554,9 +3557,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let callgraph_writer_capability =
         root_cache_storage_ok && !is_worktree_bridge && !artifact_owner_read_only && !home_match;
-    let inspect_writer_capability = root_cache_storage_ok && !home_match;
-    let heavy_root_work_allowed =
-        !home_match && !degraded_reasons.iter().any(|reason| reason == "home_root");
+    // A parent folder, like HOME, runs no project-wide work over the folder
+    // itself; its children are served from their own sessions' results.
+    let inspect_writer_capability = root_cache_storage_ok && !home_match && !parent_folder;
+    let heavy_root_work_allowed = !home_match
+        && !parent_folder
+        && !degraded_reasons.iter().any(|reason| reason == "home_root");
 
     // Commit seal: past this point the configure mutates AppContext and must
     // run to completion. The seal races the canceller atomically — exactly one
@@ -3644,6 +3650,10 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // home-root logic independently.
     ctx.set_degraded_reasons(degraded_reasons.clone());
     ctx.set_heavy_root_work_allowed(heavy_root_work_allowed);
+    // Past the commit seal: start (or join) the parent session now, so the
+    // first request after this bind is already answered by it. Starting only
+    // spawns its worker.
+    crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
     let warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
@@ -6889,13 +6899,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
-            let parent_folder = crate::views::parent::activate(
-                ctx,
-                &job.canonical_cache_root,
-                &job.storage_root,
-                &ctx.config().semantic,
-            );
-            if parent_folder {
+            if crate::views::parent::held_by(ctx, &job.canonical_cache_root) {
                 // A parent folder owns no view; its session reads the children's.
                 ctx.clear_view_runtime();
             } else if ctx.config().views.enabled && !job.home_match {

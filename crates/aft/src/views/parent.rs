@@ -128,8 +128,8 @@ pub struct Discovery {
     pub children: Vec<PathBuf>,
     /// Children past the cap, in the same order. They are not served.
     pub skipped: Vec<PathBuf>,
-    /// Files, and directories whose contents discovery did not examine, that
-    /// lie outside every child (at most [`MAX_OUTSIDE_PATHS`]).
+    /// Top-level entries of the parent folder that hold files outside every
+    /// child (at most [`MAX_OUTSIDE_PATHS`]).
     pub outside: Vec<PathBuf>,
 }
 
@@ -232,11 +232,11 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
                     found.repositories.push(path);
                 } else if depth + 1 < MAX_DISCOVERY_DEPTH {
                     subdirectories.push(path);
-                } else if found.outside.len() < MAX_OUTSIDE_PATHS {
-                    found.outside.push(path);
+                } else {
+                    note_outside(&mut found, root, &path);
                 }
-            } else if found.outside.len() < MAX_OUTSIDE_PATHS {
-                found.outside.push(path);
+            } else {
+                note_outside(&mut found, root, &path);
             }
         }
         // Depth-first in reverse so directories are visited in name order.
@@ -245,6 +245,20 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
         }
     }
     found
+}
+
+/// Records the top-level entry of `root` that holds `path`: gaps name
+/// `docs`, not every file under it.
+fn note_outside(found: &mut Walk, root: &Path, path: &Path) {
+    let top = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .map(|first| root.join(first))
+        .unwrap_or_else(|| path.to_path_buf());
+    if found.outside.len() < MAX_OUTSIDE_PATHS && !found.outside.contains(&top) {
+        found.outside.push(top);
+    }
 }
 
 /// Finds the child repositories of `root`, keeping at most `cap`.
@@ -362,7 +376,7 @@ fn context_id(ctx: &crate::context::AppContext) -> usize {
     ctx as *const crate::context::AppContext as usize
 }
 
-/// Configure's maintenance step: starts (or joins) the parent session that
+/// Configure's step after it commits to the bind: starts (or joins) the parent session that
 /// [`prepare`] decided on and records `ctx` as one of its holders. Returns
 /// false when the root was not prepared as a parent folder; `ctx` then stops
 /// holding any session for this root.
@@ -401,6 +415,13 @@ pub fn activate(
         previous.stop();
     }
     true
+}
+
+/// True when `ctx` holds the running parent session for `root`.
+pub fn held_by(ctx: &crate::context::AppContext, root: &Path) -> bool {
+    let id = context_id(ctx);
+    session_for_root(root)
+        .is_some_and(|session| lock(&session.holders).iter().any(|holder| holder.id == id))
 }
 
 /// Called whenever `ctx` binds a root: `ctx` stops holding every parent

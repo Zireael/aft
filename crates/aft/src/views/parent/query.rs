@@ -72,15 +72,11 @@ impl Gaps {
                 ),
             );
         }
-        for outside in discovery
-            .outside
-            .iter()
-            .filter(|path| path.starts_with(scope))
-        {
+        for outside in discovery.outside.iter().filter(|path| in_scope(path)) {
             self.push(
                 "outside_child_repositories",
                 display_relative(&discovery.root, outside),
-                "outside every child repository; a parent folder indexes only its repositories"
+                "holds files outside every child repository; a parent folder searches only its repositories"
                     .into(),
             );
         }

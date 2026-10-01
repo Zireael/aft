@@ -22,6 +22,9 @@ use super::{
 /// and pending paths when no watcher event wakes it.
 const TICK: Duration = Duration::from_millis(250);
 
+/// Threads that load the children's trigram snapshots when a session starts.
+const INITIAL_LOAD_THREADS: usize = 4;
+
 /// Directory names a child's own trigram walk never enters; a new file under
 /// one is not added to the snapshot either.
 const UNINDEXED_DIRECTORY_NAMES: &[&str] = &[
@@ -144,13 +147,23 @@ fn discover(session: &Arc<ParentSession>) -> bool {
 
 fn initial_load(session: &ParentSession) {
     let children = session.children();
-    for child in &children {
-        if session.stopped() {
-            return;
-        }
-        if session.planes.trigram {
-            refresh_trigram(session, child);
-        }
+    if session.planes.trigram && !children.is_empty() {
+        // A few children load at once: reading an artifact and reconciling
+        // it with the child's files is mostly I/O, and a folder of forty
+        // repositories should not wait for them one after another.
+        let per_thread = children.len().div_ceil(INITIAL_LOAD_THREADS);
+        std::thread::scope(|scope| {
+            for chunk in children.chunks(per_thread) {
+                scope.spawn(move || {
+                    for child in chunk {
+                        if session.stopped() {
+                            return;
+                        }
+                        refresh_trigram(session, child);
+                    }
+                });
+            }
+        });
     }
     for child in &children {
         if session.stopped() {
