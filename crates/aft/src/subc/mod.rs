@@ -3384,16 +3384,23 @@ fn run_subc_mode_inner(
 
     let exit_started = Instant::now();
     let actor_contexts = executor.actor_contexts();
-    if matches!(
+    log::info!("subc exit phase=drain_done elapsed_ms=0");
+    // Index persistence and language-server teardown are independent. Starting
+    // both now keeps their separate deadlines from adding to the restart gap.
+    let flush_contexts = actor_contexts.clone();
+    let flush_indexes = matches!(
         loop_result,
         Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
-    ) {
-        flush_actor_indexes_on_graceful_shutdown(&actor_contexts, exit_started);
-    }
-    log::info!(
-        "subc exit phase=index_flush_done elapsed_ms={}",
-        exit_started.elapsed().as_millis()
     );
+    let index_flush = std::thread::spawn(move || {
+        if flush_indexes {
+            flush_actor_indexes_on_graceful_shutdown(&flush_contexts, exit_started);
+        }
+        log::info!(
+            "subc exit phase=index_flush_done elapsed_ms={}",
+            exit_started.elapsed().as_millis()
+        );
+    });
     let mut clients = Vec::new();
     for actor_ctx in &actor_contexts {
         clients.extend(actor_ctx.lsp().take_all_clients());
@@ -3402,11 +3409,24 @@ fn run_subc_mode_inner(
     let registry = actor_contexts
         .first()
         .map(|ctx| ctx.app().lsp_child_registry());
+    log::info!(
+        "subc exit phase=lsp_shutdown servers={} budget_ms={} elapsed_ms={}",
+        clients.len(),
+        crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis(),
+        exit_started.elapsed().as_millis()
+    );
     if let Some(registry) = registry {
         crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
     }
     log::info!(
         "subc exit phase=lsp_done elapsed_ms={}",
+        exit_started.elapsed().as_millis()
+    );
+
+    let _ = index_flush.join();
+    log::info!(
+        "subc exit phase=runtime_shutdown_start budget_ms={} elapsed_ms={}",
+        EXIT_RUNTIME_SHUTDOWN_WAIT.as_millis(),
         exit_started.elapsed().as_millis()
     );
 
@@ -3436,9 +3456,10 @@ fn run_subc_mode_inner(
 const EXIT_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_millis(100);
 
 /// How long the process may take, after the async runtime has stopped, to
-/// flush its durable log, settle native ONNX Runtime work and exit. The drain
-/// exit budget is spent almost entirely on index flushes and LSP shutdown, so
-/// this tail must stay short and must not depend on how busy the machine is.
+/// flush its durable log, close the native ONNX Runtime gate and exit. Index
+/// persistence and LSP teardown precede this tail; together they must fit the
+/// two-second drain-to-exit ceiling (`EXIT_BUDGET_AFTER_DRAIN`). Reserving only
+/// a short tail leaves most of that ceiling for the independent shutdown work.
 pub const EXIT_TAIL_BUDGET: Duration = Duration::from_millis(250);
 
 /// Least time the final durable-log flush gets even when the tail budget is
@@ -3544,17 +3565,23 @@ fn note_fatal_panic_response(response: &Response) -> bool {
 
 /// Flush every root's search index and the queued call-graph refreshes on a
 /// graceful exit. `drained_at` is when the module loop ended; both flushes
-/// finish by [`crate::callgraph_store::exit_index_flush_deadline`] so that
-/// LSP shutdown still fits the exit budget. Returns the logged summary line.
+/// finish by [`crate::callgraph_store::exit_index_flush_deadline`] while LSP
+/// shutdown runs independently. Returns the logged summary line.
 fn flush_actor_indexes_on_graceful_shutdown(
     actor_contexts: &[Arc<AppContext>],
     drained_at: Instant,
 ) -> String {
-    flush_actor_indexes_on_graceful_shutdown_with(
-        actor_contexts,
-        drained_at,
-        crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown,
-    )
+    flush_actor_indexes_on_graceful_shutdown_with(actor_contexts, drained_at, || {
+        // Debug-only delay lets the process regression exercise a busy
+        // persistence worker without relying on cache size or disk speed.
+        #[cfg(debug_assertions)]
+        if let Ok(delay) = std::env::var("AFT_TEST_EXIT_INDEX_DELAY_MS") {
+            if let Ok(ms) = delay.parse::<u64>() {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        crate::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown()
+    })
 }
 
 fn flush_actor_indexes_on_graceful_shutdown_with(
@@ -3562,6 +3589,14 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     drained_at: Instant,
     callgraph_flush: impl FnOnce() -> bool + Send + 'static,
 ) -> String {
+    log::info!(
+        "subc exit phase=index_flush_start roots={} budget_ms={} elapsed_ms={}",
+        actor_contexts.len(),
+        crate::callgraph_store::exit_index_flush_deadline(drained_at)
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+        drained_at.elapsed().as_millis()
+    );
     // Index deltas can be rebuilt after a restart. Give the independent roots
     // one short shared window to persist them, without extending the outage
     // when a rebuild or a cache lock holds one root for several seconds.

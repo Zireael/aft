@@ -736,11 +736,15 @@ fn write_log_line<W: Write + ?Sized>(
 /// Civil-date math uses the days-from-epoch algorithm (Howard Hinnant's
 /// `civil_from_days`); u64 seconds keep it valid far past 2100.
 fn format_utc_timestamp() -> String {
-    let secs = SystemTime::now()
+    let since_epoch = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_epoch_secs(secs)
+        .unwrap_or_default();
+    let seconds = format_epoch_secs(since_epoch.as_secs());
+    format!(
+        "{}.{:03}Z",
+        seconds.trim_end_matches('Z'),
+        since_epoch.subsec_millis()
+    )
 }
 
 fn format_epoch_secs(secs: u64) -> String {

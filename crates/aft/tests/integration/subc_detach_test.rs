@@ -535,7 +535,7 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
 
 #[test]
 fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
-    drain_with_six_live_lsp_servers("", false);
+    drain_with_live_lsp_servers("", false, false);
 }
 
 /// Servers that ignore the Shutdown request and SIGTERM, and linger after
@@ -545,24 +545,30 @@ fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
 /// server may outlive the module.
 #[test]
 fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
-    drain_with_six_live_lsp_servers(
+    drain_with_live_lsp_servers(
         "AFT_FAKE_LSP_IGNORE_SIGTERM=1 AFT_FAKE_LSP_EXIT_DELAY_MS=30000",
         true,
+        false,
     );
 }
 
-/// Binds six roots that each start a fake rust-analyzer which never answers
+#[test]
+fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
+    drain_with_live_lsp_servers("", false, true);
+}
+
+/// Binds 34 roots that each start a fake rust-analyzer which never answers
 /// Shutdown, drains the module and checks that it exits within the drain
 /// budget with no language server left behind. `server_env` holds extra
 /// `NAME=value` assignments for the fake servers; `under_load` keeps every
 /// CPU busy from the drain until the module has exited.
-fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
+fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime");
     runtime.block_on(async {
-        let projects = (0..6)
+        let projects = (0..34)
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
         let storage = tempfile::tempdir().unwrap();
@@ -606,12 +612,14 @@ fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
         .unwrap();
         let listener = write_connection_file(conn_dir.path()).await;
         let conn_path = conn_dir.path().join("subc-connection.json");
-        let mut module = ModuleProcess::spawn_with_stderr_and_path(
+        let mut module = ModuleProcess::spawn_with_exit_hooks(
             &conn_path,
             config_home.path(),
             data_home.path(),
             Some(&stderr_path),
             Some(bin_dir.path()),
+            active_ort,
+            true,
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -649,7 +657,7 @@ fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        assert_eq!(children.len(), 6, "six roots must each own a live server");
+        assert_eq!(children.len(), 34, "34 roots must each own a live server");
         let hog = under_load.then(super::helpers::CpuHog::start);
         send_module_draining(&mut stream).await;
         let drained = Instant::now();
@@ -676,6 +684,17 @@ fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
             "exit took {elapsed:?}; {}",
             log_tail(&log)
         );
+        let durable_path = data_home.path().join("aft").join("logs").join(format!("aft-{}.log", module.child.id()));
+        let durable = std::fs::read_to_string(&durable_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", durable_path.display()));
+        let mode = if active_ort { "skip_native_teardown" } else { "return" };
+        assert!(
+            durable.contains(&format!("subc exit phase=process_exit mode={mode}")),
+            "missing durable terminal marker; {}", log_tail(&durable)
+        );
+        if active_ort {
+            assert!(durable.contains("phase=ort_quiesce active=1 budget_ms=0"), "{}", log_tail(&durable));
+        }
         // Draining roots may already have stopped some servers before the final
         // sweep, so the summary's split depends on timing. What must hold is one
         // summary, a bounded exit and no orphans.
@@ -694,6 +713,15 @@ fn drain_with_six_live_lsp_servers(server_env: &str, under_load: bool) {
             .next()
             .and_then(|value| value.trim().parse::<u128>().ok())
             .expect("shutdown summary reports elapsed_ms");
+        if !under_load {
+            // The deliberate CPU hog can delay loop teardown and the observer;
+            // the quiet variants isolate overlap, while both retain the 2 s cap.
+            assert!(
+                elapsed.as_millis() < lsp_elapsed_ms.max(500) + 300,
+                "index and LSP waits added instead of overlapping: exit={} ms, lsp={lsp_elapsed_ms} ms; {}",
+                elapsed.as_millis(), log_tail(&log)
+            );
+        }
         let lsp_ceiling = aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150);
         assert!(
             lsp_elapsed_ms <= lsp_ceiling.as_millis(),
@@ -788,6 +816,26 @@ impl ModuleProcess {
         stderr_path: Option<&Path>,
         bin_dir: Option<&Path>,
     ) -> Self {
+        Self::spawn_with_exit_hooks(
+            conn_path,
+            config_home,
+            data_home,
+            stderr_path,
+            bin_dir,
+            false,
+            false,
+        )
+    }
+
+    fn spawn_with_exit_hooks(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        stderr_path: Option<&Path>,
+        bin_dir: Option<&Path>,
+        active_ort: bool,
+        busy_index: bool,
+    ) -> Self {
         use std::os::unix::process::CommandExt;
 
         let stderr = match stderr_path {
@@ -811,6 +859,14 @@ impl ModuleProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr);
+        if active_ort {
+            command.env("AFT_TEST_HOLD_ORT_SECTION", "1");
+        }
+        if busy_index {
+            command.env("AFT_CACHE_DIR", data_home);
+            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
+            command.env("AFT_TEST_LOG_WRITER_DELAY_MS", "40");
+        }
         if let Some(bin_dir) = bin_dir {
             command.env(
                 "PATH",

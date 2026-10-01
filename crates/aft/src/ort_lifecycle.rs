@@ -107,6 +107,17 @@ pub fn close_and_wait(timeout: Duration) -> bool {
     GATE.close_and_wait(timeout)
 }
 
+/// Number of in-flight ORT work sections that make native teardown unsafe.
+pub fn active_sections() -> usize {
+    GATE.lock().active
+}
+
+/// End a drained daemon module without running native static destructors.
+/// The caller must flush its final log line before calling this function.
+pub fn exit_without_native_teardown(code: i32) -> ! {
+    immediate_exit(code)
+}
+
 /// How long exit waits for in-flight ORT work. Environment creation and a
 /// MiniLM session load take well under a second; a single inference batch is
 /// bounded by the embedder's per-inference budget.
@@ -164,7 +175,23 @@ fn immediate_exit(code: i32) -> ! {
     unsafe { libc::_exit(code) }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn immediate_exit(code: i32) -> ! {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn TerminateProcess(process: *mut std::ffi::c_void, code: u32) -> i32;
+    }
+    // SAFETY: the current-process handle is always valid. TerminateProcess
+    // bypasses both CRT atexit and DLL detach callbacks, which could otherwise
+    // destroy ORT's native statics while another thread is using them.
+    unsafe { TerminateProcess(GetCurrentProcess(), code as u32) };
+    // Successful self-termination does not return; abort without cleanup if
+    // the operating system unexpectedly refuses it.
+    std::process::abort()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn immediate_exit(code: i32) -> ! {
     std::process::exit(code)
 }

@@ -278,25 +278,58 @@ fn main() {
         // there is no plugin to relay on-disk config, so this is how a gateway
         // user's aft.jsonc reaches AFT.
         let user_config_path = aft::subc_config::cortexkit_user_config_path();
+        // AFT_TEST_HOLD_ORT_SECTION holds an ORT section open during shutdown,
+        // without loading ORT or relying on inference speed. Release builds
+        // ignore the environment variable.
+        #[cfg(debug_assertions)]
+        let _held_ort =
+            std::env::var_os("AFT_TEST_HOLD_ORT_SECTION").and_then(|_| aft::ort_lifecycle::enter());
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => {
                 aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
-                // Everything left of the exit shares one short tail budget
-                // (see `aft::subc::EXIT_TAIL_BUDGET`): the daemon's restart
-                // clock started at the drain, and the index flushes and LSP
-                // shutdown already used most of it. An ONNX Runtime section
-                // still running when the budget is spent makes the process
-                // end without native teardown instead of waiting for it.
-                aft::ort_lifecycle::quiesce_before_return_within(
-                    0,
-                    aft::subc::exit_tail_remaining(),
-                );
+                // ORT work persists nothing needed by the next module. Close the
+                // ORT work gate without waiting and skip native teardown if work
+                // is active: waiting would only spend the restart budget.
                 aft::slog_info!(
-                    "subc exit phase=process_exit elapsed_ms={}",
+                    "subc exit phase=ort_quiesce active={} budget_ms=0 elapsed_ms={}",
+                    aft::ort_lifecycle::active_sections(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let native_idle = aft::ort_lifecycle::close_and_wait(Duration::ZERO);
+                aft::slog_info!(
+                    "subc exit phase=ort_done native_idle={} elapsed_ms={}",
+                    native_idle,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flush_wait = aft::subc::exit_log_flush_wait();
+                aft::slog_info!(
+                    "subc exit phase=log_flush budget_ms={} elapsed_ms={}",
+                    flush_wait.as_millis(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flushed = aft::logging::flush_durable_log(flush_wait);
+                aft::slog_info!(
+                    "subc exit phase=log_flush_done flushed={} elapsed_ms={}",
+                    flushed,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                // The flush above measures persistence of the shutdown phases.
+                // This final process_exit line needs its own flush because the
+                // file writer runs on a thread that process termination stops.
+                aft::slog_info!(
+                    "subc exit phase=process_exit mode={} elapsed_ms={}",
+                    if native_idle {
+                        "return"
+                    } else {
+                        "skip_native_teardown"
+                    },
                     aft::subc::exit_elapsed().as_millis()
                 );
                 aft::logging::flush_durable_log(aft::subc::exit_log_flush_wait());
+                if !native_idle {
+                    aft::ort_lifecycle::exit_without_native_teardown(0);
+                }
                 return;
             }
             // A lost connection is a restart request, not a failure to attach:
