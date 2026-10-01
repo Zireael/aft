@@ -283,7 +283,8 @@ fn views_profile_navigation_reads_on_drill_artifacts() {
 #[test]
 fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
     let (_project, _storage, job, mut request) = view_projection_fixture();
-    // The current generation was published while the call graph was off.
+    // Publish the current generation without call graph data, as a session
+    // with the call graph off does.
     request.callgraph = false;
     crate::views::assembly::publish_checkout(&request).unwrap();
     // Both with and without paths to verify against the generation: the
@@ -302,7 +303,7 @@ fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
         crate::views::read::CALLGRAPH_DISABLED
     );
     assert_eq!(aggregate["notes"][1], "callgraph_disabled");
-    // With the index off, the same named reason, from the configuration.
+    // With the index itself off, the reason names that configuration setting.
     let mut off = job.clone();
     Arc::make_mut(&mut off.config).indexes.callgraph = false;
     let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&off);

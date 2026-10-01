@@ -1400,8 +1400,9 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         .to_string(),
     );
     assert_eq!(configured["success"], true, "{configured:#}");
-    // Let the deferred configure maintenance reach its view stage, which
-    // pins the current (keyless) generation; one unit runs per request.
+    // Configure finishes its view setup in background steps, one after each
+    // request; send a few requests so it loads the current generation (the
+    // one without call graph data) and starts republishing with the graph.
     for _ in 0..40 {
         aft.send(&json!({"id": "ping", "command": "ping"}).to_string());
         thread::sleep(Duration::from_millis(20));
@@ -1436,7 +1437,7 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
     // Zoom's own call lists come from the file's syntax tree; its call graph
     // field must say the index is not serving, not present an empty graph.
     assert_eq!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
-    // The republish started at bind builds the graph; then callers answers.
+    // Once the republish with call graph data lands, callers answers.
     let deadline = Instant::now() + DEADLINE;
     loop {
         let answer = aft.send(&callers);
