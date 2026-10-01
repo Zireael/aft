@@ -163,8 +163,8 @@ impl ExactLane {
         )
     }
 
-    /// [`Self::execute_ready_mode`] reading only the files that can hold the
-    /// evidence `scope` keeps.
+    /// [`Self::execute_ready_mode`] that reads only the files able to hold the
+    /// evidence kinds `scope` keeps.
     pub fn execute_ready_mode_scoped(
         &self,
         snapshot: &SearchIndexSnapshot,
@@ -1062,7 +1062,8 @@ pub(crate) mod tests {
         );
 
         // What a caller keeps: the evidence kinds it uses, plus declarations
-        // in the one file whose declaration mentions the identifier token.
+        // in `definition_path`, the corpus file whose declaration mentions
+        // `retry_upload`.
         let keep = |results: &[CandidateResult],
                     kinds: &[EvidenceKind],
                     definition_path: Option<&str>| {

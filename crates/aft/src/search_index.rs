@@ -48,16 +48,18 @@ pub struct ExactPassMatch {
 /// compiled at two paths, and both must name the same type.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ExactEvidenceScope {
-    /// Declarations named after a query word, verbatim phrase (E1) and
-    /// all-words window (E2) evidence.
+    /// Declarations named after a query word, verbatim phrase evidence (E1)
+    /// and all-words window evidence (E2).
     #[default]
     All,
     /// Phrase and window evidence; the caller drops declaration evidence.
     PhraseAndWindow,
     /// Phrase evidence only; the caller drops window and declaration evidence.
     Phrase,
-    /// Phrase and window evidence, and declaration evidence only where the
-    /// declaration's text contains one of these identifier-shaped tokens.
+    /// Phrase and window evidence, plus declaration evidence only where the
+    /// declaration's text contains one of these words, which the caller takes
+    /// from the identifier-shaped words of the query (`snake_case`,
+    /// `camelCase`, `a::b`).
     DefinitionsMentioning(Vec<String>),
 }
 
@@ -981,10 +983,9 @@ impl SearchIndexSnapshot {
         )
     }
 
-    /// [`Self::whole_corpus_exact_pass`] that reads only the files able to hold
-    /// the evidence `scope` keeps. The candidate set is the unscoped one with
-    /// those files removed, and every remaining file is verified as before, so
-    /// the kept evidence is identical to the unscoped pass.
+    /// [`Self::whole_corpus_exact_pass`] that skips the files unable to hold
+    /// any evidence `scope` keeps. Every remaining file is verified as before,
+    /// so the kept evidence is identical to the unscoped pass.
     pub fn whole_corpus_exact_pass_scoped(
         &self,
         query: &str,
@@ -1119,11 +1120,10 @@ impl SearchIndexSnapshot {
     /// Each kind of evidence needs certain words in the file, compared ASCII
     /// case-insensitively like the trigram index: a verbatim phrase needs every
     /// word of the phrase, a window needs every query word, and a declaration
-    /// needs the query word it is named after plus, when the scope asks for it,
-    /// one of the identifier tokens its text must contain. Phrase words are
-    /// taken one by one because the phrase is compared after collapsing
-    /// whitespace, so a hit may span a line break that the phrase's own
-    /// trigrams would not match.
+    /// needs the query word it is named after plus, when the scope lists
+    /// identifier words, one of those words. Phrase words are checked one by
+    /// one because the phrase is compared after collapsing whitespace, so a
+    /// hit may span a line break that the phrase's own trigrams would miss.
     fn exact_evidence_bound(
         &self,
         scope: &ExactEvidenceScope,
