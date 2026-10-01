@@ -3821,6 +3821,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         project_root_changed || watcher_topology_changed || !ctx.watcher_runtime_active();
     let sync_bash_compress_flag = !equivalent_warm_config
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
+    // Bash can finish before deferred maintenance reaches ProcessFlags. Publish
+    // the cheap mirror before acknowledging configure, so completion rendering
+    // cannot cache raw output while requests already see compression enabled.
+    if sync_bash_compress_flag {
+        ctx.sync_bash_compress_flag();
+    }
     let clear_failed_spawns =
         should_clear_failed_spawns(&previous_config, &next_config, equivalent_warm_config);
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
@@ -13793,6 +13799,33 @@ mod tests {
         std::fs::write(root.join("packages/pkg-a/package.json"), contents).unwrap();
     }
 
+    #[test]
+    fn configure_publishes_bash_compression_before_deferred_maintenance() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        assert!(!ctx.bash_compress_flag().load(Ordering::Relaxed));
+        let request = configure_request_with_params(json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "experimental": { "bash": { "compress": true } }
+            }))]
+        }));
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert!(
+            ctx.bash_compress_flag().load(Ordering::Relaxed),
+            "configure must publish compression before maintenance can run"
+        );
+    }
+
     fn callgraph_only_configure_request(
         root: &std::path::Path,
         storage: &std::path::Path,
@@ -13866,7 +13899,30 @@ mod tests {
             root.path(),
             r#"{"name":"@ws/pkg-a","exports":{".":"./a.ts"}}"#,
         );
+        std::fs::write(
+            root.path().join("packages/pkg-a/a.ts"),
+            "export function leaf() { oldLeaf(); }\nfunction oldLeaf() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("packages/pkg-a/b.ts"),
+            "export function leaf() { newLeaf(); }\nfunction newLeaf() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("entry.ts"),
+            "import { leaf } from '@ws/pkg-a';\nexport function entry() { leaf(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let worker = crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(
+            canonical_root.clone(),
+        );
         crate::callgraph_store::set_callgraph_refresh_worker_test_seam(
             canonical_root.clone(),
             Duration::ZERO,
@@ -13903,8 +13959,8 @@ mod tests {
             None,
             "an exports change must refresh importers, not force a rebuild"
         );
-        held.recv_timeout(Duration::from_secs(10))
-            .expect("the changed manifest never reached the callgraph refresh");
+        held.recv_timeout(Duration::from_secs(60))
+            .expect("the fixture refresh worker hung before taking the changed manifest");
         let manifest = canonical_root.join("packages/pkg-a/package.json");
         assert!(
             crate::callgraph_store::callgraph_refresh_worker_test_paths(&canonical_root)
@@ -13918,20 +13974,31 @@ mod tests {
             "a query during the refresh must not be answered from the pre-refresh store"
         );
         release.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while ctx.callgraph_catch_up_outstanding() {
-            assert!(
-                Instant::now() < deadline,
-                "the settled refresh must release queries"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            worker.wait(Duration::from_secs(60)),
+            "the fixture refresh worker hung"
+        );
+        assert!(
+            !ctx.callgraph_catch_up_outstanding(),
+            "the settled refresh must release queries"
+        );
         assert!(
             matches!(
                 ctx.callgraph_store_for_ops(),
                 crate::context::CallgraphStoreAccess::Ready(_)
             ),
             "once the refresh settles the store answers again"
+        );
+        let crate::context::CallgraphStoreAccess::Ready(store) = ctx.callgraph_store_for_ops()
+        else {
+            panic!("settled store must be ready");
+        };
+        let tree = store
+            .call_tree(std::path::Path::new("entry.ts"), "entry", 2)
+            .unwrap();
+        assert_eq!(
+            tree.children[0].children[0].name, "newLeaf",
+            "manifest refresh must re-resolve the importer to b.ts"
         );
         crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&canonical_root);
     }

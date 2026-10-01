@@ -3349,7 +3349,7 @@ mod watcher_filter_tests {
         RenameMode,
     };
     use notify::EventKind;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Wait budget for an async dispatch (semantic-refresh request / status
@@ -3583,17 +3583,10 @@ mod watcher_filter_tests {
 
     #[test]
     fn watcher_drain_refreshes_open_callgraph_store() {
-        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                30
-            )),
-            "a prior callgraph refresh worker should fully stop before this test"
-        );
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
+        let worker =
+            aft::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.to_path_buf());
         let source = root.join("main.ts");
         std::fs::write(
             &source,
@@ -3641,18 +3634,41 @@ mod watcher_filter_tests {
             "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
         )
         .unwrap();
-        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
-            root.to_path_buf(),
-            Duration::from_millis(350),
-            false,
-        );
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.to_path_buf());
         tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
-        let drain_started = Instant::now();
-        drain_watcher_events(&ctx);
-        assert!(
-            drain_started.elapsed() < Duration::from_millis(250),
-            "watcher drain waited for the callgraph store write"
-        );
+        // If drain starts waiting for the write, this thread cannot release it.
+        // The supervisor's hang cap catches that deadlock without measuring CPU speed.
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let ctx_ref = &ctx;
+            scope.spawn(move || {
+                drain_watcher_events(ctx_ref);
+                done_tx.send(()).unwrap();
+            });
+            let drained = done_rx.recv_timeout(Duration::from_secs(60));
+            if drained.is_err() {
+                drop(release);
+                panic!("watcher drain waited for the callgraph store write");
+            }
+            held.recv_timeout(Duration::from_secs(60))
+                .expect("fixture worker never took the refresh");
+            let store = ctx
+                .callgraph_store()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            assert_eq!(
+                tree.children[0].name, "oldLeaf",
+                "the held worker must not publish early"
+            );
+            release.send(()).unwrap();
+        });
 
         let store = {
             let guard = ctx
@@ -3664,26 +3680,17 @@ mod watcher_filter_tests {
                 .map(std::sync::Arc::clone)
                 .expect("store remains open")
         };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let tree = store
-                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
-                .unwrap();
-            if tree.children[0].name == "newLeaf" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "async callgraph refresh did not publish the changed edge"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                1
-            ))
+            worker.wait(Duration::from_secs(60)),
+            "fixture refresh worker hung"
         );
-        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(root);
+        let tree = store
+            .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+            .unwrap();
+        assert_eq!(
+            tree.children[0].name, "newLeaf",
+            "async callgraph refresh did not publish the changed edge"
+        );
     }
 
     #[test]

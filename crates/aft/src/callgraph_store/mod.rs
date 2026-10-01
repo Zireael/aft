@@ -1989,6 +1989,57 @@ impl RefreshWorker {
 
 static CALLGRAPH_REFRESH_WORKER: OnceLock<Mutex<Option<Arc<RefreshWorker>>>> = OnceLock::new();
 
+static ISOLATED_REFRESH_TEST_WORKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<RefreshWorker>>>> =
+    OnceLock::new();
+
+/// A fixture-owned worker avoids waiting behind other roots' held test gates.
+#[doc(hidden)]
+pub struct CallgraphRefreshTestWorker {
+    root: PathBuf,
+    worker: Arc<RefreshWorker>,
+}
+
+impl CallgraphRefreshTestWorker {
+    /// Wait on the worker's idle notification, not on a polling cadence.
+    pub fn wait(&self, hang_cap: Duration) -> bool {
+        let queue = self.worker.shared.queue.lock().unwrap();
+        let (queue, _) = self
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, hang_cap, |queue| {
+                queue.active.is_some() || !queue.order.is_empty()
+            })
+            .unwrap();
+        queue.active.is_none() && queue.order.is_empty()
+    }
+}
+
+impl Drop for CallgraphRefreshTestWorker {
+    fn drop(&mut self) {
+        ISOLATED_REFRESH_TEST_WORKERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.root);
+        let _ = self.worker.shutdown_with_budget(Duration::from_secs(60));
+        clear_callgraph_refresh_worker_test_seam(&self.root);
+    }
+}
+
+#[doc(hidden)]
+pub fn isolated_callgraph_refresh_worker_for_test(root: PathBuf) -> CallgraphRefreshTestWorker {
+    let worker = RefreshWorker::spawn();
+    assert!(ISOLATED_REFRESH_TEST_WORKERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(root.clone(), Arc::clone(&worker))
+        .is_none());
+    CallgraphRefreshTestWorker { root, worker }
+}
+
 pub fn enqueue_callgraph_store_refresh(
     callgraph_dir: PathBuf,
     project_root: PathBuf,
@@ -2057,13 +2108,16 @@ fn enqueue_callgraph_store_refresh_inner(
     if paths.is_empty() {
         return true;
     }
-    let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
-    let worker = {
+    let isolated = ISOLATED_REFRESH_TEST_WORKERS
+        .get()
+        .and_then(|workers| workers.lock().unwrap().get(&project_root).cloned());
+    let worker = isolated.unwrap_or_else(|| {
+        let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
         let mut worker = slot
             .lock()
             .expect("callgraph refresh worker mutex poisoned");
         Arc::clone(worker.get_or_insert_with(RefreshWorker::spawn))
-    };
+    });
     worker.enqueue(
         RefreshRoot {
             callgraph_dir,
@@ -2261,6 +2315,9 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
         };
 
         let store = process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes);
+        let root = batch.root.clone();
+        // Release catch-up tickets before publishing idle to event waiters.
+        drop(batch);
 
         let mut queue = shared
             .queue
@@ -2272,14 +2329,12 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
         drop(queue);
 
         if became_idle {
-            let checkpoint_due = idle_checkpoint_due(
-                last_idle_checkpoints.get(&batch.root).copied(),
-                Instant::now(),
-            );
+            let checkpoint_due =
+                idle_checkpoint_due(last_idle_checkpoints.get(&root).copied(), Instant::now());
             if checkpoint_due {
                 if let Some(store) = store {
                     if store.checkpoint_wal_truncate() {
-                        last_idle_checkpoints.insert(batch.root.clone(), Instant::now());
+                        last_idle_checkpoints.insert(root.clone(), Instant::now());
                     }
                 }
             }
@@ -2348,7 +2403,8 @@ fn process_callgraph_refresh_batch(
         // The gate is deliberately after open_ready so tests can hold a failed
         // open between its result and the defer that parks the batch.
         let _ = gate.held_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+        // Dropping the fixture's release sender also unblocks a panicking test.
+        let _ = gate.release_rx.recv();
     }
     let store = match opened {
         Ok(Some(store)) => store,
