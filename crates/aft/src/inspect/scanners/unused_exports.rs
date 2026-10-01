@@ -1768,7 +1768,7 @@ export function bannerUnused() {}
         let (_temp_dir, root, paths) = fixture_project(&[
             (
                 "src/config.ts",
-                "export const LOCAL_DEFAULT = 1;\nexport function readConfig() { return LOCAL_DEFAULT; }\n",
+                "export const LOCAL_DEFAULT = 1;\nexport interface ConfigShape { value: number }\nexport function readConfig(): ConfigShape { return { value: LOCAL_DEFAULT }; }\n",
             ),
             (
                 "src/main.ts",
@@ -1803,6 +1803,10 @@ export function bannerUnused() {}
         assert!(
             aggregate_item(&aggregate, "src/config.ts", "readConfig").is_none(),
             "an imported export is used: {aggregate:#}"
+        );
+        assert!(
+            aggregate_item(&aggregate, "src/config.ts", "ConfigShape").is_none(),
+            "a type named by an exported signature must stay exported: {aggregate:#}"
         );
     }
 

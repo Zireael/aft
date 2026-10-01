@@ -178,7 +178,8 @@ pub struct OxcExportVerdict {
     /// The export is `Used` only because its own file references it; no
     /// other module imports or re-exports it. Dead-code analysis treats it as
     /// live, while unused-export analysis reports it: the `export` keyword can
-    /// be dropped.
+    /// be dropped. Never set for type-only exports (`type`, `interface`),
+    /// which an exported signature in the same file may need.
     #[serde(default, skip_serializing_if = "is_false")]
     pub only_same_file_references: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

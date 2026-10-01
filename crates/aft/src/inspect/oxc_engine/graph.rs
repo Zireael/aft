@@ -1035,8 +1035,13 @@ impl<'a> GraphBuilder<'a> {
                     .filter(|export| seen.insert(export.fact.name.as_symbol()))
                     .map(|export| {
                         let (verdict, reason) = export.status.verdict();
-                        let only_same_file_references =
-                            verdict == LivenessVerdict::Used && !export.used_through_export;
+                        // Type-only exports are left out: a type used in its own
+                        // file usually appears in an exported signature, where
+                        // it must stay exported for callers to name it (unused-
+                        // export checkers such as fallow keep those too).
+                        let only_same_file_references = verdict == LivenessVerdict::Used
+                            && !export.used_through_export
+                            && !matches!(export.fact.kind.as_str(), "type" | "interface");
                         OxcExportVerdict {
                             symbol: export.fact.name.as_symbol(),
                             kind: export.fact.kind,
