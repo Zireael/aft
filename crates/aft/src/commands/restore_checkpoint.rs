@@ -9,7 +9,11 @@ use std::path::PathBuf;
 /// Handle the `restore_checkpoint` command: restore files from a named checkpoint.
 ///
 /// Params: `name` (string, required), plus optional `file`/`files` restore scope.
-/// Returns: `{ name, file_count, paths, created_at, storage_path, durability }` on success.
+/// Returns: `{ name, file_count, changed_count, paths, unchanged, created_at,
+/// storage_path, durability }` on success. `paths` lists every file written;
+/// `unchanged` lists those that already matched the checkpoint, and
+/// `changed_count` counts the rest. A restore is all or nothing: if any file
+/// cannot be written, the others are rolled back and the command fails naming it.
 /// If the requested checkpoint is missing, mention possible loss during a restart
 /// only when loading persisted checkpoints found none for this session.
 pub fn handle_restore_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -75,12 +79,19 @@ fn handle_restore_checkpoint_impl(
                 .as_deref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
+            let unchanged = info
+                .unchanged
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
             Ok(Response::success(
                 &req.id,
                 serde_json::json!({
                     "name": info.name,
                     "file_count": restore_paths.len(),
+                    "changed_count": restore_paths.len().saturating_sub(unchanged.len()),
                     "paths": restored_path_strings,
+                    "unchanged": unchanged,
                     "created_at": info.created_at,
                     "storage_path": storage_path,
                     "durability": checkpoint_durability(std::path::Path::new(&storage_path)),

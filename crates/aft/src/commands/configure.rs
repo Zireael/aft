@@ -3635,6 +3635,22 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
+    // Named checkpoints need the same treatment. Before configure, the
+    // checkpoint store writes under `<storage>/unbound/checkpoints`; the
+    // harness namespace is `<storage>/<harness>/checkpoints`. A subc route
+    // accepts tool calls as soon as this reply is sent, before the deferred
+    // maintenance job runs, so a checkpoint could land in the unbound
+    // directory. When that job later switched directories, an older
+    // checkpoint of the same name in the harness directory (written by
+    // another project root using the same storage directory and session)
+    // shadowed it, and restore wrote that older snapshot. Selecting the
+    // directory here only does disk I/O on the first switch away from the
+    // unbound one, to move checkpoints made before configure.
+    if let Some(storage_dir) = next_config.storage_dir.clone() {
+        ctx.checkpoint()
+            .lock()
+            .set_storage_dir_for_harness(storage_dir, harness.clone());
+    }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     crate::root_cache::configure_artifact_access(
         &canonical_cache_root,
@@ -7837,6 +7853,108 @@ mod tests {
                 .unwrap()
                 .get("views")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoint_before_deferred_maintenance_lands_in_the_harness_namespace() {
+        // A subc route accepts tool calls once configure has replied, which can
+        // be before the deferred maintenance job runs. A checkpoint created in
+        // that window must already be written under
+        // `<storage>/opencode/checkpoints`: if it went to
+        // `<storage>/unbound/checkpoints`, the later switch hid it behind an
+        // older checkpoint of the same name, and restore wrote that older one.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let target = project.path().join("target.txt");
+        std::fs::write(&target, "v1\n").unwrap();
+        let stale_target = elsewhere.path().join("stale.txt");
+        std::fs::write(&stale_target, "stale\n").unwrap();
+
+        // A different project directory that uses the same storage directory,
+        // harness and session already saved `safe-point` (covering
+        // stale.txt, outside this project).
+        let mut other_root_store =
+            crate::checkpoint::CheckpointStore::unbound_in_for_test(storage.path());
+        other_root_store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+        );
+        other_root_store
+            .create(
+                crate::protocol::DEFAULT_SESSION_ID,
+                "safe-point",
+                vec![stale_target.clone()],
+                &crate::backup::BackupStore::new(),
+            )
+            .expect("seed the other root's checkpoint");
+        drop(other_root_store);
+        // Restoring the other root's checkpoint would write "stale" back here.
+        std::fs::write(&stale_target, "moved on\n").unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        *ctx.checkpoint().lock() =
+            crate::checkpoint::CheckpointStore::unbound_in_for_test(storage.path());
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": project.path(),
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+        assert!(ctx.configure_tail_has_work());
+
+        let request = |command: &str, params: serde_json::Value| RawRequest {
+            id: command.to_string(),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params,
+        };
+        let created = crate::commands::checkpoint::handle_checkpoint(
+            &request(
+                "checkpoint",
+                json!({ "name": "safe-point", "files": [&target] }),
+            ),
+            &ctx,
+        );
+        assert!(created.success, "{}", created.data);
+        assert_eq!(created.data["file_count"], 1, "{}", created.data);
+        let storage_path = created.data["storage_path"].as_str().unwrap_or_default();
+        assert!(
+            Path::new(storage_path).starts_with(storage.path().join("opencode")),
+            "checkpoint created before deferred maintenance must use the harness namespace, got {storage_path}"
+        );
+
+        std::fs::write(&target, "v2\n").unwrap();
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let restored = crate::commands::restore_checkpoint::handle_restore_checkpoint(
+            &request("restore_checkpoint", json!({ "name": "safe-point" })),
+            &ctx,
+        );
+        assert!(restored.success, "{}", restored.data);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1\n");
+        assert_eq!(
+            std::fs::read_to_string(&stale_target).unwrap(),
+            "moved on\n"
         );
     }
 

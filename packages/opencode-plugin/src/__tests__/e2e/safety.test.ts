@@ -138,7 +138,10 @@ export function runSafetySuite(
         ),
       );
       expect(checkpoint).toContain("checkpoint created safe-point");
-      expect(checkpoint).toMatch(/files \d+/);
+      // Exactly the one named file: a checkpoint that silently captured nothing
+      // (or something else) must fail here, not at the restore below.
+      expect(checkpoint).toMatch(/^files 1$/m);
+      expect(checkpoint).toContain("safety-toolcall.txt");
       expect(checkpoint.trim().startsWith("{")).toBe(false);
 
       await writeFile(filePath, "v2\n", "utf8");
@@ -146,6 +149,8 @@ export function runSafetySuite(
         await tool.execute({ op: "restore", name: "safe-point" }, runtime(h)),
       );
       expect(restore).toContain("checkpoint restored safe-point");
+      expect(restore).toMatch(/^files 1$/m);
+      expect(restore).toContain("safety-toolcall.txt");
       expect(await readTextFile(filePath)).toBe("v1\n");
 
       const list = toolResultText(await tool.execute({ op: "list" }, runtime(h)));

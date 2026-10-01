@@ -745,6 +745,9 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 .unwrap_or_else(|| "(checkpoint)".to_string());
             let files =
                 import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
+            let file_count = number_field(response, "file_count").unwrap_or(0);
+            let requested = number_field(response, "requested_count");
+            let paths = string_array(response.get("paths"));
             let skipped = records_field(response, "skipped");
             let skipped_text = if skipped.is_empty() {
                 "No skipped files.".to_string()
@@ -766,11 +769,28 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                     .join("\n");
                 format!("skipped\n{details}")
             };
-            let mut lines = vec![
-                format!("checkpoint created {name}"),
-                format!("files {files}"),
-                skipped_text,
-            ];
+            // A partial or empty checkpoint must not read like a full one.
+            let header = if file_count == 0 {
+                format!("checkpoint created {name} (empty)")
+            } else {
+                format!("checkpoint created {name}")
+            };
+            let files_line = match requested {
+                Some(requested) if requested != file_count => {
+                    format!("files {files} of {requested} requested")
+                }
+                _ => format!("files {files}"),
+            };
+            let mut lines = vec![header, files_line];
+            lines.extend(checkpoint_path_lines(&paths, &[]));
+            if file_count == 0 {
+                lines.push(if requested.is_none() {
+                    "Nothing was snapshotted: no files were named and this session has no AFT-edited files to fall back on. Name the files to keep with 'files' or 'path'.".to_string()
+                } else {
+                    "Nothing was snapshotted.".to_string()
+                });
+            }
+            lines.push(skipped_text);
             let evicted = response
                 .get("evicted")
                 .and_then(Value::as_array)
@@ -796,10 +816,35 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 .unwrap_or_else(|| "(checkpoint)".to_string());
             let files =
                 import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
-            let mut lines = vec![
-                format!("checkpoint restored {name}"),
-                format!("files {files}"),
-            ];
+            let file_count = number_field(response, "file_count").unwrap_or(0);
+            let paths = string_array(response.get("paths"));
+            let unchanged = string_array(response.get("unchanged"));
+            let unchanged_count = i64::try_from(unchanged.len()).unwrap_or(i64::MAX);
+            // Only a restore that changed at least one file reads as
+            // "checkpoint restored"; an empty checkpoint, or one whose files
+            // all already matched, says that nothing changed instead.
+            let mut lines = if file_count == 0 {
+                vec![
+                    format!("checkpoint {name} holds no files; nothing was restored"),
+                    format!("files {files}"),
+                ]
+            } else if unchanged_count >= file_count {
+                vec![
+                    format!("checkpoint {name}: nothing to restore"),
+                    format!("files {files}, all already matched the checkpoint; none changed"),
+                ]
+            } else if unchanged_count > 0 {
+                vec![
+                    format!("checkpoint restored {name}"),
+                    format!("files {files} ({unchanged_count} already matched the checkpoint)"),
+                ]
+            } else {
+                vec![
+                    format!("checkpoint restored {name}"),
+                    format!("files {files}"),
+                ]
+            };
+            lines.extend(checkpoint_path_lines(&paths, &unchanged));
             if let Some(durability) = import_string_field(response, "durability") {
                 lines.push(durability);
             }
@@ -842,6 +887,32 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
         }
         _ => "No safety result.".to_string(),
     }
+}
+
+/// Most paths a checkpoint or restore result lists before summarising the rest.
+const CHECKPOINT_PATH_LINE_LIMIT: usize = 10;
+
+/// One `↳ path` line per checkpoint file, marking those in `unchanged`, so an
+/// agent can see which files a checkpoint or restore actually covered.
+fn checkpoint_path_lines(paths: &[String], unchanged: &[String]) -> Vec<String> {
+    let mut lines = paths
+        .iter()
+        .take(CHECKPOINT_PATH_LINE_LIMIT)
+        .map(|path| {
+            if unchanged.contains(path) {
+                format!("  ↳ {} (unchanged)", shorten_path(path))
+            } else {
+                format!("  ↳ {}", shorten_path(path))
+            }
+        })
+        .collect::<Vec<_>>();
+    if paths.len() > CHECKPOINT_PATH_LINE_LIMIT {
+        lines.push(format!(
+            "  ↳ … and {} more",
+            paths.len() - CHECKPOINT_PATH_LINE_LIMIT
+        ));
+    }
+    lines
 }
 
 fn format_timestamp(value: &Value) -> Option<String> {
@@ -3822,6 +3893,108 @@ mod status_memory_tests {
         let rendered = format_status(&data);
         assert!(rendered.contains("cache: shared repo index (built by the main checkout)"));
         assert!(rendered.contains("DEGRADED: home_root"));
+    }
+}
+
+#[cfg(test)]
+mod safety_checkpoint_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn render(op: &str, data: Value) -> String {
+        let ctx = FormatContext::from_tool_call(
+            "safety",
+            &json!({ "op": op, "name": "cp" }),
+            Path::new("/repo"),
+        );
+        let response = Response {
+            id: "1".to_string(),
+            success: true,
+            data,
+        };
+        format_response_with_context("safety", &response, &ctx)
+    }
+
+    #[test]
+    fn checkpoint_lists_snapshotted_files_and_counts_against_the_request() {
+        let text = render(
+            "checkpoint",
+            json!({
+                "name": "cp",
+                "file_count": 1,
+                "requested_count": 2,
+                "paths": ["/repo/a.txt"],
+                "skipped": [{ "file": "/repo/gone.txt", "error": "No such file" }],
+            }),
+        );
+        assert_eq!(
+            text,
+            "checkpoint created cp\nfiles 1 of 2 requested\n  ↳ /repo/a.txt\nskipped\n  ↳ /repo/gone.txt: No such file"
+        );
+    }
+
+    #[test]
+    fn empty_tracked_file_checkpoint_says_nothing_was_snapshotted() {
+        let text = render(
+            "checkpoint",
+            json!({ "name": "cp", "file_count": 0, "paths": [] }),
+        );
+        assert!(
+            text.starts_with("checkpoint created cp (empty)\nfiles 0\nNothing was snapshotted"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn restore_lists_written_files_and_marks_those_already_in_place() {
+        let text = render(
+            "restore",
+            json!({
+                "name": "cp",
+                "file_count": 2,
+                "changed_count": 1,
+                "paths": ["/repo/a.txt", "/repo/b.txt"],
+                "unchanged": ["/repo/b.txt"],
+            }),
+        );
+        assert_eq!(
+            text,
+            "checkpoint restored cp\nfiles 2 (1 already matched the checkpoint)\n  ↳ /repo/a.txt\n  ↳ /repo/b.txt (unchanged)"
+        );
+    }
+
+    #[test]
+    fn restore_that_changed_nothing_does_not_read_as_restored() {
+        let text = render(
+            "restore",
+            json!({
+                "name": "cp",
+                "file_count": 1,
+                "changed_count": 0,
+                "paths": ["/repo/a.txt"],
+                "unchanged": ["/repo/a.txt"],
+            }),
+        );
+        assert!(!text.contains("checkpoint restored"), "{text}");
+        assert!(
+            text.starts_with(
+                "checkpoint cp: nothing to restore\nfiles 1, all already matched the checkpoint; none changed"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn restore_of_an_empty_checkpoint_does_not_read_as_restored() {
+        let text = render(
+            "restore",
+            json!({ "name": "cp", "file_count": 0, "paths": [], "unchanged": [] }),
+        );
+        assert!(!text.contains("checkpoint restored"), "{text}");
+        assert!(
+            text.starts_with("checkpoint cp holds no files; nothing was restored"),
+            "{text}"
+        );
     }
 }
 
