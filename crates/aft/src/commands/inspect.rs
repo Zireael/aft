@@ -3567,7 +3567,7 @@ fn summary_for(category: InspectCategory, payload: &Value) -> Value {
 }
 
 fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
-    match category {
+    let mut summary = match category {
         InspectCategory::Diagnostics => diagnostics_summary_for(payload),
         InspectCategory::Metrics => serde_json::json!({
             "files": payload.get("files").or_else(|| payload.pointer("/totals/file_count")).and_then(Value::as_u64).unwrap_or(0),
@@ -3658,7 +3658,24 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
             "worst": payload.get("worst").cloned().unwrap_or(Value::Null),
         }),
         _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
+    };
+    // Findings withheld from `count` because they live in test files or
+    // fixtures; carried through so a reader can see what was left out.
+    if matches!(
+        category,
+        InspectCategory::Todos
+            | InspectCategory::DeadCode
+            | InspectCategory::UnusedExports
+            | InspectCategory::Duplicates
+    ) && summary.is_object()
+    {
+        for key in ["excluded_test_count", "excluded_test_files"] {
+            if let Some(value) = payload.get(key) {
+                summary[key] = value.clone();
+            }
+        }
     }
+    summary
 }
 
 fn diagnostics_summary_for(payload: &Value) -> Value {

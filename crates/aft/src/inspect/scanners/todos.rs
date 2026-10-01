@@ -11,6 +11,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::cache::Tier1FileMemo;
+use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 use crate::parser::{detect_language, grammar_for, LangId};
 
@@ -61,11 +62,20 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
 
     let mut scanned_files = Vec::new();
     let mut all_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for scan in per_file {
         if let Some(path) = scan.scanned_file {
             scanned_files.push(path);
         }
-        all_items.extend(scan.items);
+        // Markers in test trees (generated fixtures, mutation notes in test
+        // comments) are not product work items; tally them separately.
+        for item in scan.items {
+            if is_test_tree_file(&item.file) {
+                excluded.record(&item.file);
+            } else {
+                all_items.push(item);
+            }
+        }
     }
 
     let mut by_kind = BTreeMap::new();
@@ -94,12 +104,13 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
         })
         .collect::<Vec<_>>();
 
-    let aggregate = serde_json::json!({
+    let mut aggregate = serde_json::json!({
         "count": total_count,
         "by_kind": by_kind,
         "items": items,
         "drill_down_capped": drill_down_capped,
     });
+    excluded.write_into(&mut aggregate);
     let success = InspectScanSuccess {
         scanned_files,
         contributions: Vec::new(),
@@ -722,5 +733,71 @@ mod tests {
             0,
             "an unchanged full scan must retain every live file above the default memo capacity"
         );
+    }
+
+    fn scan_files(files: &[(&str, &str)]) -> serde_json::Value {
+        let project = tempfile::tempdir().expect("project");
+        let paths = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = project.path().join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+                fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect::<Vec<_>>();
+        let job = todos_job(project.path(), paths);
+        run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
+            .outcome
+            .expect("todos scan succeeds")
+            .aggregate
+    }
+
+    #[test]
+    fn markers_in_test_trees_are_excluded_from_the_product_count() {
+        let aggregate = scan_files(&[
+            (
+                "src/app.ts",
+                "// TODO: product work item\nexport const a = 1;\n",
+            ),
+            (
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "// TODO: fixture item 0\n// TODO: fixture item 1\n",
+            ),
+            (
+                "crates/app/tests/mutation.rs",
+                "fn f() -> bool {\n    true // BUG: deliberate mutant\n}\n",
+            ),
+        ]);
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["TODO"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["BUG"], 0, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 3, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+        let files = aggregate["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["file"].as_str().expect("file"))
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["src/app.ts"]);
+    }
+
+    /// Every marker must open the comment; an upper-case marker word inside
+    /// prose is not a work item. The rule is the same for all five markers.
+    #[test]
+    fn marker_words_inside_prose_do_not_count() {
+        let aggregate = scan_files(&[(
+            "src/lib.rs",
+            "// BUG: leading marker counts\n\
+             // this documents a BUG in prose\n\
+             // the TODO list and the FIXME tag and a HACK and XXX are prose here\n\
+             fn f() {}\n",
+        )]);
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["BUG"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 0, "{aggregate:#}");
     }
 }

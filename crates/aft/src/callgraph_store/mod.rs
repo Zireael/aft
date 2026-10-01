@@ -12138,6 +12138,17 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
 
+    // A file-level function of the caller's own file wins over imports. Rust
+    // rejects a file-level `use` that binds the same name as a file-level item,
+    // so any import of this name sits in a nested scope (typically
+    // `mod tests { use super::{..}; }`); applying it to the whole file
+    // resolved ordinary same-file calls through the wrong module.
+    if let Some(local) =
+        rust_unique_file_level_function(caller_file, full_ref, short_name, caller_data)
+    {
+        return Some(local);
+    }
+
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
             rust_target_for_use(index, caller_file, import, short_name)
@@ -12147,6 +12158,34 @@ fn resolve_rust_target<I: ResolverIndex>(
     }
 
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
+}
+
+fn rust_unique_file_level_function(
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+) -> Option<(String, String, String)> {
+    if full_ref.contains("::") || !callgraph::is_bare_callee(full_ref, short_name) {
+        return None;
+    }
+    // The only symbol with this unqualified name must be the file-level one
+    // itself; with a same-named nested item the call could mean either.
+    let symbol =
+        callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
+            .ok()?;
+    let is_file_level_function = symbol == short_name
+        && caller_data
+            .symbol_metadata
+            .get(short_name)
+            .is_some_and(|meta| meta.kind == SymbolKind::Function);
+    is_file_level_function.then(|| {
+        (
+            "resolved_local".to_string(),
+            caller_file.to_string(),
+            symbol,
+        )
+    })
 }
 
 fn rust_target_for_qualified<I: ResolverIndex>(
@@ -12176,18 +12215,24 @@ fn rust_target_for_qualified<I: ResolverIndex>(
             }
         }
 
-        let module_segments = rust_resolve_segments_with_index(index, caller_file, &path_refs)?;
-        if let Some(target) =
-            rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
+        // A path that does not resolve under one reading may under another, and
+        // a later alias candidate may still match, so try them all in order.
+        for module_segments in
+            rust_resolve_segment_candidates_with_index(index, caller_file, &path_refs)
         {
-            return Some(target);
-        }
-        if let Some(target_file) = rust_file_for_segments(index, caller_file, &module_segments) {
-            return Some(rust_resolve_reexport_if_symbol_missing(
-                index,
-                target_file,
-                requested_symbol.clone(),
-            ));
+            if let Some(target) =
+                rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
+            {
+                return Some(target);
+            }
+            if let Some(target_file) = rust_file_for_segments(index, caller_file, &module_segments)
+            {
+                return Some(rust_resolve_reexport_if_symbol_missing(
+                    index,
+                    target_file,
+                    requested_symbol.clone(),
+                ));
+            }
         }
     }
     None
@@ -12231,12 +12276,12 @@ fn rust_module_path_candidates(
             if !rust_import_is_visible_to_call(import, raw) {
                 continue;
             }
-            let Some((local_name, mut path_segments)) = rust_module_alias_segments(import) else {
-                continue;
-            };
-            if local_name == first {
-                path_segments.extend(segments[1..].iter().map(|segment| (*segment).to_string()));
-                rust_push_unique_path_candidate(&mut candidates, path_segments);
+            for (local_name, mut path_segments) in rust_module_alias_segments(import) {
+                if local_name == first {
+                    path_segments
+                        .extend(segments[1..].iter().map(|segment| (*segment).to_string()));
+                    rust_push_unique_path_candidate(&mut candidates, path_segments);
+                }
             }
         }
     }
@@ -12260,35 +12305,75 @@ fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> boo
     import.byte_range.start <= raw.byte_start
 }
 
-fn rust_module_alias_segments(import: &ImportStatement) -> Option<(String, Vec<String>)> {
+/// Module names a `use` declaration binds: `use a::b;` / `use a::b as c;`
+/// bind one, and a use list binds `self` (the prefix module itself, as in
+/// `use crate::cache_freshness::{self, FileFreshness};`) plus each lowercase
+/// entry. Upper-camel names are types, not modules, and are skipped.
+fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<String>)> {
     let path = rust_use_body(&import.raw_text)
         .unwrap_or(&import.module_path)
         .trim()
         .trim_end_matches(';')
         .trim();
-    if path.contains("::{") || path.contains('{') || path.contains('*') {
-        return None;
+    if path.contains('*') {
+        return Vec::new();
+    }
+    let split_path = |path: &str| {
+        path.split("::")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let is_module_name = |name: &str| {
+        !name.is_empty() && name != "_" && !name.chars().next().is_some_and(char::is_uppercase)
+    };
+    if let Some((prefix, rest)) = path.split_once("::{") {
+        if rest.contains('{') {
+            return Vec::new();
+        }
+        let prefix_segments = split_path(prefix);
+        return rest
+            .trim_end_matches('}')
+            .split(',')
+            .filter_map(|specifier| {
+                let specifier = specifier.trim();
+                let (path_without_alias, alias) = specifier
+                    .split_once(" as ")
+                    .map(|(left, right)| (left.trim(), Some(right.trim())))
+                    .unwrap_or((specifier, None));
+                let segments = if path_without_alias == "self" {
+                    prefix_segments.clone()
+                } else {
+                    let mut segments = prefix_segments.clone();
+                    segments.extend(split_path(path_without_alias));
+                    segments
+                };
+                let local_name = alias
+                    .map(str::to_string)
+                    .or_else(|| segments.last().cloned())?;
+                is_module_name(&local_name).then_some((local_name, segments))
+            })
+            .collect();
+    }
+    if path.contains('{') {
+        return Vec::new();
     }
     let (path_without_alias, alias) = path
         .split_once(" as ")
         .map(|(left, right)| (left.trim(), Some(right.trim())))
         .unwrap_or((path, None));
-    let segments = path_without_alias
-        .split("::")
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let local_name = alias.or_else(|| segments.last().copied())?.to_string();
-    if local_name.chars().next().is_some_and(char::is_uppercase) {
-        return None;
+    let segments = split_path(path_without_alias);
+    let Some(local_name) = alias
+        .map(str::to_string)
+        .or_else(|| segments.last().cloned())
+    else {
+        return Vec::new();
+    };
+    if !is_module_name(&local_name) {
+        return Vec::new();
     }
-    Some((
-        local_name,
-        segments
-            .into_iter()
-            .map(|segment| segment.to_string())
-            .collect(),
-    ))
+    vec![(local_name, segments)]
 }
 
 fn rust_inline_scoped_target<I: ResolverIndex>(
@@ -12488,14 +12573,41 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
     caller_file: &str,
     segments: &[&str],
 ) -> Option<Vec<String>> {
-    let caller_segments = if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file)
-    {
+    rust_resolve_segments_from(rust_caller_module_segments(index, caller_file), segments)
+}
+
+fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
+    if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
         Vec::new()
     } else {
         rust_registered_module_segments(index, caller_file)
             .unwrap_or_else(|| rust_module_segments_for_rel(caller_file))
-    };
-    rust_resolve_segments_from(caller_segments, segments)
+    }
+}
+
+/// Module paths a path's leading segments can denote, most likely first. A
+/// bare first segment (`registry::f()` inside `bash_background/mod.rs`) is, in
+/// Rust 2018, relative to the current module, so a child module is tried
+/// before the crate-relative sibling reading `rust_resolve_segments_from` uses.
+fn rust_resolve_segment_candidates_with_index<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    segments: &[&str],
+) -> Vec<Vec<String>> {
+    let caller_segments = rust_caller_module_segments(index, caller_file);
+    let mut candidates = Vec::new();
+    if segments
+        .first()
+        .is_some_and(|first| !matches!(*first, "crate" | "self" | "super"))
+    {
+        let mut child = caller_segments.clone();
+        child.extend(segments.iter().map(|item| item.to_string()));
+        candidates.push(child);
+    }
+    if let Some(resolved) = rust_resolve_segments_from(caller_segments, segments) {
+        rust_push_unique_path_candidate(&mut candidates, resolved);
+    }
+    candidates
 }
 
 fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
@@ -22690,6 +22802,95 @@ edition = "2021"
             "project_range",
             "src/alternate/custom.rs",
             "run",
+        );
+    }
+
+    #[test]
+    fn rust_path_calls_resolve_child_modules_use_list_self_and_crate_paths() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "path-forms-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "pub mod alerts;\npub mod cache;\npub mod net;\n",
+        );
+        // The binary reaches the library through the crate name.
+        write_file(
+            root,
+            "src/main.rs",
+            "fn main() {\n    path_forms_fixture::net::start();\n}\n",
+        );
+        // `registry::` names a child module of `net`; `cache::` is bound by
+        // the `self` entry of a use list.
+        write_file(
+            root,
+            "src/net/mod.rs",
+            r#"mod registry;
+use crate::cache::{self, Cache};
+
+pub fn start() {
+    registry::resolve_shell();
+    cache::warm();
+    let _ = Cache;
+}
+"#,
+        );
+        write_file(root, "src/net/registry.rs", "pub fn resolve_shell() {}\n");
+        write_file(
+            root,
+            "src/cache.rs",
+            "pub struct Cache;\n\npub fn warm() {\n    crate::alerts::build(\"x\");\n}\n",
+        );
+        // `normalize` is called from a struct-literal field; the file also has
+        // a nested `use super::{normalize}` that must not redirect that call
+        // to the parent module.
+        write_file(
+            root,
+            "src/alerts.rs",
+            r#"pub struct Alert {
+    pub message: String,
+}
+
+pub fn build(message: &str) -> Alert {
+    Alert {
+        message: normalize(message),
+    }
+}
+
+pub fn normalize(message: &str) -> String {
+    message.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize, Alert};
+
+    #[test]
+    fn normalizes() {
+        let _ = Alert { message: normalize(" x ") };
+    }
+}
+"#,
+        );
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/net/mod.rs", "start", "src/main.rs", "main");
+        assert_direct_caller(
+            &store,
+            "src/net/registry.rs",
+            "resolve_shell",
+            "src/net/mod.rs",
+            "start",
+        );
+        assert_direct_caller(&store, "src/cache.rs", "warm", "src/net/mod.rs", "start");
+        assert_direct_caller(&store, "src/alerts.rs", "build", "src/cache.rs", "warm");
+        assert_direct_caller(
+            &store,
+            "src/alerts.rs",
+            "normalize",
+            "src/alerts.rs",
+            "build",
         );
     }
 

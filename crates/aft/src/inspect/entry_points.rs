@@ -221,6 +221,75 @@ fn collect_cargo_manifest_entry_points(manifest: &Path, entry_points: &mut Entry
     let has_package = value.get("package").is_some_and(toml::Value::is_table);
     collect_cargo_lib_target(package_dir, &value, has_package, entry_points);
     collect_cargo_bin_targets(package_dir, &value, has_package, entry_points);
+    for (section, autodiscovery_key, directory) in [
+        ("example", "autoexamples", "examples"),
+        ("bench", "autobenches", "benches"),
+        ("test", "autotests", "tests"),
+    ] {
+        collect_cargo_auxiliary_targets(
+            package_dir,
+            &value,
+            has_package,
+            (section, autodiscovery_key, directory),
+            entry_points,
+        );
+    }
+}
+
+/// Examples, benches and integration tests are separate crates whose `main`
+/// (or test functions) Cargo runs directly, so each target file is a liveness
+/// root. Without this, a library item used only from an example or bench looks
+/// dead, and so does every helper inside the example itself.
+fn collect_cargo_auxiliary_targets(
+    package_dir: &Path,
+    value: &toml::Value,
+    has_package: bool,
+    (section, autodiscovery_key, directory): (&str, &str, &str),
+    entry_points: &mut EntryPointSet,
+) {
+    if let Some(targets) = value.get(section).and_then(toml::Value::as_array) {
+        for target in targets {
+            if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+                insert_existing_entry_point(
+                    entry_points,
+                    &package_dir.join(path),
+                    EntryPointKind::LivenessRoot,
+                );
+            } else if let Some(name) = target.get("name").and_then(toml::Value::as_str) {
+                let target_dir = package_dir.join(directory);
+                insert_existing_entry_point(
+                    entry_points,
+                    &target_dir.join(format!("{name}.rs")),
+                    EntryPointKind::LivenessRoot,
+                );
+                insert_existing_entry_point(
+                    entry_points,
+                    &target_dir.join(name).join("main.rs"),
+                    EntryPointKind::LivenessRoot,
+                );
+            }
+        }
+    }
+
+    if !has_package || !package_autodiscovery_enabled(value, autodiscovery_key) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(package_dir.join(directory)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Cargo also discovers `<dir>/<name>/main.rs` multi-file targets.
+            insert_existing_entry_point(
+                entry_points,
+                &path.join("main.rs"),
+                EntryPointKind::LivenessRoot,
+            );
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            insert_existing_entry_point(entry_points, &path, EntryPointKind::LivenessRoot);
+        }
+    }
 }
 
 fn collect_cargo_lib_target(

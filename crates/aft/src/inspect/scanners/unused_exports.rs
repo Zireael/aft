@@ -10,7 +10,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::cache_freshness;
 use crate::imports::{parse_file_imports, specifier_imported_name, ImportBlock, ImportStatement};
-use crate::inspect::job::{is_test_file, is_test_support_file};
+use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::oxc_engine::{
     ExportFact, FileFacts, LivenessVerdict, OxcEngineError, OxcEngineResult, FACTS_FORMAT_VERSION,
     OXC_PROVENANCE,
@@ -129,16 +129,15 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
     let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for scan in &per_file {
         if public_api_entries.is_public_api_file(&scan.file_path) {
             continue;
         }
-        // Fixtures/corpora/mock data are loaded by path, not imported, so their
-        // exports always look unused. Skip reporting (their import edges above
-        // still mark the product code they consume as used).
-        if is_test_support_file(&scan.relative_file) {
-            continue;
-        }
+        // Test files and fixtures (consumed by path or by test runners) are
+        // still scanned so their imports keep product exports live, but their
+        // own exports are withheld from the product count and tallied.
+        let test_tree = is_test_tree_file(&scan.relative_file);
 
         for export in &scan.exports {
             let imported = imported_by
@@ -151,6 +150,10 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
                 .unwrap_or(false);
 
             if imported {
+                continue;
+            }
+            if test_tree {
+                excluded.record(&scan.relative_file);
                 continue;
             }
             if uncertain {
@@ -241,6 +244,7 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
     });
+    excluded.write_into(&mut aggregate);
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
@@ -293,6 +297,7 @@ fn run_unused_exports_oxc_scan(
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
 
     for file in &oxc_result.files {
         if let Some(facts) = facts_by_file.get(&normalize_path(&file.file)) {
@@ -306,20 +311,20 @@ fn run_unused_exports_oxc_scan(
             }
         }
 
-        if public_api_entries.is_public_api_file(&file.file)
-            || is_test_support_file(&file.relative_file)
-        {
+        if public_api_entries.is_public_api_file(&file.file) {
             continue;
         }
+        // Test files and fixtures are still analyzed (their imports keep
+        // product exports live), but their own unused exports are withheld
+        // from the product count and tallied as excluded.
+        let test_tree = is_test_tree_file(&file.relative_file);
         let generated_file =
             crate::inspect::generated::is_generated_file(&project_root, &file.file);
 
         for export in &file.exports {
             match export.verdict {
                 LivenessVerdict::Used => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -340,6 +345,9 @@ fn run_unused_exports_oxc_scan(
                     }
                 }
                 LivenessVerdict::Uncertain => {
+                    if test_tree {
+                        continue;
+                    }
                     uncertain_count += 1;
                     if uncertain_items.len() < DRILL_DOWN_LIMIT {
                         let mut item = json!({
@@ -355,9 +363,7 @@ fn run_unused_exports_oxc_scan(
                     }
                 }
                 LivenessVerdict::Unused => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -378,6 +384,10 @@ fn run_unused_exports_oxc_scan(
                         continue;
                     }
                     if export.has_references {
+                        continue;
+                    }
+                    if test_tree {
+                        excluded.record(&file.relative_file);
                         continue;
                     }
                     let mut item = json!({
@@ -473,6 +483,7 @@ fn run_unused_exports_oxc_scan(
         "uncertain_items": uncertain_items,
         "complete": oxc_result.errors.is_empty() && oxc_result.skipped_outside_root.is_empty(),
     });
+    excluded.write_into(&mut aggregate);
     if !package_warnings.is_empty() {
         aggregate["note"] = Value::String(package_warnings.join("; "));
     }
@@ -1661,6 +1672,66 @@ export function bannerUnused() {}
             .filter_map(|item| item["file"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(item_files.first(), Some(&"src/hand.ts"), "{item_files:?}");
+    }
+
+    fn test_tree_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let (temp_dir, root, paths) = fixture_project(&[
+            ("src/product.ts", "export function productUnused() {}\n"),
+            (
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "export const bulkSymbol0 = 0;\nexport const bulkSymbol1 = 1;\n",
+            ),
+            (
+                "tests/docker/scenarios/grep/fixture/bulk/bulk.ts",
+                "export const bulkSymbol0 = 0;\n",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+        (temp_dir, root, paths)
+    }
+
+    fn assert_only_product_counted(aggregate: &serde_json::Value) {
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["total_count"], 1, "{aggregate:#}");
+        assert!(aggregate_item(aggregate, "src/product.ts", "productUnused").is_some());
+        assert_eq!(aggregate["excluded_test_count"], 3, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+    }
+
+    #[test]
+    fn legacy_scan_excludes_test_tree_exports_from_the_product_count() {
+        let (_temp_dir, root, paths) = test_tree_fixture();
+        let aggregate = run_unused_exports_scan(&job(&root, paths))
+            .outcome
+            .expect("scan succeeds")
+            .aggregate;
+        assert_only_product_counted(&aggregate);
+    }
+
+    #[test]
+    fn oxc_scan_excludes_test_tree_exports_from_the_product_count() {
+        let (_temp_dir, root, paths) = test_tree_fixture();
+        let oxc_result = crate::inspect::oxc_engine::analyze_files(
+            &root,
+            &paths,
+            crate::inspect::oxc_engine::AnalyzeOptions {
+                entry_points: Vec::new(),
+                public_api_files: Vec::new(),
+                executable_root_exports: BTreeMap::new(),
+                force_reparse_files: Vec::new(),
+                entry_reachability: false,
+            },
+        )
+        .expect("oxc analyze succeeds");
+        let aggregate = run_unused_exports_scan_with_oxc(&job(&root, paths), Some(&oxc_result))
+            .outcome
+            .expect("scan succeeds")
+            .aggregate;
+        assert_only_product_counted(&aggregate);
     }
 
     #[test]

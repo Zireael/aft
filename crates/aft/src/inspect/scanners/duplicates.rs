@@ -14,6 +14,7 @@ use tree_sitter::{Node, Parser, Tree};
 use super::duplicates_classifier::{is_anonymizable, node_cost, AnonymizeAs};
 use crate::cache_freshness;
 use crate::inspect::entry_points::TOP_PREVIEW_ITEMS;
+use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -755,6 +756,7 @@ fn aggregate_duplicate_occurrences(
 
     let expected_mirrors = compile_expected_mirrors(expected_mirrors);
     let mut suppression = SuppressionStats::default();
+    let mut excluded = ExcludedTestTally::default();
     let mut groups = by_hash
         .iter()
         .filter(|(hash, occurrences)| {
@@ -779,6 +781,14 @@ fn aggregate_duplicate_occurrences(
             }
             if marker_suppresses_group(&group, &marker_files) {
                 suppression.marker_groups += 1;
+                return None;
+            }
+            // A clone that lives only in test trees (generated fixtures, test
+            // helpers copied between suites) is not a product refactoring
+            // target. Groups that touch any product file stay in the count.
+            let files = group_files(&group);
+            if files.iter().all(|file| is_test_tree_file(file)) {
+                excluded.record_in_files(files.iter().map(String::as_str));
                 return None;
             }
             Some(group)
@@ -835,7 +845,7 @@ fn aggregate_duplicate_occurrences(
         .map(duplicate_top_item)
         .collect::<Vec<_>>();
 
-    json!({
+    let mut aggregate = json!({
         "count": count,
         "generated_count": generated_count,
         "total_count": groups_count,
@@ -860,7 +870,9 @@ fn aggregate_duplicate_occurrences(
         "generated_drill_down_capped": generated_drill_down_capped,
         "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
-    })
+    });
+    excluded.write_into(&mut aggregate);
+    aggregate
 }
 
 /// Hashes of duplicate fragments that are "maximal" — i.e. have at least one
@@ -1415,6 +1427,44 @@ mod tests {
         assert_eq!(items[1]["generated"], true, "{items:#?}");
         assert_eq!(aggregate["top"][0]["files"][0], "src/a.ts:1-10");
         assert_eq!(aggregate["generated_top"][0]["files"][0], "gen/a.ts:1-12");
+    }
+
+    #[test]
+    fn duplicate_groups_only_in_test_trees_are_excluded_from_the_count() {
+        let aggregate = aggregate_duplicate_contributions_with_limit(
+            &[
+                contribution("src/a.ts", &[(1, 10, 10, "hand")]),
+                contribution("src/b.ts", &[(1, 10, 10, "hand")]),
+                contribution(
+                    "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                    &[(1, 141, 700, "bulk")],
+                ),
+                contribution(
+                    "tests/docker/scenarios/grep/fixture/bulk/bulk.ts",
+                    &[(1, 141, 700, "bulk")],
+                ),
+                // A clone between a product file and a test keeps counting:
+                // the product side is still a refactoring target.
+                contribution("src/c.ts", &[(1, 12, 20, "mixed")]),
+                contribution("src/c.test.ts", &[(1, 12, 20, "mixed")]),
+            ],
+            Vec::new(),
+            None,
+            &[],
+        );
+
+        assert_eq!(aggregate["count"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["total_groups"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+        let items = aggregate["items"].as_array().expect("items");
+        assert!(
+            items.iter().all(|group| !group["sample_file"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fixture")),
+            "{items:#?}"
+        );
     }
 
     #[test]

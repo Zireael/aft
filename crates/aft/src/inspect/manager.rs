@@ -13,8 +13,9 @@ use super::cache::{InspectCache, InspectCacheRead, InspectDbTimings, Tier2Contri
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
-    is_test_file, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob, InspectResult,
-    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope, PendingWaitCause,
+    is_test_tree_file, CallgraphSnapshot, ExcludedTestTally, FileContribution, InspectCategory,
+    InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    PendingWaitCause,
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
@@ -4655,15 +4656,15 @@ fn roll_up_unused_exports_contributions(
     let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for scan in &parsed {
         if public_api_files.contains(&scan.file) {
             continue;
         }
-        // Mirror the fresh-scan path: fixtures/corpora/mock data are consumed
-        // by path, never imported, so their exports always look unused.
-        if super::job::is_test_support_file(&scan.file) {
-            continue;
-        }
+        // Mirror the fresh-scan path: test files and fixtures are analyzed for
+        // the product exports they keep live, but their own exports are
+        // withheld from the product count and tallied as excluded.
+        let test_tree = is_test_tree_file(&scan.file);
         let generated_file = super::generated::is_generated_file_with_cached_hint(
             &job.project_root,
             &scan.file,
@@ -4674,6 +4675,7 @@ fn roll_up_unused_exports_contributions(
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
                     LivenessVerdict::Used => continue,
+                    LivenessVerdict::Uncertain if test_tree => continue,
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
                         if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -4703,7 +4705,7 @@ fn roll_up_unused_exports_contributions(
                 if imported {
                     continue;
                 }
-                if uncertain {
+                if uncertain && !test_tree {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
                         uncertain_items.push(json!({
@@ -4724,6 +4726,10 @@ fn roll_up_unused_exports_contributions(
                 "kind": export.kind,
                 "line": export.line,
             });
+            if test_tree {
+                excluded.record(&scan.file);
+                continue;
+            }
             if let Some(provenance) = &export.provenance {
                 item["provenance"] = json!(provenance);
             }
@@ -4782,6 +4788,7 @@ fn roll_up_unused_exports_contributions(
         "uncertain_items": uncertain_items,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
+    excluded.write_into(&mut aggregate);
     if !parse_errors.is_empty() {
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
@@ -4859,12 +4866,12 @@ fn roll_up_unused_exports_oxc_contributions(
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for file in &oxc_result.files {
-        if public_api_files.contains(&file.relative_file)
-            || super::job::is_test_support_file(&file.relative_file)
-        {
+        if public_api_files.contains(&file.relative_file) {
             continue;
         }
+        let test_tree = is_test_tree_file(&file.relative_file);
         let generated_file = generated_by_file
             .get(&file.relative_file)
             .copied()
@@ -4878,9 +4885,7 @@ fn roll_up_unused_exports_oxc_contributions(
         for export in &file.exports {
             match export.verdict {
                 LivenessVerdict::Used => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -4900,6 +4905,7 @@ fn roll_up_unused_exports_oxc_contributions(
                         }
                     }
                 }
+                LivenessVerdict::Uncertain if test_tree => {}
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -4916,9 +4922,7 @@ fn roll_up_unused_exports_oxc_contributions(
                     }
                 }
                 LivenessVerdict::Unused => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -4939,6 +4943,10 @@ fn roll_up_unused_exports_oxc_contributions(
                         continue;
                     }
                     if export.has_references {
+                        continue;
+                    }
+                    if test_tree {
+                        excluded.record(&file.relative_file);
                         continue;
                     }
                     let mut item = json!({
@@ -5018,6 +5026,7 @@ fn roll_up_unused_exports_oxc_contributions(
         "uncertain_items": uncertain_items,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
+    excluded.write_into(&mut aggregate);
     if !parse_errors.is_empty() {
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
