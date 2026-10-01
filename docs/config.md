@@ -485,7 +485,7 @@ When OpenCode 2's permission rules resolve a tool call to "ask" (a `bash` comman
 Without any setting, AFT finds it on its own:
 
 - a service registration (`$XDG_STATE_HOME/opencode/service*.json`) is used only if the process ID recorded in it is the ID of the server process AFT runs in. A TUI's managed background service registers itself too; a plain `opencode serve` running beside it never sends its prompts there;
-- otherwise AFT reads its own process's `opencode serve` flags (`--hostname`, default `127.0.0.1`; `--port`, default `4096` or the next free port after it) and the password OpenCode itself adopted from `OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD`. The username is always `opencode`.
+- otherwise AFT asks the operating system which TCP ports its own process listens on (`lsof` on macOS and Linux, `/proc` on Linux without `lsof`, `netstat` on Windows) and uses the password OpenCode itself adopted from `OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD`. The username is always `opencode`. AFT never guesses ports: the password is only ever sent to ports this process listens on, never to other servers on `4096` and the ports after it. An explicit `--port` must be one of those ports; if the lookup itself fails, AFT uses a `--port` on the command line and otherwise refuses.
 
 Every candidate is checked once with an authenticated call to `/api/info`, which reports the ID of the process serving it; that must be the server process AFT runs in before any prompt is sent.
 

@@ -1,6 +1,7 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, readlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { execFile } from "@cortexkit/aft-bridge";
 import { OpenCode } from "@opencode/client";
 import { headers } from "@opencode/client/service";
 
@@ -48,11 +49,19 @@ export interface V2PromptServerSettings {
   readonly server_password_env?: string;
 }
 
+/** One TCP socket a process is listening on, as the operating system reports it. */
+export interface V2ListeningSocket {
+  /** Bind address: a concrete IP, or a wildcard such as `0.0.0.0`, `::` or `*`. */
+  readonly address: string;
+  readonly port: number;
+}
+
 /**
  * What discovery reads about the process AFT runs in.
  *
  * OpenCode 2 loads plugins inside its server process, so this process's own
- * pid, command line and environment are the server's. Tests replace it.
+ * pid, command line, environment and listening sockets are the server's.
+ * Tests replace it.
  */
 export interface V2ServerProcess {
   readonly pid: number;
@@ -60,6 +69,11 @@ export interface V2ServerProcess {
   readonly env: Readonly<Record<string, string | undefined>>;
   /** Every OpenCode service registration file on this machine, by path. */
   registrations(): Promise<readonly { readonly path: string; readonly text: string }[]>;
+  /**
+   * The TCP ports this process listens on. Rejects when the operating system
+   * could not be asked, which is different from an empty answer.
+   */
+  listeningSockets(): Promise<readonly V2ListeningSocket[]>;
   fetch(
     url: string,
     init: { headers: Record<string, string>; signal: AbortSignal },
@@ -69,10 +83,6 @@ export interface V2ServerProcess {
 export interface V2DiscoveryOptions {
   /** Bound on each health call. */
   readonly timeoutMs?: number;
-  /** First port `opencode serve` tries when started without `--port`. */
-  readonly defaultPort?: number;
-  /** How many consecutive ports from `defaultPort` are tried. */
-  readonly defaultPortAttempts?: number;
 }
 
 /**
@@ -84,13 +94,12 @@ export interface V2DiscoveryOptions {
  */
 export const OPENCODE_BASIC_AUTH_USERNAME = "opencode";
 
-/**
- * `opencode serve` without `--port` listens on 4096, or on the next free port
- * after it when 4096 is taken by another server.
- */
-export const OPENCODE_DEFAULT_SERVE_PORT = 4096;
-const DEFAULT_PORT_ATTEMPTS = 16;
 const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
+/**
+ * Limit on asking the operating system for this process's listening ports, so a
+ * hung `lsof` or `netstat` cannot hold a permission prompt open.
+ */
+const LISTEN_LOOKUP_TIMEOUT_MS = 5_000;
 
 /**
  * How to get out of the unaddressable state; appended to every reason that
@@ -351,7 +360,56 @@ async function ownRegistration(
   return undefined;
 }
 
-/** Find the server this process is, from its registration or its command line. */
+/** The address a client uses to reach a socket bound to `address`. */
+function reachableHost(address: string): string {
+  const host = address.replace(/^\[(.*)\]$/, "$1");
+  if (host === "*" || host === "0.0.0.0" || host === "") return "127.0.0.1";
+  if (/^[0:]+$/.test(host)) return "::1";
+  return host;
+}
+
+/**
+ * The endpoints to probe for this process's own server.
+ *
+ * Only ports the operating system says this very process listens on are
+ * candidates, because each probe carries the server password: guessing ports
+ * would hand it to whatever else listens there, such as another developer
+ * server started in a worktree. An explicit `--port` must be one of those
+ * ports; it is trusted on its own only when the operating system could not be
+ * asked, because then the process's own command line is the best evidence.
+ */
+async function ownCandidates(
+  server: V2ServerProcess,
+  listen: ListenAddress,
+  observed: string[],
+): Promise<readonly string[] | undefined> {
+  const declared = listen.port !== undefined && listen.port !== 0 ? listen.port : undefined;
+  let sockets: readonly V2ListeningSocket[];
+  try {
+    sockets = await server.listeningSockets();
+  } catch (error) {
+    const failure = `looking up the ports this process (${server.pid}) listens on failed: ${detail(error)}`;
+    if (declared === undefined) {
+      observed.push(`${failure}, and its command line names no --port`);
+      return undefined;
+    }
+    return [serverURL(listen.hostname, declared)];
+  }
+  const own =
+    declared === undefined ? sockets : sockets.filter((socket) => socket.port === declared);
+  if (own.length === 0) {
+    const found = sockets.map((socket) => socket.port).join(", ") || "none";
+    observed.push(
+      declared === undefined
+        ? `this process (${server.pid}) listens on no TCP port`
+        : `--port ${declared} is not one of the ports this process (${server.pid}) listens on (${found})`,
+    );
+    return undefined;
+  }
+  return [...new Set(own.map((socket) => serverURL(reachableHost(socket.address), socket.port)))];
+}
+
+/** Find the server this process is, from its registration or its own listening ports. */
 async function ownServer(
   server: V2ServerProcess,
   options: Required<V2DiscoveryOptions>,
@@ -369,12 +427,8 @@ async function ownServer(
   const password = ownServerPassword(server.env);
   if (listen.stdio) {
     observed.push(
-      "this is a private server (opencode --standalone) on a random port whose password is not readable by plugins",
+      "this is a private server (opencode --standalone) whose password is not readable by plugins",
     );
-    return unaddressable();
-  }
-  if (listen.port === 0) {
-    observed.push("this server was started with --port 0, so its port is not known");
     return unaddressable();
   }
   if (!password) {
@@ -384,20 +438,12 @@ async function ownServer(
     return unaddressable();
   }
 
-  const ports =
-    listen.port !== undefined
-      ? [listen.port]
-      : Array.from(
-          { length: options.defaultPortAttempts },
-          (_, index) => options.defaultPort + index,
-        );
+  const candidates = await ownCandidates(server, listen, observed);
+  if (!candidates) return unaddressable();
   let refused = 0;
   let others = 0;
-  for (const port of ports) {
-    const endpoint: ServiceEndpoint = {
-      url: serverURL(listen.hostname, port),
-      auth: basicAuth(password),
-    };
+  for (const url of candidates) {
+    const endpoint: ServiceEndpoint = { url, auth: basicAuth(password) };
     const result = await probe(server, endpoint, options.timeoutMs);
     if (result.kind === "answered" && result.pid === server.pid) {
       return { client: promptClient(endpoint) };
@@ -405,12 +451,8 @@ async function ownServer(
     if (result.kind === "unauthorized") refused += 1;
     if (result.kind === "answered") others += 1;
   }
-  const where =
-    listen.port !== undefined
-      ? `${serverURL(listen.hostname, listen.port)}`
-      : `${serverURL(listen.hostname, options.defaultPort)} through port ${options.defaultPort + options.defaultPortAttempts - 1}`;
   observed.push(
-    `no server at ${where} answered as this process (${server.pid})` +
+    `none of ${candidates.join(", ")} answered as this process (${server.pid})` +
       (refused > 0 ? `; ${refused} refused the password from OPENCODE_SERVER_PASSWORD` : "") +
       (others > 0 ? `; ${others} belonged to another process` : ""),
   );
@@ -422,10 +464,10 @@ async function ownServer(
  *
  * The user's `opencode.server_url` wins and skips discovery. Without it, AFT
  * looks for the server it is itself running in: first a service registration
- * whose pid is this process, then the port and password this process was
- * started with. Every candidate is verified with one authenticated health call
- * whose answer must name this process, so a prompt never goes to some other
- * OpenCode server that happens to be running.
+ * whose pid is this process, then the TCP ports this process listens on, with
+ * the password it was started with. Every candidate is verified with one
+ * authenticated health call whose answer must name this process, so a prompt
+ * never goes to some other OpenCode server that happens to be running.
  */
 export async function discoverPromptServer(
   settings: V2PromptServerSettings | undefined,
@@ -434,8 +476,6 @@ export async function discoverPromptServer(
 ): Promise<V2PromptChannelResult> {
   const resolved: Required<V2DiscoveryOptions> = {
     timeoutMs: options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
-    defaultPort: options.defaultPort ?? OPENCODE_DEFAULT_SERVE_PORT,
-    defaultPortAttempts: options.defaultPortAttempts ?? DEFAULT_PORT_ATTEMPTS,
   };
   const serverUrl = settings?.server_url;
   if (serverUrl !== undefined && serverUrl.trim() !== "") {
@@ -477,8 +517,136 @@ export function currentServerProcess(): V2ServerProcess {
       );
       return read.filter((entry) => entry !== undefined);
     },
+    listeningSockets: () => listeningSocketsOf(globalThis.process.pid),
     fetch: (url, init) => fetch(url, init),
   };
+}
+
+/** Run a short system command, bounded, with no console window on Windows. */
+function runCommand(file: string, args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      file,
+      [...args],
+      { timeout: LISTEN_LOOKUP_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" },
+      (error, stdout) => {
+        // lsof exits 1 when it matched nothing; that is an empty answer, not a failure.
+        const code = (error as { code?: unknown } | null)?.code;
+        if (error && !(code === 1 && file === "lsof")) reject(error);
+        else resolve(String(stdout ?? ""));
+      },
+    );
+  });
+}
+
+/** Split `host:port`, `[v6]:port` or `*:port` into its parts. */
+function splitHostPort(value: string): V2ListeningSocket | undefined {
+  const separator = value.lastIndexOf(":");
+  if (separator < 0) return undefined;
+  const port = Number(value.slice(separator + 1));
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return undefined;
+  return { address: value.slice(0, separator).replace(/^\[(.*)\]$/, "$1"), port };
+}
+
+/** Parse `lsof -F n` output: one `n<address>:<port>` line per socket. */
+export function parseLsofListening(output: string): V2ListeningSocket[] {
+  return output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("n"))
+    .map((line) => splitHostPort(line.slice(1)))
+    .filter((socket) => socket !== undefined);
+}
+
+/**
+ * Parse `netstat -ano` output for one pid. A listening row is recognized by
+ * its zero foreign port rather than by the state column, which Windows
+ * translates on non-English systems.
+ */
+export function parseNetstatListening(output: string, pid: number): V2ListeningSocket[] {
+  const sockets: V2ListeningSocket[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const columns = line.trim().split(/\s+/);
+    if (columns.length < 5 || !columns[0]?.toUpperCase().startsWith("TCP")) continue;
+    if (Number(columns[columns.length - 1]) !== pid) continue;
+    if (!/:0$/.test(columns[2] ?? "")) continue;
+    const socket = splitHostPort(columns[1] ?? "");
+    if (socket) sockets.push(socket);
+  }
+  return sockets;
+}
+
+/**
+ * Decode an address from `/proc/net/tcp{,6}`, where each 8-digit hex word
+ * stores its bytes in little-endian order (so 127.0.0.1 reads `0100007F`).
+ */
+function procAddress(hex: string): string {
+  const bytes: number[] = [];
+  for (let word = 0; word < hex.length; word += 8) {
+    const chunk = hex.slice(word, word + 8);
+    for (let index = 6; index >= 0; index -= 2) {
+      bytes.push(Number.parseInt(chunk.slice(index, index + 2), 16));
+    }
+  }
+  if (bytes.length === 4) return bytes.join(".");
+  const groups: string[] = [];
+  for (let index = 0; index < bytes.length; index += 2) {
+    groups.push((((bytes[index] ?? 0) << 8) | (bytes[index + 1] ?? 0)).toString(16));
+  }
+  return groups.join(":");
+}
+
+/**
+ * Parse `/proc/net/tcp` or `/proc/net/tcp6` rows that are listening (state
+ * `0A`) on one of the given socket inodes.
+ */
+export function parseProcNetListening(
+  table: string,
+  inodes: ReadonlySet<string>,
+): V2ListeningSocket[] {
+  const sockets: V2ListeningSocket[] = [];
+  for (const line of table.split(/\r?\n/).slice(1)) {
+    const columns = line.trim().split(/\s+/);
+    if (columns[3] !== "0A" || !inodes.has(columns[9] ?? "")) continue;
+    const [address, port] = (columns[1] ?? "").split(":");
+    if (!address || !port) continue;
+    sockets.push({ address: procAddress(address), port: Number.parseInt(port, 16) });
+  }
+  return sockets;
+}
+
+/** Linux without lsof: match this process's socket descriptors to the kernel's tables. */
+async function procListening(pid: number): Promise<V2ListeningSocket[]> {
+  const descriptors = await readdir(`/proc/${pid}/fd`);
+  const inodes = new Set<string>();
+  await Promise.all(
+    descriptors.map(async (fd) => {
+      const target = await readlink(`/proc/${pid}/fd/${fd}`).catch(() => "");
+      const inode = /^socket:\[(\d+)\]$/.exec(target)?.[1];
+      if (inode) inodes.add(inode);
+    }),
+  );
+  const tables = await Promise.all(
+    ["/proc/net/tcp", "/proc/net/tcp6"].map((path) => readFile(path, "utf8").catch(() => "")),
+  );
+  return tables.flatMap((table) => parseProcNetListening(table, inodes));
+}
+
+/** Ask the operating system which TCP ports `pid` listens on. */
+export async function listeningSocketsOf(pid: number): Promise<V2ListeningSocket[]> {
+  if (globalThis.process.platform === "win32") {
+    return parseNetstatListening(await runCommand("netstat", ["-ano", "-p", "TCP"]), pid).concat(
+      parseNetstatListening(await runCommand("netstat", ["-ano", "-p", "TCPv6"]), pid),
+    );
+  }
+  try {
+    return parseLsofListening(
+      await runCommand("lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"]),
+    );
+  } catch (error) {
+    const missing = (error as { code?: unknown }).code === "ENOENT";
+    if (!missing || globalThis.process.platform !== "linux") throw error;
+    return await procListening(pid);
+  }
 }
 
 /**

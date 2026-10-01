@@ -7,8 +7,13 @@ import {
 } from "../../src/permissions/v2.js";
 import {
   createV2PromptChannel,
+  currentServerProcess,
   discoverPromptServer,
   ownListenAddress,
+  parseLsofListening,
+  parseNetstatListening,
+  parseProcNetListening,
+  type V2ListeningSocket,
   type V2ServerProcess,
 } from "../../src/permissions/v2-service.js";
 
@@ -67,7 +72,11 @@ function fakeOpenCodeServer(pid: number, password: string, port = 0): FakeServer
   return fake;
 }
 
-/** Two listeners on consecutive ports, for the `opencode serve` default-port walk. */
+/**
+ * Two listeners on consecutive ports: someone else's server, and this
+ * process's server on the port after it, where `opencode serve` lands when
+ * the first one is taken.
+ */
 function consecutiveServers(
   first: { pid: number; password: string },
   second: { pid: number; password: string },
@@ -89,15 +98,30 @@ function serverProcess(options: {
   argv?: string[];
   env?: Record<string, string | undefined>;
   registrations?: { path: string; text: string }[];
-}): V2ServerProcess {
+  /** What the operating system reports this process listens on, or why it could not say. */
+  listening?: V2ListeningSocket[] | Error;
+}): V2ServerProcess & { readonly lookups: () => number } {
+  let lookups = 0;
   return {
     pid: OWN_PID,
     argv: ["/usr/local/bin/opencode", "/$bunfs/root/opencode", ...(options.argv ?? ["serve"])],
     env: options.env ?? {},
     registrations: async () => options.registrations ?? [],
+    listeningSockets: async () => {
+      lookups += 1;
+      if (options.listening instanceof Error) throw options.listening;
+      return options.listening ?? [];
+    },
     fetch: (url, init) => fetch(url, init),
+    lookups: () => lookups,
   };
 }
+
+/** The socket an `opencode serve --hostname 0.0.0.0` reports for this server. */
+const listensOn = (server: FakeServer, address = "*"): V2ListeningSocket => ({
+  address,
+  port: server.port,
+});
 
 function registration(server: FakeServer, pid: number, password: string) {
   return {
@@ -208,32 +232,49 @@ describe("OpenCode V2 prompt server: the opencode.server_url setting", () => {
 });
 
 describe("OpenCode V2 prompt server: discovering the server AFT runs in", () => {
-  test("picks this process's own --port and OPENCODE_SERVER_PASSWORD", async () => {
+  test("probes the port this process listens on, with its OPENCODE_SERVER_PASSWORD", async () => {
+    const own = fakeOpenCodeServer(OWN_PID, "own-secret");
+    const process = serverProcess({
+      argv: ["serve", `--port=${own.port}`, "--hostname", "0.0.0.0"],
+      env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
+      listening: [listensOn(own, "0.0.0.0")],
+    });
+    const result = await discoverPromptServer(undefined, process);
+    expect(result.unavailable).toBeUndefined();
+    expect(process.lookups()).toBe(1);
+    expect(probes(own)).toEqual([`GET /api/info ${basic("own-secret")}`]);
+  });
+
+  test("without --port finds the port from this process's own listening sockets", async () => {
     const own = fakeOpenCodeServer(OWN_PID, "own-secret");
     const result = await discoverPromptServer(
       undefined,
       serverProcess({
-        argv: ["serve", `--port=${own.port}`, "--hostname", "0.0.0.0"],
         env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
+        listening: [listensOn(own, "127.0.0.1")],
       }),
     );
     expect(result.unavailable).toBeUndefined();
     expect(probes(own)).toEqual([`GET /api/info ${basic("own-secret")}`]);
   });
 
-  test("without --port walks the default ports and skips another process's server", async () => {
-    const [other, own] = consecutiveServers(
+  test("a server on the next port that this process does not own is never sent the password", async () => {
+    // `opencode serve` without --port starts at 4096 and moves up, so another
+    // server often sits on the port a walk from 4096 would reach first. Only
+    // ports this process listens on may receive the password.
+    const [next, own] = consecutiveServers(
       { pid: TUI_PID, password: "shared-secret" },
       { pid: OWN_PID, password: "shared-secret" },
     );
     const result = await discoverPromptServer(
       undefined,
-      serverProcess({ env: { OPENCODE_SERVER_PASSWORD: "shared-secret" } }),
-      { defaultPort: other.port, defaultPortAttempts: 2 },
+      serverProcess({
+        env: { OPENCODE_SERVER_PASSWORD: "shared-secret" },
+        listening: [listensOn(own)],
+      }),
     );
     expect(result.unavailable).toBeUndefined();
-    expect(probes(other)).toHaveLength(1);
-    expect(probes(own)).toHaveLength(1);
+    expect(next.requests).toEqual([]);
     await result.client?.permission
       .create({
         sessionID: "s",
@@ -244,9 +285,112 @@ describe("OpenCode V2 prompt server: discovering the server AFT runs in", () => 
         source: { type: "tool", messageID: "m", id: "c" },
       })
       .catch(() => undefined);
-    // The prompt went to this process's server, not the one answering first.
     expect(own.requests.some((entry) => !entry.startsWith("GET /api/info"))).toBe(true);
-    expect(other.requests.some((entry) => !entry.startsWith("GET /api/info"))).toBe(false);
+    expect(next.requests).toEqual([]);
+  });
+
+  test("a failed port lookup refuses without probing anything", async () => {
+    const own = fakeOpenCodeServer(OWN_PID, "own-secret");
+    const result = await discoverPromptServer(
+      undefined,
+      serverProcess({
+        env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
+        listening: new Error("spawn lsof ENOENT"),
+      }),
+    );
+    expect(result.client).toBeUndefined();
+    expect(result.reason).toBe("own_server_unaddressable");
+    expect(result.unavailable).toContain("spawn lsof ENOENT");
+    expect(result.unavailable).toContain('"opencode.server_url"');
+    expect(own.requests).toEqual([]);
+  });
+
+  test("a failed port lookup still trusts the --port this process was started with", async () => {
+    const own = fakeOpenCodeServer(OWN_PID, "own-secret");
+    const result = await discoverPromptServer(
+      undefined,
+      serverProcess({
+        argv: ["serve", "--port", String(own.port)],
+        env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
+        listening: new Error("lsof timed out"),
+      }),
+    );
+    expect(result.unavailable).toBeUndefined();
+    expect(probes(own)).toEqual([`GET /api/info ${basic("own-secret")}`]);
+  });
+
+  test("a --port this process does not listen on is refused without a probe", async () => {
+    const elsewhere = fakeOpenCodeServer(TUI_PID, "own-secret");
+    const own = fakeOpenCodeServer(OWN_PID, "own-secret");
+    const result = await discoverPromptServer(
+      undefined,
+      serverProcess({
+        argv: ["serve", "--port", String(elsewhere.port)],
+        env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
+        listening: [listensOn(own)],
+      }),
+    );
+    expect(result.reason).toBe("own_server_unaddressable");
+    expect(result.unavailable).toContain(`--port ${elsewhere.port} is not one of the ports`);
+    expect(elsewhere.requests).toEqual([]);
+    expect(own.requests).toEqual([]);
+  });
+
+  test("finds a server in this very process through the real port lookup", async () => {
+    // The test process plays the OpenCode server: it listens, answers with its
+    // own pid, and the platform's lookup has to report that port.
+    const own = fakeOpenCodeServer(globalThis.process.pid, "real-secret");
+    const real = currentServerProcess();
+    const sockets = await real.listeningSockets();
+    expect(sockets.map((socket) => socket.port)).toContain(own.port);
+
+    const result = await discoverPromptServer(undefined, {
+      ...real,
+      argv: ["opencode", "serve"],
+      env: { OPENCODE_SERVER_PASSWORD: "real-secret" },
+      registrations: async () => [],
+    });
+    expect(result.unavailable).toBeUndefined();
+    expect(probes(own)).toEqual([`GET /api/info ${basic("real-secret")}`]);
+  });
+
+  test("reads lsof, netstat and /proc listening tables", () => {
+    expect(
+      parseLsofListening("p42\nf12\nn*:4096\nf13\nn127.0.0.1:4097\nf14\nn[::1]:4098\n"),
+    ).toEqual([
+      { address: "*", port: 4096 },
+      { address: "127.0.0.1", port: 4097 },
+      { address: "::1", port: 4098 },
+    ]);
+    const netstat = [
+      "  Proto  Local Address          Foreign Address        State           PID",
+      "  TCP    0.0.0.0:4096           0.0.0.0:0              LISTENING       42",
+      "  TCP    127.0.0.1:5000         0.0.0.0:0              ABHÖREN         42",
+      "  TCP    127.0.0.1:4096         127.0.0.1:50000        ESTABLISHED     42",
+      "  TCP    0.0.0.0:7000           0.0.0.0:0              LISTENING       7",
+      "  TCP    [::]:4100              [::]:0                 LISTENING       42",
+    ].join("\r\n");
+    expect(parseNetstatListening(netstat, 42)).toEqual([
+      { address: "0.0.0.0", port: 4096 },
+      { address: "127.0.0.1", port: 5000 },
+      { address: "::", port: 4100 },
+    ]);
+    const tcp = [
+      "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+      "   0: 0100007F:1000 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1",
+      "   1: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 222 1",
+      "   2: 0100007F:1001 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 111 1",
+    ].join("\n");
+    expect(parseProcNetListening(tcp, new Set(["111"]))).toEqual([
+      { address: "127.0.0.1", port: 4096 },
+    ]);
+    const tcp6 = [
+      "  sl  local_address                         remote_address                        st",
+      "   0: 00000000000000000000000001000000:1000 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 333 1",
+    ].join("\n");
+    expect(parseProcNetListening(tcp6, new Set(["333"]))).toEqual([
+      { address: "0:0:0:0:0:0:0:1", port: 4096 },
+    ]);
   });
 
   test("ignores a service.json written by another process (a TUI's background service)", async () => {
@@ -258,6 +402,7 @@ describe("OpenCode V2 prompt server: discovering the server AFT runs in", () => 
         argv: ["serve", "--port", String(own.port)],
         env: { OPENCODE_SERVER_PASSWORD: "own-secret" },
         registrations: [registration(tuiService, TUI_PID, "tui-secret")],
+        listening: [listensOn(own)],
       }),
     );
     expect(result.unavailable).toBeUndefined();
