@@ -50,6 +50,29 @@ function freshTerminal() {
 }
 
 describe("Pi aft_inspect surface", () => {
+  test("heads unknown diagnostics PARTIAL, never FRESH, and collapses repeated phases", () => {
+    const phases = [
+      ...Array.from({ length: 3 }, () => ({ id: "lsp_start", producer: "typescript" })),
+      { id: "lsp_start", producer: "rust" },
+      { id: "lsp_quiescence", producer: "rust" },
+    ];
+    const terminal = parseInspectTerminal({
+      inspect_terminal: "partial",
+      partial_reason: "diagnostics unknown for rust, typescript",
+      wait_stamp: { text: "waited: yes; completed: lsp_start ×4", phases },
+    });
+    expect(terminal?.kind).toBe("PARTIAL");
+    const rendered = renderInspectTerminal(terminal!, "body");
+    const lines = rendered.split("\n");
+    expect(lines[0]).toBe("PARTIAL: diagnostics unknown for rust, typescript (see below)");
+    expect(rendered).not.toContain("FRESH");
+    expect(rendered).toContain("- lsp_start ×4 (typescript 3, rust 1)");
+    expect(rendered).toContain("- lsp_quiescence (rust)");
+    expect(lines.filter((line) => line.startsWith("- lsp_start"))).toHaveLength(1);
+
+    const fresh = parseInspectTerminal({ inspect_terminal: "fresh", wait_stamp: { phases } });
+    expect(renderInspectTerminal(fresh!).split("\n")[0]).toBe("FRESH");
+  });
   test("registers unless explicitly disabled (inspect.enabled is runtime-only)", () => {
     expect(__test__.resolveToolSurface({ disabled_tools: [] }).inspect).toBe(true);
     expect(

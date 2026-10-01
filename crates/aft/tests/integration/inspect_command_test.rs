@@ -3513,7 +3513,18 @@ fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
         !text.trim_start().starts_with('{'),
         "text is serialized JSON: {text}"
     );
-    assert!(text.starts_with("scope: 1 root"), "{text}");
+    // `src/main.rs` has no Cargo.toml, so Rust diagnostics are unknown and the
+    // rendered text opens with the partial header that names rust.
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some("PARTIAL: diagnostics unknown for rust (see below)"),
+        "{text}"
+    );
+    assert!(
+        lines.next().is_some_and(|line| line.starts_with("scope: 1 root")),
+        "{text}"
+    );
     assert!(text.contains("TODOs: 1"), "{text}");
 }
 
@@ -4882,7 +4893,7 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     );
     assert!(
         text.lines().any(|line| line
-            .starts_with("Incomplete diagnostics: producer typescript failed (")
+            .starts_with("Incomplete diagnostics: producer typescript @ web failed (")
             && line.contains(remedy)),
         "the producer line must carry the install remedy: {text}"
     );
@@ -4971,7 +4982,13 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     .expect("inspect response serializes");
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
+    // The Rust producer failed, so the completed result is partial and its
+    // reason names rust.
+    assert_eq!(response["inspect_terminal"], "partial");
+    assert_eq!(
+        response["partial_reason"], "diagnostics unknown for rust",
+        "{response:#}"
+    );
     assert_eq!(response["complete"], false);
     assert!(
         response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"]

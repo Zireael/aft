@@ -707,16 +707,23 @@ fn handle_inspect_payload(
     if request_deadline.is_some() {
         // Completed categories survive another scanner's budget exhaustion. Do
         // not reuse unverified stale rows as if they were current findings.
-        for outcome in outcomes.values_mut() {
+        for (category, outcome) in outcomes.iter_mut() {
             if !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
                     _ => "analysis did not finish within its wait budget".to_string(),
                 };
+                // Name the scanner that did not finish; the gap has no
+                // language server behind it.
+                let producer = if category.is_tier2() {
+                    format!("{} analysis (Tier-2)", category.as_str())
+                } else {
+                    format!("{} scanner", category.as_str())
+                };
                 *outcome = JobOutcome::Fresh {
                     payload: serde_json::json!({
                         "unavailable": true, "complete": false,
-                        "gaps": [{"kind": "analysis_incomplete", "reason": format!("{reason}; retry aft_inspect") }]
+                        "gaps": [{"kind": "analysis_incomplete", "producer": producer, "reason": format!("{reason}; retry aft_inspect") }]
                     }),
                 };
             }
@@ -742,13 +749,49 @@ fn handle_inspect_payload(
     if !runtime_notes.is_empty() {
         if let Some(text) = payload.get_mut("text") {
             if let Some(existing) = text.as_str() {
-                *text =
-                    serde_json::Value::String(format!("{existing}\n{}", runtime_notes.join("\n")));
+                *text = serde_json::Value::String(format!(
+                    "{existing}\n{}",
+                    collapse_runtime_notes(&runtime_notes).join("\n")
+                ));
             }
         }
         payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
     }
     Response::success(&req.id, payload)
+}
+
+/// Collapse runtime notes that differ only in their trailing parenthesized
+/// path, such as one "TypeScript 5.9.3: project installation (<tsserver>)"
+/// per TypeScript server, into one line with a count and the first path.
+/// Distinct notes keep their first-seen order.
+fn collapse_runtime_notes(notes: &[String]) -> Vec<String> {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for note in notes {
+        let (head, detail) = match note
+            .strip_suffix(')')
+            .and_then(|rest| rest.rsplit_once(" ("))
+        {
+            Some((head, detail)) => (head, detail),
+            None => (note.as_str(), ""),
+        };
+        match groups.iter_mut().find(|(known, _)| *known == head) {
+            Some((_, details)) => {
+                if !details.contains(&detail) {
+                    details.push(detail);
+                }
+            }
+            None => groups.push((head, vec![detail])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(head, details)| match details.as_slice() {
+            [""] => head.to_string(),
+            [detail] => format!("{head} ({detail})"),
+            [first, ..] => format!("{head} ×{} (first: {first})", details.len()),
+            [] => head.to_string(),
+        })
+        .collect()
 }
 
 /// The language servers a scoped inspect answers for. A blocking request
@@ -1585,6 +1628,39 @@ enum InspectTerminal {
     },
 }
 
+/// Why a completed inspect is partial, or `None` when its diagnostics are
+/// authoritative (or were not part of the answer). The reason names every
+/// producer the diagnostics gaps attribute, in first-seen order, for example
+/// "diagnostics unknown for rust, typescript".
+pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<String> {
+    let diagnostics = payload.get("summary")?.get("diagnostics")?;
+    if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let mut producers = Vec::<String>::new();
+    for gap in diagnostics
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let producer = gap
+            .get("producer")
+            .or_else(|| gap.get("cause").and_then(|cause| cause.get("producer")))
+            .and_then(Value::as_str);
+        if let Some(producer) = producer {
+            if !producers.iter().any(|known| known == producer) {
+                producers.push(producer.to_string());
+            }
+        }
+    }
+    Some(if producers.is_empty() {
+        "diagnostics unknown".to_string()
+    } else {
+        format!("diagnostics unknown for {}", producers.join(", "))
+    })
+}
+
 fn build_inspect_terminal(
     request_id: &str,
     log: &InspectPhaseLog,
@@ -1600,10 +1676,25 @@ fn build_inspect_terminal(
                     "inspect payload was not an object",
                 );
             };
+            // A completed request whose diagnostics are unknown for some
+            // producer is not fresh: it is partial, and its header says so
+            // and for which producers, so a reader never sees FRESH above
+            // "diagnostics: unknown".
+            let partial = partial_terminal_reason(payload);
             payload.insert(
                 "inspect_terminal".to_string(),
-                Value::String("fresh".to_string()),
+                Value::String(
+                    if partial.is_some() {
+                        "partial"
+                    } else {
+                        "fresh"
+                    }
+                    .to_string(),
+                ),
             );
+            if let Some(reason) = partial {
+                payload.insert("partial_reason".to_string(), Value::String(reason));
+            }
             payload.insert(
                 "wait_stamp".to_string(),
                 serde_json::json!({
@@ -2489,13 +2580,33 @@ fn render_incomplete_categories(
             if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
                 // Not a failure: the producer is still checking, and the
                 // reason names it.
-                lines.push(format!("Incomplete {category}: {reason}"));
+                match gap.get("root").and_then(Value::as_str) {
+                    Some(root) => {
+                        lines.push(format!("Incomplete {category}: {reason} (root {root})"))
+                    }
+                    None => lines.push(format!("Incomplete {category}: {reason}")),
+                }
+                continue;
+            }
+            if gap.get("kind").and_then(Value::as_str) == Some("analysis_incomplete") {
+                // A scanner, not a language server, did not finish.
+                let producer = gap
+                    .get("producer")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("{category} scan"), str::to_owned);
+                lines.push(format!(
+                    "Incomplete {category}: {producer} did not finish ({reason})"
+                ));
                 continue;
             }
             let producer = gap
                 .get("producer")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown producer");
+            let producer = match gap.get("root").and_then(Value::as_str) {
+                Some(root) => format!("{producer} @ {root}"),
+                None => producer.to_string(),
+            };
             lines.push(format!(
                 "Incomplete {category}: producer {producer} failed ({reason})"
             ));
@@ -4884,7 +4995,7 @@ mod fresh_payload_tests {
                 "by_producer": {},
                 "complete": false,
                 "gaps": [
-                    { "kind": "failed_producer", "producer": "rust", "reason": cargo_error },
+                    { "kind": "failed_producer", "producer": "rust", "root": ".", "reason": cargo_error },
                     {
                         "kind": "uncovered_file",
                         "file": "src/lib.rs",
@@ -4919,7 +5030,7 @@ mod fresh_payload_tests {
         );
         assert!(
             text.contains(&format!(
-                "Incomplete diagnostics: producer rust failed ({cargo_error})"
+                "Incomplete diagnostics: producer rust @ . failed ({cargo_error})"
             )),
             "{text}"
         );
@@ -4931,7 +5042,7 @@ mod fresh_payload_tests {
         );
         assert!(
             text.contains(
-                "diagnostics: unknown (producer rust failed, reason above; 1 file without an authoritative report)"
+                "diagnostics: unknown (producer rust @ . failed, reason above; 1 file without an authoritative report)"
             ),
             "{text}"
         );
@@ -5242,6 +5353,60 @@ mod deferred_terminal_tests {
             "stat_verification"
         );
         assert!(failed.data.get("failed_phase").is_none());
+    }
+
+    fn diagnostics_payload(diagnostics: Value) -> Value {
+        serde_json::json!({"summary": {"diagnostics": diagnostics}, "text": "body"})
+    }
+
+    /// A completed request whose diagnostics are unknown for any producer is
+    /// PARTIAL, never FRESH, and its reason names every producer the gaps
+    /// attribute, from failure rows and from uncovered scoped files alike.
+    #[test]
+    fn unknown_diagnostics_make_the_terminal_partial_and_name_producers() {
+        let log = InspectPhaseLog::for_request("inspect-partial-header");
+        let payload = diagnostics_payload(serde_json::json!({
+            "complete": false,
+            "gaps": [
+                {"kind": "failed_producer", "producer": "rust", "root": "spikes/x", "reason": "Failed to load workspaces."},
+                {"kind": "failed_producer", "producer": "rust", "root": ".", "reason": "still indexing"},
+                {"kind": "uncovered_file", "file": "a.ts", "reason": "no report", "cause": {"producer": "typescript", "root": ".", "reason": "x"}}
+            ]
+        }));
+        let response = build_inspect_terminal(
+            "inspect-partial-header",
+            &log,
+            InspectTerminal::Fresh(payload),
+        );
+        assert!(response.success);
+        assert_eq!(response.data["inspect_terminal"], "partial");
+        assert_eq!(
+            response.data["partial_reason"],
+            "diagnostics unknown for rust, typescript"
+        );
+        assert!(response.data["wait_stamp"]["text"].is_string());
+        let rendered = crate::subc_format::format_inspect_for_test(&response);
+        assert_eq!(
+            rendered.lines().next(),
+            Some("PARTIAL: diagnostics unknown for rust, typescript (see below)")
+        );
+    }
+
+    #[test]
+    fn authoritative_diagnostics_keep_the_terminal_fresh() {
+        let log = InspectPhaseLog::for_request("inspect-fresh-header");
+        let payload = diagnostics_payload(serde_json::json!({
+            "errors": 0, "warnings": 0, "info": 0, "hints": 0, "items": []
+        }));
+        let response = build_inspect_terminal(
+            "inspect-fresh-header",
+            &log,
+            InspectTerminal::Fresh(payload),
+        );
+        assert_eq!(response.data["inspect_terminal"], "fresh");
+        assert!(response.data.get("partial_reason").is_none());
+        let rendered = crate::subc_format::format_inspect_for_test(&response);
+        assert!(!rendered.contains("PARTIAL"), "{rendered}");
     }
 
     #[test]

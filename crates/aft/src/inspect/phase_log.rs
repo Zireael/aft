@@ -285,20 +285,67 @@ pub fn inspect_phase_log_for_request(request_id: &str) -> Option<InspectPhaseLog
 
 /// The only formatter for the human wait text. Callers obtain both inputs from
 /// [`InspectPhaseLog::terminal_inputs`] rather than reconstructing them.
+///
+/// Phases are counted, not listed: a project with two dozen language servers
+/// completes `lsp_start` two dozen times, and naming each one buried the
+/// line. Each phase appears once, in first-completed order, with its count
+/// and a per-producer (or per-category) breakdown, largest first:
+/// `lsp_start ×25 (typescript 12, bash 6, rust 4, python 2, biome 1)`.
 pub fn format_wait_text(entries: &[InspectPhaseEntry], blocking_waited: bool) -> String {
     let completed = if entries.is_empty() {
         "none".to_string()
     } else {
-        entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
+        collapse_phase_entries(entries).join(", ")
     };
     format!(
         "waited: {}; completed: {completed}",
         if blocking_waited { "yes" } else { "no" }
     )
+}
+
+/// One summary per phase id: `id`, `id (label)` for a single attributed
+/// entry, or `id ×N (label n, ...)` for several.
+pub fn collapse_phase_entries(entries: &[InspectPhaseEntry]) -> Vec<String> {
+    let mut phases: Vec<(InspectPhaseId, Vec<(String, usize)>, usize)> = Vec::new();
+    for entry in entries {
+        let index = match phases.iter().position(|(id, _, _)| *id == entry.id) {
+            Some(index) => index,
+            None => {
+                phases.push((entry.id, Vec::new(), 0));
+                phases.len() - 1
+            }
+        };
+        let (_, labels, count) = &mut phases[index];
+        *count += 1;
+        if let Some(label) = entry.producer.as_ref().or(entry.category.as_ref()) {
+            match labels.iter_mut().find(|(known, _)| known == label) {
+                Some((_, n)) => *n += 1,
+                None => labels.push((label.clone(), 1)),
+            }
+        }
+    }
+    phases
+        .into_iter()
+        .map(|(id, mut labels, count)| {
+            // `sort_by` is stable, so labels with equal counts keep the
+            // order in which their phases first completed.
+            labels.sort_by(|left, right| right.1.cmp(&left.1));
+            let id = id.as_str();
+            match (count, labels.as_slice()) {
+                (_, []) if count == 1 => id.to_string(),
+                (_, []) => format!("{id} ×{count}"),
+                (1, [(label, _)]) => format!("{id} ({label})"),
+                _ => format!(
+                    "{id} ×{count} ({})",
+                    labels
+                        .iter()
+                        .map(|(label, n)| format!("{label} {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -316,14 +363,49 @@ mod tests {
         let (entries, waited) = log.terminal_inputs();
         assert_eq!(
             format_wait_text(&entries, waited),
-            "waited: no; completed: stat_verification"
+            "waited: no; completed: stat_verification (dead_code)"
         );
 
         log.note_blocking_wait();
         let (entries, waited) = log.terminal_inputs();
         assert_eq!(
             format_wait_text(&entries, waited),
-            "waited: yes; completed: stat_verification"
+            "waited: yes; completed: stat_verification (dead_code)"
+        );
+    }
+
+    fn lsp_entry(id: InspectPhaseId, producer: &str) -> InspectPhaseEntry {
+        InspectPhaseEntry {
+            id,
+            producer: Some(producer.to_string()),
+            category: None,
+            also_satisfied: None,
+        }
+    }
+
+    /// Repeated phases collapse to one count per phase with a per-producer
+    /// breakdown, largest first, ties in first-seen order.
+    #[test]
+    fn wait_text_counts_repeated_phases_per_producer() {
+        let mut entries = Vec::new();
+        for (producer, count) in [("bash", 2), ("typescript", 3), ("rust", 1), ("biome", 1)] {
+            for _ in 0..count {
+                entries.push(lsp_entry(InspectPhaseId::LspStart, producer));
+            }
+        }
+        entries.push(lsp_entry(InspectPhaseId::LspQuiescence, "rust"));
+        entries.push(InspectPhaseEntry::category(
+            InspectPhaseId::Tier2Rescan,
+            InspectCategory::DeadCode,
+        ));
+        entries.push(InspectPhaseEntry::category(
+            InspectPhaseId::Tier2Rescan,
+            InspectCategory::Duplicates,
+        ));
+        assert_eq!(
+            format_wait_text(&entries, true),
+            "waited: yes; completed: lsp_start ×7 (typescript 3, bash 2, rust 1, biome 1), \
+             lsp_quiescence (rust), tier2_rescan ×2 (dead_code 1, duplicates 1)"
         );
     }
 

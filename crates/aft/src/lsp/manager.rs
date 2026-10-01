@@ -4105,7 +4105,10 @@ impl LspManager {
         if let Some(client) = self.clients.get_mut(&key) {
             client.rust_analyzer_warning = (health == Some("warning") && !reports_failure)
                 .then(|| format!("rust-analyzer warning: {message}"));
-            client.set_diagnostic_failure(failure.clone());
+            let failure = failure
+                .clone()
+                .map(|failure| rust_failure_with_root_cause(&failure, &client.stderr_tail()));
+            client.set_diagnostic_failure(failure);
         }
         if failure.is_some() {
             // Earlier reports cannot certify a workspace whose metadata or check failed.
@@ -4571,6 +4574,28 @@ fn typescript_runtime_options(
         options,
         format!("TypeScript {version}: {source} ({})", path.display()),
     ))
+}
+
+/// When rust-analyzer fails to load a workspace, its `experimental/serverStatus`
+/// message says only "Failed to load workspaces."; the cause (for example
+/// Cargo's "cannot update the lock file ... because --locked was passed") goes
+/// to the server's stderr. Append the last Cargo `error:` line from that
+/// stderr so the failure names what to fix. A message that already carries an
+/// `error:` line is kept as it is.
+pub(crate) fn rust_failure_with_root_cause(message: &str, stderr_tail: &str) -> String {
+    let message = message.trim_end();
+    if message.contains("error:") {
+        return message.to_string();
+    }
+    let cause = stderr_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("error:"));
+    match cause {
+        Some(cause) => format!("{message} {cause}"),
+        None => message.to_string(),
+    }
 }
 
 fn typescript_initialize_failure_reason(
@@ -5863,7 +5888,28 @@ mod windows_server_key_tests {
 
 #[cfg(test)]
 mod failure_hint_tests {
-    use super::{failure_hint, rustup_missing_component};
+    use super::{failure_hint, rust_failure_with_root_cause, rustup_missing_component};
+
+    /// rust-analyzer's bare "Failed to load workspaces." status gains the
+    /// Cargo error line from its stderr; a status that already quotes Cargo's
+    /// error is left alone.
+    #[test]
+    fn failed_workspace_load_quotes_the_cargo_error_line() {
+        let stderr = "WARN `cargo metadata` failed\n\
+            error: cannot update the lock file /x/Cargo.lock because --locked was passed to prevent this\n\
+            help: to generate the lock file without accessing the network, remove the --locked flag\n\
+            Stack backtrace:\n   0: frame";
+        assert_eq!(
+            rust_failure_with_root_cause("Failed to load workspaces.\n\n", stderr),
+            "Failed to load workspaces. error: cannot update the lock file /x/Cargo.lock because --locked was passed to prevent this"
+        );
+        let detailed = "Failed to read Cargo metadata: error: cannot update the lock file";
+        assert_eq!(rust_failure_with_root_cause(detailed, stderr), detailed);
+        assert_eq!(
+            rust_failure_with_root_cause("Failed to load workspaces.", ""),
+            "Failed to load workspaces."
+        );
+    }
 
     #[test]
     fn detects_rustup_proxy_without_component() {
@@ -6315,10 +6361,10 @@ mod inspect_path_tests {
         assert!(snapshot.candidates.is_empty());
     }
 
-    /// A whole-project walk starts no server for test fixtures, spikes, or
-    /// ignored directories, each of which here is its own Cargo workspace that
-    /// would otherwise get its own rust-analyzer. A scope that names such a
-    /// directory still gets its server.
+    /// The whole-project walk skips test fixtures, spikes, and ignored
+    /// directories, each of which here is its own Cargo workspace that would
+    /// otherwise get its own rust-analyzer. A request whose scope is one of
+    /// those directories still starts the server for it.
     #[test]
     fn applicability_walk_skips_fixtures_spikes_and_ignored_directories() {
         let temp_dir = tempfile::tempdir().expect("tempdir");

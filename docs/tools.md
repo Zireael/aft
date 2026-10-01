@@ -924,6 +924,38 @@ Parameters: `sections` (string or array of category names, or `"all"`; omit for 
 `scope` (file or directory to restrict results to — applied as a result filter), `topK` (max
 drill-down items per category, default 20).
 
+#### Terminal results
+
+Every call ends in exactly one terminal result, named by `inspect_terminal` and rendered as the
+first line of the tool output:
+
+| `inspect_terminal` | Header | Meaning |
+|---|---|---|
+| `fresh` | `FRESH` | Completed, and every diagnostics producer gave an authoritative answer. Carries `wait_stamp` (`text` and `phases`). |
+| `partial` | `PARTIAL: diagnostics unknown for rust, typescript (see below)` | Completed with the same payload and `wait_stamp` as `fresh`, but diagnostics are unknown for the named producers. `partial_reason` holds the header text without the `PARTIAL:` prefix. The body names each producer and its server root, for example `Incomplete diagnostics: producer rust @ spikes/x failed (...)`. |
+| `interrupted` | prose | Cancelled before completion; `completed_phases` lists what finished. |
+| `phase_failed` | prose | A phase failed; `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` say which and why. |
+
+`FRESH` never heads a result whose diagnostics summary reads `diagnostics: unknown`. A missing
+language server binary (for example `docker-langserver`) leaves its files' diagnostics unknown and
+the result `partial`; install the server or disable it with `lsp.disabled` to get `fresh`.
+
+The wait stamp counts phases instead of listing each one:
+`waited: yes; completed: lsp_start ×9 (typescript 3, python 2, bash 1, ...), lsp_quiescence ×9 (...), tier2_rescan ×5 (...)`.
+Repeated TypeScript runtime notes collapse the same way
+(`TypeScript 5.9.3: project installation ×3 (first: ...)`).
+
+#### Which language servers start
+
+A blocking inspect walks the project (or the scope) and starts one server per (server, workspace
+root) its files need, all at once, under one shared startup deadline. The walk honors `.gitignore`
+and `.aftignore`, and skips dependency and build output directories, test-fixture directories
+(`fixtures`, `__fixtures__`, `testdata`, `test-data`, `__mocks__`, `__snapshots__`, `corpora`) and
+`spikes/`, unless the scope itself names one of them. Roots are shared where one server can serve
+several packages: TypeScript packages that see the same installed TypeScript version share one
+server, and Bash and YAML use the outermost root marker in the project. Rust uses the owning Cargo
+workspace.
+
 Registered on the `recommended` and `all` tiers; disable via `inspect.enabled: false` in config.
 
 ---

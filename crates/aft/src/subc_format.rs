@@ -2223,12 +2223,36 @@ fn format_inspect(response: &Response) -> String {
     if let Some(text) = format_inspect_terminal(&response.data) {
         return text;
     }
-    if let Some(text) = response.data.get("text").and_then(Value::as_str) {
-        return append_rendered_diagnostics(text, &response.data);
+    let body = if let Some(text) = response.data.get("text").and_then(Value::as_str) {
+        append_rendered_diagnostics(text, &response.data)
+    } else {
+        let json =
+            serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
+        append_rendered_diagnostics(&json, &response.data)
+    };
+    match inspect_partial_header(&response.data) {
+        Some(header) => format!("{header}\n{body}"),
+        None => body,
     }
-    let json =
-        serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
-    append_rendered_diagnostics(&json, &response.data)
+}
+
+#[cfg(test)]
+pub(crate) fn format_inspect_for_test(response: &Response) -> String {
+    format_inspect(response)
+}
+
+/// The one-line header of a partial inspect: it completed, but diagnostics
+/// are unknown for the named producers. Mirrors the OpenCode and Pi
+/// renderers.
+fn inspect_partial_header(data: &Value) -> Option<String> {
+    if data.get("inspect_terminal").and_then(Value::as_str) != Some("partial") {
+        return None;
+    }
+    let reason = data
+        .get("partial_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("diagnostics unknown");
+    Some(format!("PARTIAL: {reason} (see below)"))
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts appendRenderedDiagnostics.
@@ -2311,7 +2335,13 @@ pub(crate) fn format_diagnostics_summary_with(
             .iter()
             .filter(|gap| gap.get("kind").and_then(Value::as_str) != Some("uncovered_file"))
             .map(|gap| {
-                let producer = gap.get("producer").and_then(Value::as_str);
+                let producer =
+                    gap.get("producer").and_then(Value::as_str).map(|producer| {
+                        match gap.get("root").and_then(Value::as_str) {
+                            Some(root) => format!("{producer} @ {root}"),
+                            None => producer.to_string(),
+                        }
+                    });
                 let reason = gap
                     .get("reason")
                     .and_then(Value::as_str)
@@ -2322,12 +2352,13 @@ pub(crate) fn format_diagnostics_summary_with(
                 if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
                     return reason.to_string();
                 }
-                if let (true, Some(producer)) = (gap_reasons_rendered_above, producer) {
+                if let (true, Some(producer)) = (gap_reasons_rendered_above, &producer) {
                     return format!("producer {producer} failed, reason above");
                 }
                 format!(
                     "{}: {reason}",
                     producer
+                        .as_deref()
                         .or_else(|| gap.get("file").and_then(Value::as_str))
                         .unwrap_or("unknown producer"),
                 )

@@ -81,7 +81,9 @@ struct DiagnosticsCollection {
     producer_reports: Vec<(String, PathBuf, Vec<CollectedDiagnostic>)>,
     server_ran: bool,
     applicability_is_empty: bool,
-    servers_pending: BTreeSet<String>,
+    /// Unsettled producers, by server id and workspace root, so each gap row
+    /// can name the root whose server has not settled.
+    servers_pending: BTreeSet<(String, PathBuf)>,
     producer_failures: BTreeMap<String, String>,
     /// `producer_failures` keyed by server instance instead of server id, so a
     /// scoped file can be attributed to the failure of the server for its own
@@ -98,11 +100,14 @@ struct DiagnosticsCollection {
     /// `server_ran`: a quiesced producer may never publish, and that empty
     /// store is still a complete answer.
     producers_settled: bool,
-    indexing_gaps: BTreeMap<String, String>,
-    /// Server ids of rust-analyzer producers whose `cargo check` had not
+    /// Why each server, by server id and workspace root, had not finished
+    /// its initial indexing when the blocking wait ran out. Keyed by root as
+    /// well as id so each gap row names the workspace it is about.
+    indexing_gaps: BTreeMap<(String, PathBuf), String>,
+    /// Server ids and roots of rust-analyzer producers whose `cargo check` had not
     /// finished when the wait ran out. Their published reports lack the
     /// compiler's newest results, so totals cannot be certified.
-    checking_producers: BTreeSet<String>,
+    checking_producers: BTreeSet<(String, PathBuf)>,
 }
 
 /// Collect diagnostics for the explicit inspect path.
@@ -182,7 +187,7 @@ pub(crate) fn run_diagnostics_category(
     };
     collection.indexing_gaps = indexing_gaps
         .iter()
-        .map(|(server, reason)| (server_id(server), reason.clone()))
+        .map(|(server, reason)| ((server_id(server), server.root.clone()), reason.clone()))
         .collect();
     // A producer whose `cargo check` was still running is not indexing. Its
     // gap moves from `indexing_gaps` to `checking_producers`, so it is not
@@ -195,9 +200,12 @@ pub(crate) fn run_diagnostics_category(
         !checking
     });
     if let Some(sweep) = &sweep {
-        collection
-            .checking_producers
-            .extend(sweep.still_checking.iter().map(server_id));
+        collection.checking_producers.extend(
+            sweep
+                .still_checking
+                .iter()
+                .map(|key| (server_id(key), key.root.clone())),
+        );
     }
     collection.record_producer_failures(producer_failures, &snapshot.project_root);
     collection.not_applicable = not_applicable
@@ -309,7 +317,9 @@ fn collect_warm_working_set(
                     .insert(server.clone(), reason.to_string());
             }
             if !lsp.producer_has_settled(server) {
-                collection.servers_pending.insert(server_id(server));
+                collection
+                    .servers_pending
+                    .insert((server_id(server), server.root.clone()));
             }
         }
         collection.producers_settled =
@@ -614,7 +624,10 @@ impl DiagnosticsCollection {
                     } else if lsp.server_is_warming(&key) {
                         (
                             1,
-                            self.indexing_gaps.get(&producer).cloned().unwrap_or_else(|| {
+                            self.indexing_gaps
+                                .get(&(producer.clone(), root.clone()))
+                                .cloned()
+                                .unwrap_or_else(|| {
                                 "still indexing: the server has not finished its initial analysis"
                                     .to_string()
                             }),
@@ -704,17 +717,41 @@ impl DiagnosticsCollection {
         if !self.producer_notes.is_empty() {
             payload["notes"] = serde_json::json!(self.producer_notes);
         }
-        let mut gaps: Vec<Value> = self
-            .producer_failures
+        let mut failures = self.producer_failures_by_key.iter().collect::<Vec<_>>();
+        failures.sort_by(|(left, _), (right, _)| {
+            (left.kind.id_str(), &left.root).cmp(&(right.kind.id_str(), &right.root))
+        });
+        let mut gaps: Vec<Value> = failures
             .into_iter()
-            .map(|(producer, reason)| {
+            .map(|(server, reason)| {
                 serde_json::json!({
                     "kind": "failed_producer",
-                    "producer": producer,
+                    "producer": server_id(server),
+                    "root": display_root(snapshot, &server.root),
                     "reason": reason,
                 })
             })
             .collect();
+        // A failure recorded only under its server id (not under a server
+        // key) has no workspace root; it still becomes a gap row, without
+        // a root.
+        gaps.extend(
+            self.producer_failures
+                .iter()
+                .filter(|(producer, _)| {
+                    !self
+                        .producer_failures_by_key
+                        .keys()
+                        .any(|server| server.kind.id_str() == producer.as_str())
+                })
+                .map(|(producer, reason)| {
+                    serde_json::json!({
+                        "kind": "failed_producer",
+                        "producer": producer,
+                        "reason": reason,
+                    })
+                }),
+        );
         gaps.extend(self.scope_coverage_gaps.iter().map(|gap| {
             serde_json::json!({
                 "kind": "uncovered_file",
@@ -727,17 +764,23 @@ impl DiagnosticsCollection {
                 },
             })
         }));
-        for producer in self.servers_pending {
+        for (producer, root) in self.servers_pending {
+            let reason = self
+                .indexing_gaps
+                .get(&(producer.clone(), root.clone()))
+                .map(String::as_str)
+                .unwrap_or("producer has not settled");
             gaps.push(serde_json::json!({
                 "kind": "failed_producer", "producer": producer,
-                "reason": self.indexing_gaps.get(&producer).map(String::as_str)
-                    .unwrap_or("producer has not settled"),
+                "root": display_root(snapshot, &root),
+                "reason": reason,
             }));
         }
-        for producer in self.checking_producers {
+        for (producer, root) in self.checking_producers {
             gaps.push(serde_json::json!({
                 "kind": "checking_producer",
                 "producer": producer,
+                "root": display_root(snapshot, &root),
                 "reason": RUST_CHECK_RUNNING_REASON,
             }));
         }
@@ -1032,7 +1075,9 @@ mod payload_count_tests {
     #[test]
     fn incomplete_collection_cannot_be_promoted_to_a_payload() {
         let mut collection = collection();
-        collection.servers_pending.insert("rust-analyzer".into());
+        collection
+            .servers_pending
+            .insert(("rust-analyzer".into(), PathBuf::from("/repo")));
         assert!(!collection.is_complete());
     }
 
@@ -1108,6 +1153,35 @@ mod payload_count_tests {
         assert_eq!(payload["gaps"][0]["kind"], "failed_producer");
         assert_eq!(payload["gaps"][0]["producer"], "astro");
         assert_eq!(payload["gaps"][0]["reason"], "initialize failed");
+    }
+
+    /// Each failed server is its own gap row naming its workspace root, so
+    /// two failed rust-analyzer workspaces are told apart.
+    #[test]
+    fn producer_failure_gaps_name_their_server_root() {
+        let mut collection = collection();
+        for (root, reason) in [
+            ("/repo", "still indexing"),
+            ("/repo/spikes/x", "Failed to load workspaces."),
+        ] {
+            let key = ServerKey {
+                kind: ServerKind::Rust,
+                root: PathBuf::from(root),
+            };
+            collection
+                .producer_failures
+                .insert("rust".into(), reason.into());
+            collection
+                .producer_failures_by_key
+                .insert(key, reason.into());
+        }
+        let payload = collection.into_payload(&snapshot());
+        let gaps = payload["gaps"].as_array().expect("gaps");
+        assert_eq!(gaps.len(), 2, "{payload:#}");
+        assert_eq!(gaps[0]["root"], ".");
+        assert_eq!(gaps[0]["reason"], "still indexing");
+        assert_eq!(gaps[1]["root"], "spikes/x");
+        assert_eq!(gaps[1]["reason"], "Failed to load workspaces.");
     }
 
     #[test]
