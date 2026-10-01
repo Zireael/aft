@@ -27,8 +27,10 @@ use aft::migration::per_checkout::{
     legacy_semantic_path, legacy_trigram_path, run_import, Artifact, ImportLedger, ImportObserver,
     ImportOutcome, ImportRequest, ImportState, ImportStep,
 };
+#[cfg(unix)]
+use aft::migration::prune_legacy::PruneStep;
 use aft::migration::prune_legacy::{
-    prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneObserver, PruneOptions, PruneStep,
+    prune_legacy, CensusFinding, ProcessCensus, PruneExit, PruneObserver, PruneOptions,
     OPERATOR_CONTRACT, PRUNE_DIR_PREFIX,
 };
 use aft::search_index::SearchIndex;
@@ -43,6 +45,16 @@ use tempfile::tempdir;
 
 const KEY: &str = "family7";
 const SCOPE: &str = "scope7";
+
+/// The `aft` binary. Nextest remaps archive binaries into its extraction
+/// directory, so its runtime variables win over Cargo's compile-time path.
+fn aft_binary() -> PathBuf {
+    std::env::var_os("AFT_TEST_AFT_BINARY")
+        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")))
+}
 const CHILD_TEST: &str = "per_checkout_7::per_checkout_7_child";
 const POLICY: TrigramPolicy = TrigramPolicy {
     max_file_size: 1 << 20,
@@ -737,6 +749,7 @@ impl Script {
         self
     }
 
+    #[cfg(unix)]
     fn set(&self, answer: Result<Vec<CensusFinding>, String>) {
         let mut script = self.0.lock().unwrap();
         script.clear();
@@ -807,6 +820,7 @@ fn prune(
 }
 
 /// Everything except the imported legacy set.
+#[cfg(unix)]
 fn without_set(storage: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let set = legacy_tree(storage, KEY);
     tree(storage)
@@ -831,6 +845,10 @@ fn prune_areas(storage: &Path) -> Vec<PathBuf> {
 /// The positive case: the whole imported legacy set is removed once its
 /// retention passed, and every other byte (the v2 stores, the ledger, the
 /// never-imported set, the model cache, backups) is identical.
+///
+/// Unix only: directories are renamed aside only where `rename(2)` is atomic.
+/// Windows skips every set, which the next test asserts.
+#[cfg(unix)]
 #[test]
 fn prune_removes_the_whole_imported_set_and_nothing_else() {
     let base = tempdir().unwrap();
@@ -844,6 +862,27 @@ fn prune_removes_the_whole_imported_set_and_nothing_else() {
     }
     assert_same(&tree(&storage), &others, &out);
     assert!(prune_areas(&storage).is_empty());
+}
+
+/// On Windows a directory cannot be renamed aside atomically, so every
+/// eligible set is skipped and reported and nothing is deleted.
+#[cfg(windows)]
+#[test]
+fn windows_prune_skips_every_set_and_deletes_nothing() {
+    let base = tempdir().unwrap();
+    let storage = prune_fixture(base.path());
+    let before = tree(&storage);
+    let (exit, out) = prune(&storage, true, FIFTEEN_DAYS, &Script::clean(), None);
+    assert_eq!(exit, PruneExit::Skipped, "{out}");
+    assert!(
+        out.contains(&format!(
+            "Skipped {KEY}: directories cannot be renamed atomically"
+        )),
+        "{out}"
+    );
+    assert!(out.contains("Nothing was deleted"), "{out}");
+    assert_same(&tree(&storage), &before, &out);
+    assert!(prune_areas(&storage).is_empty(), "{out}");
 }
 
 /// Every refusal and every ineligible set retains all bytes.
@@ -928,14 +967,17 @@ fn an_unfinished_import_is_never_pruned() {
     assert_same(&tree(&storage), &before, "unfinished import");
 }
 
+#[cfg(unix)]
 struct OnStep<F: Fn(PruneStep<'_>)>(F);
 
+#[cfg(unix)]
 impl<F: Fn(PruneStep<'_>)> PruneObserver for OnStep<F> {
     fn reached(&self, step: PruneStep<'_>) {
         (self.0)(step)
     }
 }
 
+#[cfg(unix)]
 fn moved_tree(area: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     tree(&area.join(KEY))
         .into_iter()
@@ -952,6 +994,9 @@ fn moved_tree(area: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 /// rename finds no set, the second census sees the opener's process, and
 /// the moved set is kept intact with a non-zero exit. A later clean run
 /// removes the leftover.
+///
+/// Unix only, like every test that needs a set renamed aside.
+#[cfg(unix)]
 #[test]
 fn an_opener_between_census_and_rename_keeps_the_moved_set() {
     let base = tempdir().unwrap();
@@ -1006,6 +1051,9 @@ fn an_opener_between_census_and_rename_keeps_the_moved_set() {
 /// A process that arrives between the rename and the delete: the moved set
 /// is kept and reported, the exit is non-zero, and a later clean run
 /// removes it.
+///
+/// Unix only, like every test that needs a set renamed aside.
+#[cfg(unix)]
 #[test]
 fn a_process_arriving_before_the_delete_keeps_the_moved_set() {
     let base = tempdir().unwrap();
@@ -1060,7 +1108,7 @@ fn a_refused_rename_skips_the_set_and_deletes_nothing() {
 /// The help and the dry run carry the operator contract word for word.
 #[test]
 fn help_and_dry_run_state_the_operator_contract() {
-    let help = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let help = Command::new(aft_binary())
         .args(["cache", "prune-legacy", "--help"])
         .output()
         .unwrap();
@@ -1074,7 +1122,7 @@ fn help_and_dry_run_state_the_operator_contract() {
     let base = tempdir().unwrap();
     let storage = prune_fixture(base.path());
     let before = tree(&storage);
-    let dry = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let dry = Command::new(aft_binary())
         .args(["cache", "prune-legacy"])
         .env("AFT_STORAGE_DIR", &storage)
         .output()
@@ -1137,7 +1185,7 @@ fn the_census_sees_an_aft_executable_under_a_path_with_spaces() {
     let dir = base.path().join("with space").join("Application Support");
     fs::create_dir_all(&dir).unwrap();
     let executable = dir.join("aft");
-    fs::copy(env!("CARGO_BIN_EXE_aft"), &executable).unwrap();
+    fs::copy(aft_binary(), &executable).unwrap();
     // With stdin held open the standalone server keeps running.
     let child = KillOnDrop(
         Command::new(&executable)

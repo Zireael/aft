@@ -265,8 +265,20 @@ fn a_live_claim_is_single_flight_and_an_abandoned_one_is_taken_over() {
 fn a_dead_process_claim_is_taken_over() {
     let storage = tempfile::tempdir().unwrap();
     let ledger = ImportLedger::open(storage.path(), "key").unwrap();
-    // No process has pid u32::MAX - 1, so this owner is dead.
-    let dead = owner_of(u32::MAX - 1, 1, "dead");
+    // A process that has exited: liveness is checked through the OS for
+    // this pid, as for a crashed importer. An impossible pid would not do:
+    // some platforms cannot look it up and conservatively call it live.
+    let mut exited = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "no-such-test", "--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    // Release the handle, so nothing keeps the exited process's record open.
+    drop(exited);
+    let dead = owner_of(pid, 1, "dead");
     assert!(matches!(
         ledger.claim(Artifact::Semantic, &dead).unwrap(),
         Claim::Owned(_)
