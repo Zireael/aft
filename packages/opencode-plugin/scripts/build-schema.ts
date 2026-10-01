@@ -660,18 +660,18 @@ function buildSchema(): Record<string, unknown> {
                 enum: ["off", "onnx", "remote", "synapse"],
                 default: "off",
                 description:
-                  "Cross-encoder reranker for the head of aft_search results. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls an HTTP rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
+                  "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
               },
               model: {
                 type: "string",
                 minLength: 1,
                 description:
-                  "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3 or jina-reranker-v1-turbo. User config only.",
+                  "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only.",
               },
               endpoint: {
                 type: "string",
                 minLength: 1,
-                description: "URL of the remote rerank endpoint. User config only.",
+                description: "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
               },
               api_key_env: {
                 type: "string",

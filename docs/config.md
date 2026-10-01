@@ -450,6 +450,45 @@ A hashline mutation attempts to register every affected path before changing fil
 
 Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` removes either, AFT keeps the ordinary edit/read behavior for the registered tools and emits exactly one configure-time warning per load: `hashline_read_disabled` when `read` is disabled (it takes precedence), otherwise `hashline_edit_disabled`. No other tool is unregistered.
 
+## Search reranking
+
+`search.rerank` lets a cross-encoder reorder the head of `aft_search` results. It is off by default.
+
+```jsonc
+{
+  "search": {
+    "rerank": {
+      "backend": "off",          // "off" (default) | "onnx" | "remote" | "synapse"
+      // "model": "...",           // onnx: bge-reranker-base (default), bge-reranker-v2-m3,
+                                  //   jina-reranker-v1-turbo or gte-reranker-modernbert-base.
+                                  // remote and synapse: required; the model the service serves.
+      // "endpoint": "https://host/v1",   // remote only: base URL; AFT appends /rerank
+      // "api_key_env": "RERANK_API_KEY",  // remote only: env var holding the key (not the key)
+      "top_n": 20,                // results reranked per search (default 20, at most 200; the
+                                  //   backend caps it too: 64 for onnx, 20 for remote and synapse)
+      "timeout_ms": 1500          // budget per search (default 1500, clamped to 50..15000)
+    }
+  }
+}
+```
+
+What gets reranked:
+
+- **Prose questions only.** A query that is wholly an identifier, a path, a regex, an error code or one quoted literal is not reranked; it keeps the fused order and its response carries no rerank note. Mixed queries (prose words around an identifier) are reranked.
+- **Exact matches keep their order.** Results with exact evidence keep the engine's order and positions; only the first `top_n` non-exact results of the first result block are reordered, and only among the positions they already held. Results below them are untouched.
+- Each candidate is scored as `path:line`, a name line (the symbol's name, or for a whole-file result the query's identifier found in the file, else the file name), and up to about 1 KB of its text.
+- Scoring never blocks a search. While a backend is still being built, or when it times out, is busy or fails, the search keeps the fused order and appends `(rerank skipped: <reason>)` to the response. The first outcome for a result list (an order or a skip) is reused for every later page of that list, so pages never repeat or lose results.
+
+**Trust boundary:** `search.rerank` is user config. A project config may only set `"backend": "off"`; any other project-tier rerank key, including `backend` set to something else, `model`, `endpoint`, `api_key_env`, `top_n` and `timeout_ms`, is dropped with a configuration warning. The same applies to a project `harnesses.<name>.search` block. A repository can turn reranking off for itself, but it cannot turn it on or point it at a server.
+
+Backends:
+
+- **`synapse`** runs the model in CortexKit Synapse. It needs AFT running under the CortexKit daemon with Synapse registered; outside it the backend reports itself unavailable and searches keep the fused order. `model` names the Synapse rerank model.
+- **`onnx`** runs a pinned model locally through ONNX Runtime. The model is downloaded and hash-checked in the background on first use (about 0.15 to 2.3 GB depending on the model), and searches are not reranked until it is loaded. It is CPU-heavy: about 2 s and several CPU-seconds per reranked search on a laptop, more when the machine is busy, so it suits idle machines. With the default `timeout_ms` a busy CPU often skips instead of reranking.
+- **`remote`** calls a Cohere-style `POST <endpoint>/rerank` (`model`, `query`, `documents`, `top_n` in; `results[{index, relevance_score}]` out, scores in [0, 1]). This works with OpenRouter, Voyage, Cohere and other compatible services, and with a Hugging Face TEI server when the endpoint carries the `tei+` prefix (`tei+http://host:8080`). At most 20 candidates are sent per search. Redirects are refused, and errors never include the key or response bodies.
+
+See [Synapse search backends](synapse-search-backends.md) for the wire details of `remote` and `synapse`.
+
 ## GitHub integration
 
 The user-only `github` block controls the complete GitHub surface. `shim` defaults to `true`; `read` and `write` default to `false`. Set all three to `false` for zero AFT-originated `gh` traffic. GitHub capabilities never unregister host tools. Project `github` blocks are ignored with a configuration warning because repositories cannot grant themselves network-backed capabilities or vary host-wide tool descriptions.

@@ -192,18 +192,23 @@ export interface SemanticConfig {
 export interface RerankConfig {
   /**
    * Reranker for the head of aft_search results: "off" (default), "onnx",
-   * "remote" or "synapse". A project config may only set "off".
+   * "remote" or "synapse". Only prose questions are reranked. A project
+   * config may only set "off".
    */
   backend?: "off" | "onnx" | "remote" | "synapse";
-  /** For "onnx": bge-reranker-base (default), bge-reranker-v2-m3 or jina-reranker-v1-turbo. */
+  /**
+   * For "onnx": bge-reranker-base (default), bge-reranker-v2-m3,
+   * jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for
+   * "remote" and "synapse". User config only.
+   */
   model?: string;
-  /** URL of the "remote" rerank endpoint. User config only. */
+  /** Base URL of the "remote" endpoint (AFT appends /rerank; tei+ for TEI). User config only. */
   endpoint?: string;
   /** Environment variable holding the "remote" endpoint's API key. User config only. */
   api_key_env?: string;
-  /** How many leading results are reranked (default 20). */
+  /** How many leading results are reranked (default 20, at most 200). User config only. */
   top_n?: number;
-  /** Reranking budget per search in milliseconds (default 1500). */
+  /** Reranking budget per search in milliseconds (default 1500). User config only. */
   timeout_ms?: number;
 }
 
