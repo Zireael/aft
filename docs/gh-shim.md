@@ -87,9 +87,21 @@ gh-shim: gh_shim_operator_credentials: `auth token` prints the operator's GitHub
 ```
 
 With the bypass the command runs after an audit line
-`{as_of_unix_secs, tuple: "auth token", repository: null}`. `gh auth status`
-without a token flag only reports which account is logged in and passes
-through.
+`{as_of_unix_secs, tuple: "auth token", repository: null}`.
+
+**`gh auth status`.** Without a token flag, and while a signed routing
+manifest is installed, the shim answers `gh auth status` itself, from local
+state only: it runs neither the real `gh` nor a governance probe. The answer
+names the repository resolved from the working directory (or `GH_REPO`), the
+bot identity governed writes use there (or that the repository is unbound, so
+writes are refused unless the operator bypass applies), the manifest version
+and whether it verified, and whether governed routing is ready, from the last
+recorded rung. It exits 0 when governed writes work in that repository and 1
+otherwise, with one `Governed writes unavailable: <reason>` line per reason,
+mirroring upstream `gh`'s not-logged-in status. Only `--hostname github.com`
+(`-h`) is accepted; other flags are refused by name. With no manifest
+installed, or with `github.shim` turned off, `gh auth status` passes through to
+the real `gh` unchanged and reports the operator's own login.
 
 **What the target is.** The same resolver the governed rows use: `--repo`/`-R`,
 a thread URL, a `gh repo` subcommand's repository positional (`gh repo delete
