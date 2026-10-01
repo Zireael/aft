@@ -91,3 +91,20 @@ fn activate_requires_prepare_and_deactivate_stops_the_session() {
     assert!(session_for_root(&root).is_none());
     assert!(session.stopped());
 }
+
+#[test]
+fn inspect_merge_sums_counts_and_prefixes_item_paths() {
+    let mut merged = serde_json::Map::new();
+    let first = serde_json::json!({"count": 2, "items": [{"file": "src/a.rs"}], "partial": false});
+    let second = serde_json::json!({"count": 3, "items": [{"file": "lib/b.rs"}], "partial": true});
+    super::inspect::merge(&mut merged, first.as_object().unwrap(), Path::new("alpha"));
+    super::inspect::merge(&mut merged, second.as_object().unwrap(), Path::new("beta"));
+    assert_eq!(
+        serde_json::Value::Object(merged),
+        serde_json::json!({
+            "count": 5,
+            "items": [{"file": "alpha/src/a.rs"}, {"file": "beta/lib/b.rs"}],
+            "partial": true,
+        })
+    );
+}

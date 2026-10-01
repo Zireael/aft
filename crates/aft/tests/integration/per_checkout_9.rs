@@ -215,6 +215,14 @@ fn config_doc(views: bool, planes: Planes, embedder: Option<&MockEmbedder>) -> V
     doc
 }
 
+/// A child session that builds only its trigram index. The child's trigram
+/// artifact is the same `cache.bin` with views on or off; views stay off here
+/// so dozens of fixture children do not each queue a view publication that
+/// the trigram tests never read.
+fn child_trigram_doc() -> Value {
+    config_doc(false, TRIGRAM_ONLY, None)
+}
+
 fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -440,6 +448,7 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     let mut expected_grep = BTreeSet::new();
     let mut expected_glob = BTreeSet::new();
     let mut child_median = 0.0;
+    let mut child_unique_median = 0.0;
     let chunks = folder.children.chunks(8).collect::<Vec<_>>();
     for chunk in chunks {
         let built = thread::scope(|scope| {
@@ -449,7 +458,7 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
                     let storage = folder.storage.clone();
                     let root = folder.root.clone();
                     scope.spawn(move || {
-                        let ctx = configure(child, &storage, config_doc(true, TRIGRAM_ONLY, None));
+                        let ctx = configure(child, &storage, child_trigram_doc());
                         wait_trigram(&ctx, child, &storage);
                         let prefix = child.strip_prefix(&root).unwrap().to_path_buf();
                         let rows = grep_rows(&grep(&ctx, COMMON), child, &prefix);
@@ -467,6 +476,21 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
             if child_median == 0.0 {
                 child_median = median_ms(15, || {
                     grep(&ctx, COMMON);
+                });
+                // Each child holds its own unique needle; grep the one this
+                // child holds, so both sides read exactly one file.
+                let index = ctx
+                    .config()
+                    .project_root
+                    .as_deref()
+                    .and_then(|root| root.file_name())
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("repo-"))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .unwrap();
+                let needle = format!("unique_needle_{index}");
+                child_unique_median = median_ms(15, || {
+                    grep(&ctx, &needle);
                 });
             }
             expected_grep.extend(rows);
@@ -510,6 +534,11 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     let parent_median = median_ms(15, || {
         grep(&parent, COMMON);
     });
+    // A needle only one child holds: the parent consults 32 indexes but reads
+    // one file, which is the common shape of a real parent folder search.
+    let parent_unique_median = median_ms(15, || {
+        grep(&parent, "unique_needle_0");
+    });
     // Let at least one refresh round pass: refreshing reconciles in RAM and
     // must not reload an unchanged child either.
     assert!(session.wait_rounds(rounds + 2, DEADLINE));
@@ -524,11 +553,17 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     );
     assert!(loads.iter().all(|count| *count == 1), "{loads:?}");
     eprintln!(
-        "parent folder grep timing: parent median {parent_median:.2} ms over 32 children, child median {child_median:.2} ms"
+        "parent folder grep timing (32 children, debug build): token in every child: parent median {parent_median:.2} ms, child median {child_median:.2} ms; needle in one child: parent median {parent_unique_median:.2} ms, child median {child_unique_median:.2} ms"
     );
+    // Every child holds the common token, so the parent verifies 32 times the
+    // files one child does; it must cost no more than that work.
     assert!(
         parent_median <= child_median * 32.0 + 100.0,
         "parent grep {parent_median:.2} ms is not in the order of a child grep {child_median:.2} ms"
+    );
+    assert!(
+        parent_unique_median <= child_unique_median * 10.0 + 25.0,
+        "parent grep {parent_unique_median:.2} ms is not in the order of a child grep {child_unique_median:.2} ms"
     );
 
     // The parent wrote no index of its own.
@@ -549,7 +584,7 @@ fn parent_follows_child_edits_and_never_writes_child_artifacts() {
     let folder = folder(3);
     std::fs::remove_file(folder.root.join("README.md")).unwrap();
     for child in &folder.children {
-        let ctx = configure(child, &folder.storage, config_doc(true, TRIGRAM_ONLY, None));
+        let ctx = configure(child, &folder.storage, child_trigram_doc());
         wait_trigram(&ctx, child, &folder.storage);
     }
     let artifact = trigram_artifact(&folder.children[1], &folder.storage);
@@ -717,6 +752,45 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
     assert_eq!(
         outside.data["gaps"][0]["kind"],
         "outside_child_repositories"
+    );
+
+    // Inspect fans out too: a child that never ran a project-wide inspect and
+    // the per-file categories are named gaps; nothing is computed for them.
+    let inspected = aft::views::parent::route(
+        &request(json!({
+            "id": "parent-inspect",
+            "command": "inspect",
+            "sections": ["dead_code", "todos"],
+        })),
+        &parent,
+    )
+    .unwrap();
+    assert!(inspected.success);
+    assert_eq!(inspected.data["complete"], false);
+    assert!(inspected.data["summary"]["dead_code"].is_object());
+    let reasons = inspected.data["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|gap| {
+            format!(
+                "{} {}",
+                gap["path"].as_str().unwrap(),
+                gap["reason"].as_str().unwrap()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        reasons.contains(
+            &"graph dead_code: no current inspect results for this repository yet".to_string()
+        ),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.contains(
+            &"plain todos: computed only by a session opened in this repository".to_string()
+        ),
+        "{reasons:?}"
     );
 
     // Hold the served generation, let the child publish a new one, and sweep

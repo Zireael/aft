@@ -22,7 +22,7 @@ use super::{display_relative, read, ParentSession};
 
 /// Adds `child` into `merged`: numbers are summed, arrays concatenated (with
 /// paths made parent-relative), and nested objects merged the same way.
-fn merge(merged: &mut Map<String, Value>, child: &Map<String, Value>, prefix: &Path) {
+pub(super) fn merge(merged: &mut Map<String, Value>, child: &Map<String, Value>, prefix: &Path) {
     for (key, value) in child {
         match (merged.get_mut(key), value) {
             (Some(Value::Number(total)), Value::Number(add)) => {
