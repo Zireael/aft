@@ -646,6 +646,21 @@ pub fn any_build_in_flight(ctx: &AppContext) -> bool {
     }
 }
 
+/// [`any_build_in_flight`] without waiting: `None` when one of the receiver
+/// slots is locked by another thread right now.
+pub fn try_any_build_in_flight(ctx: &AppContext) -> Option<bool> {
+    let search = match ctx.search_index_rx().try_read() {
+        Ok(rx) => rx.is_some(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(
+        search
+            || ctx.callgraph_store_rx().try_lock()?.is_some()
+            || ctx.semantic_index_rx().try_lock()?.is_some(),
+    )
+}
+
 pub fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &Path) -> bool {
     if watcher_path_is_infra_skip(path) {
         return true;

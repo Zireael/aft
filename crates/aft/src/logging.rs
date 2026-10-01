@@ -1348,6 +1348,8 @@ fn mark_log_sweep_ran() {
 }
 
 /// Run log maintenance from an existing idle/maintenance tick at most hourly.
+/// The sweep walks and deletes files, so it runs on its own thread: callers
+/// include the subc frame loop, which must not wait on the filesystem.
 pub fn maybe_sweep_logs() {
     let now = Instant::now();
     let should_run = LAST_LOG_SWEEP
@@ -1365,6 +1367,15 @@ pub fn maybe_sweep_logs() {
         return;
     }
 
+    let spawned = std::thread::Builder::new()
+        .name("aft-log-sweep".to_owned())
+        .spawn(sweep_logs_now);
+    if let Err(error) = spawned {
+        crate::slog_warn!("log retention sweep could not start: {}", error);
+    }
+}
+
+fn sweep_logs_now() {
     let storage_root = FILE_CONTROL
         .lock()
         .ok()

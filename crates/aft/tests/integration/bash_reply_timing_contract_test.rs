@@ -524,7 +524,7 @@ fn assert_timed_out_status(label: &str, status: &Value, observed_after: Duration
     assert_reply_window(label, observed_after);
 }
 
-/// How often the status loops below re-read a running task.
+/// How often the status loops below re-read a task that has not ended.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn standalone_status_until_terminal(aft: &mut AftProcess, task_id: &str) -> Value {
@@ -540,7 +540,10 @@ fn standalone_status_until_terminal(aft: &mut AftProcess, task_id: &str) -> Valu
             .to_string(),
         );
         assert_eq!(status["success"], true, "bash_status: {status:?}");
-        if status["status"] != "running" {
+        // `killing` is not terminal: a kill publishes it before it signals
+        // the process group and publishes the final status once the group is
+        // reaped.
+        if status["status"] != "running" && status["status"] != "killing" {
             return status;
         }
         assert!(
@@ -562,7 +565,10 @@ async fn subc_status_until_terminal(stream: &mut TcpStream, corr: u64, task_id: 
             frame_body(&frame)
         );
         let status = tool_response_json(&frame);
-        if status["status"] != "running" {
+        // `killing` is not terminal: a kill publishes it before it signals
+        // the process group and publishes the final status once the group is
+        // reaped.
+        if status["status"] != "running" && status["status"] != "killing" {
             return status;
         }
         assert!(

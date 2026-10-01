@@ -1280,6 +1280,17 @@ impl InspectManager {
             .map(|in_flight| in_flight.keys().any(|key| key.category.is_tier2()))
     }
 
+    /// Hold the in-flight job map for the duration of `while_held`, so a test
+    /// can prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while_held();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
         let key = JobKey::for_project_category(category);

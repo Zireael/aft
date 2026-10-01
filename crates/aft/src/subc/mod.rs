@@ -943,6 +943,14 @@ struct RootMeta {
     idle_artifacts_evicted: bool,
     unbound_quiesced: bool,
     consecutive_missing_sweeps: u8,
+    /// The newest [`RootPresence`] generation already counted in
+    /// `consecutive_missing_sweeps`, so a probe result is counted once even
+    /// when several sweeps run before the next probe finishes.
+    presence_generation_seen: u64,
+    /// Set while a background thread terminates this deleted root's bash
+    /// tasks. The kill waits out signal grace periods, so it never runs on
+    /// the frame loop; the reaper retains the root until it finishes.
+    reclaim_kill_in_flight: Option<Arc<AtomicBool>>,
     /// When the idle reaper last submitted the unbound-teardown persist for
     /// this root. Sweeps run every few hundred milliseconds, so a persist that
     /// could not clear its blocker (cache lock contention, a failed write) is
@@ -1148,6 +1156,8 @@ impl RootMeta {
             idle_artifacts_evicted: false,
             unbound_quiesced: false,
             consecutive_missing_sweeps: 0,
+            presence_generation_seen: 0,
+            reclaim_kill_in_flight: None,
             teardown_persist_submitted_at: None,
             ttl_retention_logged: None,
             configure_tail_in_flight: false,
@@ -1239,7 +1249,16 @@ fn due_maintenance_jobs_with_tail_limits(
             // fail-open (contended sources count as pending), so an idle root
             // costs four probes per tick instead of four dispatched jobs.
             let executor_actor_context =
-                executor.and_then(|executor| executor.actor_context(&root_id));
+                match executor.map(|executor| executor.try_actor_context(&root_id)) {
+                    Some(Some(ctx)) => ctx,
+                    // The scheduler is busy: defer this root and probe it on
+                    // the next maintenance tick.
+                    Some(None) => {
+                        deferred = true;
+                        continue;
+                    }
+                    None => None,
+                };
             let root_has_pending_bg_wake =
                 bg_sub_by_session.iter().any(|((sub_root, _), channels)| {
                     sub_root == &root_id
@@ -1394,11 +1413,15 @@ fn idle_root_eviction_message(
     message
 }
 
-fn root_idle_ttl(executor: &Executor, root_id: &ProjectRootId) -> Duration {
-    executor
-        .actor_context(root_id)
-        .map(|ctx| ctx.config().idle.root_ttl())
-        .unwrap_or(IDLE_ROOT_TTL)
+/// The root's idle TTL, or `None` when the scheduler is too busy to answer
+/// right now (callers treat the root as not yet idle).
+fn root_idle_ttl(executor: &Executor, root_id: &ProjectRootId) -> Option<Duration> {
+    Some(
+        executor
+            .try_actor_context(root_id)?
+            .map(|ctx| ctx.config().idle.root_ttl())
+            .unwrap_or(IDLE_ROOT_TTL),
+    )
 }
 
 fn process_has_been_idle(
@@ -1408,7 +1431,8 @@ fn process_has_been_idle(
 ) -> bool {
     !live_roots.is_empty()
         && live_roots.iter().all(|(root_id, meta)| {
-            now.saturating_duration_since(meta.last_touched) >= root_idle_ttl(executor, root_id)
+            root_idle_ttl(executor, root_id)
+                .is_some_and(|ttl| now.saturating_duration_since(meta.last_touched) >= ttl)
                 && meta.active_bash_waits == 0
                 && !meta.maintenance_pending
                 && meta.maintenance_queued_kinds.is_empty()
@@ -1421,11 +1445,14 @@ fn allocator_pressure_relief_after_idle_sweep(
     executor: &Executor,
 ) -> Option<crate::memory::AllocatorPressureRelief> {
     if !process_has_been_idle(now, live_roots, executor)
-        || live_roots.keys().any(|root_id| {
-            executor
-                .actor_context(root_id)
-                .is_some_and(|ctx| ctx.artifact_eviction_blocked())
-        })
+        || live_roots
+            .keys()
+            .any(|root_id| match executor.try_actor_context(root_id) {
+                Some(Some(ctx)) => ctx.try_artifact_eviction_blocker(true).is_some(),
+                Some(None) => false,
+                // A busy scheduler cannot vouch that nothing is in use.
+                None => true,
+            })
     {
         return None;
     }
@@ -1636,6 +1663,98 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
     ));
 }
 
+/// Which live roots' directories existed at one probe. The idle reaper needs
+/// this to retire deleted roots, but a `stat` can stall on a slow or hung
+/// filesystem, so the frame loop never runs it: [`RootPresenceProbe`] probes
+/// on a background thread and the reaper reads its newest finished result.
+#[derive(Clone, Debug, Default)]
+struct RootPresence {
+    /// Increases with every probe; zero means no probe has finished.
+    generation: u64,
+    probed: HashSet<ProjectRootId>,
+    absent: HashSet<ProjectRootId>,
+}
+
+impl RootPresence {
+    /// Check each root's directory on the calling thread. The frame loop
+    /// never calls this directly; [`RootPresenceProbe`] runs it on a
+    /// background thread.
+    fn probe<'a>(generation: u64, roots: impl IntoIterator<Item = &'a ProjectRootId>) -> Self {
+        let mut presence = Self {
+            generation,
+            ..Self::default()
+        };
+        for root_id in roots {
+            if !root_id.as_path().exists() {
+                presence.absent.insert(root_id.clone());
+            }
+            presence.probed.insert(root_id.clone());
+        }
+        presence
+    }
+
+    /// `Some(true)` when the probe found the root's directory missing,
+    /// `Some(false)` when it found it, `None` when the probe did not cover it.
+    fn observed_absent(&self, root_id: &ProjectRootId) -> Option<bool> {
+        self.probed
+            .contains(root_id)
+            .then(|| self.absent.contains(root_id))
+    }
+}
+
+/// Runs [`RootPresence`] probes off the frame loop, at most one at a time,
+/// and keeps the newest finished result.
+struct RootPresenceProbe {
+    latest: Arc<parking_lot::Mutex<RootPresence>>,
+    in_flight: Arc<AtomicBool>,
+    next_generation: u64,
+}
+
+impl RootPresenceProbe {
+    fn new() -> Self {
+        Self {
+            latest: Arc::new(parking_lot::Mutex::new(RootPresence::default())),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            next_generation: 0,
+        }
+    }
+
+    /// The newest finished probe. A result being published right now reads
+    /// as "no probe yet", which the reaper treats as no new observation.
+    fn latest(&self) -> RootPresence {
+        self.latest
+            .try_lock()
+            .map(|presence| presence.clone())
+            .unwrap_or_default()
+    }
+
+    /// Start a probe of `roots` unless one is still running. A probe stuck
+    /// on a hung filesystem only delays deletion detection; the frame loop
+    /// never waits for it.
+    fn request(&mut self, roots: Vec<ProjectRootId>) {
+        if roots.is_empty() || self.in_flight.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let latest = Arc::clone(&self.latest);
+        let in_flight = Arc::clone(&self.in_flight);
+        let spawned = std::thread::Builder::new()
+            .name("aft-root-presence".to_owned())
+            .spawn(move || {
+                let presence = RootPresence::probe(generation, &roots);
+                *latest.lock() = presence;
+                in_flight.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.in_flight.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Tests reap with a presence probe taken synchronously, so each call sees
+/// the filesystem as it is when the call is made.
+#[cfg(test)]
 fn reap_idle_roots(
     now: Instant,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -1643,6 +1762,36 @@ fn reap_idle_roots(
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
     executor: &Arc<Executor>,
     metrics: &DispatchPathMetrics,
+) -> IdleReapOutcome {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+    let presence = RootPresence::probe(
+        NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+        live_roots.keys(),
+    );
+    reap_idle_roots_with_presence(
+        now,
+        live_roots,
+        pending_binds,
+        root_channels,
+        executor,
+        metrics,
+        &presence,
+    )
+}
+
+/// Retire deleted roots and evict idle unbound ones. This runs on the subc
+/// frame loop, so nothing in it waits: directory checks come from `presence`
+/// (probed off the loop), every lock it reads is try-locked with contention
+/// treated as "busy, retry next sweep", and killing a deleted root's bash
+/// tasks runs on a background thread.
+fn reap_idle_roots_with_presence(
+    now: Instant,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    executor: &Arc<Executor>,
+    metrics: &DispatchPathMetrics,
+    presence: &RootPresence,
 ) -> IdleReapOutcome {
     let pending_bind_roots = pending_binds
         .values()
@@ -1652,21 +1801,31 @@ fn reap_idle_roots(
     let mut candidates = Vec::new();
 
     for (root_id, meta) in live_roots.iter_mut() {
-        let deleted = !root_id.as_path().exists();
-        if deleted {
-            // A missing directory makes a bound route obsolete, but one failed
-            // lookup is not enough evidence to tear down a client-visible actor.
-            // Requiring two maintenance sweeps protects atomic replacement and
-            // transient filesystem failures; observing the path resets the proof.
-            // Absence also covers renames: a task's cwd handle can follow the
-            // moved directory while the registered path disappears. The old
-            // path is deliberately treated as a retired root identity, so the
-            // reaper accepts killing such tasks; rename a project only with no
-            // live tasks rather than relying on cwd-resolution heuristics.
-            meta.consecutive_missing_sweeps = meta.consecutive_missing_sweeps.saturating_add(1);
-        } else {
-            meta.consecutive_missing_sweeps = 0;
-        }
+        // A missing directory makes a bound route obsolete, but one failed
+        // lookup is not enough evidence to tear down a client-visible actor.
+        // Requiring two presence probes protects atomic replacement and
+        // transient filesystem failures; observing the path resets the proof.
+        // Absence also covers renames: a task's cwd handle can follow the
+        // moved directory while the registered path disappears. The old
+        // path is deliberately treated as a retired root identity, so the
+        // reaper accepts killing such tasks; rename a project only with no
+        // live tasks rather than relying on cwd-resolution heuristics.
+        //
+        // Each probe result is counted once; sweeps that run before the next
+        // probe finishes keep the last observation.
+        let deleted = match presence.observed_absent(root_id) {
+            Some(absent) if presence.generation > meta.presence_generation_seen => {
+                meta.presence_generation_seen = presence.generation;
+                if absent {
+                    meta.consecutive_missing_sweeps =
+                        meta.consecutive_missing_sweeps.saturating_add(1);
+                } else {
+                    meta.consecutive_missing_sweeps = 0;
+                }
+                absent
+            }
+            _ => meta.consecutive_missing_sweeps > 0,
+        };
         let deletion_confirmed = meta.consecutive_missing_sweeps >= 2;
         let has_bound_route = root_channels
             .get(root_id)
@@ -1717,12 +1876,14 @@ fn reap_idle_roots(
             // Route teardown marks the lifecycle admission gate before the last
             // channel disappears. Requiring zero bound channels and a quiesced
             // lifecycle prevents a still-bound root from losing its watcher.
-            if has_bound_route
-                || !meta.unbound_quiesced
-                || meta.idle_artifacts_evicted
-                || now.saturating_duration_since(meta.last_touched)
-                    < root_idle_ttl(executor, root_id)
-            {
+            if has_bound_route || !meta.unbound_quiesced || meta.idle_artifacts_evicted {
+                continue;
+            }
+            // A busy scheduler leaves the TTL unknown; the next sweep decides.
+            let Some(ttl) = root_idle_ttl(executor, root_id) else {
+                continue;
+            };
+            if now.saturating_duration_since(meta.last_touched) < ttl {
                 continue;
             }
             // The root is unbound and past its TTL, so anything that stops
@@ -1735,9 +1896,10 @@ fn reap_idle_roots(
                 Some(UnboundRetention::MaintenanceQueued)
             } else if has_pending_bind {
                 Some(UnboundRetention::PendingBind)
-            } else if !executor.actor_is_idle(root_id) {
+            } else if executor.try_actor_is_idle(root_id) != Some(true) {
                 // Includes the unbound-teardown persist while it is queued or
-                // running, so that job is never submitted twice.
+                // running, so that job is never submitted twice, and a
+                // scheduler too busy to answer right now.
                 Some(UnboundRetention::ActorBusy)
             } else {
                 None
@@ -1753,31 +1915,67 @@ fn reap_idle_roots(
     let mut reaped = Vec::new();
     let mut forgotten_deleted_roots = Vec::new();
     for (root_id, deleted) in candidates {
-        let Some(ctx) = executor.actor_context(&root_id) else {
-            if deleted {
-                census.deleted_retained += 1;
-                census.actor_busy += 1;
+        let ctx = match executor.try_actor_context(&root_id) {
+            Some(Some(ctx)) => ctx,
+            Some(None) => {
+                if deleted {
+                    census.deleted_retained += 1;
+                    census.actor_busy += 1;
+                }
+                continue;
             }
-            continue;
+            None => {
+                if deleted {
+                    census.deleted_retained += 1;
+                    census.actor_state_busy += 1;
+                } else if let Some(meta) = live_roots.get_mut(&root_id) {
+                    note_unbound_ttl_retention(
+                        &root_id,
+                        meta,
+                        UnboundRetention::ActorBusy,
+                        &mut census,
+                    );
+                }
+                continue;
+            }
         };
+        // After two consecutive directory-absence probes confirm that the
+        // root is gone, terminate its background tasks before checking the
+        // artifact-eviction gate. The tasks can otherwise keep the root's
+        // artifacts in use; cleanup first lets confirmed reclamation finish
+        // without weakening the gate for unrelated active work. The kill
+        // waits out each task's signal grace period, so it runs on its own
+        // thread and the root is retained until it has finished.
+        if deleted {
+            if let Some(meta) = live_roots.get_mut(&root_id) {
+                let kill_in_flight = Arc::clone(
+                    meta.reclaim_kill_in_flight
+                        .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
+                );
+                let tasks_settled = !kill_in_flight.load(Ordering::Acquire)
+                    && ctx.bash_background().try_has_running_tasks() == Some(false);
+                if !tasks_settled {
+                    if !kill_in_flight.swap(true, Ordering::AcqRel) {
+                        spawn_reclaimed_root_task_kill(&ctx, &root_id, kill_in_flight);
+                    }
+                    census.deleted_retained += 1;
+                    census.artifact_eviction_blocked += 1;
+                    continue;
+                }
+            }
+        }
         // A TTL-aged unbound root retained its watcher-derived pending paths
         // across the transient-unbind window. Strict gap invalidation subsumes
         // them, but every abort path must restore them because a rebind can
         // still happen until eviction commits.
-        //
-        // After two consecutive directory-absence scans confirm that the
-        // root is gone, terminate its background task before checking the
-        // artifact-eviction gate. The task can otherwise keep the root's
-        // artifacts in use; cleanup first lets confirmed reclamation finish
-        // without weakening the gate for unrelated active work.
-        if deleted {
-            ctx.bash_background()
-                .kill_running_tasks_for_root(root_id.as_path());
-        }
-        let taken_pending = Some(ctx.take_pending_reconciliation_state());
-        if let Some(blocker) = ctx.artifact_eviction_blocker() {
+        let Some(taken_pending) = ctx.try_take_pending_reconciliation_state() else {
+            note_reap_lock_contended(&root_id, deleted, live_roots, &mut census);
+            continue;
+        };
+        let taken_pending = Some(taken_pending);
+        if let Some(blocker) = ctx.try_artifact_eviction_blocker(false) {
             if let Some(pending) = taken_pending {
-                ctx.restore_pending_reconciliation_state(pending);
+                ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
             if deleted {
                 census.deleted_retained += 1;
@@ -1806,9 +2004,9 @@ fn reap_idle_roots(
             continue;
         }
         let memory_before = ctx.memory_root_snapshot();
-        if !ctx.evict_idle_artifacts() {
+        if !ctx.try_evict_idle_artifacts() {
             if let Some(pending) = taken_pending {
-                ctx.restore_pending_reconciliation_state(pending);
+                ctx.restore_pending_reconciliation_state_without_waiting(pending);
             }
             if deleted {
                 census.deleted_retained += 1;
@@ -1830,12 +2028,19 @@ fn reap_idle_roots(
         ctx.invalidate_artifacts_after_watcher_gap();
 
         if deleted {
-            if executor.retire_idle_actor_in_background(&root_id) {
-                live_roots.remove(&root_id);
-                forgotten_deleted_roots.push(root_id.clone());
-            } else {
-                census.deleted_retained += 1;
-                census.actor_busy += 1;
+            match executor.try_retire_idle_actor_in_background(&root_id) {
+                Some(true) => {
+                    live_roots.remove(&root_id);
+                    forgotten_deleted_roots.push(root_id.clone());
+                }
+                Some(false) => {
+                    census.deleted_retained += 1;
+                    census.actor_busy += 1;
+                }
+                None => {
+                    census.deleted_retained += 1;
+                    census.actor_state_busy += 1;
+                }
             }
         } else {
             if let Some(meta) = live_roots.get_mut(&root_id) {
@@ -1876,6 +2081,73 @@ fn reap_idle_roots(
     }
 }
 
+/// Reap orphaned LSP children (a deleted cwd, a reclaimed root, no live
+/// client) on a background thread, at most one pass at a time. The pass reads
+/// each child's cwd from the kernel, stats reclaim markers and signals process
+/// groups; `killpg` has been seen to sit in the kernel for over a minute, so
+/// none of it runs on the frame loop.
+fn spawn_orphaned_lsp_child_reap(registry: crate::lsp::child_registry::LspChildRegistry) {
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("aft-lsp-child-reap".to_owned())
+        .spawn(move || {
+            let reaped = registry.reap_children_with_gone_cwd_or_reclaimed_root();
+            if reaped > 0 {
+                log::warn!("subc attach: reaped {reaped} orphaned LSP child process group(s)");
+            }
+            IN_FLIGHT.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Terminate a deleted root's background tasks on their own thread: each kill
+/// waits out a signal grace period. `in_flight` is cleared when it finishes.
+fn spawn_reclaimed_root_task_kill(
+    ctx: &Arc<AppContext>,
+    root_id: &ProjectRootId,
+    in_flight: Arc<AtomicBool>,
+) {
+    let registry = ctx.bash_background().clone();
+    let root_path = root_id.as_path().to_path_buf();
+    let thread_flag = Arc::clone(&in_flight);
+    let spawned = std::thread::Builder::new()
+        .name("aft-reclaim-kill".to_owned())
+        .spawn(move || {
+            registry.kill_running_tasks_for_root(&root_path);
+            thread_flag.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        in_flight.store(false, Ordering::Release);
+    }
+}
+
+/// Count a root the reaper could not decide because a lock it reads was
+/// held: deleted roots in the census's artifact-blocked bucket, unbound roots
+/// under the `lock_contended` retention reason.
+fn note_reap_lock_contended(
+    root_id: &ProjectRootId,
+    deleted: bool,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    census: &mut ReapBlockerCensus,
+) {
+    if deleted {
+        census.deleted_retained += 1;
+        census.artifact_eviction_blocked += 1;
+    } else if let Some(meta) = live_roots.get_mut(root_id) {
+        note_unbound_ttl_retention(
+            root_id,
+            meta,
+            UnboundRetention::Artifact(crate::context::ArtifactEvictionBlocker::LockContended),
+            census,
+        );
+    }
+}
+
 /// Shut down language servers for roots that have had no request for the
 /// configured LSP idle window. This is independent of artifact eviction and
 /// runs even while the root is still bound.
@@ -1889,7 +2161,8 @@ fn reap_idle_lsp_servers(
     executor: &Executor,
 ) {
     for (root_id, meta) in live_roots {
-        let Some(ctx) = executor.actor_context(root_id) else {
+        // A busy scheduler skips the root until the next sweep.
+        let Some(Some(ctx)) = executor.try_actor_context(root_id) else {
             continue;
         };
         crate::runtime_drain::shutdown_idle_lsp_at(&ctx, now, meta.last_touched);
@@ -3806,6 +4079,7 @@ where
     // the sleep_until arm below only exists to wake an otherwise-idle loop.
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
+    let mut root_presence = RootPresenceProbe::new();
     let standing_actor =
         standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor));
     // Startup reconciliation is intentionally direct; subsequent passes use
@@ -4726,29 +5000,29 @@ where
                         .map(|(_, context)| context.bash_background().clone())
                         .collect()
                 });
-                crate::db::write_ledger::maybe_spawn_fold(shared_app.db());
-                crate::db::compression_events::maybe_spawn_retention(
-                    shared_app.db(),
-                    retention_registries,
-                );
-                let reaped_lsp_children = shared_app
-                    .lsp_child_registry()
-                    .reap_children_with_gone_cwd_or_reclaimed_root();
-                if reaped_lsp_children > 0 {
-                    log::warn!(
-                        "subc attach: reaped {reaped_lsp_children} orphaned LSP child process group(s)"
+                // A busy database slot skips these chores for one tick; both
+                // only spawn their work, and only when it is due.
+                if let Some(db) = shared_app.try_db() {
+                    crate::db::write_ledger::maybe_spawn_fold(db.clone());
+                    crate::db::compression_events::maybe_spawn_retention(
+                        db,
+                        retention_registries,
                     );
                 }
+                spawn_orphaned_lsp_child_reap(shared_app.lsp_child_registry());
                 let now = Instant::now();
                 reap_idle_lsp_servers(now, &live_roots, &executor);
-                let reap = reap_idle_roots(
+                let presence = root_presence.latest();
+                let reap = reap_idle_roots_with_presence(
                     now,
                     &mut live_roots,
                     &pending_binds,
                     &root_channels,
                     &executor,
                     &dispatch_path_metrics,
+                    &presence,
                 );
+                root_presence.request(live_roots.keys().cloned().collect());
                 for root_id in &reap.forgotten_deleted_roots {
                     bg_unacked_keys_by_root.remove(root_id);
                     let terminals = purge_deleted_root_residents(
@@ -6221,7 +6495,9 @@ fn memory_census_with_lifecycle(
                 .saturating_duration_since(meta.last_touched)
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
+            // A busy scheduler reports the default TTL for this census row.
             let ttl_ms = root_idle_ttl(executor, root_id)
+                .unwrap_or(IDLE_ROOT_TTL)
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
             let lsp = lifecycle
@@ -11571,6 +11847,154 @@ mod tests {
                 "{lock:?}: a held source must count as pending work"
             );
             assert!(!deferred, "{lock:?}");
+        }
+    }
+
+    /// Run `call` on its own thread while `hold` keeps a lock on another
+    /// thread, and return its result, or `None` if it did not finish within
+    /// `deadline` (it is then left to finish once the lock is released).
+    fn run_while_held<T: Send + 'static>(
+        hold: impl FnOnce(Box<dyn FnOnce() + Send>) + Send + 'static,
+        call: impl FnOnce() -> T + Send + 'static,
+        deadline: Duration,
+    ) -> Option<T> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            hold(Box::new(move || {
+                held_tx.send(()).expect("held signal");
+                let _ = release_rx.recv();
+            }));
+        });
+        held_rx
+            .recv_timeout(deadline)
+            .expect("holder never took the lock");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let _ = done_tx.send(call());
+        });
+        let outcome = done_rx.recv_timeout(deadline).ok();
+        release_tx.send(()).expect("release signal");
+        holder.join().expect("holder thread");
+        caller.join().expect("caller thread");
+        outcome
+    }
+
+    /// The maintenance scheduler reads the executor's actor map on the frame
+    /// loop; a busy scheduler defers the root to the next tick instead of
+    /// waiting for it.
+    #[test]
+    fn due_maintenance_jobs_defer_a_root_while_the_scheduler_lock_is_held() {
+        let (_dir, root) = test_root("maintenance-scheduler-held");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let holder_executor = Arc::clone(&executor);
+        let probe_executor = Arc::clone(&executor);
+        let probe_root = root.clone();
+        let outcome = run_while_held(
+            move |while_held| holder_executor.hold_state_lock_for_test(while_held),
+            move || {
+                let mut live_roots = HashMap::from([(probe_root, RootMeta::new(Instant::now()))]);
+                due_maintenance_jobs(
+                    &mut live_roots,
+                    Some(probe_executor.as_ref()),
+                    &BgSubsBySession::new(),
+                    &BgWakePending::new(),
+                    MAINTENANCE_SUBMIT_BUDGET,
+                    &HashSet::new(),
+                )
+            },
+            Duration::from_secs(5),
+        );
+        let (jobs, deferred) =
+            outcome.expect("maintenance scheduling waited for the executor state lock");
+        assert!(jobs.is_empty());
+        assert!(
+            deferred,
+            "a busy scheduler defers the root to the next tick"
+        );
+    }
+
+    /// What the idle-reap test holds: one of the root's own locks, or the
+    /// executor's scheduler lock.
+    #[derive(Clone, Copy, Debug)]
+    enum ReapHeldLock {
+        Root(crate::context::IdleReapLock),
+        ExecutorState,
+    }
+
+    /// The idle reaper runs on the frame loop. With any lock it reads held by
+    /// another thread, a sweep must return promptly and leave the root for a
+    /// later sweep, and the next sweep with nothing held must evict it.
+    #[test]
+    fn idle_reap_does_not_wait_for_a_held_lock() {
+        let held_locks = crate::context::IdleReapLock::ALL
+            .into_iter()
+            .map(ReapHeldLock::Root)
+            .chain([ReapHeldLock::ExecutorState]);
+        for held in held_locks {
+            let (_root_dir, root) = test_root("idle-reap-held-lock");
+            let ctx = test_ctx();
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+            ctx.mark_subc_unbound();
+            let now = Instant::now();
+            let mut meta = RootMeta::new(now);
+            meta.unbound_quiesced = true;
+            let live_roots = HashMap::from([(root.clone(), meta)]);
+            let reap_at = now + IDLE_ROOT_TTL;
+
+            let holder_ctx = Arc::clone(&ctx);
+            let holder_executor = Arc::clone(&executor);
+            let reap_executor = Arc::clone(&executor);
+            let outcome = run_while_held(
+                move |while_held| match held {
+                    ReapHeldLock::Root(lock) => {
+                        holder_ctx.hold_idle_reap_lock_for_test(lock, while_held)
+                    }
+                    ReapHeldLock::ExecutorState => {
+                        holder_executor.hold_state_lock_for_test(while_held)
+                    }
+                },
+                move || {
+                    let mut live_roots = live_roots;
+                    let evicted = reap_idle_roots(
+                        reap_at,
+                        &mut live_roots,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &reap_executor,
+                        &DispatchPathMetrics::new(),
+                    )
+                    .evicted;
+                    (evicted, live_roots)
+                },
+                Duration::from_secs(5),
+            );
+            let (evicted, mut live_roots) = outcome
+                .unwrap_or_else(|| panic!("{held:?}: the idle reaper waited for the held lock"));
+            assert_eq!(
+                evicted, 0,
+                "{held:?}: a held lock leaves the root for later"
+            );
+            assert!(!live_roots[&root].idle_artifacts_evicted, "{held:?}");
+
+            // Nothing held: the same root is evicted, so the root above was a
+            // real eviction candidate and the held lock alone kept it.
+            let evicted = reap_idle_roots(
+                reap_at,
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+                &DispatchPathMetrics::new(),
+            )
+            .evicted;
+            assert_eq!(
+                evicted, 1,
+                "{held:?}: the root was not an eviction candidate"
+            );
         }
     }
 

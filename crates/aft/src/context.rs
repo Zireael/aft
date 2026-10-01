@@ -1270,6 +1270,10 @@ pub(crate) enum ArtifactEvictionBlocker {
     /// The resident search index holds edits that were never written to
     /// `cache.bin`.
     SearchDeltaUnpersisted,
+    /// A lock the check reads was held by another thread, so the answer is
+    /// not available without waiting. Only the non-blocking check used on the
+    /// subc frame loop reports this; the reaper retries on its next sweep.
+    LockContended,
 }
 
 impl ArtifactEvictionBlocker {
@@ -2477,6 +2481,15 @@ impl App {
         self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
     }
 
+    /// [`Self::db`] without waiting for the handle slot: the outer `None`
+    /// means another thread holds it right now. The subc frame loop's
+    /// maintenance sweep uses this and skips its database chores for the tick.
+    pub fn try_db(&self) -> Option<Option<Arc<Mutex<TrackedConnection>>>> {
+        self.db
+            .try_lock()
+            .map(|slot| slot.as_ref().map(|(_, conn)| Arc::clone(conn)))
+    }
+
     /// The resident handle only when it was opened for `path`. Callers that must
     /// not open a second connection to a file this process already holds use
     /// this to tell "holding it" from "holding some other database".
@@ -3131,6 +3144,69 @@ impl Drop for CallgraphBuildWaitMsGuard {
             }
         }
     }
+}
+
+/// `try_read` that uses a poisoned lock's data, as the blocking paths in this
+/// module do, and returns `None` only when another thread holds the lock.
+fn try_read_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    match lock.try_read() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The `try_write` counterpart of [`try_read_unpoisoned`].
+fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> {
+    match lock.try_write() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The locks the subc idle reaper reads for one candidate root (the eviction
+/// gate, the pending reconciliation sets and the resident handles it drops).
+/// Tests hold each in turn to prove the reaper does not wait for it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdleReapLock {
+    SemanticIndexStatus,
+    SearchIndexReceiver,
+    CallgraphStoreReceiver,
+    SemanticIndexReceiver,
+    InspectInFlight,
+    BashWatchdogTasks,
+    PendingSearchPaths,
+    PendingCallgraphPaths,
+    PendingTier2Paths,
+    PendingSemanticPaths,
+    PendingCorpusRefresh,
+    SearchIndex,
+    CallgraphStore,
+    SemanticIndex,
+    BorrowedIndexCache,
+}
+
+#[cfg(test)]
+impl IdleReapLock {
+    pub(crate) const ALL: [Self; 15] = [
+        Self::SemanticIndexStatus,
+        Self::SearchIndexReceiver,
+        Self::CallgraphStoreReceiver,
+        Self::SemanticIndexReceiver,
+        Self::InspectInFlight,
+        Self::BashWatchdogTasks,
+        Self::PendingSearchPaths,
+        Self::PendingCallgraphPaths,
+        Self::PendingTier2Paths,
+        Self::PendingSemanticPaths,
+        Self::PendingCorpusRefresh,
+        Self::SearchIndex,
+        Self::CallgraphStore,
+        Self::SemanticIndex,
+        Self::BorrowedIndexCache,
+    ];
 }
 
 /// The locks behind the subc maintenance probes (see
@@ -4584,6 +4660,81 @@ impl AppContext {
             }
             MaintenanceProbeLock::SemanticRefreshWorker => {
                 let _held = self.semantic_refresh_worker.lock();
+                while_held();
+            }
+        }
+    }
+
+    /// Hold one lock the idle reaper reads for the duration of `while_held`.
+    #[cfg(test)]
+    pub(crate) fn hold_idle_reap_lock_for_test(
+        &self,
+        lock: IdleReapLock,
+        while_held: impl FnOnce(),
+    ) {
+        fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+            lock.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        match lock {
+            IdleReapLock::SemanticIndexStatus => {
+                let _held = write(&self.semantic_index_status);
+                while_held();
+            }
+            IdleReapLock::SearchIndexReceiver => {
+                let _held = write(&self.search_index_rx);
+                while_held();
+            }
+            IdleReapLock::CallgraphStoreReceiver => {
+                let _held = self.callgraph_store_rx.lock();
+                while_held();
+            }
+            IdleReapLock::SemanticIndexReceiver => {
+                let _held = self.semantic_index_rx.lock();
+                while_held();
+            }
+            IdleReapLock::InspectInFlight => {
+                self.inspect_manager
+                    .hold_in_flight_lock_for_test(while_held);
+            }
+            IdleReapLock::BashWatchdogTasks => {
+                self.bash_background
+                    .hold_watchdog_tasks_lock_for_test(while_held);
+            }
+            IdleReapLock::PendingSearchPaths => {
+                let _held = self.pending_search_index_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingCallgraphPaths => {
+                let _held = self.pending_callgraph_store_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingTier2Paths => {
+                let _held = self.pending_tier2_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingSemanticPaths => {
+                let _held = self.pending_semantic_index_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingCorpusRefresh => {
+                let _held = self.pending_semantic_corpus_refresh.lock();
+                while_held();
+            }
+            IdleReapLock::SearchIndex => {
+                let _held = write(&self.search_index);
+                while_held();
+            }
+            IdleReapLock::CallgraphStore => {
+                let _held = write(&self.callgraph_store);
+                while_held();
+            }
+            IdleReapLock::SemanticIndex => {
+                let _held = write(&self.semantic_index);
+                while_held();
+            }
+            IdleReapLock::BorrowedIndexCache => {
+                let _held = self.borrowed_index_cache.lock();
                 while_held();
             }
         }
@@ -6865,6 +7016,13 @@ impl AppContext {
         }
 
         if !wait.is_zero() {
+            // This holds the `callgraph_store_rx` slot for the whole wait
+            // window, and the subc frame loop's maintenance probes and the
+            // health rollup read that slot, so they would wait with it. A
+            // non-zero wait comes only from `AFT_CALLGRAPH_BUILD_WAIT_MS`,
+            // which tests set so small builds answer `Ready` inline. Never
+            // reach this with a non-zero wait from the frame loop; its
+            // warmers pass zero.
             let (received, receiver_generation, receiver_epoch) = {
                 let rx_ref = self.callgraph_store_rx.lock();
                 let Some(rx) = rx_ref.as_ref() else {
@@ -7725,23 +7883,6 @@ impl AppContext {
         self.pending_tier2_paths.lock().clear();
         self.pending_semantic_index_paths.lock().clear();
         *self.pending_semantic_corpus_refresh.lock() = false;
-    }
-
-    /// Take the retained pending reconciliation state for a transactional
-    /// teardown. The caller commits the disposal by dropping the returned
-    /// state after eviction succeeds, or restores it with
-    /// [`Self::restore_pending_reconciliation_state`] when eviction is blocked
-    /// by a secondary blocker (running bash, in-flight builds): the paths are
-    /// the only repair record for consumed watcher events, and the root may
-    /// rebind before the next reap attempt.
-    pub(crate) fn take_pending_reconciliation_state(&self) -> PendingReconciliationState {
-        PendingReconciliationState {
-            search: std::mem::take(&mut *self.pending_search_index_paths.lock()),
-            callgraph: std::mem::take(&mut *self.pending_callgraph_store_paths.lock()),
-            tier2: std::mem::take(&mut *self.pending_tier2_paths.lock()),
-            semantic: std::mem::take(&mut *self.pending_semantic_index_paths.lock()),
-            corpus_refresh: std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock()),
-        }
     }
 
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
@@ -9303,6 +9444,173 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.borrowed_index_cache.lock().clear();
+        self.inspect_manager.evict_idle_caches();
+        self.reset_symbol_cache();
+        self.clear_tsconfig_membership_cache();
+        true
+    }
+
+    /// [`Self::artifact_eviction_blocker`] for the subc frame loop: every lock
+    /// it reads is try-locked, and a contended one answers
+    /// [`ArtifactEvictionBlocker::LockContended`] instead of waiting. The idle
+    /// reaper takes the pending reconciliation sets before it asks, so it
+    /// passes `include_pending = false` for that check.
+    pub(crate) fn try_artifact_eviction_blocker(
+        &self,
+        include_pending: bool,
+    ) -> Option<ArtifactEvictionBlocker> {
+        use ArtifactEvictionBlocker as Blocker;
+        if self.standing_artifact_exempt.load(Ordering::Acquire) {
+            return Some(Blocker::StandingRoot);
+        }
+        let semantic_refresh_in_flight = match try_read_unpoisoned(&self.semantic_index_status) {
+            Some(status) => match &*status {
+                SemanticIndexStatus::Building { .. } => true,
+                SemanticIndexStatus::Ready { refreshing, .. } => !refreshing.is_empty(),
+                SemanticIndexStatus::Disabled | SemanticIndexStatus::Failed(_) => false,
+            },
+            None => return Some(Blocker::LockContended),
+        };
+        match crate::runtime_drain::try_any_build_in_flight(self) {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::BuildInFlight),
+            Some(false) => {}
+        }
+        if semantic_refresh_in_flight {
+            return Some(Blocker::SemanticRefresh);
+        }
+        match self.inspect_manager.try_tier2_any_in_flight() {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::InspectTier2),
+            Some(false) => {}
+        }
+        match self.bash_background.try_has_running_tasks() {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::BashRunning),
+            Some(false) => {}
+        }
+        if include_pending {
+            match self.try_pending_reconciliation_present() {
+                None => return Some(Blocker::LockContended),
+                Some(true) => return Some(Blocker::PendingReconciliation),
+                Some(false) => {}
+            }
+        }
+        if self.shared_artifacts_read_only() {
+            return None;
+        }
+        match try_read_unpoisoned(&self.search_index) {
+            Some(index) => index
+                .as_ref()
+                .is_some_and(SearchIndex::has_pending_disk_changes)
+                .then_some(Blocker::SearchDeltaUnpersisted),
+            None => Some(Blocker::LockContended),
+        }
+    }
+
+    fn try_pending_reconciliation_present(&self) -> Option<bool> {
+        Some(
+            !self.pending_callgraph_store_paths.try_lock()?.is_empty()
+                || !self.pending_search_index_paths.try_lock()?.is_empty()
+                || !self.pending_tier2_paths.try_lock()?.is_empty()
+                || !self.pending_semantic_index_paths.try_lock()?.is_empty()
+                || *self.pending_semantic_corpus_refresh.try_lock()?,
+        )
+    }
+
+    /// Take the retained pending reconciliation state for a transactional
+    /// teardown, without waiting: `None`, with nothing taken, when any of the
+    /// pending sets is locked. The caller commits the disposal by dropping the
+    /// returned state after eviction succeeds, or restores it with
+    /// [`Self::restore_pending_reconciliation_state_without_waiting`] when
+    /// eviction is blocked by a secondary blocker (running bash, in-flight
+    /// builds): the paths are the only repair record for consumed watcher
+    /// events, and the root may rebind before the next reap attempt.
+    pub(crate) fn try_take_pending_reconciliation_state(
+        &self,
+    ) -> Option<PendingReconciliationState> {
+        let mut search = self.pending_search_index_paths.try_lock()?;
+        let mut callgraph = self.pending_callgraph_store_paths.try_lock()?;
+        let mut tier2 = self.pending_tier2_paths.try_lock()?;
+        let mut semantic = self.pending_semantic_index_paths.try_lock()?;
+        let mut corpus_refresh = self.pending_semantic_corpus_refresh.try_lock()?;
+        Some(PendingReconciliationState {
+            search: std::mem::take(&mut *search),
+            callgraph: std::mem::take(&mut *callgraph),
+            tier2: std::mem::take(&mut *tier2),
+            semantic: std::mem::take(&mut *semantic),
+            corpus_refresh: std::mem::take(&mut *corpus_refresh),
+        })
+    }
+
+    /// Put taken pending sets back without waiting on the caller's thread.
+    /// The sets are the only record of watcher events already consumed, so
+    /// they are never dropped: when a set is locked, a short-lived thread
+    /// restores them instead.
+    pub(crate) fn restore_pending_reconciliation_state_without_waiting(
+        self: &Arc<Self>,
+        state: PendingReconciliationState,
+    ) {
+        let guards = (|| {
+            Some((
+                self.pending_search_index_paths.try_lock()?,
+                self.pending_callgraph_store_paths.try_lock()?,
+                self.pending_tier2_paths.try_lock()?,
+                self.pending_semantic_index_paths.try_lock()?,
+                self.pending_semantic_corpus_refresh.try_lock()?,
+            ))
+        })();
+        match guards {
+            Some((mut search, mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
+                search.extend(state.search);
+                callgraph.extend(state.callgraph);
+                tier2.extend(state.tier2);
+                semantic.extend(state.semantic);
+                if state.corpus_refresh {
+                    *corpus_refresh = true;
+                }
+            }
+            None => {
+                let ctx = Arc::clone(self);
+                std::thread::spawn(move || ctx.restore_pending_reconciliation_state(state));
+            }
+        }
+    }
+
+    /// [`Self::evict_idle_artifacts`] for the subc frame loop: the eviction
+    /// gate and the resident-handle write locks are all try-locked, and
+    /// nothing is evicted unless every one of them was free. Returns false
+    /// when eviction is unsafe or a lock was contended; the reaper retries on
+    /// its next sweep.
+    pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
+        if self.try_artifact_eviction_blocker(true).is_some() {
+            return false;
+        }
+        let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
+            return false;
+        };
+        let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
+            return false;
+        };
+        let Some(mut semantic_index) = try_write_unpoisoned(&self.semantic_index) else {
+            return false;
+        };
+        let Some(mut borrowed_index_cache) = self.borrowed_index_cache.try_lock() else {
+            return false;
+        };
+        callgraph_store.take();
+        search_index.take();
+        semantic_index.take();
+        borrowed_index_cache.clear();
+        drop((
+            callgraph_store,
+            search_index,
+            semantic_index,
+            borrowed_index_cache,
+        ));
+        // Intentional idle eviction starts a new reload lifecycle; a cooldown
+        // from an earlier failed load must not suppress the first reopen.
+        self.note_search_index_load_succeeded();
         self.inspect_manager.evict_idle_caches();
         self.reset_symbol_cache();
         self.clear_tsconfig_membership_cache();

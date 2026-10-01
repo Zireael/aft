@@ -75,6 +75,110 @@ pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
+/// How long a second kill waits for one already in flight on the same task
+/// before answering with whatever state the task is in: the SIGTERM grace
+/// period plus time for the SIGKILL, the reap and the terminal write.
+const KILL_IN_FLIGHT_WAIT: Duration =
+    Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 5);
+
+/// What a kill does after it releases the task's state lock. See
+/// [`BgTaskRegistry::kill_with_status_reason`].
+enum KillSignalPlan {
+    /// Nothing to signal; the locked step already settled the task.
+    Nothing,
+    /// Another kill is signaling this task; wait for its outcome.
+    AwaitOtherKill,
+    /// The task is already terminal but members of its process group were
+    /// still alive when it ended.
+    TerminalSurvivors { pgid: i32, live_count: usize },
+    /// Signal a piped task's process group and reap its direct child.
+    Piped {
+        pgid: Option<i32>,
+        child_pid: Option<u32>,
+        child: Option<Child>,
+    },
+    /// Signal a PTY task's process group.
+    Pty { pid: Option<u32> },
+}
+
+/// Signal a piped task: SIGTERM to its process group, a grace period that
+/// ends early once the direct child exits, then SIGKILL (Unix); `taskkill`
+/// on the process tree (Windows).
+fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option<&mut Child>) {
+    #[cfg(unix)]
+    {
+        let _ = child_pid;
+        if let Some(pgid) = pgid {
+            terminate_pgid(pgid, child);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pgid;
+        if let Some(child) = child {
+            super::process::terminate_process(child);
+        } else if let Some(pid) = child_pid {
+            terminate_pid(pid);
+        }
+    }
+}
+
+/// Signal a PTY task's process group (Unix) or process tree (Windows).
+fn terminate_pty_group(pid: u32) {
+    #[cfg(unix)]
+    terminate_pgid(pid as i32, None);
+    #[cfg(windows)]
+    terminate_pid(pid);
+}
+
+/// Test gates that park a piped-task kill after it has published `Killing`
+/// and released the state lock, before it signals, so a test can act while
+/// the kill is in flight. Keyed by task id so parallel tests do not collide.
+#[cfg(test)]
+struct KillSignalGate {
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+fn install_kill_signal_gate_for_test(
+    task_id: &str,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    KILL_SIGNAL_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.to_string(),
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_kill_signal_gate_for_test(task_id: &str) {
+    let gate = KILL_SIGNAL_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
     pub task_id: String,
@@ -606,6 +710,12 @@ pub(crate) struct BgTaskState {
     /// Prevent duplicate completion delivery while the post-exit process-group
     /// sample is waiting for its grace period.
     pub(crate) descendant_sampling_started: bool,
+    /// True while a kill has released this lock to signal and reap the
+    /// process group. That kill owns the terminal transition until it clears
+    /// the flag: the watchdog must not declare the task dead without an exit
+    /// marker, and a second kill waits for the first rather than signaling
+    /// again.
+    pub(crate) kill_in_flight: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
     /// PTY-only: set for timeout kill intent before signaling the child.
@@ -2256,6 +2366,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -2457,6 +2568,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -2615,6 +2727,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -5055,6 +5168,12 @@ impl BgTaskRegistry {
         if state.metadata.status.is_terminal() {
             return false;
         }
+        // A kill in flight owns the terminal transition: the process it is
+        // signaling dies without an exit marker by design, and the kill
+        // publishes the outcome once its reap finishes.
+        if state.kill_in_flight {
+            return false;
+        }
         if matches!(read_exit_marker(&task.paths), Ok(Some(_))) {
             return false;
         }
@@ -5088,6 +5207,24 @@ impl BgTaskRegistry {
             .lock()
             .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether any task is still under watch, without waiting: `None` when
+    /// the watch map is locked by another thread right now.
+    pub(crate) fn try_has_running_tasks(&self) -> Option<bool> {
+        match self.inner.watchdog_tasks.try_lock() {
+            Ok(tasks) => Some(!tasks.is_empty()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(false),
+        }
+    }
+
+    /// Hold the watch map lock for the duration of `while_held`, so a test can
+    /// prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_watchdog_tasks_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self.inner.watchdog_tasks.lock();
+        while_held();
     }
 
     pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
@@ -5134,6 +5271,7 @@ impl BgTaskRegistry {
                 // failure based on stale evidence.
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -5390,6 +5528,19 @@ impl BgTaskRegistry {
         self.kill_with_status_reason(task_id, session_id, terminal_status, None)
     }
 
+    /// Kill a task in three steps so its state lock is never held while
+    /// signals are delivered or the process group is reaped. Signaling can
+    /// take seconds (a SIGTERM grace period, then `wait()` on the direct
+    /// child), and `killpg` itself has been seen to sit in the kernel for over
+    /// a minute. Everything that reads the task's state (status polls, the
+    /// health rollup, the watchdog) would otherwise wait for all of it.
+    ///
+    /// 1. Under the lock: publish `Killing` and take what signaling needs
+    ///    (the process group, the direct child handle).
+    /// 2. Unlocked: signal, wait out the grace period, reap the child.
+    /// 3. Under the lock again: publish the terminal state, unless another
+    ///    path published one first. A task can exit on its own while the
+    ///    signal is in flight, and the first terminal state stands.
     fn kill_with_status_reason(
         &self,
         task_id: &str,
@@ -5401,17 +5552,15 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         let mut terminalized = false;
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_signaled = false;
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_reached = 0;
-        // Declared before the state lock below, so it runs after that lock is
+        // Declared before the state locks below, so it runs after they are
         // released on every exit, including a failed persist that returns
         // early after the task was already marked terminal and would
         // otherwise never reach `post_terminal_transition`.
         let _release_handles = ReleaseIoHandlesOnExit(&task);
 
-        {
+        let plan = {
             let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .state
@@ -5419,7 +5568,6 @@ impl BgTaskRegistry {
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
-                #[cfg(unix)]
                 let live_count = state
                     .metadata
                     .live_descendants
@@ -5427,22 +5575,11 @@ impl BgTaskRegistry {
                     .map(Vec::len)
                     .unwrap_or(0)
                     + state.metadata.live_descendants_omitted;
-                #[cfg(unix)]
-                if live_count > 0 {
-                    if let Some(pgid) = state.metadata.pgid {
-                        kill_signaled = true;
-                        kill_reached = live_count;
-                        terminate_pgid(pgid, None);
-                        let sample = live_process_group_members(pgid);
-                        state.metadata.live_descendants =
-                            sample.as_ref().map(|(members, _)| members.clone());
-                        state.metadata.live_descendants_omitted =
-                            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
-                        self.persist_task_locked(&task, &state.metadata, &mut db)
-                            .map_err(|error| {
-                                format!("failed to persist post-kill descendant sample: {error}")
-                            })?;
+                match state.metadata.pgid {
+                    Some(pgid) if cfg!(unix) && live_count > 0 => {
+                        KillSignalPlan::TerminalSurvivors { pgid, live_count }
                     }
+                    _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
@@ -5464,6 +5601,9 @@ impl BgTaskRegistry {
                 self.persist_task_locked(&task, &state.metadata, &mut db)
                     .map_err(|e| format!("failed to persist terminal state: {e}"))?;
                 terminalized = true;
+                KillSignalPlan::Nothing
+            } else if state.kill_in_flight {
+                KillSignalPlan::AwaitOtherKill
             } else {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
                 if !was_already_killing {
@@ -5476,11 +5616,6 @@ impl BgTaskRegistry {
                     self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
-
-                #[cfg(unix)]
-                let pgid = state.metadata.pgid;
-                #[cfg(windows)]
-                let child_pid = state.metadata.child_pid;
                 if !was_already_killing
                     && state.metadata.mode == BgMode::Pty
                     && terminal_status == BgTaskStatus::TimedOut
@@ -5488,78 +5623,17 @@ impl BgTaskRegistry {
                     state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
                 }
 
-                #[cfg(windows)]
-                let mut pty_forced_terminal_status: Option<BgTaskStatus> = None;
-
-                match &mut state.runtime {
-                    TaskRuntime::Piped(child_slot) => {
-                        #[cfg(unix)]
-                        if let Some(pgid) = pgid {
-                            terminate_pgid(pgid, child_slot.as_mut());
-                        }
-                        #[cfg(windows)]
-                        if let Some(child) = child_slot.as_mut() {
-                            super::process::terminate_process(child);
-                        } else if let Some(pid) = child_pid {
-                            terminate_pid(pid);
-                        }
-                        if let Some(child) = child_slot.as_mut() {
-                            let _ = child.wait();
-                        }
-                        *child_slot = None;
-                        state.detached = true;
-
-                        let marker_written = if let Some(handles) = state.io_handles.as_mut() {
-                            match handles.write(TaskArtifact::Exit, b"killed") {
-                                Ok(()) => Ok(()),
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::Interrupted
-                                        && error.to_string().contains(
-                                            super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
-                                        ) =>
-                                {
-                                    // The child's own temp+rename exit write landed
-                                    // between wait() and this write, leaving the
-                                    // retained handle at zero links (Windows). The
-                                    // replacement is the child's real exit marker;
-                                    // re-open by path and keep whichever is there.
-                                    write_kill_marker_if_absent(&task.paths).map_err(|e| {
-                                        format!("failed to write kill marker after replace: {e}")
-                                    })
-                                }
-                                Err(error) => {
-                                    Err(format!("failed to write retained kill marker: {error}"))
-                                }
-                            }
-                        } else {
-                            write_kill_marker_if_absent(&task.paths)
-                                .map_err(|e| format!("failed to write kill marker: {e}"))
-                        };
-                        // The process group has already been terminated, so a
-                        // failed marker write must not leave the task in
-                        // `killing`: nothing would ever finish it. End it with
-                        // a reason that names the failed write instead.
-                        let terminal_reason = match marker_written {
-                            Ok(()) => reason.clone(),
-                            Err(error) => {
-                                crate::slog_warn!(
-                                    "background task {task_id} was terminated but its exit marker could not be written: {error}"
-                                );
-                                Some(kill_marker_failure_reason(reason.as_deref(), &error))
-                            }
-                        };
-
-                        let exit_code = terminal_exit_code_for_status(&terminal_status);
-                        state
-                            .metadata
-                            .mark_terminal(terminal_status, exit_code, terminal_reason);
-
-                        state.pending_terminal_override = None;
-                        task.mark_terminal_now();
-                        self.persist_task_locked(&task, &state.metadata, &mut db)
-                            .map_err(|e| format!("failed to persist killed state: {e}"))?;
-                        terminalized = true;
-                    }
+                let pgid = state.metadata.pgid;
+                let child_pid = state.metadata.child_pid;
+                let plan = match &mut state.runtime {
+                    // The child handle leaves the slot for the unlocked wait.
+                    // With the slot empty and the task not yet detached, the
+                    // watchdog's reap pass leaves the task alone.
+                    TaskRuntime::Piped(child_slot) => KillSignalPlan::Piped {
+                        pgid,
+                        child_pid,
+                        child: child_slot.take(),
+                    },
                     TaskRuntime::Pty(Some(pty)) => {
                         pty.was_killed.store(true, Ordering::SeqCst);
                         if let Err(error) = pty.killer.kill() {
@@ -5567,54 +5641,106 @@ impl BgTaskRegistry {
                                 "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
                             );
                         }
-                        if let Some(pid) = pty.child_pid {
-                            #[cfg(unix)]
-                            terminate_pgid(pid as i32, None);
-                            #[cfg(windows)]
-                            terminate_pid(pid);
-                        }
-                        drop(pty.master.take());
-
-                        #[cfg(windows)]
-                        {
-                            let default_status = if terminal_status == BgTaskStatus::TimedOut {
-                                BgTaskStatus::TimedOut
-                            } else {
-                                BgTaskStatus::Killed
-                            };
-                            pty_forced_terminal_status = Some(
-                                state
-                                    .pending_terminal_override
-                                    .take()
-                                    .unwrap_or(default_status),
-                            );
-                        }
+                        KillSignalPlan::Pty { pid: pty.child_pid }
                     }
-                    TaskRuntime::Pty(None) => {}
+                    TaskRuntime::Pty(None) => KillSignalPlan::Nothing,
+                };
+                if !matches!(plan, KillSignalPlan::Nothing) {
+                    state.kill_in_flight = true;
                 }
+                plan
+            }
+        };
 
-                #[cfg(windows)]
-                if let Some(target_status) = pty_forced_terminal_status {
-                    if !task.paths.exit.exists() {
+        match plan {
+            KillSignalPlan::Nothing => {}
+            KillSignalPlan::AwaitOtherKill => self.await_kill_in_flight(&task),
+            KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
+                kill_signaled = true;
+                kill_reached = live_count;
+                self.terminate_terminal_survivors(&task, pgid)?;
+            }
+            KillSignalPlan::Piped {
+                pgid,
+                child_pid,
+                mut child,
+            } => {
+                #[cfg(test)]
+                wait_on_kill_signal_gate_for_test(&task.task_id);
+                terminate_piped_task(pgid, child_pid, child.as_mut());
+                if let Some(child) = child.as_mut() {
+                    let _ = child.wait();
+                }
+                drop(child);
+
+                let mut db = DeferredDbWrites::new(self, &task);
+                let mut state = task
+                    .state
+                    .lock()
+                    .map_err(|_| "background task lock poisoned".to_string())?;
+                state.kill_in_flight = false;
+                // A terminal state published while the signal was in flight
+                // (the task's own exit marker, read by the watchdog) stands.
+                if !state.metadata.status.is_terminal() {
+                    state.detached = true;
+
+                    let marker_written = if let Some(handles) = state.io_handles.as_mut() {
+                        match handles.write(TaskArtifact::Exit, b"killed") {
+                            Ok(()) => Ok(()),
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::Interrupted
+                                    && error.to_string().contains(
+                                        super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
+                                    ) =>
+                            {
+                                // The child's own temp+rename exit write landed
+                                // between wait() and this write, leaving the
+                                // retained handle at zero links (Windows). The
+                                // replacement is the child's real exit marker;
+                                // re-open by path and keep whichever is there.
+                                write_kill_marker_if_absent(&task.paths).map_err(|e| {
+                                    format!("failed to write kill marker after replace: {e}")
+                                })
+                            }
+                            Err(error) => {
+                                Err(format!("failed to write retained kill marker: {error}"))
+                            }
+                        }
+                    } else {
                         write_kill_marker_if_absent(&task.paths)
-                            .map_err(|e| format!("failed to write kill marker: {e}"))?;
-                    }
+                            .map_err(|e| format!("failed to write kill marker: {e}"))
+                    };
+                    // The process group has already been terminated, so a
+                    // failed marker write must not leave the task in
+                    // `killing`: nothing would ever finish it. End it with
+                    // a reason that names the failed write instead.
+                    let terminal_reason = match marker_written {
+                        Ok(()) => reason.clone(),
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "background task {task_id} was terminated but its exit marker could not be written: {error}"
+                            );
+                            Some(kill_marker_failure_reason(reason.as_deref(), &error))
+                        }
+                    };
 
-                    let exit_code = terminal_exit_code_for_status(&target_status);
+                    let exit_code = terminal_exit_code_for_status(&terminal_status);
                     state
                         .metadata
-                        .mark_terminal(target_status, exit_code, reason.clone());
+                        .mark_terminal(terminal_status, exit_code, terminal_reason);
 
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
-                    if let TaskRuntime::Pty(runtime) = &mut state.runtime {
-                        *runtime = None;
-                    }
-                    state.detached = true;
                     self.persist_task_locked(&task, &state.metadata, &mut db)
-                        .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+                        .map_err(|e| format!("failed to persist killed state: {e}"))?;
                     terminalized = true;
                 }
+            }
+            KillSignalPlan::Pty { pid } => {
+                if let Some(pid) = pid {
+                    terminate_pty_group(pid);
+                }
+                terminalized = self.finish_pty_kill(&task, terminal_status, reason)?;
             }
         }
 
@@ -5625,6 +5751,111 @@ impl BgTaskRegistry {
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
         Ok(snapshot)
+    }
+
+    /// Signal the surviving members of an already-terminal task's process
+    /// group, then record what is still alive. Runs without the state lock
+    /// held across the signal and its grace period.
+    #[cfg(unix)]
+    fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
+        terminate_pgid(pgid, None);
+        let sample = live_process_group_members(pgid);
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
+        state.metadata.live_descendants_omitted =
+            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+        self.persist_task_locked(task, &state.metadata, &mut db)
+            .map_err(|error| format!("failed to persist post-kill descendant sample: {error}"))
+    }
+
+    /// Process groups are not enumerated or signaled as a group on this
+    /// platform, so a terminal task has no survivors to signal.
+    #[cfg(not(unix))]
+    fn terminate_terminal_survivors(&self, _task: &Arc<BgTask>, _pgid: i32) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Re-take the state lock after a PTY kill's signal and close the master.
+    /// Returns whether this call published the terminal state.
+    fn finish_pty_kill(
+        &self,
+        task: &Arc<BgTask>,
+        terminal_status: BgTaskStatus,
+        reason: Option<String>,
+    ) -> Result<bool, String> {
+        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        state.kill_in_flight = false;
+        // The PTY may already have been finalized from its exit marker while
+        // the signal was in flight, which drops the runtime.
+        if let TaskRuntime::Pty(Some(pty)) = &mut state.runtime {
+            drop(pty.master.take());
+        }
+
+        // On Unix the PTY waiter writes the exit marker and the watchdog
+        // publishes the terminal state from it. Windows ConPTY gives no such
+        // signal, so the kill publishes it here.
+        #[cfg(windows)]
+        if !state.metadata.status.is_terminal() {
+            let default_status = if terminal_status == BgTaskStatus::TimedOut {
+                BgTaskStatus::TimedOut
+            } else {
+                BgTaskStatus::Killed
+            };
+            let target_status = state
+                .pending_terminal_override
+                .take()
+                .unwrap_or(default_status);
+            if !task.paths.exit.exists() {
+                write_kill_marker_if_absent(&task.paths)
+                    .map_err(|e| format!("failed to write kill marker: {e}"))?;
+            }
+
+            let exit_code = terminal_exit_code_for_status(&target_status);
+            state
+                .metadata
+                .mark_terminal(target_status, exit_code, reason.clone());
+
+            state.pending_terminal_override = None;
+            task.mark_terminal_now();
+            if let TaskRuntime::Pty(runtime) = &mut state.runtime {
+                *runtime = None;
+            }
+            state.detached = true;
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+            return Ok(true);
+        }
+        #[cfg(not(windows))]
+        let _ = (terminal_status, reason);
+        Ok(false)
+    }
+
+    /// Wait, without holding the task's state lock, for a kill that another
+    /// caller has in flight, so this caller also answers with the outcome.
+    /// Bounded by the longest a kill should take; past that the caller
+    /// answers with whatever state the task is in.
+    fn await_kill_in_flight(&self, task: &Arc<BgTask>) {
+        let deadline = Instant::now() + KILL_IN_FLIGHT_WAIT;
+        loop {
+            let settled = task
+                .state
+                .lock()
+                .map(|state| !state.kill_in_flight || state.metadata.status.is_terminal())
+                .unwrap_or(true);
+            if settled || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn finalize_from_marker(
@@ -10647,6 +10878,140 @@ mod tests {
             "a task whose state is held has not been observed terminal"
         );
         let _ = registry.kill(&task_id, "session");
+    }
+
+    #[cfg(unix)]
+    fn spawn_unsandboxed_for_kill_test(
+        registry: &BgTaskRegistry,
+        dir: &Path,
+        command: &str,
+    ) -> String {
+        registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                command,
+                "session".to_string(),
+                dir.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.to_path_buf()),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn completions_for(registry: &BgTaskRegistry, task_id: &str) -> Vec<BgCompletion> {
+        registry
+            .pending_completions_for_session("session")
+            .into_iter()
+            .filter(|completion| completion.task_id == task_id)
+            .collect()
+    }
+
+    /// A kill must not hold the task's state lock while it signals and waits
+    /// for the process group: status readers see `Killing` while the signal
+    /// is in flight, then exactly one terminal state and one completion.
+    #[cfg(unix)]
+    #[test]
+    fn kill_publishes_killing_and_releases_the_state_lock_while_signaling() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        // The kill is now about to signal and wait. Its state lock must be
+        // free, with the task already published as Killing.
+        let status_while_signaling = task
+            .state
+            .try_lock()
+            .map(|state| state.metadata.status.clone())
+            .ok();
+        release.send(()).expect("release the kill");
+        let snapshot = killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+        assert_eq!(
+            status_while_signaling,
+            Some(BgTaskStatus::Killing),
+            "the state lock must be free and show Killing while the kill signals"
+        );
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Killed
+        );
+        wait_for_pending_completion(&registry, "session", &task_id);
+        std::thread::sleep(Duration::from_millis(300));
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1, "exactly one completion");
+        assert_eq!(completions[0].status, BgTaskStatus::Killed);
+    }
+
+    /// A task can finish on its own while a kill is in flight. If its own
+    /// terminal state is published first (the watchdog reads its exit
+    /// marker), the kill must not overwrite it, and only one completion is
+    /// queued.
+    #[cfg(unix)]
+    #[test]
+    fn kill_keeps_a_terminal_state_published_while_its_signal_was_in_flight() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        // The task's own exit lands while the kill is in flight, and the
+        // watchdog's poll publishes it first.
+        fs::write(&task.paths.exit, "0").expect("write natural exit marker");
+        registry
+            .poll_task(&task)
+            .expect("watchdog poll publishes the natural exit");
+        assert_eq!(
+            task.state.lock().unwrap().metadata.status,
+            BgTaskStatus::Completed
+        );
+
+        release.send(()).expect("release the kill");
+        let snapshot = killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+
+        assert_eq!(
+            snapshot.info.status,
+            BgTaskStatus::Completed,
+            "the first terminal state stands"
+        );
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Completed
+        );
+        wait_for_pending_completion(&registry, "session", &task_id);
+        std::thread::sleep(Duration::from_millis(300));
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1, "exactly one completion");
+        assert_eq!(completions[0].status, BgTaskStatus::Completed);
     }
 
     #[cfg(unix)]

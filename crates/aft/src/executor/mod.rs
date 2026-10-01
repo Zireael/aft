@@ -23,6 +23,12 @@ use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Respons
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
+/// How long the subc frame loop's scheduler probes (`try_actor_context`,
+/// `try_actor_is_idle`, `try_retire_idle_actor_in_background`) wait for the
+/// scheduler lock before answering "busy". The lock guards short map
+/// updates; a few milliseconds rides out an ordinary holder that was
+/// preempted, while a holder stuck for longer cannot stall the loop.
+const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
 /// Continuous wake producers must not keep the scheduler mutex across an
 /// unbounded receiver drain; health probes and submitters get a lock turn
 /// between batches.
@@ -1037,11 +1043,12 @@ impl Executor {
         state.actors.get(root_id).is_some_and(ActorState::is_idle)
     }
 
-    /// Non-blocking idle probe for maintenance sweeps. A contended scheduler is
-    /// reported separately so root retirement can conservatively wait for the
-    /// next sweep without stalling the module loop.
+    /// Idle probe for maintenance sweeps that waits at most
+    /// [`SCHEDULER_PROBE_WAIT`] for the scheduler lock. A contended scheduler
+    /// is reported separately so root retirement can conservatively wait for
+    /// the next sweep without stalling the module loop.
     pub fn try_actor_is_idle(&self, root_id: &ProjectRootId) -> Option<bool> {
-        let state = self.inner.state.try_lock()?;
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
         Some(state.actors.get(root_id).is_some_and(ActorState::is_idle))
     }
 
@@ -1057,6 +1064,29 @@ impl Executor {
             state.actor_order.retain(|actor_root| actor_root != root_id);
             state.actors.remove(root_id)
         };
+        self.finish_idle_actor_retirement(root_id, removed)
+    }
+
+    /// [`Self::retire_idle_actor_in_background`] for the subc frame loop:
+    /// `None` when the scheduler lock stays contended past
+    /// [`SCHEDULER_PROBE_WAIT`], so the caller retries on its next sweep.
+    pub fn try_retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> Option<bool> {
+        let removed = {
+            let mut state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+            if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
+                return Some(false);
+            }
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        Some(self.finish_idle_actor_retirement(root_id, removed))
+    }
+
+    fn finish_idle_actor_retirement(
+        &self,
+        root_id: &ProjectRootId,
+        removed: Option<ActorState>,
+    ) -> bool {
         let Some(actor) = removed else {
             return false;
         };
@@ -1106,6 +1136,29 @@ impl Executor {
             .actors
             .get(root_id)
             .map(|actor| Arc::clone(&actor.ctx))
+    }
+
+    /// [`Self::actor_context`] waiting at most [`SCHEDULER_PROBE_WAIT`] for
+    /// the scheduler lock: the outer `None` means it stayed contended. The subc frame
+    /// loop's maintenance sweeps use this and retry on the next sweep. Request
+    /// routing keeps the blocking form, because there a missing actor and a
+    /// busy scheduler mean different things.
+    pub fn try_actor_context(&self, root_id: &ProjectRootId) -> Option<Option<Arc<AppContext>>> {
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+        Some(
+            state
+                .actors
+                .get(root_id)
+                .map(|actor| Arc::clone(&actor.ctx)),
+        )
+    }
+
+    /// Hold the scheduler state lock for the duration of `while_held`, so a
+    /// test can prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_state_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self.inner.state.lock();
+        while_held();
     }
 
     /// Snapshot the registered actor contexts.
