@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "lsp-shutdown-ceiling"
+  ],
+  "note": "LSP shutdown force-kill and bounded exit tail; no ranking-fenced files."
+}
