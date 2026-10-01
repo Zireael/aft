@@ -3133,6 +3133,42 @@ impl Drop for CallgraphBuildWaitMsGuard {
     }
 }
 
+/// The locks behind the subc maintenance probes (see
+/// [`AppContext::watcher_drain_has_work`] and its siblings), one per field a
+/// probe reads. Tests hold each in turn to prove no probe waits for it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceProbeLock {
+    WatcherReceiver,
+    WatcherDrainSlice,
+    Tier2RefreshScheduler,
+    LspManager,
+    ConfigureMaintenanceJobs,
+    ParkedConfigureTail,
+    SearchIndexReceiver,
+    CallgraphStoreReceiver,
+    SemanticIndexReceiver,
+    SemanticRefreshEvents,
+    SemanticRefreshWorker,
+}
+
+#[cfg(test)]
+impl MaintenanceProbeLock {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::WatcherReceiver,
+        Self::WatcherDrainSlice,
+        Self::Tier2RefreshScheduler,
+        Self::LspManager,
+        Self::ConfigureMaintenanceJobs,
+        Self::ParkedConfigureTail,
+        Self::SearchIndexReceiver,
+        Self::CallgraphStoreReceiver,
+        Self::SemanticIndexReceiver,
+        Self::SemanticRefreshEvents,
+        Self::SemanticRefreshWorker,
+    ];
+}
+
 /// Serialize test overrides of the query-op inline wait. Configure-tail tests
 /// share this with query-op tests so they cannot clobber each other's env.
 #[cfg(test)]
@@ -3565,18 +3601,11 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
-        let search_index = match self.search_index.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        let search_index_rx = match self.search_index_rx.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        let semantic_status = match self.semantic_index_status.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
+        // Answers from other subsystems are taken before any of this
+        // context's guards below. The guards are held until the summary is
+        // built, and the frame loop's maintenance probes read the same
+        // fields: a call into another subsystem made while holding them
+        // would pin those fields for as long as that subsystem is slow.
         let semantic_build_progress = match self.semantic_build_progress.try_read() {
             Ok(guard) => guard.clone(),
             Err(_) => return RootHealthSummary::busy(),
@@ -3584,22 +3613,6 @@ impl AppContext {
         let semantic_backend = match self.try_semantic_backend_health_snapshot() {
             Some(snapshot) => snapshot,
             None => return RootHealthSummary::busy(),
-        };
-        let callgraph_store = match self.callgraph_store.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        // The receiver contents no longer feed the status below (a disabled
-        // store must not report "building" from a lingering receiver), but a
-        // contended lock still means the snapshot would race a build state
-        // transition, so keep the probe for its busy signal.
-        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
-            Some(guard) => guard,
-            None => return RootHealthSummary::busy(),
-        };
-        let tier2 = match self.status_bar_tier2.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
         };
         // Read the inspect builder registry (the same map used to refuse inspect
         // work while a rebuild is registered). Published status-bar counts are
@@ -3615,6 +3628,41 @@ impl AppContext {
         };
         let suspended_domains = match self.health_build_suspensions.try_read() {
             Ok(snapshot) => snapshot.clone(),
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        // Opens the view status store on disk, so it also stays ahead of the
+        // guards.
+        let views = if config.views.enabled {
+            self.view_health_snapshot()
+        } else {
+            None
+        };
+        let search_index = match self.search_index.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let search_index_rx = match self.search_index_rx.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let semantic_status = match self.semantic_index_status.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let callgraph_store = match self.callgraph_store.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        // The receiver contents no longer feed the status below (a disabled
+        // store must not report "building" from a lingering receiver), but a
+        // contended lock still means the snapshot would race a build state
+        // transition, so keep the probe for its busy signal.
+        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
+            Some(guard) => guard,
+            None => return RootHealthSummary::busy(),
+        };
+        let tier2 = match self.status_bar_tier2.try_read() {
+            Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
 
@@ -3792,11 +3840,7 @@ impl AppContext {
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
-            views: if config.views.enabled {
-                self.view_health_snapshot()
-            } else {
-                None
-            },
+            views,
             tier2_status: Some(tier2_status),
             tier2_completion_generation: Some(successful_tier2_completions),
             tier2_stale_since_ms,
@@ -4387,23 +4431,25 @@ impl AppContext {
     /// dispatch cycle per kind per tick. Every probe is lock-free or try-lock
     /// (a contended source reports "maybe work" and the kind is enqueued —
     /// fail-open keeps the skip an optimization, never a correctness gate).
+    ///
+    /// These probes run on the subc frame loop, which also answers health
+    /// checks and routes every request. A blocking `lock()` here parks the
+    /// whole module for as long as any other thread holds the source, so
+    /// never add one: use `try_lock` and treat contention as pending work.
     pub fn watcher_drain_has_work(&self) -> bool {
         let receiver_pending = self
             .watcher_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty());
+            .try_lock()
+            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
         receiver_pending
-            || self
-                .watcher_drain_slice
-                .lock()
-                .as_ref()
-                .is_some_and(|state| {
+            || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
+                slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
                         || state
                             .ignore_refresh_due
                             .is_some_and(|due| Instant::now() >= due)
                 })
+            })
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
@@ -4429,58 +4475,118 @@ impl AppContext {
         if search_pending {
             return true;
         }
+        // A contended receiver slot counts as pending. The health rollup and
+        // callgraph access paths hold `callgraph_store_rx` while they do other
+        // work, and waiting for them here once stalled the frame loop.
         if self
             .callgraph_store_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty())
+            .try_lock()
+            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()))
         {
             return true;
         }
-        if self
-            .semantic_index_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|receiver| {
+        if self.semantic_index_rx.try_lock().is_none_or(|slot| {
+            slot.as_ref().is_some_and(|receiver| {
                 !receiver.is_empty()
                     || self.semantic_index_rx_terminal_epoch.load(Ordering::SeqCst)
                         == self.semantic_index_rx_epoch()
             })
-        {
+        }) {
             return true;
         }
-        if self
-            .semantic_refresh_event_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty())
-        {
-            return true;
+        match self.semantic_refresh_event_rx.try_lock() {
+            None => return true,
+            Some(slot) => {
+                if slot.as_ref().is_some_and(|rx| !rx.is_empty())
+                    || (self.semantic_refresh_probe_ready() && slot.is_some())
+                {
+                    return true;
+                }
+            }
         }
-        if self.semantic_refresh_probe_ready() && self.semantic_refresh_event_rx.lock().is_some() {
-            return true;
-        }
-        if self
-            .semantic_refresh_worker
-            .lock()
-            .as_ref()
-            .is_some_and(|worker_slot| match worker_slot.try_lock() {
-                Ok(handle) => handle
-                    .as_ref()
-                    .is_some_and(std::thread::JoinHandle::is_finished),
-                Err(std::sync::TryLockError::WouldBlock) => true,
-                Err(std::sync::TryLockError::Poisoned(_)) => true,
-            })
-        {
+        if self.semantic_refresh_worker.try_lock().is_none_or(|slot| {
+            slot.as_ref()
+                .is_some_and(|worker_slot| match worker_slot.try_lock() {
+                    Ok(handle) => handle
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished),
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => true,
+                })
+        }) {
             return true;
         }
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
     }
 
     pub fn configure_tail_has_work(&self) -> bool {
-        !self.configure_maintenance_jobs.lock().is_empty()
-            || self.parked_configure_tail.lock().is_some()
+        self.configure_maintenance_jobs
+            .try_lock()
+            .is_none_or(|jobs| !jobs.is_empty())
+            || self
+                .parked_configure_tail
+                .try_lock()
+                .is_none_or(|tail| tail.is_some())
             || !self.configure_warnings_rx.is_empty()
+    }
+
+    /// Hold the lock behind one maintenance probe for the duration of
+    /// `while_held`, so a test can prove the probe does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_maintenance_probe_lock_for_test(
+        &self,
+        lock: MaintenanceProbeLock,
+        while_held: impl FnOnce(),
+    ) {
+        match lock {
+            MaintenanceProbeLock::WatcherReceiver => {
+                let _held = self.watcher_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::WatcherDrainSlice => {
+                let _held = self.watcher_drain_slice.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::Tier2RefreshScheduler => {
+                let _held = self.tier2_refresh_scheduler.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::LspManager => {
+                let _held = self.lsp_manager.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::ConfigureMaintenanceJobs => {
+                let _held = self.configure_maintenance_jobs.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::ParkedConfigureTail => {
+                let _held = self.parked_configure_tail.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SearchIndexReceiver => {
+                let _held = self
+                    .search_index_rx
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while_held();
+            }
+            MaintenanceProbeLock::CallgraphStoreReceiver => {
+                let _held = self.callgraph_store_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticIndexReceiver => {
+                let _held = self.semantic_index_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticRefreshEvents => {
+                let _held = self.semantic_refresh_event_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticRefreshWorker => {
+                let _held = self.semantic_refresh_worker.lock();
+                while_held();
+            }
+        }
     }
 
     pub(crate) fn park_configure_tail(
@@ -8060,9 +8166,13 @@ impl AppContext {
         if self.try_callgraph_cold_build_active() != Some(false) {
             return false;
         }
+        // The scheduler itself is only held for short bookkeeping, so its
+        // contention says nothing about whether a refresh is due. Fail open
+        // like the other maintenance probes: the watcher drain re-reads the
+        // scheduler under its own lock and does nothing if no refresh is due.
         self.tier2_refresh_scheduler
             .try_lock()
-            .is_some_and(|scheduler| scheduler.dispatch_due(Instant::now()))
+            .is_none_or(|scheduler| scheduler.dispatch_due(Instant::now()))
     }
 
     pub fn note_tier2_refresh_started(&self) {
@@ -9250,6 +9360,13 @@ impl AppContext {
     /// Access the LSP manager.
     pub fn lsp(&self) -> parking_lot::MutexGuard<'_, LspManager> {
         self.lsp_manager.lock()
+    }
+
+    /// The LSP manager if no other thread holds it right now. For callers on
+    /// the subc frame loop, which must not wait behind a server start or a
+    /// diagnostics request.
+    pub fn try_lsp(&self) -> Option<parking_lot::MutexGuard<'_, LspManager>> {
+        self.lsp_manager.try_lock()
     }
 
     /// Start one inspect producer, holding the LSP manager lock only to

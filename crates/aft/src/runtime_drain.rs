@@ -3517,7 +3517,12 @@ pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Insta
         return;
     }
     let clients = {
-        let mut lsp = ctx.lsp();
+        // The subc frame loop runs this sweep, so it must not wait for the
+        // manager. A held manager is in use, which means the root is not
+        // idle in the way that matters here; the next sweep retries.
+        let Some(mut lsp) = ctx.try_lsp() else {
+            return;
+        };
         if lsp.server_count() == 0 {
             return;
         }

@@ -6315,13 +6315,20 @@ impl BgTaskRegistry {
         self.task(task_id)
     }
 
+    /// Health counts without waiting on any registry lock: `None` when the
+    /// task map or completion queue is contended. Per-task state is read with
+    /// a try-lock too, because a kill holds a task's state lock while it
+    /// signals and reaps the process group, which can take seconds. The health
+    /// rollup calls this while it is building a root summary, and waiting here
+    /// once kept that rollup, and the frame loop behind it, stalled for the
+    /// whole kill.
     pub fn try_health_counts(&self) -> Option<BgTaskHealthCounts> {
         let running = self
             .inner
             .tasks
             .try_lock()
             .ok()
-            .map(|tasks| tasks.values().filter(|task| task.is_running()).count())?;
+            .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
         Some(BgTaskHealthCounts {
             running,
@@ -7494,12 +7501,26 @@ impl BgTask {
     pub(crate) fn is_running(&self) -> bool {
         self.state
             .lock()
-            .map(|state| {
-                state.metadata.status == BgTaskStatus::Running
-                    || (state.metadata.mode == BgMode::Pty
-                        && state.metadata.status == BgTaskStatus::Killing)
-            })
+            .map(|state| Self::state_is_running(&state))
             .unwrap_or(false)
+    }
+
+    /// [`Self::is_running`] without waiting for the state lock. A contended
+    /// task counts as running: its holder is mid-transition (a kill holds the
+    /// lock while it signals and reaps the process group), and the task has
+    /// not been observed terminal yet.
+    fn try_is_running(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(state) => Self::state_is_running(&state),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
+    }
+
+    fn state_is_running(state: &BgTaskState) -> bool {
+        state.metadata.status == BgTaskStatus::Running
+            || (state.metadata.mode == BgMode::Pty
+                && state.metadata.status == BgTaskStatus::Killing)
     }
 
     fn is_terminal(&self) -> bool {
@@ -10567,6 +10588,64 @@ mod tests {
         registry.cleanup_finished(Duration::ZERO);
 
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
+        let _ = registry.kill(&task_id, "session");
+    }
+
+    /// A kill holds the task's state lock while it signals and reaps the
+    /// process group, which can take seconds. The health rollup reads these
+    /// counts while holding root-level locks that the frame loop also reads,
+    /// so the counts must not wait for a task's state lock.
+    #[test]
+    fn try_health_counts_does_not_wait_for_a_held_task_state_lock() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _state = task.state.lock().expect("task state");
+            held_tx.send(()).expect("held signal");
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder took the task state lock");
+
+        // Count on another thread so a count that waits shows up as a missed
+        // deadline rather than hanging the test.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let counting_registry = registry.clone();
+        let counter = std::thread::spawn(move || {
+            let _ = done_tx.send(counting_registry.try_health_counts());
+        });
+        let counts = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release signal");
+        holder.join().expect("holder thread");
+        counter.join().expect("counter thread");
+
+        let counts = counts
+            .expect("try_health_counts waited for a held task state lock")
+            .expect("the task map and completion queue are uncontended");
+        assert_eq!(
+            counts.running, 1,
+            "a task whose state is held has not been observed terminal"
+        );
         let _ = registry.kill(&task_id, "session");
     }
 

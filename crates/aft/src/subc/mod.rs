@@ -11479,6 +11479,101 @@ mod tests {
         assert!(!deferred);
     }
 
+    /// The maintenance probes run on the frame loop, which also answers
+    /// health checks and routes requests. A probe that waits for its source's
+    /// lock parks the whole module for as long as another thread holds it,
+    /// so each probe must take a contended source as pending work instead.
+    #[test]
+    fn maintenance_probes_count_a_held_source_lock_as_pending_without_waiting() {
+        use crate::context::MaintenanceProbeLock;
+
+        fn drain_kind(lock: MaintenanceProbeLock) -> MaintenanceDrainKind {
+            match lock {
+                MaintenanceProbeLock::WatcherReceiver
+                | MaintenanceProbeLock::WatcherDrainSlice
+                | MaintenanceProbeLock::Tier2RefreshScheduler => MaintenanceDrainKind::Watcher,
+                MaintenanceProbeLock::LspManager => MaintenanceDrainKind::Lsp,
+                MaintenanceProbeLock::ConfigureMaintenanceJobs
+                | MaintenanceProbeLock::ParkedConfigureTail => MaintenanceDrainKind::ConfigureTail,
+                MaintenanceProbeLock::SearchIndexReceiver
+                | MaintenanceProbeLock::CallgraphStoreReceiver
+                | MaintenanceProbeLock::SemanticIndexReceiver
+                | MaintenanceProbeLock::SemanticRefreshEvents
+                | MaintenanceProbeLock::SemanticRefreshWorker => {
+                    MaintenanceDrainKind::CompletionDrains
+                }
+            }
+        }
+
+        // Generous for a probe that never waits, and far shorter than the
+        // holder below would keep the lock if a probe did wait.
+        const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+        for lock in MaintenanceProbeLock::ALL {
+            let (_dir, root) = test_root("maintenance-probe-held-lock");
+            let ctx = test_ctx();
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+            // With nothing held the fixture root has no work of any kind, so
+            // a pending kind below can only come from the held lock.
+            let mut idle_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+            let (idle_jobs, _) = due_maintenance_jobs(
+                &mut idle_roots,
+                Some(executor.as_ref()),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+            );
+            assert!(idle_jobs.is_empty(), "{lock:?}: fixture root is not idle");
+
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder_ctx = Arc::clone(&ctx);
+            let holder = std::thread::spawn(move || {
+                holder_ctx.hold_maintenance_probe_lock_for_test(lock, || {
+                    held_tx.send(()).expect("held signal");
+                    let _ = release_rx.recv();
+                });
+            });
+            held_rx
+                .recv_timeout(PROBE_DEADLINE)
+                .unwrap_or_else(|_| panic!("{lock:?}: holder never took the lock"));
+
+            // Probe on its own thread so a probe that waits shows up as a
+            // missed deadline rather than hanging the test.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let probe_executor = Arc::clone(&executor);
+            let probe_root = root.clone();
+            let probe = std::thread::spawn(move || {
+                let mut live_roots = HashMap::from([(probe_root, RootMeta::new(Instant::now()))]);
+                let outcome = due_maintenance_jobs(
+                    &mut live_roots,
+                    Some(probe_executor.as_ref()),
+                    &BgSubsBySession::new(),
+                    &BgWakePending::new(),
+                    MAINTENANCE_SUBMIT_BUDGET,
+                    &HashSet::new(),
+                );
+                let _ = done_tx.send(outcome);
+            });
+            let outcome = done_rx.recv_timeout(PROBE_DEADLINE);
+            release_tx.send(()).expect("release signal");
+            holder.join().expect("holder thread");
+            probe.join().expect("probe thread");
+
+            let (jobs, deferred) = outcome
+                .unwrap_or_else(|_| panic!("{lock:?}: maintenance probe waited for the held lock"));
+            assert_eq!(
+                jobs,
+                vec![(root, drain_kind(lock))],
+                "{lock:?}: a held source must count as pending work"
+            );
+            assert!(!deferred, "{lock:?}");
+        }
+    }
+
     async fn assert_slow_configure_tail_admission(
         config: crate::executor::ExecutorConfig,
         shape: &'static str,
