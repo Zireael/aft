@@ -9,6 +9,7 @@ pub mod extensions;
 pub mod generation_token;
 pub mod lexical_lane;
 pub mod memo;
+mod nearest_names;
 pub mod paging;
 pub mod plan_table;
 pub mod provenance;
@@ -2566,6 +2567,9 @@ fn handle_external_semantic_or_hybrid_search(
         snippets_incomplete,
         Some(ctx),
     );
+    if let Some(answer) = &ranked.not_found {
+        text = answer.render(&display_root);
+    }
     if semantic_status != "ready" {
         let disclosure = if semantic_status == "building" {
             borrowed_semantic_loading_notice(ranked.exact_match_files)
@@ -3272,6 +3276,19 @@ struct EngineRanking {
     /// Split requests only: the first block's placements, in order, with the
     /// bonuses that placed each entry.
     split_placements: Option<Vec<split_query::Placement>>,
+    /// Set when an identifier query names something that occurs nowhere in
+    /// the index. Its nearest names are then the results, and its rendering
+    /// replaces the rendered result list.
+    not_found: Option<nearest_names::NotFoundAnswer>,
+}
+
+/// `source` of a result that is a nearest name in a not-found answer.
+const NEAREST_NAME_SOURCE: &str = "nearest_name";
+
+/// Results whose snippet the engine already chose (a matching line or a
+/// nearest name's line) rather than one read from the symbol range.
+fn snippet_set_by_engine(result: &HybridResult) -> bool {
+    result.source == "lexical" || result.source == NEAREST_NAME_SOURCE
 }
 
 /// What a request carrying both `query` and `pattern` adds to an engine run.
@@ -3437,7 +3454,13 @@ fn matching_line_from_source(
         ));
     }
 
-    let offset = symbol_range?.start.min(source.len());
+    line_at_offset(&source, symbol_range?.start)
+}
+
+/// The line holding byte `offset` of `source`, as a 0-based line number and
+/// display text windowed around that offset.
+fn line_at_offset(source: &str, offset: usize) -> Option<(u32, String)> {
+    let offset = offset.min(source.len());
     let line_index = source.as_bytes()[..offset]
         .iter()
         .filter(|byte| **byte == b'\n')
@@ -3450,6 +3473,18 @@ fn matching_line_from_source(
         u32::try_from(line_index).ok()?,
         snippet_bounds::window_snippet_line(source.lines().nth(line_index)?, offset - line_start),
     ))
+}
+
+/// The declaration line of a definition hit: the first line of its symbol
+/// range. A definition entry is ranked for that declaration, so showing the
+/// first line of the file that merely mentions the name (often a call site or
+/// a longer name that contains it) would point the reader at the wrong code.
+fn definition_line_from_source(
+    file: &Path,
+    symbol_range: SymbolOffsetRange,
+) -> Option<(u32, String)> {
+    let source = std::fs::read_to_string(file).ok()?;
+    line_at_offset(&source, symbol_range.start)
 }
 
 fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
@@ -3709,6 +3744,14 @@ fn run_engine_ranking(
         });
     }
     exact_candidates.extend(lexical_verifications);
+    if let Some(member) = exact_lane::qualified_member_name(exact_input) {
+        for candidate in &mut exact_candidates {
+            if candidate.evidence.kind == EvidenceKind::Definition {
+                let relative = project_relative_path(&candidate.path, project_root);
+                candidate.evidence.receiver_in_path = member.path_names_receiver(relative);
+            }
+        }
+    }
     exact_candidates.sort_by(score_free_r3_cmp);
     // The ranked unit is the file: after the comparator has put the most
     // specific evidence first (a bounded declaration span above a file-level
@@ -3719,6 +3762,34 @@ fn run_engine_ranking(
     let mut seen_exact = HashSet::new();
     exact_candidates.retain(|candidate| seen_exact.insert(candidate.path.clone()));
     let exact_match_files = exact_candidates.len();
+    let not_found = (plan.shape == SearchShape::Identifier
+        && exact_candidates.is_empty()
+        && exact_disclosures.is_empty()
+        && index.is_ready())
+    .then(|| nearest_names::looked_up_identifiers(exact_input))
+    .flatten()
+    .filter(|identifiers| {
+        // Absence is checked over every indexed file, tests included: a name
+        // that only a test uses still exists, and the ordinary ranking says
+        // more about it than a not-found answer would.
+        identifiers.iter().all(|identifier| {
+            snapshot
+                .whole_corpus_exact_pass(identifier, project_root, None)
+                .is_empty()
+        })
+    })
+    .map(|identifiers| {
+        let target = identifiers.last().expect("at least one identifier");
+        nearest_names::NotFoundAnswer {
+            query: exact_lane::exact_phrase(exact_input).to_string(),
+            names: nearest_names::nearest_names(
+                target,
+                lexical_candidates
+                    .iter()
+                    .map(|candidate| candidate.path.as_path()),
+            ),
+        }
+    });
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
@@ -4352,9 +4423,13 @@ fn run_engine_ranking(
             && (result.exact || result.source == "lexical")
         {
             let match_query = if result.exact { exact_input } else { query };
-            if let Some((line, text)) =
+            let definition_line = (ranked.evidence.kind == EvidenceKind::Definition)
+                .then_some(ranked.symbol_range)
+                .flatten()
+                .and_then(|range| definition_line_from_source(&ranked.path, range));
+            if let Some((line, text)) = definition_line.or_else(|| {
                 matching_line_from_source(&ranked.path, match_query, ranked.symbol_range)
-            {
+            }) {
                 result.start_line = line;
                 result.end_line = line;
                 result.snippet = text;
@@ -4365,6 +4440,58 @@ fn run_engine_ranking(
 
     let page_end = page_request.offset().saturating_add(page_request.top_k());
     let prose_found = split.map(|_| query_paths);
+    if let Some(answer) = &not_found {
+        // The answer replaces the fuzzy ranking: its results are the nearest
+        // names, paged like any list so every page size agrees.
+        let results = answer
+            .names
+            .iter()
+            .skip(page_request.offset())
+            .take(page_request.top_k())
+            .map(|name| HybridResult {
+                file: name.path.clone(),
+                name: name.name.clone(),
+                kind: SymbolKind::FileSummary,
+                start_line: name.line,
+                end_line: name.line,
+                exported: false,
+                score: 0.0,
+                source: NEAREST_NAME_SOURCE,
+                semantic_score: None,
+                lexical_score: None,
+                hybrid_boosted: false,
+                exact: false,
+                exact_phrase_count: 0,
+                exact_window_lines: None,
+                fusion_score: 0.0,
+                snippet: name.line_text.clone(),
+            })
+            .collect::<Vec<_>>();
+        let results_list_envelope = crate::list_envelope::ListEnvelope::new(
+            results.len(),
+            crate::list_envelope::Total::Exact(answer.names.len()),
+            crate::list_surfaces::search::SEARCH_UNIT,
+            Vec::new(),
+            crate::list_surfaces::search::SEARCH_NARROW,
+        );
+        return Ok(EngineRanking {
+            results,
+            more_available: false,
+            engine_capped: false,
+            results_list_envelope,
+            confidence_line: None,
+            structured_content,
+            recall_audit,
+            missing_on_disk: 0,
+            anchored_admission: (0, 0),
+            exact_disclosures,
+            exact_match_files,
+            rerank_note: None,
+            prose_found,
+            split_placements,
+            not_found: not_found.clone(),
+        });
+    }
     Ok(EngineRanking {
         results,
         more_available: page_end < page.reply.canonical_list.len()
@@ -4382,6 +4509,7 @@ fn run_engine_ranking(
         rerank_note,
         prose_found,
         split_placements,
+        not_found: None,
     })
 }
 
@@ -4440,6 +4568,9 @@ fn handle_engine_only_search(
         snippets_incomplete,
         Some(ctx),
     );
+    if let Some(answer) = &ranked.not_found {
+        text = answer.render(project_root);
+    }
     // Every reply served without the semantic lane says why, so a reader never
     // mistakes a lexical-only ranking for a semantic one.
     if let Some(line) = lane_state.opening_line() {
@@ -4838,6 +4969,9 @@ fn handle_semantic_or_hybrid_search(
         snippets_incomplete,
         Some(ctx),
     );
+    if let Some(answer) = &engine_ranking.not_found {
+        text = answer.render(project_root);
+    }
     if let Some(line) = engine_ranking.confidence_line {
         text.push_str("\n\n");
         text.push_str(line);
@@ -4985,6 +5119,9 @@ fn zero_result_escalation_response(
         snippets_incomplete,
         Some(ctx),
     );
+    if let Some(answer) = &ranked.not_found {
+        text = answer.render(display_root);
+    }
     text.push('\n');
     text.push_str(zero_result_escalation_disclosure(mode));
     if let Some(line) = ranked.confidence_line {
@@ -5166,6 +5303,9 @@ fn semantic_unavailable_or_fallback_response(
             enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
         let mut text =
             format_lexical_unavailable_text(&detail, &ranked.results, project_root, footer_reason);
+        if let Some(answer) = &ranked.not_found {
+            text = answer.render(project_root);
+        }
         if snippets_incomplete && !ranked.results.is_empty() {
             text.push_str(
                 "\n\nSome snippets were truncated; use read or aft_zoom for full context.",
@@ -6638,7 +6778,7 @@ fn snippet_read_plans(
     let mut rank0_targets = HashMap::new();
 
     for (rank, result) in results.iter().enumerate() {
-        if result.source == "lexical" {
+        if snippet_set_by_engine(result) {
             continue;
         }
 
@@ -6706,7 +6846,7 @@ fn enrich_snippets_from_source_with_context(
     let mut incomplete = false;
 
     for (rank, result) in results.iter_mut().enumerate() {
-        if result.source == "lexical" {
+        if snippet_set_by_engine(result) {
             continue;
         }
 
@@ -6800,7 +6940,7 @@ fn enrich_snippets_from_source_reference(
     let mut incomplete = false;
 
     for (rank, result) in results.iter_mut().enumerate() {
-        if result.source == "lexical" {
+        if snippet_set_by_engine(result) {
             continue;
         }
 
@@ -7198,7 +7338,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
     let is_file_level = matches!(result.kind, SymbolKind::FileSummary);
     let is_matching_line = is_file_level
-        && (result.exact || result.source == "lexical")
+        && (result.exact || snippet_set_by_engine(result))
         && !result.snippet.trim().is_empty();
     let (start_line, end_line) = if is_file_level && !is_matching_line {
         (serde_json::Value::Null, serde_json::Value::Null)

@@ -97,6 +97,107 @@ pub fn exact_verification_tokens(query: &str) -> Vec<String> {
 
 pub use crate::search_index::ExactEvidenceScope;
 
+/// Whether a declaration-shaped line in `path` may count as a definition.
+///
+/// Only source files of a language with a parser qualify. Documents and data
+/// (Markdown notes, JSON, YAML, TOML, HTML, stylesheets, or a file with no
+/// recognised language) often quote a declaration or carry a `name:` key, but
+/// they do not define the name; giving them definition credit let a planning
+/// note outrank the source file that declares the identifier.
+pub fn is_definition_source(path: &Path) -> bool {
+    use crate::parser::LangId;
+    crate::parser::detect_language(path).is_some_and(|language| {
+        !matches!(
+            language,
+            LangId::Markdown
+                | LangId::Json
+                | LangId::Yaml
+                | LangId::Toml
+                | LangId::Html
+                | LangId::Scss
+        )
+    })
+}
+
+/// The member name a `receiver.member` query asks for, lowercased.
+///
+/// A query such as `ask.list_pending_for_user` is how a call site reads, so
+/// its exact phrase only ever matches call sites: the declaration says
+/// `fn list_pending_for_user`, without the receiver. The member name is
+/// returned only when the whole exact phrase is one dotted name and the last
+/// segment is itself identifier-shaped (snake_case or camelCase); a plain
+/// word such as `lock` or `check` names too many unrelated declarations to
+/// rank as the one the query means.
+pub fn qualified_member_name(query: &str) -> Option<QualifiedMember> {
+    let phrase = exact_phrase(query);
+    let segments = phrase.split('.').collect::<Vec<_>>();
+    let is_name = |segment: &str| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$')
+    };
+    if segments.len() < 2 || !segments.iter().all(|segment| is_name(segment)) {
+        return None;
+    }
+    let member = segments[segments.len() - 1];
+    if member.len() < 3 || !crate::search_b2::router::is_identifier_shaped_token(member) {
+        return None;
+    }
+    Some(QualifiedMember {
+        receiver: segments[segments.len() - 2].to_ascii_lowercase(),
+        member: member.to_ascii_lowercase(),
+    })
+}
+
+/// The parts of a `receiver.member` query that the exact lane uses; see
+/// [`qualified_member_name`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedMember {
+    /// The segment before the member, lowercased (`ask` in `ask.list_pending`).
+    pub receiver: String,
+    /// The member name, lowercased.
+    pub member: String,
+}
+
+impl QualifiedMember {
+    /// Whether `path` names the receiver, as a cheap stand-in for resolving
+    /// the receiver's type: a directory or file stem that contains the
+    /// receiver (`ask` in `ask/store.rs`) or abbreviates it the way variable
+    /// names do (`ctx` for `context.rs`: same first letter, the receiver's
+    /// letters appear in order). `self` and `this` name no type and never match.
+    pub fn path_names_receiver(&self, path: &Path) -> bool {
+        let receiver = self.receiver.as_str();
+        if receiver.len() < 2 || matches!(receiver, "self" | "this") {
+            return false;
+        }
+        let stem = path.file_stem();
+        path.parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .map(|component| component.as_os_str())
+            .chain(stem)
+            .filter_map(|component| component.to_str())
+            .map(str::to_ascii_lowercase)
+            .any(|component| component.contains(receiver) || is_abbreviation(receiver, &component))
+    }
+}
+
+/// `short` starts with the same letter as `long` and its letters appear in
+/// `long` in order (`ctx` abbreviates `context`, `cfg` abbreviates `config`).
+fn is_abbreviation(short: &str, long: &str) -> bool {
+    if short.len() >= long.len() || short.as_bytes().first() != long.as_bytes().first() {
+        return false;
+    }
+    let mut letters = long.bytes();
+    short
+        .bytes()
+        .all(|wanted| letters.by_ref().any(|letter| letter == wanted))
+}
+
 /// Options controlling fallback execution.
 #[derive(Clone, Default)]
 pub struct FallbackExactOptions {
@@ -267,6 +368,7 @@ impl ExactLane {
         let phrase = exact_phrase(query);
         let norm_phrase = normalize_exact_phrase(phrase);
         let content_tokens = exact_verification_tokens(query);
+        let member = qualified_member_name(query);
 
         let mut results = Vec::new();
         let mut file_digests = HashMap::new();
@@ -311,9 +413,13 @@ impl ExactLane {
             file_digests.insert(file_path.clone(), digest);
 
             let text = String::from_utf8_lossy(&file.bytes);
-            if let Some(mut candidates) =
-                verify_exact_matches_in_text(&file_path, &text, &norm_phrase, &content_tokens)
-            {
+            if let Some(mut candidates) = verify_exact_matches_in_text_with_member(
+                &file_path,
+                &text,
+                &norm_phrase,
+                &content_tokens,
+                member.as_ref().map(|member| member.member.as_str()),
+            ) {
                 for candidate in &mut candidates {
                     candidate.evidence.generated = file.generated;
                 }
@@ -477,8 +583,26 @@ pub fn verify_exact_matches_in_text(
     norm_phrase: &str,
     content_tokens: &[String],
 ) -> Option<Vec<CandidateResult>> {
+    verify_exact_matches_in_text_with_member(file_path, text, norm_phrase, content_tokens, None)
+}
+
+/// [`verify_exact_matches_in_text`], where a declaration of `member` (the
+/// lowercased last segment of a `receiver.member` query, see
+/// [`qualified_member_name`]) also counts as a definition hit.
+///
+/// Definition credit goes only to a file for which [`is_definition_source`]
+/// holds. In any other file a declaration-shaped line is treated like any
+/// other text: it is E1 evidence when it contains the phrase.
+pub fn verify_exact_matches_in_text_with_member(
+    file_path: &Path,
+    text: &str,
+    norm_phrase: &str,
+    content_tokens: &[String],
+    member: Option<&str>,
+) -> Option<Vec<CandidateResult>> {
     let mut matches = Vec::new();
     let norm_text = normalize_exact_phrase(text);
+    let definition_source = is_definition_source(file_path);
 
     // 1. Check symbols first (for symbol-level candidates like `cap_chars`)
     let symbols = scan_symbols_in_text(text);
@@ -491,11 +615,18 @@ pub fn verify_exact_matches_in_text(
             continue;
         };
         let norm_sym_text = normalize_exact_phrase(sym_text);
-        if !content_tokens.is_empty()
-            && content_tokens
-                .iter()
-                .any(|token| name.to_ascii_lowercase() == *token)
-        {
+        let lowercase_name = name.to_ascii_lowercase();
+        // The member stand-in counts only item declarations (`fn`, `def`,
+        // `function`, `class`, ...), whose line starts with a keyword. A
+        // `name:` line is a struct field or an object-literal key, and for a
+        // member name the keys are mostly test doubles (`clearPluginCache:
+        // async () => ...`) that would outrank the real declaration.
+        let names_member = member.is_some_and(|member| {
+            lowercase_name == member && !sym_text.trim_start().starts_with(name.as_str())
+        });
+        let names_query =
+            content_tokens.iter().any(|token| lowercase_name == *token) || names_member;
+        if definition_source && names_query {
             matches.push(CandidateResult::new_exact(
                 file_path.to_path_buf(),
                 Some(*range),
@@ -890,6 +1021,112 @@ pub(crate) mod tests {
                 .any(|candidate| candidate.path.starts_with(root.join("packages")))
                 || result.verified_set.bound_disclosure.is_some()
         );
+    }
+
+    #[test]
+    fn receiver_member_query_finds_the_member_declaration_in_source_only() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let files = [
+            (
+                "src/handlers.rs",
+                "fn handle() {\n    ask.list_pending_for_user(user);\n}\n",
+            ),
+            (
+                "src/ask/store.rs",
+                "pub fn list_pending_for_user(user: &str) {}\n",
+            ),
+            (
+                ".notes/plan.md",
+                "fn list_pending_for_user(user: &str) {}\n",
+            ),
+            (
+                "src/fake_store.ts",
+                "export const fakeAsk = {\n  list_pending_for_user: () => [],\n};\n",
+            ),
+        ];
+        let mut index = SearchIndex::new();
+        for (relative, text) in files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write file");
+            index.index_file(&path, text.as_bytes());
+        }
+        index.ready = true;
+        let expected = vec![
+            ("src/ask/store.rs".to_string(), EvidenceKind::Definition),
+            ("src/handlers.rs".to_string(), EvidenceKind::E1),
+        ];
+
+        let ready = ExactLane::new().execute_ready_mode(
+            &index.snapshot(),
+            project.path(),
+            "ask.list_pending_for_user",
+            false,
+        );
+        assert_eq!(exact_paths(&ready.results, project.path()), expected);
+
+        let fallback = ExactLane::new().execute_fallback_mode(
+            project.path(),
+            "ask.list_pending_for_user",
+            false,
+            &FallbackExactOptions::default(),
+        );
+        assert_eq!(
+            exact_paths(&fallback.verified_set.results, project.path()),
+            expected
+        );
+    }
+
+    #[test]
+    fn qualified_member_name_needs_a_dotted_query_and_a_specific_member() {
+        let member = qualified_member_name("ask.list_pending_for_user").expect("member");
+        assert_eq!(member.receiver, "ask");
+        assert_eq!(member.member, "list_pending_for_user");
+        assert_eq!(
+            qualified_member_name("adapter.clearPluginCache").map(|member| member.member),
+            Some("clearplugincache".to_string())
+        );
+        // A plain-word member names too many unrelated declarations. A query
+        // without a receiver needs no stand-in: its own tokens already earn
+        // definition credit when a declaration has the same name.
+        assert_eq!(qualified_member_name("health.check"), None);
+        assert_eq!(qualified_member_name("inner.tasks.lock()"), None);
+        assert_eq!(qualified_member_name("running_tasks"), None);
+        assert_eq!(qualified_member_name("ask list_pending_for_user"), None);
+    }
+
+    #[test]
+    fn receiver_matches_a_path_component_that_contains_or_abbreviates_it() {
+        let member = |query| qualified_member_name(query).expect("member");
+        let ctx = member("ctx.set_harness");
+        assert!(ctx.path_names_receiver(Path::new("crates/aft/src/context.rs")));
+        assert!(!ctx.path_names_receiver(Path::new("crates/aft/src/bash_background/registry.rs")));
+        let ask = member("ask.list_pending_for_user");
+        assert!(ask.path_names_receiver(Path::new("crates/core/src/ask/store.rs")));
+        assert!(ask.path_names_receiver(Path::new("crates/core-store/src/ask.rs")));
+        assert!(!member("self.set_harness").path_names_receiver(Path::new("src/self.rs")));
+    }
+
+    #[test]
+    fn only_source_languages_earn_definition_credit() {
+        for path in ["a.rs", "a.ts", "a.py", "a.go", "a.sh"] {
+            assert!(is_definition_source(Path::new(path)), "{path}");
+        }
+        for path in [
+            "a.md", "a.json", "a.yml", "a.toml", "a.html", "a.scss", "a.txt", "Makefile",
+        ] {
+            assert!(!is_definition_source(Path::new(path)), "{path}");
+        }
+        let declared = verify_exact_matches_in_text(
+            Path::new("notes.md"),
+            "fn line_col_to_byte(source: &str) -> usize {\n",
+            "line_col_to_byte",
+            &["line_col_to_byte".to_string()],
+        )
+        .expect("the note still contains the phrase");
+        assert!(declared
+            .iter()
+            .all(|candidate| candidate.evidence.kind == EvidenceKind::E1));
     }
 
     #[test]

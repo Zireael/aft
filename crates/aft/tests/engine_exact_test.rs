@@ -627,27 +627,34 @@ fn declaration_scanner_does_not_absorb_unrelated_following_occurrences() {
 
 #[test]
 fn bare_identifiers_rank_declarations_before_repeated_consumers() {
+    // Definition credit goes only to source files, so each declaration sits in
+    // a file of its own language.
     let cases = [
         (
             "SessionStatus",
+            "ts",
             "export namespace SessionStatus { export type Value = string; }\n",
             "// SessionStatus consumer SessionStatus consumer SessionStatus\n",
         ),
         (
             "fn write_gather_log",
+            "rs",
             "fn write_gather_log() {}\n",
             "// fn write_gather_log consumer fn write_gather_log consumer\n",
         ),
         (
             "carry_required",
+            "rs",
             "struct TransformState {\n    carry_required: bool,\n}\n",
             "// carry_required consumer carry_required consumer carry_required\n",
         ),
     ];
 
-    for (case_index, (query, definition, consumer)) in cases.into_iter().enumerate() {
+    for (case_index, (query, extension, definition, consumer)) in cases.into_iter().enumerate() {
         let dir = create_temp_corpus();
-        let definition_path = dir.path().join(format!("src/definition_{case_index}.txt"));
+        let definition_path = dir
+            .path()
+            .join(format!("src/definition_{case_index}.{extension}"));
         let consumer_path = dir.path().join(format!("src/consumer_{case_index}.txt"));
         fs::write(&definition_path, definition).expect("write definition fixture");
         fs::write(&consumer_path, consumer.repeat(20)).expect("write consumer fixture");

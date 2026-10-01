@@ -1329,6 +1329,196 @@ fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_ex
     assert_exact_only_on_files_containing(&response, "residue-source-hash");
 }
 
+/// Write `files` (project-relative path, text) under a fresh project and
+/// return it with the entries for `install_lexical_index_entries`.
+fn project_with_files(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
+    let project = tempfile::tempdir().expect("create project dir");
+    // The canonical root (macOS temp dirs sit behind a /var symlink) so the
+    // indexed paths match the root the reply strips from displayed paths.
+    let root = std::fs::canonicalize(project.path()).expect("canonical project dir");
+    let mut entries = Vec::new();
+    for (relative, text) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&path, text).expect("write file");
+        entries.push((path, text.to_string()));
+    }
+    (project, entries)
+}
+
+/// Run `query` over `files` with a ready trigram index and no semantic lane.
+fn lexical_search(files: &[(&str, &str)], query: &str) -> (tempfile::TempDir, Value) {
+    let (project, entries) = project_with_files(files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k(query, None, 10),
+        &ctx,
+    ));
+    assert_eq!(response["success"], true, "{response}");
+    (project, response)
+}
+
+#[test]
+fn definition_hit_is_rendered_at_its_declaration_line() {
+    // Line 1 holds a longer name containing the query; the declaration of
+    // `running_tasks` itself is on line 5. The definition hit must show line 5.
+    let (_project, response) = lexical_search(
+        &[(
+            "src/registry.rs",
+            "pub fn kill_running_tasks_for_root(root: &str) {\n    drop(root);\n}\n\npub fn running_tasks(&self) -> usize {\n    0\n}\n",
+        )],
+        "running_tasks",
+    );
+
+    let first = &response["results"][0];
+    assert!(
+        path_ends_with(first["file"].as_str().unwrap(), "src/registry.rs"),
+        "{response}"
+    );
+    assert_eq!(first["exact"], true, "{response}");
+    assert_eq!(first["start_line"], 5, "{response}");
+    assert!(
+        first["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("pub fn running_tasks(&self)"),
+        "{response}"
+    );
+    assert!(
+        response["text"]
+            .as_str()
+            .unwrap()
+            .contains("src/registry.rs:5"),
+        "{response}"
+    );
+}
+
+#[test]
+fn source_declaration_outranks_a_document_that_quotes_it() {
+    // The note quotes the declaration and sorts first by path (`.` < `c`);
+    // only the Rust file declares the function.
+    let (_project, response) = lexical_search(
+        &[
+            (
+                ".gsd/milestones/S05-RESEARCH.md",
+                "Planned helper:\n\nfn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {\n",
+            ),
+            (
+                "crates/aft/src/edit.rs",
+                "pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {\n    0\n}\n",
+            ),
+        ],
+        "line_col_to_byte",
+    );
+
+    let files = ranked_files(&response);
+    assert!(
+        files[0].ends_with("crates/aft/src/edit.rs"),
+        "ranked: {files:?}"
+    );
+    assert!(files[1].ends_with("S05-RESEARCH.md"), "ranked: {files:?}");
+}
+
+#[test]
+fn receiver_member_query_ranks_the_member_declaration_first() {
+    // `ask.list_pending_for_user` reads like its call site; the declaration
+    // says `fn list_pending_for_user`. The file whose path names the receiver
+    // comes first even though the other declaration's path sorts before it,
+    // then that other declaration, then the call site.
+    let (_project, response) = lexical_search(
+        &[
+            (
+                "src/handlers.rs",
+                "fn handle() {\n    ask.list_pending_for_user(user);\n}\n",
+            ),
+            (
+                "src/ask/store.rs",
+                "impl AskStore {\n    pub fn list_pending_for_user(&self, user: &str) {}\n}\n",
+            ),
+            (
+                "src/admin/registry.rs",
+                "pub fn list_pending_for_user(user: &str) {}\n",
+            ),
+        ],
+        "ask.list_pending_for_user",
+    );
+
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("src/ask/store.rs"), "ranked: {files:?}");
+    assert!(
+        files[1].ends_with("src/admin/registry.rs"),
+        "ranked: {files:?}"
+    );
+    assert!(files[2].ends_with("src/handlers.rs"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["start_line"], 2, "{response}");
+}
+
+#[test]
+fn missing_identifier_answers_not_found_with_nearest_names() {
+    let (_project, response) = lexical_search(
+        &[
+            (
+                "src/state.rs",
+                "pub fn mark_file_refreshed(id: u32) {}\npub fn mark_file_stale(id: u32) {}\n",
+            ),
+            (
+                "src/caller.rs",
+                "fn run() {\n    mark_file_refreshed(1);\n}\n",
+            ),
+        ],
+        "mark_file_refreshing",
+    );
+
+    let text = response["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "`mark_file_refreshing` not found in this project. Nearest names: \
+             `mark_file_refreshed` (src/state.rs:1), `mark_file_stale` (src/state.rs:2)"
+        ),
+        "{text}"
+    );
+    let results = response["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{response}");
+    assert_eq!(results[0]["name"], "mark_file_refreshed", "{response}");
+    assert_eq!(results[0]["source"], "nearest_name", "{response}");
+    assert_eq!(results[0]["start_line"], 1, "{response}");
+    assert_eq!(response["more_available"], false, "{response}");
+}
+
+#[test]
+fn identifier_that_occurs_anywhere_keeps_the_ordinary_ranking() {
+    // `refresh_all` occurs only inside a longer name, and `rebuild_cache`
+    // only in a test file the request excludes. Neither is absent from the
+    // project, so neither gets a not-found answer.
+    let files = [
+        ("src/state.rs", "pub fn refresh_all_files() {}\n"),
+        ("tests/cache_test.rs", "fn rebuild_cache() {}\n"),
+        ("src/cache.rs", "pub fn rebuild_index() {}\n"),
+    ];
+    for query in ["refresh_all", "rebuild_cache"] {
+        let (_project, response) = lexical_search(&files, query);
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            !text.contains("not found in this project"),
+            "{query}: {text}"
+        );
+        assert!(
+            response["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["source"] != "nearest_name"),
+            "{query}: {response}"
+        );
+    }
+}
+
 #[test]
 fn quoted_phrase_ranks_source_above_data_file_that_repeats_it() {
     let (project, entries) = project_with_phrase_in_source_and_data();

@@ -998,6 +998,7 @@ impl SearchIndexSnapshot {
         let content_tokens = exact_lane::exact_verification_tokens(query);
         let literal = crate::search_b2::router::is_hyphenated_literal(query);
         let mut literal_postings = HashMap::new();
+        let member = exact_lane::qualified_member_name(query);
 
         let mut candidate_file_ids = BTreeSet::new();
 
@@ -1019,6 +1020,20 @@ impl SearchIndexSnapshot {
             }
         }
 
+        // (c) A `receiver.member` query: the member's declaration does not
+        // contain the receiver, so files holding the member name are
+        // candidates too. Verification gives them definition evidence only
+        // when they declare it.
+        let member_file_ids = member.as_ref().map(|member| {
+            let member_query = decompose_regex(&regex::escape(&member.member));
+            self.candidates(&member_query)
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        });
+        if let Some(ids) = &member_file_ids {
+            candidate_file_ids.extend(ids.iter().copied());
+        }
+
         // If no candidate trigrams (e.g. short query), check active files. A
         // hyphenated literal can only match through its own phrase trigrams,
         // so an empty candidate set already proves no file contains it.
@@ -1032,7 +1047,14 @@ impl SearchIndexSnapshot {
         if let Some(bound) =
             self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)
         {
-            candidate_file_ids.retain(|file_id| bound.binary_search(file_id).is_ok());
+            // The evidence bound is built from the query's own words, which a
+            // member's declaration does not contain, so member files stay.
+            candidate_file_ids.retain(|file_id| {
+                bound.binary_search(file_id).is_ok()
+                    || member_file_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(file_id))
+            });
         }
 
         let started = Instant::now();
@@ -1078,11 +1100,12 @@ impl SearchIndexSnapshot {
             bytes_read += file.bytes.len();
             let text = String::from_utf8_lossy(&file.bytes);
 
-            if let Some(candidates) = exact_lane::verify_exact_matches_in_text(
+            if let Some(candidates) = exact_lane::verify_exact_matches_in_text_with_member(
                 &file_entry.path,
                 &text,
                 &norm_phrase,
                 &content_tokens,
+                member.as_ref().map(|member| member.member.as_str()),
             ) {
                 // Only a matching file needs its digest: the memo re-checks
                 // the digests of the files it serves, never of the rest.

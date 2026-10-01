@@ -1,0 +1,26 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "identifier_not_definition_first",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/nearest_names.rs",
+    "commands::semantic_search::exact_lane::tests::only_source_languages_earn_definition_credit",
+    "commands::semantic_search::exact_lane::tests::receiver_member_query_finds_the_member_declaration_in_source_only",
+    "commands::semantic_search::exact_lane::tests::qualified_member_name_needs_a_dotted_query_and_a_specific_member",
+    "commands::semantic_search::exact_lane::tests::receiver_matches_a_path_component_that_contains_or_abbreviates_it",
+    "commands::semantic_search::comparator::tests::source_code_wins_a_tie_that_the_path_sort_would_give_a_document",
+    "commands::semantic_search::comparator::tests::definition_in_a_file_naming_the_receiver_sorts_first",
+    "commands::semantic_search::nearest_names::tests::nearest_names_rank_by_similarity_and_prefer_declarations",
+    "aft_search_contract_test::definition_hit_is_rendered_at_its_declaration_line",
+    "aft_search_contract_test::source_declaration_outranks_a_document_that_quotes_it",
+    "aft_search_contract_test::receiver_member_query_ranks_the_member_declaration_first",
+    "aft_search_contract_test::missing_identifier_answers_not_found_with_nearest_names",
+    "aft_search_contract_test::identifier_that_occurs_anywhere_keeps_the_ordinary_ranking",
+    "real-query-paged-identifier-answer-rows-900018-900034"
+  ],
+  "slices": [
+    "identifier-definition-receiver-missing-name-rows",
+    "identifier-answer-engine"
+  ],
+  "note": "The previous commit adds 17 identifier real-query rows and records the reference on the unchanged engine. This change: a definition hit is rendered at its declaration line instead of the first line mentioning the name (display only); definition credit goes only to source files of a parsed language, and on otherwise equal evidence source sorts before documents and data instead of letting the path decide; a receiver.member query also finds the member's declaration as definition evidence, a file whose path names the receiver first; an identifier query whose name occurs in no indexed file answers 'not found' with up to five nearest names and their locations instead of a fuzzy ranking. Other query shapes keep their exact evidence."
+}

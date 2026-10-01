@@ -45,6 +45,11 @@ pub struct EvidenceDescriptor {
     /// source files keep their existing form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub data_file: bool,
+    /// For a definition hit of a `receiver.member` query: the file's path
+    /// names the receiver (see `exact_lane::QualifiedMember`). Within the
+    /// definition kind such a file sorts first. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub receiver_in_path: bool,
 }
 
 impl EvidenceDescriptor {
@@ -61,6 +66,7 @@ impl EvidenceDescriptor {
             exact_form,
             generated,
             data_file: false,
+            receiver_in_path: false,
         }
     }
 
@@ -76,6 +82,7 @@ impl EvidenceDescriptor {
             exact_form,
             generated,
             data_file: false,
+            receiver_in_path: false,
         }
     }
 
@@ -91,6 +98,7 @@ impl EvidenceDescriptor {
             exact_form,
             generated,
             data_file: false,
+            receiver_in_path: false,
         }
     }
 
@@ -113,6 +121,7 @@ impl EvidenceDescriptor {
             exact_form,
             generated,
             data_file: false,
+            receiver_in_path: false,
         }
     }
 
@@ -128,6 +137,7 @@ impl EvidenceDescriptor {
             exact_form,
             generated,
             data_file: false,
+            receiver_in_path: false,
         }
     }
 
