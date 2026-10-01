@@ -8235,6 +8235,17 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = limiter;
     }
 
+    /// Takes one slot of this context's maintenance-build limiter, so an
+    /// integration test can hold queued background work (such as a legacy
+    /// import) at its admission point and observe what queries report
+    /// meanwhile. `None` when every slot is taken.
+    #[doc(hidden)]
+    pub fn take_cold_build_slot_for_test(
+        &self,
+    ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
+        self.cold_build_limiter().try_acquire()
+    }
+
     pub fn add_pending_tier2_paths<I>(&self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,

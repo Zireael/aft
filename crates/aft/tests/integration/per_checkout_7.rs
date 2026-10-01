@@ -1091,3 +1091,429 @@ fn help_and_dry_run_state_the_operator_contract() {
     );
     assert_eq!(tree(&storage), before);
 }
+
+/// The real census, narrowed to processes this test started, so the test
+/// can tell whether its own process was classified on a host that also runs
+/// other AFT processes (this test suite, or the operator's daemon).
+struct OnlyPids(Vec<u32>);
+
+impl ProcessCensus for OnlyPids {
+    fn take(&self) -> Result<Vec<CensusFinding>, String> {
+        Ok(aft::migration::prune_legacy::SystemCensus
+            .take()?
+            .into_iter()
+            .filter(|finding| match finding {
+                CensusFinding::Aft { pid, .. } | CensusFinding::Unclassifiable { pid, .. } => {
+                    self.0.contains(pid)
+                }
+            })
+            .collect())
+    }
+}
+
+/// Kills a child process when the test ends, however it ends.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// An `aft` executable installed under a path with spaces (as in an app
+/// bundle or `Application Support`) and running is a live AFT process: the
+/// census classifies it and the prune refuses, deleting nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_census_sees_an_aft_executable_under_a_path_with_spaces() {
+    let base = tempdir().unwrap();
+    let storage = prune_fixture(base.path());
+    let before = tree(&storage);
+    let dir = base.path().join("with space").join("Application Support");
+    fs::create_dir_all(&dir).unwrap();
+    let executable = dir.join("aft");
+    fs::copy(env!("CARGO_BIN_EXE_aft"), &executable).unwrap();
+    // With stdin held open the standalone server keeps running.
+    let child = KillOnDrop(
+        Command::new(&executable)
+            .env("AFT_STORAGE_DIR", base.path().join("child-storage"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    let census = OnlyPids(vec![pid]);
+    let findings = census.take().unwrap();
+    assert!(
+        matches!(findings.as_slice(), [CensusFinding::Aft { pid: found, .. }] if *found == pid),
+        "the census missed the AFT process at {executable:?}: {findings:?}"
+    );
+    let (exit, out) = prune(&storage, true, FIFTEEN_DAYS, &census, None);
+    drop(child);
+    assert_eq!(exit, PruneExit::Refused, "{out}");
+    assert!(
+        out.contains(&format!("live AFT process pid {pid}")),
+        "{out}"
+    );
+    assert_same(&tree(&storage), &before, &out);
+}
+
+// ---------------------------------------------------------------------------
+// The production views-on configure path
+
+mod production {
+    use super::*;
+    use aft::config::Config;
+    use aft::context::{AppContext, SemanticIndexStatus};
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use serde_json::{json, Value};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const DEADLINE: Duration = Duration::from_secs(120);
+    const FINGERPRINT_PROBE: &str = "semantic index fingerprint probe";
+    const MODEL: &str = "per-checkout-7-mock";
+
+    /// Deterministic embeddings over HTTP that count every text other than
+    /// the fingerprint probe a model sends once when it starts.
+    struct MockEmbedder {
+        base_url: String,
+        addr: SocketAddr,
+        running: Arc<AtomicBool>,
+        texts: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockEmbedder {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let texts = Arc::new(AtomicUsize::new(0));
+            let (thread_running, thread_texts) = (Arc::clone(&running), Arc::clone(&texts));
+            let handle = thread::spawn(move || {
+                while thread_running.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let texts = Arc::clone(&thread_texts);
+                    thread::spawn(move || {
+                        let _ = serve(&mut stream, &texts);
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://{addr}"),
+                addr,
+                running,
+                texts,
+                handle: Some(handle),
+            }
+        }
+
+        fn texts(&self) -> usize {
+            self.texts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for MockEmbedder {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn mock_vector(text: &str) -> Vec<f32> {
+        blake3::hash(text.as_bytes()).as_bytes()[..8]
+            .iter()
+            .map(|byte| f32::from(*byte) / 255.0 - 0.5)
+            .collect()
+    }
+
+    fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut body_start = None;
+        let mut length = 0usize;
+        loop {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if body_start.is_none() {
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    body_start = Some(end + 4);
+                    for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+            if body_start.is_some_and(|start| bytes.len() >= start + length) {
+                break;
+            }
+        }
+        let body = body_start
+            .and_then(|start| bytes.get(start..start + length))
+            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+            .unwrap_or_else(|| json!({ "input": [] }));
+        let inputs = match &body["input"] {
+            Value::Array(values) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            Value::String(value) => vec![value.clone()],
+            _ => Vec::new(),
+        };
+        texts.fetch_add(
+            inputs
+                .iter()
+                .filter(|input| *input != FINGERPRINT_PROBE)
+                .count(),
+            Ordering::SeqCst,
+        );
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| json!({ "embedding": mock_vector(input), "index": index }))
+            .collect::<Vec<_>>();
+        let body = json!({ "data": data }).to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+        let output = command.args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repository(base: &Path) -> PathBuf {
+        let root = fs::canonicalize(base).unwrap().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "views@example.test"]);
+        git(&root, &["config", "user.name", "Views Test"]);
+        for (path, text) in FILES {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "initial"]);
+        root
+    }
+
+    fn request(value: Value) -> RawRequest {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn send_configure(ctx: &AppContext, root: &Path, storage: &Path, url: &str, views: bool) {
+        let configured = aft::commands::configure::handle_configure(
+            &request(json!({
+                "id": "configure-per-checkout-7",
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": root,
+                "storage_dir": storage,
+                "config": crate::helpers::user_config(json!({
+                    "search_index": true,
+                    "semantic_search": true,
+                    "callgraph_store": false,
+                    "views": { "enabled": views },
+                    "semantic": {
+                        "backend": "openai_compatible",
+                        "model": MODEL,
+                        "base_url": url,
+                        "timeout_ms": 5_000,
+                        "max_batch_size": 64,
+                        "max_files": 2_000
+                    }
+                }))
+            })),
+            ctx,
+        );
+        assert!(configured.success, "configure failed: {configured:?}");
+    }
+
+    fn drain(ctx: &AppContext) {
+        aft::runtime_drain::drain_watcher_events(ctx);
+        aft::runtime_drain::drain_search_index_events(ctx);
+        aft::runtime_drain::drain_semantic_index_events(ctx);
+        aft::runtime_drain::drain_semantic_refresh_events(ctx);
+    }
+
+    fn wait_until(ctx: &AppContext, what: &str, done: impl Fn(&AppContext) -> bool) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            drain(ctx);
+            if done(ctx) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never happened: status={:?}",
+                ctx.semantic_index_status().read().unwrap()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn search(ctx: &AppContext, query: &str) -> Value {
+        serde_json::to_value(aft::commands::semantic_search::handle_semantic_search(
+            &request(json!({ "id": "per-checkout-7-search", "command": "search", "query": query })),
+            ctx,
+        ))
+        .unwrap()
+    }
+
+    fn legacy_semantic_files(storage: &Path) -> Vec<PathBuf> {
+        fs::read_dir(storage.join("semantic"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path().join("semantic.bin"))
+                    .filter(|path| path.is_file())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The real views-on configure path on a root whose previous release
+    /// left a semantic index: the import runs on the lane's background
+    /// thread, a search while it runs answers at once and names the
+    /// migration, and afterwards the lane serves the imported vectors
+    /// without embedding a single text again.
+    #[test]
+    fn views_on_configure_imports_a_legacy_semantic_index_in_the_background() {
+        let server = MockEmbedder::start();
+        let base = tempdir().unwrap();
+        let root = repository(base.path());
+        let storage = base.path().join("storage");
+
+        // The previous release: views off, which builds and saves the
+        // legacy semantic index.
+        {
+            let legacy = Arc::new(AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config::default(),
+            ));
+            send_configure(&legacy, &root, &storage, &server.base_url, false);
+            aft::runtime_drain::drain_deferred_configure_maintenance(&legacy);
+            wait_until(&legacy, "the legacy semantic index", |ctx| {
+                matches!(
+                    &*ctx.semantic_index_status().read().unwrap(),
+                    SemanticIndexStatus::Ready { refreshing, .. } if refreshing.is_empty()
+                ) && !legacy_semantic_files(&storage).is_empty()
+            });
+        }
+        let legacy_texts = server.texts();
+        assert!(legacy_texts > 0);
+        let [semantic_bin] = legacy_semantic_files(&storage).try_into().unwrap();
+        let key = semantic_bin
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        // The new release, views on. Holding the context's only
+        // maintenance-build slot parks the import at its admission point.
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let slot = ctx.take_cold_build_slot_for_test().unwrap();
+        let started = Instant::now();
+        send_configure(&ctx, &root, &storage, &server.base_url, true);
+        aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "configure waited for the import"
+        );
+        wait_until(&ctx, "the migrating stage", |ctx| {
+            matches!(
+                &*ctx.semantic_index_status().read().unwrap(),
+                SemanticIndexStatus::Building { stage, .. } if stage == "migrating_legacy_index"
+            )
+        });
+        let asked = Instant::now();
+        let during = search(&ctx, "evict the oldest cache entry");
+        assert!(
+            asked.elapsed() < Duration::from_secs(10),
+            "a search waited for the import"
+        );
+        // The gap is named in the readiness the answer carries.
+        let reasons = &during["structuredContent"]["plan"]["readiness"]["reasons"];
+        assert!(
+            reasons.as_array().is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason == "semantic:building:migrating_legacy_index")),
+            "no migrating gap named: {during:#}"
+        );
+        assert_eq!(
+            during["lanes"]["semantic"]["status"], "building",
+            "{during:#}"
+        );
+        assert_ne!(during["complete"], true, "{during:#}");
+        let ledger = ImportLedger::open_existing(&storage, &key).unwrap();
+        assert!(
+            ledger.is_none_or(|ledger| !ledger.status().unwrap().complete),
+            "the import ran before it was admitted"
+        );
+
+        drop(slot);
+        wait_until(&ctx, "the imported view served", |ctx| {
+            ctx.checkout_semantic_runtime().is_some_and(|runtime| {
+                runtime
+                    .search(&mock_vector("probe"), 1, &|_| true)
+                    .is_ok_and(|answer| answer.complete())
+            })
+        });
+        assert_eq!(
+            server.texts(),
+            legacy_texts,
+            "the views-on lane re-embedded content the legacy index already held"
+        );
+        let status = ImportLedger::read_status(&storage, &key).unwrap().unwrap();
+        assert!(status.complete, "{status:?}");
+        let semantic = status
+            .rows
+            .iter()
+            .find(|row| row.artifact == Artifact::Semantic)
+            .unwrap();
+        assert_eq!(semantic.state, ImportState::Done, "{semantic:?}");
+        let after = search(&ctx, "evict the oldest cache entry");
+        assert!(
+            after["results"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty()),
+            "{after:#}"
+        );
+    }
+}

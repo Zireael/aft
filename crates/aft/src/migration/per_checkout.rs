@@ -1978,22 +1978,46 @@ pub fn has_importable_legacy_artifact(storage: &Path, legacy_key: &str) -> bool 
             || legacy_semantic_path(storage, legacy_key).is_file())
 }
 
-/// The semantic producer a legacy snapshot was built with, under `config`:
-/// the configured model at the snapshot's vector dimension. Reads the first
-/// five bytes only.
+/// The semantic producer a legacy snapshot was built with, under `config`.
+///
+/// The lane derives its producer from the loaded model's fingerprint:
+/// the configured backend, model and text caps at the model's vector
+/// dimension, plus, for a Synapse backend, the served vector space. The
+/// model is not loaded here, so the producer is rebuilt from the snapshot's
+/// header instead: its stored fingerprint when that agrees with `config` at
+/// the snapshot's dimension (which carries any Synapse identity unchanged),
+/// otherwise the configured one, which the import then rejects as
+/// incompatible. Reads the header only.
 pub(crate) fn legacy_semantic_producer(
     storage: &Path,
     legacy_key: &str,
     config: &crate::config::SemanticBackendConfig,
 ) -> Option<SemanticProducer> {
     use std::io::Read as _;
-    let mut header = [0_u8; 5];
-    fs::File::open(legacy_semantic_path(storage, legacy_key))
-        .and_then(|mut file| file.read_exact(&mut header))
-        .ok()?;
+    const MAX_FINGERPRINT_BYTES: usize = 64 * 1024;
+    let mut file = fs::File::open(legacy_semantic_path(storage, legacy_key)).ok()?;
+    let mut header = [0_u8; 13];
+    file.read_exact(&mut header).ok()?;
     let dimension = u32::from_le_bytes(header[1..5].try_into().expect("4")) as usize;
-    let fingerprint =
+    let stored_len = u32::from_le_bytes(header[9..13].try_into().expect("4")) as usize;
+    let configured =
         crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(config, dimension);
+    let mut stored = vec![0_u8; stored_len.min(MAX_FINGERPRINT_BYTES)];
+    let stored = (stored_len <= MAX_FINGERPRINT_BYTES)
+        .then(|| file.read_exact(&mut stored).ok().map(|()| stored))
+        .flatten()
+        .and_then(|bytes| {
+            serde_json::from_slice::<crate::semantic_index::SemanticIndexFingerprint>(&bytes).ok()
+        })
+        .filter(|stored| {
+            stored.backend == configured.backend
+                && stored.model == configured.model
+                && stored.base_url == configured.base_url
+                && stored.dimension == configured.dimension
+                && stored.chunking_version == configured.chunking_version
+                && stored.embed_text_caps == configured.embed_text_caps
+        });
+    let fingerprint = stored.unwrap_or(configured);
     Some(SemanticProducer::current(
         fingerprint.as_string(),
         fingerprint.embed_text_caps,

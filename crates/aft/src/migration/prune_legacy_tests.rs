@@ -1,43 +1,75 @@
 use super::*;
 
-#[test]
-fn the_census_classifies_aft_processes_and_refuses_lookalikes() {
-    let output = "\
-  101 /usr/local/bin/aft /usr/local/bin/aft --subc /tmp/conn.json
-  102 ck-aft           ck-aft
-  103 node             node /opt/opencode/bin/opencode
-  104 aft-bridge       aft-bridge --serve
-  105 craft            craft build
-  106 bash             /bin/bash /home/user/bin/aft serve
-  200 aft              aft cache prune-legacy
-";
-    let findings = parse_ps_output(output, 200).unwrap();
-    assert_eq!(
-        findings,
-        vec![
-            CensusFinding::Aft {
-                pid: 101,
-                daemon: true,
-                command: "/usr/local/bin/aft --subc /tmp/conn.json".to_owned(),
-            },
-            CensusFinding::Aft {
-                pid: 102,
-                daemon: false,
-                command: "ck-aft".to_owned(),
-            },
-            CensusFinding::Unclassifiable {
-                pid: 104,
-                command: "aft-bridge --serve".to_owned(),
-                reason: "its name mentions AFT but is not an aft or ck-aft executable".to_owned(),
-            },
-        ],
-        "the shell running an aft script is not itself classified; its aft child would be"
-    );
+fn identity(pid: u32, executable: Option<&str>, args: &[&str]) -> ProcessIdentity {
+    ProcessIdentity {
+        pid,
+        executable: executable.map(str::to_owned),
+        argv0: args.first().map(|arg| (*arg).to_owned()),
+        args: Some(args.iter().map(|arg| (*arg).to_owned()).collect()),
+    }
 }
 
 #[test]
-fn an_unparsable_census_line_is_an_error() {
-    assert!(parse_ps_output("not-a-pid aft aft\n", 1).is_err());
+fn the_census_classifies_aft_processes_and_refuses_lookalikes() {
+    let spaced = "/Users/me/Library/Application Support/AFT Host/bin/aft";
+    assert_eq!(
+        classify(&identity(
+            101,
+            Some(spaced),
+            &[spaced, "--subc", "/tmp/c.json"]
+        )),
+        Some(CensusFinding::Aft {
+            pid: 101,
+            daemon: true,
+            command: format!("{spaced} --subc /tmp/c.json"),
+        }),
+        "an executable path with spaces is one field"
+    );
+    assert!(matches!(
+        classify(&identity(102, None, &["ck-aft"])),
+        Some(CensusFinding::Aft {
+            pid: 102,
+            daemon: false,
+            ..
+        })
+    ));
+    assert!(matches!(
+        classify(&identity(104, Some("/opt/bin/aft-bridge"), &["aft-bridge"])),
+        Some(CensusFinding::Unclassifiable { pid: 104, .. })
+    ));
+    assert!(matches!(
+        classify(&ProcessIdentity { pid: 105, ..ProcessIdentity::default() }),
+        Some(CensusFinding::Unclassifiable { pid: 105, ref reason, .. })
+            if reason.contains("could not be read")
+    ));
+    assert_eq!(
+        classify(&identity(106, Some("/usr/bin/craft"), &["craft"])),
+        None
+    );
+    assert_eq!(
+        classify(&identity(
+            107,
+            Some("/bin/bash"),
+            &["/bin/bash", "/home/u/bin/aft"]
+        )),
+        None,
+        "a shell running an aft script is not itself AFT; its aft child is"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_system_census_reads_every_process_and_never_lists_itself() {
+    let findings = SystemCensus.take().unwrap();
+    let me = std::process::id();
+    assert!(findings.iter().all(|finding| match finding {
+        CensusFinding::Aft { pid, .. } | CensusFinding::Unclassifiable { pid, .. } => *pid != me,
+    }));
+    let unreadable = findings
+        .iter()
+        .filter(|finding| matches!(finding, CensusFinding::Unclassifiable { reason, .. } if reason.contains("could not be read")))
+        .collect::<Vec<_>>();
+    assert!(unreadable.is_empty(), "{unreadable:?}");
 }
 
 #[test]

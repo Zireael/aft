@@ -345,7 +345,7 @@ pub enum CensusFinding {
         command: String,
     },
     /// A process whose name mentions AFT but is not an `aft` or `ck-aft`
-    /// executable.
+    /// executable, or whose executable could not be read at all.
     Unclassifiable {
         pid: u32,
         command: String,
@@ -376,29 +376,40 @@ pub trait ProcessCensus {
     fn take(&self) -> Result<Vec<CensusFinding>, String>;
 }
 
-/// The census of this machine, from `ps`.
+/// The census of this machine. Each process's identity is read whole from
+/// the OS (its executable path and first argument), never by splitting a
+/// `ps` listing on whitespace: `ps` truncates and pads its columns, so an
+/// executable under a path with spaces (an app bundle, `Application
+/// Support`) would be misread and a live AFT process missed.
 pub struct SystemCensus;
 
 impl ProcessCensus for SystemCensus {
-    #[cfg(unix)]
     fn take(&self) -> Result<Vec<CensusFinding>, String> {
-        let output = std::process::Command::new("ps")
-            .args(["-axww", "-o", "pid=,comm=,args="])
-            .env("LC_ALL", "C")
-            .output()
-            .map_err(|error| format!("could not run ps: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("ps exited with {}", output.status));
+        let self_pid = std::process::id();
+        let mut findings = Vec::new();
+        for identity in system_processes()? {
+            if identity.pid == self_pid || identity.pid == 0 {
+                continue;
+            }
+            if let Some(finding) = classify(&identity) {
+                findings.push(finding);
+            }
         }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|_| "ps printed bytes that are not UTF-8".to_owned())?;
-        parse_ps_output(&text, std::process::id())
+        Ok(findings)
     }
+}
 
-    #[cfg(not(unix))]
-    fn take(&self) -> Result<Vec<CensusFinding>, String> {
-        Err("the process census is not available on this platform".to_owned())
-    }
+/// What the OS reports about one process. `None` means the field could not
+/// be read; a process that exited while it was being read is not listed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    /// The executable's path, as one string.
+    pub executable: Option<String>,
+    /// The first argument, as one string.
+    pub argv0: Option<String>,
+    /// The arguments, one string each.
+    pub args: Option<Vec<String>>,
 }
 
 const AFT_NAMES: [&str; 4] = ["aft", "ck-aft", "aft.exe", "ck-aft.exe"];
@@ -416,50 +427,197 @@ fn names_aft(value: &str) -> bool {
         .any(|word| word == "aft")
 }
 
-/// Classifies `ps -o pid=,comm=,args=` output. An `aft`/`ck-aft` executable
-/// is a holder; a process whose executable or first argument names AFT any
-/// other way cannot be classified; a line that does not parse is a census
-/// error.
-pub fn parse_ps_output(output: &str, self_pid: u32) -> Result<Vec<CensusFinding>, String> {
-    let mut findings = Vec::new();
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (pid, rest) = line
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| format!("unparsable ps line: {line}"))?;
-        let pid: u32 = pid
-            .parse()
-            .map_err(|_| format!("unparsable ps pid in: {line}"))?;
-        if pid == self_pid {
-            continue;
-        }
-        let rest = rest.trim_start();
-        let (comm, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        let args = args.trim();
-        let argv0 = args.split_whitespace().next().unwrap_or("");
-        let exact = |value: &str| AFT_NAMES.contains(&basename(value));
-        let command = if args.is_empty() { comm } else { args }.to_owned();
-        if exact(comm) || exact(argv0) {
-            let daemon = args
-                .split_whitespace()
-                .any(|arg| arg == "--subc" || arg.starts_with("--subc="));
-            findings.push(CensusFinding::Aft {
-                pid,
-                daemon,
-                command,
-            });
-        } else if names_aft(comm) || names_aft(argv0) {
-            findings.push(CensusFinding::Unclassifiable {
-                pid,
-                command,
-                reason: "its name mentions AFT but is not an aft or ck-aft executable".to_owned(),
-            });
-        }
+/// Classifies one process. An `aft`/`ck-aft` executable or first argument
+/// is a holder. A name that mentions AFT any other way, or a process whose
+/// executable and first argument both could not be read, cannot be
+/// classified. Either one refuses the prune.
+pub fn classify(identity: &ProcessIdentity) -> Option<CensusFinding> {
+    let names = [identity.executable.as_deref(), identity.argv0.as_deref()];
+    let command = match (&identity.args, &identity.executable) {
+        (Some(args), _) if !args.is_empty() => args.join(" "),
+        (_, Some(executable)) => executable.clone(),
+        _ => "(unreadable)".to_owned(),
+    };
+    if names
+        .iter()
+        .flatten()
+        .any(|name| AFT_NAMES.contains(&basename(name)))
+    {
+        let daemon = identity.args.as_ref().is_some_and(|args| {
+            args.iter()
+                .any(|arg| arg == "--subc" || arg.starts_with("--subc="))
+        });
+        return Some(CensusFinding::Aft {
+            pid: identity.pid,
+            daemon,
+            command,
+        });
     }
-    Ok(findings)
+    if names.iter().flatten().any(|name| names_aft(name)) {
+        return Some(CensusFinding::Unclassifiable {
+            pid: identity.pid,
+            command,
+            reason: "its name mentions AFT but is not an aft or ck-aft executable".to_owned(),
+        });
+    }
+    if names.iter().all(Option::is_none) {
+        return Some(CensusFinding::Unclassifiable {
+            pid: identity.pid,
+            command,
+            reason: "its executable could not be read".to_owned(),
+        });
+    }
+    None
+}
+
+/// Every process on a Linux host, from `/proc`.
+#[cfg(target_os = "linux")]
+fn system_processes() -> Result<Vec<ProcessIdentity>, String> {
+    let entries =
+        fs::read_dir("/proc").map_err(|error| format!("could not list /proc: {error}"))?;
+    let mut processes = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not list /proc: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let dir = entry.path();
+        let executable = fs::read_link(dir.join("exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let (argv0, args) = match fs::read(dir.join("cmdline")) {
+            // Kernel threads and zombies have an empty command line; their
+            // name is their identity.
+            Ok(bytes) if bytes.is_empty() => match fs::read_to_string(dir.join("comm")) {
+                Ok(comm) => (Some(comm.trim_end().to_owned()), Some(Vec::new())),
+                Err(_) => (None, None),
+            },
+            Ok(bytes) => {
+                let args = bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|arg| !arg.is_empty())
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                    .collect::<Vec<_>>();
+                (args.first().cloned(), Some(args))
+            }
+            Err(_) => (None, None),
+        };
+        if executable.is_none() && argv0.is_none() && !dir.exists() {
+            continue;
+        }
+        processes.push(ProcessIdentity {
+            pid,
+            executable,
+            argv0,
+            args,
+        });
+    }
+    Ok(processes)
+}
+
+/// Every process on a macOS host: pids from `proc_listallpids`, each
+/// executable from `proc_pidpath`, and `ps -p <pid>` with one column when
+/// that fails or for the arguments of an AFT process.
+#[cfg(target_os = "macos")]
+fn system_processes() -> Result<Vec<ProcessIdentity>, String> {
+    // SAFETY: a null buffer asks for the number of pids.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Err("proc_listallpids failed".to_owned());
+    }
+    // Room for processes started since the count was taken.
+    let mut pids = vec![0 as libc::pid_t; count as usize + 256];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes of pid_t values.
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if listed <= 0 {
+        return Err("proc_listallpids failed".to_owned());
+    }
+    pids.truncate((listed as usize).min(pids.len()));
+    let mut processes = Vec::with_capacity(pids.len());
+    for pid in pids {
+        let Ok(pid) = u32::try_from(pid) else {
+            continue;
+        };
+        let executable = match pid_path(pid) {
+            Some(path) => Some(path),
+            None => match ps_field(pid, "comm=") {
+                PsField::Gone => continue,
+                PsField::Value(value) => Some(value),
+                PsField::Unreadable => None,
+            },
+        };
+        let mut identity = ProcessIdentity {
+            pid,
+            executable,
+            ..ProcessIdentity::default()
+        };
+        // Only an AFT process's arguments matter (the daemon flag and the
+        // report), so they are read for those alone. They are split on
+        // whitespace only to find the flag; identity comes from the
+        // executable path, read whole above.
+        if identity
+            .executable
+            .as_deref()
+            .is_some_and(|path| AFT_NAMES.contains(&basename(path)) || names_aft(path))
+        {
+            if let PsField::Value(args) = ps_field(pid, "args=") {
+                identity.args = Some(args.split_whitespace().map(str::to_owned).collect());
+            }
+        }
+        processes.push(identity);
+    }
+    Ok(processes)
+}
+
+#[cfg(target_os = "macos")]
+fn pid_path(pid: u32) -> Option<String> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is PROC_PIDPATHINFO_MAXSIZE bytes long.
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    (length > 0).then(|| String::from_utf8_lossy(&buffer[..length as usize]).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+enum PsField {
+    Value(String),
+    Gone,
+    Unreadable,
+}
+
+/// One `ps` column for one pid. With a single column nothing is padded or
+/// truncated, so the whole value is the field.
+#[cfg(target_os = "macos")]
+fn ps_field(pid: u32, column: &str) -> PsField {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", column])
+        .env("LC_ALL", "C")
+        .output()
+    else {
+        return PsField::Unreadable;
+    };
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    match (output.status.success(), value.is_empty()) {
+        (true, false) => PsField::Value(value),
+        // `ps -p` exits non-zero when the pid no longer exists.
+        (false, true) => PsField::Gone,
+        _ => PsField::Unreadable,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn system_processes() -> Result<Vec<ProcessIdentity>, String> {
+    Err("the process census is not available on this platform".to_owned())
 }
 
 // ---------------------------------------------------------------------------

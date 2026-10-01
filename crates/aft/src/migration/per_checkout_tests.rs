@@ -404,3 +404,57 @@ fn old_sweeps_do_not_reach_v2_and_the_import_keeps_the_legacy_set() {
         v2_before
     );
 }
+
+fn write_legacy_header(storage: &Path, key: &str, fingerprint: &SemanticIndexFingerprint) {
+    let mut index = SemanticIndex::build(
+        storage,
+        &[],
+        &mut |texts: Vec<String>| Ok(texts.iter().map(|text| deterministic(text)).collect()),
+        64,
+    )
+    .unwrap();
+    index.set_fingerprint(fingerprint.clone());
+    let mut bytes = index.to_bytes();
+    // An empty build has no vectors to give it a dimension; stamp the one
+    // the fingerprint names, as a real build of that model would.
+    bytes[1..5].copy_from_slice(&(fingerprint.dimension as u32).to_le_bytes());
+    let dir = storage.join("semantic").join(key);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("semantic.bin"), bytes).unwrap();
+}
+
+/// The lane's producer is the loaded model's fingerprint. For every backend
+/// except Synapse that is the configuration at the model's dimension, which
+/// the snapshot's dimension reproduces; for the default local model too.
+/// A Synapse snapshot's served-space identity comes from its own stored
+/// fingerprint, so it matches the lane while that identity is unchanged.
+#[test]
+fn the_legacy_producer_matches_the_lane_for_local_and_synapse_backends() {
+    let storage = tempfile::tempdir().unwrap();
+    let config = crate::config::SemanticBackendConfig::default();
+    let local = SemanticIndexFingerprint::for_config_dimension(&config, 384);
+    write_legacy_header(storage.path(), "local", &local);
+    let producer = legacy_semantic_producer(storage.path(), "local", &config).unwrap();
+    assert_eq!(producer.model_fingerprint, local.as_string());
+    assert_eq!(
+        producer.id(),
+        SemanticProducer::current(local.as_string(), local.embed_text_caps).id()
+    );
+
+    let mut synapse = local.clone();
+    synapse.synapse_fingerprint = Some("served-space".to_owned());
+    synapse.synapse_table_epoch = Some(7);
+    write_legacy_header(storage.path(), "synapse", &synapse);
+    let producer = legacy_semantic_producer(storage.path(), "synapse", &config).unwrap();
+    assert_eq!(producer.model_fingerprint, synapse.as_string());
+
+    let mut other_model = local.clone();
+    other_model.model = "another-model".to_owned();
+    write_legacy_header(storage.path(), "other", &other_model);
+    let producer = legacy_semantic_producer(storage.path(), "other", &config).unwrap();
+    assert_eq!(
+        producer.model_fingerprint,
+        local.as_string(),
+        "a snapshot of another model yields the configured producer, which the import rejects"
+    );
+}
