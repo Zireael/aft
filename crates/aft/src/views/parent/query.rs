@@ -250,6 +250,7 @@ pub(crate) fn grep_fan_out(
             fully_degraded: false,
             engine_capped: false,
             walk_truncated: false,
+            scan_deadline_reached: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
         }
