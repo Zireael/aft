@@ -1433,8 +1433,9 @@ fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
     // entries, so delivered file events invalidate this wait immediately. File
     // delivery is asynchronous, however; the terminal StatVerification phase
     // compares the scanned file set directly and closes that latency window.
-    // The unscoped diagnostics gate uses this same producer-settled check, so
-    // a wait that returns cannot then be judged incomplete for lack of reports.
+    // Settlement ends the producer wait, not the authority obligation. The
+    // diagnostics collection rechecks reports and compiler progress and names
+    // missing results as gaps instead of certifying a quiescent empty store.
     ctx.lsp().producers_settled(expected)
 }
 
@@ -2600,17 +2601,21 @@ fn render_incomplete_categories(
                 ));
                 continue;
             }
-            let producer = gap
-                .get("producer")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown producer");
-            let producer = match gap.get("root").and_then(Value::as_str) {
-                Some(root) => format!("{producer} @ {root}"),
-                None => producer.to_string(),
-            };
-            lines.push(format!(
-                "Incomplete {category}: producer {producer} failed ({reason})"
-            ));
+            if let Some(producer) = gap.get("producer").and_then(Value::as_str) {
+                let producer = match gap.get("root").and_then(Value::as_str) {
+                    Some(root) => format!("{producer} @ {root}"),
+                    None => producer.to_string(),
+                };
+                if gap.get("kind").and_then(Value::as_str) == Some("unreported_producer") {
+                    lines.push(format!("Incomplete {category}: {producer}: {reason}"));
+                } else {
+                    lines.push(format!(
+                        "Incomplete {category}: producer {producer} failed ({reason})"
+                    ));
+                }
+            } else {
+                lines.push(format!("Incomplete {category}: {reason}"));
+            }
         }
         render_uncovered_file_groups(lines, category, value, details);
     }
@@ -4067,6 +4072,22 @@ mod render_text_tests {
 
     fn render_with_details(summary: Value, details: Value) -> String {
         render_inspect_text(&summary_map(summary), &summary_map(details), None)
+    }
+
+    #[test]
+    fn aggregate_gap_renders_category_and_reason_without_a_producer() {
+        let text = render(serde_json::json!({
+            "dead_code": {
+                "unavailable": true,
+                "complete": false,
+                "gaps": [{
+                    "kind": "analysis_incomplete",
+                    "reason": "tier2 dead_code aggregate did not complete; retry aft_inspect"
+                }]
+            }
+        }));
+        assert!(text.contains("Incomplete dead_code: tier2 dead_code aggregate did not complete; retry aft_inspect"), "{text}");
+        assert!(!text.contains("producer"), "{text}");
     }
 
     #[test]

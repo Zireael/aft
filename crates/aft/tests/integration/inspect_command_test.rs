@@ -4421,11 +4421,10 @@ fn blocking_inspect_indexing_gap_names_elapsed_wait_and_retry() {
     assert!(reason.contains("retry aft_inspect"), "{reason}");
 }
 
-/// A producer that declares quiescence without publishing any report is
-/// complete. The wait already treated that producer as settled; the freshness
-/// gate must use the same predicate rather than requiring a published report.
+/// Quiescence ends the startup wait but cannot certify clean diagnostics
+/// when the producer has never published an authoritative report.
 #[test]
-fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
+fn blocking_inspect_names_producers_that_quiesce_without_reports() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -4476,12 +4475,11 @@ fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
     let summary = response["summary"]["diagnostics"]
         .as_object()
         .expect("diagnostics summary");
-    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
-    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
-    assert!(
-        !summary.contains_key("status"),
-        "settled empty diagnostics must be complete, not pending: {response:#}"
-    );
+    assert!(summary["errors"].is_null(), "{response:#}");
+    assert!(summary["warnings"].is_null(), "{response:#}");
+    assert_eq!(summary["complete"], false, "{response:#}");
+    assert_eq!(summary["gaps"][0]["producer"], "rust", "{response:#}");
+    assert!(summary["by_producer"]["rust"]["errors"].is_null());
 }
 
 #[test]
@@ -5738,6 +5736,11 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         "{text}"
     );
     assert!(!text.contains("producer rust failed"), "{text}");
+    assert!(!text.contains("unknown producer"), "{text}");
+    assert!(response["summary"]["diagnostics"]["by_producer"]
+        .as_object()
+        .expect("producer counts")
+        .contains_key("rust"));
 }
 
 #[test]

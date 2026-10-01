@@ -12,6 +12,7 @@ use crate::config::{
     Config, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
 };
 use crate::context::AppContext;
+use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{ApplicableServerFailure, NotApplicableServer, ServerAttemptResult};
 use crate::lsp::registry::{servers_for_file, ServerKind};
@@ -95,15 +96,16 @@ struct DiagnosticsCollection {
     /// gap, so it never makes the payload incomplete.
     not_applicable: BTreeMap<String, String>,
     scope_coverage_gaps: Vec<ScopedCoverageGap>,
-    /// True when the producer set this collection is responsible for has all
-    /// settled (authoritative report or no longer warming). Distinct from
-    /// `server_ran`: a quiesced producer may never publish, and that empty
-    /// store is still a complete answer.
+    /// Whether the producer wait has ended. Settlement alone does not prove
+    /// diagnostics authority: a quiescent server may not have reported yet.
     producers_settled: bool,
     /// Why each server, by server id and workspace root, had not finished
     /// its initial indexing when the blocking wait ran out. Keyed by root as
     /// well as id so each gap row names the workspace it is about.
     indexing_gaps: BTreeMap<(String, PathBuf), String>,
+    /// Server ids and roots of settled producers that have not published an
+    /// authoritative diagnostic report, so their files cannot be certified.
+    unreported_producers: BTreeSet<(String, PathBuf)>,
     /// Server ids and roots of rust-analyzer producers whose `cargo check` had not
     /// finished when the wait ran out. Their published reports lack the
     /// compiler's newest results, so totals cannot be certified.
@@ -122,8 +124,8 @@ struct DiagnosticsCollection {
 /// no per-file work.
 ///
 /// The authority halves differ by design. An unscoped request makes a
-/// full-root claim, so producer settlement over the started set decides
-/// freshness — the same predicate the blocking wait uses. A scoped request
+/// full-root claim, so each started producer needs an authoritative report
+/// and a current compiler check, or a named gap. A scoped request
 /// makes per-file claims: every scoped file must either carry an
 /// authoritative producer report or appear as a named gap, because a
 /// settled producer cannot prove that a specific file nothing ever analyzed
@@ -247,7 +249,11 @@ pub(crate) fn run_diagnostics_category(
         return JobOutcome::Fresh { payload };
     }
 
-    if collection.is_reportable() || !collection.indexing_gaps.is_empty() {
+    if collection.is_reportable()
+        || !collection.indexing_gaps.is_empty()
+        || !collection.checking_producers.is_empty()
+        || !collection.unreported_producers.is_empty()
+    {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
         }
@@ -291,11 +297,10 @@ fn collect_warm_working_set(
                 )
             })
             .collect();
-        // Pending producers are those that have not settled. The blocking wait
-        // uses the same `producer_has_settled` check, so a quiesced producer
-        // with no published report is complete rather than forever pending.
-        // When the caller started a specific set, that set is the obligation;
-        // otherwise the currently running clients are.
+        // The started set remains an obligation even if a client has exited.
+        // Quiescence ends the startup wait, but only an authoritative report
+        // can certify diagnostics. Recheck authority after draining events:
+        // progress can arrive after the earlier quiescence wait returned.
         let mut producers = if expected_producers.is_empty() {
             lsp.active_server_keys()
         } else {
@@ -316,10 +321,25 @@ fn collect_warm_working_set(
                     .producer_failures_by_key
                     .insert(server.clone(), reason.to_string());
             }
-            if !lsp.producer_has_settled(server) {
-                collection
-                    .servers_pending
-                    .insert((server_id(server), server.root.clone()));
+            let key = (server_id(server), server.root.clone());
+            if scope_producers.is_none()
+                && lsp.producer_failure(server).is_none()
+                && !lsp.server_is_warming(server)
+            {
+                let reported = lsp.has_authoritative_report_for_server(server);
+                if server.kind == ServerKind::Rust
+                    && (!reported || lsp.rust_check_state(server) != RustCheckState::Current)
+                {
+                    collection.checking_producers.insert(key.clone());
+                } else if !reported {
+                    collection.unreported_producers.insert(key.clone());
+                }
+            }
+            if !lsp.producer_has_settled(server)
+                && !collection.checking_producers.contains(&key)
+                && !collection.unreported_producers.contains(&key)
+            {
+                collection.servers_pending.insert(key);
             }
         }
         collection.producers_settled =
@@ -661,14 +681,13 @@ impl DiagnosticsCollection {
         self.is_reportable()
             && self.producer_failures.is_empty()
             && self.scope_coverage_gaps.is_empty()
+            && self.checking_producers.is_empty()
+            && self.unreported_producers.is_empty()
     }
 
-    /// Full-root authority conjunction for the no-scope path. Completeness is
-    /// producer settlement — the same predicate the blocking wait uses — not
-    /// "some server published a report". A quiesced producer with no reports
-    /// is complete; a still-warming producer without an authoritative report
-    /// is not. Scoped requests use per-file authority instead (see
-    /// `record_scope_coverage_gaps`).
+    /// Whether collection can return a payload after the producer wait.
+    /// Missing reports and unfinished checks are carried as named gaps, not
+    /// inferred to be clean from settlement. Scoped authority is per file.
     fn is_reportable(&self) -> bool {
         self.servers_pending.is_empty()
             && (self.server_ran
@@ -776,6 +795,14 @@ impl DiagnosticsCollection {
                 "reason": reason,
             }));
         }
+        for (producer, root) in self.unreported_producers {
+            gaps.push(serde_json::json!({
+                "kind": "unreported_producer",
+                "producer": producer,
+                "root": display_root(snapshot, &root),
+                "reason": "producer has no authoritative diagnostic report; retry aft_inspect",
+            }));
+        }
         for (producer, root) in self.checking_producers {
             gaps.push(serde_json::json!({
                 "kind": "checking_producer",
@@ -785,6 +812,13 @@ impl DiagnosticsCollection {
             }));
         }
         if !gaps.is_empty() {
+            for gap in &gaps {
+                if let Some(producer) = gap["producer"].as_str() {
+                    payload["by_producer"][producer] = serde_json::json!({
+                        "errors": null, "warnings": null, "info": null, "hints": null,
+                    });
+                }
+            }
             // Aggregate totals cannot certify a scope with missing producer results.
             // Answering producers retain their numeric counts in by_producer.
             for key in ["errors", "warnings", "info", "hints"] {
@@ -1089,32 +1123,34 @@ mod payload_count_tests {
     }
 
     #[test]
-    fn settled_producers_without_reports_are_reportable() {
-        let collection = DiagnosticsCollection {
-            producers_settled: true,
-            ..DiagnosticsCollection::default()
-        };
-        // The previous full-root check required `server_ran` (any published
-        // report) and treated a settled empty store as incomplete. That
-        // disagreed with producer settlement, which is complete once every
-        // producer holds an authoritative report or has stopped warming.
-        let old_predicate = (collection.server_ran
-            || collection.applicability_is_empty
-            || !collection.producer_failures.is_empty())
-            && collection.servers_pending.is_empty()
-            && collection
-                .diagnostics
-                .iter()
-                .all(|diagnostic| !diagnostic.provisional);
-        assert!(
-            !old_predicate,
-            "the old reportable check must reject a settled empty store, otherwise this test cannot catch the wait/gate split"
+    fn started_producers_without_authoritative_reports_are_named_gaps() {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
         );
-        assert!(collection.is_reportable());
-        assert!(collection.is_complete());
+        let expected = [ServerKind::Rust, ServerKind::TypeScript].map(|kind| ServerKey {
+            kind,
+            root: PathBuf::from("/repo"),
+        });
+        let collection = super::collect_warm_working_set(&ctx, &snapshot(), &expected, None);
+        assert!(!collection.is_complete());
         let payload = collection.into_payload(&snapshot());
-        assert_eq!(payload["errors"], 0);
-        assert!(payload.get("complete").is_none());
+        assert!(payload["errors"].is_null(), "{payload:#}");
+        let gaps = payload["gaps"].as_array().expect("named gaps");
+        assert_eq!(gaps.len(), 2, "{payload:#}");
+        assert!(gaps
+            .iter()
+            .any(|gap| gap["producer"] == "rust" && gap["kind"] == "checking_producer"));
+        assert!(gaps
+            .iter()
+            .any(|gap| gap["producer"] == "typescript" && gap["kind"] == "unreported_producer"));
+        for producer in ["rust", "typescript"] {
+            assert!(payload["by_producer"]
+                .as_object()
+                .unwrap()
+                .contains_key(producer));
+            assert!(payload["by_producer"][producer]["errors"].is_null());
+        }
     }
 
     #[test]
