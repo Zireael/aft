@@ -657,6 +657,24 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
             return;
         }
     };
+    // Read the view's current-generation pointer first, without the family
+    // registry: an unchanged pointer means this session already serves the
+    // generation, and the check costs one small read-only database read.
+    let current_name = super::super::registry::view_dir(&session.storage, &child.scope)
+        .ok()
+        .and_then(super::super::ViewStore::existing_dir)
+        .and_then(|store| store.current_generation_read_only().ok().flatten());
+    let Some(current_name) = current_name else {
+        *write(&child.semantic) =
+            Plane::Gap("no semantic view has been published for this repository yet".into());
+        return;
+    };
+    if read(&child.semantic)
+        .ready()
+        .is_some_and(|current| current.generation.name() == current_name)
+    {
+        return;
+    }
     let reader = match child.reader(&session.storage) {
         Ok(Some(reader)) => reader,
         Ok(None) => {
@@ -680,19 +698,6 @@ fn refresh_semantic(session: &ParentSession, child: &Child) {
         semantic: Some(semantic.producer_id.clone()),
         callgraph: super::super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
     };
-    // Read the view's current-generation pointer first: a generation this
-    // session already serves needs no new read marker or admission.
-    let current_name = super::super::registry::view_dir(&session.storage, &child.scope)
-        .ok()
-        .and_then(super::super::ViewStore::existing_dir)
-        .and_then(|store| store.current_generation_read_only().ok().flatten());
-    if current_name.is_some()
-        && read(&child.semantic)
-            .ready()
-            .is_some_and(|current| Some(current.generation.name()) == current_name.as_deref())
-    {
-        return;
-    }
     let generation =
         match super::super::read::open_foreign_generation(&reader, &child.scope, &producers) {
             Ok(Some(generation)) => generation,

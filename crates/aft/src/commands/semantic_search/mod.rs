@@ -4890,11 +4890,59 @@ fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {
     embed_query_for_dimension(query, ctx, index_dimension)
 }
 
+thread_local! {
+    /// A query vector the caller already computed for one query text; see
+    /// [`with_precomputed_query_vector`].
+    static PRECOMPUTED_QUERY_VECTOR: std::cell::RefCell<Option<(String, Vec<f32>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous precomputed query vector when dropped, so a panic in
+/// the search cannot leave a stale vector on the thread.
+struct PrecomputedQueryVectorGuard(Option<(String, Vec<f32>)>);
+
+impl Drop for PrecomputedQueryVectorGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        PRECOMPUTED_QUERY_VECTOR.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Runs `run` with `vector` standing in for the embedding of `query` on this
+/// thread: a search of exactly that query text uses the vector instead of
+/// asking the context's model. Everything after the embedding is unchanged, so
+/// when the vector comes from the same model and query text, the answer is
+/// byte-identical to the normal path. A multi-repository parent folder uses
+/// this to embed a query once and search its child repositories in parallel
+/// without a model per child.
+pub fn with_precomputed_query_vector<R>(
+    query: &str,
+    vector: Vec<f32>,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous =
+        PRECOMPUTED_QUERY_VECTOR.with(|slot| slot.borrow_mut().replace((query.to_owned(), vector)));
+    let _restore = PrecomputedQueryVectorGuard(previous);
+    run()
+}
+
+fn precomputed_query_vector(query: &str) -> Option<Vec<f32>> {
+    PRECOMPUTED_QUERY_VECTOR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(text, _)| text == query)
+            .map(|(_, vector)| vector.clone())
+    })
+}
+
 fn embed_query_for_dimension(
     query: &str,
     ctx: &AppContext,
     index_dimension: Option<usize>,
 ) -> Result<Vec<f32>, String> {
+    if let Some(query_vector) = precomputed_query_vector(query) {
+        return check_query_dimension(query_vector, index_dimension);
+    }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
     let mut model_ref = ctx.semantic_embedding_model().lock();
@@ -4927,6 +4975,13 @@ fn embed_query_for_dimension(
         .map_err(|error| format!("failed to embed query: {error}"))?;
     drop(model_ref);
 
+    check_query_dimension(query_vector, index_dimension)
+}
+
+fn check_query_dimension(
+    query_vector: Vec<f32>,
+    index_dimension: Option<usize>,
+) -> Result<Vec<f32>, String> {
     if let Some(index_dimension) = index_dimension {
         if index_dimension != query_vector.len() {
             return Err(format!(

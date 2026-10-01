@@ -293,15 +293,28 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         return Response::success(&req.id, body);
     }
     let wanted = offset.saturating_add(top_k);
-    // When semantic search runs, the session's one model is lent to each
-    // engine in turn: the query is embedded once (the model caches it) and no
-    // child starts a model of its own, so those engines run one after
-    // another. Without a model to lend, the children's engines are
-    // independent and run in parallel.
+    // With semantic search on, the session embeds the query once with its
+    // one model; every child engine then runs in parallel with that vector in
+    // place of its own embedding, so no child starts a model. If the query
+    // cannot be embedded, the model is lent to each engine in turn instead,
+    // which reports the failure the way a direct search would.
     let semantic = read(&session.semantic).clone();
-    let model = semantic
+    let mut model = semantic
         .ready()
         .and_then(|semantic| lock(&semantic.model).take());
+    let vector = model.as_mut().and_then(|model| {
+        model
+            .embed_query_cached(
+                query,
+                crate::semantic_index::QueryBudget::from_config(&session.semantic_config),
+            )
+            .ok()
+    });
+    if vector.is_some() {
+        if let Some(semantic) = semantic.ready() {
+            *lock(&semantic.model) = model.take();
+        }
+    }
     if let Some(reason) = semantic.gap_reason("semantic") {
         // A normal answer without semantic search is incomplete too; the
         // parent says why once instead of once per child.
@@ -312,7 +325,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         .into_iter()
         .filter(|child| child.root.starts_with(&scope) || scope.starts_with(&child.root))
         .collect::<Vec<_>>();
-    let run = |child: &Child, lent: Option<crate::semantic_index::EmbeddingModel>| {
+    let run = |child: &Child,
+               lent: Option<crate::semantic_index::EmbeddingModel>,
+               vector: Option<&Vec<f32>>| {
         let mut engine = lock(&child.engine);
         let Some(engine) = engine.as_mut() else {
             let reason = read(&child.trigram)
@@ -338,8 +353,16 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         if lending {
             *engine.ctx.semantic_embedding_model().lock() = lent;
         }
-        let response =
-            crate::commands::semantic_search::handle_semantic_search(&child_req, &engine.ctx);
+        let search =
+            || crate::commands::semantic_search::handle_semantic_search(&child_req, &engine.ctx);
+        let response = match vector {
+            Some(vector) => crate::commands::semantic_search::with_precomputed_query_vector(
+                query,
+                vector.clone(),
+                search,
+            ),
+            None => search(),
+        };
         let returned = if lending {
             engine.ctx.semantic_embedding_model().lock().take()
         } else {
@@ -357,10 +380,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         (Ok(response.data), returned)
     };
     let outcomes = if model.is_some() {
-        let mut model = model;
         let mut outcomes = Vec::new();
         for child in &children {
-            let (outcome, returned) = run(child, model.take());
+            let (outcome, returned) = run(child, model.take(), None);
             model = returned;
             outcomes.push(outcome);
         }
@@ -372,7 +394,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         use rayon::prelude::*;
         children
             .par_iter()
-            .map(|child| run(child, None).0)
+            .map(|child| run(child, None, vector.as_ref()).0)
             .collect::<Vec<_>>()
     };
 

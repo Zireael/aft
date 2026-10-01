@@ -1118,6 +1118,7 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     }
 
     // Paging: offset and topK select a window of the same merged ranking.
+    precomputed_query_vector_ranks_byte_identically(&sessions[0], "retry with exponential backoff");
     let page = data(
         aft::views::parent::route(
             &request(json!({
@@ -1134,6 +1135,46 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
     assert_eq!(rows(&page), parent_rows[1..2].to_vec(), "{page:#}");
     assert_eq!(page["more_available"], parent_rows.len() > 2, "{page:#}");
     assert_eq!(page["results_list_envelope"]["shown"], 1, "{page:#}");
+}
+
+/// A search given the query's own embedding as a precomputed vector answers
+/// exactly like the normal path that embeds it: same ranked rows, same text.
+fn precomputed_query_vector_ranks_byte_identically(ctx: &AppContext, query: &str) {
+    let search = || {
+        aft::commands::semantic_search::handle_semantic_search(
+            &request(json!({
+                "id": "precomputed",
+                "command": "semantic_search",
+                "query": query,
+                "top_k": 10,
+            })),
+            ctx,
+        )
+        .data
+    };
+    let normal = search();
+    let vector = {
+        let mut model = ctx.semantic_embedding_model().lock();
+        let model = model.as_mut().expect("the normal search started the model");
+        model
+            .embed_query_cached(
+                query,
+                aft::semantic_index::QueryBudget::from_config(&ctx.config().semantic),
+            )
+            .unwrap()
+    };
+    // No model in the slot: the precomputed vector must be the only source.
+    let model = ctx.semantic_embedding_model().lock().take();
+    let precomputed =
+        aft::commands::semantic_search::with_precomputed_query_vector(query, vector, search);
+    assert!(ctx.semantic_embedding_model().lock().is_none());
+    *ctx.semantic_embedding_model().lock() = model;
+    assert!(!normal["results"].as_array().unwrap().is_empty());
+    assert_eq!(
+        serde_json::to_string(&normal["results"]).unwrap(),
+        serde_json::to_string(&precomputed["results"]).unwrap()
+    );
+    assert_eq!(normal["text"], precomputed["text"]);
 }
 
 /// More children than the cap: the first 64 are served and the rest are one
