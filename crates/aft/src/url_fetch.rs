@@ -831,8 +831,11 @@ fn html_to_markdown_converter() -> HtmlToMarkdown {
 /// Walking the text ourselves also keeps htmd's text handling (escaping,
 /// collapsing blank lines) away from code that has to be copied verbatim.
 fn fenced_code_block(element: &Element<'_>) -> String {
-    let mut code = String::new();
-    collect_preformatted_text(element.node, &mut code);
+    let mut text = PreformattedText::default();
+    text.collect(element.node);
+    // A break still pending after the last line ends the block, so it is
+    // dropped rather than written.
+    let mut code = text.output;
     // The line break before `</code>` or `</pre>` ends the last line; it is
     // not an extra blank line inside the block.
     if code.ends_with('\n') {
@@ -858,37 +861,118 @@ fn fenced_code_block(element: &Element<'_>) -> String {
     block
 }
 
-/// Append the text under `node` exactly as written: no escaping and no
-/// whitespace changes. `<br>` becomes a line break, and a Prism `token-line`
-/// span (Docusaurus puts one line in each, with no newline between them) ends
-/// its line when the line has no break of its own.
-fn collect_preformatted_text(node: &Node, output: &mut String) {
-    for child in node.children.borrow().iter() {
-        match &child.data {
-            NodeData::Text { contents } => output.push_str(&contents.borrow()),
-            NodeData::Element { name, attrs, .. } => {
-                let tag = name.local.as_ref();
-                if SKIPPED_HTML_TAGS.contains(&tag) {
-                    continue;
+/// How an element inside a `<pre>` ends the text line it holds.
+///
+/// Many highlighters emit one element per source line with no newline text
+/// between them: Prism `span.token-line` (Docusaurus), Shiki `span.line`,
+/// `<li>` per line, table rows (highlight.js line-numbers plugin), or plain
+/// per-line `<div>`s. A browser still shows separate lines, so the copied
+/// text must break after each one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreLineBreak {
+    /// Inline element: adds no break.
+    None,
+    /// One source line, so it always ends a line, even when empty (an empty
+    /// row or `span.line` is a blank line of code).
+    Line,
+    /// Generic block (`<div>`, `<p>`): ends a line only when it holds text,
+    /// so an empty line-number `<div>` beside the code does not add a blank
+    /// line.
+    Block,
+}
+
+fn pre_line_break(tag: &str, class: Option<&str>) -> PreLineBreak {
+    let has_class =
+        |token: &str| class.is_some_and(|value| value.split_ascii_whitespace().any(|c| c == token));
+    match tag {
+        "tr" | "li" => PreLineBreak::Line,
+        "span" if has_class("token-line") || has_class("line") => PreLineBreak::Line,
+        "div" | "p" => PreLineBreak::Block,
+        _ => PreLineBreak::None,
+    }
+}
+
+/// The raw text of a `<pre>`, collected exactly as written: no escaping and
+/// no whitespace changes.
+///
+/// A per-line element (see [`PreLineBreak`]) ends its line with a *pending*
+/// break rather than a written one. Some highlighters already put a newline
+/// between their line elements (Shiki's default output does) and some do
+/// not; the pending break is written only when more of the block follows
+/// and is absorbed when that next text already starts with a newline, so
+/// both layouts give one line per element.
+#[derive(Default)]
+struct PreformattedText {
+    output: String,
+    pending_break: bool,
+}
+
+impl PreformattedText {
+    fn flush_pending_break(&mut self) {
+        if self.pending_break {
+            self.output.push('\n');
+            self.pending_break = false;
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.pending_break && text.starts_with('\n') {
+            self.pending_break = false;
+        }
+        self.flush_pending_break();
+        self.output.push_str(text);
+    }
+
+    fn collect(&mut self, node: &Node) {
+        for child in node.children.borrow().iter() {
+            match &child.data {
+                NodeData::Text { contents } => self.push_text(&contents.borrow()),
+                NodeData::Element { name, attrs, .. } => {
+                    let tag = name.local.as_ref();
+                    if SKIPPED_HTML_TAGS.contains(&tag) {
+                        continue;
+                    }
+                    if tag == "br" {
+                        // A `<br>` right after a finished line starts an
+                        // empty line, as it does in a browser.
+                        self.flush_pending_break();
+                        self.output.push('\n');
+                        continue;
+                    }
+                    let line_break = {
+                        let attrs = attrs.borrow();
+                        let class = attrs
+                            .iter()
+                            .find(|attr| attr.name.local.as_ref() == "class")
+                            .map(|attr| attr.value.as_ref());
+                        pre_line_break(tag, class)
+                    };
+                    if line_break == PreLineBreak::None {
+                        self.collect(child);
+                        continue;
+                    }
+                    // A new line element starts on its own line, so the
+                    // previous one's break is written before measuring this
+                    // one's text.
+                    self.flush_pending_break();
+                    let line_start = self.output.len();
+                    self.collect(child);
+                    let line = &self.output[line_start..];
+                    let line_ended = self.pending_break || line.ends_with('\n');
+                    let ends_line = match line_break {
+                        PreLineBreak::None => false,
+                        PreLineBreak::Line => !line_ended,
+                        PreLineBreak::Block => !line.is_empty() && !line_ended,
+                    };
+                    if ends_line {
+                        self.pending_break = true;
+                    }
                 }
-                if tag == "br" {
-                    output.push('\n');
-                    continue;
-                }
-                let is_token_line = attrs.borrow().iter().any(|attr| {
-                    attr.name.local.as_ref() == "class"
-                        && attr
-                            .value
-                            .split_ascii_whitespace()
-                            .any(|class| class == "token-line")
-                });
-                let line_start = output.len();
-                collect_preformatted_text(child, output);
-                if is_token_line && !output[line_start..].ends_with('\n') {
-                    output.push('\n');
-                }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -1382,6 +1466,67 @@ mod tests {
         let md = html_to_markdown_converter().convert(html).unwrap();
         assert!(!md.contains("```"), "{md:?}");
         assert!(md.contains("plain preformatted"), "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_per_line_divs_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!(
+                "../tests/fixtures/url_html/per_line_divs.html"
+            ))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        // The template literal's single backticks leave the fence at three.
+        assert_eq!(blocks[0].0, "```js", "{md}");
+        assert_eq!(
+            blocks[0].1, "function greet(name) {\n  return `Hello, ${name}`;\n\n}",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_table_rows_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!("../tests/fixtures/url_html/table_rows.html"))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        assert_eq!(blocks[0].0, "```python", "{md}");
+        assert_eq!(
+            blocks[0].1, "def add(a, b):\n    return a + b\n\nprint(add(1, 2))",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_shiki_line_spans_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!("../tests/fixtures/url_html/shiki_lines.html"))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        assert_eq!(blocks[0].0, "```", "{md}");
+        assert_eq!(
+            blocks[0].1,
+            "const total = items.reduce((sum, item) => sum + item.price, 0);\n\nconsole.log(total);",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_list_item_lines_keep_their_lines() {
+        let html = "<pre><code><ol><li>first</li><li></li><li>  third</li></ol></code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(md.trim(), "```\nfirst\n\n  third\n```", "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_newline_text_between_lines_is_not_doubled() {
+        // Lines that already end in newline text must not gain a second break.
+        let html = "<pre><code><span class=\"line\">a</span>\n<span class=\"line\">b</span>\n<div>c\n</div></code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(md.trim(), "```\na\nb\nc\n```", "{md:?}");
     }
 
     #[test]
