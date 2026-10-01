@@ -576,11 +576,13 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
         .exists());
 }
 
-/// Child edits made with no child session running reach the parent through
-/// its in-RAM reconciliation, the child's artifact is never written, and an
+/// Child edits made with no child session running reach the parent without
+/// reloading the child: the full-reconcile backstop (shortened here; it runs
+/// every few minutes by default) re-reads only the changed files into the
+/// parent's in-memory copy. The child's artifact is never written, and an
 /// unchanged child is answered without any gap.
 #[test]
-fn parent_follows_child_edits_and_never_writes_child_artifacts() {
+fn parent_backstop_applies_child_edits_and_never_writes_child_artifacts() {
     fast_refresh();
     let folder = folder(3);
     std::fs::remove_file(folder.root.join("README.md")).unwrap();
@@ -591,6 +593,7 @@ fn parent_follows_child_edits_and_never_writes_child_artifacts() {
     let artifact = trigram_artifact(&folder.children[1], &folder.storage);
     let before = std::fs::read(&artifact).unwrap();
 
+    aft::views::parent::set_backstop_interval_for(&folder.root, Duration::from_millis(200));
     let parent = configure(
         &folder.root,
         &folder.storage,
@@ -611,22 +614,112 @@ fn parent_follows_child_edits_and_never_writes_child_artifacts() {
         "src/util.rs",
         "pub fn helper() {}\n// edited, FRESH_PARENT_EDIT_NEEDLE\n",
     );
-    let rounds = session.rounds();
-    assert!(session.wait_rounds(rounds + 2, DEADLINE));
-    let answer = grep(&parent, "FRESH_PARENT_EDIT_NEEDLE");
-    assert_eq!(
-        grep_rows(&answer, &folder.root, Path::new("")),
-        BTreeSet::from([
-            ("repo-01/src/fresh.rs".to_string(), 2),
-            ("repo-01/src/util.rs".to_string(), 2),
-        ])
-    );
+    let expected = BTreeSet::from([
+        ("repo-01/src/fresh.rs".to_string(), 2),
+        ("repo-01/src/util.rs".to_string(), 2),
+    ]);
+    let deadline = Instant::now() + DEADLINE;
+    let answer = loop {
+        let answer = grep(&parent, "FRESH_PARENT_EDIT_NEEDLE");
+        if grep_rows(&answer, &folder.root, Path::new("")) == expected {
+            break answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "edits never reached the parent: {answer:#}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(answer["complete"], true, "{answer:#}");
     // The edit replaced a line holding the common token.
     let common = grep_rows(&grep(&parent, COMMON), &folder.root, Path::new(""));
     assert!(!common.contains(&("repo-01/src/util.rs".to_string(), 2)));
     assert_eq!(std::fs::read(&artifact).unwrap(), before);
-    assert_eq!(session.children()[1].loads(), 1);
+    let child = &session.children()[1];
+    assert_eq!(child.loads(), 1, "edits must not reload the child");
+    assert!(child.applied_paths() >= 2);
+    // Unchanged children had nothing applied.
+    assert_eq!(session.children()[0].applied_paths(), 0);
+}
+
+/// The parent's own file watcher carries a child's edit to the parent within
+/// seconds, while the backstop stays at its multi-minute default: changes are
+/// event-driven, routed to the child that owns the path.
+#[test]
+fn parent_watcher_routes_child_edits_to_the_owning_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    let child = root.join("child");
+    let other = root.join("other");
+    init_repo(&child, &child_files(0));
+    init_repo(&other, &child_files(1));
+    let configure_request = |root: &Path, views: bool| {
+        json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": crate::helpers::user_config(config_doc(views, TRIGRAM_ONLY, None)),
+        })
+        .to_string()
+    };
+    let grep_request =
+        |pattern: &str| json!({"id": "grep", "command": "grep", "pattern": pattern}).to_string();
+    let mut aft = crate::helpers::AftProcess::spawn_with_real_watcher();
+    for repo in [&child, &other] {
+        let configured = aft.send(&configure_request(repo, false));
+        assert_eq!(configured["success"], true, "{configured:#}");
+        let deadline = Instant::now() + DEADLINE;
+        while !trigram_artifact(repo, &storage).is_file() {
+            assert!(Instant::now() < deadline, "child index never persisted");
+            aft.send(&grep_request(COMMON));
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let configured = aft.send(&configure_request(&root, true));
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let answer = aft.send(&grep_request(COMMON));
+        if answer["matches"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 4)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "parent never loaded: {answer:#}");
+        thread::sleep(Duration::from_millis(100));
+    }
+    // Give the watcher time to settle on the freshly bound folder.
+    thread::sleep(Duration::from_millis(500));
+    write(&child, "src/watched.rs", "// WATCHED_PARENT_EDIT_NEEDLE\n");
+    let started = Instant::now();
+    loop {
+        let answer = aft.send(&grep_request("WATCHED_PARENT_EDIT_NEEDLE"));
+        if answer["matches"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            assert!(answer["matches"][0]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("child/src/watched.rs"));
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the watcher never delivered the edit: {answer:#}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "parent folder watcher: edit visible to parent grep after {} ms",
+        started.elapsed().as_millis()
+    );
+    assert!(aft.shutdown().success());
 }
 
 /// The call graph is served from a child's view while the child's SQLite
@@ -947,27 +1040,100 @@ fn parent_search_merges_child_semantic_views_without_a_size_cap() {
         thread::sleep(Duration::from_millis(50));
         answer = search();
     }
-    let files = answer["results"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{answer:#}"))
+    let rows = |answer: &Value| -> Vec<(String, String, u64)> {
+        answer["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{answer:#}"))
+            .iter()
+            .map(|row| {
+                (
+                    row["file"].as_str().unwrap().to_owned(),
+                    row["name"].as_str().unwrap_or_default().to_owned(),
+                    row["start_line"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect()
+    };
+    let parent_rows = rows(&answer);
+    let files = parent_rows
         .iter()
-        .filter(|row| row["source"] == "semantic")
-        .map(|row| row["file"].as_str().unwrap().to_owned())
+        .map(|(file, _, _)| file.clone())
         .collect::<BTreeSet<_>>();
     assert!(files.contains("alpha/src/retry.rs"), "{answer:#}");
     assert!(files.contains("beta/src/cache.rs"), "{answer:#}");
     assert_eq!(answer["complete"], true, "{answer:#}");
-    let scores = answer["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["source"] == "semantic")
-        .map(|row| row["score"].as_f64().unwrap())
-        .collect::<Vec<_>>();
-    assert!(
-        scores.windows(2).all(|pair| pair[0] >= pair[1]),
-        "{scores:?}"
+    // The same envelope and paging fields a normal aft_search answer has.
+    for key in [
+        "status",
+        "text",
+        "query",
+        "include_tests",
+        "interpreted_as",
+        "query_kind",
+        "result_count",
+        "more_available",
+        "engine_capped",
+        "fully_degraded",
+        "semantic_status",
+        "results_list_envelope",
+    ] {
+        assert!(answer.get(key).is_some(), "missing {key}: {answer:#}");
+    }
+
+    // Each child's rows keep the order a direct search of that child gives:
+    // the parent merges the children's own engine rankings.
+    for (session_ctx, (child_root, prefix)) in
+        sessions.iter().zip([(&alpha, "alpha"), (&beta, "beta")])
+    {
+        let direct = aft::commands::semantic_search::handle_semantic_search(
+            &request(json!({
+                "id": "child-search",
+                "command": "semantic_search",
+                "query": "retry with exponential backoff",
+                "top_k": 10,
+            })),
+            session_ctx,
+        )
+        .data;
+        let direct = rows(&direct)
+            .into_iter()
+            .map(|(file, name, line)| {
+                let file = Path::new(&file)
+                    .strip_prefix(child_root)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or(file);
+                (format!("{prefix}/{file}"), name, line)
+            })
+            .collect::<Vec<_>>();
+        let from_parent = parent_rows
+            .iter()
+            .filter(|(file, _, _)| file.starts_with(&format!("{prefix}/")))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(!from_parent.is_empty());
+        assert!(
+            direct.starts_with(&from_parent),
+            "parent order {from_parent:?} disagrees with the child's own {direct:?}"
+        );
+    }
+
+    // Paging: offset and topK select a window of the same merged ranking.
+    let page = data(
+        aft::views::parent::route(
+            &request(json!({
+                "id": "parent-search-page",
+                "command": "semantic_search",
+                "query": "retry with exponential backoff",
+                "topK": 1,
+                "offset": 1,
+            })),
+            &parent,
+        )
+        .unwrap(),
     );
+    assert_eq!(rows(&page), parent_rows[1..2].to_vec(), "{page:#}");
+    assert_eq!(page["more_available"], parent_rows.len() > 2, "{page:#}");
+    assert_eq!(page["results_list_envelope"]["shown"], 1, "{page:#}");
 }
 
 /// More children than the cap: the first 64 are served and the rest are one
@@ -1014,6 +1180,74 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
         let child = root.join(format!("repo-{index:02}"));
         assert!(!trigram_artifact(&child, &storage).exists());
     }
+}
+
+/// Discovery runs on the session worker, never on the configure path: with
+/// a walk slowed to seconds, the bind still answers promptly, queries name
+/// the discovery as a gap meanwhile, and the children appear once it ends.
+#[test]
+fn slow_discovery_never_delays_the_bind() {
+    fast_refresh();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    for index in 0..20 {
+        std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
+    }
+    // 150 ms per examined entry: the full walk takes about 3 s, while the
+    // configure probe stops at the first repository it meets.
+    aft::views::parent::set_discovery_entry_delay(&root, Duration::from_millis(150));
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    let started = Instant::now();
+    let configured = aft::commands::configure::handle_configure(
+        &request(json!({
+            "id": "configure-slow-parent",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": crate::helpers::user_config(config_doc(true, TRIGRAM_ONLY, None)),
+        })),
+        &ctx,
+    );
+    let bind = started.elapsed();
+    assert!(configured.success, "{configured:?}");
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    let first = grep(&ctx, "anything");
+    let session = aft::views::parent::session_for(&ctx).expect("parent session");
+    let discovered_at = Instant::now() + DEADLINE;
+    assert!(
+        gap_kinds(&first).contains(&"parent_discovering".to_string()),
+        "{first:#}"
+    );
+    eprintln!(
+        "parent folder bind with a 3 s discovery walk answered in {} ms",
+        bind.as_millis()
+    );
+    assert!(
+        bind < Duration::from_millis(2_000),
+        "the bind waited for discovery: {} ms",
+        bind.as_millis()
+    );
+    while session.discovery().is_none() {
+        assert!(Instant::now() < discovered_at, "discovery never finished");
+        thread::sleep(Duration::from_millis(20));
+    }
+    aft::views::parent::set_discovery_entry_delay(&root, Duration::ZERO);
+    assert_eq!(session.children().len(), 20);
+    let after = grep(&ctx, "anything");
+    assert!(!gap_kinds(&after).contains(&"parent_discovering".to_string()));
+    assert_eq!(
+        gap_kinds(&after)
+            .iter()
+            .filter(|kind| *kind == "parent_child_unavailable")
+            .count(),
+        20
+    );
 }
 
 /// Views stay off by default; with views off a parent folder keeps today's

@@ -136,8 +136,8 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         summary.insert(category.as_str().into(), Value::Object(Map::new()));
     }
     let children = session
-        .children
-        .iter()
+        .children()
+        .into_iter()
         .filter(|child| {
             scopes
                 .iter()

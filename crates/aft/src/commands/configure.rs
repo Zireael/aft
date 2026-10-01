@@ -3203,6 +3203,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if callgraph_disabled_for_home {
         next_config.indexes.callgraph = false;
     }
+    // A context that binds another root stops holding the parent folder
+    // session it held before; a session no context holds stops.
+    crate::views::parent::release_context_except(ctx, &canonical_cache_root);
     // With views on, a plain folder of repositories is a parent folder: it is
     // served from its child repositories' own indexes and, like HOME, builds
     // none of its own. The index types the user enabled are passed to the
@@ -6887,6 +6890,7 @@ fn run_configure_maintenance_unit_inner(
         }
         ConfigureMaintenanceStage::ViewLoad => {
             let parent_folder = crate::views::parent::activate(
+                ctx,
                 &job.canonical_cache_root,
                 &job.storage_root,
                 &ctx.config().semantic,

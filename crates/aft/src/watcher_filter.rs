@@ -1814,6 +1814,9 @@ impl WatcherFilterThread {
         }
         let paths = filtered.changed.into_iter().collect::<Vec<_>>();
         let path_count = paths.len();
+        // A parent folder session follows its child repositories through
+        // this watcher; it only queues the paths for its own worker.
+        crate::views::parent::note_changed_paths(&paths);
         if !self.send_dispatch(WatcherDispatchEvent::Paths(paths)) {
             return false;
         }

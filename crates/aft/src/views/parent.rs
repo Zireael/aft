@@ -16,40 +16,46 @@
 //! - **callgraph:** the child's content-addressed view generation, protected
 //!   by a query pin (a read marker in the child's view directory).
 //!
-//! Every child plane is loaded once by the session's background worker and
-//! kept warm; the worker follows the child's publications and reconciles its
-//! trigram snapshot with disk between queries. A request never loads, builds,
-//! repairs or waits for a child index: a child still loading, or without a
-//! published index, is a named gap for that child, and files outside every
-//! child are a named gap too. Gaps use the existing `complete: false` and
-//! `gaps` response fields.
+//! Everything slow happens on the session's background worker: finding the
+//! children, loading each child plane once, following the children's later
+//! publications, and applying file changes. Changes reach the worker as
+//! paths from the parent's own file watcher, routed to the child that owns
+//! them, so only the changed files of that child are re-read; a slow
+//! full-reconcile backstop catches anything the watcher missed. A request
+//! never loads, builds, repairs or waits for a child index: a child still
+//! loading, or without a published index, is a named gap for that child, and
+//! files outside every child are a named gap too. Gaps use the existing
+//! `complete: false` and `gaps` response fields.
 //!
 //! The session registry is process-wide and keyed by the canonical parent
 //! root, so every context bound to the same parent folder shares one warm set
-//! of child readers.
+//! of child readers. The session stops once no context holds it: a context
+//! that rebinds to another root, is dropped, or whose routes have all been
+//! closed past the unbind grace period no longer counts.
 
+mod engine;
 mod inspect;
 mod query;
 #[cfg(test)]
 mod tests;
+mod worker;
 
 pub use query::route;
 pub(crate) use query::{attach_gaps, glob_fan_out, grep_fan_out};
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::readonly_artifacts::{BorrowedArtifactGeneration, ReadOnlyArtifact};
+use crate::readonly_artifacts::BorrowedArtifactGeneration;
 use crate::search_index::SearchIndex;
 
-use super::contracts::{PlaneAdapter, ViewAccess};
-use super::manifest_v2::Producers;
+use super::contracts::ViewAccess;
 use super::registry::{FamilyRegistry, ReaderRegistration};
-use super::semantic::{SemanticPlane, SemanticProducer};
-use super::snapshot::{LiveDelta, OpenGeneration, Snapshot};
+use super::semantic::SemanticPlane;
+use super::snapshot::{OpenGeneration, Snapshot};
 
 /// Most child repositories one parent folder serves. The operator's own
 /// projects folder holds 39 repositories, so the cap leaves room above that.
@@ -60,8 +66,13 @@ pub const DEFAULT_MAX_CHILD_REPOS: usize = 64;
 const MAX_DISCOVERY_DEPTH: usize = 3;
 
 /// Upper bound on directory entries discovery examines, so a huge non-project
-/// folder cannot stall configure.
+/// folder cannot keep the worker walking.
 const MAX_DISCOVERY_ENTRIES: usize = 20_000;
+
+/// Wall-clock budget of the probe configure runs to decide whether a root is
+/// a parent folder. Configure answers a route bind under a deadline, so the
+/// probe stops at the first repository it finds, or when this budget ends.
+const PROBE_BUDGET: Duration = Duration::from_millis(200);
 
 /// At most this many paths outside every child are remembered for gap reports.
 const MAX_OUTSIDE_PATHS: usize = 64;
@@ -77,21 +88,29 @@ const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
     "build",
 ];
 
-/// Default pause between two refresh rounds of the session worker.
-const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the worker checks the children for new publications (a child
+/// session rewriting its trigram artifact or publishing a view generation).
+/// Each check reads a few small files per child; file contents are followed
+/// through watcher events instead.
+const DEFAULT_POINTER_INTERVAL: Duration = Duration::from_secs(10);
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+/// How often the worker compares each child's files with its trigram
+/// snapshot in full, to catch changes the watcher did not deliver. It walks
+/// and stats the child; nothing is re-read or copied when nothing changed.
+const DEFAULT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -126,12 +145,30 @@ fn home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&home).unwrap_or(home))
 }
 
-/// Finds the child repositories of `root`, keeping at most `cap`.
-///
-/// `None` means `root` is not a parent folder: it is inside a git checkout
-/// (which keeps its own indexes), it is the home folder (which never indexes
-/// anything), or it holds no repository within [`MAX_DISCOVERY_DEPTH`].
-pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
+/// Per-root pause applied to every directory entry discovery examines, so a
+/// test can make a walk slow without a slow disk.
+fn discovery_delays() -> &'static Mutex<HashMap<PathBuf, Duration>> {
+    static DELAYS: OnceLock<Mutex<HashMap<PathBuf, Duration>>> = OnceLock::new();
+    DELAYS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Slows discovery under `root` by `delay` per examined entry (zero clears
+/// it). Only tests use this.
+#[doc(hidden)]
+pub fn set_discovery_entry_delay(root: &Path, delay: Duration) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut delays = lock(discovery_delays());
+    if delay.is_zero() {
+        delays.remove(&root);
+    } else {
+        delays.insert(root, delay);
+    }
+}
+
+/// Canonical `root` when it may be a parent folder: not inside a git checkout
+/// (which keeps its own indexes) and not the home folder (which indexes
+/// nothing).
+fn candidate_root(root: &Path) -> Option<PathBuf> {
     let root = std::fs::canonicalize(root).ok()?;
     if root.ancestors().any(is_repository) {
         return None;
@@ -139,10 +176,25 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
     if home_dir().is_some_and(|home| home == root) {
         return None;
     }
-    let mut repositories = Vec::new();
-    let mut outside = Vec::new();
+    Some(root)
+}
+
+/// What a walk found, and whether it finished.
+struct Walk {
+    repositories: Vec<PathBuf>,
+    outside: Vec<PathBuf>,
+}
+
+/// Walks `root` for repositories. `stop` is asked after each entry; when it
+/// answers true the walk ends with what it found so far.
+fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
+    let delay = lock(discovery_delays()).get(root).copied();
+    let mut found = Walk {
+        repositories: Vec::new(),
+        outside: Vec::new(),
+    };
     let mut examined = 0usize;
-    let mut pending = vec![(root.clone(), 0usize)];
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -152,8 +204,11 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
         let mut subdirectories = Vec::new();
         for entry in entries {
             examined += 1;
-            if examined > MAX_DISCOVERY_ENTRIES {
-                break;
+            if examined > MAX_DISCOVERY_ENTRIES || stop(&found) {
+                return found;
+            }
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
             }
             let name = entry.file_name();
             let hidden = name.to_str().is_none_or(|name| name.starts_with('.'));
@@ -174,14 +229,14 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
                     continue;
                 }
                 if is_repository(&path) {
-                    repositories.push(path);
+                    found.repositories.push(path);
                 } else if depth + 1 < MAX_DISCOVERY_DEPTH {
                     subdirectories.push(path);
-                } else if outside.len() < MAX_OUTSIDE_PATHS {
-                    outside.push(path);
+                } else if found.outside.len() < MAX_OUTSIDE_PATHS {
+                    found.outside.push(path);
                 }
-            } else if outside.len() < MAX_OUTSIDE_PATHS {
-                outside.push(path);
+            } else if found.outside.len() < MAX_OUTSIDE_PATHS {
+                found.outside.push(path);
             }
         }
         // Depth-first in reverse so directories are visited in name order.
@@ -189,16 +244,29 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
             pending.push((subdirectory, depth + 1));
         }
     }
-    if repositories.is_empty() {
+    found
+}
+
+/// Finds the child repositories of `root`, keeping at most `cap`.
+///
+/// `None` means `root` is not a parent folder: it is inside a git checkout,
+/// it is the home folder, or it holds no repository within
+/// [`MAX_DISCOVERY_DEPTH`].
+pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
+    let root = candidate_root(root)?;
+    let found = walk(&root, &|_| false);
+    if found.repositories.is_empty() {
         return None;
     }
-    let mut repositories = repositories
+    let mut repositories = found
+        .repositories
         .into_iter()
         .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         .collect::<Vec<_>>();
     repositories.sort_by(|left, right| left.as_os_str().cmp(right.as_os_str()));
     repositories.dedup();
     let skipped = repositories.split_off(repositories.len().min(cap));
+    let mut outside = found.outside;
     outside.sort();
     Some(Discovery {
         root,
@@ -206,6 +274,18 @@ pub fn discover(root: &Path, cap: usize) -> Option<Discovery> {
         skipped,
         outside,
     })
+}
+
+/// Configure's decision: does `root` hold a repository? Stops at the first
+/// one found or after `budget`, whichever comes first. A root whose
+/// repositories are not found within the budget keeps its own index.
+fn probe(root: &Path, budget: Duration) -> Option<PathBuf> {
+    let root = candidate_root(root)?;
+    let deadline = Instant::now() + budget;
+    let found = walk(&root, &|found| {
+        !found.repositories.is_empty() || Instant::now() >= deadline
+    });
+    (!found.repositories.is_empty()).then_some(root)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,14 +301,9 @@ pub struct RequestedPlanes {
     pub callgraph: bool,
 }
 
-struct Prepared {
-    discovery: Discovery,
-    planes: RequestedPlanes,
-}
-
 #[derive(Default)]
 struct Registry {
-    prepared: HashMap<PathBuf, Prepared>,
+    prepared: HashMap<PathBuf, RequestedPlanes>,
     sessions: HashMap<PathBuf, Arc<ParentSession>>,
 }
 
@@ -238,62 +313,107 @@ fn registry() -> &'static Mutex<Registry> {
 }
 
 /// Configure's first step for a views-on root: decides whether `root` is a
-/// parent folder and, when it is, remembers its children for [`activate`].
-/// True means the root must build no index of its own.
+/// parent folder and remembers the requested planes for [`activate`]. True
+/// means the root must build no index of its own.
+///
+/// This runs on the configure path, so it only probes: it returns at the
+/// first repository found or after a short wall-clock budget. The full walk
+/// for every child runs later, on the session worker.
 pub fn prepare(root: &Path, planes: RequestedPlanes) -> bool {
-    prepare_with_cap(root, planes, DEFAULT_MAX_CHILD_REPOS)
+    prepare_with_budget(root, planes, PROBE_BUDGET)
 }
 
-pub fn prepare_with_cap(root: &Path, planes: RequestedPlanes, cap: usize) -> bool {
-    let Some(discovery) = discover(root, cap) else {
+pub fn prepare_with_budget(root: &Path, planes: RequestedPlanes, budget: Duration) -> bool {
+    let Some(root) = probe(root, budget) else {
         return false;
     };
-    let key = discovery.root.clone();
-    lock(registry())
-        .prepared
-        .insert(key, Prepared { discovery, planes });
+    lock(registry()).prepared.insert(root, planes);
     true
 }
 
-/// Configure's maintenance step: starts (or keeps) the parent session that
-/// [`prepare`] decided on. Returns false, and drops any session left for this
-/// root, when the root was not prepared as a parent folder.
+/// Who holds a session: one bound context, tracked without a reference that
+/// would keep it alive.
+struct Holder {
+    /// The context's address, unique while the context lives.
+    id: usize,
+    /// Upgradeable while the context lives: the context owns the only
+    /// long-lived strong reference to its configure-generation counter.
+    alive: Weak<AtomicU64>,
+    lifecycle: crate::context::SubcLifecycleAdmission,
+}
+
+impl Holder {
+    fn of(ctx: &crate::context::AppContext) -> Self {
+        Self {
+            id: context_id(ctx),
+            alive: Arc::downgrade(&ctx.configure_generation_flag()),
+            lifecycle: ctx.subc_lifecycle_admission(),
+        }
+    }
+
+    /// True while the context lives and its routes have not all been closed
+    /// past the unbind grace period.
+    fn holds(&self) -> bool {
+        self.alive.strong_count() > 0 && !self.lifecycle.unbound_past_grace()
+    }
+}
+
+fn context_id(ctx: &crate::context::AppContext) -> usize {
+    ctx as *const crate::context::AppContext as usize
+}
+
+/// Configure's maintenance step: starts (or joins) the parent session that
+/// [`prepare`] decided on and records `ctx` as one of its holders. Returns
+/// false when the root was not prepared as a parent folder; `ctx` then stops
+/// holding any session for this root.
 ///
-/// Starting a session only spawns its worker; no child index is read here.
+/// Starting a session only spawns its worker; no child is read here.
 pub fn activate(
+    ctx: &crate::context::AppContext,
     root: &Path,
     storage: &Path,
     semantic: &crate::config::SemanticBackendConfig,
 ) -> bool {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut registry = lock(registry());
-    let Some(prepared) = registry.prepared.remove(&root) else {
-        if let Some(session) = registry.sessions.remove(&root) {
-            session.stop();
+    let Some(planes) = registry.prepared.remove(&root) else {
+        if let Some(session) = registry.sessions.get(&root) {
+            session.release(context_id(ctx));
         }
         return false;
     };
     if let Some(existing) = registry.sessions.get(&root) {
-        // A rebind with the same children, planes and storage keeps the warm
-        // readers instead of loading every child again.
-        if existing.discovery == prepared.discovery
-            && existing.planes == prepared.planes
-            && existing.storage == storage
-        {
+        // A rebind with the same planes and storage joins the warm session
+        // instead of loading every child again.
+        if !existing.stopped() && existing.planes == planes && existing.storage == storage {
+            existing.hold(Holder::of(ctx));
             return true;
         }
     }
     let session = ParentSession::start(
-        prepared.discovery,
-        prepared.planes,
+        root.clone(),
+        planes,
         storage.to_path_buf(),
         semantic.clone(),
-        refresh_interval(),
+        Holder::of(ctx),
     );
     if let Some(previous) = registry.sessions.insert(root, session) {
         previous.stop();
     }
     true
+}
+
+/// Called whenever `ctx` binds a root: `ctx` stops holding every parent
+/// session other than the one for `root`. A session nobody holds stops.
+pub fn release_context_except(ctx: &crate::context::AppContext, root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let id = context_id(ctx);
+    let registry = lock(registry());
+    for (session_root, session) in &registry.sessions {
+        if *session_root != root {
+            session.release(id);
+        }
+    }
 }
 
 /// Drops the parent session for `root`, if any: its worker stops and every
@@ -307,17 +427,29 @@ pub fn deactivate(root: &Path) {
     }
 }
 
+/// Removes `session` from the registry when it is still the one registered.
+fn unregister(session: &ParentSession) {
+    let mut registry = lock(registry());
+    if registry
+        .sessions
+        .get(session.root())
+        .is_some_and(|registered| std::ptr::eq(Arc::as_ptr(registered), session))
+    {
+        registry.sessions.remove(session.root());
+    }
+}
+
 /// The active parent session for `root`.
 pub fn session_for_root(root: &Path) -> Option<Arc<ParentSession>> {
     let registry = lock(registry());
     if registry.sessions.is_empty() {
         return None;
     }
-    if let Some(session) = registry.sessions.get(root) {
-        return Some(Arc::clone(session));
-    }
-    let canonical = std::fs::canonicalize(root).ok()?;
-    registry.sessions.get(&canonical).cloned()
+    let session = registry.sessions.get(root).cloned().or_else(|| {
+        let canonical = std::fs::canonicalize(root).ok()?;
+        registry.sessions.get(&canonical).cloned()
+    })?;
+    (!session.stopped()).then_some(session)
 }
 
 /// The parent session serving `ctx`'s root, when views are on.
@@ -329,32 +461,86 @@ pub fn session_for(ctx: &crate::context::AppContext) -> Option<Arc<ParentSession
     session_for_root(config.project_root.as_deref()?)
 }
 
-fn refresh_interval() -> Duration {
-    if let Some(interval) = std::env::var("AFT_PARENT_REFRESH_MS")
+/// Routes changed paths from a file watcher to the parent sessions whose
+/// children own them. The watcher thread calls this for every batch it
+/// dispatches; it only queues the paths and wakes the session worker.
+pub fn note_changed_paths(paths: &[PathBuf]) {
+    let sessions = {
+        let registry = lock(registry());
+        if registry.sessions.is_empty() {
+            return;
+        }
+        registry.sessions.values().cloned().collect::<Vec<_>>()
+    };
+    for session in sessions {
+        let mut woke = false;
+        for path in paths.iter().filter(|path| path.starts_with(session.root())) {
+            if let Some(child) = session.child_for(path) {
+                lock(&child.pending).insert(path.clone());
+                woke = true;
+            }
+        }
+        if woke {
+            session.wake();
+        }
+    }
+}
+
+static POINTER_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+/// Always zero: the backstop default is changed per root, never globally.
+static BACKSTOP_DEFAULT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn interval(env: &str, overridden: &AtomicU64, default: Duration) -> Duration {
+    if let Some(millis) = std::env::var(env)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
     {
-        return Duration::from_millis(interval);
+        return Duration::from_millis(millis.max(1));
     }
-    match DEFAULT_REFRESH_OVERRIDE_MS.load(Ordering::SeqCst) {
-        0 => DEFAULT_REFRESH_INTERVAL,
+    match overridden.load(Ordering::SeqCst) {
+        0 => default,
         millis => Duration::from_millis(millis),
     }
 }
 
-static DEFAULT_REFRESH_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Replaces the default refresh interval for sessions started afterwards in
-/// this process, so tests can observe child edits without waiting seconds.
-#[doc(hidden)]
-pub fn set_default_refresh_interval(interval: Duration) {
-    DEFAULT_REFRESH_OVERRIDE_MS.store(
+fn store_override(target: &AtomicU64, interval: Duration) {
+    target.store(
         u64::try_from(interval.as_millis())
             .unwrap_or(u64::MAX)
             .max(1),
         Ordering::SeqCst,
     );
+}
+
+/// Replaces the publication-check interval for sessions started afterwards in
+/// this process, so tests can observe child publications without waiting.
+#[doc(hidden)]
+pub fn set_default_refresh_interval(interval: Duration) {
+    store_override(&POINTER_OVERRIDE_MS, interval);
+}
+
+/// Replaces the full-reconcile backstop interval for the session next started
+/// for `root`. Only tests use this.
+#[doc(hidden)]
+pub fn set_backstop_interval_for(root: &Path, interval: Duration) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    lock(backstop_overrides()).insert(root, interval);
+}
+
+fn backstop_overrides() -> &'static Mutex<HashMap<PathBuf, Duration>> {
+    static OVERRIDES: OnceLock<Mutex<HashMap<PathBuf, Duration>>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn backstop_interval(root: &Path) -> Duration {
+    if let Some(interval) = lock(backstop_overrides()).get(root) {
+        return *interval;
+    }
+    interval(
+        "AFT_PARENT_BACKSTOP_MS",
+        &BACKSTOP_DEFAULT_MS,
+        DEFAULT_BACKSTOP_INTERVAL,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -430,11 +616,20 @@ pub struct Child {
     /// Read-only handle on the child's persisted inspect aggregates, holding
     /// a read marker on the inspect generation it reads.
     pub(crate) inspect: RwLock<Option<Arc<crate::inspect::cache::ReadonlyInspectCache>>>,
+    /// The search engine context that runs `aft_search` over this child's
+    /// loaded indexes; see [`engine`].
+    pub(crate) engine: Mutex<Option<engine::ChildEngine>>,
+    /// Changed paths the watcher reported and the worker has not applied.
+    pending: Mutex<BTreeSet<PathBuf>>,
+    /// Ignore files read for deciding whether a newly created file belongs
+    /// to the child, keyed by path with the mtime they were read at.
+    ignore_files: Mutex<worker::IgnoreCache>,
     /// The family registry reader registration, created once on first use.
     reader: Mutex<Option<Arc<ReaderRegistration>>>,
     /// HEAD fingerprint, cached against the `.git/HEAD` bytes it came from.
     head: Mutex<Option<(Vec<u8>, String)>>,
     loads: AtomicUsize,
+    applied: AtomicUsize,
 }
 
 impl Child {
@@ -453,9 +648,13 @@ impl Child {
             semantic: RwLock::new(Plane::Loading),
             callgraph: RwLock::new(Plane::Loading),
             inspect: RwLock::new(None),
+            engine: Mutex::new(None),
+            pending: Mutex::new(BTreeSet::new()),
+            ignore_files: Mutex::new(worker::IgnoreCache::default()),
             reader: Mutex::new(None),
             head: Mutex::new(None),
             loads: AtomicUsize::new(0),
+            applied: AtomicUsize::new(0),
         }
     }
 
@@ -471,9 +670,15 @@ impl Child {
     }
 
     /// How many index artifacts the worker has loaded for this child. Queries
-    /// never add to it.
+    /// never add to it, and neither does applying file changes.
     pub fn loads(&self) -> usize {
         self.loads.load(Ordering::SeqCst)
+    }
+
+    /// How many changed paths the worker has applied to this child's trigram
+    /// snapshot, from watcher events and the backstop together.
+    pub fn applied_paths(&self) -> usize {
+        self.applied.load(Ordering::SeqCst)
     }
 
     pub fn trigram_ready(&self) -> bool {
@@ -486,6 +691,11 @@ impl Child {
 
     pub fn callgraph_ready(&self) -> bool {
         read(&self.callgraph).ready().is_some()
+    }
+
+    /// True once this child's search engine serves its loaded indexes.
+    pub fn engine_ready(&self) -> bool {
+        lock(&self.engine).is_some()
     }
 
     /// The callgraph generation this session holds a read marker on.
@@ -507,8 +717,9 @@ impl Child {
         if let Some(reader) = reader.as_ref() {
             return Ok(Some(Arc::clone(reader)));
         }
-        // Readers never create a family registry: a child whose own sessions
-        // never published a per-checkout view has nothing to read yet.
+        // The family registry lists a repository's per-checkout views. A
+        // reader never creates one: a child whose own sessions never
+        // published such a view has nothing to read yet.
         let Some(registry) =
             FamilyRegistry::open_existing(storage, self.family()).map_err(|e| e.to_string())?
         else {
@@ -522,160 +733,96 @@ impl Child {
         *reader = Some(Arc::clone(&registration));
         Ok(Some(registration))
     }
-
-    /// The fingerprint the child's view generations are named after for its
-    /// current HEAD. `git ls-tree` runs only when `.git/HEAD` or the ref it
-    /// names changed since the last call.
-    fn head_fingerprint(&self) -> Result<String, String> {
-        let probe = head_probe(&self.root);
-        if let Some((cached_probe, fingerprint)) = lock(&self.head).as_ref() {
-            if *cached_probe == probe {
-                return Ok(fingerprint.clone());
-            }
-        }
-        let entries =
-            crate::alias::head_tree_entries(&self.root).map_err(|error| error.to_string())?;
-        let fingerprint = super::assembly::head_tree_fingerprint(&entries);
-        *lock(&self.head) = Some((probe, fingerprint.clone()));
-        Ok(fingerprint)
-    }
 }
 
-/// Bytes that change whenever the checkout's HEAD commit can have changed: the
-/// HEAD file plus the ref file it names (and `packed-refs`), with their mtimes.
-fn head_probe(root: &Path) -> Vec<u8> {
-    let git = root.join(".git");
-    let git_dir = if git.is_file() {
-        std::fs::read_to_string(&git)
-            .ok()
-            .and_then(|text| {
-                text.trim()
-                    .strip_prefix("gitdir:")
-                    .map(|dir| root.join(dir.trim()))
-            })
-            .unwrap_or(git)
-    } else {
-        git
-    };
-    let mut probe = Vec::new();
-    let mut add = |path: &Path| {
-        if let Ok(bytes) = std::fs::read(path) {
-            probe.extend_from_slice(&bytes);
-        }
-        if let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
-            probe.extend_from_slice(format!("{modified:?}").as_bytes());
-        }
-        probe.push(0);
-    };
-    let head = git_dir.join("HEAD");
-    add(&head);
-    let head_text = std::fs::read_to_string(&head).unwrap_or_default();
-    if let Some(reference) = head_text.trim().strip_prefix("ref:") {
-        let reference = reference.trim();
-        add(&git_dir.join(reference));
-        // A linked worktree keeps branch refs in the common directory.
-        if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
-            let common = git_dir.join(common.trim());
-            add(&common.join(reference));
-            add(&common.join("packed-refs"));
-        }
-    }
-    add(&git_dir.join("packed-refs"));
-    probe
-}
-
-/// The semantic model this session embeds queries with, and the shared plane
-/// whose arena holds the children's resident vectors.
+/// The semantic model this session embeds queries with, and the shared
+/// semantic plane whose arena holds the children's vectors once per family.
 pub(crate) struct ParentSemantic {
-    pub model: Mutex<crate::semantic_index::EmbeddingModel>,
+    /// The model, lent to each child's search engine for the length of one
+    /// query so the query is embedded once and no child starts its own model.
+    pub model: Mutex<Option<crate::semantic_index::EmbeddingModel>>,
     pub plane: Arc<SemanticPlane>,
     pub producer_id: String,
-    pub config: crate::config::SemanticBackendConfig,
 }
 
 /// A parent folder's session state, shared by every context bound to it.
 pub struct ParentSession {
-    pub(crate) discovery: Discovery,
+    root: PathBuf,
     pub(crate) planes: RequestedPlanes,
     storage: PathBuf,
-    pub(crate) children: Vec<Arc<Child>>,
+    semantic_config: crate::config::SemanticBackendConfig,
+    /// `None` until the worker's first full discovery walk finishes.
+    discovery: RwLock<Option<Arc<Discovery>>>,
+    children: RwLock<Vec<Arc<Child>>>,
     pub(crate) semantic: RwLock<Plane<ParentSemantic>>,
-    stop: Arc<AtomicBool>,
-    /// While set, the worker skips its refresh rounds, so a test can hold the
+    holders: Mutex<Vec<Holder>>,
+    stop: AtomicBool,
+    /// While set, the worker skips its rounds, so a test can hold the
     /// generations the session currently serves.
     paused: AtomicBool,
-    /// Completed refresh rounds, including the first load.
+    /// Completed publication-check rounds, including the first load.
     rounds: AtomicUsize,
+    wake: (Mutex<bool>, Condvar),
+    pointer_interval: Duration,
+    backstop_interval: Duration,
 }
 
 impl ParentSession {
     fn start(
-        discovery: Discovery,
+        root: PathBuf,
         planes: RequestedPlanes,
         storage: PathBuf,
-        semantic: crate::config::SemanticBackendConfig,
-        interval: Duration,
+        semantic_config: crate::config::SemanticBackendConfig,
+        holder: Holder,
     ) -> Arc<Self> {
-        let children = discovery
-            .children
-            .iter()
-            .map(|child| Arc::new(Child::new(&discovery.root, child.clone())))
-            .collect();
+        let root_for_backstop = root.clone();
         let session = Arc::new(Self {
-            discovery,
+            root,
             planes,
             storage,
-            children,
+            semantic_config,
+            discovery: RwLock::new(None),
+            children: RwLock::new(Vec::new()),
             semantic: RwLock::new(if planes.semantic {
                 Plane::Loading
             } else {
                 Plane::Gap("semantic search is off".into())
             }),
-            stop: Arc::new(AtomicBool::new(false)),
+            holders: Mutex::new(vec![holder]),
+            stop: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             rounds: AtomicUsize::new(0),
+            wake: (Mutex::new(false), Condvar::new()),
+            pointer_interval: interval(
+                "AFT_PARENT_REFRESH_MS",
+                &POINTER_OVERRIDE_MS,
+                DEFAULT_POINTER_INTERVAL,
+            ),
+            backstop_interval: backstop_interval(&root_for_backstop),
         });
-        if !planes.trigram {
-            for child in &session.children {
-                *write(&child.trigram) = Plane::Gap("the trigram index is off".into());
-            }
-        }
-        if !planes.callgraph {
-            for child in &session.children {
-                *write(&child.callgraph) = Plane::Gap("the call graph is off".into());
-            }
-        }
-        if !planes.semantic {
-            for child in &session.children {
-                *write(&child.semantic) = Plane::Gap("semantic search is off".into());
-            }
-        }
         let weak = Arc::downgrade(&session);
-        let stop = Arc::clone(&session.stop);
         let spawned = std::thread::Builder::new()
             .name("aft-parent-folder".into())
-            .spawn(move || worker(weak, stop, semantic, interval));
+            .spawn(move || worker::run(weak));
         if let Err(error) = spawned {
             crate::slog_warn!("parent folder worker could not start: {}", error);
-            for child in &session.children {
-                *write(&child.trigram) = Plane::Gap(format!("worker unavailable: {error}"));
-                *write(&child.callgraph) = Plane::Gap(format!("worker unavailable: {error}"));
-                *write(&child.semantic) = Plane::Gap(format!("worker unavailable: {error}"));
-            }
+            session.stop();
         }
         session
     }
 
     pub fn root(&self) -> &Path {
-        &self.discovery.root
+        &self.root
     }
 
-    pub fn children(&self) -> &[Arc<Child>] {
-        &self.children
+    /// The children found so far; empty until discovery finishes.
+    pub fn children(&self) -> Vec<Arc<Child>> {
+        read(&self.children).clone()
     }
 
-    pub fn discovery(&self) -> &Discovery {
-        &self.discovery
+    /// The finished discovery, or `None` while the worker is still walking.
+    pub fn discovery(&self) -> Option<Arc<Discovery>> {
+        read(&self.discovery).clone()
     }
 
     /// Completed worker rounds; the first one is the initial load.
@@ -688,7 +835,7 @@ impl ParentSession {
     pub fn wait_rounds(&self, rounds: usize, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while self.rounds() < rounds {
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || self.stopped() {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -696,382 +843,75 @@ impl ParentSession {
         true
     }
 
-    fn stopped(&self) -> bool {
+    /// True once the session stopped: no context holds it any more, or it was
+    /// replaced or deactivated.
+    pub fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// Holds (or releases) the worker's refresh rounds. Queries keep being
-    /// answered from what is already loaded.
+    /// Holds (or releases) the worker's rounds. Queries keep being answered
+    /// from what is already loaded.
     #[doc(hidden)]
     pub fn pause_refresh(&self, paused: bool) {
         self.paused.store(paused, Ordering::SeqCst);
+        self.wake();
     }
 
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        let (flag, condvar) = &self.wake;
+        *lock(flag) = true;
+        condvar.notify_all();
+    }
+
+    /// Waits up to `timeout` for a wake-up; true when one arrived.
+    fn wait_for_wake(&self, timeout: Duration) -> bool {
+        let (flag, condvar) = &self.wake;
+        let mut woken = lock(flag);
+        if !*woken {
+            woken = condvar
+                .wait_timeout(woken, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        std::mem::replace(&mut *woken, false)
+    }
+
+    fn hold(&self, holder: Holder) {
+        let mut holders = lock(&self.holders);
+        holders.retain(|existing| existing.id != holder.id);
+        holders.push(holder);
+    }
+
+    fn release(&self, id: usize) {
+        lock(&self.holders).retain(|holder| holder.id != id);
+        self.wake();
+    }
+
+    /// True while some context still holds this session.
+    fn held(&self) -> bool {
+        let mut holders = lock(&self.holders);
+        holders.retain(Holder::holds);
+        !holders.is_empty()
     }
 
     /// The child whose checkout contains `path`.
-    pub fn child_for(&self, path: &Path) -> Option<&Arc<Child>> {
-        self.children
+    pub fn child_for(&self, path: &Path) -> Option<Arc<Child>> {
+        read(&self.children)
             .iter()
             .filter(|child| path.starts_with(&child.root))
             .max_by_key(|child| child.root.components().count())
+            .cloned()
     }
 }
 
 impl Drop for ParentSession {
     fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Worker: load once, keep warm
-// ---------------------------------------------------------------------------
-
-fn worker(
-    session: std::sync::Weak<ParentSession>,
-    stop: Arc<AtomicBool>,
-    semantic: crate::config::SemanticBackendConfig,
-    interval: Duration,
-) {
-    let mut semantic_config = Some(semantic);
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        let Some(session) = session.upgrade() else {
-            return;
-        };
-        if session.paused.load(Ordering::SeqCst) {
-            drop(session);
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        // The embedding model starts after the first lexical round, so grep
-        // and glob are served as early as possible.
-        let first_round = session.rounds() == 0;
-        refresh_round(&session, PlaneKind::Trigram);
-        refresh_round(&session, PlaneKind::Callgraph);
-        if session.planes.semantic {
-            if let Some(config) = semantic_config.take() {
-                start_semantic(&session, config);
-            }
-            refresh_round(&session, PlaneKind::Semantic);
-        }
-        session.rounds.fetch_add(1, Ordering::SeqCst);
-        if first_round {
-            crate::slog_info!(
-                "parent folder loaded root={} children={} skipped={}",
-                session.root().display(),
-                session.children.len(),
-                session.discovery.skipped.len()
-            );
-        }
-        drop(session);
-        let deadline = Instant::now() + interval;
-        while Instant::now() < deadline {
-            if stop.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20).min(interval));
-        }
-    }
-}
-
-/// Which child plane a refresh round works on.
-#[derive(Clone, Copy)]
-enum PlaneKind {
-    Trigram,
-    Semantic,
-    Callgraph,
-}
-
-fn refresh_round(session: &ParentSession, plane: PlaneKind) {
-    for child in &session.children {
-        if session.stopped() {
-            return;
-        }
-        match plane {
-            PlaneKind::Trigram if session.planes.trigram => refresh_trigram(session, child),
-            PlaneKind::Callgraph => {
-                if session.planes.callgraph {
-                    refresh_callgraph(session, child);
-                }
-                refresh_inspect(session, child);
-            }
-            PlaneKind::Semantic if session.planes.semantic => refresh_semantic(session, child),
-            _ => {}
-        }
-    }
-}
-
-fn refresh_trigram(session: &ParentSession, child: &Child) {
-    let keep_going = || !session.stopped();
-    let artifact = crate::readonly_artifacts::search_index_artifact_generation_with_key(
-        child.family(),
-        Some(&session.storage),
-    );
-    let Some(artifact) = artifact else {
-        *write(&child.trigram) =
-            Plane::Gap("no trigram index has been built for this repository yet".into());
-        return;
-    };
-    let current = read(&child.trigram).ready().cloned();
-    if let Some(current) = current.filter(|current| current.artifact == artifact) {
-        // Same artifact: bring the warm snapshot up to date with the files in
-        // RAM. Nothing is loaded; unchanged files cost a stat.
-        let mut index = (*current.index).clone();
-        match index.reconcile_borrowed_snapshot_with_disk(&keep_going) {
-            Some(summary) if summary.reindexed + summary.added + summary.removed > 0 => {
-                *write(&child.trigram) = Plane::Ready(Arc::new(TrigramChild {
-                    index: Arc::new(index),
-                    artifact,
-                }));
-            }
-            _ => {}
-        }
-        return;
-    }
-    let cache_dir =
-        crate::search_index::resolve_cache_dir_with_key(child.family(), Some(&session.storage));
-    child.loads.fetch_add(1, Ordering::SeqCst);
-    let opened = crate::readonly_artifacts::open_search_index_background(
-        &child.root,
-        cache_dir,
-        &keep_going,
-    );
-    let mut index = match opened {
-        ReadOnlyArtifact::Fresh(index) => index,
-        ReadOnlyArtifact::Stale(stale) => stale.index,
-        ReadOnlyArtifact::Degraded(degradation) => {
-            *write(&child.trigram) = Plane::Gap(format!(
-                "the trigram index could not be read ({})",
-                degradation.reason
-            ));
-            return;
-        }
-        ReadOnlyArtifact::Absent => {
-            *write(&child.trigram) =
-                Plane::Gap("no readable trigram index for this repository".into());
-            return;
-        }
-        ReadOnlyArtifact::Cancelled => return,
-    };
-    // The artifact describes the child as its owner last saved it; edits made
-    // since then go into this reader's RAM copy, never into the artifact.
-    if index
-        .reconcile_borrowed_snapshot_with_disk(&keep_going)
-        .is_none()
-    {
-        return;
-    }
-    *write(&child.trigram) = Plane::Ready(Arc::new(TrigramChild {
-        index: Arc::new(index),
-        artifact,
-    }));
-}
-
-fn refresh_callgraph(session: &ParentSession, child: &Child) {
-    let view_dir = session.storage.join("views").join(&child.scope);
-    let Some(store) = super::ViewStore::existing_dir(view_dir.clone()) else {
-        *write(&child.callgraph) =
-            Plane::Gap("no call graph view has been published for this repository yet".into());
-        return;
-    };
-    let generation = match store.current_generation_read_only() {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            *write(&child.callgraph) =
-                Plane::Gap("no call graph view has been published for this repository yet".into());
-            return;
-        }
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view unreadable: {error}"));
-            return;
-        }
-    };
-    let head = match child.head_fingerprint() {
-        Ok(head) => head,
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("HEAD unreadable: {error}"));
-            return;
-        }
-    };
-    if !super::generation_matches_head(&generation, &head) {
-        // The child's sessions have not yet published a view for its current
-        // HEAD. Serving the older graph would answer for another commit.
-        *write(&child.callgraph) =
-            Plane::Gap("the call graph view for the current HEAD is still pending".into());
-        return;
-    }
-    if read(&child.callgraph)
-        .ready()
-        .is_some_and(|current| current.generation == generation)
-    {
-        return;
-    }
-    // Protect before touching: the read marker exists before the generation's
-    // database is opened, and the pointer is re-read afterwards so a
-    // generation the child replaced in between is never adopted.
-    let pin = match crate::pins::QueryPin::acquire(&view_dir, &generation) {
-        Ok(pin) => Arc::new(pin),
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view not pinned: {error}"));
-            return;
-        }
-    };
-    if store
-        .current_generation_read_only()
-        .ok()
-        .flatten()
-        .as_deref()
-        != Some(generation.as_str())
-    {
-        return;
-    }
-    child.loads.fetch_add(1, Ordering::SeqCst);
-    match super::read::open_published_callgraph(
-        child.root.clone(),
-        child.family().to_owned(),
-        view_dir,
-        &generation,
-        Some(pin),
-    ) {
-        Ok(opened) => {
-            *write(&child.callgraph) = Plane::Ready(Arc::new(CallgraphChild {
-                store: Arc::new(opened),
-                generation,
-            }));
-        }
-        Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view unreadable: {error}"));
-        }
-    }
-}
-
-fn refresh_inspect(session: &ParentSession, child: &Child) {
-    if read(&child.inspect).is_some() {
-        return;
-    }
-    // `open_readonly` creates nothing but its read marker; `None` means the
-    // child's sessions never ran a project-wide inspect.
-    if let Ok(Some(cache)) = crate::inspect::cache::InspectCache::open_readonly(
-        session.storage.join("inspect"),
-        child.root.clone(),
-    ) {
-        child.loads.fetch_add(1, Ordering::SeqCst);
-        *write(&child.inspect) = Some(Arc::new(cache));
-    }
-}
-
-fn start_semantic(session: &ParentSession, config: crate::config::SemanticBackendConfig) {
-    let started = (|| -> Result<ParentSemantic, String> {
-        let mut model = crate::semantic_index::EmbeddingModel::from_config(&config)?;
-        let fingerprint = model.fingerprint(&config)?;
-        let producer =
-            SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
-        let producer_id = producer.id();
-        let plane = super::semantic_runtime::shared_plane(&session.storage, producer);
-        Ok(ParentSemantic {
-            model: Mutex::new(model),
-            plane,
-            producer_id,
-            config,
-        })
-    })();
-    *write(&session.semantic) = match started {
-        Ok(semantic) => Plane::Ready(Arc::new(semantic)),
-        Err(error) => Plane::Gap(format!("embedding model unavailable: {error}")),
-    };
-}
-
-fn refresh_semantic(session: &ParentSession, child: &Child) {
-    let semantic = match &*read(&session.semantic) {
-        Plane::Ready(semantic) => Arc::clone(semantic),
-        Plane::Loading => return,
-        Plane::Gap(reason) => {
-            *write(&child.semantic) = Plane::Gap(reason.clone());
-            return;
-        }
-    };
-    let reader = match child.reader(&session.storage) {
-        Ok(Some(reader)) => reader,
-        Ok(None) => {
-            *write(&child.semantic) =
-                Plane::Gap("no semantic view has been published for this repository yet".into());
-            return;
-        }
-        Err(error) => {
-            *write(&child.semantic) = Plane::Gap(format!("semantic view unreadable: {error}"));
-            return;
-        }
-    };
-    let members = reader.members().unwrap_or_default();
-    if !members.iter().any(|member| member.scope == child.scope) {
-        *write(&child.semantic) =
-            Plane::Gap("no semantic view has been published for this repository yet".into());
-        return;
-    }
-    let producers = Producers {
-        trigram: super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-        semantic: Some(semantic.producer_id.clone()),
-        callgraph: super::semantic_runtime::UNREGISTERED_PRODUCER.into(),
-    };
-    // `open_foreign_generation` reads the pointer before protecting it, so
-    // check the cheap pointer first and skip a generation already served.
-    let current_name = super::registry::view_dir(&session.storage, &child.scope)
-        .ok()
-        .and_then(super::ViewStore::existing_dir)
-        .and_then(|store| store.current_generation_read_only().ok().flatten());
-    if current_name.is_some()
-        && read(&child.semantic)
-            .ready()
-            .is_some_and(|current| Some(current.generation.name()) == current_name.as_deref())
-    {
-        return;
-    }
-    let generation = match super::read::open_foreign_generation(&reader, &child.scope, &producers) {
-        Ok(Some(generation)) => generation,
-        Ok(None) => {
-            *write(&child.semantic) =
-                Plane::Gap("no semantic view has been published for this repository yet".into());
-            return;
-        }
-        Err(error) => {
-            *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
-            return;
-        }
-    };
-    let access = ViewAccess::Reader {
-        registration: Arc::clone(&reader),
-        scope: child.scope.clone(),
-    };
-    child.loads.fetch_add(1, Ordering::SeqCst);
-    // Admission decodes the generation's vectors once into the family arena.
-    // It has no size cap: a large child is served like a small one.
-    if let Err(error) = semantic.plane.open_generation(&access, &generation) {
-        *write(&child.semantic) = Plane::Gap(format!("semantic view unavailable: {error}"));
-        return;
-    }
-    let snapshot = LiveDelta::new(Arc::clone(&generation)).snapshot();
-    let previous = std::mem::replace(
-        &mut *write(&child.semantic),
-        Plane::Ready(Arc::new(SemanticChild {
-            access: access.clone(),
-            generation,
-            snapshot,
-        })),
-    );
-    if let Plane::Ready(previous) = previous {
-        // Release the replaced generation's residents unless a session of the
-        // child in this same process still serves them.
-        if super::semantic_runtime::live_holders(&semantic.plane, &access) == 0 {
-            semantic
-                .plane
-                .release_generation(&access, previous.generation.name());
-        }
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1084,13 +924,4 @@ pub(crate) fn display_relative(root: &Path, path: &Path) -> String {
     } else {
         text
     }
-}
-
-/// The set of child roots, for tests.
-pub fn child_roots(session: &ParentSession) -> BTreeSet<PathBuf> {
-    session
-        .children
-        .iter()
-        .map(|child| child.root.clone())
-        .collect()
 }

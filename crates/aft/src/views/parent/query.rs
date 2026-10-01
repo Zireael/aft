@@ -42,14 +42,17 @@ impl Gaps {
     }
 
     /// Records that `child` cannot answer this request, and why.
-    fn child(&mut self, child: &Child, reason: String) {
+    pub(crate) fn child(&mut self, child: &Child, reason: String) {
         self.push("parent_child_unavailable", child.display(), reason);
     }
 
     /// Children, skipped children and outside paths a search of `scope`
     /// covers but cannot reach, beyond the per-child plane gaps.
     pub(crate) fn scope(&mut self, session: &ParentSession, scope: &Path) {
-        let discovery = &session.discovery;
+        let Some(discovery) = session.discovery() else {
+            self.discovering();
+            return;
+        };
         let in_scope = |path: &Path| path.starts_with(scope) || scope.starts_with(path);
         let skipped = discovery
             .skipped
@@ -81,6 +84,15 @@ impl Gaps {
                     .into(),
             );
         }
+    }
+
+    /// The worker has not finished finding the child repositories yet.
+    pub(crate) fn discovering(&mut self) {
+        self.push(
+            "parent_discovering",
+            ".".into(),
+            "still discovering child repositories; their answers are not included yet".into(),
+        );
     }
 
     pub(crate) fn into_values(self) -> Vec<Value> {
@@ -128,15 +140,22 @@ pub(crate) fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
     }
 }
 
+/// True once discovery finished; otherwise records the discovering gap.
+pub(crate) fn discovered(session: &ParentSession, gaps: &mut Gaps) -> bool {
+    if session.discovery().is_some() {
+        return true;
+    }
+    gaps.discovering();
+    false
+}
+
 /// Children whose checkout overlaps `scope`: inside it, or containing it.
-fn overlapping<'a>(
-    session: &'a ParentSession,
-    scope: &'a Path,
-) -> impl Iterator<Item = &'a Arc<Child>> + 'a {
+fn overlapping(session: &ParentSession, scope: &Path) -> Vec<Arc<Child>> {
     session
-        .children
-        .iter()
-        .filter(move |child| child.root.starts_with(scope) || scope.starts_with(&child.root))
+        .children()
+        .into_iter()
+        .filter(|child| child.root.starts_with(scope) || scope.starts_with(&child.root))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +205,7 @@ pub(crate) fn grep_fan_out(
             let trigram = read(&child.trigram).clone();
             let Plane::Ready(trigram) = trigram else {
                 if let Some(reason) = trigram.gap_reason("trigram") {
-                    gaps.child(child, reason);
+                    gaps.child(&child, reason);
                 }
                 continue;
             };
@@ -283,7 +302,7 @@ pub(crate) fn glob_fan_out(
             let trigram = read(&child.trigram).clone();
             let Plane::Ready(trigram) = trigram else {
                 if let Some(reason) = trigram.gap_reason("trigram") {
-                    gaps.child(child, reason);
+                    gaps.child(&child, reason);
                 }
                 continue;
             };
@@ -317,7 +336,7 @@ pub fn route(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
     }
     let session = super::session_for(ctx)?;
     Some(match req.command.as_str() {
-        "semantic_search" => search(req, ctx, &session),
+        "semantic_search" => super::engine::search(req, ctx, &session),
         "inspect" => inspect(req, ctx, &session),
         operation => callgraph(req, ctx, &session, operation),
     })
@@ -432,6 +451,9 @@ fn callgraph(
     };
     let mut gaps = Gaps::default();
     let Some(child) = session.child_for(&file) else {
+        if !discovered(session, &mut gaps) {
+            return gap_response(req, operation, gaps);
+        }
         gaps.push(
             "outside_child_repositories",
             display_relative(session.root(), &file),
@@ -442,7 +464,7 @@ fn callgraph(
     let plane = read(&child.callgraph).clone();
     let Plane::Ready(callgraph) = plane else {
         if let Some(reason) = plane.gap_reason("call graph") {
-            gaps.child(child, reason);
+            gaps.child(&child, reason);
         }
         return gap_response(req, operation, gaps);
     };
@@ -520,228 +542,6 @@ fn callgraph(
         Ok(Err(response)) => response,
         Err(error) => adapter::store_error_response(&req.id, operation, error),
     }
-}
-
-// ---------------------------------------------------------------------------
-// aft_search
-// ---------------------------------------------------------------------------
-
-const DEFAULT_SEARCH_TOP_K: usize = 10;
-
-fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {
-    let Some(query) = string_param(req, "query") else {
-        return missing(req, "semantic_search", "query");
-    };
-    let top_k = req
-        .params
-        .get("top_k")
-        .or_else(|| req.params.get("topK"))
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_SEARCH_TOP_K);
-    let mut gaps = Gaps::default();
-    let mut rows: Vec<(f32, Value)> = Vec::new();
-
-    let semantic = read(&session.semantic).clone();
-    match &semantic {
-        Plane::Ready(semantic) => {
-            let budget = crate::semantic_index::QueryBudget::from_config(&semantic.config);
-            let embedded = super::lock(&semantic.model).embed_query_cached(query, budget);
-            match embedded {
-                Ok(vector) => {
-                    for child in &session.children {
-                        let plane = read(&child.semantic).clone();
-                        let Plane::Ready(view) = plane else {
-                            if let Some(reason) = plane.gap_reason("semantic") {
-                                gaps.child(child, reason);
-                            }
-                            continue;
-                        };
-                        match semantic.plane.search(
-                            &view.access,
-                            &child.root,
-                            &view.snapshot,
-                            &vector,
-                            top_k,
-                            &|_| true,
-                        ) {
-                            Ok(answer) => {
-                                let unreflected = answer.pending.len() + answer.failed.len();
-                                if unreflected > 0 {
-                                    gaps.child(
-                                        child,
-                                        format!(
-                                            "semantic: {unreflected} file(s) have no current vectors in this repository's view"
-                                        ),
-                                    );
-                                }
-                                for result in answer.results {
-                                    rows.push((
-                                        result.score,
-                                        json!({
-                                            "file": display_relative(session.root(), &result.file),
-                                            "name": result.name,
-                                            "kind": result.kind,
-                                            "start_line": result.start_line,
-                                            "end_line": result.end_line,
-                                            "location": format!(
-                                                "{}:{}-{}",
-                                                display_relative(session.root(), &result.file),
-                                                result.start_line,
-                                                result.end_line
-                                            ),
-                                            "score": result.score,
-                                            "source": "semantic",
-                                            "semantic_score": result.score,
-                                            "snippet": result.snippet,
-                                        }),
-                                    ));
-                                }
-                            }
-                            Err(error) => gaps.child(child, format!("semantic: {error}")),
-                        }
-                    }
-                }
-                Err(error) => gaps.push(
-                    "parent_semantic_unavailable",
-                    ".".into(),
-                    format!("the query could not be embedded: {error}"),
-                ),
-            }
-        }
-        other => {
-            if let Some(reason) = other.gap_reason("semantic") {
-                gaps.push("parent_semantic_unavailable", ".".into(), reason);
-            }
-        }
-    }
-    rows.sort_by(|left, right| right.0.total_cmp(&left.0));
-    rows.truncate(top_k);
-    let mut results = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
-
-    // Exact identifiers are also looked up in the children's trigram indexes,
-    // so a parent search still finds a named symbol when vectors are missing.
-    if !query.trim().is_empty() && !query.contains(char::is_whitespace) {
-        for row in lexical_rows(ctx, session, query, top_k, &mut gaps) {
-            if results.len() >= top_k {
-                break;
-            }
-            if !results.iter().any(|existing| {
-                existing["file"] == row["file"]
-                    && existing["start_line"].as_u64() <= row["start_line"].as_u64()
-                    && existing["end_line"].as_u64() >= row["start_line"].as_u64()
-            }) {
-                results.push(row);
-            }
-        }
-    }
-    gaps.scope(session, session.root());
-
-    let text = if results.is_empty() {
-        format!("No results for \"{query}\" in this parent folder's repositories.")
-    } else {
-        results
-            .iter()
-            .map(|row| {
-                let mut line = format!(
-                    "{} {}",
-                    row["location"].as_str().unwrap_or_default(),
-                    row["name"].as_str().unwrap_or_default()
-                );
-                if let Some(snippet) = row["snippet"].as_str() {
-                    let first = snippet.lines().next().unwrap_or_default().trim();
-                    if !first.is_empty() {
-                        line.push_str(&format!("\n  {first}"));
-                    }
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let mut body = json!({
-        "status": "ok",
-        "complete": true,
-        "text": text,
-        "query": query,
-        "result_count": results.len(),
-        "results": results,
-        "more_available": false,
-    });
-    attach_gaps(&mut body, gaps.into_values());
-    Response::success(&req.id, body)
-}
-
-/// Literal matches of `query` in the children's trigram indexes, as search rows.
-fn lexical_rows(
-    ctx: &AppContext,
-    session: &ParentSession,
-    query: &str,
-    limit: usize,
-    gaps: &mut Gaps,
-) -> Vec<Value> {
-    let crate::pattern_compile::CompileResult::Ok(pattern) = crate::pattern_compile::compile(
-        query,
-        crate::pattern_compile::CompileOpts {
-            literal: true,
-            ..Default::default()
-        },
-    ) else {
-        return Vec::new();
-    };
-    let Ok(filters) = crate::search_index::build_path_filters(&[], &[]) else {
-        return Vec::new();
-    };
-    let root = session.root().to_path_buf();
-    let scope = GrepScope {
-        roots: vec![crate::grep_executor::ResolvedRoot {
-            search_root: root.clone(),
-            filter_root: root,
-            use_index: true,
-            is_external: false,
-        }],
-        multi_root: false,
-        per_root_max: limit,
-    };
-    let params = GrepParams {
-        include: Vec::new(),
-        exclude: Vec::new(),
-        max_results: limit,
-        path_exclusion: None,
-    };
-    let Some((result, _, lexical_gaps)) = grep_fan_out(ctx, &pattern, &scope, &params, &filters)
-    else {
-        return Vec::new();
-    };
-    for gap in lexical_gaps {
-        if let (Some(kind), Some(path), Some(reason)) = (
-            gap["kind"].as_str(),
-            gap["path"].as_str(),
-            gap["reason"].as_str(),
-        ) {
-            gaps.push(kind, path.into(), reason.into());
-        }
-    }
-    result
-        .matches
-        .into_iter()
-        .map(|found| {
-            let file = display_relative(session.root(), &found.file);
-            json!({
-                "file": file,
-                "name": found.match_text,
-                "kind": "line",
-                "start_line": found.line,
-                "end_line": found.line,
-                "location": format!("{}:{}", file, found.line),
-                "score": 0.0,
-                "source": "lexical",
-                "exact": true,
-                "snippet": found.line_text,
-            })
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------

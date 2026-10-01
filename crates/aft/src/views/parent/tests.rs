@@ -58,6 +58,19 @@ fn default_cap_covers_the_operators_projects_folder() {
     assert_eq!(capped.skipped.len(), 7);
 }
 
+fn context() -> crate::context::AppContext {
+    crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config::default(),
+    )
+}
+
+const PLANES: RequestedPlanes = RequestedPlanes {
+    trigram: true,
+    semantic: false,
+    callgraph: true,
+};
+
 #[test]
 fn activate_requires_prepare_and_deactivate_stops_the_session() {
     let temp = tempfile::tempdir().unwrap();
@@ -65,15 +78,11 @@ fn activate_requires_prepare_and_deactivate_stops_the_session() {
     git_init(&root.join("child"));
     let storage = tempfile::tempdir().unwrap();
     let semantic = crate::config::SemanticBackendConfig::default();
-    assert!(!activate(&root, storage.path(), &semantic));
+    let ctx = context();
+    assert!(!activate(&ctx, &root, storage.path(), &semantic));
     assert!(session_for_root(&root).is_none());
-    let planes = RequestedPlanes {
-        trigram: true,
-        semantic: false,
-        callgraph: true,
-    };
-    assert!(prepare(&root, planes));
-    assert!(activate(&root, storage.path(), &semantic));
+    assert!(prepare(&root, PLANES));
+    assert!(activate(&ctx, &root, storage.path(), &semantic));
     let session = session_for_root(&root).unwrap();
     assert!(session.wait_rounds(1, Duration::from_secs(30)));
     // The child has published nothing: each plane is a named gap, and the
@@ -83,13 +92,92 @@ fn activate_requires_prepare_and_deactivate_stops_the_session() {
     assert!(matches!(&*read(&child.callgraph), Plane::Gap(_)));
     assert!(matches!(&*read(&child.semantic), Plane::Gap(_)));
     assert_eq!(std::fs::read_dir(storage.path()).unwrap().count(), 0);
-    // Rebinding with the same discovery reuses the running session.
-    assert!(prepare(&root, planes));
-    assert!(activate(&root, storage.path(), &semantic));
+    // Rebinding with the same planes reuses the running session.
+    assert!(prepare(&root, PLANES));
+    assert!(activate(&ctx, &root, storage.path(), &semantic));
     assert!(Arc::ptr_eq(&session, &session_for_root(&root).unwrap()));
     deactivate(&root);
     assert!(session_for_root(&root).is_none());
     assert!(session.stopped());
+}
+
+fn wait_stopped(session: &ParentSession) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !session.stopped() {
+        assert!(
+            Instant::now() < deadline,
+            "the parent session never stopped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn session_stops_when_its_only_context_binds_another_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    git_init(&root.join("child"));
+    let storage = tempfile::tempdir().unwrap();
+    let semantic = crate::config::SemanticBackendConfig::default();
+    let first = context();
+    let second = context();
+    assert!(prepare(&root, PLANES));
+    assert!(activate(&first, &root, storage.path(), &semantic));
+    assert!(prepare(&root, PLANES));
+    assert!(activate(&second, &root, storage.path(), &semantic));
+    let session = session_for_root(&root).unwrap();
+    // One holder leaves: the other still holds the session.
+    release_context_except(&first, &root.join("child"));
+    assert!(session.wait_rounds(1, Duration::from_secs(30)));
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!session.stopped());
+    // The last holder binds another root: the session stops and leaves the
+    // registry.
+    release_context_except(&second, &root.join("child"));
+    wait_stopped(&session);
+    assert!(session_for_root(&root).is_none());
+}
+
+#[test]
+fn session_stops_when_its_context_is_dropped() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    git_init(&root.join("child"));
+    let storage = tempfile::tempdir().unwrap();
+    let semantic = crate::config::SemanticBackendConfig::default();
+    let ctx = context();
+    assert!(prepare(&root, PLANES));
+    assert!(activate(&ctx, &root, storage.path(), &semantic));
+    let session = session_for_root(&root).unwrap();
+    drop(ctx);
+    wait_stopped(&session);
+    assert!(session_for_root(&root).is_none());
+}
+
+#[test]
+fn configure_probe_is_bounded_by_wall_clock_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    for index in 0..20 {
+        std::fs::create_dir_all(root.join(format!("plain-{index:02}"))).unwrap();
+    }
+    git_init(&root.join("zz-repo"));
+    set_discovery_entry_delay(&root, Duration::from_millis(50));
+    let started = Instant::now();
+    // The only repository sorts last, past the budget: the probe gives up
+    // and the root keeps its own index rather than stalling configure.
+    assert!(!prepare_with_budget(
+        &root,
+        PLANES,
+        Duration::from_millis(200)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(600));
+    set_discovery_entry_delay(&root, Duration::ZERO);
+    assert!(prepare_with_budget(
+        &root,
+        PLANES,
+        Duration::from_millis(200)
+    ));
 }
 
 #[test]
