@@ -70,15 +70,17 @@ use crate::views::segment_store::{
 use crate::views::semantic::SemanticProducer;
 use crate::views::{RelPath, ViewError};
 
-/// Format of the import ledger this build writes. A ledger stamped with a
-/// newer format is refused by name rather than reinterpreted.
+/// Format of the import ledger this build writes. A ledger whose format is
+/// newer than this is reported as an error naming its version rather than
+/// read with this build's schema.
 pub const LEDGER_FORMAT_VERSION: i64 = 1;
 
 /// How long a legacy set stays on disk after its import completed, so an
 /// offline rollback to the previous binary still finds its caches.
 pub const LEGACY_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
-/// Legacy files larger than this are rebuilt rather than read into memory.
+/// Legacy files larger than this are not read into memory; their plane is
+/// built from the checkout instead.
 const MAX_LEGACY_SOURCE_BYTES: u64 = 1 << 30;
 /// Upper bound on files listed by one legacy artifact.
 const MAX_LEGACY_FILES: usize = 2_000_000;

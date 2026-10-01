@@ -334,16 +334,18 @@ pub fn inventory(storage: &Path, now: SystemTime) -> io::Result<Inventory> {
 // ---------------------------------------------------------------------------
 // Process census
 
-/// One process the census will not prune alongside.
+/// One process whose presence stops the prune.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CensusFinding {
-    /// An `aft` or `ck-aft` process; `daemon` when it runs `--subc`.
+    /// An `aft` or `ck-aft` process; `daemon` is true when it was started
+    /// with `--subc`.
     Aft {
         pid: u32,
         daemon: bool,
         command: String,
     },
-    /// A process that looks like AFT but cannot be classified.
+    /// A process whose name mentions AFT but is not an `aft` or `ck-aft`
+    /// executable.
     Unclassifiable {
         pid: u32,
         command: String,
@@ -369,7 +371,7 @@ impl CensusFinding {
     }
 }
 
-/// Lists the processes that block a prune, excluding this one.
+/// Lists the processes that block a prune, excluding the process running it.
 pub trait ProcessCensus {
     fn take(&self) -> Result<Vec<CensusFinding>, String>;
 }
@@ -520,11 +522,14 @@ fn same_filesystem(source: &Path, target_dir: &Path) -> io::Result<bool> {
     Ok(fs::symlink_metadata(source)?.dev() == fs::metadata(target_dir)?.dev())
 }
 
+// Only Unix renames directories here, so elsewhere every set is skipped.
+#[cfg_attr(not(unix), allow(dead_code))]
 enum Moved {
     All,
     Skipped(String),
     /// Some directories moved, the rest refused, and moving them back failed:
-    /// the area must not be deleted, or the set would be removed in part.
+    /// the rename-aside directory must not be deleted, or the set would be
+    /// removed in part.
     Partial(String),
 }
 
