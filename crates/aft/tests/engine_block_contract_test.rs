@@ -71,6 +71,7 @@ fn key() -> CanonicalListKey {
         snapshot_generation: "generation-17".to_string(),
         normalized_query: "block frozen query".to_string(),
         include_tests: false,
+        split: None,
     }
 }
 

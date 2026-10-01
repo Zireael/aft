@@ -73,9 +73,18 @@ pub enum SearchLaneKind {
     PathLookup,
     FallbackWalk,
     ReadinessDisclosure,
+    /// Split-query `pattern` input: files whose strongest match declares a
+    /// matched name (see `split_query`).
+    PatternDefinition,
+    /// Split-query `pattern` input: every other file the pattern matched.
+    PatternMention,
 }
 
 impl SearchLaneKind {
+    /// The lanes the shape-indexed plan table covers. The two pattern lanes
+    /// are not in it: they run only when a request supplies `pattern`, and
+    /// their weights come from the constants in `split_query`, not from a
+    /// shape row. See [`SearchLaneKind::PATTERN_LANES`].
     pub const ALL: [SearchLaneKind; 9] = [
         SearchLaneKind::Symbol,
         SearchLaneKind::Exact,
@@ -86,6 +95,12 @@ impl SearchLaneKind {
         SearchLaneKind::PathLookup,
         SearchLaneKind::FallbackWalk,
         SearchLaneKind::ReadinessDisclosure,
+    ];
+
+    /// Scored lanes fed by a split request's `pattern`.
+    pub const PATTERN_LANES: [SearchLaneKind; 2] = [
+        SearchLaneKind::PatternDefinition,
+        SearchLaneKind::PatternMention,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -99,6 +114,8 @@ impl SearchLaneKind {
             SearchLaneKind::PathLookup => "path_lookup",
             SearchLaneKind::FallbackWalk => "fallback_walk",
             SearchLaneKind::ReadinessDisclosure => "readiness_disclosure",
+            SearchLaneKind::PatternDefinition => "pattern_definition",
+            SearchLaneKind::PatternMention => "pattern_mention",
         }
     }
 
@@ -113,6 +130,8 @@ impl SearchLaneKind {
             "path_lookup" => Some(SearchLaneKind::PathLookup),
             "fallback_walk" => Some(SearchLaneKind::FallbackWalk),
             "readiness_disclosure" => Some(SearchLaneKind::ReadinessDisclosure),
+            "pattern_definition" => Some(SearchLaneKind::PatternDefinition),
+            "pattern_mention" => Some(SearchLaneKind::PatternMention),
             _ => None,
         }
     }
@@ -128,11 +147,16 @@ impl SearchLaneKind {
             SearchLaneKind::PathLookup => 6,
             SearchLaneKind::FallbackWalk => 7,
             SearchLaneKind::ReadinessDisclosure => 8,
+            SearchLaneKind::PatternDefinition => 9,
+            SearchLaneKind::PatternMention => 10,
         }
     }
 
     pub const fn is_scored(self) -> bool {
-        matches!(self, Self::Lexical | Self::Semantic)
+        matches!(
+            self,
+            Self::Lexical | Self::Semantic | Self::PatternDefinition | Self::PatternMention
+        )
     }
 }
 

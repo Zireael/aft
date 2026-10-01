@@ -94,6 +94,7 @@ fn key(label: &str, include_tests: bool) -> CanonicalListKey {
         snapshot_generation: "paging-generation-1".to_string(),
         normalized_query: label.to_string(),
         include_tests,
+        split: None,
     }
 }
 

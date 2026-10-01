@@ -2282,16 +2282,38 @@ fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> String {
 
 fn translate_search(args: Value) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
+    // `query` is prose (or a single auto-routed string); `pattern` is a regex
+    // in grep's syntax. At least one must be non-empty. A whitespace-only
+    // pattern counts as absent, but a real pattern is forwarded untrimmed:
+    // whitespace inside a regex is part of what it matches.
     let query = map_in
         .get("query")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            invalid_request("semantic_search: invalid params: `query` must be a non-empty string")
-        })?;
+        .filter(|s| !s.trim().is_empty());
+    let pattern = match map_in.get("pattern") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(pattern)) => Some(pattern.as_str()).filter(|s| !s.trim().is_empty()),
+        Some(_) => {
+            return Err(invalid_request(
+                "semantic_search: invalid params: `pattern` must be a string",
+            ));
+        }
+    };
+    if query.is_none() && pattern.is_none() {
+        return Err(invalid_request(if map_in.contains_key("pattern") {
+            "semantic_search: invalid params: at least one of `query` or `pattern` must be a non-empty string"
+        } else {
+            "semantic_search: invalid params: `query` must be a non-empty string"
+        }));
+    }
 
     let mut out = Map::new();
-    out.insert("query".to_string(), Value::String(query.to_string()));
+    if let Some(query) = query {
+        out.insert("query".to_string(), Value::String(query.to_string()));
+    }
+    if let Some(pattern) = pattern {
+        out.insert("pattern".to_string(), Value::String(pattern.to_string()));
+    }
     let top_k_value = coerce_optional_int_result(map_in.get("topK"), "topK", 0, SEARCH_MAX_TOP_K)
         .map_err(|error| {
         if error.message.starts_with("topK must be between") {
@@ -4009,6 +4031,61 @@ mod tests {
             Some(5)
         );
         assert!(translated.args.get("hint").is_none());
+    }
+
+    #[test]
+    fn search_pattern_is_forwarded_beside_or_instead_of_query() {
+        use serde_json::json;
+        let translate = |args: Value| subc_translate_owned("search", args, Path::new("/project"));
+
+        let split =
+            translate(json!({"query": "how is config loaded", "pattern": "load_config|Config "}))
+                .expect("query and pattern");
+        assert_eq!(split.command, "semantic_search");
+        assert_eq!(
+            split.args.get("query").and_then(Value::as_str),
+            Some("how is config loaded")
+        );
+        // The regex is forwarded as written, trailing space included.
+        assert_eq!(
+            split.args.get("pattern").and_then(Value::as_str),
+            Some("load_config|Config ")
+        );
+
+        let alone = translate(json!({"pattern": "^export"})).expect("pattern alone");
+        assert!(alone.args.get("query").is_none());
+        assert_eq!(
+            alone.args.get("pattern").and_then(Value::as_str),
+            Some("^export")
+        );
+
+        // A blank pattern is absent: the request is the query-only request.
+        let blank = translate(json!({"query": "needle", "pattern": "   "})).expect("blank");
+        assert_eq!(
+            blank.args,
+            translate(json!({"query": "needle"}))
+                .expect("query only")
+                .args
+        );
+
+        // An invalid regex is not judged here: it reaches the engine, which
+        // refuses it with grep's `invalid_pattern` code and text.
+        let invalid = translate(json!({"pattern": "["})).expect("forwarded");
+        assert_eq!(
+            invalid.args.get("pattern").and_then(Value::as_str),
+            Some("[")
+        );
+
+        for args in [
+            json!({}),
+            json!({"pattern": " "}),
+            json!({"query": "", "pattern": null}),
+        ] {
+            let error = translate(args.clone()).expect_err("no usable input");
+            assert_eq!(error.code, "invalid_request", "{args}");
+        }
+        let error = translate(json!({"query": "x", "pattern": 3})).expect_err("non-string");
+        assert!(error.message.contains("pattern"));
     }
 
     #[test]

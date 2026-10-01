@@ -782,3 +782,51 @@ fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
 
     assert!(aft.shutdown().success());
 }
+
+// Benchmark harnesses detect split-query support by sending `pattern: "["`
+// and expecting grep's stable `invalid_pattern` code. Pin that contract on
+// both entry points: the native NDJSON command and the translated tool call.
+#[test]
+fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    fs::write(root.join("lib.rs"), "pub fn load() {}\n").expect("write fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let native = aft.send(
+        &json!({
+            "id": "search-invalid-pattern-native",
+            "command": "semantic_search",
+            "pattern": "[",
+        })
+        .to_string(),
+    );
+    let translated = aft.send(
+        &json!({
+            "id": "search-invalid-pattern-subc",
+            "command": "tool_call",
+            "session_id": "search-invalid-pattern",
+            "name": "search",
+            "arguments": { "query": "where is config loaded", "pattern": "[" }
+        })
+        .to_string(),
+    );
+    for response in [native, translated] {
+        assert_eq!(response["success"], false, "{response:#}");
+        assert_eq!(response["code"], "invalid_pattern", "{response:#}");
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("regex parse error") && message.contains('^'),
+            "grep's error text with its position: {response:#}"
+        );
+    }
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

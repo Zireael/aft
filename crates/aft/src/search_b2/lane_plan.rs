@@ -107,6 +107,55 @@ pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind
     lanes
 }
 
+/// Lane plan for a request that supplies both `query` and `pattern`.
+///
+/// No router runs. The prose feeds only the lexical and semantic lanes
+/// (whichever are ready), and the pattern feeds the two scored pattern lanes.
+/// No exact, symbol, variants or path-lookup lane runs on the prose: the
+/// agent has already put the names it wants matched verbatim in `pattern`,
+/// and any of those lanes would place prose-derived files in the exact tier
+/// ahead of every pattern and semantic result. The shape is recorded as
+/// natural language for telemetry only; scoring comes from `split_query`.
+pub fn split_plan<'a>(readiness: &Readiness<'a>) -> LanePlan<'a> {
+    let legal = [
+        SearchLaneKind::Lexical,
+        SearchLaneKind::Semantic,
+        SearchLaneKind::PatternDefinition,
+        SearchLaneKind::PatternMention,
+    ];
+    let selected_lanes = legal
+        .iter()
+        .copied()
+        .filter(|lane| lane_is_ready(*lane, readiness))
+        .collect::<Vec<_>>();
+    let mut executed_callbacks = selected_lanes.clone();
+    if readiness_disclosure_required(&legal, readiness) {
+        executed_callbacks.push(SearchLaneKind::ReadinessDisclosure);
+    }
+    LanePlan {
+        shape: SearchShape::NaturalLanguage,
+        query_facts: no_query_facts(),
+        exact_input: None,
+        exact_mode: ExactMode::NotApplicable,
+        selected_lanes,
+        executed_callbacks,
+        readiness: readiness.clone(),
+        variants: Vec::new(),
+    }
+}
+
+/// Query facts for input the router did not read: an explicit `pattern`, or
+/// the prose of a split request.
+pub fn no_query_facts() -> QueryFacts {
+    QueryFacts {
+        embedded_span: None,
+        exact_input_tokens: 0,
+        has_path_token: false,
+        has_timestamp_or_pid: false,
+        has_identifier_token: false,
+    }
+}
+
 fn lane_is_ready(lane: SearchLaneKind, readiness: &Readiness<'_>) -> bool {
     match lane {
         SearchLaneKind::Symbol => readiness.symbol_index,
@@ -116,7 +165,9 @@ fn lane_is_ready(lane: SearchLaneKind, readiness: &Readiness<'_>) -> bool {
         | SearchLaneKind::Anchored
         | SearchLaneKind::PathLookup
         | SearchLaneKind::FallbackWalk
-        | SearchLaneKind::ReadinessDisclosure => true,
+        | SearchLaneKind::ReadinessDisclosure
+        | SearchLaneKind::PatternDefinition
+        | SearchLaneKind::PatternMention => true,
     }
 }
 

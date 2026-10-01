@@ -350,7 +350,11 @@
     "type": "object",
     "properties": {
       "query": {
-        "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+        "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+        "type": "string"
+      },
+      "pattern": {
+        "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
         "type": "string"
       },
       "topK": {
@@ -374,10 +378,7 @@
         "type": "string"
       }
     },
-    "required": [
-      "query"
-    ],
-    "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
+    "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
   },
   "outline": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

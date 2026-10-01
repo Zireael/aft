@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search",
             },
         ],
     },
@@ -485,6 +485,27 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file",
         location_or_primitive: "commands::zoom indexed offset work-count test",
         reason: "test fixture selecting sample offsets for a work-count assertion; not an agent-visible list",
+    },
+    // Split-query search (aft_search with both query and pattern). The
+    // results list is the search surface's, cut and enveloped by the engine;
+    // these items only describe the pattern input.
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "summary_line",
+        location_or_primitive: "commands::semantic_search::split_query::SUMMARY_DEFINITION_SITES",
+        reason: "the one-line pattern summary names at most three definition sites as a preview; the reply's pattern_summary.definition_files carries the full count, and no result is removed",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "from_bounded_scan, bounded_scan_groups_lines_by_file_and_keeps_the_bound",
+        location_or_primitive: "commands::semantic_search::split_query bounded scan truncation flags",
+        reason: "reads (or, in the test, sets) the bounded grep scan's truncation flags to mark the pattern examination capped; nothing is cut here, and the split reply discloses the bound through its budget envelope",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "selective_definitions, admission_definers, expand_group",
+        location_or_primitive: "commands::semantic_search::split_query::MAX_PLACED_DEFINITIONS, MAX_GROUP_EXPANSION",
+        reason: "bounds the definitions scored for relevance or carried into the ranking and the alternatives a group expands into; these are ranking inputs, no list is shown to the agent, and the results list is cut and enveloped by the engine",
     },
 ];
 

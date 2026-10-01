@@ -480,6 +480,7 @@ fn tiny_list(project: &Path, count: usize) -> CanonicalList {
             snapshot_generation: "g1".to_string(),
             normalized_query: "q".to_string(),
             include_tests: false,
+            split: None,
         },
         blocks: vec![FrozenBlock {
             tier_index: 0,

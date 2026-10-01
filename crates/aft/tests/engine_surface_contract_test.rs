@@ -105,6 +105,7 @@ fn backend() -> BlockBuilder {
             snapshot_generation: "surface-generation".to_string(),
             normalized_query: "paged query".to_string(),
             include_tests: false,
+            split: None,
         },
         policy(),
         vec![lane],
@@ -353,9 +354,11 @@ fn surface_audit_locks_the_only_request_schema_change_and_runtime_hooks() {
     let properties = search["properties"]
         .as_object()
         .expect("search schema properties");
+    // `pattern` joined the request schema with split-query search: a regex
+    // ranked beside (or instead of) `query`.
     assert_eq!(
         properties.keys().cloned().collect::<HashSet<_>>(),
-        ["query", "topK", "offset", "includeTests", "path"]
+        ["query", "pattern", "topK", "offset", "includeTests", "path"]
             .into_iter()
             .map(str::to_string)
             .collect()

@@ -39,6 +39,7 @@ fn page(label: &str, candidate_count: usize, offset: usize, top_k: usize) -> Sea
         snapshot_generation: "trailer-generation-1".to_string(),
         normalized_query: label.to_string(),
         include_tests: false,
+        split: None,
     };
     let policy =
         ScoringPolicy::from_plan_table(&PlanTable::running_table(), SearchShape::NaturalLanguage)

@@ -267,16 +267,34 @@ pub(crate) fn keep_past_line_limit(grep_match: &GrepMatch) -> bool {
     match_declaration(grep_match) == Some(Declaration::Keyword)
 }
 
+/// How [`rank_collection`] breaks a tie between files of the same class,
+/// declaration strength and matched-line count, before falling back to path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecencyTiebreak {
+    /// Newest file first: the pattern-only route's order.
+    NewestFirst,
+    /// No modification-time tie-break, so ties fall to the path. Split-query
+    /// search feeds these positions into score fusion, where an order that
+    /// moves when a file is touched (without its content changing) would make
+    /// the fused ranking depend on the machine and the time of the checkout.
+    None,
+}
+
 /// Order the examined files, one result per file with its listed lines.
 ///
 /// Files are ordered by class (source, other text, data), then by the
 /// strongest declaration of a matched name among their listed lines (keyword,
-/// field, none), then by how many lines match, newest first, and by path.
+/// field, none), then by how many lines match, newest first unless `recency`
+/// says otherwise, and by path.
 /// Each file lists every matching line when it has ten or fewer, else five,
 /// its declaration line first (see [`RankedFile`]).
 /// `total_matches` counts every matching line in the examined files.
 /// `truncated` and `engine_capped` are set when a bound left files unexamined.
-pub(crate) fn rank_collection(collection: GrepFileCollection, query: &str) -> RankedFiles {
+pub(crate) fn rank_collection(
+    collection: GrepFileCollection,
+    query: &str,
+    recency: RecencyTiebreak,
+) -> RankedFiles {
     let mut data_files = DataFileClassifier::new(query);
     let mut keyed: Vec<((FileClass, Option<Declaration>), GrepFileMatches)> = collection
         .files
@@ -293,7 +311,10 @@ pub(crate) fn rank_collection(collection: GrepFileCollection, query: &str) -> Ra
             // `None` sorts first for Option; a declaration must sort first here.
             .then_with(|| declaration_rank(*left_declaration).cmp(&declaration_rank(*right_declaration)))
             .then_with(|| right.matched_lines.cmp(&left.matched_lines))
-            .then_with(|| Reverse(left.modified).cmp(&Reverse(right.modified)))
+            .then_with(|| match recency {
+                RecencyTiebreak::NewestFirst => Reverse(left.modified).cmp(&Reverse(right.modified)),
+                RecencyTiebreak::None => std::cmp::Ordering::Equal,
+            })
             .then_with(|| left.path.cmp(&right.path))
     });
 
@@ -349,6 +370,16 @@ pub(crate) struct RankedFile {
 }
 
 impl RankedFile {
+    /// True when the file's leading line declares a matched name with a
+    /// declaration keyword (`fn name`, `class Name`, `const NAME`). The
+    /// leading line is the file's strongest declaration, so this holds exactly
+    /// when the file ranks among keyword-declaring files. A field line
+    /// (`name: value`) does not count: it looks the same as a struct literal
+    /// or object property that merely uses the name.
+    pub(crate) fn declares_match(&self) -> bool {
+        match_declaration(&self.lines[0]) == Some(Declaration::Keyword)
+    }
+
     fn from_matches(matches: Vec<GrepMatch>, matched_lines: usize) -> Option<Self> {
         let best = matches
             .iter()
@@ -610,6 +641,7 @@ mod tests {
                 false,
             ),
             "addToCart",
+            RecencyTiebreak::NewestFirst,
         );
         assert_eq!(
             ranked_paths(&result),
@@ -675,6 +707,7 @@ mod tests {
                 false,
             ),
             "validate_read_path|restrict_to_project_root",
+            RecencyTiebreak::NewestFirst,
         );
         // Both field-form files tie on declaration strength; the one with more
         // matching lines goes first.
@@ -732,7 +765,12 @@ mod tests {
         assert_eq!(listed(&many), [7, 1, 2, 3, 4]);
         assert_eq!(many.more_in_file, 25);
 
-        let summary = rank_collection(collection(Vec::new(), false), "addToCart").summary;
+        let summary = rank_collection(
+            collection(Vec::new(), false),
+            "addToCart",
+            RecencyTiebreak::NewestFirst,
+        )
+        .summary;
         let text = format_ranked_page(&[many], &summary, Path::new("/nonexistent"));
         assert!(
             text.starts_with(
@@ -826,6 +864,7 @@ mod tests {
                 true,
             ),
             "x",
+            RecencyTiebreak::NewestFirst,
         );
         assert!(capped.summary.truncated && capped.summary.engine_capped);
 
@@ -845,6 +884,7 @@ mod tests {
                 false,
             ),
             "load",
+            RecencyTiebreak::NewestFirst,
         );
         assert!(!complete.summary.truncated && !complete.summary.engine_capped);
         assert_eq!(complete.summary.total_matches, 40);
