@@ -123,6 +123,7 @@ struct FileAnalysis {
     cfg_test_ranges: Vec<RustCfgTestRange>,
     cfg_test_module_files: Vec<String>,
     globs_parent_module: bool,
+    trait_impl_methods: Vec<String>,
     type_ref_names: BTreeSet<String>,
 }
 
@@ -287,6 +288,13 @@ impl DeadCodeFileAnalyzer {
             && tree
                 .as_ref()
                 .is_some_and(|tree| rust_globs_parent_module(&source, tree.root_node()));
+        let trait_impl_methods = if lang == LangId::Rust {
+            tree.as_ref()
+                .map(|tree| rust_trait_impl_methods(&source, tree.root_node()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         FileAnalysis {
             raw_imports,
@@ -297,6 +305,7 @@ impl DeadCodeFileAnalyzer {
             cfg_test_ranges,
             cfg_test_module_files,
             globs_parent_module,
+            trait_impl_methods,
             type_ref_names,
         }
     }
@@ -508,6 +517,7 @@ fn gather_file_contribution(
         cfg_test_ranges,
         cfg_test_module_files,
         globs_parent_module,
+        trait_impl_methods,
         type_ref_names,
     } = file_analyzer.analyze_file(file, &file_name, oxc_facts.is_some());
 
@@ -554,6 +564,9 @@ fn gather_file_contribution(
     }
     if globs_parent_module {
         payload["globs_parent_module"] = json!(true);
+    }
+    if !trait_impl_methods.is_empty() {
+        payload["trait_impl_methods"] = json!(trait_impl_methods);
     }
     if let Some(facts) = oxc_facts {
         payload["provenance"] = json!(OXC_PROVENANCE);
@@ -1421,6 +1434,7 @@ fn materialize_dead_code_contributions(
             if let Some(snapshot_roots) = attribute_roots_from_snapshot.get(&contribution.file) {
                 attribute_entry_points.extend(snapshot_roots.iter().cloned());
             }
+            attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
             let liveness_roots = liveness_roots_for_file(
                 &contribution.file,
                 &exports,
@@ -1578,6 +1592,8 @@ fn aggregate_materialized_dead_code_contributions(
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> serde_json::Value {
     let test_only_callers = test_only_callers_by_target(facts);
+    let test_reachable = test_reachable_nodes(facts);
+    let caller_files = std::cell::OnceCell::new();
     let referenced_type_names = collect_referenced_type_names(facts);
     let test_module_files = cfg_test_module_files(facts);
 
@@ -1677,15 +1693,25 @@ fn aggregate_materialized_dead_code_contributions(
                     && !is_public_api_file
                     && !export.is_entry_point
                     && !production_reachable.contains(&node)
-                    && test_only_callers.contains_key(&node)
+                    && (test_only_callers.contains_key(&node) || test_reachable.contains(&node))
                 {
+                    // A symbol reached only through other test-only code (a
+                    // production-file helper that only tests call) is test
+                    // usage too; name its direct callers' files.
+                    let used_by = test_only_callers.get(&node).cloned().unwrap_or_else(|| {
+                        caller_files
+                            .get_or_init(|| caller_files_by_target(facts))
+                            .get(&node)
+                            .map(|files| files.iter().cloned().collect())
+                            .unwrap_or_default()
+                    });
                     let mut item = json!({
                         "file": contribution.file,
                         "symbol": export.symbol,
                         "kind": export.kind,
                         "line": export.line,
                         "provenance": CALLGRAPH_PROVENANCE_TREESITTER,
-                        "used_by": test_only_callers.get(&node).cloned().unwrap_or_default(),
+                        "used_by": used_by,
                     });
                     add_other_definition_lines(&mut item, &other_lines);
                     if generated_file {
@@ -1923,6 +1949,46 @@ fn edges_by_source(
     }
 
     edges
+}
+
+/// Nodes reachable from test code: the targets of test-origin calls and every
+/// node they reach in turn. A node in this set that production code never
+/// reaches is used only by tests, even when its direct caller lives in a
+/// production file (a helper that only tests call).
+fn test_reachable_nodes(contributions: &[DeadCodeContribution]) -> BTreeSet<ExportNode> {
+    let edges = edges_by_source(contributions, false);
+    let mut frontier = contributions
+        .iter()
+        .flat_map(|contribution| contribution.internal_calls.iter())
+        .filter(|call| call.test_origin == Some(true))
+        .map(|call| (call.file.clone(), call.symbol.clone()))
+        .collect::<Vec<_>>();
+    let mut reached = BTreeSet::new();
+    while let Some(node) = frontier.pop() {
+        if let Some(targets) = edges.get(&node) {
+            if !reached.contains(&node) {
+                frontier.extend(targets.iter().cloned());
+            }
+        }
+        reached.insert(node);
+    }
+    reached
+}
+
+/// For every call target, the files whose code calls it directly.
+fn caller_files_by_target(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<ExportNode, BTreeSet<String>> {
+    let mut callers: BTreeMap<ExportNode, BTreeSet<String>> = BTreeMap::new();
+    for contribution in contributions {
+        for call in &contribution.internal_calls {
+            callers
+                .entry((call.file.clone(), call.symbol.clone()))
+                .or_default()
+                .insert(contribution.file.clone());
+        }
+    }
+    callers
 }
 
 fn test_only_callers_by_target(
@@ -2466,6 +2532,31 @@ fn rust_globs_parent_module(source: &str, root: tree_sitter::Node) -> bool {
                 .ends_with("usesuper::*;")
     });
     globs
+}
+
+/// Names of the methods defined inside `impl Trait for Type` blocks anywhere
+/// in the file (including inline modules).
+fn rust_trait_impl_methods(source: &str, root: tree_sitter::Node) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "impl_item" && node.child_by_field_name("trait").is_some() {
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for item in body.children(&mut cursor) {
+                    if item.kind() == "function_item" {
+                        if let Some(name) = item.child_by_field_name("name") {
+                            names.insert(node_text(source, name).to_string());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    names.into_iter().collect()
 }
 
 /// Files that can declare the module `file` belongs to. `x/y/z.rs` is module
@@ -4730,6 +4821,12 @@ struct DeadCodeContribution {
     /// module's imports are in scope for path resolution.
     #[serde(default)]
     globs_parent_module: bool,
+    /// Names of methods defined in `impl Trait for Type` blocks. Rust code
+    /// calls them through the trait (`Default::default()`, `.parse()`,
+    /// formatting, drop glue), which the callgraph rarely sees, so they are
+    /// liveness roots: what they call is used whenever the trait is.
+    #[serde(default)]
+    trait_impl_methods: Vec<String>,
     #[serde(default)]
     oxc_facts: Option<OxcFactsContribution>,
     #[serde(default)]
@@ -6699,6 +6796,99 @@ pub fn false_helper() -> String { "dead".to_string() }
         assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
         assert!(
             aggregate_test_only_item(&aggregate, "src/store.rs", "only_tests").is_some(),
+            "{aggregate:#}"
+        );
+    }
+
+    /// Trait-impl methods run through the trait (`Default::default()`,
+    /// `.parse()`, formatting), which the callgraph does not see, so what
+    /// they call must stay live.
+    #[test]
+    fn calls_inside_trait_impl_methods_keep_targets_live() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod slot;\nfn main() {}\n"),
+            (
+                "src/slot.rs",
+                "pub struct Slot;\nimpl Slot {\n    pub fn with_constructor() -> Self { Slot }\n    pub fn planted_dead() {}\n}\nimpl Default for Slot {\n    fn default() -> Self {\n        Self::with_constructor()\n    }\n}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/slot.rs", "with_constructor", "method"),
+            export(&root, "src/slot.rs", "planted_dead", "method"),
+        ];
+        let calls = vec![outbound(
+            &root,
+            "src/slot.rs",
+            "default",
+            &resolved_target(&root, "src/slot.rs", "with_constructor"),
+        )];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/slot.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A production-file helper that only tests call is test-only usage, and so
+    /// is everything only that helper calls.
+    #[test]
+    fn symbols_reached_only_through_test_only_code_are_test_only() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod calls;\nfn main() {}\n"),
+            (
+                "src/calls.rs",
+                "pub fn extract_in_range() { walk(); }\npub fn walk() {}\npub fn planted_dead() {}\n",
+            ),
+            (
+                "tests/calls_test.rs",
+                "#[test]\nfn extracts() { demo::calls::extract_in_range(); }\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/calls.rs", "extract_in_range", "function"),
+            export(&root, "src/calls.rs", "walk", "function"),
+            export(&root, "src/calls.rs", "planted_dead", "function"),
+        ];
+        let calls = vec![
+            outbound(
+                &root,
+                "tests/calls_test.rs",
+                "extracts",
+                &resolved_target(&root, "src/calls.rs", "extract_in_range"),
+            ),
+            outbound(
+                &root,
+                "src/calls.rs",
+                "extract_in_range",
+                &resolved_target(&root, "src/calls.rs", "walk"),
+            ),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/calls.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+        let walk = aggregate_test_only_item(&aggregate, "src/calls.rs", "walk")
+            .unwrap_or_else(|| panic!("walk is reached only from tests: {aggregate:#}"));
+        assert_eq!(walk["used_by"], json!(["src/calls.rs"]), "{walk:#}");
+        assert!(
+            aggregate_test_only_item(&aggregate, "src/calls.rs", "extract_in_range").is_some(),
             "{aggregate:#}"
         );
     }

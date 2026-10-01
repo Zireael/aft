@@ -12399,9 +12399,7 @@ fn rust_target_for_use<I: ResolverIndex>(
         let prefix = &path[..brace_start];
         if import.names.iter().any(|name| name == short_name) {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
-            let module_segments =
-                rust_resolve_segments_with_index(index, caller_file, &prefix_segments)?;
-            let file = rust_file_for_segments(index, caller_file, &module_segments)?;
+            let file = rust_use_module_file(index, caller_file, &prefix_segments)?;
             // The module may only re-export the item (`pub use inner::{f};`);
             // follow that to the definition, as qualified paths already do.
             return Some(rust_resolve_reexport_if_symbol_missing(
@@ -12425,14 +12423,32 @@ fn rust_target_for_use<I: ResolverIndex>(
     if segments.len() < 2 {
         return None;
     }
-    let module_segments =
-        rust_resolve_segments_with_index(index, caller_file, &segments[..segments.len() - 1])?;
-    let file = rust_file_for_segments(index, caller_file, &module_segments)?;
+    let file = rust_use_module_file(index, caller_file, &segments[..segments.len() - 1])?;
     Some(rust_resolve_reexport_if_symbol_missing(
         index,
         file,
         segments.last().unwrap_or(&short_name).to_string(),
     ))
+}
+
+/// The file of the module a `use` path names. A path may start with another
+/// workspace crate (`use aft::callgraph_store::{..}` in an integration test or
+/// a binary), which is checked first, as qualified call paths do.
+fn rust_use_module_file<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    module_segments: &[&str],
+) -> Option<String> {
+    if !matches!(
+        module_segments.first().copied(),
+        Some("crate" | "self" | "super") | None
+    ) {
+        if let Some(file) = rust_workspace_file_for_segments(index, module_segments) {
+            return Some(file);
+        }
+    }
+    let resolved = rust_resolve_segments_with_index(index, caller_file, module_segments)?;
+    rust_file_for_segments(index, caller_file, &resolved)
 }
 
 fn rust_workspace_file_for_segments<I: ResolverIndex>(
@@ -22825,11 +22841,12 @@ edition = "2021"
             "src/lib.rs",
             "pub mod alerts;\npub mod cache;\npub mod net;\n",
         );
-        // The binary reaches the library through the crate name.
+        // The binary reaches the library through the crate name, both as a
+        // qualified call and through a `use` list.
         write_file(
             root,
             "src/main.rs",
-            "fn main() {\n    path_forms_fixture::net::start();\n}\n",
+            "use path_forms_fixture::alerts::{normalize};\n\nfn main() {\n    path_forms_fixture::net::start();\n    normalize(\"x\");\n}\n",
         );
         // `registry::` names a child module of `net`; `cache::` is bound by
         // the `self` entry of a use list.
@@ -22902,6 +22919,7 @@ mod tests {
             "src/alerts.rs",
             "build",
         );
+        assert_direct_caller(&store, "src/alerts.rs", "normalize", "src/main.rs", "main");
     }
 
     #[test]
