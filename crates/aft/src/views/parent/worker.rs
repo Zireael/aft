@@ -591,7 +591,6 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     {
         return;
     }
-    child.loads.fetch_add(1, Ordering::SeqCst);
     match super::super::read::open_published_callgraph(
         child.root.clone(),
         child.family().to_owned(),
@@ -600,13 +599,17 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
         Some(pin),
     ) {
         Ok(opened) => {
+            child.loads.fetch_add(1, Ordering::SeqCst);
             *write(&child.callgraph) = Plane::Ready(Arc::new(CallgraphChild {
                 store: Arc::new(opened),
                 generation,
             }));
         }
         Err(error) => {
-            *write(&child.callgraph) = Plane::Gap(format!("call graph view unreadable: {error}"));
+            *write(&child.callgraph) = Plane::Gap(match error {
+                crate::callgraph_store::CallGraphStoreError::Unavailable(reason) => reason,
+                other => format!("call graph view unreadable: {other}"),
+            });
         }
     }
 }

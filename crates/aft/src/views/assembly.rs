@@ -1153,6 +1153,16 @@ fn publication_delay_for_test() {
     }
 }
 
+/// True when `manifest` was published with the call graph off: some source
+/// file has a callgraph language but no callgraph key. Such a generation's
+/// derived database holds no call graph at all, so a reader must report the
+/// call graph unavailable rather than answer from it.
+pub fn manifest_lacks_callgraph(manifest: &super::Manifest) -> bool {
+    manifest
+        .entries()
+        .any(|(path, entry)| lacks_callgraph_key(entry, path.as_bytes()))
+}
+
 /// True when `entry` is a source file published while the call graph was off:
 /// it has a callgraph language but no callgraph key.
 fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {

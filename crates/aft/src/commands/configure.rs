@@ -7130,7 +7130,16 @@ fn open_view_runtime_for_configure(
         .as_deref()
         .is_some_and(|value| value.ends_with(&desired_head))
         && previous_paths == head_paths;
-    let pending_paths = if generation_matches_head {
+    // A generation published while the call graph was off has no call graph.
+    // Once the call graph is on, every path is republished so the graph is
+    // built, instead of the call graph staying unavailable indefinitely.
+    let callgraph_missing = ctx.config().indexes.callgraph
+        && manifest
+            .as_ref()
+            .is_some_and(crate::views::assembly::manifest_lacks_callgraph);
+    let pending_paths = if callgraph_missing {
+        head_paths.clone()
+    } else if generation_matches_head {
         BTreeSet::new()
     } else {
         head_entries

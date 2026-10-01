@@ -1358,6 +1358,167 @@ fn standalone_view_publication_never_blocks_requests() {
     assert!(aft.shutdown().success());
 }
 
+/// A view generation published with the call graph off holds no call graph.
+/// Every reader of a view's call graph reports it unavailable, by name, never
+/// as zero callers: here the call graph tools (and zoom's call graph field)
+/// in a standalone process whose current generation was published with the
+/// call graph off, while the republish that builds the graph is still
+/// running. Once that republish lands, the same query answers.
+#[test]
+fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("repo");
+    let storage = base.join("storage");
+    init_repo(
+        &root,
+        &[(
+            "src/lib.rs",
+            "pub fn target() -> u32 {\n    1\n}\n\npub fn caller() -> u32 {\n    target()\n}\n"
+                .to_string(),
+        )],
+    );
+    publish_without_callgraph(&root, &storage);
+    let mut aft = crate::helpers::AftProcess::spawn_with_env(&[(
+        "AFT_TEST_VIEW_PUBLICATION_DELAY_MS",
+        std::ffi::OsStr::new("8000"),
+    )]);
+    let with_graph = Planes {
+        trigram: true,
+        callgraph: true,
+        semantic: false,
+    };
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "storage_dir": storage,
+            "config": crate::helpers::user_config(config_doc(true, with_graph, None)),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:#}");
+    // Let the deferred configure maintenance reach its view stage, which
+    // pins the current (keyless) generation; one unit runs per request.
+    for _ in 0..40 {
+        aft.send(&json!({"id": "ping", "command": "ping"}).to_string());
+        thread::sleep(Duration::from_millis(20));
+    }
+    let callers = json!({
+        "id": "callers",
+        "command": "callers",
+        "file": root.join("src/lib.rs"),
+        "symbol": "target",
+    })
+    .to_string();
+    let answer = aft.send(&callers);
+    assert_eq!(answer["success"], false, "{answer:#}");
+    assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap()
+            .contains("call graph is disabled (indexes.callgraph=false)"),
+        "{answer:#}"
+    );
+    let zoom = aft.send(
+        &json!({
+            "id": "zoom",
+            "command": "zoom",
+            "file": root.join("src/lib.rs"),
+            "symbol": "target",
+            "callgraph": true,
+        })
+        .to_string(),
+    );
+    // Zoom's own call lists come from the file's syntax tree; its call graph
+    // field must say the index is not serving, not present an empty graph.
+    assert_eq!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
+    // The republish started at bind builds the graph; then callers answers.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let answer = aft.send(&callers);
+        if answer["success"] == true {
+            assert!(answer.to_string().contains("caller"), "{answer:#}");
+            break;
+        }
+        assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
+        assert!(
+            Instant::now() < deadline,
+            "the call graph was never published"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(aft.shutdown().success());
+}
+
+/// Publishes `root`'s current view generation with the call graph off, as a
+/// views-on session with `callgraph_store: false` does.
+fn publish_without_callgraph(root: &Path, storage: &Path) {
+    let head = aft::alias::head_tree_entries(root).unwrap();
+    let report = aft::views::assembly::publish_checkout(&aft::views::assembly::AssemblyRequest {
+        storage: storage.to_path_buf(),
+        project_root: root.to_path_buf(),
+        family: aft::search_index::artifact_cache_key(root),
+        scope: aft::path_identity::project_scope_key(root),
+        desired_head: aft::views::assembly::head_tree_fingerprint(&head),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: false,
+    })
+    .unwrap();
+    assert!(report.published);
+    assert!(aft::views::assembly::manifest_lacks_callgraph(
+        report.manifest.as_ref().unwrap()
+    ));
+}
+
+/// A parent folder names a child whose view was published with the call
+/// graph off as unavailable for the call graph, never as having no callers.
+#[test]
+fn parent_names_a_child_view_without_callgraph_as_disabled() {
+    fast_refresh();
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    let child = root.join("child");
+    init_repo(&child, &[("src/lib.rs", "pub fn alone() {}\n".to_string())]);
+    publish_without_callgraph(&child, &storage);
+    let with_graph = Planes {
+        trigram: true,
+        callgraph: true,
+        semantic: false,
+    };
+    let parent = configure(&root, &storage, config_doc(true, with_graph, None));
+    parent_session(&parent);
+    let answer = aft::views::parent::route(
+        &request(json!({
+            "id": "parent-callers",
+            "command": "callers",
+            "file": "child/src/lib.rs",
+            "symbol": "alone",
+        })),
+        &parent,
+    )
+    .unwrap();
+    assert!(!answer.success, "{:#}", answer.data);
+    assert_eq!(answer.data["complete"], false);
+    assert_eq!(answer.data["gaps"][0]["path"], "child");
+    assert!(
+        answer.data["gaps"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("call graph is disabled (indexes.callgraph=false)"),
+        "{:#}",
+        answer.data
+    );
+}
+
 /// Views stay off by default; with views off a parent folder keeps today's
 /// behaviour and no parent session starts.
 #[test]

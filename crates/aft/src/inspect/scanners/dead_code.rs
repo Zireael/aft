@@ -315,7 +315,7 @@ fn run_dead_code_scan_with_oxc_started(
         let success = InspectScanSuccess {
             scanned_files: job.scope_files.clone(),
             contributions: Vec::new(),
-            aggregate: callgraph_unavailable_aggregate(job.scope_files.len()),
+            aggregate: callgraph_unavailable_aggregate_for_job(job),
         };
         return InspectResult::success(job, success, started.elapsed());
     };
@@ -616,6 +616,31 @@ fn oxc_skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) 
 
 pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
     callgraph_unavailable_aggregate_with_reason(scanned_files, None)
+}
+
+/// The unavailable aggregate for `job`, naming the cause when the call graph
+/// was never built: the index is off, or (with views on) the current view
+/// generation was published while it was off. Either way dead code is not
+/// determined, so no count is reported.
+pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde_json::Value {
+    let mut aggregate = callgraph_unavailable_aggregate(job.scope_files.len());
+    let disabled = if !job.config.indexes.callgraph {
+        Some("call graph is disabled (indexes.callgraph=false)")
+    } else if job.config.views.enabled
+        && crate::views::read::current_generation_lacks_callgraph(
+            &crate::bash_background::storage_dir(job.config.storage_dir.as_deref()),
+            &job.project_root,
+        )
+    {
+        Some(crate::views::read::CALLGRAPH_DISABLED)
+    } else {
+        None
+    };
+    if let Some(reason) = disabled {
+        aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_disabled"]);
+        aggregate["callgraph_unavailable_reason"] = json!(reason);
+    }
+    aggregate
 }
 
 /// Report a terminal callgraph capability gap without inventing a dead-code

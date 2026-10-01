@@ -279,3 +279,35 @@ fn views_profile_navigation_reads_on_drill_artifacts() {
     }
     assert_eq!(rows[0], rows[1]);
 }
+
+#[test]
+fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
+    let (_project, _storage, job, mut request) = view_projection_fixture();
+    // The current generation was published while the call graph was off.
+    request.callgraph = false;
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    // Both with and without paths to verify against the generation: the
+    // path check alone already rejects a keyless entry, so the projection
+    // with no refresh paths is the one the generation-wide guard protects.
+    for refresh_paths in [&job.scope_files[..], &[]] {
+        assert!(
+            build_tier2_callgraph_snapshot_with_refresh(&job, true, refresh_paths).is_none(),
+            "a generation without call graph data must not project an empty graph"
+        );
+    }
+    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&job);
+    assert_eq!(aggregate["callgraph_available"], false);
+    assert_eq!(
+        aggregate["callgraph_unavailable_reason"],
+        crate::views::read::CALLGRAPH_DISABLED
+    );
+    assert_eq!(aggregate["notes"][1], "callgraph_disabled");
+    // With the index off, the same named reason, from the configuration.
+    let mut off = job.clone();
+    Arc::make_mut(&mut off.config).indexes.callgraph = false;
+    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&off);
+    assert_eq!(
+        aggregate["callgraph_unavailable_reason"],
+        "call graph is disabled (indexes.callgraph=false)"
+    );
+}

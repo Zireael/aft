@@ -4591,7 +4591,7 @@ fn roll_up_dead_code_contributions(
     drill_down_limit: Option<usize>,
 ) -> Value {
     let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
-        return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
+        return super::scanners::dead_code::callgraph_unavailable_aggregate_for_job(job);
     };
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);

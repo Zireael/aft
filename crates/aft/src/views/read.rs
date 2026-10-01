@@ -6,9 +6,19 @@ use std::sync::Arc;
 use crate::callgraph_store::{ReadonlyCallGraphStore, Result};
 use crate::pins::QueryPin;
 
+/// Why a view generation published with the call graph off is not served.
+pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.callgraph=false): this view generation was published without call graph data";
+
 /// Open exactly the selected generation. The caller decides whether its snapshot
 /// is acceptable; opening a reader must never replace a pinned generation with a
 /// newer pointer or silently fall back to the mutable legacy store.
+///
+/// A generation published with the call graph off has an empty derived
+/// database; serving it would answer "no callers" and "no dead code" for a
+/// graph that was never built. Every reader of a view's call graph opens it
+/// here, so it is refused here, as unavailable with [`CALLGRAPH_DISABLED`].
+/// A manifest that cannot be read is refused too, rather than assumed to
+/// carry a call graph.
 pub(crate) fn open_published_callgraph(
     project_root: PathBuf,
     family: String,
@@ -16,7 +26,67 @@ pub(crate) fn open_published_callgraph(
     generation: &str,
     pin: Option<Arc<QueryPin>>,
 ) -> Result<ReadonlyCallGraphStore> {
+    if !generation_has_callgraph(&view_dir, generation)? {
+        return Err(crate::callgraph_store::CallGraphStoreError::Unavailable(
+            CALLGRAPH_DISABLED.to_string(),
+        ));
+    }
     ReadonlyCallGraphStore::open_manifest_view(project_root, family, view_dir, generation, pin)
+}
+
+/// True when the checkout's current view generation (the v1 view under
+/// `<storage>/views/<scope>`) exists and was published without call graph
+/// data. Read-only: nothing is created when the view is absent.
+pub(crate) fn current_generation_lacks_callgraph(
+    storage: &std::path::Path,
+    root: &std::path::Path,
+) -> bool {
+    let view_dir = storage
+        .join("views")
+        .join(crate::path_identity::project_scope_key(root));
+    let Some(store) = super::ViewStore::existing_dir(view_dir.clone()) else {
+        return false;
+    };
+    let Ok(Some(generation)) = store.current_generation_read_only() else {
+        return false;
+    };
+    matches!(generation_has_callgraph(&view_dir, &generation), Ok(false))
+}
+
+/// Whether `generation` was published with call graph data. Generations are
+/// immutable, so the answer is cached per view directory and generation; the
+/// manifest is read once, not on every call graph query.
+fn generation_has_callgraph(view_dir: &std::path::Path, generation: &str) -> Result<bool> {
+    type Cache = std::collections::HashMap<(PathBuf, String), bool>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (view_dir.to_path_buf(), generation.to_owned());
+    if let Some(known) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(*known);
+    }
+    let unavailable = |reason: String| {
+        crate::callgraph_store::CallGraphStoreError::Unavailable(format!(
+            "view generation {generation} manifest unreadable: {reason}"
+        ))
+    };
+    let store = super::ViewStore::existing_dir(view_dir.to_path_buf())
+        .ok_or_else(|| unavailable("view pointer missing".into()))?;
+    let manifest = store
+        .load_manifest(generation)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let has = !super::assembly::manifest_lacks_callgraph(&manifest);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
+    cache.insert(key, has);
+    Ok(has)
 }
 
 /// Watcher edits do not change HEAD. Refuse to project an older published plane
