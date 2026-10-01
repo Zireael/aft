@@ -377,7 +377,10 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(Math.abs(reported - realElapsed)).toBeLessThan(500);
     expect(waited?.elapsed_ms).toBe(reported);
     expect(text).toContain("timeout reached without match");
-    expect(text).toContain("timeoutMs up to 120000");
+    // A delegated worker that passed its own timeout is told that leaving it
+    // out waits until the command finishes; it is no longer pointed at the cap.
+    expect(text).toContain("a bash_watch without timeoutMs waits until the command finishes");
+    expect(text).not.toContain("timeoutMs up to");
   }, 30_000);
 
   skipOnWindows("workdir is respected", async () => {

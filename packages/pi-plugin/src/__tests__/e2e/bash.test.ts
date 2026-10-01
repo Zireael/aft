@@ -421,12 +421,12 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     // Header: status line for the task. Don't anchor on exact format because
     // duration may or may not be present depending on timing on the runner.
     expect(status.output).toContain(`Task ${taskId}: running`);
-    // Anti-polling reminder must be appended for running tasks (parity with
-    // the OpenCode plugin). Same wording so agent behavior is consistent
-    // across both harnesses.
-    expect(status.output).toContain(
-      "A completion reminder will be delivered automatically; don't poll.",
-    );
+    // Anti-polling reminder must be appended for running tasks. The e2e
+    // harness runs headless (hasUI false), which Pi classifies as a worker
+    // session: a worker is never woken by a completion reminder, so it is told
+    // to wait with bash_watch instead.
+    expect(status.output).toContain("To wait for it, call bash_watch; don't poll.");
+    expect(status.output).not.toContain("completion reminder");
     expect(status.details.success).toBe(true);
     expect(status.details.status).toBe("running");
   });
