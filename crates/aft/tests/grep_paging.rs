@@ -200,8 +200,13 @@ fn grep_long_line_is_cut_and_marked() {
     let printed = format!("1: {}{}", &long_line[..LINE_CHARS], LINE_MARKER);
     assert!(text.contains(&format!("{printed}\n")), "text:\n{text}");
     assert!(text.contains("2: needle short"));
-    // The JSON keeps the full line; only the printed row is cut.
-    assert_eq!(data["matches"][0]["line_text"], long_line);
+    // The JSON carries the same cut as the printed row. Keeping a whole
+    // multi-megabyte minified line per match is what made grep quadratic on
+    // such files, and every renderer prints at most this prefix anyway.
+    assert_eq!(
+        data["matches"][0]["line_text"],
+        format!("{}{}", &long_line[..LINE_CHARS], LINE_MARKER)
+    );
 }
 
 #[test]
