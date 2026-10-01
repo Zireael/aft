@@ -292,18 +292,19 @@ describe("Pi bash wait:true caller role", () => {
 
   test("a primary's wait:true without a timeout keeps the 30-minute budget", async () => {
     const [params, options] = await waitCall({ wait: true }, true);
-    expect(params.worker_session).toBe(false);
+    expect(params).not.toHaveProperty("worker_session");
     expect(options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
   });
 
-  test("a worker's background launch does not promise a completion reminder", async () => {
-    const tool = registeredTool("bash", () => ({
-      success: true,
-      status: "running",
-      task_id: "bash-bg",
-      output:
-        "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
-    }));
+  test("a worker's requests carry its role and the engine's hand-off text is shown as is", async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    // The engine words the hand-off for the worker it was told about.
+    const handOff =
+      "Background task started: bash-bg. It won't wake you when it finishes, so wait for it before you report a result.";
+    const tool = registeredTool("bash", (_command, params) => {
+      sent.push(params);
+      return { success: true, status: "running", task_id: "bash-bg", output: handOff };
+    });
     const result = (await tool.execute(
       "call",
       { command: "sleep 30", background: true },
@@ -311,9 +312,47 @@ describe("Pi bash wait:true caller role", () => {
       undefined,
       { cwd: process.cwd(), hasUI: false },
     )) as ToolResult;
-    const text = result.content[0].text;
-    expect(text).toContain("Background task started: bash-bg.");
-    expect(text).toContain("call bash_watch without a timeout");
-    expect(text).not.toContain("completion reminder");
+    expect(sent[0]?.worker_session).toBe(true);
+    expect(result.content[0].text).toBe(handOff);
+  });
+
+  test("a worker's bash_watch status polls carry its role too", async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const tool = registeredTool("bash_watch", (_command, params) => {
+      sent.push(params);
+      return { success: true, status: "completed", exit_code: 0 };
+    });
+    await watch(tool, { task_id: "bash-role" }, false);
+    expect(sent.every((params) => params.worker_session === true)).toBe(true);
+    await watch(tool, { task_id: "bash-role" }, true);
+    expect(sent.at(-1)).not.toHaveProperty("worker_session");
+  });
+});
+
+describe("Pi tool_call caller role", () => {
+  test("a worker's tool_call carries its role in the envelope; a primary's does not", async () => {
+    const { callToolCall } = await import("../tools/_shared.js");
+    const options: Array<Record<string, unknown> | undefined> = [];
+    const bridge = {
+      toolCall: async (
+        _sessionId: string | undefined,
+        _name: string,
+        _args: Record<string, unknown>,
+        sent?: Record<string, unknown>,
+      ) => {
+        options.push(sent);
+        return { success: true, text: "ok" };
+      },
+    } as unknown as Parameters<typeof callToolCall>[0];
+    await callToolCall(bridge, "read", { filePath: "a.ts" }, {
+      cwd: process.cwd(),
+      hasUI: false,
+    } as never);
+    await callToolCall(bridge, "read", { filePath: "a.ts" }, {
+      cwd: process.cwd(),
+      hasUI: true,
+    } as never);
+    expect(options[0]?.workerSession).toBe(true);
+    expect(options[1]).not.toHaveProperty("workerSession");
   });
 });

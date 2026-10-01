@@ -363,6 +363,41 @@ describe("SubcTransport.toolCall", () => {
     });
   });
 
+  // A delegated worker's role rides beside the call, never inside the agent's
+  // arguments: AFT words its replies by it and lifts the default hard kill on
+  // a worker's wait:true bash, so an agent must not be able to set it.
+  test("the worker role is placed at the top level of a tool call body", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+
+    await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("s", "bash", { command: "make" }, { workerSession: true });
+
+    expect(client.requests[0]?.body).toEqual({
+      name: "bash",
+      arguments: { command: "make" },
+      worker_session: true,
+    });
+  });
+
+  test("the worker role moves out of a native command's arguments into the body", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+
+    await pool.getBridge(TEST_PROJECT_ROOT).send("bash", {
+      session_id: "sess",
+      command: "make",
+      worker_session: true,
+    });
+
+    expect(client.requests[0]?.body).toEqual({
+      name: "bash",
+      arguments: { session_id: "sess", command: "make" },
+      worker_session: true,
+    });
+  });
+
   test("transportTimeoutMs (wait-aware bash budget) reaches the wire request deadline", async () => {
     const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "ok" }));
     const { pool } = poolWith(client);

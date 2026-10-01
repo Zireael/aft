@@ -52,12 +52,17 @@ pub fn format_seconds(ms: u64) -> String {
     format!("{seconds}s")
 }
 
-/// The plugins remove this completion-reminder sentence, and the ones in
-/// `format_background_launch`, from replies to delegated workers, which are
-/// never woken by a reminder (`withoutCompletionReminderPromise` in
-/// `packages/aft-bridge/src/bash-hints.ts` matches the exact wording, so a
-/// change here must be made there too).
-fn format_background_handoff_tail(task_id: &str) -> String {
+/// What happens to a task once it runs in the background, worded for the
+/// caller's role. A primary session is woken by a completion reminder when the
+/// task finishes. A delegated worker (`worker_session`) never is: once its
+/// turn ends it has delivered its result, so it is told to wait for the task
+/// instead of being promised a reminder that would never reach it.
+fn format_background_handoff_tail(task_id: &str, worker_session: bool) -> String {
+    if worker_session {
+        return format!(
+            "{task_id}. It won't wake you when it finishes, so wait for it before you report a result; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+        );
+    }
     format!(
         "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
     )
@@ -68,6 +73,7 @@ pub fn format_promotion_message(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
 ) -> String {
     let waited = timeout
         .map(|timeout| timeout.min(wait_window_ms))
@@ -75,29 +81,40 @@ pub fn format_promotion_message(
     format!(
         "Foreground bash didn't finish within {} and was promoted to background: {}",
         format_seconds(waited),
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
-pub fn format_wait_detach_message(task_id: &str) -> String {
+pub fn format_wait_detach_message(task_id: &str, worker_session: bool) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because a user message arrived.",
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
-pub fn format_module_drain_detach_message(task_id: &str) -> String {
+pub fn format_module_drain_detach_message(task_id: &str, worker_session: bool) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatBackgroundLaunch` (lines 593-601).
-pub fn format_background_launch(task_id: &str, pty: bool) -> String {
+/// Worded per role like [`format_background_handoff_tail`].
+pub fn format_background_launch(task_id: &str, pty: bool, worker_session: bool) -> String {
     if pty {
+        let tail = if worker_session {
+            "It won't wake you when it exits."
+        } else {
+            "A completion reminder fires automatically when the task exits."
+        };
         return format!(
-            "PTY task started: {task_id}. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, bash_write({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. A completion reminder fires automatically when the task exits."
+            "PTY task started: {task_id}. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, bash_write({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. {tail}"
+        );
+    }
+    if worker_session {
+        return format!(
+            "Background task started: {task_id}. It won't wake you when it finishes, so wait for it before you report a result."
         );
     }
     format!(
@@ -132,6 +149,7 @@ pub fn raw_bash_repeat(req: &RawRequest) -> RawBashRepeat {
         &req.command,
         arguments,
         false,
+        req.worker_session(),
     ))
 }
 
@@ -205,6 +223,7 @@ pub fn build_bash_outcome(
     }
 
     let params = parse_params(req).unwrap_or_default();
+    let worker_session = req.worker_session();
     let Some(task_id) = spawn_response
         .data
         .get("task_id")
@@ -224,7 +243,12 @@ pub fn build_bash_outcome(
         .unwrap_or("pipes");
     let is_pty = mode == "pty" || params.pty;
     if is_pty || params.background {
-        return DispatchOutcome::Immediate(background_launch_response(&req.id, &task_id, is_pty));
+        return DispatchOutcome::Immediate(background_launch_response(
+            &req.id,
+            &task_id,
+            is_pty,
+            worker_session,
+        ));
     }
 
     let request_id = req.id.clone();
@@ -275,6 +299,7 @@ pub fn build_bash_outcome(
                     &task_id_for_poll,
                     &session_id_for_poll,
                     &request_id_for_poll,
+                    worker_session,
                 ))
             } else {
                 match decide_bash_step(
@@ -292,6 +317,7 @@ pub fn build_bash_outcome(
                         timeout,
                         wait_window_ms,
                         &request_id_for_poll,
+                        worker_session,
                     )),
                     BashStep::Wait => None,
                 }
@@ -383,9 +409,10 @@ pub(crate) fn promote_bash(
     timeout: Option<u64>,
     wait_window_ms: u64,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
+        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms, worker_session),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -400,9 +427,10 @@ pub(crate) fn detach_wait_mode_bash(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => wait_detach_response(request_id, task_id),
+        Ok(_) => wait_detach_response(request_id, task_id, worker_session),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -420,6 +448,7 @@ pub(crate) fn detach_bash_for_module_drain(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
@@ -436,7 +465,7 @@ pub(crate) fn detach_bash_for_module_drain(
             Response::success(
                 request_id,
                 json!({
-                    "output": format!("{}\nOutput: {}", format_module_drain_detach_message(task_id), output_path.unwrap_or("unavailable")),
+                    "output": format!("{}\nOutput: {}", format_module_drain_detach_message(task_id, worker_session), output_path.unwrap_or("unavailable")),
                     "task_id": task_id,
                     "status": "running",
                     "output_path": output_path,
@@ -514,11 +543,16 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     Response::success(request_id, data)
 }
 
-fn background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+fn background_launch_response(
+    request_id: &str,
+    task_id: &str,
+    is_pty: bool,
+    worker_session: bool,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_background_launch(task_id, is_pty),
+            "output": format_background_launch(task_id, is_pty, worker_session),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -531,22 +565,23 @@ fn promotion_response(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_promotion_message(task_id, timeout, wait_window_ms),
+            "output": format_promotion_message(task_id, timeout, wait_window_ms, worker_session),
             "task_id": task_id,
             "status": "running",
         }),
     )
 }
 
-fn wait_detach_response(request_id: &str, task_id: &str) -> Response {
+fn wait_detach_response(request_id: &str, task_id: &str, worker_session: bool) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_wait_detach_message(task_id),
+            "output": format_wait_detach_message(task_id, worker_session),
             "task_id": task_id,
             "status": "running",
         }),
@@ -776,7 +811,7 @@ mod tests {
     #[test]
     fn promotion_message_matches_opencode_copy() {
         assert_eq!(
-            format_promotion_message("bash-123", Some(5_500), 8_000),
+            format_promotion_message("bash-123", Some(5_500), 8_000, false),
             "Foreground bash didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate."
         );
     }
@@ -784,7 +819,7 @@ mod tests {
     #[test]
     fn wait_detach_message_mentions_user_message() {
         assert_eq!(
-            format_wait_detach_message("bash-123"),
+            format_wait_detach_message("bash-123", false),
             "Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate.\nDetached because a user message arrived."
         );
     }
@@ -792,12 +827,41 @@ mod tests {
     #[test]
     fn background_launch_messages_match_opencode_copy() {
         assert_eq!(
-            format_background_launch("bash-bg", false),
+            format_background_launch("bash-bg", false, false),
             "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status."
         );
         assert_eq!(
-            format_background_launch("bash-pty", true),
+            format_background_launch("bash-pty", true, false),
             "PTY task started: bash-pty. Use bash_status({ taskId: \"bash-pty\", outputMode: \"screen\" }) to see the visible terminal, bash_write({ taskId: \"bash-pty\", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits."
         );
+    }
+
+    /// A delegated worker is never woken by a completion reminder, so no
+    /// hand-off text it can receive may promise one; a primary's text is
+    /// unchanged.
+    #[test]
+    fn hand_off_texts_are_worded_per_role() {
+        let worker = [
+            format_background_launch("bash-bg", false, true),
+            format_background_launch("bash-pty", true, true),
+            format_promotion_message("bash-123", None, 8_000, true),
+            format_wait_detach_message("bash-123", true),
+            format_module_drain_detach_message("bash-123", true),
+        ];
+        for text in &worker {
+            assert!(!text.contains("completion reminder"), "{text}");
+            assert!(!text.contains("end the turn"), "{text}");
+            assert!(text.contains("won't wake you"), "{text}");
+        }
+        let primary = [
+            format_background_launch("bash-bg", false, false),
+            format_background_launch("bash-pty", true, false),
+            format_promotion_message("bash-123", None, 8_000, false),
+            format_wait_detach_message("bash-123", false),
+            format_module_drain_detach_message("bash-123", false),
+        ];
+        for text in &primary {
+            assert!(text.contains("completion reminder"), "{text}");
+        }
     }
 }

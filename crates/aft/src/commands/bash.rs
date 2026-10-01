@@ -71,25 +71,24 @@ struct BashParams {
     permissions_requested: bool,
     #[serde(default)]
     env: HashMap<String, String>,
-    /// Set by the plugins when the calling session is a delegated worker
-    /// (subagent). A worker cannot be woken once its turn ends, so a
-    /// `wait: true` call is how it waits for a long build; see
-    /// `applies_default_hard_kill`.
-    #[serde(default)]
-    worker_session: bool,
 }
 
-/// Whether a command without an explicit `timeout` gets the registry's
-/// default hard kill (30 minutes).
+/// The hard kill for a bash request.
 ///
-/// A delegated worker's `wait: true` call is exempt: the worker blocks on it
-/// because it has nothing else to do until the command finishes, and killing
-/// a long build at an implicit limit would only make it start over. The wait
-/// still ends on a new message (which detaches the command to the background)
-/// or on an abort of the tool call, and an explicit `timeout` is always
-/// honoured.
-fn applies_default_hard_kill(params: &BashParams) -> bool {
-    !(params.worker_session && params.wait && params.timeout.is_none())
+/// An explicit `timeout` always wins. Without one the registry's default
+/// (30 minutes) applies, except to a delegated worker's `wait: true` call
+/// (`worker_session`, see [`RawRequest::worker_session`]): the worker blocks
+/// on it because it has nothing else to do until the command finishes, and
+/// killing a long build at an implicit limit would only make it start over.
+/// That wait still ends on a new message (which detaches the command to the
+/// background) or on an abort of the tool call.
+fn hard_kill_for(params: &BashParams, worker_session: bool) -> crate::bash_background::HardKill {
+    use crate::bash_background::HardKill;
+    match params.timeout {
+        Some(_) => HardKill::from_timeout_ms(params.timeout),
+        None if worker_session && params.wait => HardKill::Never,
+        None => HardKill::Default,
+    }
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -377,8 +376,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         shell_path,
         workdir,
         env,
-        params.timeout,
-        applies_default_hard_kill(&params),
+        hard_kill_for(&params, req.worker_session()),
         ctx,
         effective_background,
         params.notify_on_completion,
@@ -843,7 +841,13 @@ mod tests {
         let ctx = spawn_test_context(project.path(), storage.path());
         let mut request = spawn_test_request("hard-kill", "sleep 30", false);
         for (key, value) in extra.as_object().unwrap() {
-            request.params["params"][key] = value.clone();
+            // The role sits beside `session_id`, outside the bash arguments,
+            // as the plugins send it.
+            if key == crate::protocol::WORKER_SESSION_FIELD {
+                request.params[key] = value.clone();
+            } else {
+                request.params["params"][key] = value.clone();
+            }
         }
         let response = handle(&request, &ctx);
         assert!(response.success, "spawn failed: {:?}", response.data);

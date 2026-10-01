@@ -214,6 +214,11 @@ pub struct ToolCallContext {
     /// harnesses can share one root context; `None` uses the configure
     /// snapshot in the root's config.
     pub disabled_tools: Option<std::sync::Arc<Vec<String>>>,
+    /// The caller is a delegated worker session (see
+    /// [`RawRequest::worker_session`]). It decides how the repeat breaker and
+    /// bash hand-off texts are worded, and it lets a worker's `wait: true`
+    /// bash call run without the default hard kill.
+    pub worker_session: bool,
 }
 
 pub(crate) fn ensure_hashline_registration(
@@ -463,6 +468,9 @@ pub(crate) struct RepeatObservation {
     session_id: String,
     tool: String,
     semantic_key: String,
+    /// Picks the reminder's wording: a delegated worker is never told to end
+    /// its turn.
+    worker_session: bool,
 }
 
 impl RepeatObservation {
@@ -484,11 +492,14 @@ impl RepeatObservation {
     /// AFT answers by rewriting it into another tool (for example `grep` into
     /// the grep tool) still keys as `bash` with its `command` and `workdir`,
     /// because that is the call the model repeats.
+    ///
+    /// `worker_session` is the caller's role (see `RawRequest::worker_session`).
     pub(crate) fn for_agent_call(
         session_id: &str,
         tool: &str,
         args: &Value,
         preview: bool,
+        worker_session: bool,
     ) -> Option<Self> {
         if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
             return None;
@@ -497,6 +508,7 @@ impl RepeatObservation {
             session_id: session_id.to_string(),
             tool: tool.to_string(),
             semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
+            worker_session,
         })
     }
 
@@ -519,6 +531,7 @@ impl RepeatObservation {
                 text,
                 &self.session_id,
                 &intervention,
+                self.worker_session,
             );
         }
     }
@@ -541,7 +554,13 @@ pub fn run_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let repeat = RepeatObservation::for_agent_call(session_id, bare_name, &args, ctx.preview);
+    let repeat = RepeatObservation::for_agent_call(
+        session_id,
+        bare_name,
+        &args,
+        ctx.preview,
+        ctx.worker_session,
+    );
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
@@ -632,6 +651,16 @@ fn raw_request_from_translated(
         params.remove("command");
     }
     params.remove("session_id");
+    // The caller's role comes from the request envelope, never from the
+    // agent's arguments: an agent must not be able to claim it is a worker
+    // to lift the default hard kill on its commands.
+    params.remove(crate::protocol::WORKER_SESSION_FIELD);
+    if ctx.worker_session {
+        params.insert(
+            crate::protocol::WORKER_SESSION_FIELD.to_string(),
+            json!(true),
+        );
+    }
     let lsp_hints = params.remove("lsp_hints").filter(|value| !value.is_null());
 
     Ok(RawRequest {
@@ -771,6 +800,7 @@ mod tests {
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
                 disabled_tools: None,
+                worker_session: false,
             }
         }
 
@@ -803,6 +833,28 @@ mod tests {
                 }),
             );
             serde_json::to_vec(&response).expect("serialize recording dispatch response")
+        }
+
+        #[test]
+        fn worker_role_comes_from_the_context_never_the_agent_arguments() {
+            let spoofed = object(json!({ "command": "make", "worker_session": true }));
+            let primary =
+                raw_request_from_translated("bash".to_string(), spoofed.clone(), &context(false))
+                    .unwrap();
+            assert!(
+                !primary.worker_session(),
+                "an agent argument must not set the role"
+            );
+
+            let mut worker_ctx = context(false);
+            worker_ctx.worker_session = true;
+            let worker = raw_request_from_translated(
+                "bash".to_string(),
+                object(json!({ "command": "make" })),
+                &worker_ctx,
+            )
+            .unwrap();
+            assert!(worker.worker_session());
         }
 
         #[test]

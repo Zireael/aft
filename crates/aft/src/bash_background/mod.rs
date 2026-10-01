@@ -207,11 +207,41 @@ impl BgTaskStatus {
     }
 }
 
-/// Spawn a bash command in the background. Returns a task_id immediately.
+/// When a background bash task is killed for running too long.
 ///
-/// `timeout_ms` is the command's hard kill. When it is `None`,
-/// `default_hard_kill` decides between the registry's default
-/// (`DEFAULT_BG_TIMEOUT`) and no hard kill at all.
+/// Every spawn names one explicitly, so no caller can drop the default by
+/// passing an empty timeout by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardKill {
+    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes).
+    Default,
+    /// Never killed for running too long. Only a delegated worker's
+    /// `wait: true` call without a timeout uses this: the worker blocks until
+    /// the command finishes and cannot be woken later, so an implicit kill
+    /// would only cut a long build short.
+    Never,
+    /// Killed once it has run this long (the caller's explicit `timeout`).
+    After(Duration),
+}
+
+impl HardKill {
+    /// The hard kill for an optional caller timeout in milliseconds, falling
+    /// back to [`HardKill::Default`].
+    pub fn from_timeout_ms(timeout_ms: Option<u64>) -> Self {
+        timeout_ms.map_or(Self::Default, |ms| Self::After(Duration::from_millis(ms)))
+    }
+
+    /// How long the task may run, or `None` when it is never killed for it.
+    pub fn limit(self) -> Option<Duration> {
+        match self {
+            Self::Default => Some(registry::DEFAULT_BG_TIMEOUT),
+            Self::Never => None,
+            Self::After(limit) => Some(limit),
+        }
+    }
+}
+
+/// Spawn a bash command in the background. Returns a task_id immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     request_id: &str,
@@ -221,8 +251,7 @@ pub fn spawn(
     shell_path: PathBuf,
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
-    timeout_ms: Option<u64>,
-    default_hard_kill: bool,
+    hard_kill: HardKill,
     ctx: &AppContext,
     require_background_flag: bool,
     notify_on_completion: bool,
@@ -248,11 +277,6 @@ pub fn spawn(
     });
     let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
-    let timeout = match timeout_ms {
-        Some(timeout_ms) => Some(Duration::from_millis(timeout_ms)),
-        None if default_hard_kill => Some(registry::DEFAULT_BG_TIMEOUT),
-        None => None,
-    };
     let project_root = ctx
         .config()
         .project_root
@@ -402,7 +426,7 @@ pub fn spawn(
             session_id.to_string(),
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -420,7 +444,7 @@ pub fn spawn(
             session_id.to_string(),
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,

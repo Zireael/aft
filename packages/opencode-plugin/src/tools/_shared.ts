@@ -31,10 +31,12 @@ import {
   decodeFileUrl,
   isBashTransportDeadError,
   timeoutForCommand,
+  WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
+import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 
@@ -255,6 +257,16 @@ export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectT
  * is absent (see `RawRequest::session()`), so hosts that don't expose a
  * session identifier still work — they just share undo/checkpoint state.
  */
+/**
+ * Whether this tool call comes from a delegated worker (subagent) session.
+ * AFT words its replies by role (see WORKER_SESSION_FIELD), so every request
+ * carries it. The lookup is cached per session after the first call.
+ */
+async function isWorkerRuntime(ctx: PluginContext, runtime: ToolRuntime): Promise<boolean> {
+  if (!runtime.sessionID) return false;
+  return resolveIsSubagent(ctx.client, runtime.sessionID, runtime.directory);
+}
+
 export async function callBridge(
   ctx: PluginContext,
   runtime: ToolRuntime,
@@ -273,6 +285,10 @@ export async function callBridge(
   const merged: Record<string, unknown> = { ...params };
   if (runtime.sessionID) {
     merged.session_id = runtime.sessionID;
+  }
+  // The caller's role travels with every request, beside the session.
+  if (await isWorkerRuntime(ctx, runtime)) {
+    merged[WORKER_SESSION_FIELD] = true;
   }
   const timeoutMs = timeoutForCommand(command);
   const sendOptions = {
@@ -322,10 +338,13 @@ export async function callToolCall(
   }
 
   const timeoutMs = timeoutForCommand(name);
+  const workerSession = await isWorkerRuntime(ctx, runtime);
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
     ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
+    // The caller's role travels in the tool_call envelope, beside the session.
+    ...(workerSession ? { workerSession: true } : {}),
     ...options,
   };
   markBridgeStart();

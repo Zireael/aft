@@ -74,6 +74,7 @@ enum BashSpawnControl {
         timeout: Option<u64>,
         wait_window_ms: u64,
         detach_on_user_message: bool,
+        worker_session: bool,
     },
 }
 
@@ -197,7 +198,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 let response = Response::success(
                     &target.request_id,
                     json!({
-                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id),
+                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
@@ -331,11 +332,16 @@ fn bash_result_from_response(
     ToolCallResult { text, response }
 }
 
-fn bash_background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+fn bash_background_launch_response(
+    request_id: &str,
+    task_id: &str,
+    is_pty: bool,
+    worker_session: bool,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty),
+            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -423,6 +429,7 @@ pub(super) fn submit_deferred_bash(
     call_key: Option<String>,
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
+    worker_session: bool,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -508,6 +515,18 @@ pub(super) fn submit_deferred_bash(
                         Value::Array(grants.into_iter().map(Value::String).collect()),
                     );
                 }
+                // The caller's role comes from the call body, never from the
+                // agent's arguments: an agent must not be able to claim it is a
+                // worker to lift the default hard kill on its command.
+                translated
+                    .args
+                    .remove(crate::protocol::WORKER_SESSION_FIELD);
+                if worker_session {
+                    translated.args.insert(
+                        crate::protocol::WORKER_SESSION_FIELD.to_string(),
+                        Value::Bool(true),
+                    );
+                }
                 let settings = bash_settings_from_translated(&translated.args);
                 let raw_req = RawRequest {
                     id: request_id_for_spawn.clone(),
@@ -575,8 +594,12 @@ pub(super) fn submit_deferred_bash(
                     .unwrap_or("pipes");
                 let is_pty = mode == "pty" || settings.pty;
                 if is_pty || settings.background {
-                    let response =
-                        bash_background_launch_response(&request_id_for_spawn, &task_id, is_pty);
+                    let response = bash_background_launch_response(
+                        &request_id_for_spawn,
+                        &task_id,
+                        is_pty,
+                        worker_session,
+                    );
                     return finish_bash_spawn_immediate(
                         response,
                         ctx,
@@ -619,6 +642,7 @@ pub(super) fn submit_deferred_bash(
                         timeout: settings.timeout,
                         wait_window_ms,
                         detach_on_user_message,
+                        worker_session,
                     });
                 }
                 response
@@ -673,6 +697,7 @@ pub(super) fn submit_deferred_bash(
                 timeout,
                 wait_window_ms,
                 detach_on_user_message,
+                worker_session,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -703,6 +728,7 @@ pub(super) fn submit_deferred_bash(
                     timeout,
                     wait_window_ms,
                     detach_on_user_message,
+                    worker_session,
                     format_context,
                     cancel,
                     claim,
@@ -752,6 +778,7 @@ async fn run_deferred_bash_wait(
     timeout: Option<u64>,
     wait_window_ms: u64,
     detach_on_user_message: bool,
+    worker_session: bool,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
@@ -783,6 +810,7 @@ async fn run_deferred_bash_wait(
             task_id: task_id.clone(),
             session_id: session_id.clone(),
             wait_mode: detach_on_user_message,
+            worker_session,
             registry: registry.clone(),
             request_id: request_id.clone(),
             ver,
@@ -934,6 +962,7 @@ async fn run_deferred_bash_wait(
                                         &task_id_for_poll,
                                         &session_for_poll,
                                         &request_id_for_poll,
+                                        worker_session,
                                     );
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
@@ -971,6 +1000,7 @@ async fn run_deferred_bash_wait(
                                     &task_id_for_poll,
                                     &session_for_poll,
                                     &request_id_for_poll,
+                                    worker_session,
                                 );
                                 ctx.bash_background().end_wait_mode_session(
                                     &session_for_poll,
@@ -1140,6 +1170,7 @@ async fn run_deferred_bash_wait(
                             session_id.clone(),
                             timeout,
                             wait_window_ms,
+                            worker_session,
                             format_context.clone(),
                             repeat.clone(),
                         )
@@ -1175,6 +1206,7 @@ async fn submit_bash_promote(
     session_id: String,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
     format_context: crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
@@ -1208,6 +1240,7 @@ async fn submit_bash_promote(
                         timeout,
                         wait_window_ms,
                         &request_id_for_promote,
+                        worker_session,
                     )
                 };
                 let result = finalized_bash_result(
@@ -1426,8 +1459,9 @@ mod grant_path_tests {
             std::path::PathBuf::from("/bin/bash"),
             None,
             None,
-            raw_params.get("timeout").and_then(Value::as_u64),
-            true,
+            crate::bash_background::HardKill::from_timeout_ms(
+                raw_params.get("timeout").and_then(Value::as_u64),
+            ),
             ctx,
             false,
             false,
@@ -1497,6 +1531,7 @@ mod grant_path_tests {
                 None,
                 None,
                 None,
+                false,
             );
         }
 
@@ -1626,6 +1661,7 @@ mod grant_path_tests {
             None,
             None,
             None,
+            false,
         );
 
         let started_by = Instant::now() + Duration::from_secs(3);

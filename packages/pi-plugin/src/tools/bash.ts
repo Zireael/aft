@@ -24,7 +24,6 @@ import {
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
-  withoutCompletionReminderPromise,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -767,8 +766,9 @@ export function registerBashTool(
       // A worker that asks to wait for its command without a timeout has
       // nothing else to do until the command finishes and can't be woken
       // after its turn ends, so the engine skips its 30-minute default kill
-      // (worker_session below). A new message still detaches the wait and an
-      // abort still kills the command.
+      // (it knows the role from the `worker_session` field callBridge adds to
+      // every request). A new message still detaches the wait and an abort
+      // still kills the command. The transport timeout must not undercut it.
       const workerUnboundedWait = isWorker && requestedWait && timeout === undefined;
 
       // Build spawn context for potential hook modification
@@ -812,7 +812,6 @@ export function registerBashTool(
             foreground_orchestrate: true,
             block_to_completion: blockToCompletion,
             wait: requestedWait,
-            worker_session: isWorker,
             sandbox: params.sandbox,
             ...(isPowerShell ? { shell: "powershell" } : {}),
           },
@@ -887,12 +886,9 @@ export function registerBashTool(
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
         trackBgTask(resolveSessionId(extCtx), taskId);
-        const handoff = (response.output as string | undefined) ?? "";
-        // The engine's background hand-off text promises a completion reminder, which a
-        // worker never receives once its turn ends.
-        return bashResult(isWorker ? withoutCompletionReminderPromise(handoff) : handoff, {
-          task_id: taskId,
-        });
+        // AFT words the hand-off text for the caller's role, which callBridge
+        // sends with every request.
+        return bashResult((response.output as string | undefined) ?? "", { task_id: taskId });
       }
 
       const details: BashDetails = {

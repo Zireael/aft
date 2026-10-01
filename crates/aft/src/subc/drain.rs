@@ -219,6 +219,8 @@ pub(super) struct BashDetachTarget {
     /// `wait: true`: the session's wait-mode registration is ended rather than
     /// only the foreground-task registration.
     pub(super) wait_mode: bool,
+    /// The caller is a delegated worker; picks the wording of the detach text.
+    pub(super) worker_session: bool,
     pub(super) registry: crate::bash_background::BgTaskRegistry,
     pub(super) request_id: String,
     pub(super) ver: u8,

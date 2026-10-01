@@ -172,3 +172,4 @@ mod undo_path_lifecycle_test;
 mod url_fetch_test;
 mod view_assembly_wiring_test;
 mod vue_test;
+mod worker_session_test;

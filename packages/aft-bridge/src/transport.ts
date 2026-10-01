@@ -25,7 +25,23 @@ export interface AftTransportOptions extends BridgeRequestOptions {
 export interface ToolCallOptions extends AftTransportOptions {
   /** Server-owned dry-run flag placed at the top level of the tool_call request. */
   preview?: boolean;
+  /**
+   * The caller is a delegated worker (subagent) session. Placed beside the
+   * session, outside the agent's arguments, as `worker_session: true`; see
+   * WORKER_SESSION_FIELD.
+   */
+  workerSession?: boolean;
 }
+
+/**
+ * Request field that tells AFT the caller is a delegated worker (subagent)
+ * session rather than a primary one. A worker cannot be woken once its turn
+ * ends, so AFT words its replies accordingly: it never promises a completion
+ * reminder or tells a worker to end its turn, and a worker's `wait: true`
+ * bash call runs without the default hard kill. The plugins set it on every
+ * request from a worker, next to `session_id`; absent means primary.
+ */
+export const WORKER_SESSION_FIELD = "worker_session";
 
 // A single project's transport (today: one BinaryBridge per project root).
 export interface AftProjectTransport {

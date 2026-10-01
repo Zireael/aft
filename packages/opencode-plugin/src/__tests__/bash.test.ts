@@ -2258,7 +2258,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
       { command: "long-build", wait: true },
       createMockSdkContext({ sessionID: "ses_primary_wait" }),
     );
-    expect(calls[0].params.worker_session).toBe(false);
+    expect(calls[0].params.worker_session).toBeUndefined();
     expect(calls[0].options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
   });
 
@@ -2342,8 +2342,9 @@ describe("OpenCode bash adapter — subagent gating", () => {
             success: true,
             status: "running",
             task_id: "bash-sub-bg",
+            // The engine words the hand-off for a worker (worker_session).
             output:
-              "Background task started: bash-sub-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
+              "Background task started: bash-sub-bg. It won't wake you when it finishes, so wait for it before you report a result.",
           };
         return { success: true };
       },
@@ -2361,7 +2362,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
     // subagent's watch without one waits until the command finishes, and any
     // value only makes it return sooner.
     expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg" })');
-    expect(result as string).toContain("without timeoutMs it waits until the command finishes");
+    expect(result as string).toContain("without a timeout it waits until the command finishes");
     expect(result as string).not.toContain("waits up to");
     // A subagent is never woken after its turn ends, so nothing may promise
     // it a completion reminder or tell it to end its turn.
@@ -2370,6 +2371,8 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(result as string).not.toContain("timeoutMs: 60000");
     expect(calls.find((c) => c.command === "bash")?.params.background).toBe(true);
     expect(calls.find((c) => c.command === "bash")?.params.notify_on_completion).toBe(true);
+    // The engine can only word its reply for a worker if it is told the role.
+    expect(calls.find((c) => c.command === "bash")?.params.worker_session).toBe(true);
   });
 
   test("subagent auto-promotion with subagent_background true includes guidance", async () => {
@@ -2379,7 +2382,7 @@ describe("OpenCode bash adapter — subagent gating", () => {
         success: true,
         status: "running",
         task_id: "bash-sub-promote",
-        output: `Foreground bash didn't finish within 0s and was promoted to background: bash-sub-promote. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-sub-promote" }) to inspect output or bash_kill({ taskId: "bash-sub-promote" }) to terminate.`,
+        output: `Foreground bash didn't finish within 0s and was promoted to background: bash-sub-promote. It won't wake you when it finishes, so wait for it before you report a result; use bash_status({ taskId: "bash-sub-promote" }) to inspect output or bash_kill({ taskId: "bash-sub-promote" }) to terminate.`,
       }),
       undefined,
       { bash: { subagent_background: true } } as PluginContext["config"],
@@ -2395,7 +2398,8 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(result as string).toContain("promoted to background: bash-sub-promote");
     expect(result as string).toContain('bash_watch({ taskId: "bash-sub-promote" })');
     expect(result as string).not.toContain("completion reminder will be delivered");
-    expect(result as string).toContain('Use bash_status({ taskId: "bash-sub-promote" })');
+    expect(result as string).toContain('use bash_status({ taskId: "bash-sub-promote" })');
+    expect(calls[0].params.worker_session).toBe(true);
     expect(result as string).not.toContain("timeoutMs: 60000");
     expect(calls.map((c) => c.command)).toEqual(["bash"]);
   });

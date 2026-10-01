@@ -107,6 +107,7 @@ pub fn handle_with_dispatch(
         // Standalone tool calls use the `disabled_tools` list configure resolved
         // when the session connected (the root config).
         disabled_tools: None,
+        worker_session: req.worker_session(),
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);

@@ -120,7 +120,9 @@ describe("aft-status command", () => {
     });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].params).toEqual({ session_id: "session-new" });
+    // The mock context is headless (no UI), which Pi treats as a worker
+    // session, so every request also carries the caller's role.
+    expect(calls[0].params).toEqual({ session_id: "session-new", worker_session: true });
     expect(notifications[0].message).toContain("AFT version: fresh");
   });
 

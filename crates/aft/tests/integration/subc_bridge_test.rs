@@ -3123,6 +3123,16 @@ fn subc_bridge_bash_background_returns_launch_text() {
 }
 
 #[test]
+fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_hand_off_text_follows_the_worker_role",
+        Duration::from_secs(30),
+        drive_bash_worker_role_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_records_call_key_and_refuses_malformed_keys() {
     run_subc_bridge_test(
         "subc_bridge_bash_records_call_key_and_refuses_malformed_keys",
@@ -4438,6 +4448,71 @@ async fn drive_bash_wait_rejection_daemon(input: FakeDaemonInput) {
         "unexpected rejection text: {text:?}"
     );
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// The plugins mark a delegated worker's call with `worker_session: true` in
+/// the call body, beside `name` and `arguments`. A worker is never woken by a
+/// completion reminder, so its background hand-off text must not promise one;
+/// a call without the flag keeps the primary wording.
+async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    for (corr, worker) in [(130_u64, true), (131_u64, false)] {
+        let mut body = json!({
+            "name": "bash",
+            "arguments": {
+                "command": "sleep 5",
+                "background": true,
+                "foreground_orchestrate": true,
+            },
+        });
+        if worker {
+            body["worker_session"] = json!(true);
+        }
+        send_frame(
+            &mut stream,
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&body).expect("worker role tool call body"),
+            )
+            .expect("worker role tool call frame"),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "worker role background bash").await;
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame));
+        let text = tool_result_text(&frame);
+        assert!(text.contains("Background task started"), "{text:?}");
+        if worker {
+            assert!(text.contains("won't wake you"), "worker text: {text:?}");
+            assert!(
+                !text.contains("completion reminder"),
+                "worker text: {text:?}"
+            );
+        } else {
+            assert!(
+                text.contains("A completion reminder will be delivered automatically"),
+                "primary text: {text:?}"
+            );
+        }
+        let task_id = extract_bash_task_id(&text);
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 100,
+            "bash_kill",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let _ = read_frame_timeout(&mut stream, "worker role bash kill").await;
+    }
     send_connection_goodbye(&mut stream).await;
 }
 

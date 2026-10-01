@@ -1186,15 +1186,19 @@ mod tests {
                 false,
             )
         };
-        vec![
-            orchestrate::format_background_launch(task, false),
-            orchestrate::format_background_launch(task, true),
-            orchestrate::format_promotion_message(task, None, 30_000),
-            orchestrate::format_wait_detach_message(task),
-            orchestrate::format_module_drain_detach_message(task),
-            running_status("pty"),
-            running_status("pipes"),
-        ]
+        let mut texts = Vec::new();
+        // Both roles' wording: a catalog consumer may be a delegated worker.
+        for worker_session in [false, true] {
+            texts.extend([
+                orchestrate::format_background_launch(task, false, worker_session),
+                orchestrate::format_background_launch(task, true, worker_session),
+                orchestrate::format_promotion_message(task, None, 30_000, worker_session),
+                orchestrate::format_wait_detach_message(task, worker_session),
+                orchestrate::format_module_drain_detach_message(task, worker_session),
+            ]);
+        }
+        texts.extend([running_status("pty"), running_status("pipes")]);
+        texts
     }
 
     /// A consumer that builds its tool surface from this catalog can only offer

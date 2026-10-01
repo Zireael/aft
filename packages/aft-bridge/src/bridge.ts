@@ -14,6 +14,7 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+import { WORKER_SESSION_FIELD } from "./transport.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
@@ -819,8 +820,9 @@ export class BinaryBridge implements AftProjectTransport {
       params.edit_slot_survives = editSlotSurvives;
       this.logHashlineRegistrationCarrier("tool_call", sessionId, editSlotSurvives);
     }
-    const { preview, ...sendOptions } = options ?? {};
+    const { preview, workerSession, ...sendOptions } = options ?? {};
     if (preview === true) params.preview = true;
+    if (workerSession === true) params[WORKER_SESSION_FIELD] = true;
     return (await this.send(
       "tool_call",
       params,
@@ -974,7 +976,7 @@ export class BinaryBridge implements AftProjectTransport {
       ) {
         const nested: Record<string, unknown> = { ...params };
         const reserved: Record<string, unknown> = {};
-        for (const key of ["session_id", "lsp_hints"] as const) {
+        for (const key of ["session_id", "lsp_hints", WORKER_SESSION_FIELD] as const) {
           if (Object.hasOwn(nested, key)) {
             reserved[key] = nested[key];
             delete nested[key];

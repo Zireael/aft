@@ -10,7 +10,7 @@ import {
   runningTaskStatusHint,
   sleep,
   type WatchCallerRole,
-  withoutCompletionReminderPromise,
+  workerBackgroundTaskNote,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -573,8 +573,9 @@ export function createBashTool(
       // A subagent that asks to wait for its command without a timeout has
       // nothing else to do until the command finishes and can't be woken
       // after its turn ends, so the engine skips its 30-minute default kill
-      // (worker_session below). A new message still detaches the wait and an
-      // abort still kills the command.
+      // (it knows the role from the `worker_session` field callBridge adds to
+      // every request). A new message still detaches the wait and an abort
+      // still kills the command. The transport timeout must not undercut it.
       const workerUnboundedWait = isSubagent && requestedWait && rawTimeout === undefined;
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
@@ -622,7 +623,6 @@ export function createBashTool(
             foreground_orchestrate: true,
             block_to_completion: blockToCompletion,
             wait: requestedWait,
-            worker_session: isSubagent,
             sandbox: args.sandbox,
           },
           callBashBridge,
@@ -685,13 +685,8 @@ export function createBashTool(
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         let rendered = (data.output as string | undefined) ?? "";
-        if (isSubagent) {
-          // The engine's background hand-off text promises a completion reminder, which a
-          // subagent never receives once its turn ends.
-          rendered = withoutCompletionReminderPromise(rendered);
-        }
         if (isSubagent && allowSubagentBg) {
-          rendered += subagentGuidance(taskId);
+          rendered += workerBackgroundTaskNote(taskId);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
         metadata?.(metadataPayload);
@@ -854,18 +849,6 @@ async function formatPtyStatus(
 
 function preview(output: string): string {
   return output.length <= METADATA_PREVIEW_LIMIT ? output : output.slice(-METADATA_PREVIEW_LIMIT);
-}
-
-/**
- * Appended when a subagent's command goes to the background. The suggested
- * bash_watch call passes no timeout on purpose: a subagent's watch without one
- * waits until the command finishes, so naming any number would only make it
- * wake and re-watch.
- */
-function subagentGuidance(taskId: string): string {
-  return `
-
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits until the command finishes. Subagents don't survive turn-end and won't be woken when the command finishes.`;
 }
 
 function foregroundMetadata(

@@ -54,10 +54,13 @@ describe("tool shared helpers", () => {
 
     const response = await callBridge(bridge, "grep", { pattern: "needle" }, extCtx);
 
-    expect(response.params).toEqual({ pattern: "needle", session_id: "pi-session-123" });
+    // The mock context is headless (no UI), which Pi treats as a worker
+    // session, so every request also carries the caller's role.
+    const expected = { pattern: "needle", session_id: "pi-session-123", worker_session: true };
+    expect(response.params).toEqual(expected);
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("grep");
-    expect(calls[0].params).toEqual({ pattern: "needle", session_id: "pi-session-123" });
+    expect(calls[0].params).toEqual(expected);
     expect(calls[0].options?.timeoutMs).toBe(60_000);
     expect(calls[0].options?.configureWarningClient).toBe(extCtx);
   });

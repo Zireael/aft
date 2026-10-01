@@ -10,7 +10,6 @@ import {
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
   watchPollDelayMs,
-  withoutCompletionReminderPromise,
 } from "../bash-hints.js";
 
 const AFT_SEARCH_HINT =
@@ -68,31 +67,6 @@ describe("watch polling", () => {
     controller.abort();
     await sleeping;
     expect(performance.now() - started).toBeLessThan(1_000);
-  });
-});
-
-describe("withoutCompletionReminderPromise", () => {
-  // The inputs are the engine's exact hand-off texts, rendered by
-  // crates/aft/src/commands/bash_orchestrate.rs.
-  test("rewrites every engine hand-off text that promises a reminder", () => {
-    const texts = [
-      "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
-      'Foreground bash didn\'t finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-123" }) to inspect output or bash_kill({ taskId: "bash-123" }) to terminate.',
-      'Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-123" }) to inspect output or bash_kill({ taskId: "bash-123" }) to terminate.\nDetached because a user message arrived.',
-      'PTY task started: bash-pty. Use bash_status({ taskId: "bash-pty", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.',
-    ];
-    for (const text of texts) {
-      const rewritten = withoutCompletionReminderPromise(text);
-      expect(rewritten).not.toContain("completion reminder");
-      expect(rewritten).not.toBe(text);
-    }
-    expect(withoutCompletionReminderPromise(texts[1])).toContain(
-      'Use bash_status({ taskId: "bash-123" }) to inspect output',
-    );
-  });
-
-  test("leaves other text alone", () => {
-    expect(withoutCompletionReminderPromise("hello")).toBe("hello");
   });
 });
 

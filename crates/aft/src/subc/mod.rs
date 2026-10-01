@@ -1128,6 +1128,8 @@ struct PendingBashAsk {
     /// The call as the repeat breaker counts it, observed once the ask is
     /// allowed and the command answers.
     repeat: Option<crate::run_tool_call::RepeatObservation>,
+    /// The caller is a delegated worker session (the call body's flag).
+    worker_session: bool,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -2532,6 +2534,7 @@ async fn handle_bash_elicitation_reply(
                 pending.call_key,
                 Some(pending.grants),
                 pending.repeat,
+                pending.worker_session,
             );
             return Ok(());
         }
@@ -6656,6 +6659,7 @@ async fn handle_tool_call(
                     .unwrap_or_else(|| json!({})),
                 edit_slot_survives: None,
                 preview: false,
+                worker_session: false,
                 call_key: None,
                 schema_pin: None,
             })
@@ -6909,6 +6913,7 @@ async fn handle_tool_call(
             &bare_name,
             &arguments,
             call.preview,
+            call.worker_session,
         );
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
@@ -7017,6 +7022,7 @@ async fn handle_tool_call(
                     cancel,
                     grants: plan.grants,
                     repeat,
+                    worker_session: call.worker_session,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -7068,6 +7074,7 @@ async fn handle_tool_call(
             call_key,
             None,
             repeat,
+            call.worker_session,
         );
         return Ok(());
     }
@@ -7082,6 +7089,7 @@ async fn handle_tool_call(
         edit_slot_survives: call.edit_slot_survives,
         report_registration_downgrade: true,
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
+        worker_session: call.worker_session,
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
@@ -7821,6 +7829,11 @@ struct ToolCallRequest {
     /// apply fail with not-found.
     #[serde(default)]
     preview: bool,
+    /// The caller is a delegated worker session. The AFT plugins set it next
+    /// to the call, like `preview`, and never inside the agent's `arguments`;
+    /// see `RawRequest::worker_session`.
+    #[serde(default)]
+    worker_session: bool,
     /// The consumer's own key for this call, which lets it recognise the
     /// same call arriving twice. Checked with subc-protocol's validator
     /// before anything runs; a bash call records it on its background task.
@@ -10649,7 +10662,7 @@ mod tests {
                 session_id.to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(60)),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
                 storage.path().to_path_buf(),
                 8,
                 true,

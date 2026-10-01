@@ -53,7 +53,9 @@ describe("aft_safety adapter", () => {
     await executeTool(tools.get("aft_safety")!, { op: "undo" });
 
     expect(calls.map((call) => call.command)).toEqual(["undo_preview", "tool_call"]);
-    expect(calls[0].params).toEqual({});
+    // The mock context is headless (no UI), which Pi treats as a worker
+    // session, so every request also carries the caller's role.
+    expect(calls[0].params).toEqual({ worker_session: true });
     expect(calls[1].params).toMatchObject({
       name: "safety",
       arguments: { op: "undo" },

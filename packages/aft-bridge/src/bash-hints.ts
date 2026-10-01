@@ -181,33 +181,17 @@ export function interruptedWatchTail(role: WatchCallerRole, primaryTail: string)
   return role === "worker" ? `The task is still running. ${WORKER_KEEP_WAITING}` : primaryTail;
 }
 
-/** How a delegated worker is told to wait for a task it just sent to the background. */
-const WORKER_WAIT_FOR_TASK =
-  "It won't wake you when it finishes: to wait for it, call bash_watch without a timeout, which returns when the command finishes.";
-
 /**
- * Removes the engine's promise of a completion reminder from a bash reply
- * shown to a delegated worker. Completion reminders reach a session only when
- * it is woken for a new turn, which never happens to a worker whose turn has
- * ended, so the promise would tell it to stop and wait for nothing. The
- * phrases are the ones `crates/aft/src/commands/bash_orchestrate.rs` renders
- * for background launches, promotions and detaches; text without them is
- * returned unchanged.
+ * Appended to a bash reply shown to a delegated worker (subagent) whose
+ * command now runs in the background. AFT's own reply already says the task
+ * won't wake the worker; this names the plugin-owned bash_watch tool, which
+ * AFT cannot assume a host has. The suggested call passes no timeout on
+ * purpose: a worker's watch without one waits until the command finishes, so
+ * any number would only make it wake and watch again. `taskIdArg` is the
+ * host's spelling of the task id argument.
  */
-export function withoutCompletionReminderPromise(text: string): string {
-  return text
-    .replaceAll(
-      "A completion reminder will be delivered automatically; don't poll bash_status.",
-      WORKER_WAIT_FOR_TASK,
-    )
-    .replaceAll(
-      "A completion reminder will be delivered automatically; use ",
-      `${WORKER_WAIT_FOR_TASK} Use `,
-    )
-    .replaceAll(
-      "A completion reminder fires automatically when the task exits.",
-      "It won't wake you when it exits.",
-    );
+export function workerBackgroundTaskNote(taskId: string, taskIdArg = "taskId"): string {
+  return `\n\nNOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ ${taskIdArg}: "${taskId}" }) to wait for completion before returning to the parent; without a timeout it waits until the command finishes. Subagents don't survive turn-end and won't be woken when the command finishes.`;
 }
 
 /**

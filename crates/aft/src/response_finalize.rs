@@ -14,6 +14,7 @@ pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
     intervention: &repeat_breaker::RepeatIntervention,
+    worker_session: bool,
 ) {
     let count = intervention.count;
     let span_seconds = intervention.span.as_secs();
@@ -23,14 +24,15 @@ pub fn append_repeat_breaker_reminder(
     // drift. Both variants point legitimate waiting toward a background watch
     // instead of treating output churn as progress.
     //
-    // Neither instruction below tells the caller to end its turn. Rust cannot tell a
-    // delegated worker (subagent) from a primary session here, and a worker
-    // that ends its turn has delivered its result: it cannot be woken again
-    // when the awaited task finishes. Both roles can wait with a watch.
-    let instruction = if repeat_breaker::escalation_starts_at(count) {
-        "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
-    } else {
-        "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
+    // A delegated worker (subagent) is never told to end its turn: a worker
+    // that ends its turn has delivered its result and cannot be woken when the
+    // awaited task finishes. It is told to wait on the task instead.
+    let escalated = repeat_breaker::escalation_starts_at(count);
+    let instruction = match (worker_session, escalated) {
+        (false, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (false, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
     };
     let observation = if intervention.outputs_identical {
         format!(

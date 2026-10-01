@@ -476,7 +476,31 @@ impl RawRequest {
     pub fn session(&self) -> &str {
         self.session_id.as_deref().unwrap_or(DEFAULT_SESSION_ID)
     }
+
+    /// Whether the caller is a delegated worker (subagent) session rather than
+    /// a primary one.
+    ///
+    /// The plugins attach `worker_session: true` to every request from a
+    /// worker, next to `session_id`; it is absent (false) for a primary
+    /// session and for any caller that predates it. A worker cannot be woken
+    /// once its turn ends, so the text it is shown must never promise a later
+    /// reminder or tell it to end its turn. The field normally sits at the top
+    /// level; it is also read from a nested `params` object, the shape some
+    /// in-process requests are built in.
+    pub fn worker_session(&self) -> bool {
+        let flag = |value: &serde_json::Value| {
+            value
+                .get(WORKER_SESSION_FIELD)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        };
+        flag(&self.params) || self.params.get("params").is_some_and(flag)
+    }
 }
+
+/// Request field that marks the caller as a delegated worker session; see
+/// [`RawRequest::worker_session`].
+pub const WORKER_SESSION_FIELD: &str = "worker_session";
 
 /// Outbound response envelope.
 ///

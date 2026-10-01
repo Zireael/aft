@@ -57,6 +57,7 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+import { WORKER_SESSION_FIELD } from "./transport.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -1023,6 +1024,7 @@ class SubcTransport implements AftProjectTransport {
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
+    if (options?.workerSession === true) body[WORKER_SESSION_FIELD] = true;
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
       body,
@@ -1055,7 +1057,12 @@ class SubcTransport implements AftProjectTransport {
     }
     const { timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const session = typeof params.session_id === "string" ? params.session_id : undefined;
-    const body: Record<string, unknown> = { name: command, arguments: params };
+    // The caller's role travels beside the call, like the session (which the
+    // route bind carries), not inside the command's arguments: the module
+    // reads it from the call body.
+    const { [WORKER_SESSION_FIELD]: workerSession, ...args } = params;
+    const body: Record<string, unknown> = { name: command, arguments: args };
+    if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     const reply = await this.pool.routeRequest(

@@ -39,7 +39,7 @@ export {
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
-  withoutCompletionReminderPromise,
+  workerBackgroundTaskNote,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,
@@ -344,6 +344,7 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+export { WORKER_SESSION_FIELD } from "./transport.js";
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,

@@ -64,10 +64,8 @@ use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 /// Default timeout for background bash tasks: 30 minutes.
-/// Agents can override per-call via the `timeout` parameter (in ms). The
-/// convenience `spawn`/`spawn_pty` wrappers and `bash_background::spawn` apply
-/// it; the `*_with_shell` functions take the final hard kill, where `None`
-/// means the command is never killed for running too long.
+/// Agents can override per-call via the `timeout` parameter (in ms); see
+/// [`super::HardKill`].
 pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -2061,7 +2059,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2076,7 +2074,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2096,7 +2094,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2121,7 +2119,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
         } else {
@@ -2288,7 +2286,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2306,7 +2304,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2327,7 +2325,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2349,7 +2347,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         #[cfg(unix)]
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
@@ -2490,7 +2488,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2505,7 +2503,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2525,7 +2523,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2545,7 +2543,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
@@ -8461,7 +8459,7 @@ mod tests {
                     session_id.clone(),
                     dir.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     dir.path().to_path_buf(),
                     10,
                     true,
@@ -9039,7 +9037,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9120,7 +9118,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9176,7 +9174,7 @@ mod tests {
                 "session".to_string(),
                 root.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -9259,7 +9257,7 @@ mod tests {
                 "session".to_string(),
                 root.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(60)),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -9363,7 +9361,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9429,7 +9427,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9463,7 +9461,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9501,7 +9499,7 @@ mod tests {
                     session.to_string(),
                     project.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -9613,7 +9611,7 @@ mod tests {
                     session.to_string(),
                     project.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     storage.path().to_path_buf(),
                     QUICK_TASKS * 2,
                     false,
@@ -9634,7 +9632,7 @@ mod tests {
                 session.to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 QUICK_TASKS * 2,
                 false,
@@ -9700,7 +9698,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9876,7 +9874,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -10039,7 +10037,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -10141,7 +10139,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10230,7 +10228,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10280,7 +10278,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -10362,7 +10360,7 @@ mod tests {
                 session.to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(120)),
+                crate::bash_background::HardKill::After(Duration::from_secs(120)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -10557,7 +10555,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -10620,7 +10618,7 @@ mod tests {
                 "sandbox-rehydrate".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10714,7 +10712,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 false,
@@ -10884,7 +10882,7 @@ mod tests {
                 session.to_string(),
                 project.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(60)),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -11264,7 +11262,7 @@ mod tests {
                     session.to_string(),
                     project.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(60)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(60)),
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -11355,7 +11353,7 @@ mod tests {
                 session.to_string(),
                 project.path().to_path_buf(),
                 env,
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -11649,7 +11647,7 @@ mod tests {
                 "session-a".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -11672,7 +11670,7 @@ mod tests {
                 "session-a".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -11832,7 +11830,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -12032,7 +12030,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -12095,7 +12093,7 @@ mod tests {
                     "session".to_string(),
                     storage.to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     storage.to_path_buf(),
                     10,
                     true,
@@ -12163,7 +12161,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -12199,7 +12197,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -12264,7 +12262,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
