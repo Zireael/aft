@@ -54,6 +54,7 @@ dependencies = [
  "libc",
  "log",
  "lsp-types",
+ "markup5ever_rcdom",
  "memchr",
  "ndarray",
  "notify",

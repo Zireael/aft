@@ -1,0 +1,50 @@
+<!doctype html>
+<!-- Trimmed from https://developer.chrome.com/docs/devtools/agents/use-cases/auto-connect
+     (fetched 2026-10-01). The published markup closes </code> in the middle of the
+     "chrome-devtools-mcp@latest" string inside the <pre>; the stray end tag is kept
+     verbatim because it is what split the converted code block. -->
+<html lang="en">
+<head><title>Auto-connect | Chrome DevTools</title></head>
+<body>
+<article class="devsite-article">
+<h1 class="devsite-page-title">Use auto-connect with your agent</h1>
+<p>Auto-connect lets your coding agent attach to the Chrome browser you already use.</p>
+
+<h2 id="set_up_auto-connect" data-text="Set up auto-connect" tabindex="-1">Set up auto-connect</h2>
+
+<p>To configure the auto-connect feature in your MCP server, do the following:</p>
+
+<ol>
+<li>In your running Chrome browser, navigate to
+<code translate="no" dir="ltr">chrome://inspect/#remote-debugging</code> and enable remote debugging.</li>
+<li><p>Update your MCP configuration to include the <code translate="no" dir="ltr">--autoConnect</code> flag:</p>
+<div></div><devsite-code><pre class="devsite-click-to-copy" translate="no" dir="ltr" is-upgraded syntax="JSON"><code translate="no" dir="ltr"><span class="devsite-syntax-p">{</span>
+<span class="devsite-syntax-w">  </span><span class="devsite-syntax-nt">&quot;mcpServers&quot;</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-p">{</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-nt">&quot;chrome-devtools&quot;</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-p">{</span>
+<span class="devsite-syntax-w">      </span><span class="devsite-syntax-nt">&quot;command&quot;</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s2">&quot;npx&quot;</span><span class="devsite-syntax-p">,</span>
+<span class="devsite-syntax-w">      </span><span class="devsite-syntax-nt">&quot;args&quot;</span><span class="devsite-syntax-p">:</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-p">[</span><span class="devsite-syntax-s2">&quot;chr</code>ome-devtools-mcp@latest&quot;</span><span class="devsite-syntax-p">,</span><span class="devsite-syntax-w"> </span><span class="devsite-syntax-s2">&quot;--autoConnect&quot;</span><span class="devsite-syntax-p">]</span>
+<span class="devsite-syntax-w">    </span><span class="devsite-syntax-p">}</span>
+<span class="devsite-syntax-w">  </span><span class="devsite-syntax-p">}</span>
+<span class="devsite-syntax-p">}</span>
+</pre></devsite-code></li>
+<li><p>Prompt your agent to interact with your open Chrome app. When Chrome asks
+for permission to allow the session, click <strong>Allow</strong>.</p></li>
+</ol>
+
+<p>Your agent now uses the MCP server to interact with your running Chrome
+application. For more information on configuration options, see the <a href="/docs/devtools/agents/get-started/configuration">Configuration guide</a>.</p>
+
+<h2 id="use_cases_for_auto-connect" data-text="Use cases for auto-connect" tabindex="-1">Use cases for auto-connect</h2>
+
+<p>Auto-connect lets you use tools or states that can&#39;t be used on sandboxed
+Chrome sessions. For example, instead of asking your agent to sign in, which
+often fails, you can navigate to the page yourself and sign in. Then, ask your
+agent to take over.</p>
+
+<p>The following sections include some examples of use cases for the auto-connect
+feature.</p>
+<aside class="note"><strong>Note:</strong><span> Agent execution steps are examples of potential behavior. Your agent may
+act differently.</span></aside>
+</article>
+</body>
+</html>
