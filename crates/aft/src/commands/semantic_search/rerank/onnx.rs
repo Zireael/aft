@@ -582,6 +582,34 @@ pub(crate) struct SessionTuning {
     pub(crate) arena_shrinkage: bool,
     /// Largest `batch × tokens²` one inference may use.
     pub(crate) attention_units: usize,
+    /// Run the graph through Core ML (Apple GPU / Neural Engine) with these
+    /// compute units; `None` is the CPU provider alone. Only the hardware
+    /// experiment test sets it.
+    pub(crate) coreml: Option<ort::ep::coreml::ComputeUnits>,
+    /// Pad every inference to a fixed shape: the sequence length up to the
+    /// next of [`LENGTH_BUCKETS`] and the batch up to the most rows that
+    /// length allows within `attention_units`, so an accelerator sees a few
+    /// static shapes instead of a new one per call. Padding rows repeat the
+    /// batch's first row and their scores are dropped.
+    pub(crate) length_buckets: bool,
+    /// Write an ONNX Runtime profile (per-node timings and providers) with
+    /// this file prefix.
+    pub(crate) profile_prefix: Option<&'static str>,
+    /// Declare the model's `batch_size` and `sequence_length` dimensions as
+    /// these fixed values, and pad every inference to exactly that shape
+    /// (one session per shape). Only the hardware experiment sets it.
+    pub(crate) fixed_shape: Option<(usize, usize)>,
+}
+
+/// Sequence lengths inputs are padded to when `length_buckets` is set.
+pub(crate) const LENGTH_BUCKETS: [usize; 4] = [128, 256, 384, 512];
+
+fn length_bucket(length: usize) -> usize {
+    LENGTH_BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| *bucket >= length)
+        .unwrap_or(length)
 }
 
 impl Default for SessionTuning {
@@ -592,6 +620,10 @@ impl Default for SessionTuning {
             cpu_arena: true,
             arena_shrinkage: false,
             attention_units: MAX_RERANK_ATTENTION_UNITS,
+            coreml: None,
+            length_buckets: false,
+            profile_prefix: None,
+            fixed_shape: None,
         }
     }
 }
@@ -607,6 +639,8 @@ pub(crate) struct OnnxPairScorer {
     /// shrunk after every run.
     run_options: Option<ort::session::RunOptions>,
     attention_units: usize,
+    length_buckets: bool,
+    fixed_shape: Option<(usize, usize)>,
 }
 
 impl OnnxPairScorer {
@@ -630,7 +664,22 @@ impl OnnxPairScorer {
         crate::semantic_index::pre_validate_onnx_runtime()?;
         let _ort_section = crate::ort_lifecycle::enter()
             .ok_or_else(|| "rerank model not loaded: the process is shutting down".to_string())?;
-        let session = Session::builder()
+        let cpu = ort::ep::CPU::default()
+            .with_arena_allocator(tuning.cpu_arena)
+            .build();
+        let providers = match tuning.coreml {
+            Some(units) => vec![
+                ort::ep::CoreML::default()
+                    .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
+                    .with_compute_units(units)
+                    .with_static_input_shapes(tuning.length_buckets)
+                    .build()
+                    .error_on_failure(),
+                cpu,
+            ],
+            None => vec![cpu],
+        };
+        let mut builder = Session::builder()
             .map_err(|error| format!("create ONNX session builder: {error}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|error| format!("set ONNX optimization level: {error}"))?
@@ -639,11 +688,26 @@ impl OnnxPairScorer {
             .with_intra_op_spinning(tuning.intra_op_spinning)
             .map_err(|error| format!("set ONNX intra-op spinning: {error}"))?
             .with_memory_pattern(tuning.memory_pattern)
-            .map_err(|error| format!("set ONNX memory pattern: {error}"))?
-            .with_execution_providers([ort::ep::CPU::default()
-                .with_arena_allocator(tuning.cpu_arena)
-                .build()])
-            .map_err(|error| format!("set ONNX CPU provider: {error}"))?
+            .map_err(|error| format!("set ONNX memory pattern: {error}"))?;
+        // Fixing both input dimensions lets Core ML compile the whole graph
+        // for one shape instead of only the pieces whose shapes it can infer.
+        if let Some((batch, length)) = tuning.fixed_shape {
+            builder = builder
+                .with_dimension_override("batch_size", batch as i64)
+                .and_then(|builder| {
+                    builder.with_dimension_override("sequence_length", length as i64)
+                })
+                .map_err(|error| format!("set ONNX dimension overrides: {error}"))?;
+        }
+        let mut builder = builder
+            .with_execution_providers(providers)
+            .map_err(|error| format!("set ONNX execution providers: {error}"))?;
+        if let Some(prefix) = tuning.profile_prefix {
+            builder = builder
+                .with_profiling(prefix)
+                .map_err(|error| format!("set ONNX profiling: {error}"))?;
+        }
+        let session = builder
             .commit_from_file(&files.model)
             .map_err(crate::semantic_index::format_embedding_init_error)?;
         let mut tokenizer = Tokenizer::from_file(&files.tokenizer)
@@ -684,6 +748,8 @@ impl OnnxPairScorer {
             pad_id,
             run_options,
             attention_units: tuning.attention_units,
+            length_buckets: tuning.length_buckets,
+            fixed_shape: tuning.fixed_shape,
         })
     }
 
@@ -691,16 +757,28 @@ impl OnnxPairScorer {
         let _ort_section = crate::ort_lifecycle::enter()
             .ok_or_else(|| "rerank stopped: the process is shutting down".to_string())?;
         let batch = encodings.len();
-        let max_len = encodings
+        let longest = encodings
             .iter()
             .map(|encoding| encoding.get_ids().len())
             .max()
             .unwrap_or(1)
             .max(1);
-        let mut ids = vec![self.pad_id; batch * max_len];
-        let mut mask = vec![0i64; batch * max_len];
-        let mut types = vec![0i64; batch * max_len];
-        for (row, encoding) in encodings.iter().enumerate() {
+        // With fixed shapes, pad the length to its bucket and the batch to the
+        // most rows that bucket allows; padding rows repeat the first row.
+        let (rows, max_len) = if let Some((batch_rows, length)) = self.fixed_shape {
+            (batch_rows.max(batch), length.max(longest))
+        } else if self.length_buckets {
+            let bucket = length_bucket(longest);
+            let fixed = (self.attention_units / (bucket * bucket)).clamp(1, MAX_PAIRS_PER_CALL);
+            (fixed.max(batch), bucket)
+        } else {
+            (batch, longest)
+        };
+        let mut ids = vec![self.pad_id; rows * max_len];
+        let mut mask = vec![0i64; rows * max_len];
+        let mut types = vec![0i64; rows * max_len];
+        for row in 0..rows {
+            let encoding = &encodings[if row < batch { row } else { 0 }];
             let base = row * max_len;
             for (column, ((id, attention), kind)) in encoding
                 .get_ids()
@@ -714,7 +792,7 @@ impl OnnxPairScorer {
                 types[base + column] = i64::from(*kind);
             }
         }
-        let shape = (batch, max_len);
+        let shape = (rows, max_len);
         let input_ids = ndarray::Array2::from_shape_vec(shape, ids)
             .map_err(|error| format!("build input_ids: {error}"))?;
         let attention_mask = ndarray::Array2::from_shape_vec(shape, mask)
@@ -758,18 +836,26 @@ impl OnnxPairScorer {
         // relevance logit. Its sigmoid is monotonic, so the raw logit orders
         // the same way.
         let width = match shape.as_slice() {
-            [rows] if *rows as usize == batch => 1,
-            [rows, columns] if *rows as usize == batch && *columns >= 1 => *columns as usize,
+            [count] if *count as usize == rows => 1,
+            [count, columns] if *count as usize == rows && *columns >= 1 => *columns as usize,
             other => return Err(format!("unexpected rerank output shape {other:?}")),
         };
         Ok((0..batch).map(|row| data[row * width]).collect())
     }
 }
 
-// Only the Unix-only cost profiling test uses this, to report how many tokens
-// each truncated (query, document) pair has and how pairs split into batches.
+// Only the Unix-only tests that measure scoring cost and run the hardware
+// experiment use these: token counts of each truncated (query, document)
+// pair, and the runtime profile.
 #[cfg(all(test, unix))]
 impl OnnxPairScorer {
+    /// Write the ONNX Runtime profile now and return its path.
+    pub(crate) fn end_profiling(&mut self) -> Result<String, String> {
+        self.session
+            .end_profiling()
+            .map_err(|error| format!("end ONNX profiling: {error}"))
+    }
+
     /// Tokens in each (query, doc) pair after truncation, as scoring sees them.
     pub(crate) fn pair_token_lengths(
         &self,
@@ -810,7 +896,24 @@ impl PairScorer for OnnxPairScorer {
             .encode_batch(pairs, true)
             .map_err(|error| RerankError::Failed(format!("tokenize: {error}")))?;
         let mut scores = Vec::with_capacity(encodings.len());
-        for range in attention_batches(&encodings, self.attention_units) {
+        // With fixed shapes, batches are cut by bucketed length so a padded
+        // batch still fits the attention budget.
+        let ranges = if let Some((rows, _)) = self.fixed_shape {
+            // One fixed shape: cut into runs of exactly `rows` pairs.
+            (0..encodings.len())
+                .step_by(rows.max(1))
+                .map(|start| start..(start + rows.max(1)).min(encodings.len()))
+                .collect()
+        } else if self.length_buckets {
+            let lengths = encodings
+                .iter()
+                .map(|encoding| length_bucket(encoding.get_ids().len().max(1)))
+                .collect::<Vec<_>>();
+            attention_batches_for_lengths(&lengths, self.attention_units)
+        } else {
+            attention_batches(&encodings, self.attention_units)
+        };
+        for range in ranges {
             if Instant::now() >= deadline {
                 return Err(RerankError::Timeout);
             }

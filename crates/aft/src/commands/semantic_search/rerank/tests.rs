@@ -547,11 +547,25 @@ fn pattern_only_requests_are_never_reranked() {
 /// Scores benchmark pools with the production local ONNX scorer, outside any
 /// search deadline. `AFT_RERANK_SCORE_POOLS` names a JSON list of
 /// `{"query", "texts"}` objects and `AFT_RERANK_SCORE_OUTPUT` the file the
-/// scores are written to (one list per pool, in input order).
-/// `AFT_RERANK_ONNX_TEST_CACHE_DIR` must hold the pinned
-/// gte-reranker-modernbert-base. Runs only when all three are set.
+/// results are written to: the scores (one list per pool, in input order),
+/// the session build time, wall and CPU time per pool, and the process's peak
+/// resident memory. `AFT_RERANK_ONNX_TEST_CACHE_DIR` must hold
+/// gte-reranker-modernbert-base at the commit pinned in `onnx::ALLOWED_MODELS`
+/// (it is downloaded there when missing). Runs only when all three are set.
+///
+/// For the hardware experiment, `AFT_RERANK_SCORE_COREML` (`ALL`,
+/// `CPU_AND_GPU`, `CPU_AND_NE` or `CPU_ONLY`) runs the graph through Core ML,
+/// `AFT_RERANK_SCORE_BUCKETS=1` pads every inference to a bucketed length
+/// and batch,
+/// `AFT_RERANK_SCORE_FIXED_SHAPE=BATCHxLENGTH` declares one static input
+/// shape and pads every inference to it,
+/// `AFT_RERANK_SCORE_PROFILE` names an ONNX Runtime profile file prefix (it
+/// slows every call, so time runs without it), and `AFT_RERANK_SCORE_LIMIT`
+/// scores only the first N pools.
+#[cfg(unix)]
 #[test]
 fn score_pools_with_local_onnx_when_asked() {
+    use ort::ep::coreml::ComputeUnits;
     let (Some(input), Some(output), Some(cache_dir)) = (
         std::env::var_os("AFT_RERANK_SCORE_POOLS"),
         std::env::var_os("AFT_RERANK_SCORE_OUTPUT"),
@@ -564,24 +578,105 @@ fn score_pools_with_local_onnx_when_asked() {
         query: String,
         texts: Vec<String>,
     }
+    let coreml = std::env::var("AFT_RERANK_SCORE_COREML")
+        .ok()
+        .map(|units| match units.as_str() {
+            "ALL" => ComputeUnits::All,
+            "CPU_AND_GPU" => ComputeUnits::CPUAndGPU,
+            "CPU_AND_NE" => ComputeUnits::CPUAndNeuralEngine,
+            "CPU_ONLY" => ComputeUnits::CPUOnly,
+            other => panic!("unknown Core ML compute units {other}"),
+        });
+    let profile_prefix = std::env::var("AFT_RERANK_SCORE_PROFILE")
+        .ok()
+        .map(|prefix| &*Box::leak(prefix.into_boxed_str()));
+    let tuning = onnx::SessionTuning {
+        coreml,
+        length_buckets: std::env::var("AFT_RERANK_SCORE_BUCKETS").is_ok_and(|value| value == "1"),
+        profile_prefix,
+        fixed_shape: std::env::var("AFT_RERANK_SCORE_FIXED_SHAPE")
+            .ok()
+            .map(|value| {
+                let (batch, length) = value.split_once('x').expect("BATCHxLENGTH");
+                (batch.parse().unwrap(), length.parse().unwrap())
+            }),
+        ..onnx::SessionTuning::default()
+    };
     let pools: Vec<Pool> = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+    let limit = std::env::var("AFT_RERANK_SCORE_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(pools.len());
+    let pools = &pools[..limit.min(pools.len())];
     let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
     let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
-    let mut scorer = onnx::OnnxPairScorer::load(model.name, &files, onnx::rerank_intra_threads())
-        .expect("load model");
-    let scores = pools
-        .iter()
-        .map(|pool| {
+    let started = Instant::now();
+    let mut scorer =
+        onnx::OnnxPairScorer::load_with(model.name, &files, onnx::rerank_intra_threads(), tuning)
+            .expect("load model");
+    let build_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut scores = Vec::new();
+    let mut timings = Vec::new();
+    for pool in pools {
+        let cpu = process_cpu_seconds();
+        let started = Instant::now();
+        scores.push(
             scorer
                 .score_pairs(
                     &pool.query,
                     &pool.texts,
                     Instant::now() + Duration::from_secs(600),
                 )
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    std::fs::write(output, serde_json::to_vec(&scores).unwrap()).unwrap();
+                .unwrap(),
+        );
+        timings.push(serde_json::json!({
+            "wall_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "cpu_s": process_cpu_seconds() - cpu,
+        }));
+    }
+    let profile = profile_prefix.map(|_| scorer.end_profiling().unwrap());
+    // SAFETY: getrusage only writes the struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    std::fs::write(
+        output,
+        serde_json::to_vec(&serde_json::json!({
+            "tuning": format!("{tuning:?}"),
+            "build_ms": build_ms,
+            "timings": timings,
+            // ru_maxrss is in bytes on macOS and kilobytes on Linux.
+            "max_rss_raw": usage.ru_maxrss,
+            "profile": profile,
+            "scores": scores,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// Prints the execution providers the loaded ONNX Runtime library reports.
+/// Runs only when `AFT_RERANK_PRINT_PROVIDERS` is set (it loads the runtime
+/// named by `ORT_DYLIB_PATH`).
+#[test]
+fn print_onnx_runtime_providers_when_asked() {
+    if std::env::var_os("AFT_RERANK_PRINT_PROVIDERS").is_none() {
+        return;
+    }
+    crate::semantic_index::pre_validate_onnx_runtime().expect("onnx runtime");
+    let api = ort::api();
+    let mut providers: *mut *mut std::ffi::c_char = std::ptr::null_mut();
+    let mut count: std::ffi::c_int = 0;
+    // SAFETY: the runtime fills a list it owns and frees it in the release
+    // call below; each entry is a NUL-terminated name.
+    unsafe {
+        let status = (api.GetAvailableProviders)(&mut providers, &mut count);
+        assert!(status.0.is_null(), "GetAvailableProviders failed");
+        for index in 0..count as isize {
+            let name = std::ffi::CStr::from_ptr(*providers.offset(index));
+            println!("provider\t{}", name.to_string_lossy());
+        }
+        let _ = (api.ReleaseAvailableProviders)(providers, count);
+    }
 }
 
 /// Prints the reranker gate's decision for each query in the JSON list named
@@ -1518,6 +1613,7 @@ fn onnx_cost_profile_when_available() {
             "AFT_RERANK_PROFILE_ATTENTION_UNITS",
             defaults.attention_units,
         ),
+        ..defaults
     };
     let doc_count = number("AFT_RERANK_PROFILE_DOCS", DEFAULT_TOP_N);
     let byte_budget = number("AFT_RERANK_PROFILE_BYTES", CANDIDATE_TEXT_BUDGET_BYTES);
