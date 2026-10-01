@@ -374,6 +374,14 @@ fn collect_type_reference_fields(
             collect_type_reference_identifiers(value, source, lang, results);
         }
     }
+
+    // Building a value with a struct literal (`ZoomResponse { .. }`) uses the
+    // type even when no annotation ever names it.
+    if lang == LangId::Rust && node.kind() == "struct_expression" {
+        if let Some(name) = node.child_by_field_name("name") {
+            collect_type_reference_identifiers(name, source, lang, results);
+        }
+    }
 }
 
 fn is_type_context_node(lang: LangId, kind: &str) -> bool {

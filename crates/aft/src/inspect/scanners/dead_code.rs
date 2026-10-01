@@ -6949,6 +6949,36 @@ pub fn false_helper() -> String { "dead".to_string() }
         );
     }
 
+    /// A struct built only with a struct literal is used even though no type
+    /// annotation names it.
+    #[test]
+    fn struct_built_by_a_struct_literal_is_live() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod zoom;\nfn main() {}\n"),
+            (
+                "src/zoom.rs",
+                "pub struct ZoomResponse {\n    pub lines: usize,\n}\npub struct PlantedDead;\npub fn respond() -> usize {\n    let response = ZoomResponse { lines: 1 };\n    response.lines\n}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/zoom.rs", "ZoomResponse", "struct"),
+            export(&root, "src/zoom.rs", "PlantedDead", "struct"),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, Vec::new(), entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/zoom.rs::PlantedDead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
     /// Two `new` methods on different types in one file share one liveness
     /// node; report it once with both definition lines instead of twice.
     #[test]

@@ -12151,7 +12151,7 @@ fn resolve_rust_target<I: ResolverIndex>(
 
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
-            rust_target_for_use(index, caller_file, import, short_name)
+            rust_target_for_use(index, caller_file, import, short_name, caller_data)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
@@ -12390,7 +12390,9 @@ fn rust_target_for_use<I: ResolverIndex>(
     caller_file: &str,
     import: &ImportStatement,
     short_name: &str,
+    caller_data: &FileCallData,
 ) -> Option<(String, String)> {
+    let imports = &caller_data.import_block.imports;
     let path = rust_use_body(&import.raw_text)
         .unwrap_or(&import.module_path)
         .trim()
@@ -12404,7 +12406,7 @@ fn rust_target_for_use<I: ResolverIndex>(
         });
         if let Some(imported) = imported {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
-            let file = rust_use_module_file(index, caller_file, &prefix_segments)?;
+            let file = rust_use_module_file(index, caller_file, &prefix_segments, imports)?;
             // The module may only re-export the item (`pub use inner::{f};`);
             // follow that to the definition, as qualified paths already do.
             return Some(rust_resolve_reexport_if_symbol_missing(
@@ -12426,7 +12428,7 @@ fn rust_target_for_use<I: ResolverIndex>(
     if segments.len() < 2 {
         return None;
     }
-    let file = rust_use_module_file(index, caller_file, &segments[..segments.len() - 1])?;
+    let file = rust_use_module_file(index, caller_file, &segments[..segments.len() - 1], imports)?;
     Some(rust_resolve_reexport_if_symbol_missing(
         index,
         file,
@@ -12436,8 +12438,34 @@ fn rust_target_for_use<I: ResolverIndex>(
 
 /// The file of the module a `use` path names. A path may start with another
 /// workspace crate (`use aft::callgraph_store::{..}` in an integration test or
-/// a binary), which is checked first, as qualified call paths do.
+/// a binary), which is checked first, as qualified call paths do. It may also
+/// start with a module another `use` in the same file brought into scope
+/// (`use aft::search::{paging};` then `use paging::{build};`).
 fn rust_use_module_file<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    module_segments: &[&str],
+    imports: &[ImportStatement],
+) -> Option<String> {
+    if let Some(file) = rust_use_module_file_direct(index, caller_file, module_segments) {
+        return Some(file);
+    }
+    let (first, rest) = module_segments.split_first()?;
+    imports
+        .iter()
+        .flat_map(rust_module_alias_segments)
+        .filter(|(local_name, _)| local_name == first)
+        .find_map(|(_, mut alias_segments)| {
+            alias_segments.extend(rest.iter().map(|segment| (*segment).to_string()));
+            let alias_refs = alias_segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            rust_use_module_file_direct(index, caller_file, &alias_refs)
+        })
+}
+
+fn rust_use_module_file_direct<I: ResolverIndex>(
     index: &I,
     caller_file: &str,
     module_segments: &[&str],
@@ -22845,11 +22873,12 @@ edition = "2021"
             "pub mod alerts;\npub mod cache;\npub mod net;\n",
         );
         // The binary reaches the library through the crate name, both as a
-        // qualified call and through an aliased `use` list entry.
+        // qualified call and through an aliased `use` list entry whose module
+        // was itself brought into scope by an earlier `use`.
         write_file(
             root,
             "src/main.rs",
-            "use path_forms_fixture::alerts::{normalize as tidy};\n\nfn main() {\n    path_forms_fixture::net::start();\n    tidy(\"x\");\n}\n",
+            "use path_forms_fixture::{alerts};\nuse alerts::{normalize as tidy};\n\nfn main() {\n    path_forms_fixture::net::start();\n    tidy(\"x\");\n}\n",
         );
         // `registry::` names a child module of `net`; `cache::` is bound by
         // the `self` entry of a use list.
