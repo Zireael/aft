@@ -1095,8 +1095,10 @@ fn help_and_dry_run_state_the_operator_contract() {
 /// The real census, narrowed to processes this test started, so the test
 /// can tell whether its own process was classified on a host that also runs
 /// other AFT processes (this test suite, or the operator's daemon).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct OnlyPids(Vec<u32>);
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ProcessCensus for OnlyPids {
     fn take(&self) -> Result<Vec<CensusFinding>, String> {
         Ok(aft::migration::prune_legacy::SystemCensus
@@ -1112,8 +1114,10 @@ impl ProcessCensus for OnlyPids {
 }
 
 /// Kills a child process when the test ends, however it ends.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct KillOnDrop(Child);
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -1147,13 +1151,17 @@ fn the_census_sees_an_aft_executable_under_a_path_with_spaces() {
     let pid = child.0.id();
     let census = OnlyPids(vec![pid]);
     let findings = census.take().unwrap();
-    assert!(
-        matches!(findings.as_slice(), [CensusFinding::Aft { pid: found, .. }] if *found == pid),
-        "the census missed the AFT process at {executable:?}: {findings:?}"
-    );
     let (exit, out) = prune(&storage, true, FIFTEEN_DAYS, &census, None);
     drop(child);
-    assert_eq!(exit, PruneExit::Refused, "{out}");
+    assert_eq!(
+        exit,
+        PruneExit::Refused,
+        "the census missed the AFT process at {executable:?} ({findings:?}), so the prune ran: {out}"
+    );
+    assert!(
+        matches!(findings.as_slice(), [CensusFinding::Aft { pid: found, .. }] if *found == pid),
+        "{findings:?}"
+    );
     assert!(
         out.contains(&format!("live AFT process pid {pid}")),
         "{out}"
