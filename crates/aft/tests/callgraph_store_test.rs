@@ -1,5 +1,5 @@
 #[path = "helpers/mod.rs"]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{

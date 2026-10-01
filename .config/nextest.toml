@@ -82,7 +82,7 @@ subc = { max-threads = 4 }
 storm = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(=lsp_registry_test) or binary(=lsp_transport_test) or test(/^lsp_/) or test(/^inspect_(diagnostics|tsconfig_membership)_test::/)'
+filter = 'test(/^lsp_/) or test(/^inspect_(diagnostics|tsconfig_membership)_test::/)'
 test-group = 'lsp'
 
 [[profile.default.overrides]]

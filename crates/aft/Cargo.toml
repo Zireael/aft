@@ -9,6 +9,9 @@ keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 rust-version.workspace = true
+# Aggregate integration suites avoid linking one executable per source file.
+# Explicit targets leave fixture/descriptor paths stable without autodiscovery.
+autotests = false
 
 [lib]
 name = "aft"
@@ -21,6 +24,64 @@ path = "src/main.rs"
 [[bin]]
 name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
+
+[[test]]
+name = "engine"
+path = "tests/engine/main.rs"
+
+[[test]]
+name = "list_envelope"
+path = "tests/list_envelope/main.rs"
+
+[[test]]
+name = "semantic"
+path = "tests/semantic/main.rs"
+
+[[test]]
+name = "alert"
+path = "tests/alert/main.rs"
+
+[[test]]
+name = "rest"
+path = "tests/rest/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+# Live watchers must not share a harness with unrelated process-heavy tests.
+[[test]]
+name = "watcher_integration"
+path = "tests/watcher_integration/main.rs"
+
+# CI runs sandbox probes single-threaded with mandatory Landlock on Linux.
+[[test]]
+name = "sandbox_launch_probe"
+path = "tests/sandbox_launch_probe.rs"
+
+# The semantic wrapper changes process cwd; keep it out of the shared harness.
+[[test]]
+name = "semantic_test"
+path = "tests/semantic_test.rs"
+
+# Counting allocators measure the entire process heap, so unrelated tests would
+# contaminate their working-set bounds even with a shared allocator implementation.
+[[test]]
+name = "semantic_embed_working_set_test"
+path = "tests/semantic_embed_working_set_test.rs"
+
+[[test]]
+name = "semantic_embed_overflow_recovery_working_set_test"
+path = "tests/semantic_embed_overflow_recovery_working_set_test.rs"
+
+# Ignored macOS heap probes also need an uncontaminated process-wide allocator.
+[[test]]
+name = "daemon_malloc_small_growth_repro"
+path = "tests/daemon_malloc_small_growth_repro.rs"
+
+[lints.rust]
+# The ignored navigation profile is enabled explicitly for manual measurements.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'] }
 
 [features]
 # Explicit opt-in for cross-process timing controls used by integration tests.

@@ -113,7 +113,7 @@ function markdownTable(headers: string[], rows: string[][]): string {
 
 function runCompressionTest() {
   const proc = Bun.spawnSync({
-    cmd: ["cargo", "test", "--test", "compress_spike", "--", "--nocapture"],
+    cmd: ["cargo", "test", "-p", "agent-file-tools", "--test", "rest", "compress_spike::", "--", "--nocapture"],
     cwd: REPO_ROOT,
     stdout: "pipe",
     stderr: "pipe",

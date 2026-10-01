@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! AFT_GH_SHIM_WIRE_GOLDENS_REGEN=1 cargo test -p agent-file-tools \
-//!     --test gh_shim_wire_goldens_test -- --test-threads=1
+//!     --test rest gh_shim_wire_goldens_test:: -- --test-threads=1
 //! ```
 //!
 //! Isolation: every run gets its own HOME, XDG config/state directories,
