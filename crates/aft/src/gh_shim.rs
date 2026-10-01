@@ -12114,7 +12114,7 @@ INHERITED FLAGS
         assert!(text.ends_with("Governed writes unavailable: governed routing is unavailable: the last rung recorded was R2 (agent_credentials_present), not R3\n"), "{text}");
         assert!(!text.contains("GH_TOKEN"), "{text}");
 
-        // Outside any repository there is no binding to name.
+        // Outside any repository there is no repository-to-bot binding to name.
         fixture.record_r3();
         let (text, exit_code) = auth_status_report(fixture.answer(&["auth", "status"], None));
         assert_eq!(exit_code, 1);
@@ -12228,8 +12228,9 @@ INHERITED FLAGS
 
     #[test]
     fn auth_status_token_forms_stay_refused_and_unknown_flags_are_refused_by_name() {
-        // The token forms and help never reach the local answer; the token
-        // forms keep their operator-credential refusal.
+        // `-t`, `--show-token` and their spellings never reach the local
+        // answer: they keep the existing refusal for commands that would
+        // print the operator's token. `--help` stays with the real gh.
         for raw in [
             &["auth", "status", "-t"][..],
             &["auth", "status", "--show-token"],
