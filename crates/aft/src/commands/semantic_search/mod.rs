@@ -182,7 +182,28 @@ fn with_first_search_index_load_wait_budget_for_test<T>(
 }
 const BORROWED_SEARCH_LOAD_WARNING: &str = "Borrowed search index loading stopped at the interactive budget; returning a bounded lexical scan (no semantic ranking).";
 const BORROWED_SEARCH_LOAD_FOOTER: &str = "[Degraded: borrowed search index loading stopped at the interactive budget; bounded lexical scan only.]";
-const BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS: &str = "Semantic lane is loading the shared index; lexical results below are complete for exact/identifier matches.";
+const BORROWED_SEMANTIC_LOADING: &str = "Semantic lane is loading the shared index";
+
+/// The opening line of a reply served while a shared (borrowed) semantic index
+/// is still loading, so only the index-backed lanes ran.
+///
+/// It names what was searched and what the exact pass found, never more: an
+/// empty exact set is reported as empty. Calling the lexical list "complete
+/// for exact matches" when the exact pass found nothing told readers a string
+/// was absent from the project when it was only absent from the page.
+fn borrowed_semantic_loading_notice(exact_match_files: usize) -> String {
+    match exact_match_files {
+        0 => format!(
+            "{BORROWED_SEMANTIC_LOADING}; the trigram index's exact pass found no exact match for the query, so the results below are lexical matches on its words."
+        ),
+        1 => format!(
+            "{BORROWED_SEMANTIC_LOADING}; results below come from the trigram index: the 1 file with an exact match first, then lexical matches."
+        ),
+        files => format!(
+            "{BORROWED_SEMANTIC_LOADING}; results below come from the trigram index: the {files} files with an exact match first, then lexical matches."
+        ),
+    }
+}
 const STALE_CLI_SNAPSHOT_WARNING: &str = "Serving the last usable standing-root CLI snapshot after its freshness could not be verified; rerun `npx @cortexkit/aft index` to refresh it.";
 /// Cap on the rank-0 full-symbol preview. Sized to absorb the follow-up zoom for
 /// virtually every real function/type so the agent doesn't re-read a file it
@@ -1793,9 +1814,10 @@ fn handle_external_semantic_or_hybrid_search(
     );
     if semantic_status != "ready" {
         let disclosure = if semantic_status == "building" {
-            BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
+            borrowed_semantic_loading_notice(ranked.exact_match_files)
         } else {
             "Semantic search is not available for the external root; lexical engine results follow."
+                .to_string()
         };
         text = format!("{disclosure}\n\n{text}");
     }
@@ -2457,6 +2479,9 @@ struct EngineRanking {
     missing_on_disk: usize,
     anchored_admission: (usize, usize),
     exact_disclosures: Vec<String>,
+    /// Files the exact pass matched, before paging. A reply's notices use it to
+    /// say what the exact pass found instead of assuming it found something.
+    exact_match_files: usize,
     /// One short line when a configured reranker was skipped (for example on
     /// a timeout) and the fused order was kept.
     rerank_note: Option<String>,
@@ -2711,6 +2736,10 @@ fn run_engine_ranking(
         .map(String::as_str)
         .collect::<Vec<_>>();
     let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    // The lexical lane still ranks by the query's words, but only the tokens the
+    // exact lane accepts may promote a lexical candidate to exact evidence; a
+    // hyphenated literal has none, so only a file holding the whole string can.
+    let exactness_tokens = exact_lane::exact_verification_tokens(query);
     let candidate_filter =
         |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
     let lexical = CanonicalLexicalLane::from_snapshot(
@@ -2736,7 +2765,7 @@ fn run_engine_ranking(
         .take(lexical_lane::LEXICAL_ENUMERATION_LIMIT)
         .filter_map(|candidate| {
             let (exact, occurrences, window_lines) =
-                lexical_candidate_exactness(&candidate.result.path, query, &content_tokens);
+                lexical_candidate_exactness(&candidate.result.path, query, &exactness_tokens);
             if !exact {
                 return None;
             }
@@ -2833,6 +2862,7 @@ fn run_engine_ranking(
     // contract and rendered the same file twice.
     let mut seen_exact = HashSet::new();
     exact_candidates.retain(|candidate| seen_exact.insert(candidate.path.clone()));
+    let exact_match_files = exact_candidates.len();
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query
@@ -3320,6 +3350,7 @@ fn run_engine_ranking(
         missing_on_disk,
         anchored_admission,
         exact_disclosures,
+        exact_match_files,
         rerank_note,
     })
 }
@@ -3398,7 +3429,7 @@ fn handle_engine_only_search(
             "Checking the semantic backend ({base_url})"
         )))
     } else {
-        semantic_lane_disclosure(ctx, semantic_snapshot)
+        semantic_lane_disclosure(ctx, semantic_snapshot, ranked.exact_match_files)
     };
     if let Some(disclosure) = backend_unavailable.as_deref() {
         text = format!("{disclosure}; lexical fallback results follow.\n\n{text}");
@@ -4273,7 +4304,9 @@ fn semantic_unavailable_grep_fallback_response(
     };
     let result = &fallback.grep;
     let detail = if borrowed_loading && !result.matches.is_empty() {
-        BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string()
+        format!(
+            "{BORROWED_SEMANTIC_LOADING}; results below are literal matches for the query from a bounded file scan."
+        )
     } else {
         detail
     };
@@ -5193,10 +5226,12 @@ impl SemanticLaneDisclosure {
 
 /// The disclosure for a semantic lane that is not serving, or `None` when it
 /// is ready or turned off by configuration (the user asked for that, so there
-/// is nothing to explain).
+/// is nothing to explain). `exact_match_files` is how many files the exact
+/// pass matched, so a borrowed-index notice can say what it actually found.
 fn semantic_lane_disclosure(
     ctx: &AppContext,
     status: &SemanticIndexStatus,
+    exact_match_files: usize,
 ) -> Option<SemanticLaneDisclosure> {
     match status {
         SemanticIndexStatus::Ready { .. } | SemanticIndexStatus::Disabled => None,
@@ -5207,9 +5242,10 @@ fn semantic_lane_disclosure(
             )))
         }
         SemanticIndexStatus::Building { .. } if ctx.shared_artifacts_read_only() => {
+            let notice = borrowed_semantic_loading_notice(exact_match_files);
             Some(SemanticLaneDisclosure {
-                text: BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string(),
-                note: BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string(),
+                text: notice.clone(),
+                note: notice,
             })
         }
         SemanticIndexStatus::Building { stage, .. }
@@ -6778,7 +6814,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("rebuilding"), "{text}");
-        assert!(!text.contains(BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS));
+        assert!(!text.contains(BORROWED_SEMANTIC_LOADING));
         let results = response["results"].as_array().expect("results array");
         assert!(
             results.iter().any(|result| {
@@ -7150,14 +7186,80 @@ mod tests {
             &ctx,
         ));
         let text = response["text"].as_str().expect("response text");
-        assert!(text.contains(
-            "Semantic lane is loading the shared index; lexical results below are complete for exact/identifier matches."
-        ));
+        // The notice names the trigram index and what its exact pass found
+        // (the one file declaring the needle); it must not claim the lexical
+        // list is complete for exact matches it never checked.
+        assert!(
+            text.starts_with(
+                "Semantic lane is loading the shared index; results below come from the trigram index: the 1 file with an exact match first, then lexical matches."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("complete for exact"), "{text}");
         assert!(!text.contains("still building"));
         assert!(!text.contains("rebuilding"));
         assert!(response["results"]
             .as_array()
             .is_some_and(|results| !results.is_empty()));
+    }
+
+    #[test]
+    fn borrowed_loading_notice_reports_what_the_exact_pass_found() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let literal_file = project.path().join("scripts/check.py");
+        let field_file = project.path().join("src/server.rs");
+        let literal_source = "CHECKS = [\"residue-source-hash\"]\n";
+        let field_source = "pub struct Registry {\n    source: String,\n}\n";
+        for (path, text) in [(&literal_file, literal_source), (&field_file, field_source)] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(path, text).expect("write file");
+        }
+
+        let ctx = test_context(project.path());
+        ctx.set_cache_role(true, None);
+        let mut index = SearchIndex::new();
+        index.index_file(&literal_file, literal_source.as_bytes());
+        index.index_file(&field_file, field_source.as_bytes());
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+
+        // The literal exists in one file: the notice counts that file, and the
+        // `source` field does not inflate the count.
+        let present = response_value(handle_semantic_search(
+            &semantic_request("residue-source-hash", 5),
+            &ctx,
+        ));
+        let text = present["text"].as_str().expect("response text");
+        assert!(
+            text.starts_with(
+                "Semantic lane is loading the shared index; results below come from the trigram index: the 1 file with an exact match first, then lexical matches."
+            ),
+            "{text}"
+        );
+
+        // The literal exists nowhere: the notice says the exact pass found
+        // nothing instead of vouching for the lexical list.
+        let absent = response_value(handle_semantic_search(
+            &semantic_request("residue-target-hash", 5),
+            &ctx,
+        ));
+        let text = absent["text"].as_str().expect("response text");
+        assert!(
+            text.starts_with(
+                "Semantic lane is loading the shared index; the trigram index's exact pass found no exact match for the query, so the results below are lexical matches on its words."
+            ),
+            "{text}"
+        );
     }
 
     #[test]

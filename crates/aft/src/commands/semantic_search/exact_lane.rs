@@ -80,6 +80,20 @@ pub fn e2_window_scan_needed(normalized_text: &str, content_tokens: &[String]) -
             .all(|token| normalized_text.contains(token))
 }
 
+/// The query words that may stand in for the whole query as exact evidence: a
+/// declaration named after one of them, or all of them within a short window.
+///
+/// A single hyphenated token is a literal name, so it gets none: its parts are
+/// not words the user typed, and only a file containing the whole string (E1)
+/// is exact evidence for it.
+pub fn exact_verification_tokens(query: &str) -> Vec<String> {
+    if crate::search_b2::router::is_hyphenated_literal(query) {
+        Vec::new()
+    } else {
+        extract_content_tokens(query)
+    }
+}
+
 /// Options controlling fallback execution.
 #[derive(Clone, Default)]
 pub struct FallbackExactOptions {
@@ -216,7 +230,7 @@ impl ExactLane {
 
         let phrase = exact_phrase(query);
         let norm_phrase = normalize_exact_phrase(phrase);
-        let content_tokens = extract_content_tokens(query);
+        let content_tokens = exact_verification_tokens(query);
 
         let mut results = Vec::new();
         let mut file_digests = HashMap::new();
@@ -546,5 +560,118 @@ fn extract_identifier(s: &str) -> Option<String> {
         None
     } else {
         Some(ident)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::semantic_search::EvidenceKind;
+    use std::path::PathBuf;
+
+    /// A project where only `scripts/check.py` contains `residue-source-hash`.
+    /// The other two files hold its parts: a declared field named `source`,
+    /// and all three words within three lines.
+    fn hyphenated_literal_project() -> (tempfile::TempDir, Vec<(PathBuf, String)>) {
+        let project = tempfile::tempdir().expect("create project dir");
+        let files = [
+            (
+                "src/server.rs",
+                "pub struct Registry {\n    source: String,\n}\n",
+            ),
+            (
+                "docs/notes.md",
+                "The residue left behind\nby the source\nchanges its hash.\n",
+            ),
+            (
+                "scripts/check.py",
+                "CHECKS = [\"residue-source-hash\", \"slice-fences\"]\n",
+            ),
+        ];
+        let mut entries = Vec::new();
+        for (relative, text) in files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write file");
+            entries.push((path, text.to_string()));
+        }
+        (project, entries)
+    }
+
+    fn exact_paths(results: &[CandidateResult], root: &Path) -> Vec<(String, EvidenceKind)> {
+        results
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate
+                        .path
+                        .strip_prefix(root)
+                        .unwrap_or(&candidate.path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    candidate.evidence.kind,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hyphenated_literal_is_exact_only_where_the_whole_string_occurs() {
+        let (project, entries) = hyphenated_literal_project();
+        let mut index = SearchIndex::new();
+        for (path, text) in &entries {
+            index.index_file(path, text.as_bytes());
+        }
+        index.ready = true;
+
+        let ready = ExactLane::new().execute_ready_mode(
+            &index.snapshot(),
+            project.path(),
+            "residue-source-hash",
+            false,
+        );
+        assert_eq!(
+            exact_paths(&ready.results, project.path()),
+            vec![("scripts/check.py".to_string(), EvidenceKind::E1)]
+        );
+
+        let fallback = ExactLane::new().execute_fallback_mode(
+            project.path(),
+            "residue-source-hash",
+            false,
+            &FallbackExactOptions::default(),
+        );
+        assert_eq!(
+            exact_paths(&fallback.verified_set.results, project.path()),
+            vec![("scripts/check.py".to_string(), EvidenceKind::E1)]
+        );
+    }
+
+    #[test]
+    fn spaced_words_keep_declaration_and_window_evidence() {
+        // The same words separated by spaces are ordinary query words, so the
+        // declared field and the three-line window still count as exact.
+        let (project, entries) = hyphenated_literal_project();
+        let mut index = SearchIndex::new();
+        for (path, text) in &entries {
+            index.index_file(path, text.as_bytes());
+        }
+        index.ready = true;
+
+        let ready = ExactLane::new().execute_ready_mode(
+            &index.snapshot(),
+            project.path(),
+            "residue source hash",
+            false,
+        );
+        let found = exact_paths(&ready.results, project.path());
+        assert!(
+            found.contains(&("src/server.rs".to_string(), EvidenceKind::Definition)),
+            "{found:?}"
+        );
+        assert!(
+            found.contains(&("docs/notes.md".to_string(), EvidenceKind::E2)),
+            "{found:?}"
+        );
     }
 }

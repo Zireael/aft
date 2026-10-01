@@ -947,7 +947,8 @@ impl SearchIndexSnapshot {
     ) -> Vec<ExactPassMatch> {
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
-        let content_tokens = crate::query_shape::extract_content_tokens(query);
+        let content_tokens = exact_lane::exact_verification_tokens(query);
+        let literal = crate::search_b2::router::is_hyphenated_literal(query);
 
         let mut candidate_file_ids = BTreeSet::new();
 
@@ -967,8 +968,12 @@ impl SearchIndexSnapshot {
             }
         }
 
-        // If no candidate trigrams (e.g. short query), check active files
-        if candidate_file_ids.is_empty() && (phrase.len() < 3 || content_tokens.is_empty()) {
+        // If no candidate trigrams (e.g. short query), check active files. A
+        // hyphenated literal can only match through its own phrase trigrams,
+        // so an empty candidate set already proves no file contains it.
+        if candidate_file_ids.is_empty()
+            && (phrase.len() < 3 || (content_tokens.is_empty() && !literal))
+        {
             candidate_file_ids.extend(self.active_file_ids());
         }
 

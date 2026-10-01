@@ -1211,6 +1211,124 @@ fn ranked_files(response: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Only `scripts/check.py` contains the literal `residue-source-hash`. The other
+/// two files hold its parts: `src/server.rs` declares a field named `source`,
+/// and `docs/notes.md` mentions all three words within three lines. Before
+/// hyphenated queries were verified as literals, both of those ranked above
+/// the file holding the string and were labelled `[exact]`.
+fn project_with_hyphenated_literal() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
+    let project = tempfile::tempdir().expect("create project dir");
+    let files = [
+        (
+            "src/server.rs",
+            "pub struct Registry {\n    source: String,\n}\n",
+        ),
+        (
+            "docs/notes.md",
+            "The residue left behind\nby the source\nchanges its hash.\n",
+        ),
+        (
+            "scripts/check.py",
+            "CHECKS = [\"residue-source-hash\", \"slice-fences\"]\n",
+        ),
+    ];
+    let mut entries = Vec::new();
+    for (relative, text) in files {
+        let path = project.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&path, text).expect("write file");
+        entries.push((path, text.to_string()));
+    }
+    (project, entries)
+}
+
+/// Every result marked exact, in the JSON and in the rendered `[exact]`
+/// header, must be a file that contains `literal` verbatim.
+fn assert_exact_only_on_files_containing(response: &Value, literal: &str) {
+    let mut exact_files = Vec::new();
+    for result in response["results"].as_array().expect("results array") {
+        let file = result["file"].as_str().expect("result file");
+        if result["exact"] == true {
+            let text = std::fs::read_to_string(file).expect("read exact result");
+            assert!(
+                text.contains(literal),
+                "{file} is marked exact but does not contain {literal:?}: {response}"
+            );
+            exact_files.push(file.replace('\\', "/"));
+        }
+    }
+    let rendered = response["text"].as_str().expect("rendered response");
+    for line in rendered.lines().filter(|line| line.contains("[exact]")) {
+        // A header reads `<path>[:line] [exact]`; local replies show the path
+        // relative to the project, external ones show it absolute.
+        let shown = line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .replace('\\', "/");
+        let shown = shown
+            .rsplit_once(':')
+            .filter(|(_, line_number)| line_number.chars().all(|c| c.is_ascii_digit()))
+            .map_or(shown.as_str(), |(path, _)| path)
+            .to_string();
+        assert!(
+            exact_files.iter().any(|file| file.ends_with(&shown)),
+            "[exact] header on a file that does not contain {literal:?}: {line}\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact() {
+    let (project, entries) = project_with_hyphenated_literal();
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("residue-source-hash", None, 5),
+        &ctx,
+    ));
+
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("scripts/check.py"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["exact"], true, "{response}");
+    assert!(response["text"]
+        .as_str()
+        .expect("rendered response")
+        .contains("[exact]"));
+    assert_exact_only_on_files_containing(&response, "residue-source-hash");
+}
+
+#[test]
+fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact() {
+    // A path naming another Git project searches that project's persisted
+    // (borrowed) index instead of the session's own, so the literal routing
+    // must hold on that path too.
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (external_project, _entries) = project_with_hyphenated_literal();
+    init_git(external_project.path());
+    commit_all(external_project.path());
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let session_project = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("residue-source-hash", None, external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["borrowed"], true, "{response}");
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("scripts/check.py"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["exact"], true, "{response}");
+    assert_exact_only_on_files_containing(&response, "residue-source-hash");
+}
+
 #[test]
 fn quoted_phrase_ranks_source_above_data_file_that_repeats_it() {
     let (project, entries) = project_with_phrase_in_source_and_data();

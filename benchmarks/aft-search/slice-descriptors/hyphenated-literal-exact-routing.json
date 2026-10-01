@@ -1,0 +1,19 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "phrase_present_not_surfaced",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/search_b2/router.rs",
+    "search_b2::router::tests::hyphen_joined_words_are_one_literal",
+    "commands::semantic_search::exact_lane::tests::hyphenated_literal_is_exact_only_where_the_whole_string_occurs",
+    "commands::semantic_search::tests::borrowed_loading_notice_reports_what_the_exact_pass_found",
+    "aft_search_contract_test::hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact",
+    "aft_search_contract_test::external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact",
+    "real-query-paged-hyphenated-literal-rows-900010-900017"
+  ],
+  "slices": [
+    "hyphenated-literal-rows",
+    "hyphenated-literal-exact-routing"
+  ],
+  "note": "The previous commits add eight hyphenated-literal real-query rows and record the reference on the unchanged engine. This change makes a query that is one hyphen-joined identifier-like token verify as a literal in the exact lane: only a file containing the whole string is exact evidence (E1); the token's parts no longer supply declaration or three-line-window evidence, so they cannot carry the [exact] label or outrank the file holding the literal. The borrowed-index loading notice now says what the exact pass found instead of calling the lexical list complete. Other query shapes and their exact evidence are unchanged."
+}

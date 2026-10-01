@@ -299,6 +299,37 @@ pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
     qualified || snake_case || kebab_case || camel_case
 }
 
+/// Whether the exact-lane input is one hyphen-joined, identifier-like token,
+/// such as `residue-source-hash`, `max-depth` or `btn-primary`.
+///
+/// Such a query names one literal string: a check name, a CLI flag, a
+/// kebab-case key. Its hyphens are part of the name, so the exact lane must
+/// look for the whole string. Splitting it into `residue`, `source` and `hash`
+/// would let a field named `source`, or three lines that happen to mention
+/// the parts, pass as exact evidence and outrank every file that contains the
+/// literal. Surrounding quotes are ignored, matching how the exact lane reads
+/// a quoted phrase.
+pub(crate) fn is_hyphenated_literal(query: &str) -> bool {
+    let mut token = query.trim();
+    if token.len() >= 2 {
+        let first = token.as_bytes()[0];
+        if matches!(first, b'\'' | b'"' | b'`') && token.as_bytes()[token.len() - 1] == first {
+            token = &token[1..token.len() - 1];
+        }
+    }
+    let mut segments = token.split('-');
+    let is_word = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    segments.next().is_some_and(is_word) && {
+        let mut rest = segments.peekable();
+        rest.peek().is_some() && rest.all(is_word)
+    }
+}
+
 fn is_authoritative_path_token(token: &str) -> bool {
     let basename = token
         .rsplit(['/', '\\'])
@@ -369,4 +400,43 @@ fn qualifying_exact_tokens(input: &str) -> impl Iterator<Item = &str> {
     input
         .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
         .filter(|token| token.len() >= 3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_hyphenated_literal;
+
+    #[test]
+    fn hyphen_joined_words_are_one_literal() {
+        for query in [
+            "residue-source-hash",
+            "max-depth",
+            "aft-escalation-payload-v3",
+            "snake_part-kebab_part",
+            "\"residue-source-hash\"",
+            "`btn-primary`",
+            "  residue-source-hash  ",
+        ] {
+            assert!(is_hyphenated_literal(query), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn other_shapes_are_not_hyphenated_literals() {
+        for query in [
+            "residue",
+            "residue_source_hash",
+            "residue source hash",
+            "residue-source hash",
+            "-max-depth",
+            "max-depth-",
+            "max--depth",
+            "src/residue-source.rs",
+            "residue-source.hash",
+            "\"residue-source-hash",
+            "",
+        ] {
+            assert!(!is_hyphenated_literal(query), "{query:?}");
+        }
+    }
 }
