@@ -79,8 +79,7 @@ async fn next_frame(stream: &mut TcpStream) -> Result<Frame, HarnessError> {
     }
 }
 fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
-    // Windows verbatim paths do not normalize forward slashes in joined strings.
-    // Join individual components so canonicalized temp roots remain usable.
+    // Construct the config location from the same components on every platform.
     let directory = root.join("project").join(".cortexkit");
     std::fs::create_dir_all(&directory).map_err(|error| {
         HarnessError::new(format!(
@@ -91,6 +90,66 @@ fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
     let config = directory.join("aft.jsonc");
     std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "callgraph_store": false, "search_index": false, "semantic_search": false})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
     Ok(())
+}
+
+fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, HarnessError> {
+    std::fs::create_dir_all(root).map_err(|error| {
+        HarnessError::new(format!("creating provider cwd {}: {error}", root.display()))
+    })?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    // CreateProcess uses the parent's cwd when none is supplied. Always launch
+    // inside this fixture, independently of the test runner's working directory.
+    command.current_dir(root);
+    for (variable, component) in [
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+    ] {
+        let directory = root.join(component);
+        std::fs::create_dir_all(&directory).map_err(|error| {
+            HarnessError::new(format!(
+                "creating {variable} {}: {error}",
+                directory.display()
+            ))
+        })?;
+        command.env(variable, directory);
+    }
+    command
+        .arg("--subc")
+        .arg(connection_path)
+        .env_remove("SUBC_MODULE_ID")
+        .env_remove("SUBC_LAUNCH_NONCE")
+        .env_remove("AFT_STORAGE_DIR")
+        .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(command)
+}
+
+#[test]
+fn provider_command_uses_existing_fixture_cwd_and_xdg_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("not-yet-created");
+    let command = provider_command(&root, &root.join("connection.json")).unwrap();
+    assert_eq!(command.get_current_dir(), Some(root.as_path()));
+    assert!(root.is_dir());
+    let directories: Vec<_> = command
+        .get_envs()
+        .filter(|(name, _)| name.to_string_lossy().starts_with("XDG_"))
+        .collect();
+    assert_eq!(directories.len(), 4);
+    for (_, value) in directories {
+        let path = Path::new(value.unwrap());
+        assert!(path.is_dir(), "{} must exist before spawn", path.display());
+        assert_eq!(path.parent(), Some(root.as_path()));
+    }
+    // --version exits without attaching, so this directly exercises OS process
+    // creation with the fixture cwd and env rather than requiring a fake daemon.
+    let mut probe = provider_command(&root, &root.join("connection.json")).unwrap();
+    probe.args(["--version"]);
+    assert!(probe.status().unwrap().success());
 }
 
 #[test]
@@ -112,13 +171,7 @@ fn provider_project_setup_accepts_absent_and_canonical_roots() {
     .unwrap();
     assert_eq!(config["disabled_tools"], json!(["aft_outline"]));
     assert_eq!(config["callgraph_store"], false);
-    #[cfg(windows)]
-    {
-        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
-        // A slash-separated suffix stays literal under a verbatim prefix, rather
-        // than addressing the project and .cortexkit directories created above.
-        assert!(std::fs::write(canonical.join("project/.cortexkit/aft.jsonc"), b"{}").is_err());
-    }
+    assert!(canonical.join("project").join(".cortexkit").is_dir());
 }
 
 #[async_trait]
@@ -152,26 +205,15 @@ impl Harness for Subject {
                 connection_path.display()
             ))
         })?;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
-        command
-            .arg("--subc")
-            .arg(&connection_path)
-            .env_remove("SUBC_MODULE_ID")
-            .env_remove("SUBC_LAUNCH_NONCE")
-            .env_remove("AFT_STORAGE_DIR")
-            .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_STATE_HOME", root.join("state"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        let mut command = provider_command(root, &connection_path)?;
         let child = command.spawn().map_err(|error| {
             HarnessError::new(format!(
-                "launching {} with --subc {}: {error}",
+                "launching {} with --subc {} in cwd {} (exe_exists={}, cwd_exists={}): {error}",
                 env!("CARGO_BIN_EXE_aft"),
-                connection_path.display()
+                connection_path.display(),
+                root.display(),
+                Path::new(env!("CARGO_BIN_EXE_aft")).is_file(),
+                root.is_dir()
             ))
         })?;
         // Own the child before awaiting the handshake so failed setup also reaps it.
