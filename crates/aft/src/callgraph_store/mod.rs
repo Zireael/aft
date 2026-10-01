@@ -12402,7 +12402,13 @@ fn rust_target_for_use<I: ResolverIndex>(
             let module_segments =
                 rust_resolve_segments_with_index(index, caller_file, &prefix_segments)?;
             let file = rust_file_for_segments(index, caller_file, &module_segments)?;
-            return Some((file, short_name.to_string()));
+            // The module may only re-export the item (`pub use inner::{f};`);
+            // follow that to the definition, as qualified paths already do.
+            return Some(rust_resolve_reexport_if_symbol_missing(
+                index,
+                file,
+                short_name.to_string(),
+            ));
         }
         return None;
     }
@@ -12422,7 +12428,11 @@ fn rust_target_for_use<I: ResolverIndex>(
     let module_segments =
         rust_resolve_segments_with_index(index, caller_file, &segments[..segments.len() - 1])?;
     let file = rust_file_for_segments(index, caller_file, &module_segments)?;
-    Some((file, segments.last().unwrap_or(&short_name).to_string()))
+    Some(rust_resolve_reexport_if_symbol_missing(
+        index,
+        file,
+        segments.last().unwrap_or(&short_name).to_string(),
+    ))
 }
 
 fn rust_workspace_file_for_segments<I: ResolverIndex>(
@@ -22891,6 +22901,38 @@ mod tests {
             "normalize",
             "src/alerts.rs",
             "build",
+        );
+    }
+
+    #[test]
+    fn rust_use_list_import_through_crate_visible_reexport_targets_definition() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "reexport-import-fixture");
+        write_file(root, "src/lib.rs", "mod store;\npub mod inspect;\n");
+        write_file(
+            root,
+            "src/store/mod.rs",
+            "mod projection;\npub(crate) use projection::{project_snapshot};\n",
+        );
+        write_file(
+            root,
+            "src/store/projection.rs",
+            "pub fn project_snapshot() {}\n",
+        );
+        write_file(
+            root,
+            "src/inspect.rs",
+            "use crate::store::{project_snapshot};\n\npub fn run() {\n    project_snapshot();\n}\n",
+        );
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/store/projection.rs",
+            "project_snapshot",
+            "src/inspect.rs",
+            "run",
         );
     }
 
