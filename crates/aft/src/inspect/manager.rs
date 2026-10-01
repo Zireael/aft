@@ -4903,6 +4903,30 @@ fn roll_up_unused_exports_oxc_contributions(
                             test_only_count += 1;
                             test_only_items.push(item);
                         }
+                    } else if export.only_same_file_references {
+                        // Mirror the fresh scan: an export referenced only
+                        // inside its own file is an unused export.
+                        if test_tree {
+                            excluded.record(&file.relative_file);
+                            continue;
+                        }
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "reason": super::scanners::unused_exports::ONLY_SAME_FILE_REFERENCES_REASON,
+                        });
+                        add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            count += 1;
+                            items.push(item);
+                        }
                     }
                 }
                 LivenessVerdict::Uncertain if test_tree => {}

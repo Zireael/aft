@@ -22,6 +22,9 @@ use crate::parser::{detect_language, LangId};
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
 const DRILL_DOWN_LIMIT: usize = 100;
+/// Item reason for an export whose symbol is referenced only inside its own
+/// file: no other module imports it, so the `export` is unused.
+pub(crate) const ONLY_SAME_FILE_REFERENCES_REASON: &str = "used_only_in_own_file";
 
 #[derive(Debug, Clone)]
 struct ExportSymbol {
@@ -341,6 +344,31 @@ fn run_unused_exports_oxc_scan(
                         } else {
                             test_only_count += 1;
                             test_only_items.push(item);
+                        }
+                    } else if export.only_same_file_references {
+                        // Only the declaring file uses the symbol, so the
+                        // export itself is unused (the same notion fallow and
+                        // other unused-export tools report).
+                        if test_tree {
+                            excluded.record(&file.relative_file);
+                            continue;
+                        }
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "reason": ONLY_SAME_FILE_REFERENCES_REASON,
+                        });
+                        add_reexport_contexts(&mut item, &export.also_reexported);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            count += 1;
+                            headline_items.push(item);
                         }
                     }
                 }
@@ -1732,6 +1760,51 @@ export function bannerUnused() {}
             .expect("scan succeeds")
             .aggregate;
         assert_only_product_counted(&aggregate);
+    }
+
+    /// fallow and similar tools report an export that only its own file uses:
+    /// the symbol is live but the `export` keyword serves nobody.
+    #[test]
+    fn oxc_scan_reports_exports_used_only_in_their_own_file() {
+        let (_temp_dir, root, paths) = fixture_project(&[
+            (
+                "src/config.ts",
+                "export const LOCAL_DEFAULT = 1;\nexport function readConfig() { return LOCAL_DEFAULT; }\n",
+            ),
+            (
+                "src/main.ts",
+                "import { readConfig } from \"./config\";\nconsole.log(readConfig());\n",
+            ),
+        ]);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture path"))
+            .collect::<Vec<_>>();
+        let oxc_result = crate::inspect::oxc_engine::analyze_files(
+            &root,
+            &paths,
+            crate::inspect::oxc_engine::AnalyzeOptions {
+                entry_points: Vec::new(),
+                public_api_files: Vec::new(),
+                executable_root_exports: BTreeMap::new(),
+                force_reparse_files: Vec::new(),
+                entry_reachability: false,
+            },
+        )
+        .expect("oxc analyze succeeds");
+        let aggregate = run_unused_exports_scan_with_oxc(&job(&root, paths), Some(&oxc_result))
+            .outcome
+            .expect("scan succeeds")
+            .aggregate;
+
+        let item = aggregate_item(&aggregate, "src/config.ts", "LOCAL_DEFAULT")
+            .unwrap_or_else(|| panic!("own-file-only export must be reported: {aggregate:#}"));
+        assert_eq!(item["reason"], ONLY_SAME_FILE_REFERENCES_REASON, "{item:#}");
+        assert!(
+            aggregate_item(&aggregate, "src/config.ts", "readConfig").is_none(),
+            "an imported export is used: {aggregate:#}"
+        );
     }
 
     #[test]
