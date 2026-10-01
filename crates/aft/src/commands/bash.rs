@@ -71,6 +71,25 @@ struct BashParams {
     permissions_requested: bool,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Set by the plugins when the calling session is a delegated worker
+    /// (subagent). A worker cannot be woken once its turn ends, so a
+    /// `wait: true` call is how it waits for a long build; see
+    /// `applies_default_hard_kill`.
+    #[serde(default)]
+    worker_session: bool,
+}
+
+/// Whether a command without an explicit `timeout` gets the registry's
+/// default hard kill (30 minutes).
+///
+/// A delegated worker's `wait: true` call is exempt: the worker blocks on it
+/// because it has nothing else to do until the command finishes, and killing
+/// a long build at an implicit limit would only make it start over. The wait
+/// still ends on a new message (which detaches the command to the background)
+/// or on an abort of the tool call, and an explicit `timeout` is always
+/// honoured.
+fn applies_default_hard_kill(params: &BashParams) -> bool {
+    !(params.worker_session && params.wait && params.timeout.is_none())
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -359,6 +378,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         workdir,
         env,
         params.timeout,
+        applies_default_hard_kill(&params),
         ctx,
         effective_background,
         params.notify_on_completion,
@@ -813,6 +833,55 @@ mod tests {
         {
             let _ = ctx.bash_background().kill(task_id, "sandbox-spawn-test");
         }
+    }
+
+    /// The hard kill recorded for the task a `bash` request spawned.
+    #[cfg(unix)]
+    fn spawned_hard_kill_ms(extra: serde_json::Value) -> Option<u64> {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let mut request = spawn_test_request("hard-kill", "sleep 30", false);
+        for (key, value) in extra.as_object().unwrap() {
+            request.params["params"][key] = value.clone();
+        }
+        let response = handle(&request, &ctx);
+        assert!(response.success, "spawn failed: {:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let json_path = ctx
+            .bash_background()
+            .task_json_path(&task_id, "sandbox-spawn-test")
+            .expect("task json path");
+        let task = crate::bash_background::persistence::read_task(&json_path).unwrap();
+        stop_spawned_test_task(&ctx, &response);
+        task.timeout_ms
+    }
+
+    // A delegated worker blocks on `wait: true` until its command finishes, so
+    // the implicit 30-minute kill must not cut a long build short. Everything
+    // else keeps the default, and an explicit timeout always wins.
+    #[cfg(unix)]
+    #[test]
+    fn worker_wait_without_timeout_gets_no_default_hard_kill() {
+        let default_ms = crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64;
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "wait": true, "worker_session": true })),
+            None
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "wait": true })),
+            Some(default_ms)
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "worker_session": true })),
+            Some(default_ms)
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(
+                json!({ "wait": true, "worker_session": true, "timeout": 45_000 })
+            ),
+            Some(45_000)
+        );
     }
 
     #[cfg(unix)]

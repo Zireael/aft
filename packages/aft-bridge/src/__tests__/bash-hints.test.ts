@@ -3,10 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  abortableSleep,
   commandInvokesCodeSearch,
   formatWatchWaited,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  resolveWatchTimeoutMs,
+  watchPollDelayMs,
+  withoutCompletionReminderPromise,
 } from "../bash-hints.js";
 
 const AFT_SEARCH_HINT =
@@ -23,6 +27,72 @@ describe("formatWatchWaited", () => {
     expect(formatWatchWaited(118_000, 120_000, 120_000)).toBe(
       "Waited 118000ms (limit 120000ms, the bash.watch_sync_max_ms cap)",
     );
+  });
+
+  test("says a wait without a deadline has no limit", () => {
+    expect(formatWatchWaited(150_000, undefined, undefined)).toBe(
+      "Waited 150000ms (no limit: waits until the command finishes)",
+    );
+  });
+
+  test("never names the cap for a caller the cap does not bound", () => {
+    expect(formatWatchWaited(600_000, 600_000, undefined)).toBe("Waited 600000ms (limit 600000ms)");
+  });
+});
+
+describe("resolveWatchTimeoutMs", () => {
+  test("a worker without a timeout gets no deadline; its own timeout is not capped", () => {
+    expect(resolveWatchTimeoutMs(undefined, "worker", 120_000)).toBeUndefined();
+    expect(resolveWatchTimeoutMs(600_000, "worker", 120_000)).toBe(600_000);
+  });
+
+  test("a primary keeps the 30 s default and the cap", () => {
+    expect(resolveWatchTimeoutMs(undefined, "primary", 120_000)).toBe(30_000);
+    expect(resolveWatchTimeoutMs(600_000, "primary", 120_000)).toBe(120_000);
+    expect(resolveWatchTimeoutMs(undefined, "primary", 10_000)).toBe(10_000);
+  });
+});
+
+describe("watch polling", () => {
+  test("the poll interval backs off as the wait grows", () => {
+    expect(watchPollDelayMs(0)).toBe(100);
+    expect(watchPollDelayMs(10_000)).toBe(250);
+    expect(watchPollDelayMs(60_000)).toBe(500);
+    expect(watchPollDelayMs(600_000)).toBe(1_000);
+  });
+
+  test("an abort ends a pending sleep at once", async () => {
+    const controller = new AbortController();
+    const started = performance.now();
+    const sleeping = abortableSleep(60_000, controller.signal);
+    controller.abort();
+    await sleeping;
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+});
+
+describe("withoutCompletionReminderPromise", () => {
+  // The inputs are the engine's exact hand-off texts, rendered by
+  // crates/aft/src/commands/bash_orchestrate.rs.
+  test("rewrites every engine hand-off text that promises a reminder", () => {
+    const texts = [
+      "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status.",
+      'Foreground bash didn\'t finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-123" }) to inspect output or bash_kill({ taskId: "bash-123" }) to terminate.',
+      'Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: "bash-123" }) to inspect output or bash_kill({ taskId: "bash-123" }) to terminate.\nDetached because a user message arrived.',
+      'PTY task started: bash-pty. Use bash_status({ taskId: "bash-pty", outputMode: "screen" }) to see the visible terminal, bash_write({ taskId: "bash-pty", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits.',
+    ];
+    for (const text of texts) {
+      const rewritten = withoutCompletionReminderPromise(text);
+      expect(rewritten).not.toContain("completion reminder");
+      expect(rewritten).not.toBe(text);
+    }
+    expect(withoutCompletionReminderPromise(texts[1])).toContain(
+      'Use bash_status({ taskId: "bash-123" }) to inspect output',
+    );
+  });
+
+  test("leaves other text alone", () => {
+    expect(withoutCompletionReminderPromise("hello")).toBe("hello");
   });
 });
 

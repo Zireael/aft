@@ -208,6 +208,10 @@ impl BgTaskStatus {
 }
 
 /// Spawn a bash command in the background. Returns a task_id immediately.
+///
+/// `timeout_ms` is the command's hard kill. When it is `None`,
+/// `default_hard_kill` decides between the registry's default
+/// (`DEFAULT_BG_TIMEOUT`) and no hard kill at all.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     request_id: &str,
@@ -218,6 +222,7 @@ pub fn spawn(
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     timeout_ms: Option<u64>,
+    default_hard_kill: bool,
     ctx: &AppContext,
     require_background_flag: bool,
     notify_on_completion: bool,
@@ -243,7 +248,11 @@ pub fn spawn(
     });
     let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
-    let timeout = timeout_ms.map(Duration::from_millis);
+    let timeout = match timeout_ms {
+        Some(timeout_ms) => Some(Duration::from_millis(timeout_ms)),
+        None if default_hard_kill => Some(registry::DEFAULT_BG_TIMEOUT),
+        None => None,
+    };
     let project_root = ctx
         .config()
         .project_root

@@ -15,26 +15,102 @@ export type WatchCallerRole = "worker" | "primary";
 /** Sync bash_watch deadline used by a primary session that passes no timeout. */
 export const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS = 30_000;
 
-/**
- * Description of the bash_watch timeout parameter. It must stay true for both
- * roles without naming them, because every caller sees the same schema.
- */
-export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
-  "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default).";
+/** Largest bash_watch timeout either plugin's schema accepts. */
+export const MAX_WATCH_TIMEOUT_MS = 1_800_000;
 
 /**
- * Effective sync bash_watch deadline. A delegated worker cannot end its turn
- * while a command runs, so a short default only makes it loop, re-reading its
- * whole context on every call; it gets the configured cap instead. A primary
- * keeps the short default because it can do other work or end its turn.
+ * Longest delay a JavaScript timer accepts (2^31 - 1 ms, about 24.8 days); a
+ * larger one fires almost at once. A bridge request that must wait for a
+ * command with no hard-kill timeout uses it as its transport timeout, which
+ * in practice means no transport timeout.
+ */
+export const LONGEST_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Description of the bash_watch tool's sync-wait defaults, embedded in both
+ * plugins' tool descriptions. Every caller sees the same description, so it
+ * has to state both roles' real behaviour.
+ */
+export const WATCH_SYNC_DEFAULTS_DESCRIPTION =
+  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits until the command finishes";
+
+/**
+ * Description of the bash_watch timeout parameter. Every caller sees the same
+ * schema, so it has to be true for both roles.
+ */
+export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
+  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait until the command finishes; a value you pass is used as given.";
+
+/**
+ * Effective sync bash_watch deadline in milliseconds, or `undefined` for a
+ * wait with no deadline, which lasts until the task exits, a pattern matches,
+ * a new message arrives, or the call is aborted.
+ *
+ * A delegated worker cannot be woken once its turn ends, so it has nothing
+ * useful to do while its command runs except wait. Any deadline only makes it
+ * call bash_watch again, and every such call re-reads its whole context. It
+ * therefore waits with no deadline by default, and a timeout it passes is
+ * honoured as given rather than clamped to the configured cap. A primary keeps
+ * the short default and the cap because it can do other work or end its turn
+ * and be woken by the completion reminder.
  */
 export function resolveWatchTimeoutMs(
   requestedMs: number | undefined,
   role: WatchCallerRole,
   capMs: number,
-): number {
-  const fallback = role === "worker" ? capMs : DEFAULT_PRIMARY_WATCH_TIMEOUT_MS;
-  return Math.min(requestedMs ?? fallback, capMs);
+): number | undefined {
+  if (role === "worker") return requestedMs;
+  return Math.min(requestedMs ?? DEFAULT_PRIMARY_WATCH_TIMEOUT_MS, capMs);
+}
+
+/**
+ * Largest bash_watch timeout a caller of this role may pass. A primary is
+ * bounded by the configured cap; a worker only by the schema maximum.
+ */
+export function maxWatchTimeoutMs(role: WatchCallerRole, capMs: number): number {
+  return role === "worker" ? MAX_WATCH_TIMEOUT_MS : capMs;
+}
+
+/**
+ * Delay before the next bash_watch status poll. The first seconds poll fast so
+ * a short command's exit or a quick pattern is seen promptly; after that the
+ * interval grows, because a wait that can last as long as a build would
+ * otherwise send ten status requests a second for its whole length. The
+ * longest interval is also the worst-case delay before a new message or an
+ * abort ends the wait.
+ */
+export function watchPollDelayMs(elapsedMs: number): number {
+  if (elapsedMs < 5_000) return 100;
+  if (elapsedMs < 30_000) return 250;
+  if (elapsedMs < 120_000) return 500;
+  return 1_000;
+}
+
+/**
+ * Clock and sleep used by the bash_watch wait loops. Production uses the
+ * monotonic clock and a real timer; tests replace both fields so a wait that
+ * lasts minutes of simulated time runs in milliseconds.
+ */
+export const watchClock: {
+  now: () => number;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+} = {
+  now: () => performance.now(),
+  sleep: abortableSleep,
+};
+
+/** Sleep that resolves early when `signal` aborts, so an aborted wait ends at once. */
+export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -42,12 +118,21 @@ export function resolveWatchTimeoutMs(
  * the call, next to the limit it was allowed. Printing both lets a reader see
  * at a glance whether the watch ran to its limit or returned early, and when
  * the limit is the configured cap it names the knob, so a caller that wanted
- * longer knows what bounded it. `elapsedMs` must come from a monotonic clock
- * (see monotonicNowMs).
+ * longer knows what bounded it. `limitMs` is undefined for a wait with no
+ * deadline, and `capMs` is undefined when the caller is not bounded by the
+ * configured cap (a delegated worker). `elapsedMs` must come from a monotonic
+ * clock (see monotonicNowMs).
  */
-export function formatWatchWaited(elapsedMs: number, limitMs: number, capMs: number): string {
-  const limit =
-    limitMs >= capMs ? `limit ${limitMs}ms, the bash.watch_sync_max_ms cap` : `limit ${limitMs}ms`;
+export function formatWatchWaited(
+  elapsedMs: number,
+  limitMs: number | undefined,
+  capMs: number | undefined,
+): string {
+  let limit: string;
+  if (limitMs === undefined) limit = "no limit: waits until the command finishes";
+  else if (capMs !== undefined && limitMs >= capMs)
+    limit = `limit ${limitMs}ms, the bash.watch_sync_max_ms cap`;
+  else limit = `limit ${limitMs}ms`;
   return `Waited ${Math.round(elapsedMs)}ms (${limit})`;
 }
 
@@ -58,18 +143,93 @@ export function formatWatchWaited(elapsedMs: number, limitMs: number, capMs: num
  * interrupted declared a failed result while its long-running command was
  * still going. Each role gets only the move that applies to it: a worker must
  * keep watching and not report, while a primary may end its turn because the
- * completion reminder wakes it. `timeoutParam` is the host's spelling of the
- * bash_watch timeout argument, so the worker is told a name it can pass.
+ * completion reminder wakes it. A worker only reaches this with a timeout it
+ * passed itself, so it is told that leaving the timeout out waits until the
+ * command finishes. `timeoutParam` is the host's spelling of the bash_watch
+ * timeout argument, so the worker is told a name it can pass.
  */
-export function watchTimeoutSteer(
-  role: WatchCallerRole,
-  capMs: number,
-  timeoutParam = "timeoutMs",
-): string {
+export function watchTimeoutSteer(role: WatchCallerRole, timeoutParam = "timeoutMs"): string {
   if (role === "worker") {
-    return `The command is still running; this is not a failure. Watch again (${timeoutParam} up to ${capMs}) and don't report a result until it finishes.`;
+    return `The command is still running; this is not a failure. Watch again and don't report a result until it finishes; a bash_watch without ${timeoutParam} waits until the command finishes.`;
   }
   return "The command is still running; this is not a failure. Watch again, do other work, or end your turn: the completion reminder wakes you.";
+}
+
+/**
+ * How long a sync bash_watch with no deadline keeps retrying while every
+ * status poll times out because the bridge is busy. Without this bound a wait
+ * with no deadline would retry a wedged bridge forever; after it, the watch
+ * returns and says the task state is unknown.
+ */
+export const WATCH_UNAVAILABLE_GIVE_UP_MS = 120_000;
+
+/**
+ * What a delegated worker is told whenever its task is still running and its
+ * watch returned anyway. It cannot be woken after its turn ends, so the only
+ * right move is to wait again.
+ */
+export const WORKER_KEEP_WAITING =
+  "Call bash_watch again to keep waiting; don't report a result until the command finishes.";
+
+/**
+ * Tail of a sync bash_watch reply interrupted by a new message, saying what
+ * happens to the still-running task next. A primary is woken later by the
+ * completion reminder or an async watch, as `primaryTail` says; a worker
+ * cannot be woken once its turn ends, so it is told to wait again instead.
+ */
+export function interruptedWatchTail(role: WatchCallerRole, primaryTail: string): string {
+  return role === "worker" ? `The task is still running. ${WORKER_KEEP_WAITING}` : primaryTail;
+}
+
+/** How a delegated worker is told to wait for a task it just sent to the background. */
+const WORKER_WAIT_FOR_TASK =
+  "It won't wake you when it finishes: to wait for it, call bash_watch without a timeout, which returns when the command finishes.";
+
+/**
+ * Removes the engine's promise of a completion reminder from a bash reply
+ * shown to a delegated worker. Completion reminders reach a session only when
+ * it is woken for a new turn, which never happens to a worker whose turn has
+ * ended, so the promise would tell it to stop and wait for nothing. The
+ * phrases are the ones `crates/aft/src/commands/bash_orchestrate.rs` renders
+ * for background launches, promotions and detaches; text without them is
+ * returned unchanged.
+ */
+export function withoutCompletionReminderPromise(text: string): string {
+  return text
+    .replaceAll(
+      "A completion reminder will be delivered automatically; don't poll bash_status.",
+      WORKER_WAIT_FOR_TASK,
+    )
+    .replaceAll(
+      "A completion reminder will be delivered automatically; use ",
+      `${WORKER_WAIT_FOR_TASK} Use `,
+    )
+    .replaceAll(
+      "A completion reminder fires automatically when the task exits.",
+      "It won't wake you when it exits.",
+    );
+}
+
+/**
+ * Line a bash_status snapshot of a still-running task ends with. A primary is
+ * woken by the completion reminder; a delegated worker is not, so it is
+ * pointed at bash_watch instead.
+ */
+export function runningTaskStatusHint(role: WatchCallerRole): string {
+  return role === "worker"
+    ? "To wait for it, call bash_watch; don't poll."
+    : "A completion reminder will be delivered automatically; don't poll.";
+}
+
+/**
+ * Tail of a sync bash_watch reply that ended because the bridge stayed busy,
+ * so the task's state is unknown. Only a primary can rely on the completion
+ * notification to wake it.
+ */
+export function watchUnavailableSteer(role: WatchCallerRole): string {
+  const unknown = "the bridge was busy, so task state is unknown.";
+  if (role === "worker") return `${unknown} ${WORKER_KEEP_WAITING}`;
+  return `${unknown} Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
 }
 
 const CONFLICT_HINT =

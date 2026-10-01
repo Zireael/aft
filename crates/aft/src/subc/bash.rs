@@ -1427,6 +1427,7 @@ mod grant_path_tests {
             None,
             None,
             raw_params.get("timeout").and_then(Value::as_u64),
+            true,
             ctx,
             false,
             false,

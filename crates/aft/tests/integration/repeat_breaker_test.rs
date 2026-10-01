@@ -126,8 +126,8 @@ pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
         "third call: {:?}",
         texts[2]
     );
-    assert!(texts[2].contains("use a background task with a watch"));
-    assert!(texts[2].contains("end the turn"));
+    assert!(texts[2].contains("wait with a watch on its background task"));
+    assert!(!texts[2].contains("end the turn"));
 }
 
 fn observe_tool(
@@ -177,8 +177,8 @@ fn repeat_breaker_fires_on_third_identical_call_after_thirty_seconds() {
 
     assert!(third.contains("This is the 3rd identical call"));
     assert!(third.contains("in 42s"));
-    assert!(third.contains("use a background task with a watch"));
-    assert!(third.contains("end the turn"));
+    assert!(third.contains("wait with a watch on its background task"));
+    assert!(!third.contains("end the turn"));
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn repeat_breaker_steers_when_output_drifts() {
     let third = third.expect("same arguments must steer even when output changes");
     assert!(third.contains("3rd call with the same arguments"));
     assert!(third.contains("output is drifting"));
-    assert!(third.contains("use a background task with a watch"));
+    assert!(third.contains("wait with a watch on its background task"));
 }
 
 #[test]
@@ -823,5 +823,9 @@ fn repeat_breaker_escalates_from_sixth_call() {
 
     let sixth = sixth.expect("sixth identical call must escalate");
     assert!(sixth.contains("This is the 6th identical call"));
-    assert!(sixth.contains("The turn must end now with no further tool call"));
+    assert!(sixth.contains("Stop now: make no further call with these arguments"));
+    // The breaker cannot tell a delegated worker from a primary session, and
+    // a worker that ends its turn has delivered its result, so no variant may
+    // tell the caller to end its turn.
+    assert!(!sixth.contains("turn"));
 }

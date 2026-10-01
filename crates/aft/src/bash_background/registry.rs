@@ -64,8 +64,11 @@ use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 /// Default timeout for background bash tasks: 30 minutes.
-/// Agents can override per-call via the `timeout` parameter (in ms).
-const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Agents can override per-call via the `timeout` parameter (in ms). The
+/// convenience `spawn`/`spawn_pty` wrappers and `bash_background::spawn` apply
+/// it; the `*_with_shell` functions take the final hard kill, where `None`
+/// means the command is never killed for running too long.
+pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -2073,7 +2076,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2118,7 +2121,6 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
@@ -2304,7 +2306,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2347,7 +2349,6 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
         #[cfg(unix)]
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
@@ -2504,7 +2505,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            timeout.or(Some(DEFAULT_BG_TIMEOUT)),
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2544,7 +2545,6 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
         let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;

@@ -18,15 +18,28 @@ export {
   sleep,
 } from "./bash-format.js";
 export {
+  abortableSleep,
   commandInvokesCodeSearch,
   DEFAULT_PRIMARY_WATCH_TIMEOUT_MS,
   formatWatchWaited,
+  interruptedWatchTail,
+  LONGEST_TIMER_DELAY_MS,
+  MAX_WATCH_TIMEOUT_MS,
+  maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
+  runningTaskStatusHint,
+  WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
+  WORKER_KEEP_WAITING,
+  watchClock,
+  watchPollDelayMs,
   watchTimeoutSteer,
+  watchUnavailableSteer,
+  withoutCompletionReminderPromise,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,

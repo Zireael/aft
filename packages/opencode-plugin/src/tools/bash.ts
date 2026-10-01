@@ -4,9 +4,13 @@ import {
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  LONGEST_TIMER_DELAY_MS,
   maybeAppendGrepSearchHint,
   runBashHostFallback,
+  runningTaskStatusHint,
   sleep,
+  type WatchCallerRole,
+  withoutCompletionReminderPromise,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -50,7 +54,11 @@ function orchestratedTransportTimeoutMs(
   wait: boolean,
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
+  noHardKill = false,
 ): number {
+  // A command with no hard kill can hold the call for as long as it runs, so
+  // the transport must not time out first.
+  if (noHardKill) return LONGEST_TIMER_DELAY_MS;
   const waitBudget =
     blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
@@ -195,7 +203,7 @@ function backgroundWaitDescription(
 ): string {
   if (watchToolRegistered) {
     const noPolling = statusRegistered ? ", and never loop bash_status to wait" : "";
-    return `then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one)${noPolling}.`;
+    return `then bash_watch handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one)${noPolling}.`;
   }
   return statusRegistered
     ? "the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else."
@@ -562,6 +570,12 @@ export function createBashTool(
       // and the call answers with the timed-out result. Omitting it lets the
       // engine apply its 30-minute default.
       const rawTimeout = coerceOptionalInt(args.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
+      // A subagent that asks to wait for its command without a timeout has
+      // nothing else to do until the command finishes and can't be woken
+      // after its turn ends, so the engine skips its 30-minute default kill
+      // (worker_session below). A new message still detaches the wait and an
+      // abort still kills the command.
+      const workerUnboundedWait = isSubagent && requestedWait && rawTimeout === undefined;
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
@@ -608,6 +622,7 @@ export function createBashTool(
             foreground_orchestrate: true,
             block_to_completion: blockToCompletion,
             wait: requestedWait,
+            worker_session: isSubagent,
             sandbox: args.sandbox,
           },
           callBashBridge,
@@ -617,6 +632,7 @@ export function createBashTool(
               requestedWait,
               rawTimeout,
               foregroundWaitMs,
+              workerUnboundedWait,
             ),
             onProgress: ({ text }) => {
               accumulatedOutput = preview(accumulatedOutput + text);
@@ -669,8 +685,13 @@ export function createBashTool(
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         let rendered = (data.output as string | undefined) ?? "";
+        if (isSubagent) {
+          // The engine's hand-off text promises a completion reminder, which a
+          // subagent never receives once its turn ends.
+          rendered = withoutCompletionReminderPromise(rendered);
+        }
         if (isSubagent && allowSubagentBg) {
-          rendered += subagentGuidance(taskId, bashCfg.watch_sync_max_ms);
+          rendered += subagentGuidance(taskId);
         }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
         metadata?.(metadataPayload);
@@ -719,7 +740,14 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
       // timeoutMs moved to bash_watch — if the agent passes them here, they're
       // silently ignored at the Zod schema layer (extra keys stripped).
       const data = await bashStatusSnapshot(ctx, context, taskId, outputMode);
-      return await formatBashStatusText(context, taskId, data, outputMode);
+      const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
+      return await formatBashStatusText(
+        context,
+        taskId,
+        data,
+        outputMode,
+        isSubagent ? "worker" : "primary",
+      );
     },
   };
 }
@@ -775,6 +803,7 @@ async function formatBashStatusText(
   taskId: string,
   data: Record<string, unknown>,
   requestedOutputMode: string | undefined,
+  role: WatchCallerRole,
 ): Promise<string> {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
@@ -794,7 +823,7 @@ async function formatBashStatusText(
       text += `\n${preview}`;
     }
     if (status === "running") {
-      text += `\nA completion reminder will be delivered automatically; don't poll.`;
+      text += `\n${runningTaskStatusHint(role)}`;
     }
   }
   return text;
@@ -829,14 +858,14 @@ function preview(output: string): string {
 
 /**
  * Appended when a subagent's command goes to the background. The suggested
- * bash_watch call passes no timeout on purpose: a subagent's watch already
- * defaults to the configured maximum (`bash.watch_sync_max_ms`), so naming any
- * smaller number would only make it wake and re-watch more often.
+ * bash_watch call passes no timeout on purpose: a subagent's watch without one
+ * waits until the command finishes, so naming any number would only make it
+ * wake and re-watch.
  */
-function subagentGuidance(taskId: string, watchSyncMaxMs: number): string {
+function subagentGuidance(taskId: string): string {
   return `
 
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits up to ${watchSyncMaxMs} ms, the maximum. Subagents don't survive turn-end and won't receive the completion reminder.`;
+NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits until the command finishes. Subagents don't survive turn-end and won't be woken when the command finishes.`;
 }
 
 function foregroundMetadata(

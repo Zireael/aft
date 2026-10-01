@@ -2,14 +2,19 @@ import {
   type BridgeRequestOptions,
   coerceBoolean,
   formatWatchWaited,
+  interruptedWatchTail,
   isBridgeTransportTimeout,
   isTerminalStatus,
-  monotonicNowMs,
+  maxWatchTimeoutMs,
   resolveWatchTimeoutMs,
-  sleep,
+  WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
+  watchClock,
+  watchPollDelayMs,
   watchTimeoutSteer,
+  watchUnavailableSteer,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -29,18 +34,17 @@ import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "
 import { bashCompanionRegistered } from "./bash.js";
 
 const z = tool.schema;
-const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
   | { kind: "substring"; value: string }
   | { kind: "regex"; source: string };
 export type BashStatusWaited = {
-  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable";
+  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable" | "aborted";
   /** Real time the watch held the call, measured on a monotonic clock. */
   elapsed_ms: number;
-  /** Longest time this watch was allowed to hold the call. */
-  limit_ms: number;
+  /** Longest time this watch was allowed to hold the call; absent when it had no deadline. */
+  limit_ms?: number;
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
@@ -60,11 +64,17 @@ type OutputCursor = { output: number; stderr: number };
 type OutputScanChunk = { stream: OutputStream; text: string; baseOffset: number };
 type OutputScanState = Record<OutputStream, { text: string; baseOffset: number }>;
 
-function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
+function coerceConfiguredWatchTimeout(
+  value: unknown,
+  role: WatchCallerRole,
+  cap: number,
+): number | undefined {
   try {
-    return coerceOptionalInt(value, "timeoutMs", 1, cap);
+    return coerceOptionalInt(value, "timeoutMs", 1, maxWatchTimeoutMs(role, cap));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // Only a primary's timeout is bounded by the configured cap.
+    if (role === "worker") throw error;
     throw new Error(`${message} (bash.watch_sync_max_ms)`);
   }
 }
@@ -75,7 +85,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
     ? " Never loop bash_status to wait."
     : "";
   return {
-    description: `Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max \`bash.watch_sync_max_ms\`, 120s by default); for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${noPolling}`,
+    description: `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${noPolling}`,
     args: {
       taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z
@@ -141,10 +151,13 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
 
       const syncWaitCap = bashCfg.watch_sync_max_ms;
       const role: WatchCallerRole = isSubagent ? "worker" : "primary";
+      // A worker's async request that was turned into a sync wait keeps the
+      // async request's meaning, "tell me when it's done", so it waits with no
+      // deadline like any worker watch without a timeout.
       const effectiveWaitMs = subagentForcedSync
-        ? syncWaitCap
+        ? undefined
         : resolveWatchTimeoutMs(
-            coerceConfiguredWatchTimeout(args.timeoutMs, syncWaitCap),
+            coerceConfiguredWatchTimeout(args.timeoutMs, role, syncWaitCap),
             role,
             syncWaitCap,
           );
@@ -168,6 +181,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           waitFor,
           coerceBoolean(args.once, true),
           waited.elapsed_ms,
+          role,
         );
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;
@@ -195,15 +209,24 @@ async function convertToAsyncWatchOnAbort(
   waitFor: BashWaitPattern | undefined,
   once: boolean,
   elapsedMs: number,
+  role: WatchCallerRole,
 ): Promise<string> {
   const interrupted = `Sync watch for task ${taskId} was interrupted because you sent a message after ${elapsedMs}ms of waiting. `;
+  const reminderFallback = interruptedWatchTail(
+    role,
+    `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits.`,
+  );
   // No pattern: the auto-reminder system already handles exit notifications
   // for background tasks, so no explicit watch registration is needed.
   if (!waitFor) {
     return (
       interrupted +
-      `The task is still running in the background. A completion reminder will be ` +
-      `delivered automatically when the task exits; don't poll bash_status.`
+      interruptedWatchTail(
+        role,
+        `The task is still running in the background. A completion reminder will be ` +
+          `delivered automatically when the task exits; don't poll bash_status.`,
+      )
     );
   }
   // Register the equivalent async watch so the pattern/exit notification
@@ -223,14 +246,16 @@ async function convertToAsyncWatchOnAbort(
       return (
         interrupted +
         `Auto-registering an async watch failed (${String(registered.message ?? "unknown error")}). ` +
-        `The task is still running in the background. A completion reminder will be ` +
-        `delivered automatically when the task exits.`
+        reminderFallback
       );
     }
     return (
       interrupted +
       `The wait has been converted to an async watch (${registered.watch_id}). ` +
-      `A notification will fire when the pattern matches or the task exits.`
+      interruptedWatchTail(
+        role,
+        `A notification will fire when the pattern matches or the task exits.`,
+      )
     );
   } catch (err) {
     unmarkExplicitControl(context.sessionID, taskId);
@@ -238,8 +263,7 @@ async function convertToAsyncWatchOnAbort(
     return (
       interrupted +
       `Auto-registering an async watch failed (${err instanceof Error ? err.message : String(err)}). ` +
-      `The task is still running in the background. A completion reminder will be ` +
-      `delivered automatically when the task exits.`
+      reminderFallback
     );
   }
 }
@@ -257,7 +281,12 @@ function formatWatchResultText(
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
   if (waited) {
-    const waitedText = formatWatchWaited(waited.elapsed_ms, waited.limit_ms, syncWaitCap);
+    // Only a primary's watch is bounded by the configured cap.
+    const waitedText = formatWatchWaited(
+      waited.elapsed_ms,
+      waited.limit_ms,
+      role === "primary" ? syncWaitCap : undefined,
+    );
     if (waited.reason === "matched") {
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
       text += `\n${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
@@ -265,9 +294,11 @@ function formatWatchResultText(
       // A watch deadline is not a failure of the command, and a delegated
       // worker that reads it as one declares a failed result mid-run. Tell
       // the caller what it is and the move that fits its own role.
-      text += `\n${waitedText}; timeout reached without match. ${watchTimeoutSteer(role, syncWaitCap)}`;
+      text += `\n${waitedText}; timeout reached without match. ${watchTimeoutSteer(role)}`;
     } else if (waited.reason === "unavailable") {
-      text += `\n${waitedText}; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
+      text += `\n${waitedText}; ${watchUnavailableSteer(role)}`;
+    } else if (waited.reason === "aborted") {
+      text += `\n${waitedText}; the watch was cancelled. The task keeps running.`;
     } else {
       const stat = String(data.status ?? "unknown");
       const e = typeof data.exit_code === "number" ? `, exit ${data.exit_code}` : "";
@@ -312,14 +343,33 @@ export async function waitForBashStatus(
   taskId: string,
   outputMode: string | undefined,
   waitFor: BashWaitPattern | undefined,
-  effectiveWaitMs: number,
+  effectiveWaitMs: number | undefined,
 ): Promise<BashStatusWithWait> {
   // The deadline and the reported elapsed time both come from a monotonic
   // clock, so a wall-clock step during the wait can neither end it early nor
-  // inflate the time the reply says it waited.
-  const startedAt = monotonicNowMs();
-  const deadline = startedAt + effectiveWaitMs;
-  const elapsedMs = () => Math.round(monotonicNowMs() - startedAt);
+  // inflate the time the reply says it waited. An undefined wait has no
+  // deadline: it ends only on exit, a match, a new message, or an abort.
+  const startedAt = watchClock.now();
+  const deadline =
+    effectiveWaitMs === undefined ? Number.POSITIVE_INFINITY : startedAt + effectiveWaitMs;
+  const elapsedMs = () => Math.round(watchClock.now() - startedAt);
+  const abortSignal = (runtime as { abort?: AbortSignal }).abort;
+  // Sleep until the next poll, never past the deadline. The poll interval
+  // grows with the time already waited (watchPollDelayMs).
+  const pause = () =>
+    watchClock.sleep(
+      Math.min(watchPollDelayMs(elapsedMs()), Math.max(0, deadline - watchClock.now())),
+      abortSignal,
+    );
+  const waited = (
+    reason: BashStatusWaited["reason"],
+    extra: Partial<BashStatusWaited> = {},
+  ): BashStatusWaited => ({
+    reason,
+    elapsed_ms: elapsedMs(),
+    ...(effectiveWaitMs === undefined ? {} : { limit_ms: effectiveWaitMs }),
+    ...extra,
+  });
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
   const scanState: OutputScanState = {
     output: { text: "", baseOffset: 0 },
@@ -335,8 +385,13 @@ export async function waitForBashStatus(
   markTaskWaiting(runtime.sessionID, taskId);
   let sawTerminal = false;
   let lastData: Record<string, unknown> | undefined;
+  // Start of the current run of status polls that all timed out, if any.
+  let busySince: number | undefined;
   try {
     while (true) {
+      if (abortSignal?.aborted) {
+        return withWaited(lastData ?? unavailableSnapshot(), waited("aborted"));
+      }
       let data: Record<string, unknown>;
       try {
         data = await bashStatusSnapshot(
@@ -354,23 +409,22 @@ export async function waitForBashStatus(
         // user every poll); honor abort/deadline and otherwise retry. A
         // genuine non-timeout error still propagates.
         if (!isBridgeTransportTimeout(err)) throw err;
+        busySince ??= watchClock.now();
         if (isSyncWatchAborted(runtime.sessionID)) {
-          return withWaited(lastData ?? unavailableSnapshot(), {
-            reason: "user_message",
-            elapsed_ms: elapsedMs(),
-            limit_ms: effectiveWaitMs,
-          });
+          return withWaited(lastData ?? unavailableSnapshot(), waited("user_message"));
         }
-        if (monotonicNowMs() >= deadline) {
-          return withWaited(lastData ?? unavailableSnapshot(), {
-            reason: "unavailable",
-            elapsed_ms: elapsedMs(),
-            limit_ms: effectiveWaitMs,
-          });
+        // A wait with no deadline still gives up on a bridge that has not
+        // answered for WATCH_UNAVAILABLE_GIVE_UP_MS, instead of retrying forever.
+        if (
+          watchClock.now() >= deadline ||
+          watchClock.now() - busySince >= WATCH_UNAVAILABLE_GIVE_UP_MS
+        ) {
+          return withWaited(lastData ?? unavailableSnapshot(), waited("unavailable"));
         }
-        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - monotonicNowMs())));
+        await pause();
         continue;
       }
+      busySince = undefined;
       lastData = data;
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
@@ -401,14 +455,14 @@ export async function waitForBashStatus(
               }
               const matchStream: "stdout" | "stderr" | undefined =
                 data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
-              return withWaited(data, {
-                reason: "matched",
-                elapsed_ms: elapsedMs(),
-                limit_ms: effectiveWaitMs,
-                match: match.text,
-                match_offset: state.baseOffset + match.byteOffset,
-                match_stream: matchStream,
-              });
+              return withWaited(
+                data,
+                waited("matched", {
+                  match: match.text,
+                  match_offset: state.baseOffset + match.byteOffset,
+                  match_stream: matchStream,
+                }),
+              );
             }
             if (waitFor.kind === "substring") {
               const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
@@ -425,11 +479,7 @@ export async function waitForBashStatus(
           { ctx, directory: projectRootFor(runtime), sessionID: runtime.sessionID },
           taskId,
         );
-        return withWaited(data, {
-          reason: "exited",
-          elapsed_ms: elapsedMs(),
-          limit_ms: effectiveWaitMs,
-        });
+        return withWaited(data, waited("exited"));
       }
       // User-message abort: if the user sent a message while we were
       // blocking, convert this sync wait to an async watch so the agent's
@@ -437,20 +487,12 @@ export async function waitForBashStatus(
       // if the task already matched or exited in this iteration, we return
       // that result instead of aborting.
       if (isSyncWatchAborted(runtime.sessionID)) {
-        return withWaited(data, {
-          reason: "user_message",
-          elapsed_ms: elapsedMs(),
-          limit_ms: effectiveWaitMs,
-        });
+        return withWaited(data, waited("user_message"));
       }
-      if (monotonicNowMs() >= deadline) {
-        return withWaited(data, {
-          reason: "timeout",
-          elapsed_ms: elapsedMs(),
-          limit_ms: effectiveWaitMs,
-        });
+      if (watchClock.now() >= deadline) {
+        return withWaited(data, waited("timeout"));
       }
-      await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - monotonicNowMs())));
+      await pause();
     }
   } finally {
     if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);

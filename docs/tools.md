@@ -233,7 +233,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | Param | Type | Description |
 |---|---|---|
 | `command` | string | Shell command to execute |
-| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset. NOT a polling window — see below. |
+| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset, except a delegated (subagent) session's `wait: true` call, which has no hard kill unless one is passed. NOT a polling window — see below. |
 | `workdir` | string | Working directory for command execution |
 | `description` | string | Short human-readable summary for harness UI metadata |
 | `background` | boolean | Spawn detached and return a `taskId` (requires the background flag) |
@@ -348,11 +348,15 @@ and return a `taskId`.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
 
-**`bash_watch`** — block on or register for a background task's output. Sync waits are for a
-short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default);
-for anything longer end the turn on `bash({background:true})` and let the completion reminder
-wake you, or use `bash({wait:true})` when the result is needed before anything else. Sync mode
-waits until a `pattern` matches, the task exits, or `timeoutMs` elapses. Async mode (`background: true`)
+**`bash_watch`** — block on or register for a background task's output. In a main session sync
+waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
+by default); for anything longer end the turn on `bash({background:true})` and let the completion
+reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
+delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
+`timeoutMs` has no deadline and returns when the task exits, and an explicit `timeoutMs` is used
+as given rather than capped. Sync mode
+waits until a `pattern` matches, the task exits, `timeoutMs` elapses, a new message arrives, or the
+call is aborted. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default
 completion reminder. (Wait/watch semantics moved here from `bash_status` — `bash_status` is
 snapshot-only.)

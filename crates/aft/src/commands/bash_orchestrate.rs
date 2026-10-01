@@ -52,6 +52,11 @@ pub fn format_seconds(ms: u64) -> String {
     format!("{seconds}s")
 }
 
+/// The plugins remove this completion-reminder sentence, and the ones in
+/// `format_background_launch`, from replies to delegated workers, which are
+/// never woken by a reminder (`withoutCompletionReminderPromise` in
+/// `packages/aft-bridge/src/bash-hints.ts` matches the exact wording, so a
+/// change here must be made there too).
 fn format_background_handoff_tail(task_id: &str) -> String {
     format!(
         "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."

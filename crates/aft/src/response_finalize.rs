@@ -22,10 +22,15 @@ pub fn append_repeat_breaker_reminder(
     // call returns nothing new, while changing output names common timestamp
     // drift. Both variants point legitimate waiting toward a background watch
     // instead of treating output churn as progress.
+    //
+    // The wording never tells the caller to end its turn. Rust cannot tell a
+    // delegated worker (subagent) from a primary session here, and a worker
+    // that ends its turn has delivered its result: it cannot be woken again
+    // when the awaited task finishes. Both roles can wait with a watch.
     let instruction = if repeat_breaker::escalation_starts_at(count) {
-        "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
+        "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
     } else {
-        "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
+        "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again."
     };
     let observation = if intervention.outputs_identical {
         format!(
