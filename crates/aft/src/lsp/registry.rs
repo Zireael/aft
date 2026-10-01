@@ -2334,15 +2334,17 @@ mod tests {
         };
         touch_exe(&outside_python);
 
+        let project_root = crate::inspect::job::canonicalize_normalized(&project);
         for kind in [ServerKind::Python, ServerKind::Ty] {
             let server = builtin_servers()
                 .into_iter()
                 .find(|server| server.kind == kind)
                 .unwrap();
-            assert!(
-                server
-                    .workspace_root_for_file_with_project_root(&source, Some(&project))
-                    .is_none(),
+            // With no marker inside the project, the script is served from
+            // the project root itself, never from the marker above it.
+            assert_eq!(
+                server.workspace_root_for_file_with_project_root(&source, Some(&project)),
+                Some(project_root.clone()),
                 "{kind:?} must not select a marker above project_root"
             );
         }
