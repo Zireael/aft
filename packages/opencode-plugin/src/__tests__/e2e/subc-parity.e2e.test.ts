@@ -284,11 +284,15 @@ maybeDescribe(describeName, () => {
       ];
 
       for (const call of calls) {
-        // Transient index/store building states are honest output, not parity
-        // gaps — poll BOTH sides to the converged state before comparing. A
+        // Transient index/store states are honest output, not parity gaps —
+        // poll BOTH sides to the converged state before comparing. A
         // side that never converges still fails the assertion verbatim.
+        // An index that listed a file since deleted is also a transient state:
+        // the watcher's next drain removes it.
         const converged = (text: string) =>
-          !text.includes("building/retrying") && !text.includes("[index: building]");
+          !text.includes("building/retrying") &&
+          !text.includes("[index: building]") &&
+          !text.includes("were not on disk in this checkout");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
         expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(
@@ -302,6 +306,15 @@ maybeDescribe(describeName, () => {
 });
 
 async function seedParityFixture(harness: E2EHarness): Promise<void> {
+  // The NDJSON harness points its child's AFT_CACHE_DIR at `.aft-cache` inside
+  // the project, and both harnesses write `.aft-user/aft.jsonc` there. AFT's
+  // project walk includes hidden directories, so without this the NDJSON
+  // side indexed its own state: lock files and `*.tmp.*` files that come and
+  // go while it runs. A grep after one vanished reported "1 indexed file(s)
+  // were not on disk" on the NDJSON side only, because the subc daemon keeps
+  // its cache outside the project. Excluding both directories keeps each
+  // side's index to the fixture files.
+  await writeFile(harness.path(".aftignore"), ".aft-cache/\n.aft-user/\n", "utf8");
   await writeFile(
     harness.path("sample.ts"),
     [

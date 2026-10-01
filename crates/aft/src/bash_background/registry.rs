@@ -99,8 +99,14 @@ enum KillSignalPlan {
         child_pid: Option<u32>,
         child: Option<Child>,
     },
-    /// Signal a PTY task's process group.
-    Pty { pid: Option<u32> },
+    /// The task had already exited; close its retired PTY runtime, if any.
+    RetirePty(Option<PtyRuntime>),
+    /// Signal a PTY task's process group, then close its pseudoterminal so
+    /// the PTY reader reaches end-of-file.
+    Pty {
+        pid: Option<u32>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    },
 }
 
 /// Signal a piped task: SIGTERM to its process group, a grace period that
@@ -126,6 +132,27 @@ fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option
 }
 
 /// Signal a PTY task's process group (Unix) or process tree (Windows).
+/// Close a killed PTY's pseudoterminal so its reader reaches end-of-file and
+/// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
+/// once the pseudoconsole is closed, and closing it can wait for conhost to
+/// flush; it runs on its own thread so no caller (or lock) waits on that.
+fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
+    let Some(master) = master else {
+        return;
+    };
+    #[cfg(windows)]
+    {
+        let spawned = std::thread::Builder::new()
+            .name("aft-pty-close".to_owned())
+            .spawn(move || drop(master));
+        if let Err(error) = spawned {
+            crate::slog_warn!("[pty-kill] could not close the pseudoconsole off-thread: {error}");
+        }
+    }
+    #[cfg(not(windows))]
+    drop(master);
+}
+
 fn terminate_pty_group(pid: u32) {
     #[cfg(unix)]
     terminate_pgid(pid as i32, None);
@@ -5278,10 +5305,20 @@ impl BgTaskRegistry {
     /// PTY reader has drained the output as well. The watchdog uses this to
     /// leave such a task to that wake instead of finalizing it on a periodic
     /// tick.
+    ///
+    /// Always false on Windows: a ConPTY reader reaches end-of-file only after
+    /// the pseudoconsole is closed, which finalizing the task does, so there
+    /// the wake cannot come first. Also false for a killed task, whose
+    /// outcome is already decided and must not wait on output.
     pub(crate) fn pty_exit_awaiting_reader(&self, task: &BgTask) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
         task.state.lock().is_ok_and(|state| match &state.runtime {
             TaskRuntime::Pty(Some(pty)) => {
-                pty.exit_observed.load(Ordering::SeqCst)
+                state.metadata.status != BgTaskStatus::Killing
+                    && !pty.was_killed.load(Ordering::SeqCst)
+                    && pty.exit_observed.load(Ordering::SeqCst)
                     && !pty.coordinator.woken.load(Ordering::SeqCst)
             }
             _ => false,
@@ -5702,13 +5739,19 @@ impl BgTaskRegistry {
                     // `wait()`s after signaling, so this is the only kill
                     // path that needed the explicit reap.
                     TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
-                    TaskRuntime::Pty(runtime) => *runtime = None,
+                    TaskRuntime::Pty(_) => {}
                 }
+                // Move the PTY runtime out of the task while holding the lock;
+                // it is closed after the lock is released.
+                let retired_pty = match &mut state.runtime {
+                    TaskRuntime::Pty(runtime) => runtime.take(),
+                    TaskRuntime::Piped(_) => None,
+                };
                 state.detached = true;
                 self.persist_task_locked(&task, &state.metadata, &mut db)
                     .map_err(|e| format!("failed to persist terminal state: {e}"))?;
                 terminalized = true;
-                KillSignalPlan::Nothing
+                KillSignalPlan::RetirePty(retired_pty)
             } else if state.kill_in_flight {
                 KillSignalPlan::AwaitOtherKill
             } else {
@@ -5748,7 +5791,10 @@ impl BgTaskRegistry {
                                 "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
                             );
                         }
-                        KillSignalPlan::Pty { pid: pty.child_pid }
+                        KillSignalPlan::Pty {
+                            pid: pty.child_pid,
+                            master: pty.master.take(),
+                        }
                     }
                     TaskRuntime::Pty(None) => KillSignalPlan::Nothing,
                 };
@@ -5761,6 +5807,11 @@ impl BgTaskRegistry {
 
         match plan {
             KillSignalPlan::Nothing => {}
+            KillSignalPlan::RetirePty(runtime) => {
+                if let Some(mut runtime) = runtime {
+                    close_pty_master(runtime.master.take());
+                }
+            }
             KillSignalPlan::AwaitOtherKill => self.await_kill_in_flight(&task),
             KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
                 kill_signaled = true;
@@ -5844,10 +5895,11 @@ impl BgTaskRegistry {
                     terminalized = true;
                 }
             }
-            KillSignalPlan::Pty { pid } => {
+            KillSignalPlan::Pty { pid, master } => {
                 if let Some(pid) = pid {
                     terminate_pty_group(pid);
                 }
+                close_pty_master(master);
                 terminalized = self.finish_pty_kill(&task, terminal_status, reason)?;
             }
         }
@@ -5903,11 +5955,6 @@ impl BgTaskRegistry {
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.kill_in_flight = false;
         task.kill_settled.notify_all();
-        // The PTY may already have been finalized from its exit marker while
-        // the signal was in flight, which drops the runtime.
-        if let TaskRuntime::Pty(Some(pty)) = &mut state.runtime {
-            drop(pty.master.take());
-        }
 
         // On Unix the PTY waiter writes the exit marker and the watchdog
         // publishes the terminal state from it. Windows ConPTY gives no such
@@ -5963,6 +6010,10 @@ impl BgTaskRegistry {
         reason: Option<String>,
     ) -> Result<(), String> {
         let mut pty_reader_done = None;
+        // The PTY runtime leaves the task under the lock and is dropped after
+        // it is released: dropping it closes the pseudoterminal, which on
+        // Windows can wait for conhost, and that must not hold the state lock.
+        let mut retired_pty_runtime = None;
         {
             // The aft.db mirror of the terminal row is written when this
             // scope ends, after the state lock is released: the aft.db mutex
@@ -6010,10 +6061,14 @@ impl BgTaskRegistry {
                     pty_reader_done = runtime
                         .as_ref()
                         .map(|runtime| Arc::clone(&runtime.reader_done));
-                    *runtime = None;
+                    retired_pty_runtime = runtime.take();
                 }
             }
             state.detached = true;
+        }
+        if let Some(mut runtime) = retired_pty_runtime {
+            close_pty_master(runtime.master.take());
+            drop(runtime);
         }
 
         if let Some(reader_done) = pty_reader_done {
@@ -11219,6 +11274,54 @@ mod tests {
             registry.completion_pass_cause(&task_id),
             Some(WatchdogPassCause::Wake)
         );
+    }
+
+    /// A killed PTY's outcome is decided, so the watchdog never leaves it to
+    /// the reader's wake: on Windows that reader may not reach end-of-file
+    /// until the task is finalized. The reader is held at end-of-file here.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_pty_is_not_left_to_the_reader_wake() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done'",
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let release_reader = super::super::pty_process::install_pty_reader_gate_for_test(&task_id);
+        fs::write(dir.path().join("ready"), "").unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !registry.pty_exit_awaiting_reader(&task) {
+            assert!(
+                Instant::now() < deadline,
+                "the child never exited with its reader held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Set the flag a kill sets on a PTY before it signals the process
+        // group, as if this exited task had been killed.
+        if let TaskRuntime::Pty(Some(pty)) = &task.state.lock().unwrap().runtime {
+            pty.was_killed.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            !registry.pty_exit_awaiting_reader(&task),
+            "a killed PTY must not wait for its reader's wake"
+        );
+        release_reader.send(()).expect("release the reader");
     }
 
     /// A task can finish on its own while a kill is in flight. If its own

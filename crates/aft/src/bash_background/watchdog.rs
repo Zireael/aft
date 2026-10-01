@@ -10,9 +10,10 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const FINISHED_RETENTION: Duration = Duration::from_secs(60 * 60);
 /// How long periodic passes leave an exited PTY task to its reader's wake.
-/// The reader normally reaches end-of-file right after the child exits; on
-/// Windows ConPTY it may not while the master is held, so after this the
-/// periodic pass finalizes the task itself.
+/// The reader normally reaches end-of-file right after the child exits, but a
+/// background grandchild can keep the terminal open, so after this the
+/// periodic pass finalizes the task itself. Windows tasks and killed tasks are
+/// never left to the wake (see `BgTaskRegistry::pty_exit_awaiting_reader`).
 const PTY_READER_WAKE_GRACE: Duration = Duration::from_secs(1);
 
 thread_local! {
