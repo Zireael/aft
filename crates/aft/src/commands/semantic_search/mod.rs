@@ -302,13 +302,30 @@ impl<'a> ExternalReadinessSource<'a> {
             )
             .map(|artifact| format!("{:?}", artifact.generation))
             .unwrap_or_else(|| "absent".to_string());
+            let mut search = self
+                .ctx
+                .open_borrowed_search_index(self.root, self.storage_dir);
+            let semantic = self
+                .ctx
+                .open_borrowed_semantic_index(self.root, self.storage_dir);
+            // The background search-index load may finish while semantic artifacts
+            // load. Recheck it until the first-search budget expires rather than
+            // treating an earlier degraded result as final for this request.
+            let deadline = Instant::now() + first_search_index_load_wait_budget();
+            while matches!(search, ReadOnlyArtifact::Degraded(_))
+                && Instant::now() < deadline
+                && !search_cancellation_requested()
+            {
+                search = self
+                    .ctx
+                    .open_borrowed_search_index(self.root, self.storage_dir);
+                if matches!(search, ReadOnlyArtifact::Degraded(_)) {
+                    std::thread::sleep(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL);
+                }
+            }
             ExternalBorrowedArtifacts {
-                search: self
-                    .ctx
-                    .open_borrowed_search_index(self.root, self.storage_dir),
-                semantic: self
-                    .ctx
-                    .open_borrowed_semantic_index(self.root, self.storage_dir),
+                search,
+                semantic,
                 search_generation: GenerationToken::new_with_str(&format!(
                     "borrowed:{}:{generation}",
                     self.root.display()
@@ -2707,6 +2724,22 @@ fn run_engine_ranking(
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
+    // Semantic readiness can admit a request before the borrowed search index
+    // finishes loading. Wait up to the first-search budget before exact
+    // verification falls back to filesystem search, without holding the search
+    // index's read lock.
+    if borrowed_index.is_none()
+        && (plan.contains(SearchLaneKind::Exact)
+            || plan.shape == SearchShape::Identifier
+            || plan.query_facts.has_identifier_token)
+    {
+        use extensions::ReadinessSource as _;
+        if (RuntimeReadinessSource { ctx }).bounded_first_search_wait()
+            == extensions::ReadinessWait::Cancelled
+        {
+            return Err("request_cancelled".to_string());
+        }
+    }
     let context_index = borrowed_index
         .is_none()
         .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
@@ -7646,6 +7679,42 @@ mod tests {
         assert_eq!(response["code"], "no_search_lanes_enabled");
         assert_eq!(response["lanes"]["trigram"]["status"], "off");
         assert_eq!(response["lanes"]["semantic"]["status"], "off");
+    }
+
+    #[test]
+    fn exact_search_waits_for_loading_borrowed_trigram_with_semantic_already_ready() {
+        let project = exact_lane::tests::large_identifier_project();
+        let ctx = test_context(project.path());
+        ctx.set_cache_role(true, None);
+        install_ready_semantic_lane(&ctx, project.path());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let root = project.path().to_path_buf();
+        let publisher = std::thread::spawn(move || {
+            let index = SearchIndex::build(&root);
+            std::thread::sleep(Duration::from_millis(40));
+            tx.send(index).unwrap();
+        });
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(2), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("isPrefixBoundThinkingModel", 50),
+                    &ctx,
+                ))
+            });
+        publisher.join().unwrap();
+        assert_eq!(response["success"], true, "{response}");
+        assert!(ctx.search_index().read().unwrap().as_ref().is_some_and(SearchIndex::is_ready),
+            "exact search must drain the borrowed loader even when semantic readiness skips the admission wait");
+        assert_eq!(
+            response["results"].as_array().unwrap().len(),
+            47,
+            "{response}"
+        );
+        assert!(!response["text"]
+            .as_str()
+            .unwrap()
+            .contains("exact pass: bounded"));
     }
 
     #[test]

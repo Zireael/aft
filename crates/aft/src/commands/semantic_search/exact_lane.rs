@@ -20,7 +20,8 @@ use crate::search_index::{
     DEFAULT_MAX_FILE_SIZE,
 };
 
-pub const DEFAULT_FALLBACK_FILE_LIMIT: usize = 1_000;
+/// Disable the default file-count cutoff; the fallback walk has a time limit.
+pub const DEFAULT_FALLBACK_FILE_LIMIT: usize = usize::MAX;
 pub const DEFAULT_FALLBACK_RESULT_LIMIT: usize = 100;
 
 /// Assemble response text containing optional bounded disclosure and trailer.
@@ -197,16 +198,23 @@ impl ExactLane {
             .unwrap_or(crate::grep_executor::FALLBACK_WALK_BUDGET);
         let deadline = Some(Instant::now() + budget);
 
-        // Sort a bounded discovery batch before verification, retaining a lookahead
-        // file and enough headroom to preserve small-directory path ordering.
-        // The shared walker rejects directory symlinks and foreign mounts.
-        let walk = crate::grep_executor::bounded_fallback_walk_files_with_limits(
-            project_root,
-            project_root,
-            &crate::search_index::PathFilters::default(),
-            file_limit.saturating_add(1).max(1024),
-            budget,
-        );
+        // Discovery and verification share one deadline. The shared walkers
+        // reject directory symlinks and foreign mounts.
+        let walk = if file_limit == usize::MAX {
+            crate::grep_executor::source_first_fallback_walk_files(
+                project_root,
+                deadline.expect("fallback has a deadline"),
+            )
+        } else {
+            // Callers and tests can still request explicit file-count bounds.
+            crate::grep_executor::bounded_fallback_walk_files_with_limits(
+                project_root,
+                project_root,
+                &crate::search_index::PathFilters::default(),
+                file_limit.saturating_add(1).max(1024),
+                budget,
+            )
+        };
         let mut files = walk.files;
 
         // Filter tests if needed
@@ -214,20 +222,26 @@ impl ExactLane {
             files.retain(|p| !p.to_str().map_or(false, is_test_file));
         }
 
-        // Visit order: project-root-relative path, byte-wise ascending
+        // Prefer source over documentation/data; retain byte-wise path order
+        // within each group so bounded pages do not depend on directory order.
         if options.force_directory_order {
             // Mutation red test: do not sort, keep directory order
         } else {
             files.sort_by(|a, b| {
                 let rel_a = a.strip_prefix(project_root).unwrap_or(a);
                 let rel_b = b.strip_prefix(project_root).unwrap_or(b);
-                rel_a
-                    .as_os_str()
-                    .as_encoded_bytes()
-                    .cmp(rel_b.as_os_str().as_encoded_bytes())
+                crate::grep_executor::is_fallback_source_path(b)
+                    .cmp(&crate::grep_executor::is_fallback_source_path(a))
+                    .then_with(|| {
+                        rel_a
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .cmp(rel_b.as_os_str().as_encoded_bytes())
+                    })
             });
         }
 
+        let discovered_files = files.len();
         let phrase = exact_phrase(query);
         let norm_phrase = normalize_exact_phrase(phrase);
         let content_tokens = exact_verification_tokens(query);
@@ -290,13 +304,16 @@ impl ExactLane {
             stability_void = true;
         }
         let bound_disclosure = bound_reason.as_ref().map(|reason| {
-            if reason == "time limit" {
-                format!(
-                    "exact pass: bounded ({files_visited} files, time limit) - page stability void"
-                )
+            let coverage = if walk.walk_truncated {
+                format!("{files_visited} files; total unknown because enumeration stopped")
             } else {
-                format!("exact pass: bounded ({files_visited} files, {reason})")
-            }
+                format!("{files_visited} of {discovered_files} discovered files")
+            };
+            let stability = if stability_void { " - page stability void" } else { "" };
+            format!(
+                "exact pass: bounded ({files_visited} files, {reason}){stability}; checked {coverage} (trigram index unavailable); source code and other files under {} not fully searched; use grep for an exhaustive check",
+                project_root.display()
+            )
         });
 
         results.sort_by(score_free_r3_cmp);
@@ -326,13 +343,21 @@ impl ExactLane {
         top_k: usize,
         fallback_options: Option<&FallbackExactOptions>,
     ) -> Result<ServeOutcome, MemoError> {
-        let key = MemoKey::new(project_root, snapshot_generation, query, include_tests);
+        let is_ready = index.is_some_and(SearchIndex::is_ready);
+        // Index loading can finish without changing snapshot_generation. Give
+        // fallback results a separate memo key so they cannot be reused once
+        // the full index is ready.
+        let memo_generation = if is_ready {
+            snapshot_generation
+        } else {
+            GenerationToken::new_with_str(&format!("fallback:{}", snapshot_generation.as_str()))
+        };
+        let key = MemoKey::new(project_root, memo_generation, query, include_tests);
 
         let default_opts = FallbackExactOptions::default();
         let fallback_opts = fallback_options.unwrap_or(&default_opts);
 
         self.memo.get_or_verify(&key, offset, top_k, || {
-            let is_ready = index.as_ref().is_some_and(|idx| idx.is_ready());
             if is_ready {
                 let snapshot = index.unwrap().snapshot();
                 Ok(self.execute_ready_mode(&snapshot, project_root, query, include_tests))
@@ -564,7 +589,7 @@ fn extract_identifier(s: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::commands::semantic_search::EvidenceKind;
     use std::path::PathBuf;
@@ -613,6 +638,187 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    pub(crate) fn large_identifier_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let docs = project.path().join("docs");
+        let source = project.path().join("packages/plugin/src");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        for i in 0..1_200 {
+            std::fs::write(
+                docs.join(format!("{i:04}.md")),
+                if i < 2 {
+                    "isPrefixBoundThinkingModel"
+                } else {
+                    "unrelated documentation"
+                },
+            )
+            .unwrap();
+        }
+        for i in 0..45 {
+            std::fs::write(
+                source.join(format!("use_{i:02}.ts")),
+                "export const value = isPrefixBoundThinkingModel(model);\n",
+            )
+            .unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn unavailable_index_searches_code_beyond_old_thousand_file_cap() {
+        let project = large_identifier_project();
+        let result = ExactLane::new().execute_fallback_mode(
+            project.path(),
+            "isPrefixBoundThinkingModel",
+            true,
+            &FallbackExactOptions::default(),
+        );
+        assert_eq!(result.files_visited, 1_245);
+        assert_eq!(result.verified_set.results.len(), 47);
+        assert!(result.verified_set.bound_disclosure.is_none());
+    }
+
+    #[test]
+    fn fallback_checks_source_before_docs_when_result_budget_expires() {
+        let project = large_identifier_project();
+        let result = ExactLane::new().execute_fallback_mode(
+            project.path(),
+            "isPrefixBoundThinkingModel",
+            true,
+            &FallbackExactOptions {
+                result_limit: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.verified_set.results.len(), 1);
+        assert!(result.verified_set.results[0]
+            .path
+            .starts_with(project.path().join("packages")));
+        let notice = result.verified_set.bound_disclosure.unwrap();
+        assert!(notice.contains("1 of 1245 discovered files"), "{notice}");
+        assert!(
+            notice.contains("not fully searched; use grep for an exhaustive check"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn fallback_timeout_names_unknown_coverage_and_exhaustive_alternative() {
+        let project = large_identifier_project();
+        let result = ExactLane::new().execute_fallback_mode(
+            project.path(),
+            "isPrefixBoundThinkingModel",
+            true,
+            &FallbackExactOptions {
+                time_limit: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        );
+        let notice = result.verified_set.bound_disclosure.unwrap();
+        assert!(
+            notice.contains("total unknown because enumeration stopped"),
+            "{notice}"
+        );
+        assert!(notice.contains("trigram index unavailable"), "{notice}");
+        assert!(
+            notice.contains(&project.path().display().to_string()),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("not fully searched; use grep for an exhaustive check"),
+            "{notice}"
+        );
+        assert_eq!(result.entries_examined, 1);
+    }
+
+    #[test]
+    fn ready_index_does_not_reuse_loading_fallback_memo() {
+        let project = large_identifier_project();
+        let lane = ExactLane::new();
+        let generation = GenerationToken::new(1);
+        let partial = lane
+            .search(
+                None,
+                project.path(),
+                generation.clone(),
+                "isPrefixBoundThinkingModel",
+                true,
+                0,
+                50,
+                Some(&FallbackExactOptions {
+                    result_limit: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(partial.results.len(), 1);
+        let index = SearchIndex::build(project.path());
+        let ready = lane
+            .search(
+                Some(&index),
+                project.path(),
+                generation,
+                "isPrefixBoundThinkingModel",
+                true,
+                0,
+                50,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ready.results.len(), 47);
+        assert!(ready.bound_disclosure.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires an isolated real corpus in AFT_EXACT_REPRO_ROOT"]
+    fn copied_worktree_exact_fallback_reproduction() {
+        let root =
+            PathBuf::from(std::env::var_os("AFT_EXACT_REPRO_ROOT").expect("isolated corpus"));
+        let old = crate::grep_executor::bounded_fallback_walk_files_with_limits(
+            &root,
+            &root,
+            &crate::search_index::PathFilters::default(),
+            1_024,
+            crate::grep_executor::FALLBACK_WALK_BUDGET,
+        );
+        let mut old_files = old.files;
+        old_files.sort();
+        old_files.truncate(1_000);
+        let old_hits: Vec<_> = old_files
+            .iter()
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .is_ok_and(|text| text.contains("isPrefixBoundThinkingModel"))
+            })
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect();
+        eprintln!(
+            "OLD WALK entries={} truncated={} hits={old_hits:?}",
+            old.entries_visited, old.walk_truncated
+        );
+        let result = ExactLane::new().execute_fallback_mode(
+            &root,
+            "isPrefixBoundThinkingModel",
+            true,
+            &Default::default(),
+        );
+        eprintln!(
+            "NEW WALK files={} hits={:?} notice={:?}",
+            result.files_visited,
+            exact_paths(&result.verified_set.results, &root),
+            result.verified_set.bound_disclosure
+        );
+        assert!(
+            result
+                .verified_set
+                .results
+                .iter()
+                .any(|candidate| candidate.path.starts_with(root.join("packages")))
+                || result.verified_set.bound_disclosure.is_some()
+        );
     }
 
     #[test]

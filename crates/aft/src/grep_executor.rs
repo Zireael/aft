@@ -662,6 +662,50 @@ pub(crate) fn bounded_fallback_walk_files(
     )
 }
 
+/// Enumerate source paths before documentation and data, with no file-count cap.
+/// Check the deadline on each directory entry, including entries rejected as files.
+pub(crate) fn source_first_fallback_walk_files(
+    root: &Path,
+    deadline: Instant,
+) -> FallbackWalkOutcome {
+    let mut files = Vec::new();
+    let mut entries_visited = 0;
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let mut walk_truncated = false;
+    'phases: for source_phase in [true, false] {
+        let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
+        for entry in builder.build() {
+            entries_visited += 1;
+            if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+                walk_truncated = true;
+                break 'phases;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && is_fallback_source_path(entry.path()) == source_phase
+            {
+                files.push(entry.into_path());
+            }
+        }
+    }
+    FallbackWalkOutcome {
+        files,
+        walk_truncated,
+        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        entries_visited,
+    }
+}
+
+pub(crate) fn is_fallback_source_path(path: &Path) -> bool {
+    use crate::parser::LangId;
+    crate::parser::detect_language(path).is_some_and(|language| {
+        !matches!(
+            language,
+            LangId::Markdown | LangId::Json | LangId::Yaml | LangId::Toml
+        )
+    })
+}
+
 pub(crate) fn bounded_fallback_walk_files_with_limits(
     filter_root: &Path,
     search_root: &Path,
