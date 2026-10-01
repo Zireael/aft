@@ -100,7 +100,7 @@ for (const version of [1, 2]) {
       }
     });
 
-    test("a host that never resolves lets callBridge use each call's directory within one second", async () => {
+    test("a timed-out lookup lets callBridge use the host-version fallback within one second", async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "aft-directory-timeout-")));
       tempRoots.push(root);
       const firstDirectory = join(root, "first");
@@ -129,9 +129,45 @@ for (const version of [1, 2]) {
       const started = performance.now();
       await callBridge(ctx, runtime, "read", {});
       expect(performance.now() - started).toBeLessThan(1_500);
-      expect(roots).toEqual([firstDirectory]);
+      expect(roots).toEqual([version === 1 ? root : firstDirectory]);
       await callBridge(ctx, { ...runtime, directory: secondDirectory }, "read", {});
-      expect(roots).toEqual([firstDirectory, secondDirectory]);
+      expect(roots).toEqual(version === 1 ? [root, root] : [firstDirectory, secondDirectory]);
     }, 4_000);
+
+    test("a session with no directory field routes to the host-version fallback", async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "aft-directory-missing-")));
+      tempRoots.push(root);
+      const directory = join(root, "subdirectory");
+      mkdirSync(directory);
+      const roots: string[] = [];
+      const host =
+        version === 1
+          ? { session: { get: async () => ({ data: {} }) } }
+          : { location: { directory }, session: { get: () => Effect.succeed({}) } };
+      const ctx = {
+        client: host,
+        pool: {
+          getBridge: (root: string) => {
+            roots.push(root);
+            return { send: async () => ({ success: true }) };
+          },
+        },
+        config: {},
+        storageDir: "/isolated/storage",
+      } as unknown as PluginContext;
+      await callBridge(
+        ctx,
+        {
+          sessionID: "missing-directory",
+          directory,
+          worktree: root,
+          directoryIsSessionRoot: version === 2,
+        },
+        "read",
+        {},
+      );
+      expect(getSessionDirectoryCached("missing-directory")).toBeNull();
+      expect(roots).toEqual([version === 1 ? root : directory]);
+    });
   });
 }

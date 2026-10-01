@@ -158,12 +158,9 @@ export function projectRootFor(runtime: ToolRuntime): string {
     return canonicalizeDirectory(cached);
   }
 
-  // A failed lookup has no session root to trust. Keep its fallback local to
-  // this call rather than binding a linked-worktree session to the main checkout.
-  const raw =
-    runtime.directoryIsSessionRoot || cached === null
-      ? runtime.directory
-      : (runtime.worktree ?? runtime.directory);
+  const raw = runtime.directoryIsSessionRoot
+    ? runtime.directory
+    : (runtime.worktree ?? runtime.directory);
   return canonicalizeDirectory(raw);
 }
 
