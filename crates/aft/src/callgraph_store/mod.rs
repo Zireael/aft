@@ -12397,15 +12397,18 @@ fn rust_target_for_use<I: ResolverIndex>(
         .trim_end_matches(';');
     if let Some(brace_start) = path.find("::{") {
         let prefix = &path[..brace_start];
-        if import.names.iter().any(|name| name == short_name) {
+        // `use m::{f as g};` binds `g`; resolve the imported `f`.
+        let imported = import.names.iter().find_map(|name| {
+            (crate::imports::specifier_local_name(name) == short_name)
+                .then(|| crate::imports::specifier_imported_name(name).to_string())
+        });
+        if let Some(imported) = imported {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
             let file = rust_use_module_file(index, caller_file, &prefix_segments)?;
             // The module may only re-export the item (`pub use inner::{f};`);
             // follow that to the definition, as qualified paths already do.
             return Some(rust_resolve_reexport_if_symbol_missing(
-                index,
-                file,
-                short_name.to_string(),
+                index, file, imported,
             ));
         }
         return None;
@@ -22842,11 +22845,11 @@ edition = "2021"
             "pub mod alerts;\npub mod cache;\npub mod net;\n",
         );
         // The binary reaches the library through the crate name, both as a
-        // qualified call and through a `use` list.
+        // qualified call and through an aliased `use` list entry.
         write_file(
             root,
             "src/main.rs",
-            "use path_forms_fixture::alerts::{normalize};\n\nfn main() {\n    path_forms_fixture::net::start();\n    normalize(\"x\");\n}\n",
+            "use path_forms_fixture::alerts::{normalize as tidy};\n\nfn main() {\n    path_forms_fixture::net::start();\n    tidy(\"x\");\n}\n",
         );
         // `registry::` names a child module of `net`; `cache::` is bound by
         // the `self` entry of a use list.

@@ -3,7 +3,7 @@ use std::collections::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -256,6 +256,7 @@ impl DeadCodeFileAnalyzer {
                         roots.insert(entry.name);
                         roots.insert(entry.scoped_name);
                     }
+                    roots.extend(rust_serde_function_references(&source));
                     roots.into_iter().collect()
                 })
                 .unwrap_or_default()
@@ -2532,6 +2533,25 @@ fn rust_globs_parent_module(source: &str, root: tree_sitter::Node) -> bool {
                 .ends_with("usesuper::*;")
     });
     globs
+}
+
+/// Functions named by serde field attributes (`deserialize_with = "f"`,
+/// `serialize_with`, `default`, `skip_serializing_if`). serde calls them from
+/// derived code the callgraph never sees, so they are liveness roots. Only the
+/// last path segment is kept: the root applies to this file's definition.
+fn rust_serde_function_references(source: &str) -> Vec<String> {
+    static SERDE_FUNCTION_ATTRIBUTE: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = SERDE_FUNCTION_ATTRIBUTE.get_or_init(|| {
+        regex::Regex::new(
+            r#"\b(?:deserialize_with|serialize_with|default|skip_serializing_if)\s*=\s*"([A-Za-z_][A-Za-z0-9_:]*)""#,
+        )
+        .expect("serde function attribute pattern compiles")
+    });
+    pattern
+        .captures_iter(source)
+        .filter_map(|captures| captures.get(1))
+        .filter_map(|path| path.as_str().rsplit("::").next().map(str::to_string))
+        .collect()
 }
 
 /// Names of the methods defined inside `impl Trait for Type` blocks anywhere
@@ -6889,6 +6909,42 @@ pub fn false_helper() -> String { "dead".to_string() }
         assert_eq!(walk["used_by"], json!(["src/calls.rs"]), "{walk:#}");
         assert!(
             aggregate_test_only_item(&aggregate, "src/calls.rs", "extract_in_range").is_some(),
+            "{aggregate:#}"
+        );
+    }
+
+    /// serde calls `deserialize_with` / `default` functions from derived code
+    /// the callgraph never sees; what they call must stay live.
+    #[test]
+    fn serde_attribute_functions_are_liveness_roots() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod config;\nfn main() {}\n"),
+            (
+                "src/config.rs",
+                "#[derive(serde::Deserialize)]\npub struct Git {\n    #[serde(deserialize_with = \"deserialize_author\")]\n    pub author: Option<String>,\n}\n\nfn deserialize_author<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {\n    let _ = d;\n    Ok(normalize_author(\"x\"))\n}\n\npub fn normalize_author(value: &str) -> Option<String> {\n    Some(value.to_string())\n}\n\npub fn planted_dead() {}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/config.rs", "normalize_author", "function"),
+            export(&root, "src/config.rs", "planted_dead", "function"),
+        ];
+        let calls = vec![outbound(
+            &root,
+            "src/config.rs",
+            "deserialize_author",
+            &resolved_target(&root, "src/config.rs", "normalize_author"),
+        )];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/config.rs::planted_dead".to_string()],
             "{aggregate:#}"
         );
     }
