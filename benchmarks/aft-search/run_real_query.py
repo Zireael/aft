@@ -38,6 +38,7 @@ from search_quality_lib import (
     profile_requests,
     row_metrics,
     sha256_file,
+    split_rows_not_applicable,
     validate_profile_score,
     validate_scored_population,
 )
@@ -568,7 +569,7 @@ def assemble_score(
     exact_family, exact_groups = _family_from_exact(exact_report)
     concept_family, concept_groups = _family_from_concept(concept_report)
     real = aggregate_real_query(rows)
-    return {
+    score: JsonObject = {
         "schema": "aft-search-score-v1",
         "evidence_sha": EVIDENCE_SHA,
         "model_id": model_id,
@@ -593,6 +594,12 @@ def assemble_score(
         "fixture_results": {"harness-goldens": True, "profile-grammar": True, "paging": profile != "paged" or capability.get("probe_pages_differ") is True},
         "rows": [dict(row) for row in rows],
     }
+    # Say which split rows the gate will not judge on this engine, and why,
+    # in the score itself rather than leaving the skip implicit.
+    not_applicable = split_rows_not_applicable(score)
+    if not_applicable:
+        score["split_rows_not_applicable"] = not_applicable
+    return score
 
 
 def load_manifest_and_tree(
@@ -840,6 +847,9 @@ def run(args: argparse.Namespace) -> int:
             if row["input_form"] == "split":
                 print(f"split_summary:{row['episode_id']} {row.get('pattern_summary')} {row.get('summary_text')}")
     print(f"real_query_rows:{len(rows)}")
+    if "split_rows_not_applicable" in score:
+        skipped = score["split_rows_not_applicable"]
+        print(f"split_rows_not_applicable:{','.join(skipped['rows'])}:{skipped['reason']}")
     print(f"real_query_score:{output}")
     print(f"real_query_score_sha256:{sha256_file(output)}")
     return 0

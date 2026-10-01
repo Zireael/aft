@@ -318,8 +318,17 @@ including an empty pattern. Capability is probed on the actual binary with
 `pattern: "["`: `success: false, code: invalid_pattern` means supported,
 success means the legacy engine ignored the parameter, and any other error is a
 hard fault. The score records `pattern_probe`, `pattern_declared`, and each split
-row's `input_form`. A ranking evaluation refuses any joined-form candidate;
-joined references are measurement of the old engine, never split measurements.
+row's `input_form`. Joined references are measurement of the old engine, never
+split measurements, so the split predicates (the joined-candidate refusal, the
+paired rule and the R1-R6 requirements below) do not judge a joined row. When
+the probe reports `ignored_pattern`, the engine cannot run split form at all:
+its joined split rows are recorded as not applicable and skipped by those
+predicates under every descriptor class. The score names them in
+`split_rows_not_applicable` (rows and reason), and both the runner and the gate
+print a `split_rows_not_applicable:` line. They still count in the real-query
+aggregates, which compare the joined replay with the joined reference. Once an
+engine honours `pattern`, its candidate must be split form: a joined row then
+faults with `split_candidate_required`, and every split predicate applies.
 
 Every split row also runs **prose-only**, at the same scoring depth and page
 profile. Paged replays verify invariance for both forms. The score carries the

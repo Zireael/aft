@@ -708,7 +708,9 @@ def _real_query_score_document(document: Mapping[str, Any]) -> dict[str, Any]:
     from their derived summaries without weakening row-level comparisons.
     """
     score = dict(document)
-    for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows"):
+    # split_rows_not_applicable is derived from the capability probe and the
+    # rows, which are compared themselves; it is a reader-facing annotation.
+    for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows", "split_rows_not_applicable"):
         score.pop(key, None)
     families = document.get("families", {})
     real_query = families.get("real_query") if isinstance(families, Mapping) else None
@@ -796,11 +798,54 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
     return None
 
 
+SPLIT_ROWS_NOT_APPLICABLE_REASON = (
+    "engine ignores the pattern parameter (pattern_probe ignored_pattern): "
+    "its split rows were replayed joined into one query, which measures the "
+    "single-query surface, not query/pattern fusion"
+)
+
+
+def split_rows_not_applicable(score: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Name the split rows the split predicates cannot judge on this engine.
+
+    The replay sends a split row's query and pattern separately only when the
+    capability probe shows the engine honours `pattern`; otherwise it joins
+    them into one query. A joined row says nothing about split fusion, so
+    holding it to the split predicates would refuse every ranking change on
+    an engine that has no split support yet. Such rows are recorded here as
+    not applicable, with the reason, and skipped. Only an explicit
+    `ignored_pattern` probe result skips them: an engine that honours
+    `pattern`, or a score without a probe result, is judged in full.
+    """
+    capability = score.get("capability", {})
+    if (
+        not isinstance(capability, Mapping)
+        or capability.get("pattern_probe") != "ignored_pattern"
+        or capability.get("pattern_declared") is not False
+    ):
+        return None
+    rows = sorted(
+        (
+            str(row.get("episode_id"))
+            for row in score.get("rows", [])
+            if isinstance(row, Mapping) and row.get("input_form") == "joined"
+        ),
+        key=episode_number,
+    )
+    if not rows:
+        return None
+    return {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": rows}
+
+
 def split_paired_failures(score: Mapping[str, Any]) -> list[str]:
     """Do not let aggregate gains hide harm to an individual concept answer."""
     failures = []
+    not_applicable = split_rows_not_applicable(score)
+    skipped = set(not_applicable["rows"]) if not_applicable else set()
     for row in score.get("rows", []):
         if "input_form" not in row:
+            continue
+        if row["input_form"] == "joined" and row["episode_id"] in skipped:
             continue
         if row["input_form"] != "split":
             raise InputFault(f"split_candidate_required:{row['episode_id']}:joined")

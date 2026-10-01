@@ -10,7 +10,7 @@ from search_quality_lib import (
     EVIDENCE_SHA, PAGE_SIZE, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
-    row_metrics, sample_plan, sha256_bytes, sha256_file, total_gate,
+    row_metrics, sample_plan, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
     validate_manifest_maintenance_scores, validate_manifest_relabels, validate_profile_score, validate_scored_population,
 )
 
@@ -258,6 +258,10 @@ def run(args:argparse.Namespace)->int:
     if not args.score: raise InputFault("missing_score")
     score_path=Path(args.score); score=read_json(score_path); reference=read_json(reference_path)
     diff_path=score_path.with_suffix(".diff.txt"); diff_path.write_text(real_query_behavior_diff(reference,score)); print(f"real_query_diff:{diff_path}")
+    # Recomputed from the score's own probe result, never read from a field
+    # the score carries, so a score cannot excuse rows by claiming the skip.
+    not_applicable=split_rows_not_applicable(score)
+    if not_applicable: print(f"split_rows_not_applicable:{','.join(not_applicable['rows'])}:{not_applicable['reason']}")
     path=descriptor_path(args.descriptor,args.branch); descriptor=read_json(path) if path else None
     paths=diff_paths(args.base_ref,args.head)
     if args.rebaseline:

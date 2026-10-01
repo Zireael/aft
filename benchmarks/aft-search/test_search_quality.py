@@ -19,10 +19,13 @@ from search_quality_lib import (
     PAGE_INVARIANCE_FAILED_FIELD,
     PAGE_SIZE,
     REFERENCE_NOT_PAGE_INVARIANT_FIELD,
+    SPLIT_ROWS_NOT_APPLICABLE_REASON,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     included_manifest_ids,
+    real_query_behavior_diff,
     split_paired_failures,
+    split_rows_not_applicable,
     evaluate_predicate,
     mean_metrics,
     total_gate,
@@ -53,6 +56,47 @@ class SplitPairedTests(unittest.TestCase):
     def test_joined_form_cannot_be_evaluated_as_split(self) -> None:
         with self.assertRaisesRegex(InputFault, "split_candidate_required.*joined"):
             split_paired_failures(self.candidate(0.5, 0.25, form="joined"))
+
+    def ranking_score_with_probe(self, pattern_declared: bool, pattern_probe: str) -> tuple[dict, dict]:
+        """A ranking evaluation whose only split row is joined and harmed."""
+        _, reference, score = synthetic_documents()
+        score["rows"] = self.candidate(0.25, 0.5, form="joined")["rows"]
+        score["rows"][0]["split_kind"] = "R1"
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        score["capability"].update(pattern_declared=pattern_declared, pattern_probe=pattern_probe)
+        return reference, score
+
+    def test_engine_ignoring_pattern_skips_joined_split_rows_under_ranking(self) -> None:
+        reference, score = self.ranking_score_with_probe(False, "ignored_pattern")
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertEqual(evaluate_predicate(reference, score, descriptor), [])
+        self.assertEqual(
+            split_rows_not_applicable(score),
+            {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": ["followup-census:910003"]},
+        )
+
+    def test_engine_honouring_pattern_still_fails_a_missing_split_candidate(self) -> None:
+        reference, score = self.ranking_score_with_probe(True, "invalid_pattern")
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertIsNone(split_rows_not_applicable(score))
+        with self.assertRaisesRegex(InputFault, "split_candidate_required:followup-census:910003:joined"):
+            evaluate_predicate(reference, score, descriptor)
+
+    def test_skip_needs_an_explicit_ignored_pattern_probe(self) -> None:
+        # A score with no probe result, or a probe that contradicts the
+        # declared capability, is judged in full.
+        for capability in ({}, {"pattern_declared": False}, {"pattern_declared": True, "pattern_probe": "ignored_pattern"}):
+            score = self.candidate(0.5, 0.25, form="joined")
+            score["capability"] = capability
+            self.assertIsNone(split_rows_not_applicable(score), capability)
+            with self.assertRaisesRegex(InputFault, "split_candidate_required"):
+                split_paired_failures(score)
+
+    def test_skip_annotation_is_ignored_by_behaviour_comparison(self) -> None:
+        _, reference, score = synthetic_documents()
+        named = copy.deepcopy(score)
+        named["split_rows_not_applicable"] = {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": ["followup-census:910003"]}
+        self.assertEqual(real_query_behavior_diff(reference, named), real_query_behavior_diff(reference, score))
 
     def test_ranking_predicate_invokes_paired_check(self) -> None:
         _, reference, score = synthetic_documents()

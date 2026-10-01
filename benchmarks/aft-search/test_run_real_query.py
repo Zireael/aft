@@ -267,6 +267,25 @@ class SplitQueryRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(InputFault, "empty_pattern_not_identical"):
             score_manifest_rows(document, "single_page", {"pattern_declared": True}, Drifting(), Path("/fixture"))
 
+    def assembled(self, capability: dict[str, Any]) -> dict[str, Any]:
+        document = self.split_manifest()
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_bytes(canonical_json(document))
+            binary = root / "aft"
+            binary.write_bytes(b"fake-aft-binary")
+            return assemble_score(document, rows, "single_page", capability, "fixture-model", exact_report(), concept_report(), manifest_path, binary, root / "missing-reference.json")
+
+    def test_score_names_split_rows_an_engine_ignoring_pattern_cannot_be_judged_on(self) -> None:
+        base = {"schema_path": "fixture.json", "schema_sha256": "0" * 64, "offset_declared": False}
+        ignored = self.assembled(base | {"pattern_declared": False, "pattern_probe": "ignored_pattern"})
+        self.assertEqual(ignored["split_rows_not_applicable"]["rows"], [ignored["rows"][0]["episode_id"]])
+        self.assertIn("ignored_pattern", ignored["split_rows_not_applicable"]["reason"])
+        honoured = self.assembled(base | {"pattern_declared": True, "pattern_probe": "invalid_pattern"})
+        self.assertNotIn("split_rows_not_applicable", honoured)
+
 
 class RealQueryRunnerTests(unittest.TestCase):
     def test_missing_checkout_is_provisioned_from_local_repository_with_manifest_digest(self) -> None:
