@@ -78,6 +78,49 @@ async fn next_frame(stream: &mut TcpStream) -> Result<Frame, HarnessError> {
         return Ok(frame);
     }
 }
+fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
+    // Windows verbatim paths do not normalize forward slashes in joined strings.
+    // Join individual components so canonicalized temp roots remain usable.
+    let directory = root.join("project").join(".cortexkit");
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        HarnessError::new(format!(
+            "creating provider config directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let config = directory.join("aft.jsonc");
+    std::fs::write(&config, serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "callgraph_store": false, "search_index": false, "semantic_search": false})).unwrap()).map_err(|error| HarnessError::new(format!("writing provider config {}: {error}", config.display())))?;
+    Ok(())
+}
+
+#[test]
+fn provider_project_setup_accepts_absent_and_canonical_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("absent").join("main");
+    prepare_provider_project(&absent).unwrap();
+    let canonical = absent.canonicalize().unwrap();
+    prepare_provider_project(&canonical).unwrap();
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(
+            canonical
+                .join("project")
+                .join(".cortexkit")
+                .join("aft.jsonc"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["disabled_tools"], json!(["aft_outline"]));
+    assert_eq!(config["callgraph_store"], false);
+    #[cfg(windows)]
+    {
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        // A slash-separated suffix stays literal under a verbatim prefix, rather
+        // than addressing the project and .cortexkit directories created above.
+        assert!(std::fs::write(canonical.join("project/.cortexkit/aft.jsonc"), b"{}").is_err());
+    }
+}
+
 #[async_trait]
 impl Harness for Subject {
     type Handle = Process;
@@ -86,8 +129,7 @@ impl Harness for Subject {
         vec![]
     }
     async fn spawn(&self, root: &Path) -> Result<Process, HarnessError> {
-        std::fs::create_dir_all(root.join("project/.cortexkit")).map_err(harness_error)?;
-        std::fs::write(root.join("project/.cortexkit/aft.jsonc"), serde_json::to_vec(&json!({"disabled_tools": ["aft_outline"], "callgraph_store": false, "search_index": false, "semantic_search": false})).unwrap()).map_err(harness_error)?;
+        prepare_provider_project(root)?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(harness_error)?;
@@ -104,7 +146,12 @@ impl Harness for Subject {
             daemon_ver: "tool-provider-conformance".into(),
         };
         let connection_path = root.join("connection.json");
-        connection_file::write_atomic(&connection_path, &connection).map_err(harness_error)?;
+        connection_file::write_atomic(&connection_path, &connection).map_err(|error| {
+            HarnessError::new(format!(
+                "publishing connection file {}: {error}",
+                connection_path.display()
+            ))
+        })?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_aft"));
         command
             .arg("--subc")
@@ -120,7 +167,13 @@ impl Harness for Subject {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = command.spawn().map_err(harness_error)?;
+        let child = command.spawn().map_err(|error| {
+            HarnessError::new(format!(
+                "launching {} with --subc {}: {error}",
+                env!("CARGO_BIN_EXE_aft"),
+                connection_path.display()
+            ))
+        })?;
         // Own the child before awaiting the handshake so failed setup also reaps it.
         struct ChildGuard(Option<Child>);
         impl Drop for ChildGuard {
