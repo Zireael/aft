@@ -734,18 +734,24 @@ impl JobOutcome {
 /// the path, kept conservative to avoid hiding real product directories.
 pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
     let normalized = relative_path.replace('\\', "/");
-    normalized.split('/').any(|segment| {
-        matches!(
-            segment,
-            "fixtures"
-                | "__fixtures__"
-                | "testdata"
-                | "test-data"
-                | "__mocks__"
-                | "__snapshots__"
-                | "corpora"
-        )
-    })
+    normalized.split('/').any(is_test_support_dir_name)
+}
+
+/// Whether one path segment is a conventional test-support directory name
+/// (fixtures, corpora, mock data, snapshots). Shared by the reporting filter
+/// above and the language-server walk, which starts no server for these
+/// directories.
+pub(crate) fn is_test_support_dir_name(segment: &str) -> bool {
+    matches!(
+        segment,
+        "fixtures"
+            | "__fixtures__"
+            | "testdata"
+            | "test-data"
+            | "__mocks__"
+            | "__snapshots__"
+            | "corpora"
+    )
 }
 
 /// Whether a project-relative path is an actual automated-test file (unit /

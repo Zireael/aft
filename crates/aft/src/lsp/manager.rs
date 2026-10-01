@@ -5640,9 +5640,9 @@ pub fn walk_applicable_area(
         .standard_filters(true)
         .add_custom_ignore_filename(".aftignore")
         .filter_entry(|entry| {
-            !matches!(
+            !crate::lsp::roots::skip_in_server_walk(
                 entry.file_name().to_string_lossy().as_ref(),
-                ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+                entry.depth(),
             )
         })
         .build();
@@ -6259,7 +6259,7 @@ mod clear_diagnostics_tests {
 
 #[cfg(test)]
 mod inspect_path_tests {
-    use super::LspManager;
+    use super::{walk_applicable_area, ApplicabilityWalk, LspManager};
     use crate::config::{Config, UserServerDef};
     use crate::lsp::registry::ServerKind;
 
@@ -6313,6 +6313,55 @@ mod inspect_path_tests {
 
         assert!(snapshot.server_keys.is_empty());
         assert!(snapshot.candidates.is_empty());
+    }
+
+    /// A whole-project walk starts no server for test fixtures, spikes, or
+    /// ignored directories, each of which here is its own Cargo workspace that
+    /// would otherwise get its own rust-analyzer. A scope that names such a
+    /// directory still gets its server.
+    #[test]
+    fn applicability_walk_skips_fixtures_spikes_and_ignored_directories() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = crate::inspect::job::canonicalize_normalized(temp_dir.path());
+        let write = |relative: &str, contents: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        let standalone = "[workspace]\n[package]\nname = \"x\"\nversion = \"0.1.0\"\n";
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+        );
+        write("src/lib.rs", "pub fn root() {}\n");
+        for dir in [
+            "spikes/foreign",
+            "crates/app/tests/fixtures/bin_targets",
+            "ignored/standalone",
+        ] {
+            write(&format!("{dir}/Cargo.toml"), standalone);
+            write(&format!("{dir}/src/lib.rs"), "pub fn x() {}\n");
+        }
+        write(".aftignore", "ignored/\n");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let rust_roots = |walk: ApplicabilityWalk| {
+            walk.candidates
+                .into_iter()
+                .filter(|candidate| candidate.key.kind == ServerKind::Rust)
+                .map(|candidate| candidate.key.root)
+                .collect::<Vec<_>>()
+        };
+
+        let whole = walk_applicable_area(&root, None, &config, None).expect("whole walk");
+        assert_eq!(rust_roots(whole), vec![root.clone()]);
+
+        let spike = root.join("spikes/foreign");
+        let scoped = walk_applicable_area(&root, Some(&[spike.clone()]), &config, None)
+            .expect("scoped walk");
+        assert_eq!(rust_roots(scoped), vec![spike]);
     }
 }
 

@@ -210,6 +210,57 @@ fn cargo_member_pattern_matches(pattern: &str, crate_relative_path: &Path) -> bo
         .unwrap_or(false)
 }
 
+/// The highest directory, from `nearest` up to `project_root`, that holds one
+/// of a server's root markers. `nearest` is returned when it lies outside the
+/// project root or no higher directory has a marker.
+pub fn outermost_marker_root(
+    nearest: &Path,
+    project_root: &Path,
+    has_marker: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let mut chosen = nearest.to_path_buf();
+    if !nearest.starts_with(&project_root) {
+        return chosen;
+    }
+    let mut current = nearest.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(&project_root) {
+            break;
+        }
+        if has_marker(dir) {
+            chosen = dir.to_path_buf();
+        }
+        if dir == project_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    chosen
+}
+
+/// Whether a walk that chooses language servers skips this entry and
+/// everything under it.
+///
+/// Dependency and build output directories hold no project sources. Test
+/// fixtures, corpora and `spikes/` do hold sources, but they are inputs to
+/// tests or throwaway experiments, often with their own manifests: each one
+/// would start another server (a fixture `Cargo.toml` is a separate
+/// rust-analyzer workspace; a spike with a stale `Cargo.lock` fails its
+/// workspace load) whose diagnostics nobody asked for. The walk root itself
+/// (`depth == 0`) is never skipped, so a scope that names such a directory
+/// still gets its servers. Ignore files (`.gitignore`, `.aftignore`) are
+/// applied by the walker itself.
+pub fn skip_in_server_walk(name: &str, depth: usize) -> bool {
+    if matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+    ) {
+        return true;
+    }
+    depth > 0 && (name == "spikes" || crate::inspect::job::is_test_support_dir_name(name))
+}
+
 /// Composite key for caching server instances.
 /// Each unique (ServerKind, workspace_root) pair gets its own server process.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

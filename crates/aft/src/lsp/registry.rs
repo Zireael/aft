@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
     find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
+    outermost_marker_root,
 };
 use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
 
@@ -322,6 +323,62 @@ impl ServerDef {
             self.kind,
             ServerKind::Rust | ServerKind::Python | ServerKind::Ty
         );
+        let nearest = match self.nearest_marker_root(file_path, project_root, bounded_to_project) {
+            Some(nearest) => nearest,
+            // A Python script with no project file above it (a helper under
+            // `scripts/`, say) is still Python that Pyright can check with its
+            // defaults. Serving it from the project root keeps such files from
+            // being permanently "no workspace root" gaps in a scoped inspect.
+            None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
+                let project_root = crate::inspect::job::canonicalize_normalized(project_root?);
+                crate::inspect::job::canonicalize_normalized(file_path)
+                    .starts_with(&project_root)
+                    .then_some(project_root)?
+            }
+            None => return None,
+        };
+        let Some(project_root) = project_root else {
+            return Some(nearest);
+        };
+        match self.kind {
+            // One TypeScript language server serves every tsconfig project
+            // below its root: tsserver finds the nearest tsconfig of each file
+            // it opens. Packages share a server as long as they see the same
+            // TypeScript version, so a monorepo whose packages each install
+            // the same TypeScript runs one server instead of one per package.
+            ServerKind::TypeScript => {
+                Some(super::typescript_project::shared_typescript_server_root(
+                    &nearest,
+                    project_root,
+                    |dir| self.has_root_marker(dir),
+                ))
+            }
+            // Bash and YAML servers analyze each file on its own; their
+            // workspace root only bounds background indexing. Their markers
+            // (`package.json`, `.git`) mark every JavaScript package, which
+            // started one server per package for the same project.
+            ServerKind::Bash | ServerKind::Yaml => {
+                Some(outermost_marker_root(&nearest, project_root, |dir| {
+                    self.has_root_marker(dir)
+                }))
+            }
+            _ => Some(nearest),
+        }
+    }
+
+    fn has_root_marker(&self, dir: &Path) -> bool {
+        self.root_markers
+            .iter()
+            .chain(self.priority_root_markers.iter())
+            .any(|marker| dir.join(marker).exists())
+    }
+
+    fn nearest_marker_root(
+        &self,
+        file_path: &Path,
+        project_root: Option<&Path>,
+        bounded_to_project: bool,
+    ) -> Option<PathBuf> {
         for marker in &self.priority_root_markers {
             let root = if bounded_to_project {
                 find_workspace_root_within(file_path, &[marker.as_str()], project_root)
@@ -1145,6 +1202,101 @@ mod tests {
                 ServerKind::TypeScript | ServerKind::TypeScriptNative(_)
             )
         })
+    }
+
+    /// Packages that each install the same TypeScript share one server at the
+    /// highest root that still sees that version; a package with a different
+    /// version keeps its own server root.
+    #[test]
+    fn typescript_packages_with_the_same_version_share_one_server_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "5.9.3");
+        for package in ["cli", "plugin", "old"] {
+            write_file(
+                &root.join("packages").join(package).join("package.json"),
+                "{}",
+            );
+            write_file(
+                &root.join("packages").join(package).join("tsconfig.json"),
+                "{}",
+            );
+            write_file(
+                &root.join("packages").join(package).join("src/index.ts"),
+                "",
+            );
+        }
+        install_typescript(&root.join("packages/cli"), "5.9.3");
+        install_typescript(&root.join("packages/old"), "5.4.5");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let server_root = |package: &str| {
+            let file = root.join("packages").join(package).join("src/index.ts");
+            let server = typescript_server(&file, &config).unwrap();
+            assert_eq!(server.kind, ServerKind::TypeScript);
+            server
+                .workspace_root_for_file_with_project_root(&file, Some(&root))
+                .unwrap()
+        };
+        assert_eq!(server_root("cli"), root);
+        assert_eq!(server_root("plugin"), root);
+        assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    /// A Python script with no project file above it is served from the
+    /// project root instead of having no server at all.
+    #[test]
+    fn python_script_without_a_project_file_uses_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let script = root.join("scripts/report.py");
+        write_file(&script, "print(1)\n");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let python = servers_for_file(&script, &config)
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        assert_eq!(
+            python.workspace_root_for_file_with_project_root(&script, Some(&root)),
+            Some(root.clone())
+        );
+        assert_eq!(python.workspace_root_for_file(&script), None);
+    }
+
+    /// Bash marks every JavaScript package (`package.json`) as a root; one
+    /// server at the outermost root in the project serves all of them.
+    #[test]
+    fn bash_scripts_in_nested_packages_share_the_outermost_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        write_file(&root.join("packages/cli/package.json"), "{}");
+        let script = root.join("packages/cli/scripts/release.sh");
+        write_file(&script, "echo hi\n");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let bash = servers_for_file(&script, &config)
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Bash)
+            .unwrap();
+        assert_eq!(
+            bash.workspace_root_for_file_with_project_root(&script, Some(&root)),
+            Some(root.clone())
+        );
+        // Without a project root there is nothing to bound the climb, so the
+        // nearest marker stays the root.
+        assert_eq!(
+            bash.workspace_root_for_file(&script),
+            Some(root.join("packages/cli"))
+        );
     }
 
     /// One root can hold packages with different TypeScript installations.

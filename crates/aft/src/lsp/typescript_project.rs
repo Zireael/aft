@@ -217,6 +217,78 @@ pub(crate) fn native_typescript_for(
 /// Forget every memoized TypeScript server choice.
 pub(crate) fn clear_typescript_selection() {
     selection_memo().lock().clear();
+    shared_root_memo().lock().clear();
+}
+
+/// (nearest TypeScript root marker directory, project root) to the root the
+/// server for that directory runs at. Emptied with the selection memo.
+type SharedRootMemo = parking_lot::Mutex<HashMap<(PathBuf, PathBuf), PathBuf>>;
+
+fn shared_root_memo() -> &'static SharedRootMemo {
+    static MEMO: OnceLock<SharedRootMemo> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// The workspace root for the `typescript-language-server` that serves the
+/// package whose nearest root marker directory is `nearest`.
+///
+/// One server can serve many packages: tsserver resolves each opened file's
+/// own tsconfig, and runs several configured projects in one process. What it
+/// cannot do is run two TypeScript versions, because the server loads one
+/// `tsserver.js`. So the root moves up from `nearest` through every ancestor
+/// with a root marker that sees the same installed TypeScript version, and
+/// stops at the first ancestor that sees a different one (or none, when
+/// `nearest` has one). Packages that each install the same version then
+/// share the server at the project root instead of starting one per package.
+pub(crate) fn shared_typescript_server_root(
+    nearest: &Path,
+    project_root: &Path,
+    has_marker: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    if !nearest.starts_with(&project_root) {
+        return nearest.to_path_buf();
+    }
+    let key = (nearest.to_path_buf(), project_root.clone());
+    if let Some(root) = shared_root_memo().lock().get(&key) {
+        return root.clone();
+    }
+    // The TypeScript a directory's files would load: its version, or the
+    // package path when the version is unreadable, so two unreadable
+    // installations never count as the same one.
+    let typescript_of = |dir: &Path| {
+        find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
+            if found.version == "unknown" {
+                found.package_dir.to_string_lossy().into_owned()
+            } else {
+                found.version
+            }
+        })
+    };
+    let own = typescript_of(nearest);
+    let mut chosen = nearest.to_path_buf();
+    let mut current = nearest.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(&project_root) {
+            break;
+        }
+        if has_marker(dir) {
+            if typescript_of(dir) != own {
+                break;
+            }
+            chosen = dir.to_path_buf();
+        }
+        if dir == project_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    let mut memo = shared_root_memo().lock();
+    if memo.len() >= SELECTION_MEMO_CAPACITY {
+        memo.clear();
+    }
+    memo.insert(key, chosen.clone());
+    chosen
 }
 
 /// Whether a change to `path` can change which TypeScript server a file gets:

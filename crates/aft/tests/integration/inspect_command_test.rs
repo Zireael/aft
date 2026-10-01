@@ -3343,9 +3343,12 @@ fn scoped_typescript_file_inspect_starts_only_its_workspace() {
     assert_eq!(response["scope_files"], 1, "scope was lost: {response:#}");
     assert_eq!(active.len(), 1, "response: {response:#}");
     assert_eq!(active[0].kind, ServerKind::TypeScript);
+    // No package installs its own TypeScript, so every package sees the same
+    // (none) and one server at the outermost TypeScript root serves them all;
+    // the scope still starts only that one server, not one per package.
     assert_eq!(
         active[0].root,
-        crate::helpers::canonicalize_like_product(&root.join("packages/plugin/scripts"))
+        crate::helpers::canonicalize_like_product(&root)
     );
 }
 
@@ -3365,12 +3368,15 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
         "[package]\nname = \"scoped-owner\"\nversion = \"0.1.0\"\n",
     );
     write_file(&root, "crates/aft/src/lib.rs", "pub fn owned() {}\n");
+    // A nested standalone workspace outside `spikes/` and fixture directories,
+    // which the whole-project walk skips; this one must still get its own
+    // server when the request is unscoped.
     write_file(
         &root,
-        "spikes/foreign/Cargo.toml",
+        "tools/foreign/Cargo.toml",
         "[workspace]\n[package]\nname = \"foreign\"\nversion = \"0.1.0\"\n",
     );
-    write_file(&root, "spikes/foreign/src/lib.rs", "pub fn foreign() {}\n");
+    write_file(&root, "tools/foreign/src/lib.rs", "pub fn foreign() {}\n");
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
 
@@ -3403,7 +3409,7 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
     let active = ctx.lsp().active_server_keys();
     assert_eq!(active.len(), 2, "response: {unscoped:#}");
     assert!(active.iter().any(|key| {
-        key.root == crate::helpers::canonicalize_like_product(&root.join("spikes/foreign"))
+        key.root == crate::helpers::canonicalize_like_product(&root.join("tools/foreign"))
     }));
 }
 

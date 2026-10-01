@@ -424,10 +424,9 @@ fn scoped_coverage_candidates(
             .standard_filters(true)
             .add_custom_ignore_filename(".aftignore")
             .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+                !crate::lsp::roots::skip_in_server_walk(
+                    entry.file_name().to_string_lossy().as_ref(),
+                    entry.depth(),
                 )
             })
             .build();
