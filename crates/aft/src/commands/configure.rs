@@ -3643,13 +3643,15 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // directory. When that job later switched directories, an older
     // checkpoint of the same name in the harness directory (written by
     // another project root using the same storage directory and session)
-    // shadowed it, and restore wrote that older snapshot. Selecting the
-    // directory here only does disk I/O on the first switch away from the
-    // unbound one, to move checkpoints made before configure.
+    // shadowed it, and restore wrote that older snapshot.
+    //
+    // This runs before the bind reply, so it only records the choice: it
+    // takes neither the store's mutex nor its file lock and does no I/O. The
+    // store switches directories at the start of its next operation, and
+    // moving checkpoints saved before configure stays with that operation or
+    // the deferred maintenance job, whichever takes the file lock first.
     if let Some(storage_dir) = next_config.storage_dir.clone() {
-        ctx.checkpoint()
-            .lock()
-            .set_storage_dir_for_harness(storage_dir, harness.clone());
+        ctx.request_checkpoint_namespace(storage_dir, harness.clone());
     }
     ctx.set_canonical_cache_root(canonical_cache_root.clone());
     crate::root_cache::configure_artifact_access(
@@ -7903,8 +7905,9 @@ mod tests {
                 ..Config::default()
             },
         );
-        *ctx.checkpoint().lock() =
-            crate::checkpoint::CheckpointStore::unbound_in_for_test(storage.path());
+        ctx.replace_checkpoint_store_for_test(
+            crate::checkpoint::CheckpointStore::unbound_in_for_test(storage.path()),
+        );
         let response = handle_configure_for_test(
             &configure_request_with_params(json!({
                 "project_root": project.path(),
@@ -7956,6 +7959,111 @@ mod tests {
             std::fs::read_to_string(&stale_target).unwrap(),
             "moved on\n"
         );
+    }
+
+    #[test]
+    fn configure_replies_while_the_checkpoint_store_and_its_file_lock_are_held() {
+        // Configure runs before a subc bind reply, which has a hard deadline.
+        // A checkpoint command can hold the store's mutex while it waits up to
+        // 30 s for the cross-process checkpoint file lock, so configure must
+        // select the checkpoint namespace without either.
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let early_file = project.path().join("early.txt");
+        std::fs::write(&early_file, "early\n").unwrap();
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.replace_checkpoint_store_for_test(
+            crate::checkpoint::CheckpointStore::unbound_in_for_test(storage.path()),
+        );
+        // Saved before configure, under `<storage>/unbound/checkpoints`, so
+        // binding the harness has checkpoints to move.
+        ctx.checkpoint()
+            .lock()
+            .create(
+                crate::protocol::DEFAULT_SESSION_ID,
+                "early",
+                vec![early_file.clone()],
+                &crate::backup::BackupStore::new(),
+            )
+            .expect("checkpoint before configure");
+
+        let lock_path = storage
+            .path()
+            .join("checkpoints")
+            .join("test-project")
+            .join("checkpoint.lock");
+        let file_lock = crate::fs_lock::try_acquire(&lock_path, Duration::from_secs(5))
+            .expect("hold the checkpoint file lock");
+        let request = configure_request_with_params(json!({
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        }));
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            // Hold the store's mutex on another thread, as a checkpoint command
+            // waiting on the file lock would. Configure itself stays on this
+            // thread, which holds the process env guards it needs. The holder
+            // gives up after 15 s, so a configure that waits for the mutex
+            // fails the elapsed check below instead of hanging the test.
+            let ctx_ref = &ctx;
+            scope.spawn(move || {
+                let store_guard = ctx_ref.checkpoint().lock();
+                locked_tx.send(()).expect("signal store locked");
+                let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                drop(store_guard);
+            });
+            locked_rx.recv().expect("store locked");
+            let started = Instant::now();
+            let response = handle_configure_for_test(&request, &ctx);
+            let elapsed = started.elapsed();
+            let _ = release_tx.send(());
+            assert!(response.success, "{}", response.data);
+            // Well under both the holder's 15 s and the 30 s file-lock timeout.
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "configure waited on the checkpoint store: {elapsed:?}"
+            );
+        });
+        drop(file_lock);
+
+        // The next operation applies the namespace and moves the checkpoint
+        // saved before configure into it.
+        let listed = ctx
+            .checkpoint()
+            .lock()
+            .list(crate::protocol::DEFAULT_SESSION_ID)
+            .expect("list checkpoints");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|info| info.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["early"]
+        );
+        let storage_path = listed[0].storage_path.clone().unwrap_or_default();
+        assert!(
+            storage_path.starts_with(storage.path().join("opencode")),
+            "{}",
+            storage_path.display()
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
     }
 
     #[test]

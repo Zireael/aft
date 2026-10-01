@@ -2758,6 +2758,10 @@ pub struct AppContext {
     provider: Box<dyn LanguageProvider>,
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
+    /// Lets configure select the checkpoint store's durable namespace without
+    /// taking `checkpoint`, which a command can hold while it waits on the
+    /// cross-process checkpoint file lock.
+    checkpoint_namespace_request: crate::checkpoint::CheckpointNamespaceRequest,
     config: RwLock<Arc<Config>>,
     /// State for applying config file edits while the root stays bound: the
     /// config file texts the last configure applied, the pending-reload flag
@@ -3424,11 +3428,14 @@ impl AppContext {
         } else {
             VIEW_DISK_LIMITS_OFF
         });
+        let checkpoint_store = CheckpointStore::new();
+        let checkpoint_namespace_request = checkpoint_store.namespace_request();
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
             backup: parking_lot::Mutex::new(BackupStore::new()),
-            checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
+            checkpoint: parking_lot::Mutex::new(checkpoint_store),
+            checkpoint_namespace_request,
             config: RwLock::new(Arc::new(config)),
             config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
@@ -5308,6 +5315,27 @@ impl AppContext {
     /// Access the checkpoint store.
     pub fn checkpoint(&self) -> &parking_lot::Mutex<CheckpointStore> {
         &self.checkpoint
+    }
+
+    /// Select the checkpoint store's durable namespace without waiting on
+    /// anything: no store mutex, no file lock, no I/O. The store applies it at
+    /// the start of its next operation; moving checkpoints saved before
+    /// configure happens then or in deferred maintenance.
+    pub fn request_checkpoint_namespace(
+        &self,
+        storage_dir: PathBuf,
+        harness: crate::harness::Harness,
+    ) {
+        self.checkpoint_namespace_request
+            .request(storage_dir, harness);
+    }
+
+    /// Swap in a test-built checkpoint store that answers this context's
+    /// namespace requests.
+    #[cfg(test)]
+    pub(crate) fn replace_checkpoint_store_for_test(&self, mut store: CheckpointStore) {
+        store.use_namespace_request(self.checkpoint_namespace_request.clone());
+        *self.checkpoint.lock() = store;
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
