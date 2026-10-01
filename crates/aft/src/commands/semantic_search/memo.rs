@@ -11,6 +11,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffsetRange};
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
+use crate::search_index::ExactEvidenceScope;
 
 const MAX_EXACT_MEMO_ENTRIES: usize = 128;
 
@@ -33,17 +34,23 @@ pub fn compute_file_content_digest(path: &Path) -> Option<String> {
     fs::read(path).ok().map(|b| compute_content_digest(&b))
 }
 
-/// Memo key K = (project_root, snapshot_generation, normalized_query, include_tests).
+/// Memo key K = (project_root, snapshot_generation, normalized_query, include_tests,
+/// evidence_scope).
 ///
 /// Per spec:
 /// Equality is the only permitted operation on snapshot_generation.
 /// Neither epoch nor poisoned is part of this key.
+///
+/// The evidence scope is part of the key because a narrowly scoped pass skips
+/// files whose only evidence is of a kind its caller drops; serving that entry
+/// to a caller that keeps the kind would lose those files.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemoKey {
     pub project_root: PathBuf,
     pub snapshot_generation: GenerationToken,
     pub normalized_query: String,
     pub include_tests: bool,
+    pub evidence_scope: ExactEvidenceScope,
 }
 
 impl MemoKey {
@@ -58,7 +65,14 @@ impl MemoKey {
             snapshot_generation,
             normalized_query: normalize_query(query),
             include_tests,
+            evidence_scope: ExactEvidenceScope::All,
         }
+    }
+
+    /// The same key for a pass that keeps only the evidence in `scope`.
+    pub fn with_evidence_scope(mut self, scope: ExactEvidenceScope) -> Self {
+        self.evidence_scope = scope;
+        self
     }
 }
 

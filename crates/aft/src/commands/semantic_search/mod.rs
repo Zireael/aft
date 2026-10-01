@@ -2681,6 +2681,18 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
     let Some(symbol) = source.get(range.start..range.end) else {
         return false;
     };
+    definition_identifier_tokens(query)
+        .into_iter()
+        .any(|token| {
+            symbol
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        })
+}
+
+/// The identifier-shaped words of `query` that a declaration's text must
+/// contain for a natural-language query to keep it as exact evidence.
+fn definition_identifier_tokens(query: &str) -> Vec<&str> {
     query
         .split_whitespace()
         .map(|token| {
@@ -2692,11 +2704,7 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
             })
         })
         .filter(|token| crate::search_b2::router::is_identifier_shaped_token(token))
-        .any(|token| {
-            symbol
-                .windows(token.len())
-                .any(|window| window == token.as_bytes())
-        })
+        .collect()
 }
 
 fn path_scope_contains(path_scope: &HashSet<PathBuf>, path: &Path) -> bool {
@@ -2815,11 +2823,27 @@ fn run_engine_ranking(
         })
         .collect::<Vec<_>>();
     let exact_input = plan.exact_input.as_deref().unwrap_or(query);
+    let retain_definition_evidence = plan.shape == SearchShape::Identifier
+        || (plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token);
+    // The exact pass reads only files able to hold evidence kept below, so its
+    // scope mirrors the declaration filtering applied to its candidates.
+    let exact_scope = if plan.shape == SearchShape::Identifier {
+        exact_lane::ExactEvidenceScope::All
+    } else if retain_definition_evidence {
+        exact_lane::ExactEvidenceScope::DefinitionsMentioning(
+            definition_identifier_tokens(query)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    } else {
+        exact_lane::ExactEvidenceScope::PhraseAndWindow
+    };
     let mut exact_disclosures = Vec::new();
     let mut exact_candidates =
         if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
             let outcome = exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
-                .search(
+                .search_scoped(
                     Some(&index),
                     project_root,
                     generation.clone(),
@@ -2828,6 +2852,7 @@ fn run_engine_ranking(
                     0,
                     usize::MAX,
                     None,
+                    &exact_scope,
                 )
                 .map_err(|error| error.to_string())?;
             if let Some(disclosure) = outcome.bound_disclosure {
@@ -2851,8 +2876,9 @@ fn run_engine_ranking(
                     .map(|variant| (variant.text, false)),
             );
             for (fact_input, exact_form) in fact_inputs {
+                // Only phrase evidence is kept from these passes.
                 let outcome = lane
-                    .search(
+                    .search_scoped(
                         Some(&index),
                         project_root,
                         generation.clone(),
@@ -2861,6 +2887,7 @@ fn run_engine_ranking(
                         0,
                         usize::MAX,
                         None,
+                        &exact_lane::ExactEvidenceScope::Phrase,
                     )
                     .map_err(|error| error.to_string())?;
                 if let Some(disclosure) = outcome.bound_disclosure {
@@ -2875,8 +2902,6 @@ fn run_engine_ranking(
             }
         }
     }
-    let retain_definition_evidence = plan.shape == SearchShape::Identifier
-        || (plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token);
     if !retain_definition_evidence {
         exact_candidates.retain(|candidate| candidate.evidence.kind != EvidenceKind::Definition);
     } else if plan.shape == SearchShape::NaturalLanguage {

@@ -33,6 +33,34 @@ pub struct ExactPassMatch {
     pub content_digest: String,
 }
 
+/// Which evidence a caller keeps from an exact pass.
+///
+/// The pass reads every file that could hold kept evidence, so the scope sets
+/// how much of the corpus it reads. A declaration named after a query word can
+/// sit in any file that mentions that word, while a verbatim phrase or an
+/// all-words window needs every one of its words in the file. A caller that
+/// drops declaration evidence therefore lets the pass skip the files that only
+/// mention one or two query words, which for a prose query is most of the
+/// corpus. Files that are read are verified exactly as under [`Self::All`], so
+/// the evidence a caller keeps is the same under any scope that keeps it.
+///
+/// Defined here rather than in the exact lane module because that module is
+/// compiled at two paths, and both must name the same type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExactEvidenceScope {
+    /// Declarations named after a query word, verbatim phrase (E1) and
+    /// all-words window (E2) evidence.
+    #[default]
+    All,
+    /// Phrase and window evidence; the caller drops declaration evidence.
+    PhraseAndWindow,
+    /// Phrase evidence only; the caller drops window and declaration evidence.
+    Phrase,
+    /// Phrase and window evidence, and declaration evidence only where the
+    /// declaration's text contains one of these identifier-shaped tokens.
+    DefinitionsMentioning(Vec<String>),
+}
+
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
@@ -945,10 +973,30 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
     ) -> Vec<ExactPassMatch> {
+        self.whole_corpus_exact_pass_scoped(
+            query,
+            search_root,
+            candidate_filter,
+            &ExactEvidenceScope::All,
+        )
+    }
+
+    /// [`Self::whole_corpus_exact_pass`] that reads only the files able to hold
+    /// the evidence `scope` keeps. The candidate set is the unscoped one with
+    /// those files removed, and every remaining file is verified as before, so
+    /// the kept evidence is identical to the unscoped pass.
+    pub fn whole_corpus_exact_pass_scoped(
+        &self,
+        query: &str,
+        search_root: &Path,
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        scope: &ExactEvidenceScope,
+    ) -> Vec<ExactPassMatch> {
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
         let content_tokens = exact_lane::exact_verification_tokens(query);
         let literal = crate::search_b2::router::is_hyphenated_literal(query);
+        let mut literal_postings = HashMap::new();
 
         let mut candidate_file_ids = BTreeSet::new();
 
@@ -962,8 +1010,10 @@ impl SearchIndexSnapshot {
         if content_tokens.len() >= 2 {
             for token in &content_tokens {
                 if token.len() >= 3 {
-                    let token_query = decompose_regex(&regex::escape(token));
-                    candidate_file_ids.extend(self.candidates(&token_query));
+                    match self.files_possibly_containing(token, &mut literal_postings) {
+                        Some(ids) => candidate_file_ids.extend(ids.iter().copied()),
+                        None => candidate_file_ids.extend(self.active_file_ids()),
+                    }
                 }
             }
         }
@@ -977,6 +1027,18 @@ impl SearchIndexSnapshot {
             candidate_file_ids.extend(self.active_file_ids());
         }
 
+        let unscoped_candidates = candidate_file_ids.len();
+        if let Some(bound) =
+            self.exact_evidence_bound(scope, &norm_phrase, &content_tokens, &mut literal_postings)
+        {
+            candidate_file_ids.retain(|file_id| bound.binary_search(file_id).is_ok());
+        }
+
+        let started = Instant::now();
+        let candidate_count = candidate_file_ids.len();
+        let mut files_read = 0usize;
+        let mut bytes_read = 0usize;
+        let mut files_hashed = 0usize;
         let mut matches = Vec::new();
         let search_root_canon = canonicalize_for_search_membership(search_root);
 
@@ -988,11 +1050,15 @@ impl SearchIndexSnapshot {
                 continue;
             }
 
-            let file_canon = canonicalize_for_search_membership(&file_entry.path);
-            if !is_within_search_root(search_root, &file_entry.path)
-                && !is_within_search_root(&search_root_canon, &file_canon)
-                && !is_within_search_root(&search_root_canon, &file_entry.path)
-            {
+            // Canonicalizing costs a filesystem call per file, so it is only
+            // done when the stored path alone does not place the file in scope.
+            let in_scope = is_within_search_root(search_root, &file_entry.path)
+                || is_within_search_root(&search_root_canon, &file_entry.path)
+                || is_within_search_root(
+                    &search_root_canon,
+                    &canonicalize_for_search_membership(&file_entry.path),
+                );
+            if !in_scope {
                 continue;
             }
 
@@ -1002,12 +1068,13 @@ impl SearchIndexSnapshot {
                 }
             }
 
+            files_read += 1;
             let SearchCorpusEligibility::Eligible(file) =
                 read_search_corpus_file(&file_entry.path, self.max_file_size)
             else {
                 continue;
             };
-            let digest = blake3::hash(&file.bytes).to_hex().to_string();
+            bytes_read += file.bytes.len();
             let text = String::from_utf8_lossy(&file.bytes);
 
             if let Some(candidates) = exact_lane::verify_exact_matches_in_text(
@@ -1016,6 +1083,10 @@ impl SearchIndexSnapshot {
                 &norm_phrase,
                 &content_tokens,
             ) {
+                // Only a matching file needs its digest: the memo re-checks
+                // the digests of the files it serves, never of the rest.
+                files_hashed += 1;
+                let digest = blake3::hash(&file.bytes).to_hex().to_string();
                 for mut cand in candidates {
                     cand.evidence.generated = file.generated;
                     matches.push(ExactPassMatch {
@@ -1028,7 +1099,134 @@ impl SearchIndexSnapshot {
             }
         }
 
+        crate::slog_debug!(
+            "exact pass: {} of {} candidate files kept for {:?}, {} read, {} bytes, {} hashed, {} matches in {:?}",
+            candidate_count,
+            unscoped_candidates,
+            scope,
+            files_read,
+            bytes_read,
+            files_hashed,
+            matches.len(),
+            started.elapsed()
+        );
         matches
+    }
+
+    /// The sorted ids of every file that can hold evidence `scope` keeps, or
+    /// `None` when the index cannot rule any file out.
+    ///
+    /// Each kind of evidence needs certain words in the file, compared ASCII
+    /// case-insensitively like the trigram index: a verbatim phrase needs every
+    /// word of the phrase, a window needs every query word, and a declaration
+    /// needs the query word it is named after plus, when the scope asks for it,
+    /// one of the identifier tokens its text must contain. Phrase words are
+    /// taken one by one because the phrase is compared after collapsing
+    /// whitespace, so a hit may span a line break that the phrase's own
+    /// trigrams would not match.
+    fn exact_evidence_bound(
+        &self,
+        scope: &ExactEvidenceScope,
+        norm_phrase: &str,
+        content_tokens: &[String],
+        literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
+    ) -> Option<Vec<u32>> {
+        let (keeps_window, declaration_mentions) = match scope {
+            ExactEvidenceScope::All => return None,
+            ExactEvidenceScope::Phrase => (false, None),
+            ExactEvidenceScope::PhraseAndWindow => (true, None),
+            ExactEvidenceScope::DefinitionsMentioning(tokens) => (true, Some(tokens.as_slice())),
+        };
+
+        let mut bound = Vec::new();
+        if !norm_phrase.is_empty() {
+            let phrase_files =
+                self.files_possibly_containing_all(norm_phrase.split(' '), literal_postings)?;
+            bound = union_sorted_ids(&bound, &phrase_files);
+        }
+        if keeps_window && content_tokens.len() >= 2 {
+            let window_files = self.files_possibly_containing_all(
+                content_tokens.iter().map(String::as_str),
+                literal_postings,
+            )?;
+            bound = union_sorted_ids(&bound, &window_files);
+        }
+        if let Some(mentions) = declaration_mentions {
+            if !content_tokens.is_empty() && !mentions.is_empty() {
+                let named = self.files_possibly_containing_any(
+                    content_tokens.iter().map(String::as_str),
+                    literal_postings,
+                );
+                let mentioning = self.files_possibly_containing_any(
+                    mentions.iter().map(String::as_str),
+                    literal_postings,
+                );
+                let declaration_files = match (named, mentioning) {
+                    (Some(named), Some(mentioning)) => intersect_sorted_ids(&named, &mentioning),
+                    (Some(files), None) | (None, Some(files)) => files,
+                    (None, None) => return None,
+                };
+                bound = union_sorted_ids(&bound, &declaration_files);
+            }
+        }
+        Some(bound)
+    }
+
+    /// Files containing every one of `words`, or `None` when no word is long
+    /// enough to have a trigram.
+    fn files_possibly_containing_all<'a>(
+        &self,
+        words: impl Iterator<Item = &'a str>,
+        literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
+    ) -> Option<Vec<u32>> {
+        let mut files: Option<Vec<u32>> = None;
+        for word in words {
+            let Some(word_files) = self.files_possibly_containing(word, literal_postings) else {
+                continue;
+            };
+            files = Some(match files {
+                Some(files) => intersect_sorted_ids(&files, word_files),
+                None => word_files.clone(),
+            });
+            if files.as_ref().is_some_and(Vec::is_empty) {
+                break;
+            }
+        }
+        files
+    }
+
+    /// Files containing at least one of `words`, or `None` when some word is
+    /// too short to have a trigram and so could be in any file.
+    fn files_possibly_containing_any<'a>(
+        &self,
+        words: impl Iterator<Item = &'a str>,
+        literal_postings: &mut HashMap<String, Option<Vec<u32>>>,
+    ) -> Option<Vec<u32>> {
+        let mut files = Vec::new();
+        for word in words {
+            let word_files = self.files_possibly_containing(word, literal_postings)?;
+            files = union_sorted_ids(&files, word_files);
+        }
+        Some(files)
+    }
+
+    /// The sorted ids of files that may contain `literal`, ASCII
+    /// case-insensitively, from its trigram postings; `None` when the literal
+    /// has no trigram. Lookups are cached per pass because one word can serve
+    /// several kinds of evidence.
+    fn files_possibly_containing<'a>(
+        &self,
+        literal: &str,
+        literal_postings: &'a mut HashMap<String, Option<Vec<u32>>>,
+    ) -> Option<&'a Vec<u32>> {
+        literal_postings
+            .entry(literal.to_string())
+            .or_insert_with(|| {
+                let query = decompose_regex(&regex::escape(literal));
+                (!query.and_trigrams.is_empty() || !query.or_groups.is_empty())
+                    .then(|| self.candidates(&query))
+            })
+            .as_ref()
     }
 }
 

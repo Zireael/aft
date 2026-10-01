@@ -95,6 +95,8 @@ pub fn exact_verification_tokens(query: &str) -> Vec<String> {
     }
 }
 
+pub use crate::search_index::ExactEvidenceScope;
+
 /// Options controlling fallback execution.
 #[derive(Clone, Default)]
 pub struct FallbackExactOptions {
@@ -152,10 +154,30 @@ impl ExactLane {
         query: &str,
         include_tests: bool,
     ) -> VerifiedExactSet {
-        let matches = snapshot.whole_corpus_exact_pass(
+        self.execute_ready_mode_scoped(
+            snapshot,
+            project_root,
+            query,
+            include_tests,
+            &ExactEvidenceScope::All,
+        )
+    }
+
+    /// [`Self::execute_ready_mode`] reading only the files that can hold the
+    /// evidence `scope` keeps.
+    pub fn execute_ready_mode_scoped(
+        &self,
+        snapshot: &SearchIndexSnapshot,
+        project_root: &Path,
+        query: &str,
+        include_tests: bool,
+        scope: &ExactEvidenceScope,
+    ) -> VerifiedExactSet {
+        let matches = snapshot.whole_corpus_exact_pass_scoped(
             query,
             project_root,
             Some(&|path| include_tests || !path.to_str().map_or(false, is_test_file)),
+            scope,
         );
 
         let mut results = Vec::new();
@@ -343,6 +365,35 @@ impl ExactLane {
         top_k: usize,
         fallback_options: Option<&FallbackExactOptions>,
     ) -> Result<ServeOutcome, MemoError> {
+        self.search_scoped(
+            index,
+            project_root,
+            snapshot_generation,
+            query,
+            include_tests,
+            offset,
+            top_k,
+            fallback_options,
+            &ExactEvidenceScope::All,
+        )
+    }
+
+    /// [`Self::search`] for a caller that keeps only the evidence in `scope`.
+    /// In ready mode the pass reads only files that can hold that evidence;
+    /// the fallback walk is unchanged. The scope is part of the memo key, so a
+    /// narrowly scoped entry never serves a caller that keeps more.
+    pub fn search_scoped(
+        &self,
+        index: Option<&SearchIndex>,
+        project_root: &Path,
+        snapshot_generation: GenerationToken,
+        query: &str,
+        include_tests: bool,
+        offset: usize,
+        top_k: usize,
+        fallback_options: Option<&FallbackExactOptions>,
+        scope: &ExactEvidenceScope,
+    ) -> Result<ServeOutcome, MemoError> {
         let is_ready = index.is_some_and(SearchIndex::is_ready);
         // Index loading can finish without changing snapshot_generation. Give
         // fallback results a separate memo key so they cannot be reused once
@@ -352,7 +403,8 @@ impl ExactLane {
         } else {
             GenerationToken::new_with_str(&format!("fallback:{}", snapshot_generation.as_str()))
         };
-        let key = MemoKey::new(project_root, memo_generation, query, include_tests);
+        let key = MemoKey::new(project_root, memo_generation, query, include_tests)
+            .with_evidence_scope(scope.clone());
 
         let default_opts = FallbackExactOptions::default();
         let fallback_opts = fallback_options.unwrap_or(&default_opts);
@@ -360,7 +412,13 @@ impl ExactLane {
         self.memo.get_or_verify(&key, offset, top_k, || {
             if is_ready {
                 let snapshot = index.unwrap().snapshot();
-                Ok(self.execute_ready_mode(&snapshot, project_root, query, include_tests))
+                Ok(self.execute_ready_mode_scoped(
+                    &snapshot,
+                    project_root,
+                    query,
+                    include_tests,
+                    scope,
+                ))
             } else {
                 let mut fallback =
                     self.execute_fallback_mode(project_root, query, include_tests, fallback_opts);
@@ -383,10 +441,23 @@ impl SearchLane for ExactLane {
 
     fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
         let snapshot = input.index.snapshot();
+        let keeps_definitions =
+            input.shape == crate::commands::semantic_search::SearchShape::Identifier;
+        let scope = if keeps_definitions {
+            ExactEvidenceScope::All
+        } else {
+            ExactEvidenceScope::PhraseAndWindow
+        };
         let mut candidates = self
-            .execute_ready_mode(&snapshot, input.root, input.query, input.include_tests)
+            .execute_ready_mode_scoped(
+                &snapshot,
+                input.root,
+                input.query,
+                input.include_tests,
+                &scope,
+            )
             .results;
-        if input.shape != crate::commands::semantic_search::SearchShape::Identifier {
+        if !keeps_definitions {
             candidates.retain(|candidate| {
                 candidate.evidence.kind
                     != crate::commands::semantic_search::EvidenceKind::Definition
@@ -879,5 +950,187 @@ pub(crate) mod tests {
             found.contains(&("docs/notes.md".to_string(), EvidenceKind::E2)),
             "{found:?}"
         );
+    }
+
+    const PROSE_QUERY: &str = "how does the reconciler retry stalled uploads";
+
+    /// A corpus for `PROSE_QUERY`: one file holds the sentence verbatim but
+    /// wrapped across a line break and in another case, one holds every query
+    /// word within three lines, two declare a function named after a query
+    /// word (only one of them mentions `retry_upload`), and twenty mention only
+    /// one or two of the query words.
+    fn prose_project() -> (tempfile::TempDir, SearchIndex) {
+        let mut files = vec![
+            (
+                "docs/guide.md".to_string(),
+                "Q: How does the Reconciler\n   retry stalled uploads?\n".to_string(),
+            ),
+            (
+                "src/window.rs".to_string(),
+                "// reconciler\n// retry stalled\n// uploads\n".to_string(),
+            ),
+            ("src/retry.rs".to_string(), "fn retry() {}\n".to_string()),
+            (
+                "src/upload.rs".to_string(),
+                "fn retry() {\n    retry_upload();\n}\n".to_string(),
+            ),
+        ];
+        let mentions = ["the reconciler runs", "uploads go here", "stalled retry"];
+        for index in 0..20 {
+            files.push((
+                format!("src/noise_{index}.rs"),
+                format!("// {}\n", mentions[index % mentions.len()]),
+            ));
+        }
+        let project = tempfile::tempdir().expect("create project dir");
+        let mut index = SearchIndex::new();
+        for (relative, text) in &files {
+            let path = project.path().join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+            std::fs::write(&path, text).expect("write file");
+            index.index_file(&path, text.as_bytes());
+        }
+        index.ready = true;
+        (project, index)
+    }
+
+    /// Runs a ready-mode pass and returns its results with the number of
+    /// files it read.
+    fn scoped_pass(
+        index: &SearchIndex,
+        root: &Path,
+        query: &str,
+        scope: &ExactEvidenceScope,
+    ) -> (Vec<CandidateResult>, usize) {
+        crate::search_hot_path_measurements::reset();
+        let results = ExactLane::new()
+            .execute_ready_mode_scoped(&index.snapshot(), root, query, false, scope)
+            .results;
+        (
+            results,
+            crate::search_hot_path_measurements::counts().file_reads,
+        )
+    }
+
+    #[test]
+    fn prose_pass_without_declarations_reads_only_files_with_every_word() {
+        let (project, index) = prose_project();
+        let (_, unscoped_reads) = scoped_pass(
+            &index,
+            project.path(),
+            PROSE_QUERY,
+            &ExactEvidenceScope::All,
+        );
+        assert_eq!(unscoped_reads, 24, "every file mentions some query word");
+
+        let (_, phrase_and_window_reads) = scoped_pass(
+            &index,
+            project.path(),
+            PROSE_QUERY,
+            &ExactEvidenceScope::PhraseAndWindow,
+        );
+        assert_eq!(
+            phrase_and_window_reads, 2,
+            "only the phrase and window files hold every query word"
+        );
+
+        let (_, declaration_reads) = scoped_pass(
+            &index,
+            project.path(),
+            PROSE_QUERY,
+            &ExactEvidenceScope::DefinitionsMentioning(vec!["retry_upload".to_string()]),
+        );
+        assert_eq!(
+            declaration_reads, 3,
+            "a declaration is read only where the identifier is mentioned"
+        );
+    }
+
+    #[test]
+    fn scoped_prose_pass_keeps_every_kept_exact_hit() {
+        let (project, index) = prose_project();
+        let root = project.path();
+        let (all, _) = scoped_pass(&index, root, PROSE_QUERY, &ExactEvidenceScope::All);
+        let all_found = exact_paths(&all, root);
+        assert!(
+            all_found.contains(&("docs/guide.md".to_string(), EvidenceKind::E1)),
+            "a sentence wrapped across a line is still verbatim: {all_found:?}"
+        );
+        assert!(
+            all_found.contains(&("src/window.rs".to_string(), EvidenceKind::E2)),
+            "{all_found:?}"
+        );
+
+        let keep = |kinds: &[EvidenceKind], definition_path: Option<&str>| {
+            all.iter()
+                .filter(|candidate| {
+                    kinds.contains(&candidate.evidence.kind)
+                        || (candidate.evidence.kind == EvidenceKind::Definition
+                            && definition_path.is_some_and(|path| candidate.path.ends_with(path)))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let (phrase_and_window, _) = scoped_pass(
+            &index,
+            root,
+            PROSE_QUERY,
+            &ExactEvidenceScope::PhraseAndWindow,
+        );
+        assert_eq!(
+            phrase_and_window,
+            keep(&[EvidenceKind::E1, EvidenceKind::E2], None)
+        );
+        let (phrase, _) = scoped_pass(&index, root, PROSE_QUERY, &ExactEvidenceScope::Phrase);
+        assert_eq!(phrase, keep(&[EvidenceKind::E1], None));
+        let (declarations, _) = scoped_pass(
+            &index,
+            root,
+            PROSE_QUERY,
+            &ExactEvidenceScope::DefinitionsMentioning(vec!["retry_upload".to_string()]),
+        );
+        assert_eq!(
+            declarations,
+            keep(&[EvidenceKind::E1, EvidenceKind::E2], Some("src/upload.rs"))
+        );
+        assert!(
+            exact_paths(&declarations, root)
+                .contains(&("src/upload.rs".to_string(), EvidenceKind::Definition)),
+            "{declarations:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_memo_entry_never_serves_a_caller_that_keeps_more() {
+        let (project, index) = prose_project();
+        let lane = ExactLane::new();
+        let generation = GenerationToken::new_with_str("generation");
+        let serve = |scope: &ExactEvidenceScope| {
+            let outcome = lane
+                .search_scoped(
+                    Some(&index),
+                    project.path(),
+                    generation.clone(),
+                    PROSE_QUERY,
+                    false,
+                    0,
+                    usize::MAX,
+                    None,
+                    scope,
+                )
+                .expect("exact search");
+            exact_paths(&outcome.results, project.path())
+        };
+        let narrow = serve(&ExactEvidenceScope::Phrase);
+        assert_eq!(
+            narrow,
+            vec![("docs/guide.md".to_string(), EvidenceKind::E1)]
+        );
+        let full = serve(&ExactEvidenceScope::All);
+        assert!(
+            full.contains(&("src/retry.rs".to_string(), EvidenceKind::Definition)),
+            "{full:?}"
+        );
+        assert_eq!(lane.memo.verifier_call_count(), 2);
     }
 }
