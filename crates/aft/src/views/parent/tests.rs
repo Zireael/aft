@@ -83,7 +83,7 @@ fn activate_requires_prepare_and_deactivate_stops_the_session() {
     assert!(matches!(&*read(&child.callgraph), Plane::Gap(_)));
     assert!(matches!(&*read(&child.semantic), Plane::Gap(_)));
     assert_eq!(std::fs::read_dir(storage.path()).unwrap().count(), 0);
-    // Rebinding with the same discovery keeps the warm session.
+    // Rebinding with the same discovery reuses the running session.
     assert!(prepare(&root, planes));
     assert!(activate(&root, storage.path(), &semantic));
     assert!(Arc::ptr_eq(&session, &session_for_root(&root).unwrap()));

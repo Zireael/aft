@@ -3205,7 +3205,8 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     // With views on, a plain folder of repositories is a parent folder: it is
     // served from its child repositories' own indexes and, like HOME, builds
-    // none of its own. The planes the user asked for are kept for the parent.
+    // none of its own. The index types the user enabled are passed to the
+    // parent session, which serves those same types from the children.
     if !home_match
         && next_config.views.enabled
         && crate::views::parent::prepare(

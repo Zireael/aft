@@ -5,12 +5,12 @@
 //!
 //! The fixtures build every child index through the real configure path of a
 //! session bound to that child, then drop that session, so the parent reads
-//! exactly what a child's own sessions leave on disk. The earlier parent
-//! folder attempt failed by loading child indexes inside each call; the tests
-//! below pin the measured failures: per-call loads, children reported stale
-//! when unchanged, stores refused because of SQLite journal files, a large
-//! child's semantic index refused by a size cap, and parent latency far above
-//! a child's.
+//! exactly what a child's own sessions leave on disk. Loading child indexes
+//! inside each call is the failure mode these tests guard against, together
+//! with its measured symptoms: per-call loads, children reported stale when
+//! unchanged, stores refused because of SQLite journal files, a large child's
+//! semantic index refused by a size cap, and parent latency far above a
+//! child's.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -440,7 +440,8 @@ fn parent_session(ctx: &AppContext) -> Arc<aft::views::parent::ParentSession> {
 /// 32 repositories: the merged grep and glob answers equal the union of each
 /// child's own answers with the child's folder as path prefix; repeated
 /// queries load nothing; unchanged children are never reported stale; and the
-/// parent's grep latency stays in the same order as one child's.
+/// parent's grep latency stays within the bounds asserted below relative to
+/// one child's.
 #[test]
 fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
     fast_refresh();

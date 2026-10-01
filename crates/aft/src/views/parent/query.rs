@@ -41,7 +41,7 @@ impl Gaps {
         }
     }
 
-    /// A child that cannot answer on `plane`.
+    /// Records that `child` cannot answer this request, and why.
     fn child(&mut self, child: &Child, reason: String) {
         self.push("parent_child_unavailable", child.display(), reason);
     }
