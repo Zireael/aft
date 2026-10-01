@@ -1559,6 +1559,16 @@ mod grant_path_tests {
         }
     }
 
+    struct DeferredWaitReleaseGuard(Vec<std::path::PathBuf>);
+
+    impl Drop for DeferredWaitReleaseGuard {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::write(path, b"release");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn cap_many_deferred_bash_waits_leave_maintenance_admission_available() {
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
@@ -1579,7 +1589,18 @@ mod grant_path_tests {
             roots.push((dir, root));
         }
 
+        let releases = DeferredWaitReleaseGuard(
+            roots
+                .iter()
+                .take(4)
+                .map(|(_, root)| root.as_path().join("release"))
+                .collect(),
+        );
         for (index, (_, root)) in roots.iter().take(4).enumerate() {
+            let command = format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done",
+                releases.0[index].display()
+            );
             let connection = PersistentCancelSignal::new();
             let route = PersistentCancelSignal::new();
             submit_deferred_bash(
@@ -1600,9 +1621,9 @@ mod grant_path_tests {
                 Flags::new(false, Priority::Passive, false),
                 PROTOCOL_VERSION,
                 json!({
-                    "command": "sleep 1",
+                    "command": command,
                     "wait": true,
-                    "timeout": 5_000,
+                    "timeout": 60_000,
                 }),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
@@ -1621,7 +1642,7 @@ mod grant_path_tests {
             );
         }
 
-        let waits_started_by = Instant::now() + Duration::from_secs(2);
+        let waits_started_by = Instant::now() + Duration::from_secs(60);
         while metrics
             .deferred_bash_waits_in_flight
             .load(Ordering::Relaxed)
@@ -1636,24 +1657,31 @@ mod grant_path_tests {
 
         // Every caller keeps its tool call open until the command actually exits.
         assert!(completion_rx.try_recv().is_err());
-
-        // Let at least one legacy poll interval elapse: an on-worker waiter would
-        // have occupied all four maintenance-eligible seats by now.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(completion_rx.try_recv().is_err());
+        assert_eq!(
+            executor
+                .try_dispatch_liveness_snapshot()
+                .expect("dispatch liveness")
+                .running
+                .maintenance,
+            0,
+            "parked waits must not hold maintenance workers"
+        );
 
         let admitted = executor.submit_maintenance_async(
             roots[4].1.clone(),
             Lane::MaintenanceCommit,
             "fresh-configure-tail".to_string(),
-            Box::new(|_| Response::success("fresh-configure-tail", json!({ "drained": true }))),
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(150));
+                Response::success("fresh-configure-tail", json!({ "drained": true }))
+            }),
         );
-        let response = tokio::time::timeout(Duration::from_millis(75), admitted)
+        let response = tokio::time::timeout(Duration::from_secs(60), admitted)
             .await
             .expect("maintenance admission must not wait for deferred bash")
             .expect("executor maintenance response");
         assert!(response.success);
-        let maintenance_released_by = Instant::now() + Duration::from_millis(75);
+        let maintenance_released_by = Instant::now() + Duration::from_secs(60);
         loop {
             let running = executor
                 .try_dispatch_liveness_snapshot()
@@ -1670,16 +1698,26 @@ mod grant_path_tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Maintenance must complete while the commands are still held, not
+        // merely finish faster than a wall-clock threshold on an idle machine.
+        assert!(completion_rx.try_recv().is_err());
+        assert_eq!(
+            metrics
+                .deferred_bash_waits_in_flight
+                .load(Ordering::Relaxed),
+            4
+        );
+        drop(releases);
         // Require each long command's ordinary terminal response and exact formatted text.
         for _ in 0..4 {
-            let completion = tokio::time::timeout(Duration::from_secs(3), completion_rx.recv())
+            let completion = tokio::time::timeout(Duration::from_secs(60), completion_rx.recv())
                 .await
                 .expect("deferred completion deadline")
                 .expect("deferred completion");
             let result = completion.result.expect("terminal bash result");
             assert!(result.response.success);
             assert_eq!(result.text, "");
-            tokio::time::timeout(Duration::from_secs(1), poll_touch_rx.recv())
+            tokio::time::timeout(Duration::from_secs(60), poll_touch_rx.recv())
                 .await
                 .expect("poll touch deadline")
                 .expect("poll touch");

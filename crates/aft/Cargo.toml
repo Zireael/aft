@@ -23,6 +23,8 @@ name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
 
 [features]
+# Explicit opt-in for cross-process timing controls used by integration tests.
+test-timing-hooks = []
 semantic-chunk-census = []
 
 [dependencies]

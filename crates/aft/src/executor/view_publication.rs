@@ -94,7 +94,12 @@ impl Lifecycle {
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        JOBS.lock().remove(&self.0);
+        let job = JOBS.lock().remove(&self.0);
+        #[cfg(test)]
+        if let Some(job) = job.as_ref() {
+            tests::settled(self.0, &job.root);
+        }
+        drop(job);
     }
 }
 

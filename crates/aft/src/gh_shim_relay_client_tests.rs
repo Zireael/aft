@@ -1090,19 +1090,20 @@ fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
     });
     let harness = harness(handler);
     let budget = Duration::from_millis(1_000);
-    let (status, elapsed) = dispatch_timed(
+    ATTEMPT_DEADLINES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let (status, _elapsed) = dispatch_timed(
         &harness,
         live.value(),
         [Duration::from_millis(400); 2],
         budget,
     );
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
-    // Setup (connect, catalog, route open) runs before the budget starts, so
-    // allow a little over it; a fresh budget for the retry would take 1.4 s.
-    assert!(
-        elapsed < budget + Duration::from_millis(250),
-        "took {elapsed:?} against a {budget:?} budget"
-    );
+    // Setup and scheduling do not consume the exchange budget. Observe the
+    // actual CallOptions passed to the consumer: resetting the timeout for the
+    // retry would give it a different deadline even if this thread ran late.
+    let deadlines = ATTEMPT_DEADLINES.with(|slot| slot.borrow_mut().take().unwrap());
+    assert_eq!(deadlines.len(), 2);
+    assert_eq!(deadlines[0], deadlines[1], "retry received a fresh budget");
     assert_eq!(
         nonces(&harness).len(),
         2,

@@ -810,6 +810,42 @@ enum FillOutcome {
     Stop,
 }
 
+#[cfg(test)]
+static FILL_OBSERVERS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, crossbeam_channel::Sender<&'static str>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+
+#[cfg(test)]
+pub(crate) struct FillObserver {
+    root: PathBuf,
+    rx: crossbeam_channel::Receiver<&'static str>,
+}
+#[cfg(test)]
+impl FillObserver {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        lock(&FILL_OBSERVERS).insert(root.clone(), tx);
+        Self { root, rx }
+    }
+    pub(crate) fn next(&self) -> &'static str {
+        self.rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("semantic fill event")
+    }
+}
+#[cfg(test)]
+impl Drop for FillObserver {
+    fn drop(&mut self) {
+        lock(&FILL_OBSERVERS).remove(&self.root);
+    }
+}
+#[cfg(test)]
+fn observe_fill(root: &Path, event: &'static str) {
+    if let Some(tx) = lock(&FILL_OBSERVERS).get(root) {
+        let _ = tx.send(event);
+    }
+}
+
 /// Fills the lane's installed checkout now, then again after the quiet
 /// window following each wake, and after a backoff when a fill left work
 /// behind because of a transient error. Returns when the lane is cleared,
@@ -843,12 +879,25 @@ pub(crate) fn serve_fills<F>(
                     Err(_) => return,
                 },
             };
+            #[cfg(test)]
+            if woke {
+                observe_fill(&schedule.root, "wake");
+                if lock(&FILL_OBSERVERS).contains_key(&schedule.root) {
+                    let delay = std::env::var("AFT_TEST_TIMING_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0);
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
             if woke && !wait_quiet(wake, schedule.quiet_window) {
                 return;
             }
         }
         first = false;
         let outcome = if (schedule.paused)() {
+            #[cfg(test)]
+            observe_fill(&schedule.root, "paused");
             FillOutcome::Retry { progress: false }
         } else {
             match slot
@@ -863,6 +912,8 @@ pub(crate) fn serve_fills<F>(
         match outcome {
             FillOutcome::Stop => return,
             FillOutcome::Settled => {
+                #[cfg(test)]
+                observe_fill(&schedule.root, "settled");
                 backoff = schedule.retry_initial;
                 retry_after = None;
             }

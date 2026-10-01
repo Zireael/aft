@@ -1885,7 +1885,19 @@ enum EmbeddingExchange {
     },
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFUSED_EXCHANGE_OBSERVER: std::cell::RefCell<Option<(usize, Duration)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn execute_embedding_exchange(request: reqwest::blocking::RequestBuilder) -> EmbeddingExchange {
+    #[cfg(test)]
+    REFUSED_EXCHANGE_OBSERVER.with(|slot| {
+        if let Some((attempts, delay)) = slot.borrow_mut().as_mut() {
+            *attempts += 1;
+            std::thread::sleep(*delay);
+        }
+    });
     match request.send() {
         Ok(response) => EmbeddingExchange::Response {
             status: response.status(),
@@ -14284,12 +14296,17 @@ public class Greeter {
             ..Default::default()
         };
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-        let started = Instant::now();
-
+        // Count actual HTTP sends rather than using scheduler latency as evidence
+        // that connection refusal bypassed the retry ladder.
+        REFUSED_EXCHANGE_OBSERVER.with(|slot| {
+            *slot.borrow_mut() = Some((0, Duration::from_millis(750)));
+        });
         let error = model
             .embed(vec!["connection probe".to_string()])
             .expect_err("closed listener must refuse the request");
 
+        let attempts = REFUSED_EXCHANGE_OBSERVER.with(|slot| slot.borrow_mut().take().unwrap().0);
+        assert_eq!(attempts, 1, "connection refusal must not retry");
         assert!(embedding_failure_is_transient(&error), "error: {error}");
         // Unix answers a closed loopback port with RST, so the request fails at
         // connect. Windows Filtering Platform stealth mode drops the SYN instead,
@@ -14303,20 +14320,12 @@ public class Greeter {
                 ) || error.contains("single-item request timed out at 500 ms: treating as down"),
                 "error: {error}"
             );
-            assert!(
-                started.elapsed() < Duration::from_millis(500 * 2),
-                "a dropped SYN must be judged within one base deadline, not a ladder"
-            );
         } else {
             assert!(
                 error.contains(
                     "embedding backend unreachable (connection refused or connect failure)"
                 ),
                 "error: {error}"
-            );
-            assert!(
-                started.elapsed() < Duration::from_millis(500),
-                "connection refusal should not wait through a retry ladder"
             );
         }
     }

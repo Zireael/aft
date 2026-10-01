@@ -195,7 +195,9 @@ fn views_tier2_head_mismatch_is_pending() {
 #[test]
 fn views_tier2_watcher_edit_is_pending_until_publication() {
     let (_project, _storage, job, mut request) = view_projection_fixture();
+    let view = crate::views::ViewStore::open(&request.storage, &request.scope).unwrap();
     crate::views::assembly::publish_checkout(&request).unwrap();
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     let path = request.project_root.join("target.ts");
     write_projection_cache_file(&path, "export function used() { return 2; }\n");
     let before = LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get);
@@ -205,6 +207,9 @@ fn views_tier2_watcher_edit_is_pending_until_publication() {
     );
     request.changed_paths.insert(b"target.ts".to_vec());
     crate::views::assembly::publish_checkout(&request).unwrap();
+    // Publication schedules a detached checkpoint whose keeper close can briefly
+    // contend with a zero-wait reader. Test content freshness after it settles.
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     assert!(build_tier2_callgraph_snapshot_with_refresh(&job, true, &[path]).is_some());
     assert_eq!(LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get), before);
 }

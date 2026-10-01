@@ -929,6 +929,22 @@ fn fork_semantic_refresh_index(index: &mut SemanticIndex) -> (SemanticIndex, u64
     (worker, pending_bytes)
 }
 
+#[cfg(any(test, feature = "test-timing-hooks"))]
+fn semantic_quiet_gate_path() -> Option<PathBuf> {
+    std::env::var_os("AFT_TEST_SEMANTIC_QUIET_GATE").map(PathBuf::from)
+}
+
+#[cfg(any(test, feature = "test-timing-hooks"))]
+fn semantic_quiet_gate_held() -> bool {
+    let Some(path) = semantic_quiet_gate_path()
+        .filter(|path| path.exists() && !path.with_extension("release").exists())
+    else {
+        return false;
+    };
+    std::fs::write(path.with_extension("waiting"), b"waiting").expect("quiet gate observation");
+    true
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -965,10 +981,23 @@ fn spawn_semantic_refresh_worker(
                 }
 
                 let mut deadline = Instant::now() + quiet_window;
+                #[cfg(any(test, feature = "test-timing-hooks"))]
+                let mut gate_was_held = false;
 
                 loop {
+                    #[cfg(any(test, feature = "test-timing-hooks"))]
+                    if semantic_quiet_gate_held() {
+                        gate_was_held = true;
+                        deadline = Instant::now() + quiet_window;
+                    }
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         break;
+                    };
+                    #[cfg(any(test, feature = "test-timing-hooks"))]
+                    let remaining = if gate_was_held {
+                        remaining.min(Duration::from_millis(10))
+                    } else {
+                        remaining
                     };
                     match request_rx.recv_timeout(remaining) {
                         Ok(SemanticRefreshRequest::Files {
@@ -985,7 +1014,13 @@ fn spawn_semantic_refresh_worker(
                             deadline = Instant::now() + quiet_window;
                         }
                         Ok(SemanticRefreshRequest::Corpus) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            #[cfg(any(test, feature = "test-timing-hooks"))]
+                            if gate_was_held {
+                                continue;
+                            }
+                            break;
+                        }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
@@ -1267,6 +1302,13 @@ fn spawn_semantic_refresh_worker(
                         {
                             break;
                         }
+                    }
+                }
+                #[cfg(any(test, feature = "test-timing-hooks"))]
+                if gate_was_held {
+                    if let Some(path) = semantic_quiet_gate_path() {
+                        std::fs::write(path.with_extension("settled"), b"settled")
+                            .expect("quiet gate completion");
                     }
                 }
             }
@@ -8049,6 +8091,7 @@ mod tests {
                 ..Config::default()
             },
         );
+        let fills = crate::views::semantic_runtime::FillObserver::new(root.clone());
         let request = configure_semantic_views(&root, storage.path(), &server.base_url);
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
@@ -8059,17 +8102,13 @@ mod tests {
                     .is_ok_and(|answer| answer.complete())
             })
         };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !complete(&ctx) {
-            assert!(Instant::now() < deadline, "the semantic view never filled");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert_eq!(fills.next(), "settled");
+        assert!(complete(&ctx), "the semantic view never filled");
         let stored = server.non_probe_input_count();
         assert!(stored >= 6);
 
-        ctx.set_unbound_build_abandon_grace_for_test(Duration::from_millis(10));
+        ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
         ctx.mark_subc_unbound();
-        std::thread::sleep(Duration::from_millis(50));
         let edited = root.join("module_0.rs");
         fs::write(
             &edited,
@@ -8077,8 +8116,10 @@ mod tests {
         )
         .unwrap();
         ctx.record_checkout_watcher_change(&edited);
-        // Several quiet windows pass while unbound: nothing is embedded.
-        std::thread::sleep(Duration::from_millis(400));
+        // Observe the worker actually taking the pause branch. Absence of a
+        // request during a fixed sleep would not prove it ran while unbound.
+        assert_eq!(fills.next(), "wake");
+        assert_eq!(fills.next(), "paused");
         assert_eq!(
             server.non_probe_input_count(),
             stored,
@@ -8086,10 +8127,11 @@ mod tests {
         );
         assert!(!complete(&ctx), "the unreconciled edit must stay a gap");
 
-        // No further edit or wake: the rebind alone resumes the lane, well
-        // before the first transient-retry wait (five seconds) would.
+        // Require a consumed wake from the rebind, not eventual progress from
+        // the transient-retry timer, then wait for that fill to finish.
         ctx.mark_subc_bound();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        assert_eq!(fills.next(), "wake");
+        assert_eq!(fills.next(), "settled");
         let names = |ctx: &AppContext| {
             ctx.checkout_semantic_runtime()
                 .unwrap()
@@ -8100,17 +8142,10 @@ mod tests {
                 .map(|result| result.name)
                 .collect::<Vec<_>>()
         };
-        while !(complete(&ctx)
-            && names(&ctx)
-                .iter()
-                .any(|name| name == "resumed_after_rebind"))
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the lane did not resume after the rebind"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        assert!(complete(&ctx));
+        assert!(names(&ctx)
+            .iter()
+            .any(|name| name == "resumed_after_rebind"));
         let resumed = server.non_probe_input_count() - stored;
         assert!(
             (1..=2).contains(&resumed),
@@ -11143,6 +11178,33 @@ mod tests {
         );
     }
 
+    fn wait_for_semantic_completion(ctx: &AppContext) {
+        let receiver = ctx
+            .semantic_index_rx()
+            .lock()
+            .clone()
+            .expect("semantic completion receiver");
+        let cap = Instant::now() + Duration::from_secs(60);
+        let event = loop {
+            let event = receiver
+                .recv_timeout(cap.saturating_duration_since(Instant::now()))
+                .expect("semantic completion");
+            if matches!(
+                &event,
+                crate::context::SemanticIndexEvent::Ready(_)
+                    | crate::context::SemanticIndexEvent::Failed(_)
+            ) {
+                break event;
+            }
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(event).unwrap();
+        *ctx.semantic_index_rx().lock() = Some(rx);
+        crate::runtime_drain::drain_build_completions(ctx);
+        assert!(ctx.semantic_index_rx().lock().is_none());
+        assert!(ctx.semantic_index().read().unwrap().is_some());
+    }
+
     #[test]
     fn semantic_query_reloads_evicted_index_once_without_reconfigure() {
         let _artifact_guard = artifact_owner_test_lock();
@@ -11168,15 +11230,25 @@ mod tests {
         assert!(configure.success, "configure failed: {:?}", configure.data);
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(
-            server.wait_for_non_probe_input(Duration::from_secs(5)),
+            server.wait_for_non_probe_input(Duration::from_secs(60)),
             "initial semantic build did not reach the embedding server"
         );
         server.release_responses();
-        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        wait_for_semantic_completion(&ctx);
         let embedded_before_reload = server.non_probe_input_count();
 
         assert!(ctx.evict_idle_artifacts(), "semantic index should be idle");
-        reset_configure_artifact_load_attempts_for_test();
+        let loads_before = super::configure_artifact_load_attempts_for_root_for_test(&project);
+        // Hold the load until both queries have observed the reserved receiver.
+        // A fast disk load must not turn the second query into an unrelated Ready query.
+        set_configure_artifact_post_gate_delay_for_test(1);
+        struct ReleaseLoad;
+        impl Drop for ReleaseLoad {
+            fn drop(&mut self) {
+                release_configure_artifact_post_gate_for_test();
+            }
+        }
+        let release_load = ReleaseLoad;
         let first = crate::commands::semantic_search::handle_semantic_search(
             &semantic_search_request("how does the query reload semantic state"),
             &ctx,
@@ -11206,9 +11278,15 @@ mod tests {
             "second query must join the in-flight reload: {:?}",
             second.data
         );
-        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        let delay = std::env::var("AFT_TEST_TIMING_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(delay));
+        drop(release_load);
+        wait_for_semantic_completion(&ctx);
         assert_eq!(
-            configure_artifact_load_attempts_for_test(),
+            super::configure_artifact_load_attempts_for_root_for_test(&project) - loads_before,
             1,
             "repeated queries started duplicate semantic reload workers"
         );

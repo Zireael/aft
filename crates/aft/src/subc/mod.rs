@@ -5420,12 +5420,23 @@ where
         loop {
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
+                    #[cfg(any(test, feature = "test-timing-hooks"))]
+                    let delay_after_ping =
+                        frame.header.ty == FrameType::Ping && frame.header.corr == 124;
                     let decoded = DecodedFrame {
                         frame,
                         phase_trace: PhaseTrace::new(Instant::now()),
                     };
                     if tx.send(Ok(decoded)).await.is_err() {
                         return;
+                    }
+                    #[cfg(any(test, feature = "test-timing-hooks"))]
+                    if delay_after_ping {
+                        let delay = std::env::var("AFT_TEST_TIMING_DELAY_MS")
+                            .ok()
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
                     }
                 }
                 Ok(None) => {

@@ -593,6 +593,7 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
     assert!(refreshing.is_empty());
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
@@ -657,20 +658,19 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
         .expect("write borrow-only storm file");
     }
     fs::remove_dir_all(&storm).expect("remove borrow-only storm");
-    for _ in 0..30 {
-        let _ = status(&mut borrower);
-        thread::sleep(Duration::from_millis(100));
-    }
+    assert!(borrower.shutdown().success());
     assert!(
         server.non_probe_requests().is_empty(),
         "borrow-only edit and appear/vanish storm must not call the embedder"
     );
-    assert!(borrower.shutdown().success());
 
     fs::write(&source, original).expect("restore shared baseline before overlay bind");
     server.reset_requests();
-    let mut overlay =
-        AftProcess::spawn_with_real_watcher_env(&[("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms)]);
+    let gate = storage.path().join("semantic-quiet-gate");
+    let mut overlay = AftProcess::spawn_with_real_watcher_env(&[
+        ("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms),
+        ("AFT_TEST_SEMANTIC_QUIET_GATE", gate.as_os_str()),
+    ]);
     let configured = configure_semantic_openai_with_overlay(
         &mut overlay,
         &worktree,
@@ -714,6 +714,8 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
     );
 
     server.reset_requests();
+    fs::write(&gate, b"hold").expect("hold quiet window");
+    let release_gate = crate::helpers::ReleaseOnDrop::new(gate.with_extension("release"));
     fs::create_dir_all(&storm).expect("create overlay storm");
     for index in 0..1_470 {
         fs::write(
@@ -721,11 +723,32 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
             format!("pub fn overlay_storm_{index}() {{}}\n"),
         )
         .expect("write overlay storm file");
+        if index == 0 {
+            let cap = std::time::Instant::now() + Duration::from_secs(60);
+            while !gate.with_extension("waiting").exists() {
+                assert!(
+                    std::time::Instant::now() < cap,
+                    "refresh never observed quiet gate"
+                );
+                let _ = status(&mut overlay);
+                thread::sleep(Duration::from_millis(10));
+            }
+            // Deliberately exceed the real quiet interval while the first storm
+            // file remains alive. The gate, not writer speed, prevents embedding.
+            thread::sleep(Duration::from_millis(2_500));
+        }
     }
     fs::remove_dir_all(&storm).expect("remove overlay storm");
-    for _ in 0..35 {
+    fs::remove_file(&gate).expect("release quiet window");
+    drop(release_gate);
+    let cap = std::time::Instant::now() + Duration::from_secs(60);
+    while !gate.with_extension("settled").exists() {
+        assert!(
+            std::time::Instant::now() < cap,
+            "held refresh never completed"
+        );
         let _ = status(&mut overlay);
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
     }
     assert!(
         server.non_probe_requests().is_empty(),

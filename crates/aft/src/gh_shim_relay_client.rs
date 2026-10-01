@@ -480,6 +480,11 @@ fn new_nonce() -> String {
     format!("gh-shim-{hex}")
 }
 
+#[cfg(test)]
+thread_local! {
+    static ATTEMPT_DEADLINES: std::cell::RefCell<Option<Vec<Instant>>> = const { std::cell::RefCell::new(None) };
+}
+
 struct Exchange<'a> {
     consumer: &'a SubcConsumer,
     route: &'a subc_client_rs::RouteHandle,
@@ -506,7 +511,8 @@ impl Exchange<'_> {
         *self.stage.lock().unwrap() = ProbeStage::Request;
         let bytes = serde_json::to_vec(body)
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
-        let remaining = self.deadline().saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let remaining = self.deadline().saturating_duration_since(now);
         if remaining.is_zero() {
             return Err(RouteOutcome::Unavailable(format!(
                 "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
@@ -517,6 +523,14 @@ impl Exchange<'_> {
             timeout: remaining,
             ..CallOptions::default()
         };
+        #[cfg(test)]
+        if body["op"] == BOT_REQUEST_OPERATION {
+            ATTEMPT_DEADLINES.with(|slot| {
+                if let Some(deadlines) = slot.borrow_mut().as_mut() {
+                    deadlines.push(now + options.timeout);
+                }
+            });
+        }
         match self.consumer.request(self.route, bytes, options).await {
             Ok(bytes) => Ok(bytes),
             Err(CallError::NotSent(_)) => Err(RouteOutcome::GovernanceUnavailable),
@@ -837,7 +851,15 @@ pub(super) fn route(
                 route: &route,
                 ticket: &ticket,
                 stage: &stage,
-                started: Instant::now(),
+                started: {
+                    #[cfg(test)]
+                    ATTEMPT_DEADLINES.with(|slot| {
+                        if slot.borrow().is_some() {
+                            std::thread::sleep(Duration::from_millis(400));
+                        }
+                    });
+                    Instant::now()
+                },
                 budget: relay.relay_budget,
             },
             paths,
