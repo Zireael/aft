@@ -220,8 +220,9 @@ pub(crate) fn clear_typescript_selection() {
     shared_root_memo().lock().clear();
 }
 
-/// (nearest TypeScript root marker directory, project root) to the root the
-/// server for that directory runs at. Emptied with the selection memo.
+/// Maps (nearest TypeScript root marker directory, project root) to the root
+/// the shared TypeScript server for that directory runs at. Emptied together
+/// with the selection memo.
 type SharedRootMemo = parking_lot::Mutex<HashMap<(PathBuf, PathBuf), PathBuf>>;
 
 fn shared_root_memo() -> &'static SharedRootMemo {
@@ -253,9 +254,9 @@ pub(crate) fn shared_typescript_server_root(
     if let Some(root) = shared_root_memo().lock().get(&key) {
         return root.clone();
     }
-    // The TypeScript a directory's files would load: its version, or the
-    // package path when the version is unreadable, so two unreadable
-    // installations never count as the same one.
+    // Identifies the TypeScript installation a directory's files would load:
+    // its version, or the package path when the version is unreadable, so two
+    // unreadable installations never count as the same one.
     let typescript_of = |dir: &Path| {
         find_project_typescript_package(&dir.join("package.json"), &project_root).map(|found| {
             if found.version == "unknown" {

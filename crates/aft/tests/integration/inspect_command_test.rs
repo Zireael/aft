@@ -3522,7 +3522,9 @@ fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
         "{text}"
     );
     assert!(
-        lines.next().is_some_and(|line| line.starts_with("scope: 1 root")),
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with("scope: 1 root")),
         "{text}"
     );
     assert!(text.contains("TODOs: 1"), "{text}");

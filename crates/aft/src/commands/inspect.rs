@@ -1544,8 +1544,9 @@ fn start_applicable_servers_concurrently(
                 Ok(handle) => handle
                     .join()
                     .unwrap_or_else(|_| start_panicked_outcome(server, "server start panicked")),
-                // Without a thread the start can still run here; it is only
-                // slower, not wrong.
+                // If the thread cannot be spawned, start the server on this
+                // thread instead: slower, because it no longer overlaps the
+                // other starts, but the server is still started.
                 Err(_) => start(server),
             })
             .collect()

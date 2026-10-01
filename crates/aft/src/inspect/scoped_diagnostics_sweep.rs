@@ -29,9 +29,9 @@ use crate::lsp::roots::ServerKey;
 /// count, rather than silently skipped.
 pub(crate) const SCOPED_SWEEP_FILE_CAP: usize = 1000;
 
-/// How many files' pull requests are in flight at once. Enough to keep a
-/// server's worker threads busy without queueing the whole scope behind one
-/// slow file.
+/// The most files whose diagnostic pull requests (`textDocument/diagnostic`)
+/// are in flight at once. Enough to keep a language server working on several
+/// files concurrently without queueing the whole scope behind one slow file.
 const PULL_WINDOW: usize = 16;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
