@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import bench_rerank
 from run import AftClient, AftProtocolError, binary_sha256, binary_version, git_rev, normalize_result_path
 from search_quality_lib import sha256_file
 from setup_corpus import parse_corpus_toml
@@ -277,6 +278,11 @@ def run(argv: Sequence[str]) -> int:
         try:
             client.configure()
             repo_statuses[repo_name] = client.wait_for_indexes(require_search=True)
+            bench_rerank.report_warm_up(f"exact:{repo_name}", bench_rerank.warm_up(
+                lambda query: client.semantic_search(query, 5)[0],
+                bench_rerank.burn_in_queries(),
+                args.ready_timeout,
+            ))
             version = client.call("version", timeout_secs=10.0)
             if version.get("success"):
                 protocol_version = protocol_version or version.get("version")

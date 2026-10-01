@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
+import bench_rerank
 from embedding_fixture_server import Server
 from evidence_tree import evidence_tree_sha256
 from ndjson_stream import NdjsonStream
@@ -112,6 +113,7 @@ class NdjsonClient:
         env["FASTEMBED_CACHE_DIR"] = str(storage_dir / "model-cache")
         if model_env:
             env.update(model_env)
+        bench_rerank.apply_to_env(env)
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = "http://127.0.0.1:9"
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
         env.setdefault("RUST_LOG", "warn")
@@ -184,12 +186,12 @@ class NdjsonClient:
         }
         if endpoint:
             semantic["base_url"] = endpoint
-        doc = {
+        doc = bench_rerank.apply_to_config({
             "search_index": True,
             "semantic_search": True,
             "callgraph_store": False,
             "semantic": semantic,
-        }
+        })
         response = self.call(
             "configure",
             {
@@ -215,15 +217,20 @@ class NdjsonClient:
             if semantic_status == "failed":
                 raise AftProtocolError(f"semantic_index_failed:{semantic}:{self.stderr_text()}")
             if semantic_status == "ready" and lexical_status == "ready":
+                settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
+                if settled is not None:
+                    print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
                 return
             time.sleep(0.1)
         raise AftProtocolError(f"index_ready_timeout:{last}:{self.stderr_text()}")
 
     def search(self, arguments: Mapping[str, Any]) -> JsonObject:
+        started = time.perf_counter()
         response = self.call(
             "tool_call",
             {"session_id": "aft-search-real-query", "name": "search", "arguments": dict(arguments)},
         )
+        bench_rerank.observe("search", arguments, response, (time.perf_counter() - started) * 1000.0)
         allowed_statuses = {"ready", "building"} if self.allow_building else {"ready"}
         if response.get("success") is not True or response.get("status") not in allowed_statuses:
             raise AftProtocolError(f"aft_search_failed:success={response.get('success')}:status={response.get('status')}:code={response.get('code')}")
@@ -796,6 +803,11 @@ def run(args: argparse.Namespace) -> int:
             try:
                 client.configure(endpoint, configured_model, args.ready_timeout)
                 client.wait_ready(args.ready_timeout)
+                bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
+                    lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
+                    bench_rerank.burn_in_queries(),
+                    args.ready_timeout,
+                ))
                 capability.update(probe_pattern_capability(client))
                 if any(row.get("semantic_state") == "building" for row in manifest["rows"]):
                     with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:

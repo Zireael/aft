@@ -684,6 +684,46 @@ Re-records so far:
   re-measured in the recording run. The six `reference_not_page_invariant`
   flags remain for a separate change.
 
+## Measuring a reranker (report-only)
+
+`search.rerank` is off in the product and in every runner above. Environment
+variables, read by `bench_rerank.py`, make the exact-recall, concept-recall and
+real-query runners configure one instead, without changing a run when unset:
+
+- `AFT_SEARCH_BENCH_RERANK`: the `search.rerank` block as JSON, for example
+  `{"backend": "onnx", "model": "gte-reranker-modernbert-base", "timeout_ms": 15000}`
+  or `{"backend": "remote", "endpoint": "http://127.0.0.1:8091", "model": "..."}`.
+- `AFT_SEARCH_BENCH_RERANK_CACHE`: the model cache the ONNX reranker reads
+  (it becomes the AFT process's `FASTEMBED_CACHE_DIR`). The pack replays block
+  downloads, so put the pinned snapshot there first, and nothing else: the
+  replay must not find an embedding model to fall back on. The ONNX backend
+  also needs `ORT_DYLIB_PATH` pointing at the managed ONNX Runtime.
+- `AFT_SEARCH_BENCH_RERANK_LOG`: a JSON-lines file of every search (latency
+  and the `rerank skipped: ...` note when there was one), plus each runner's
+  warm-up. The scores keep their normal shape; the log is how a reader sees
+  whether the reranker ran or was skipped.
+- `AFT_SEARCH_BENCH_SETTLE_SECONDS`: after the index reports ready, wait at
+  least this long and until the semantic entry count is steady. It works
+  around the macOS watcher burst described above: with `30`, a macOS
+  `paged` replay of the unchanged engine reproduced the Linux reference
+  byte-for-byte on all 68 rows.
+
+Before the scored rows, each runner lets the reranker score the tuning-only
+split rows' queries (never scored, and present in the vector packs), so no row
+is measured against a backend that is still loading or on its slow first
+inference. Use a generous `timeout_ms` to measure ranking; with the default
+1.5 s a CPU backend times out under load, and a timed-out list keeps fused
+order.
+
+`run_rerank_probe.py` measures the rest on the same pinned AFT evidence tree
+and vector packs as the real-query replay:
+config-to-installed time and memory on a tiny project, cold and warm
+per-search latency, resident memory and CPU time sampled every 100 ms (also
+for an out-of-process backend with `--extra-pid`), in-process repeat and
+paging consistency, and, with `--proxy-upstream`, the backend stalling,
+answering 503, recovering and being killed. `rerank_score_proxy.py` is the
+loopback adapter it puts in front of `llama-server --reranking` for that.
+
 ## Prefrontal search-miss rows
 
 `prefrontal-search-fixtures.json` holds real `aft_search` queries an agent

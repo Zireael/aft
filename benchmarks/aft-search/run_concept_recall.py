@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, MutableMapping, Sequence
 
+import bench_rerank
 from embedding_fixture_server import Server, query_key
 from run_real_query import (
     DEFAULT_BINARY,
@@ -218,6 +219,11 @@ def run(args: argparse.Namespace) -> int:
                 client.wait_ready(args.ready_timeout)
                 if server.refused:
                     raise InputFault("vector_missing:index:" + ",".join(server.refused))
+                bench_rerank.report_warm_up("concept", bench_rerank.warm_up(
+                    lambda query: client.search({"query": query, "topK": PAGE_SIZE, "includeTests": INCLUDE_TESTS}),
+                    bench_rerank.burn_in_queries(),
+                    args.ready_timeout,
+                ))
                 rows = score_cases(fixtures, client, project_root, lambda: server.refused)
             finally:
                 client.close()

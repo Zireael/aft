@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import bench_rerank
 from ndjson_stream import NdjsonStream
 
 
@@ -58,6 +59,7 @@ class AftClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
+            env=bench_rerank.apply_to_env(os.environ.copy()),
         )
         if self.proc.stdout is None:
             raise AftProtocolError("aft stdout is closed")
@@ -86,10 +88,12 @@ class AftClient:
                         "tier": "user",
                         "source": "<aft-search-benchmark>",
                         "doc": json.dumps(
-                            {
-                                "search_index": True,
-                                "semantic_search": self.semantic_search_enabled,
-                            }
+                            bench_rerank.apply_to_config(
+                                {
+                                    "search_index": True,
+                                    "semantic_search": self.semantic_search_enabled,
+                                }
+                            )
                         ),
                     }
                 ],
@@ -130,6 +134,7 @@ class AftClient:
             timeout_secs=60.0,
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
+        bench_rerank.observe("semantic_search", {"query": query, "top_k": top_k}, response, latency_ms)
         return response, latency_ms
 
     def call(
