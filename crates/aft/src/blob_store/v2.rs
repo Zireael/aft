@@ -579,12 +579,20 @@ impl FamilyStore {
 
     /// Every stored key with its payload size and epoch, oldest epoch first.
     pub fn rows(&self) -> StoreResult<Vec<StoredRow>> {
+        self.rows_oldest(usize::MAX)
+    }
+
+    /// At most `limit` stored keys, oldest epoch first. The limit is applied
+    /// by SQLite, so a store with millions of rows never has to be listed
+    /// whole by a caller that only needs the oldest ones.
+    pub fn rows_oldest(&self, limit: usize) -> StoreResult<Vec<StoredRow>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let connection = lock(&self.inner.connection);
         let mut statement = connection.prepare(
             "SELECT full_key, length(payload), ref_epoch FROM blob_payloads
-             ORDER BY ref_epoch ASC, full_key ASC",
+             ORDER BY ref_epoch ASC, full_key ASC LIMIT ?1",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![limit], |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, u64>(1)?,
@@ -629,6 +637,24 @@ impl FamilyStore {
     pub fn incremental_vacuum(&self) -> StoreResult<()> {
         lock(&self.inner.connection).execute_batch("PRAGMA incremental_vacuum;")?;
         Ok(())
+    }
+
+    /// Shrinks the store's files after rows were deleted: `incremental_vacuum`
+    /// moves the freed pages out of the database, and a TRUNCATE checkpoint
+    /// copies that change from the write-ahead log into the main file and
+    /// empties the log. In WAL mode the main file only gets shorter at that
+    /// checkpoint. Both go through this store's own connection; opening the
+    /// files any other way would drop the locks SQLite holds on them.
+    ///
+    /// Returns `false` when another connection kept the checkpoint from
+    /// finishing. The freed pages are still out of the database then, and
+    /// the next checkpoint returns them.
+    pub fn reclaim_space(&self) -> StoreResult<bool> {
+        let connection = lock(&self.inner.connection);
+        connection.execute_batch("PRAGMA incremental_vacuum;")?;
+        let busy: i64 =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        Ok(busy == 0)
     }
 
     pub fn usage(&self) -> StoreResult<StoreUsage> {
@@ -738,6 +764,19 @@ impl FamilyStore {
         sweep_epoch: u64,
         file: &Path,
     ) -> StoreResult<SegmentDeletion> {
+        self.delete_segment_observed(segment_id, sweep_epoch, file, &|_| {})
+    }
+
+    /// [`Self::delete_segment_if_unreferenced_since`], reporting each step
+    /// to `observe` while the write lock is still held. Tests use the steps
+    /// to stop or kill a deleting process between the row and the file.
+    pub fn delete_segment_observed(
+        &self,
+        segment_id: &[u8; 32],
+        sweep_epoch: u64,
+        file: &Path,
+        observe: &dyn Fn(SegmentDeletionStep),
+    ) -> StoreResult<SegmentDeletion> {
         self.require_trigram()?;
         let mut connection = lock(&self.inner.connection);
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -749,6 +788,7 @@ impl FamilyStore {
             tx.commit()?;
             return Ok(SegmentDeletion::Retained);
         }
+        observe(SegmentDeletionStep::RowDeleted);
         match fs::remove_file(file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -759,6 +799,7 @@ impl FamilyStore {
                 return Ok(SegmentDeletion::FileBusy);
             }
         }
+        observe(SegmentDeletionStep::FileUnlinked);
         tx.commit()?;
         crate::fs_lock::sync_parent(file);
         Ok(SegmentDeletion::Deleted)
@@ -839,6 +880,15 @@ pub enum SegmentDeletion {
     Deleted,
     Retained,
     FileBusy,
+}
+
+/// Steps inside a segment deletion, all taken while the store's write lock
+/// is held: the row is deleted (not yet committed), then the file is
+/// unlinked, then the deletion commits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentDeletionStep {
+    RowDeleted,
+    FileUnlinked,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

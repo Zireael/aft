@@ -4592,7 +4592,33 @@ impl AppContext {
         }) {
             return true;
         }
+        if self.view_disk_limits_due() {
+            return true;
+        }
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
+    }
+
+    /// The family registry behind this project root's per-checkout view,
+    /// when views are enabled and the root's checkout semantic runtime is
+    /// loaded. `None` with views off, so the disk-limit checks below never
+    /// run for users who did not enable views.
+    pub(crate) fn checkout_view_registry(&self) -> Option<crate::views::registry::FamilyRegistry> {
+        if !self.config().views.enabled {
+            return None;
+        }
+        match self.checkout_semantic.runtime()?.access() {
+            crate::views::contracts::ViewAccess::Owner(owner) => Some(owner.registry().clone()),
+            _ => None,
+        }
+    }
+
+    /// True when the repository family of this root's per-checkout view has
+    /// not had its disk limits checked recently (see
+    /// `views::eviction::enforcement_due`); the completion drain then starts
+    /// the check (`runtime_drain::drain_view_disk_limits`).
+    pub fn view_disk_limits_due(&self) -> bool {
+        self.checkout_view_registry()
+            .is_some_and(|registry| crate::views::eviction::enforcement_due(&registry))
     }
 
     pub fn configure_tail_has_work(&self) -> bool {

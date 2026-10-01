@@ -30,12 +30,23 @@
 //! stopped but live owner keeps its protection.
 //!
 //! This module does not decide *what* to evict under disk pressure; the byte
-//! budget here only bounds how much unmarked garbage a sweep collects.
+//! budget here only bounds how much unmarked garbage a sweep collects. Disk
+//! limits and least-recently-used eviction of whole views live in
+//! `views::eviction`, which runs this sweep afterwards so that keys only an
+//! evicted view referenced are reclaimed too.
+//!
+//! Every walk is bounded: the rows a sweep considers are capped in SQL, the
+//! entries of a member's `pins/` and `readers/` are capped at the iterator,
+//! and an optional deadline is checked inside each loop. A marking walk that
+//! reaches a bound aborts the sweep with nothing deleted, because a partial
+//! mark could miss a protected key; a deletion walk that reaches one simply
+//! stops, which only leaves garbage for the next sweep.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use rusqlite::{params, OptionalExtension};
 
@@ -54,6 +65,9 @@ pub enum FamilySweepError {
     Busy,
     /// Protection state could not be read with certainty; nothing was deleted.
     Uncertain(String),
+    /// Marking reached the sweep's deadline or an entry bound before it
+    /// covered every member; nothing was deleted.
+    Bounded(String),
     Registry(RegistryError),
     Store(StoreError),
     Io(std::io::Error),
@@ -65,6 +79,12 @@ impl fmt::Display for FamilySweepError {
             Self::Busy => write!(f, "another process is sweeping this family"),
             Self::Uncertain(reason) => {
                 write!(f, "sweep aborted with nothing deleted: {reason}")
+            }
+            Self::Bounded(reason) => {
+                write!(
+                    f,
+                    "sweep stopped before marking finished, nothing deleted: {reason}"
+                )
             }
             Self::Registry(error) => write!(f, "{error}"),
             Self::Store(error) => write!(f, "{error}"),
@@ -99,6 +119,38 @@ pub struct FamilySweepPolicy {
     pub byte_budget: u64,
 }
 
+/// Bounds on the walks of one sweep.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepBounds {
+    /// Rows (and segments) of one store considered for deletion, oldest
+    /// epoch first. Rows past the bound wait for a later sweep.
+    pub max_rows_per_store: usize,
+    /// Entries read from one member's `pins/` or `readers/` directory. A
+    /// directory with more entries aborts the sweep, since marking must
+    /// see every protection.
+    pub max_entries_per_dir: usize,
+    /// Checked inside every loop. Marking past it aborts with nothing
+    /// deleted; deletion past it stops early.
+    pub deadline: Option<Instant>,
+}
+
+impl Default for SweepBounds {
+    fn default() -> Self {
+        Self {
+            max_rows_per_store: 1_000_000,
+            max_entries_per_dir: 100_000,
+            deadline: None,
+        }
+    }
+}
+
+impl SweepBounds {
+    fn past_deadline(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
 /// Points in a sweep where tests can pause it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SweepStep {
@@ -109,6 +161,11 @@ pub enum SweepStep {
     /// registry barrier after counting it and has not yet taken it again to
     /// re-check its protection and remove it.
     RemovalPending,
+    /// A segment's row is deleted inside its still-open transaction and its
+    /// file is not unlinked yet.
+    SegmentRowDeleted,
+    /// That segment's file is unlinked and the transaction has not committed.
+    SegmentFileUnlinked,
 }
 
 pub trait SweepObserver {
@@ -128,6 +185,12 @@ pub struct FamilySweepReport {
     pub missing_root_retained: Vec<String>,
     /// Members removed with their view directories.
     pub deregistered: Vec<String>,
+    /// True when deletion stopped at a row bound or the deadline.
+    pub stopped_early: bool,
+    /// True when a store's freed space could not be fully returned to the
+    /// filesystem because another connection held its write-ahead log; the
+    /// next sweep returns it.
+    pub reclaim_deferred: bool,
 }
 
 /// What one member contributes to marking.
@@ -143,6 +206,26 @@ pub fn sweep_family(
     registry: &FamilyRegistry,
     requested_by: Option<&str>,
     policy: FamilySweepPolicy,
+    observer: Option<&dyn SweepObserver>,
+) -> Result<FamilySweepReport, FamilySweepError> {
+    sweep_family_bounded(
+        registry,
+        requested_by,
+        policy,
+        SweepBounds::default(),
+        observer,
+    )
+}
+
+/// [`sweep_family`] with explicit [`SweepBounds`]: a cap on the rows of each
+/// store it considers, a cap on the entries it reads from each member's
+/// `pins/` and `readers/`, and a deadline. Background passes use it so one
+/// sweep of a very large family cannot run unbounded.
+pub fn sweep_family_bounded(
+    registry: &FamilyRegistry,
+    requested_by: Option<&str>,
+    policy: FamilySweepPolicy,
+    bounds: SweepBounds,
     observer: Option<&dyn SweepObserver>,
 ) -> Result<FamilySweepReport, FamilySweepError> {
     let _ = requested_by;
@@ -167,8 +250,23 @@ pub fn sweep_family(
     let members = registry.members()?;
     let mut marked = BTreeSet::new();
     for member in &members {
-        let marks = mark_member(member, registry.family())
-            .map_err(|reason| FamilySweepError::Uncertain(format!("{}: {reason}", member.scope)))?;
+        if bounds.past_deadline() {
+            return Err(FamilySweepError::Bounded(format!(
+                "deadline reached before marking {}",
+                member.scope
+            )));
+        }
+        let marks =
+            mark_member(member, registry.family(), &bounds, true).map_err(
+                |failure| match failure {
+                    MarkFailure::Uncertain(reason) => {
+                        FamilySweepError::Uncertain(format!("{}: {reason}", member.scope))
+                    }
+                    MarkFailure::Bounded(reason) => {
+                        FamilySweepError::Bounded(format!("{}: {reason}", member.scope))
+                    }
+                },
+            )?;
         report.reclaimed_pins += marks.reclaimed_pins;
         marked.extend(marks.keys);
     }
@@ -176,7 +274,16 @@ pub fn sweep_family(
     observe(observer, SweepStep::Marked);
 
     for store in &stores {
-        delete_unmarked(registry, store, &marked, epoch, policy, &mut report)?;
+        delete_unmarked(
+            registry,
+            store,
+            &marked,
+            epoch,
+            policy,
+            &bounds,
+            observer,
+            &mut report,
+        )?;
     }
     observe(observer, SweepStep::Deleted);
 
@@ -187,27 +294,60 @@ pub fn sweep_family(
     Ok(report)
 }
 
+/// Every key and segment one member relies on (its current generation, the
+/// generations its pins and read markers protect, and the keys its pins
+/// list), read without changing anything. Disk accounting uses this to count
+/// a key shared by several views once and to tell which keys only one view
+/// holds. An `Err` is uncertainty, like in the sweep.
+pub(crate) fn member_references(
+    member: &MemberRecord,
+    family: &str,
+    bounds: &SweepBounds,
+) -> Result<BTreeSet<[u8; 32]>, String> {
+    mark_member(member, family, bounds, false)
+        .map(|marks| marks.keys)
+        .map_err(|failure| match failure {
+            MarkFailure::Uncertain(reason) | MarkFailure::Bounded(reason) => reason,
+        })
+}
+
+/// Protection of any class for a view directory: a pin whose owner lives, or
+/// a protected read or residency marker. `Err` means it could not be read,
+/// which callers treat as protected.
+pub(crate) fn view_has_protection(view_dir: &Path) -> Result<bool, String> {
+    member_has_protection(view_dir)
+}
+
 fn observe(observer: Option<&dyn SweepObserver>, step: SweepStep) {
     if let Some(observer) = observer {
         observer.reached(step);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delete_unmarked(
     registry: &FamilyRegistry,
     store: &FamilyStore,
     marked: &BTreeSet<[u8; 32]>,
     epoch: u64,
     policy: FamilySweepPolicy,
+    bounds: &SweepBounds,
+    observer: Option<&dyn SweepObserver>,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
-    let rows = store.rows()?;
+    // The total comes from SQLite's own sums, not from the listing, so the
+    // budget check stays right when the listing below is cut at its bound.
     let segments = store.segments()?;
-    let mut total = rows.iter().map(|row| row.payload_bytes).sum::<u64>()
-        + segments.iter().map(|row| row.byte_len).sum::<u64>();
+    let mut total =
+        store.usage()?.payload_bytes + segments.iter().map(|row| row.byte_len).sum::<u64>();
+    let rows = store.rows_oldest(bounds.max_rows_per_store)?;
     let mut deleted_any = false;
     for row in rows {
         if total <= policy.byte_budget {
+            break;
+        }
+        if bounds.past_deadline() {
+            report.stopped_early = true;
             break;
         }
         // The epoch check happens in the DELETE itself, not here: a touch can
@@ -222,15 +362,32 @@ fn delete_unmarked(
             deleted_any = true;
         }
     }
-    for segment in segments {
+    for segment in segments.into_iter().take(bounds.max_rows_per_store) {
         if total <= policy.byte_budget {
+            break;
+        }
+        if bounds.past_deadline() {
+            report.stopped_early = true;
             break;
         }
         if marked.contains(&segment.segment_id) {
             continue;
         }
         let file = segment_path(registry.storage(), registry.family(), &segment.segment_id)?;
-        if store.delete_segment_if_unreferenced_since(&segment.segment_id, epoch, &file)?
+        let step = |step: crate::blob_store::v2::SegmentDeletionStep| {
+            observe(
+                observer,
+                match step {
+                    crate::blob_store::v2::SegmentDeletionStep::RowDeleted => {
+                        SweepStep::SegmentRowDeleted
+                    }
+                    crate::blob_store::v2::SegmentDeletionStep::FileUnlinked => {
+                        SweepStep::SegmentFileUnlinked
+                    }
+                },
+            )
+        };
+        if store.delete_segment_observed(&segment.segment_id, epoch, &file, &step)?
             == crate::blob_store::v2::SegmentDeletion::Deleted
         {
             total = total.saturating_sub(segment.byte_len);
@@ -238,20 +395,38 @@ fn delete_unmarked(
             report.deleted_bytes += segment.byte_len;
         }
     }
-    if deleted_any {
-        store.incremental_vacuum()?;
+    if deleted_any && !store.reclaim_space()? {
+        report.reclaim_deferred = true;
     }
     Ok(())
 }
 
+enum MarkFailure {
+    Uncertain(String),
+    Bounded(String),
+}
+
+impl From<String> for MarkFailure {
+    fn from(reason: String) -> Self {
+        Self::Uncertain(reason)
+    }
+}
+
 /// Marks everything one member relies on. Any uncertainty is an error.
-fn mark_member(member: &MemberRecord, family: &str) -> Result<MemberMarks, String> {
+/// With `reclaim`, pins and read markers of dead owners are removed on the
+/// way, as a sweep does; without it nothing on disk changes.
+fn mark_member(
+    member: &MemberRecord,
+    family: &str,
+    bounds: &SweepBounds,
+    reclaim: bool,
+) -> Result<MemberMarks, MarkFailure> {
     let mut marks = MemberMarks::default();
     let view_dir = &member.view_dir;
     match fs::symlink_metadata(view_dir) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(marks),
-        Err(error) => return Err(format!("view directory unreadable: {error}")),
+        Err(error) => return Err(format!("view directory unreadable: {error}").into()),
     }
     let store = ViewStore::existing_dir(view_dir.clone());
     if let Some(store) = &store {
@@ -262,9 +437,47 @@ fn mark_member(member: &MemberRecord, family: &str) -> Result<MemberMarks, Strin
             mark_generation(store, &generation, &mut marks)?;
         }
     }
-    mark_pins(view_dir, family, store.as_ref(), &mut marks)?;
-    mark_readers(view_dir, store.as_ref(), &mut marks)?;
+    mark_pins(
+        view_dir,
+        family,
+        store.as_ref(),
+        bounds,
+        reclaim,
+        &mut marks,
+    )?;
+    mark_readers(view_dir, store.as_ref(), bounds, reclaim, &mut marks)?;
     Ok(marks)
+}
+
+/// The entries of a protection directory, at most `bounds` of them. More
+/// entries than the bound, or the deadline, is a [`MarkFailure::Bounded`]:
+/// a mark that skipped an entry could miss a protection.
+fn bounded_entries(
+    dir: &Path,
+    what: &str,
+    bounds: &SweepBounds,
+) -> Result<Option<Vec<fs::DirEntry>>, MarkFailure> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{what} unreadable: {error}").into()),
+    };
+    let mut result = Vec::new();
+    for entry in entries.take(bounds.max_entries_per_dir.saturating_add(1)) {
+        if bounds.past_deadline() {
+            return Err(MarkFailure::Bounded(format!(
+                "deadline reached reading {what}"
+            )));
+        }
+        result.push(entry.map_err(|error| format!("{what} unreadable: {error}"))?);
+    }
+    if result.len() > bounds.max_entries_per_dir {
+        return Err(MarkFailure::Bounded(format!(
+            "{what} holds more than {} entries",
+            bounds.max_entries_per_dir
+        )));
+    }
+    Ok(Some(result))
 }
 
 fn mark_generation(
@@ -288,16 +501,15 @@ fn mark_pins(
     view_dir: &Path,
     family: &str,
     store: Option<&ViewStore>,
+    bounds: &SweepBounds,
+    reclaim: bool,
     marks: &mut MemberMarks,
-) -> Result<(), String> {
+) -> Result<(), MarkFailure> {
     let pins_dir = view_dir.join("pins");
-    let entries = match fs::read_dir(&pins_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("pins unreadable: {error}")),
+    let Some(entries) = bounded_entries(&pins_dir, "pins", bounds)? else {
+        return Ok(());
     };
     for entry in entries {
-        let entry = entry.map_err(|error| format!("pins unreadable: {error}"))?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
@@ -309,13 +521,16 @@ fn mark_pins(
             return Err(format!(
                 "pin {} does not belong to this view and family",
                 path.display()
-            ));
+            )
+            .into());
         }
         if !pins::owner_is_live(&metadata.owner) {
-            let _ = fs::remove_file(&metadata_path);
-            let _ = fs::remove_file(&keys_path);
-            crate::fs_lock::sync_parent(&metadata_path);
-            marks.reclaimed_pins += 1;
+            if reclaim {
+                let _ = fs::remove_file(&metadata_path);
+                let _ = fs::remove_file(&keys_path);
+                crate::fs_lock::sync_parent(&metadata_path);
+                marks.reclaimed_pins += 1;
+            }
             continue;
         }
         let keys = pins::read_keys(&keys_path).map_err(|error: PinError| {
@@ -332,16 +547,15 @@ fn mark_pins(
 fn mark_readers(
     view_dir: &Path,
     store: Option<&ViewStore>,
+    bounds: &SweepBounds,
+    reclaim: bool,
     marks: &mut MemberMarks,
-) -> Result<(), String> {
+) -> Result<(), MarkFailure> {
     let readers = view_dir.join("readers");
-    let entries = match fs::read_dir(&readers) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("readers unreadable: {error}")),
+    let Some(entries) = bounded_entries(&readers, "readers", bounds)? else {
+        return Ok(());
     };
     for entry in entries {
-        let entry = entry.map_err(|error| format!("readers unreadable: {error}"))?;
         let is_dir = entry
             .file_type()
             .map_err(|error| format!("reader entry unreadable: {error}"))?
@@ -350,10 +564,15 @@ fn mark_readers(
             continue;
         }
         let Some(generation) = entry.file_name().to_str().map(str::to_owned) else {
-            return Err("reader directory with a non-UTF-8 name".to_string());
+            return Err("reader directory with a non-UTF-8 name".to_string().into());
         };
         // Unreadable markers count as protected here, so uncertainty retains.
-        if crate::root_cache::sweep_read_markers(view_dir, &generation).protected {
+        let protected = if reclaim {
+            crate::root_cache::sweep_read_markers(view_dir, &generation).protected
+        } else {
+            crate::root_cache::protected_read_marker_exists(view_dir, &generation)
+        };
+        if protected {
             if let Some(store) = store {
                 mark_generation_if_present(store, &generation, marks)?;
             }
@@ -390,51 +609,42 @@ fn root_is_missing(member: &MemberRecord) -> bool {
 
 /// Protection of any class for a member, checked inside the barrier: live
 /// pins (assembly, live or seed), and protected read or residency markers.
-/// An error is uncertainty and keeps the member.
+/// An error is uncertainty and keeps the member; so is a directory with more
+/// entries than the walk reads.
 fn member_has_protection(view_dir: &Path) -> Result<bool, String> {
-    let pins_dir = view_dir.join("pins");
-    match fs::read_dir(&pins_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| error.to_string())?;
-                let path = entry.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-                    continue;
-                }
-                let metadata =
-                    pins::read_metadata_strict(&path).map_err(|error| error.to_string())?;
-                if pins::owner_is_live(&metadata.owner) {
-                    return Ok(true);
-                }
-            }
+    let bounds = SweepBounds::default();
+    let failure = |failure: MarkFailure| match failure {
+        MarkFailure::Uncertain(reason) | MarkFailure::Bounded(reason) => reason,
+    };
+    let pins = bounded_entries(&view_dir.join("pins"), "pins", &bounds).map_err(failure)?;
+    for entry in pins.into_iter().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        let metadata = pins::read_metadata_strict(&path).map_err(|error| error.to_string())?;
+        if pins::owner_is_live(&metadata.owner) {
+            return Ok(true);
+        }
     }
-    let readers = view_dir.join("readers");
-    match fs::read_dir(&readers) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| error.to_string())?;
-                if !entry
-                    .file_type()
-                    .map_err(|error| error.to_string())?
-                    .is_dir()
-                {
-                    continue;
-                }
-                let generation = entry
-                    .file_name()
-                    .to_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "non-UTF-8 reader directory".to_string())?;
-                if crate::root_cache::sweep_read_markers(view_dir, &generation).protected {
-                    return Ok(true);
-                }
-            }
+    let readers =
+        bounded_entries(&view_dir.join("readers"), "readers", &bounds).map_err(failure)?;
+    for entry in readers.into_iter().flatten() {
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        let generation = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "non-UTF-8 reader directory".to_string())?;
+        if crate::root_cache::sweep_read_markers(view_dir, &generation).protected {
+            return Ok(true);
+        }
     }
     Ok(false)
 }

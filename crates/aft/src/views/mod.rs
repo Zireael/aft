@@ -22,6 +22,7 @@ pub(crate) mod read;
 // Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
 // trigram segments, the plane contracts and the parity harness.
 pub mod contracts;
+pub mod eviction;
 pub mod manifest_v2;
 pub mod parity_harness;
 pub mod readiness;

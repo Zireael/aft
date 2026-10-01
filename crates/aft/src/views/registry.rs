@@ -83,6 +83,31 @@ CREATE TABLE IF NOT EXISTS sweep_lease (
 );
 "#;
 
+/// Live sessions of registered views, one row per [`ViewRegistration`] that a
+/// process still holds. Disk-limit eviction never removes a view with a row
+/// whose owner process is alive.
+///
+/// The table is created with `IF NOT EXISTS` by every writer that needs it,
+/// without a schema version bump: releases that predate it never read it, and
+/// their views stay protected while in use by their pins and read markers.
+const SESSION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS view_sessions (
+    session_id TEXT NOT NULL PRIMARY KEY,
+    scope TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_start INTEGER NOT NULL,
+    opened_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS view_sessions_scope ON view_sessions (scope);
+"#;
+
+/// `members.state` of a view whose disk-limit eviction has begun. Eviction
+/// commits this state before it deletes anything, so a process killed
+/// halfway leaves a member that the next eviction pass or the view's next
+/// registration finishes cleaning, instead of a half-deleted view that looks
+/// intact.
+pub(crate) const STATE_EVICTING: &str = "evicting";
+
 #[derive(Debug)]
 pub enum RegistryError {
     Io(std::io::Error),
@@ -94,6 +119,9 @@ pub enum RegistryError {
     Incompatible(String),
     /// The member is not registered (any more).
     NotRegistered(String),
+    /// A new view could not be admitted under the family's disk limits. The
+    /// text is the named reason, starting with `queued:`.
+    AdmissionQueued(String),
     /// A reader could not pin a generation that stayed current long enough to
     /// verify it.
     PointerUnstable {
@@ -111,6 +139,7 @@ impl fmt::Display for RegistryError {
             Self::InvalidScope(scope) => write!(f, "invalid view scope `{scope}`"),
             Self::Incompatible(message) => write!(f, "incompatible family registry: {message}"),
             Self::NotRegistered(scope) => write!(f, "view `{scope}` is not registered"),
+            Self::AdmissionQueued(reason) => write!(f, "{reason}"),
             Self::PointerUnstable { scope } => write!(
                 f,
                 "the current generation of `{scope}` kept changing while a reader pinned it"
@@ -162,6 +191,8 @@ pub struct MemberRecord {
     pub last_bind_ms: u64,
     pub last_publish_ms: Option<u64>,
     pub missing_sweeps: u32,
+    /// A disk-limit eviction of this view began and has not finished.
+    pub evicting: bool,
 }
 
 /// One registry reader that holds no view.
@@ -178,6 +209,9 @@ struct RegistryInner {
     family: String,
     path: PathBuf,
     connection: Mutex<TrackedConnection>,
+    /// The disk limits this process applies to the family; see
+    /// `views::eviction`. Shared by every handle on this registry file.
+    budget: Mutex<super::eviction::DiskBudget>,
 }
 
 impl fmt::Debug for RegistryInner {
@@ -253,6 +287,7 @@ impl FamilyRegistry {
             family: family.to_owned(),
             path: path.clone(),
             connection: Mutex::new(connection),
+            budget: Mutex::new(super::eviction::DiskBudget::default()),
         });
         {
             let mut connection = lock(&inner.connection);
@@ -264,6 +299,7 @@ impl FamilyRegistry {
                 connection.pragma_update(None, "synchronous", "FULL")?;
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 tx.execute_batch(REGISTRY_SCHEMA)?;
+                tx.execute_batch(SESSION_SCHEMA)?;
                 tx.execute(
                     "INSERT OR IGNORE INTO registry_meta (singleton, schema_version, gc_epoch)
                      VALUES (1, ?1, 0)",
@@ -294,11 +330,47 @@ impl FamilyRegistry {
     /// Registers (or re-binds) a view in one IMMEDIATE transaction. This must
     /// be the first durable step of any view work; the returned registration
     /// is the only way to obtain write access to the family's stores.
+    ///
+    /// The registration is also the view's session: while any clone of it is
+    /// alive, a `view_sessions` row names this process, and disk-limit
+    /// eviction leaves the view alone. A scope that is not registered yet is
+    /// a new view whose first generation will add bytes, so it must first be
+    /// admitted under the family's disk limits; see
+    /// [`super::eviction::admit_new_view`]. Re-binding an existing member is
+    /// never refused.
     pub fn register_view(&self, scope: &str, root: &Path) -> RegistryResult<ViewRegistration> {
         let view_dir = view_dir(&self.inner.storage, scope)?;
+        if self.member(scope)?.is_none() {
+            super::eviction::admit_new_view(self)?;
+        }
         let now = now_ms();
+        let owner = current_owner();
+        let session_id = format!(
+            "{}-{}-{}",
+            owner.pid,
+            owner.start_time,
+            SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let mut connection = lock(&self.inner.connection);
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(SESSION_SCHEMA)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT state FROM members WHERE scope = ?1",
+                params![scope],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(STATE_EVICTING) {
+            // An eviction began deleting this view and was interrupted. It
+            // removed the pointer first, so nothing here is published; clear
+            // the rest before the view is used again, so a rebuilt generation
+            // never meets a leftover file of the same name. Anything still
+            // protected (or protection that cannot be read) is left alone.
+            if matches!(crate::gc::family::view_has_protection(&view_dir), Ok(false)) {
+                remove_view_dir(&view_dir)?;
+            }
+        }
         tx.execute(
             "INSERT INTO members
                  (scope, root, view_dir, registered_at_ms, last_bind_ms, state, missing_sweeps)
@@ -311,6 +383,17 @@ impl FamilyRegistry {
                  missing_sweeps = 0",
             params![scope, encode_root(root), path_text(&view_dir), now as i64],
         )?;
+        tx.execute(
+            "INSERT INTO view_sessions (session_id, scope, owner_pid, owner_start, opened_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id,
+                scope,
+                i64::from(owner.pid),
+                owner.start_time as i64,
+                now as i64
+            ],
+        )?;
         tx.commit()?;
         drop(connection);
         fs::create_dir_all(&view_dir)?;
@@ -319,7 +402,50 @@ impl FamilyRegistry {
             scope: scope.to_owned(),
             root: root.to_path_buf(),
             view_dir,
+            session: Arc::new(ViewSession {
+                registry: self.clone(),
+                session_id,
+                scope: scope.to_owned(),
+            }),
         })
+    }
+
+    /// The disk limits this process applies to the family.
+    pub fn disk_budget(&self) -> super::eviction::DiskBudget {
+        *lock(&self.inner.budget)
+    }
+
+    /// Replaces the disk limits for every handle on this registry in this
+    /// process. Production keeps the defaults; tests use small limits to
+    /// exercise eviction and admission with real files.
+    pub fn set_disk_budget(&self, budget: super::eviction::DiskBudget) {
+        *lock(&self.inner.budget) = budget;
+    }
+
+    /// Every recorded view session, live or not.
+    pub fn sessions(&self) -> RegistryResult<Vec<SessionRecord>> {
+        let connection = lock(&self.inner.connection);
+        read_sessions(&connection, None)
+    }
+
+    /// Removes session rows whose owner process is gone. Their views count
+    /// as having no session whether or not the rows are removed; this only
+    /// keeps the table small.
+    pub(crate) fn reclaim_dead_sessions(&self) -> RegistryResult<usize> {
+        let dead = self
+            .sessions()?
+            .into_iter()
+            .filter(|session| !crate::pins::owner_is_live(&session.owner))
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        let connection = lock(&self.inner.connection);
+        for session_id in &dead {
+            connection.execute(
+                "DELETE FROM view_sessions WHERE session_id = ?1",
+                params![session_id],
+            )?;
+        }
+        Ok(dead.len())
     }
 
     /// Registers a reader that holds no view. The row is removed when the
@@ -546,6 +672,42 @@ pub struct ViewRegistration {
     scope: String,
     root: PathBuf,
     view_dir: PathBuf,
+    /// Shared by every clone, so the session ends when the last clone of
+    /// this registration is dropped.
+    session: Arc<ViewSession>,
+}
+
+/// One process's live use of a view. Dropping it removes its session row and
+/// records the time as the view's most recent use (`last_bind_ms`), which is
+/// what least-recently-used eviction orders by.
+#[derive(Debug)]
+struct ViewSession {
+    registry: FamilyRegistry,
+    session_id: String,
+    scope: String,
+}
+
+impl Drop for ViewSession {
+    fn drop(&mut self) {
+        let connection = lock(&self.registry.inner.connection);
+        let _ = connection.execute(
+            "DELETE FROM view_sessions WHERE session_id = ?1",
+            params![self.session_id],
+        );
+        let _ = connection.execute(
+            "UPDATE members SET last_bind_ms = MAX(last_bind_ms, ?2) WHERE scope = ?1",
+            params![self.scope, now_ms() as i64],
+        );
+    }
+}
+
+/// One recorded view session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecord {
+    pub session_id: String,
+    pub scope: String,
+    pub owner: PinOwner,
+    pub opened_at_ms: u64,
 }
 
 impl ViewRegistration {
@@ -567,6 +729,11 @@ impl ViewRegistration {
 
     pub fn view_dir(&self) -> &Path {
         &self.view_dir
+    }
+
+    /// The id of this registration's session row in `view_sessions`.
+    pub fn session_id(&self) -> &str {
+        &self.session.session_id
     }
 
     pub fn write_access(&self) -> StoreWriteAccess {
@@ -614,6 +781,7 @@ impl ViewRegistration {
 }
 
 static READER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A registered reader that holds no view. It can list the family's members,
 /// read their stores and pin their current generations, and nothing else.
@@ -747,7 +915,7 @@ pub(crate) fn current_owner() -> PinOwner {
 pub(crate) fn read_members(connection: &rusqlite::Connection) -> RegistryResult<Vec<MemberRecord>> {
     let mut statement = connection.prepare(
         "SELECT scope, root, view_dir, registered_at_ms, last_bind_ms, last_publish_ms,
-                missing_sweeps
+                missing_sweeps, state
          FROM members ORDER BY scope",
     )?;
     let rows = statement.query_map([], |row| {
@@ -761,9 +929,65 @@ pub(crate) fn read_members(connection: &rusqlite::Connection) -> RegistryResult<
                 .get::<_, Option<i64>>(5)?
                 .map(|value| value.max(0) as u64),
             missing_sweeps: row.get::<_, i64>(6)?.max(0) as u32,
+            evicting: row.get::<_, String>(7)? == STATE_EVICTING,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Session rows, all of them or those of one scope. A registry that no
+/// writer of this release has opened yet has no session table, which means
+/// no sessions.
+pub(crate) fn read_sessions(
+    connection: &rusqlite::Connection,
+    scope: Option<&str>,
+) -> RegistryResult<Vec<SessionRecord>> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'view_sessions'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT session_id, scope, owner_pid, owner_start, opened_at_ms FROM view_sessions
+         WHERE ?1 IS NULL OR scope = ?1 ORDER BY session_id",
+    )?;
+    let rows = statement.query_map(params![scope], |row| {
+        Ok(SessionRecord {
+            session_id: row.get(0)?,
+            scope: row.get(1)?,
+            owner: PinOwner {
+                pid: row.get::<_, i64>(2)? as u32,
+                start_time: row.get::<_, i64>(3)?.max(0) as u64,
+            },
+            opened_at_ms: row.get::<_, i64>(4)?.max(0) as u64,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// True when a process that is still alive holds a session on `scope`.
+pub(crate) fn has_live_session(
+    connection: &rusqlite::Connection,
+    scope: &str,
+) -> RegistryResult<bool> {
+    Ok(read_sessions(connection, Some(scope))?
+        .iter()
+        .any(|session| crate::pins::owner_is_live(&session.owner)))
+}
+
+/// Removes a view directory, treating one that is already gone as removed.
+pub(crate) fn remove_view_dir(view_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(view_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn check_schema(connection: &rusqlite::Connection) -> RegistryResult<()> {
