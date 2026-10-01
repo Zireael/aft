@@ -1096,6 +1096,58 @@ fn pending_bind_breadcrumb(
     )
 }
 
+/// Refusal code for a route bind whose deadline passed while it waited
+/// behind a reader on its root. Retryable like `actor_not_ready`: the reader
+/// ends eventually, and a later bind can then be admitted.
+pub(super) const BIND_BLOCKED_BY_READER: &str = "bind_blocked_by_reader";
+
+/// The code and message an overdue route bind is refused with. A bind still
+/// queued while readers run on its root waited for them (a bind that needs
+/// exclusive use of the root cannot start beside readers), so the refusal
+/// names the oldest of them: its job, its tool and how long it has run.
+/// Every other cause keeps the generic `actor_not_ready`.
+pub(super) fn route_bind_deadline_refusal(
+    age: Duration,
+    deadline: Duration,
+    relay: Duration,
+    snapshot: &BindBlockerSnapshot,
+) -> (&'static str, String) {
+    let age_ms = duration_millis_u64(age);
+    let deadline_ms = duration_millis_u64(deadline);
+    let blocking_reader = (snapshot.configure_state == "queued")
+        .then(|| {
+            snapshot
+                .in_flight_readers
+                .iter()
+                .max_by_key(|reader| reader.started_age_ms)
+        })
+        .flatten();
+    match blocking_reader {
+        Some(reader) => {
+            let others = snapshot.in_flight_readers.len() - 1;
+            let others = if others == 0 {
+                String::new()
+            } else {
+                format!(" and {others} other reader(s)")
+            };
+            (
+                BIND_BLOCKED_BY_READER,
+                format!(
+                    "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the bind waited behind a reader on this root that has not finished (job={} tool={} age_ms={}){others}; retry once it finishes or is cancelled",
+                    reader.request_id, reader.command, reader.started_age_ms,
+                ),
+            )
+        }
+        None => (
+            "actor_not_ready",
+            format!(
+                "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the root's configure did not finish, so AFT refuses the bind before the daemon's {}ms bind relay times out",
+                relay.as_millis()
+            ),
+        ),
+    }
+}
+
 const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
 // SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
@@ -2852,6 +2904,49 @@ mod tests {
             metrics["roots"][0]["callgraph_store"]["status"], "disabled",
             "a disabled store must never report building: {metrics:#}"
         );
+    }
+
+    #[test]
+    fn overdue_bind_refusal_blames_the_oldest_reader_only_while_the_bind_is_queued() {
+        let reader = |request_id: &str, command: &str, started_age_ms: u64| {
+            crate::executor::BindBlockerReaderSnapshot {
+                request_id: request_id.to_string(),
+                command: command.to_string(),
+                lane: Lane::PureRead,
+                started_age_ms,
+                execution_started: true,
+                started_before_oldest_writer: true,
+            }
+        };
+        let snapshot = |configure_state: &'static str| BindBlockerSnapshot {
+            configure_state,
+            configure_phase_timings: None,
+            blockers: Vec::new(),
+            oldest_queued_writer_age_ms: Some(10_600),
+            in_flight_readers: vec![
+                reader("subc-1-790", "read", 900),
+                reader("subc-1-789", "grep", 840_000),
+            ],
+            reader_admissions_while_promoted_writer_waited: 0,
+        };
+        let age = Duration::from_millis(10_600);
+        let deadline = Duration::from_millis(10_500);
+        let relay = Duration::from_secs(12);
+
+        let (code, message) =
+            route_bind_deadline_refusal(age, deadline, relay, &snapshot("queued"));
+        assert_eq!(code, BIND_BLOCKED_BY_READER);
+        assert!(
+            message.contains("job=subc-1-789 tool=grep age_ms=840000")
+                && message.contains("and 1 other reader(s)"),
+            "{message}"
+        );
+
+        // A running configure that did not finish is not a reader's doing.
+        let (code, message) =
+            route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
+        assert_eq!(code, "actor_not_ready");
+        assert!(message.contains("configure did not finish"), "{message}");
     }
 
     #[test]

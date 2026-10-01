@@ -1067,6 +1067,16 @@ fn tool_disabled_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response 
     }
 }
 
+/// The real configure, so a rebind of an unchanged root takes configure's own
+/// equivalent-rebind path; every other command, including the held `echo`
+/// read, goes to [`bridge_dispatch`].
+fn real_configure_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        _ => bridge_dispatch(req, ctx),
+    }
+}
+
 fn hashline_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -1086,6 +1096,18 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = current_bridge_state();
     match req.command.as_str() {
         "configure" => {
+            // This stand-in configure rewrites the root's configuration on
+            // every bind, as the real configure does on its full path. Like
+            // that path, a bind the executor started with only a shared hold
+            // (beside readers or maintenance) asks to run again with
+            // exclusive use before it changes anything.
+            if aft::executor::request_exclusive_rerun() {
+                return Response::error(
+                    &req.id,
+                    "configure_needs_exclusive",
+                    "configure must run with exclusive use of the root; queued again",
+                );
+            }
             state.configure(&req, ctx);
             if slow_configure_requested(&req) {
                 state.slow_configure();
@@ -2146,6 +2168,17 @@ fn subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots() 
                 "same-root reconfigure must wait for route 1 reads to drain"
             );
         },
+    );
+}
+
+#[test]
+fn subc_bridge_same_root_rebind_is_acked_while_a_read_is_held() {
+    run_subc_bridge_test_with_dispatch(
+        "subc_bridge_same_root_rebind_is_acked_while_a_read_is_held",
+        Duration::from_secs(45),
+        drive_rebind_beside_held_read_daemon,
+        |_, _, _| {},
+        real_configure_bridge_dispatch,
     );
 }
 
@@ -5188,6 +5221,65 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     assert_eq!(route4_read.header.channel, 4);
     assert_eq!(route4_read.header.corr, 420);
     assert_tool_project_root(&route4_read, &root1);
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// A second session binding to a root that is already configured, with the
+/// same configuration, only needs to be recorded. A read still running on the
+/// root (one that runs for minutes, in the case this reproduces) must not
+/// hold that bind until the route-bind deadline refuses it.
+async fn drive_rebind_beside_held_read_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    // Well inside the 10.5 s route-bind deadline: a rebind is a short job.
+    const REBIND_BOUND: Duration = Duration::from_secs(3);
+
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(&mut stream, 1, 100, "echo", json!({ "case": "overlap" })).await;
+    state.wait_until("held read started", |inner| inner.overlap_started == 1);
+
+    let started = Instant::now();
+    send_route_bind(&mut stream, 2, 20, &root1).await;
+    let ack = read_frame_within(&mut stream, REBIND_BOUND, "rebind beside a held read").await;
+    let elapsed = started.elapsed();
+    let read_still_held = state
+        .inner
+        .lock()
+        .expect("bridge state lock")
+        .overlap_current
+        == 1;
+    state.release_overlap();
+    let ack = ack.unwrap_or_else(|| {
+        panic!("the same-root rebind was not answered within {REBIND_BOUND:?} beside a held read")
+    });
+    assert_eq!(ack.header.ty, FrameType::Response, "{:?}", ack.header);
+    assert_eq!((ack.header.channel, ack.header.corr), (0, 20));
+    let ack: ModuleControlResponse = serde_json::from_slice(&ack.body).expect("ack body");
+    assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+    assert!(
+        read_still_held,
+        "the read was released before the rebind was answered"
+    );
+    eprintln!("same-root rebind answered beside a held read in {elapsed:?}");
+
+    let read = read_frame_timeout(&mut stream, "held read response").await;
+    assert_eq!((read.header.channel, read.header.corr), (1, 100));
+    send_tool_call(&mut stream, 2, 200, "echo", json!({ "case": "fast" })).await;
+    let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
+    assert_eq!(
+        (route2_read.header.channel, route2_read.header.corr),
+        (2, 200)
+    );
+    assert_eq!(
+        tool_response_json(&route2_read)["success"].as_bool(),
+        Some(true),
+        "the rebound route serves tool calls"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

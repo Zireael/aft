@@ -210,9 +210,9 @@ mod standing;
 mod wire;
 
 use self::health::{
-    build_health_report, warn_slow_pending_binds, warn_slow_running_interactive_jobs,
-    DeferredBashWaitGuard, DispatchPathMetrics, HealthRollupCache, HealthRollupWorker,
-    ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
+    build_health_report, route_bind_deadline_refusal, warn_slow_pending_binds,
+    warn_slow_running_interactive_jobs, DeferredBashWaitGuard, DispatchPathMetrics,
+    HealthRollupCache, HealthRollupWorker, ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
 };
 pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
@@ -617,7 +617,7 @@ fn submit_active_tool_call(
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let (rx, cancellation) =
-        executor.submit_cancellable_async(root_id.clone(), lane, request_id, job);
+        executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
     active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5534,6 +5534,9 @@ async fn expire_overdue_route_binds(
         .collect();
 
     for (route, corr, ver, flags, root_id, configure_request_id, age) in expired {
+        // Read the blockers before cancelling: once cancelled, the bind is no
+        // longer queued and the snapshot can no longer say what held it.
+        let blockers = executor.bind_blocker_snapshot(&root_id, &configure_request_id);
         if let Some(pending) = pending_binds.get_mut(&route) {
             pending.cancelled = true;
             pending.deadline_reported = true;
@@ -5544,27 +5547,21 @@ async fn expire_overdue_route_binds(
         }
         remove_installed_route(installed_route_epochs, route);
         metrics.record_bind_ack(age);
-        let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
-        send_route_bind_error_parts(
-            tx,
-            ver,
-            corr,
-            flags,
-            "actor_not_ready",
-            &format!(
-                "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the root's configure did not finish, so AFT refuses the bind before the daemon's {relay_ms}ms bind relay times out",
-                relay_ms = DAEMON_BIND_RELAY_TIMEOUT.as_millis()
-            ),
-            metrics,
-        )
-        .await?;
+        let (code, message) = route_bind_deadline_refusal(
+            age,
+            ROUTE_BIND_DEADLINE,
+            DAEMON_BIND_RELAY_TIMEOUT,
+            &blockers,
+        );
+        send_route_bind_error_parts(tx, ver, corr, flags, code, &message, metrics).await?;
         log::warn!(
-            "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={})",
+            "subc attach: route {} bind for root {} exceeded {}ms deadline (configure_request_id={}, code={})",
             route,
             root_id.as_path().display(),
             deadline_ms,
-            configure_request_id
+            configure_request_id,
+            code
         );
     }
 
@@ -12403,6 +12400,112 @@ mod tests {
         );
         assert!(pending_binds[&held].deadline_reported);
         assert!(!pending_binds[&young].deadline_reported);
+    }
+
+    /// A bind whose deadline passes while it waits behind a reader on its root
+    /// is refused with its own retryable code, and the message names the
+    /// reader's job, its tool and how long it has run, so whoever retries the
+    /// bind can see what holds the root.
+    #[tokio::test]
+    async fn bind_overdue_behind_a_reader_is_refused_naming_the_reader_job_and_tool() {
+        let (_dir, root) = test_root("route-bind-blocked-by-reader");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let (reader_started_tx, reader_started_rx) = crossbeam_channel::bounded::<()>(1);
+        let (release_reader_tx, release_reader_rx) = crossbeam_channel::bounded::<()>(1);
+        let (reader, _reader_token) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::PureRead,
+            "subc-1-789".to_string(),
+            "grep",
+            Box::new(move |_| {
+                reader_started_tx.send(()).expect("signal reader start");
+                let _ = release_reader_rx.recv_timeout(Duration::from_secs(30));
+                Response::success("subc-1-789", json!({}))
+            }),
+        );
+        reader_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader starts");
+        // A bind that must change the root, so it waits for the reader.
+        let (bind, bind_token) = executor.submit_bind_cancellable_async(
+            root.clone(),
+            "subc-bind-11".to_string(),
+            Arc::new(|_| {
+                if crate::executor::request_exclusive_rerun() {
+                    return Response::error("subc-bind-11", "configure_needs_exclusive", "rerun");
+                }
+                Response::success("subc-bind-11", json!({}))
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !executor
+            .try_bind_blocker_snapshot(&root, "subc-bind-11")
+            .is_some_and(|snapshot| {
+                snapshot
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker == "rerun_as_exclusive_writer")
+            })
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the bind never queued for exclusive use"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let route = route_key(11, 1);
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root.clone(),
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-11".to_string(),
+                started_at: Instant::now()
+                    .checked_sub(Duration::from_secs(11))
+                    .expect("monotonic clock is older than the bind age"),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 95,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation: bind_token,
+            },
+        )]);
+        let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+
+        expire_overdue_route_binds(
+            &writer_tx,
+            &executor,
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        let _ = release_reader_tx.send(());
+        let bind_response = bind.await.expect("bind completion");
+        assert!(reader.await.expect("reader completion").success);
+
+        let refusal = writer_rx.try_recv().expect("named bind refusal");
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        assert_eq!(refusal.header.corr, 95);
+        let body: Value = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(body["code"], "bind_blocked_by_reader", "{body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("route bind deadline exceeded")
+                && message.contains("job=subc-1-789")
+                && message.contains("tool=grep")
+                && message.contains("age_ms="),
+            "{body}"
+        );
+        // The overdue bind was cancelled, not left queued behind the reader.
+        assert_eq!(bind_response.data["code"], "request_cancelled");
     }
 
     /// Restart-shaped burst: 40 git roots configured together, then their

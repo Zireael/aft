@@ -797,8 +797,8 @@ pub(crate) fn install_actor_waiting_writers_for_test(
 }
 
 /// A route-bind job that can run more than once. The scheduler may admit such
-/// a bind beside a running maintenance job with only a shared hold on the
-/// actor's epoch gate; when the configure finds it must change the root, the
+/// a bind beside a running maintenance job or interactive readers with only a
+/// shared hold on the actor's epoch gate; when the configure finds it must change the root, the
 /// run is discarded and the same job is queued again as an exclusive writer.
 pub type RepeatableJob = Arc<dyn Fn(&AppContext) -> Response + Send + Sync + 'static>;
 
@@ -841,8 +841,10 @@ impl Drop for SharedBindScope {
 /// unchanged. That rebind only reads the published configuration and records
 /// the session in state behind its own locks, so it is safe next to readers,
 /// and making it wait for exclusive use would park it behind a configure tail
-/// unit that can run for many seconds on a large root. Such a bind starts with
-/// a shared hold; a configure that turns out to change the root calls
+/// unit that can run for many seconds on a large root, or behind a slow
+/// interactive read for as long as that read runs. Such a bind starts with a
+/// shared hold beside whatever already holds the gate for reading; a
+/// configure that turns out to change the root calls
 /// [`request_exclusive_rerun`] before its first change to actor state.
 pub fn current_bind_gate_is_shared() -> bool {
     CURRENT_BIND_GATE_SHARED.with(std::cell::Cell::get)
@@ -1221,12 +1223,40 @@ impl Executor {
         (completion_rx, cancellation)
     }
 
+    /// [`Executor::submit_cancellable_async`] for a tool call: the job is
+    /// labelled with the tool's name, so the census and the blockers a
+    /// waiting bind reports say which tool a long-running job is running.
+    pub fn submit_tool_call_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let cancellation = JobCancellation::new();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            tool.to_string(),
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            None,
+        );
+        (completion_rx, cancellation)
+    }
+
     /// Submit a route-bind configure (a request id starting `subc-bind-`)
     /// that may run more than once, with an exact-job cancellation token.
     ///
     /// Unlike [`Executor::submit_cancellable_async`], the scheduler may admit
-    /// it beside a running maintenance job of its actor with only a shared
-    /// hold on the epoch gate; see [`request_exclusive_rerun`] for how a run
+    /// it beside a running maintenance job or readers of its actor with only a
+    /// shared hold on the epoch gate; see [`request_exclusive_rerun`] for how a run
     /// that must change the root hands its worker back.
     pub fn submit_bind_cancellable_async(
         &self,
@@ -1437,7 +1467,36 @@ impl Executor {
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
         rerun: Option<RepeatableJob>,
     ) {
-        let command = job_command(job_class, lane);
+        self.submit_labeled(
+            root_id,
+            job_class,
+            lane,
+            request_id,
+            job_command(job_class, lane),
+            job,
+            completion,
+            cancellation,
+            maintenance_coalesce_key,
+            rerun,
+        );
+    }
+
+    /// Queue one job. `command` is the label census, blocker and panic lines
+    /// show for it.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_labeled(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        command: String,
+        job: ExecutorJob,
+        completion: CompletionSender,
+        cancellation: Option<JobCancellation>,
+        maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+        rerun: Option<RepeatableJob>,
+    ) {
         let mut rerun = rerun;
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -1568,6 +1627,20 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
+    /// Snapshot RouteBind blockers, waiting for the scheduler lock. For the
+    /// bind-deadline refusal, which names its blocker and is about to take
+    /// the same lock to cancel the bind anyway.
+    pub fn bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        self.inner
+            .state
+            .lock()
+            .bind_blocker_snapshot(root_id, request_id)
     }
 
     /// Snapshot RouteBind blockers without waiting on scheduler state. The subc
@@ -1860,6 +1933,19 @@ impl SchedulerState {
         snapshots
     }
 
+    /// When the most recently admitted reader still running on `root_id`
+    /// started, for interactive admission (see `next_interactive_lane`).
+    fn newest_in_flight_reader_started_at(&self, root_id: &ProjectRootId) -> Option<Instant> {
+        self.running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| job.started_at)
+            .max()
+    }
+
     fn mutating_job_state_label(&self, root_id: &ProjectRootId, request_id: &str) -> &'static str {
         let Some(actor) = self.actors.get(root_id) else {
             return "actor_missing";
@@ -2069,7 +2155,8 @@ struct ActorState {
     actor_total_inflight: usize,
     writer_inflight: bool,
     /// The running writer is a route bind that started with a shared epoch
-    /// hold beside running maintenance (see `current_bind_gate_is_shared`).
+    /// hold beside running maintenance or readers (see
+    /// `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
@@ -2273,14 +2360,30 @@ impl ClassQueues {
     /// overlap each other and never barrier the actor), then remaining lanes
     /// in arrival order. Maintenance keeps strict arrival order via
     /// `front_lane`.
-    fn next_interactive_lane(&self, now: Instant) -> Option<Lane> {
+    ///
+    /// `newest_reader_started_at` is when the most recently admitted reader
+    /// still running on this actor started. A writer is not promoted while
+    /// every running reader started before it queued and has run for
+    /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
+    /// end, which may be never, so holding back new reads would only add an
+    /// outage of every read on the root to the writer's own wait.
+    fn next_interactive_lane(
+        &self,
+        now: Instant,
+        newest_reader_started_at: Option<Instant>,
+    ) -> Option<Lane> {
+        let stuck_readers_started_by = newest_reader_started_at
+            .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
         let starved_writer = self.mutating.iter().any(|job| {
             let promotion_age = if is_configure_request(&job.request_id) {
                 BIND_PROMOTION_AGE
             } else {
                 INTERACTIVE_WRITER_PROMOTION_AGE
             };
+            let waits_only_on_stuck_readers =
+                stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
             now.saturating_duration_since(job.queued_at) >= promotion_age
+                && !waits_only_on_stuck_readers
         });
         if starved_writer {
             // Also stops NEW readers from being admitted on this actor while
@@ -2629,8 +2732,8 @@ struct RunJob {
     /// The actor's parked detached writers, also reported through
     /// [`current_actor_writer_waiting`].
     detached_writers: Arc<AtomicUsize>,
-    /// A route bind admitted while a maintenance job held the epoch gate: it
-    /// runs with a shared hold (see [`current_bind_gate_is_shared`]).
+    /// A route bind admitted while a maintenance job or reader held the epoch
+    /// gate: it runs with a shared hold (see [`current_bind_gate_is_shared`]).
     shared_bind_gate: bool,
     /// How to run this bind again if it has to be queued again.
     rerun: Option<RepeatableJob>,
@@ -3012,6 +3115,10 @@ fn dispatch_runnable_class(
         }
         let root_id = state.actor_order[state.cursor].clone();
         state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let newest_reader_started_at = match job_class {
+            JobClass::Interactive => state.newest_in_flight_reader_started_at(&root_id),
+            JobClass::Maintenance => None,
+        };
 
         let run_job = {
             let Some(actor) = state.actors.get_mut(&root_id) else {
@@ -3045,6 +3152,7 @@ fn dispatch_runnable_class(
                 AdmissionPass::Class(job_class),
                 &state.config,
                 heavy,
+                newest_reader_started_at,
             )
         };
 
@@ -3097,7 +3205,14 @@ fn dispatch_queued_binds(
             let Some(actor) = state.actors.get_mut(&root_id) else {
                 continue;
             };
-            try_admit_actor(&root_id, actor, AdmissionPass::Bind, &state.config, heavy)
+            try_admit_actor(
+                &root_id,
+                actor,
+                AdmissionPass::Bind,
+                &state.config,
+                heavy,
+                None,
+            )
         };
         if let Some(run_job) = run_job {
             made_progress = true;
@@ -3199,6 +3314,7 @@ fn try_admit_actor(
     pass: AdmissionPass,
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
+    newest_reader_started_at: Option<Instant>,
 ) -> Option<RunJob> {
     let bind_pass = pass == AdmissionPass::Bind;
     let job_class = match pass {
@@ -3215,7 +3331,7 @@ fn try_admit_actor(
             .map(|_| Lane::Mutating)?,
         AdmissionPass::Class(JobClass::Interactive) => actor
             .class_queues(JobClass::Interactive)
-            .next_interactive_lane(Instant::now())?,
+            .next_interactive_lane(Instant::now(), newest_reader_started_at)?,
         AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
     };
     let mut heavy_permit = None;
@@ -3283,16 +3399,18 @@ fn try_admit_actor(
         // A bind skips the per-actor interactive cap: HeavyInit jobs count
         // toward that cap without holding the epoch gate, and the writer only
         // needs the gate itself to be free. A repeatable bind also does not
-        // wait for a running maintenance job (typically a configure tail,
-        // whose single units can run for seconds on a large root) to release
-        // the gate: it starts beside it with a shared hold, which is all a
-        // rebind of an unchanged root needs. A run that must change the root
-        // is sent back and queued again as an exclusive writer. Interactive
-        // readers are short and stop being admitted once a bind has waited
-        // `BIND_PROMOTION_AGE`, so a bind still waits for them as before.
+        // wait for whatever holds the gate for reading (a configure tail,
+        // whose single units can run for seconds on a large root, or
+        // interactive readers, which are usually short but are not bounded:
+        // one slow read would otherwise hold every bind of its root until the
+        // bind deadline). It starts beside them with a shared hold, which is
+        // all a rebind of an unchanged root needs, the same hold readers
+        // admitted after it already overlap. A run that must change the root
+        // is sent back and queued again as an exclusive writer, which does
+        // wait for readers and maintenance. `writer_inflight` above still
+        // serializes binds and other writers per root.
         Lane::Mutating => {
-            (bind_may_share && actor.read_inflight == 0 && !actor.lsp_inflight)
-                || (!has_epoch_reader && (bind_pass || actor_has_interactive_capacity))
+            bind_may_share || (!has_epoch_reader && (bind_pass || actor_has_interactive_capacity))
         }
         // This lane has separate global and per-actor bounds: maintenance_cap
         // reserves workers globally, and the boolean prevents same-actor
