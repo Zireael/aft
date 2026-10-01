@@ -807,7 +807,12 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
     let child = configure(&graph, &storage, config_doc(true, with_graph, None));
     let second = wait_callgraph_view(&child, &graph, &storage, Some(&first));
     let manifest = view_dir.join(format!("manifest-{first}.json"));
-    assert!(manifest.is_file());
+    // The child's own maintenance sweeps its view after publishing; the
+    // generation the parent serves must survive that sweep and an explicit one.
+    assert!(
+        manifest.is_file(),
+        "the child's post-publication sweep removed a generation the parent serves"
+    );
     callgraph_view(&graph, &storage)
         .sweep_generations()
         .unwrap();
