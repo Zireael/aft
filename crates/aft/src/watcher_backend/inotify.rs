@@ -178,43 +178,38 @@ impl ProjectWatcher {
                                 EventKind::Create(CreateKind::Folder)
                                     | EventKind::Modify(ModifyKind::Name(RenameMode::To))
                             ) {
-                                let mut added = Vec::new();
+                                let deadline = Instant::now() + NEW_DIRECTORY_SCAN_BUDGET;
+                                let mut scan = NewDirectoryScan::Complete;
                                 for path in &event.paths {
-                                    for directory in
-                                        collect_watch_directories(path, &matcher, &exclusion_paths)
-                                    {
-                                        if watched_directories.insert(directory.clone()) {
-                                            match watch_directory(
+                                    match watch_new_tree(
+                                        path,
+                                        &matcher,
+                                        &exclusion_paths,
+                                        &mut watched_directories,
+                                        &mut new_directory_files,
+                                        NEW_DIRECTORY_FILE_CAP,
+                                        deadline,
+                                        |directory| {
+                                            watch_directory(
                                                 &mut watcher,
-                                                &directory,
+                                                directory,
                                                 &mut watch,
                                                 &counters,
-                                            ) {
-                                                Ok(true) => added.push(directory),
-                                                Ok(false) => {
-                                                    watched_directories.remove(&directory);
-                                                }
-                                                Err(error) => {
-                                                    watched_directories.remove(&directory);
-                                                    let _ = tx.send(Err(error));
-                                                    return;
-                                                }
-                                            }
+                                            )
+                                        },
+                                    ) {
+                                        Ok(NewDirectoryScan::Complete) => {}
+                                        Ok(NewDirectoryScan::Bounded) => {
+                                            scan = NewDirectoryScan::Bounded;
+                                        }
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error));
+                                            return;
                                         }
                                     }
                                 }
                                 thread_count.store(watched_directories.len(), Ordering::Release);
-                                // Enumerate only after the watches are in
-                                // place, so a file written later is either
-                                // found here or reported by the kernel.
-                                if new_directory_files.enumerate(
-                                    &added,
-                                    &matcher,
-                                    &exclusion_paths,
-                                    NEW_DIRECTORY_FILE_CAP,
-                                    Instant::now() + NEW_DIRECTORY_SCAN_BUDGET,
-                                ) == NewDirectoryScan::Bounded
-                                {
+                                if scan == NewDirectoryScan::Bounded {
                                     // Too many files or too slow: ask for a
                                     // rescan rather than report part of them.
                                     let rescan =
@@ -318,43 +313,10 @@ struct PendingNewDirectoryFiles {
 }
 
 impl PendingNewDirectoryFiles {
-    /// Queue every non-ignored file directly inside `directories`. Each newly
-    /// watched directory, nested ones included, is in the list once, so the
-    /// walk does not recurse itself. Stops at `cap` files or at `deadline`.
-    fn enumerate(
-        &mut self,
-        directories: &[PathBuf],
-        matcher: &SharedGitignore,
-        exclusions: &[PathBuf],
-        cap: usize,
-        deadline: Instant,
-    ) -> NewDirectoryScan {
-        let mut found = 0usize;
-        for directory in directories {
-            let Ok(entries) = std::fs::read_dir(directory) else {
-                continue;
-            };
-            for entry in entries {
-                if Instant::now() >= deadline || found >= cap {
-                    return NewDirectoryScan::Bounded;
-                }
-                let Ok(entry) = entry else { continue };
-                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                    continue;
-                }
-                let path = entry.path();
-                if exclusions.iter().any(|excluded| path.starts_with(excluded))
-                    || watcher_path_is_ignored_by_matcher(matcher, &path)
-                {
-                    continue;
-                }
-                found += 1;
-                if self.files.insert(path) && self.since.is_none() {
-                    self.since = Some(Instant::now());
-                }
-            }
+    fn queue(&mut self, path: PathBuf) {
+        if self.files.insert(path) && self.since.is_none() {
+            self.since = Some(Instant::now());
         }
-        NewDirectoryScan::Complete
     }
 
     /// Drop paths the kernel reported itself.
@@ -381,6 +343,76 @@ impl PendingNewDirectoryFiles {
         }
         event
     }
+}
+
+/// Watches `root` and every directory under it that is not watched yet, and
+/// queues the non-ignored files found in them.
+///
+/// Each directory's watch is installed before the directory is read. Then a
+/// child created after the read is reported by the kernel, and one created
+/// before it is found by the read, so nothing falls between the two. Reading
+/// first leaves a gap: a subdirectory created after the read but before its
+/// parent's watch was installed would never be watched at all.
+///
+/// Every new directory is still watched. File listing stops at `cap` files or
+/// at `deadline`, and the result is then `Bounded` so the caller can ask for a
+/// rescan instead of reporting a partial list.
+fn watch_new_tree(
+    root: &Path,
+    matcher: &SharedGitignore,
+    exclusions: &[PathBuf],
+    watched: &mut BTreeSet<PathBuf>,
+    pending: &mut PendingNewDirectoryFiles,
+    cap: usize,
+    deadline: Instant,
+    mut watch: impl FnMut(&Path) -> notify::Result<bool>,
+) -> notify::Result<NewDirectoryScan> {
+    let excluded = |path: &Path| {
+        exclusions.iter().any(|excluded| path.starts_with(excluded))
+            || watcher_path_is_ignored_by_matcher(matcher, path)
+    };
+    let mut stack = vec![std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())];
+    let mut found = 0usize;
+    let mut scan = NewDirectoryScan::Complete;
+    while let Some(directory) = stack.pop() {
+        if excluded(&directory) || !directory.is_dir() || !watched.insert(directory.clone()) {
+            continue;
+        }
+        match watch(&directory) {
+            Ok(true) => {}
+            Ok(false) => {
+                watched.remove(&directory);
+                continue;
+            }
+            Err(error) => {
+                watched.remove(&directory);
+                return Err(error);
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                stack.push(path);
+                continue;
+            }
+            if scan == NewDirectoryScan::Bounded {
+                continue;
+            }
+            if found >= cap || Instant::now() >= deadline {
+                scan = NewDirectoryScan::Bounded;
+                continue;
+            }
+            if excluded(&path) {
+                continue;
+            }
+            found += 1;
+            pending.queue(path);
+        }
+    }
+    Ok(scan)
 }
 
 fn collect_watch_directories(
@@ -602,13 +634,8 @@ mod tests {
         assert_eq!(watcher.watched_directory_count(), 2);
     }
 
-    /// Waits for an event naming each of `expected` and fails if `unexpected`
-    /// is reported first. Returns once every expected path has been seen.
-    fn wait_for_paths(
-        rx: &mpsc::Receiver<notify::Result<Event>>,
-        expected: &[PathBuf],
-        unexpected: &[PathBuf],
-    ) {
+    /// Waits until events have named each of `expected`.
+    fn wait_for_paths(rx: &mpsc::Receiver<notify::Result<Event>>, expected: &[PathBuf]) {
         let mut missing = expected.iter().cloned().collect::<BTreeSet<_>>();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !missing.is_empty() {
@@ -618,10 +645,6 @@ mod tests {
                 .unwrap_or_else(|_| panic!("never reported: {missing:?}"))
                 .expect("backend should remain available");
             for path in &event.paths {
-                assert!(
-                    !unexpected.contains(path),
-                    "ignored file reported: {path:?}"
-                );
                 missing.remove(path);
             }
         }
@@ -629,8 +652,13 @@ mod tests {
 
     /// A directory created and filled straight away, before its watch can be
     /// added, still has its files reported: a checkout or a code generator
-    /// does exactly this. Nested new directories are covered, ignored files
-    /// are not reported.
+    /// does exactly this. Nested new directories are covered.
+    ///
+    /// Ignored files are not checked here. The backend forwards the kernel's
+    /// own events unfiltered (the watcher filter downstream applies the ignore
+    /// rules), so a write that lands after a watch is installed can name an
+    /// ignored file legitimately. That the listing itself skips ignored files
+    /// is checked by `new_directory_listing_skips_ignored_files`.
     #[test]
     fn files_written_into_a_new_directory_before_its_watch_are_reported() {
         let root = tempfile::tempdir().unwrap();
@@ -653,61 +681,153 @@ mod tests {
         std::fs::create_dir_all(fresh.join("nested/deeper")).unwrap();
         let top = fresh.join("top.rs");
         let deep = fresh.join("nested/deeper/deep.rs");
-        let ignored = fresh.join("build.log");
         std::fs::write(&top, "pub fn top() {}\n").unwrap();
         std::fs::write(&deep, "pub fn deep() {}\n").unwrap();
-        std::fs::write(&ignored, "noise\n").unwrap();
+        std::fs::write(fresh.join("build.log"), "noise\n").unwrap();
 
-        wait_for_paths(&rx, &[top, deep], &[ignored]);
+        wait_for_paths(&rx, &[top, deep]);
+    }
+
+    /// Runs [`watch_new_tree`] for `root` with a watch that always succeeds
+    /// and calls `on_watch` with each directory as it is watched.
+    fn walk_new_tree(
+        root: &Path,
+        matcher: &SharedGitignore,
+        exclusions: &[PathBuf],
+        cap: usize,
+        deadline: Instant,
+        mut on_watch: impl FnMut(&Path),
+    ) -> (
+        NewDirectoryScan,
+        BTreeSet<PathBuf>,
+        PendingNewDirectoryFiles,
+    ) {
+        let mut watched = BTreeSet::new();
+        let mut pending = PendingNewDirectoryFiles::default();
+        let scan = watch_new_tree(
+            root,
+            matcher,
+            exclusions,
+            &mut watched,
+            &mut pending,
+            cap,
+            deadline,
+            |directory| {
+                on_watch(directory);
+                Ok(true)
+            },
+        )
+        .expect("walk new tree");
+        (scan, watched, pending)
     }
 
     #[test]
-    fn new_directory_enumeration_stops_at_its_file_cap() {
+    fn new_directory_listing_skips_ignored_files() {
         let root = tempfile::tempdir().unwrap();
-        for index in 0..3 {
-            std::fs::write(root.path().join(format!("{index}.rs")), "").unwrap();
-        }
-        let mut pending = PendingNewDirectoryFiles::default();
-        let scan = pending.enumerate(
-            &[root.path().to_path_buf()],
+        std::fs::write(root.path().join(".gitignore"), "*.log\n").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let mut builder = GitignoreBuilder::new(&canonical_root);
+        builder.add(root.path().join(".gitignore"));
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let fresh = canonical_root.join("fresh");
+        let excluded = fresh.join("excluded");
+        std::fs::create_dir_all(&excluded).unwrap();
+        let kept = fresh.join("kept.rs");
+        std::fs::write(&kept, "").unwrap();
+        std::fs::write(fresh.join("build.log"), "").unwrap();
+        std::fs::write(excluded.join("skipped.rs"), "").unwrap();
+
+        let (scan, watched, mut pending) = walk_new_tree(
+            &fresh,
+            &matcher,
+            std::slice::from_ref(&excluded),
+            NEW_DIRECTORY_FILE_CAP,
+            Instant::now() + Duration::from_secs(5),
+            |_| {},
+        );
+        assert_eq!(scan, NewDirectoryScan::Complete);
+        assert_eq!(watched, BTreeSet::from([fresh]));
+        assert_eq!(pending.take_event().paths, vec![kept]);
+    }
+
+    /// A subdirectory created after its parent's watch is installed but
+    /// before the parent is read must still be watched and listed. Reading
+    /// first and watching afterwards leaves it neither seen by the read nor
+    /// announced by the kernel.
+    #[test]
+    fn new_tree_watches_each_directory_before_reading_it() {
+        let root = tempfile::tempdir().unwrap();
+        let fresh = std::fs::canonicalize(root.path()).unwrap().join("fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        let late_dir = fresh.join("late");
+        let late_file = late_dir.join("late.rs");
+        let (scan, watched, mut pending) = walk_new_tree(
+            &fresh,
             &Arc::new(RwLock::new(None)),
+            &[],
+            NEW_DIRECTORY_FILE_CAP,
+            Instant::now() + Duration::from_secs(5),
+            |directory| {
+                // Lands between this directory's watch and its read.
+                if directory == fresh {
+                    std::fs::create_dir(&late_dir).unwrap();
+                    std::fs::write(&late_file, "").unwrap();
+                }
+            },
+        );
+        assert_eq!(scan, NewDirectoryScan::Complete);
+        assert!(watched.contains(&late_dir), "{watched:?}");
+        assert_eq!(pending.take_event().paths, vec![late_file]);
+    }
+
+    #[test]
+    fn new_directory_listing_stops_at_its_file_cap_and_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(canonical.join("nested")).unwrap();
+        for index in 0..3 {
+            std::fs::write(canonical.join(format!("{index}.rs")), "").unwrap();
+        }
+        let matcher: SharedGitignore = Arc::new(RwLock::new(None));
+        let (scan, watched, _) = walk_new_tree(
+            &canonical,
+            &matcher,
             &[],
             2,
             Instant::now() + Duration::from_secs(5),
+            |_| {},
         );
         assert_eq!(scan, NewDirectoryScan::Bounded);
-        let scan = PendingNewDirectoryFiles::default().enumerate(
-            &[root.path().to_path_buf()],
-            &Arc::new(RwLock::new(None)),
-            &[],
+        assert_eq!(
+            watched.len(),
             2,
-            Instant::now(),
+            "bounded listing still watches every directory"
         );
+        let (scan, _, _) = walk_new_tree(&canonical, &matcher, &[], 2, Instant::now(), |_| {});
         assert_eq!(
             scan,
             NewDirectoryScan::Bounded,
-            "an expired deadline stops the walk"
+            "an expired deadline stops the listing"
         );
     }
 
     #[test]
-    fn kernel_events_replace_enumerated_paths() {
+    fn kernel_events_replace_listed_paths() {
         let root = tempfile::tempdir().unwrap();
-        let reported = root.path().join("reported.rs");
-        let quiet = root.path().join("quiet.rs");
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let reported = canonical.join("reported.rs");
+        let quiet = canonical.join("quiet.rs");
         std::fs::write(&reported, "").unwrap();
         std::fs::write(&quiet, "").unwrap();
-        let mut pending = PendingNewDirectoryFiles::default();
-        assert_eq!(
-            pending.enumerate(
-                &[root.path().to_path_buf()],
-                &Arc::new(RwLock::new(None)),
-                &[],
-                NEW_DIRECTORY_FILE_CAP,
-                Instant::now() + Duration::from_secs(5),
-            ),
-            NewDirectoryScan::Complete
+        let (scan, _, mut pending) = walk_new_tree(
+            &canonical,
+            &Arc::new(RwLock::new(None)),
+            &[],
+            NEW_DIRECTORY_FILE_CAP,
+            Instant::now() + Duration::from_secs(5),
+            |_| {},
         );
+        assert_eq!(scan, NewDirectoryScan::Complete);
         pending.forget(std::slice::from_ref(&reported));
         let event = pending.take_event();
         assert_eq!(event.paths, vec![quiet]);
