@@ -2762,3 +2762,202 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
         "external engine reply must contain exactly one trailer: {rendered}"
     );
 }
+
+const EXTERNAL_IDENTIFIER: &str = "requireCredentialStamps";
+
+/// Source files that each use `EXTERNAL_IDENTIFIER` once; `pool.ts` declares it.
+const EXTERNAL_IDENTIFIER_SOURCES: [(&str, &str); 6] = [
+    (
+        "src/store/pool.ts",
+        "export interface PoolOptions {\n  requireCredentialStamps?: boolean\n}\n",
+    ),
+    (
+        "src/store/mutate.ts",
+        "if (options.requireCredentialStamps) {\n  rejectUnstamped()\n}\n",
+    ),
+    (
+        "src/store/runtime.ts",
+        "const strict = config.requireCredentialStamps ?? false\n",
+    ),
+    (
+        "src/store/schema.ts",
+        "// requireCredentialStamps turns unbound rows into errors\n",
+    ),
+    (
+        "src/store/torn.ts",
+        "export function check(o) { return o.requireCredentialStamps }\n",
+    ),
+    (
+        "src/guard.ts",
+        "assert(opts.requireCredentialStamps === true)\n",
+    ),
+];
+
+/// A Git project whose captured JSON dumps repeat the identifier's sub-tokens
+/// on one giant line without ever spelling it. With `with_identifier` false the
+/// source files hold a placeholder instead, so an index built now predates
+/// the identifier.
+fn external_identifier_project(with_identifier: bool) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("external project");
+    let root = project.path();
+    write_external_identifier_sources(root, with_identifier);
+    fs::write(
+        root.join("src/credentials.ts"),
+        "// credential stamps are required before a row is used\nexport const requireStamps = true\n",
+    )
+    .expect("write related source");
+    let dumps = root.join("research/evidence/dumps");
+    fs::create_dir_all(&dumps).expect("create dumps dir");
+    let body = format!(
+        "{{\"model\":\"m\",\"instructions\":\"{}\"}}",
+        "require credential stamps; the Credential store must require Stamps. ".repeat(3_000)
+    );
+    for index in 0..8 {
+        fs::write(dumps.join(format!("{index:04}-main.body.json")), &body).expect("write dump");
+    }
+    init_git(root);
+    commit_all(root);
+    project
+}
+
+fn write_external_identifier_sources(root: &Path, with_identifier: bool) {
+    for (relative, content) in EXTERNAL_IDENTIFIER_SOURCES {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("source parent")).expect("create source dir");
+        let content = if with_identifier {
+            content.to_string()
+        } else {
+            content.replace(EXTERNAL_IDENTIFIER, "placeholderOption")
+        };
+        fs::write(path, content).expect("write source");
+    }
+}
+
+fn external_identifier_request(root: &Path) -> RawRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "aft-search-contract",
+        "command": "semantic_search",
+        "query": EXTERNAL_IDENTIFIER,
+        "top_k": 25,
+        "path": root.display().to_string(),
+    }))
+    .expect("build external identifier request")
+}
+
+fn result_suffixes(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("result file")
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+fn assert_every_source_use_first_and_no_dump(response: &Value) {
+    let files = result_suffixes(response);
+    assert!(
+        files.len() >= 6,
+        "every source use must come back: {response:#?}"
+    );
+    assert!(
+        files[0].ends_with("src/store/pool.ts"),
+        "the declaring file leads: {files:#?}"
+    );
+    for (relative, _) in EXTERNAL_IDENTIFIER_SOURCES {
+        assert!(
+            files[..6].iter().any(|file| file.ends_with(relative)),
+            "{relative} must be among the first six results: {files:#?}"
+        );
+    }
+    assert!(
+        !files
+            .iter()
+            .any(|file| file.contains("/dumps/") || file.ends_with(".json")),
+        "no dump file may pad an identifier query: {files:#?}"
+    );
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .all(|result| result["source"] == "exact"),
+        "only exact occurrences are listed: {response:#?}"
+    );
+}
+
+#[test]
+fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let external = external_identifier_project(true);
+    let session = tempfile::tempdir().expect("session project");
+    let storage = tempfile::tempdir().expect("storage");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &external_identifier_request(external.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["semantic_status"], "external_unindexed");
+    assert_every_source_use_first_and_no_dump(&response);
+    assert_eq!(response["result_count"], 6);
+    assert_eq!(response["complete"], true);
+    assert_eq!(response["exact_sweep"]["complete"], true);
+    assert_eq!(response["exact_sweep"]["used_index"], false);
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("exact pass: complete; checked all"),
+        "a finished walk says it covered the project: {text}"
+    );
+    assert!(
+        !text.contains("use grep for an exhaustive check"),
+        "a finished walk does not send the agent to grep: {text}"
+    );
+    assert!(
+        response.get("results_list_envelope").is_none(),
+        "a complete, uncut list carries no trailer: {response:#?}"
+    );
+}
+
+#[test]
+fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no_dump() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let external = external_identifier_project(false);
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external.path(), storage.path());
+    // The identifier arrives after the project's own index was written, as it
+    // does when nobody has opened a session in that project since.
+    std::thread::sleep(Duration::from_millis(20));
+    write_external_identifier_sources(external.path(), true);
+    let session = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &external_identifier_request(external.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["borrowed"], true);
+    assert_every_source_use_first_and_no_dump(&response);
+    assert_eq!(response["result_count"], 6);
+    assert_eq!(response["exact_sweep"]["used_index"], true);
+    assert_eq!(response["exact_sweep"]["complete"], true);
+    assert!(
+        response["exact_sweep"]["index_answered_files"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "unchanged files are answered by the project's own index: {response:#?}"
+    );
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("this project's own AFT index answered"),
+        "the reply says when the project's own index was used: {text}"
+    );
+}

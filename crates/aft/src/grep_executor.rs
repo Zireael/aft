@@ -610,7 +610,7 @@ pub fn merge_grep_results(
     }
 }
 
-fn fallback_project_walk_builder(
+pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {

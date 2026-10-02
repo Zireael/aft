@@ -6,6 +6,7 @@ pub mod data_file;
 pub mod evidence_descriptor;
 pub mod exact_lane;
 pub mod extensions;
+mod external_exact;
 pub mod generation_token;
 pub mod lexical_lane;
 pub mod memo;
@@ -2154,6 +2155,45 @@ fn handle_external_bounded_lexical_fallback(
     degradation: Option<ReadOnlyDegradation>,
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
+    let display_root = absolute_display_root(external_root);
+    // An identifier is answered by every line that contains it, searched
+    // source first, rather than by a substring scan in modification-time order.
+    if let Some(terms) = external_exact::IdentifierTerms::from_query(&params.query) {
+        let outcome = external_exact::sweep(
+            external_root,
+            &terms,
+            None,
+            params.include_tests,
+            Instant::now() + external_exact::SWEEP_BUDGET,
+        );
+        if search_cancellation_requested() {
+            return cancelled_search_response(req);
+        }
+        let reply = external_exact::reply(
+            &outcome,
+            &terms,
+            external_root,
+            &display_root,
+            params.offset,
+            top_k,
+        );
+        return external_fallback_response(
+            req,
+            params,
+            shape,
+            external_root,
+            degradation,
+            ExternalFallbackBody {
+                results: reply.results,
+                text: reply.text,
+                walk_truncated: !outcome.fully_covered(),
+                more_available: reply.more_available,
+                engine_capped: false,
+                envelope: reply.envelope,
+                exact_sweep: Some(reply.summary),
+            },
+        );
+    }
     let literal = true;
     let compiled = match pattern_compile::compile(
         &params.query,
@@ -2206,8 +2246,52 @@ fn handle_external_bounded_lexical_fallback(
         .iter()
         .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
-    let display_root = absolute_display_root(external_root);
-    let mut text = format_grep_search_text(&result, &display_root, interpreted_as);
+    let text = format_grep_search_text(&result, &display_root, interpreted_as);
+    let more_available =
+        result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
+    let envelope =
+        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
+    external_fallback_response(
+        req,
+        params,
+        shape,
+        external_root,
+        degradation,
+        ExternalFallbackBody {
+            results: result_values,
+            text,
+            walk_truncated: result.walk_truncated,
+            more_available,
+            engine_capped: result.engine_capped,
+            envelope: Some(envelope),
+            exact_sweep: None,
+        },
+    )
+}
+
+/// Results of an external search that had no usable borrowed index.
+struct ExternalFallbackBody {
+    results: Vec<serde_json::Value>,
+    text: String,
+    /// The scan stopped before covering the project.
+    walk_truncated: bool,
+    more_available: bool,
+    engine_capped: bool,
+    envelope: Option<ListEnvelope>,
+    /// Coverage record of an identifier's exact-occurrence sweep.
+    exact_sweep: Option<serde_json::Value>,
+}
+
+fn external_fallback_response(
+    req: &RawRequest,
+    params: &SemanticSearchParams,
+    shape: &QueryShape,
+    external_root: &Path,
+    degradation: Option<ReadOnlyDegradation>,
+    body: ExternalFallbackBody,
+) -> Response {
+    let borrow_metadata = ExternalBorrowMetadata::default();
+    let mut text = body.text;
     if degradation.is_some() {
         text.push_str("\n\n");
         text.push_str(BORROWED_SEARCH_LOAD_FOOTER);
@@ -2222,32 +2306,33 @@ fn handle_external_bounded_lexical_fallback(
             external_root.display()
         ));
     }
-    if result.walk_truncated {
+    if body.walk_truncated {
         warnings.push(
             "Lexical scan stopped early (file-count or time budget reached); results may be incomplete.".to_string(),
         );
     }
 
-    let more_available =
-        result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
     let mut extras = external_response_extras(external_root, &borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
-    let envelope =
-        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
-    crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
+    if let Some(envelope) = &body.envelope {
+        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
+    }
     if let Some(degradation) = degradation {
         extras.insert(
             "borrowed_index_degraded_reason".to_string(),
             serde_json::json!(degradation.reason),
         );
     }
+    if let Some(summary) = body.exact_sweep {
+        extras.insert("exact_sweep".to_string(), summary);
+    }
     search_response(
         req,
         SearchResponseParts {
             query: &params.query,
-            interpreted_as,
+            interpreted_as: "literal",
             query_kind: query_kind_label(shape.kind),
             semantic_status: if degradation.is_some() {
                 "external_borrowed_degraded"
@@ -2255,11 +2340,11 @@ fn handle_external_bounded_lexical_fallback(
                 "external_unindexed"
             },
             status: "ready",
-            complete: degradation.is_none() && !result.walk_truncated,
+            complete: degradation.is_none() && !body.walk_truncated,
             text,
-            results: result_values,
-            more_available,
-            engine_capped: result.engine_capped,
+            results: body.results,
+            more_available: body.more_available,
+            engine_capped: body.engine_capped,
             fully_degraded: true,
             warnings,
             extras,
@@ -2499,6 +2584,73 @@ fn handle_external_semantic_or_hybrid_search(
             None
         }
     };
+
+    // An identifier is answered by every line that contains it. The borrowed
+    // index can predate the files on disk, so it only rules out files whose
+    // size and modification time still match it; the lexical lanes would pad
+    // the page with files that merely share the identifier's sub-tokens.
+    if let Some(terms) = external_exact::IdentifierTerms::from_query(&params.query) {
+        let usable_index =
+            (search_index.is_ready() && search_index.file_count() > 0).then_some(search_index);
+        let outcome = external_exact::sweep(
+            &external_root,
+            &terms,
+            usable_index,
+            params.include_tests,
+            Instant::now() + external_exact::SWEEP_BUDGET,
+        );
+        if search_cancellation_requested() {
+            return cancelled_search_response(req);
+        }
+        let reply = external_exact::reply(
+            &outcome,
+            &terms,
+            &external_root,
+            &absolute_display_root(&external_root),
+            params.offset,
+            page_request.top_k(),
+        );
+        let mut extras = external_response_extras(&external_root, &borrow_metadata)
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(envelope) = &reply.envelope {
+            crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, envelope);
+        }
+        extras.insert("exact_sweep".to_string(), reply.summary);
+        extras.insert(
+            "lexical_only_fallback".to_string(),
+            serde_json::json!(semantic_status != "ready"),
+        );
+        extras.insert(
+            "semantic_unavailable".to_string(),
+            serde_json::json!(semantic_status != "ready"),
+        );
+        return search_response(
+            req,
+            SearchResponseParts {
+                query: &params.query,
+                interpreted_as: if semantic_status == "ready" {
+                    interpreted_as_label(mode)
+                } else {
+                    "lexical"
+                },
+                query_kind: query_kind_label(shape.kind),
+                semantic_status,
+                status: "ready",
+                complete: semantic_status == "ready"
+                    && !borrow_metadata.stale_cli_snapshot()
+                    && outcome.fully_covered(),
+                text: reply.text,
+                results: reply.results,
+                more_available: reply.more_available,
+                engine_capped: false,
+                fully_degraded: false,
+                warnings,
+                extras,
+            },
+        );
+    }
 
     let mut semantic_more_available = false;
     let mut semantic_results = if engine_plan.contains(SearchLaneKind::Semantic) {
