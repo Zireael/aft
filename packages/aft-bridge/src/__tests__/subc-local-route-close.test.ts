@@ -244,8 +244,9 @@ async function waitFor(condition: () => boolean, what: string): Promise<void> {
 
 /**
  * The agent-facing outcome of an in-flight bash call cut off by a local close:
- * no host fallback, the unknown-outcome guidance, and none of the guidance that
- * would invite a re-run or blame a module restart.
+ * no host fallback, SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION (outcome unknown),
+ * and neither BASH_TRANSPORT_DISPOSITION (which says to re-run) nor
+ * SUBC_MODULE_RESTART_DISPOSITION (which blames a daemon module restart).
  */
 function expectUnknownOutcomeForBash(error: unknown, reason: string): void {
   expect(error).toBeInstanceOf(SubcRouteClosedMidCallError);
@@ -255,7 +256,7 @@ function expectUnknownOutcomeForBash(error: unknown, reason: string): void {
   expect(midCall.message).toContain(
     `the command may have run; the route closed mid-call: ${reason}`,
   );
-  // The real client's own rejection is what the pool translated.
+  // The pool keeps subc-client's own closeRoute rejection as the cause.
   expect(midCall.cause).toBeInstanceOf(SubcError);
   expect((midCall.cause as SubcError).message).toBe("route closed by closeRoute");
 
@@ -381,9 +382,7 @@ describe("a route the plugin closes under an in-flight call (real SubcClient, fa
       await waitFor(() => daemon.heldRouteOpens === 1, "the route.open to reach the daemon");
 
       const closing =
-        teardown === "shutdown"
-          ? pool.shutdown()
-          : pool.closeSession(TEST_PROJECT_ROOT, "opening");
+        teardown === "shutdown" ? pool.shutdown() : pool.closeSession(TEST_PROJECT_ROOT, "opening");
       daemon.releaseRouteOpens();
       await closing;
 

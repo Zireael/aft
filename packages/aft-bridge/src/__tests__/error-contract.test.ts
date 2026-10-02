@@ -323,10 +323,11 @@ describe("adaptToolError", () => {
   });
 
   test("a local closeRoute with the route_closed code is NOT a GOODBYE, but its outcome is unknown", () => {
-    // Same code, different mechanism: closeRoute is the plugin closing its own
-    // route, so the module-restart wording would be wrong. subc-client only
-    // raises this rejection for a request already pending (and written) on the
-    // route, so it still carries the unknown-outcome guidance of its own.
+    // The route_closed code has two sources: a daemon GOODBYE, and closeRoute,
+    // which is the plugin closing its own route, so the module-restart wording
+    // would be wrong here. subc-client raises the closeRoute rejection only for
+    // a request already pending (and written) on the route, so it carries its
+    // own unknown-outcome guidance instead.
     const local = new SubcError("route closed by closeRoute", "route_closed");
 
     const adapted = adaptToolError("write", local);

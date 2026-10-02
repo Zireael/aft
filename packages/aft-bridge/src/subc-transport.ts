@@ -973,8 +973,10 @@ interface RouteEntry {
   /** Tombstone: a teardown raced the open — the resolving open must self-close. */
   closed: boolean;
   /**
-   * Why the plugin closed this route, recorded before the close so a request
-   * still in flight on it can report the reason with its unknown outcome.
+   * Set when a call on this session gives up on the shared route after its own
+   * failure or cancellation and closes it, while other calls on the session may
+   * still have requests in flight on it. A session teardown leaves it null,
+   * because the session record's teardown reason already names that close.
    */
   closedBy: SubcLocalRouteCloseReason | null;
 }
@@ -1774,7 +1776,6 @@ export class SubcTransportPool implements AftTransportPool {
     if (detached.bgSub) cleanup.push(detached.bgSub.stop());
     const routeEntry = detached.routeEntry;
     const route = routeEntry?.handle;
-    if (routeEntry) routeEntry.closedBy = teardownCloseReason(detached.record.teardownReason);
     if (routeEntry && route !== null && route !== undefined) {
       try {
         cleanup.push(
