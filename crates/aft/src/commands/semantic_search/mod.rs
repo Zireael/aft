@@ -797,11 +797,30 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         external_root.as_deref().unwrap_or(&project_root),
         readiness_source,
     );
-    let readiness = extensions.sample_readiness(&root);
+    let mut readiness = extensions.sample_readiness(&root);
     if readiness.cancelled() {
         return cancelled_search_response(req);
     }
     let mut plan = extensions.plan(&shape, &facts, &readiness);
+    // Admission skips the first-search wait when the semantic index is ready,
+    // but a query that needs exact evidence still depends on the trigram
+    // index. Wait for a loading trigram index here, within the same budget,
+    // and plan again from a fresh sample. Waiting later, at ranking, is not
+    // enough: if the query embedding then fails, the lexical fallback is
+    // chosen from this plan and would scan files instead of using the index
+    // that finished loading meanwhile.
+    if readiness.semantic_index && !readiness.lexical_index && plan_needs_exact_index(&plan) {
+        if let (None, Some(source)) = (root.fixed_readiness(), root.source()) {
+            if source.bounded_first_search_wait() == extensions::ReadinessWait::Cancelled {
+                return cancelled_search_response(req);
+            }
+            readiness = extensions.sample_readiness(&root);
+            if readiness.cancelled() {
+                return cancelled_search_response(req);
+            }
+            plan = extensions.plan(&shape, &facts, &readiness);
+        }
+    }
     if plan.contains(SearchLaneKind::Exact) {
         plan.exact_input = Some(crate::search_b2::router::exact_input(
             &raw_query, shape, &facts,
@@ -2724,6 +2743,14 @@ fn public_query(req: &RawRequest) -> &str {
         .unwrap_or_default()
 }
 
+/// Whether ranking `plan` verifies exact evidence against the trigram index,
+/// so a trigram index that is still loading is worth waiting for.
+fn plan_needs_exact_index(plan: &extensions::LanePlan<'_>) -> bool {
+    plan.contains(SearchLaneKind::Exact)
+        || plan.shape == SearchShape::Identifier
+        || plan.query_facts.has_identifier_token
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -2749,11 +2776,7 @@ fn run_engine_ranking(
     // finishes loading. Wait up to the first-search budget before exact
     // verification falls back to filesystem search, without holding the search
     // index's read lock.
-    if borrowed_index.is_none()
-        && (plan.contains(SearchLaneKind::Exact)
-            || plan.shape == SearchShape::Identifier
-            || plan.query_facts.has_identifier_token)
-    {
+    if borrowed_index.is_none() && plan_needs_exact_index(plan) {
         use extensions::ReadinessSource as _;
         if (RuntimeReadinessSource { ctx }).bounded_first_search_wait()
             == extensions::ReadinessWait::Cancelled
@@ -7836,6 +7859,57 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("exact pass: bounded"));
+    }
+
+    /// The same wait when the query embedding then fails fast, as it does on a
+    /// machine without ONNX Runtime or with an unreachable backend. The
+    /// lexical fallback is chosen from the admission plan, so the trigram load
+    /// must be awaited before that plan is made, not only at ranking.
+    #[test]
+    fn exact_search_waits_for_loading_trigram_when_query_embedding_fails() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let project = exact_lane::tests::large_identifier_project();
+        let ctx = test_context(project.path());
+        ctx.set_cache_role(true, None);
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(format!("http://127.0.0.1:{port}/v1"));
+        });
+        install_ready_semantic_lane(&ctx, project.path());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+        let root = project.path().to_path_buf();
+        let publisher = std::thread::spawn(move || {
+            let index = SearchIndex::build(&root);
+            // Publish well after the request has embedded and failed.
+            std::thread::sleep(Duration::from_millis(400));
+            tx.send(index).unwrap();
+        });
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_secs(5), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("isPrefixBoundThinkingModel", 50),
+                    &ctx,
+                ))
+            });
+        publisher.join().unwrap();
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        assert_eq!(response["success"], true, "{response}");
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(SearchIndex::is_ready),
+            "exact search must drain the loading trigram index before choosing the lexical fallback"
+        );
+        assert_eq!(
+            response["results"].as_array().unwrap().len(),
+            47,
+            "{response}"
+        );
     }
 
     #[test]
