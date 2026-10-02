@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "borrowed-callgraph-coverage",
+    "inspect-truth-harness",
+    "windows-npm-host-detection"
+  ],
+  "note": "No ranking-fence file is touched: a borrowed-callgraph answer now also searches the files the borrowed graph does not reflect; an inspect accuracy harness and baseline report under benchmarks/inspect-truth/; Windows npm launcher detection for OpenCode 2 in aft-cli (#391)."
+}
