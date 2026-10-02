@@ -654,21 +654,25 @@ pub struct LspManager {
     /// drive the fake server's behavioral variants (`AFT_FAKE_LSP_PULL=1`,
     /// `AFT_FAKE_LSP_WORKSPACE=1`, etc.). Production code does not set this.
     extra_env: HashMap<String, String>,
-    /// Per-(kind,root) cache of spawn failures. Once a server fails to spawn
-    /// for a workspace root, we remember why and skip subsequent attempts for
-    /// the lifetime of this AFT process. Without this, every file open or
+    /// Per-(kind,root) cache of start failures. Once a server fails to start
+    /// for a workspace root, later requests report the remembered failure
+    /// instead of starting it again. Without this, every file open or
     /// didChange retries `spawn_server` and logs a fresh ERROR — visible as
     /// repeated `failed to spawn TypeScript Language Server: Could not find a
     /// valid TypeScript installation` lines per edit.
     ///
-    /// Entries are NEVER evicted automatically. The expected recovery path is
-    /// for the user to fix their environment (install the missing binary or
-    /// add a `tsconfig.json` / `package.json` with the right dependency) and
-    /// restart OpenCode/Pi, which spawns a fresh `aft` process with an empty
-    /// cache. We deliberately don't auto-retry on file events: the failure
-    /// modes we track here (binary not installed, init handshake failure)
-    /// don't fix themselves at runtime.
-    failed_spawns: HashMap<ServerKey, ServerAttemptResult>,
+    /// A permanent failure (binary not installed, a configuration error the
+    /// server names) is replayed until the search paths or the configuration
+    /// change; see [`Self::clear_failed_spawns`]. A transient one (a handshake
+    /// past its time budget, an unexplained crash) is replayed only until its
+    /// backoff window passes; the next request then starts the server again.
+    /// A server that is slow to start once, such as Eclipse JDTLS indexing a
+    /// large repository, would otherwise stay unavailable until AFT restarts.
+    failed_spawns: HashMap<ServerKey, FailedSpawn>,
+    /// The backoff that followed the latest transient start failure of each
+    /// server and root. Kept across retries so repeated failures wait longer;
+    /// removed when the server starts or fails permanently.
+    transient_backoff: HashMap<ServerKey, Duration>,
     /// Server/root pairs for which we already logged that watched-file
     /// notifications are skipped because the capability is absent.
     watched_file_skip_logged: HashSet<ServerKey>,
@@ -722,6 +726,8 @@ pub struct LspManager {
     /// or the watcher sees it change, because they then describe an older
     /// state of the file.
     latest_pull_for_rust: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
+    /// Times the retry window of transient start failures in `failed_spawns`.
+    retry_clock: RetryClock,
 }
 /// How many server-exit log lines `LspManager` keeps for inspection.
 const RECENT_EXIT_LOG_LINES: usize = 16;
@@ -734,6 +740,118 @@ const INITIALIZE_EXIT_WAIT: Duration = Duration::from_millis(250);
 /// Longest failure reason, in bytes, that inspect shows when a language
 /// server (a diagnostics producer) could not start.
 const PRODUCER_FAILURE_REASON_BYTES: usize = 500;
+
+/// Monotonic time source that decides when a server whose start failed for
+/// a transient reason may be started again. Production reads
+/// `Instant::now()`; tests substitute a clock they can move forward so a
+/// retry window can pass without the test sleeping through it.
+#[derive(Clone)]
+pub struct RetryClock(Arc<dyn Fn() -> Instant + Send + Sync>);
+
+impl RetryClock {
+    /// The real monotonic clock.
+    pub fn system() -> Self {
+        Self(Arc::new(Instant::now))
+    }
+
+    /// A clock that reports whatever `now` returns.
+    pub fn from_fn(now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub fn now(&self) -> Instant {
+        (self.0)()
+    }
+}
+
+impl Default for RetryClock {
+    fn default() -> Self {
+        Self::system()
+    }
+}
+
+/// How long a server whose start failed for a transient reason waits before
+/// the next request may start it again. Each further transient failure of the
+/// same server and root doubles the wait, up to
+/// [`TRANSIENT_RETRY_MAX_BACKOFF`]; a successful start resets it.
+const TRANSIENT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest wait between attempts to start a server whose start keeps
+/// failing for transient reasons.
+const TRANSIENT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a failed server start can succeed later without anything in the
+/// environment changing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureDurability {
+    /// Only a change to the environment fixes it: a binary that is missing or
+    /// cannot be executed, a server that exited naming a configuration error
+    /// AFT recognises, or a server AFT's own checks refused. Replayed until
+    /// the search paths or the configuration change.
+    Permanent,
+    /// May pass on a later attempt: a handshake that ran past its time
+    /// budget (the server is then killed), a server that died without naming
+    /// a recognised configuration error, or an I/O error on its pipes.
+    /// Retried once a backoff window has passed.
+    Transient,
+}
+
+/// A server start that produced no client.
+#[derive(Debug)]
+struct StartFailure {
+    error: LspError,
+    durability: FailureDurability,
+}
+
+/// A failed start remembered for one server and workspace root.
+#[derive(Clone, Debug)]
+struct FailedSpawn {
+    result: ServerAttemptResult,
+    /// When a transient failure may be retried; `None` for a permanent one.
+    retry_at: Option<Instant>,
+}
+
+impl FailedSpawn {
+    /// The result to report for this failure at `now`. A transient failure
+    /// says so, and says when the next start attempt will be made, so it does
+    /// not read as "this server cannot run here". The note leads the reason
+    /// because inspect shows only the reason's first line, cut to a length.
+    fn reported_result(&self, now: Instant) -> ServerAttemptResult {
+        let (Some(retry_at), ServerAttemptResult::SpawnFailed { binary, reason }) =
+            (self.retry_at, &self.result)
+        else {
+            return self.result.clone();
+        };
+        let remaining = retry_at.saturating_duration_since(now);
+        let when = if remaining.is_zero() {
+            "retrying now".to_string()
+        } else {
+            format!("will retry after {}", format_retry_delay(remaining))
+        };
+        ServerAttemptResult::SpawnFailed {
+            binary: binary.clone(),
+            reason: format!("transient failure, {when}: {reason}"),
+        }
+    }
+}
+
+/// The backoff that follows a transient failure, given the one that followed
+/// the previous transient failure of the same server and root, if any.
+fn next_transient_backoff(previous: Option<Duration>) -> Duration {
+    previous.map_or(TRANSIENT_RETRY_INITIAL_BACKOFF, |previous| {
+        previous.saturating_mul(2).min(TRANSIENT_RETRY_MAX_BACKOFF)
+    })
+}
+
+/// A retry delay in whole seconds, rounded up so a pending retry never reads
+/// as "after 0s": `45s`, `2m`, `4m 30s`.
+fn format_retry_delay(delay: Duration) -> String {
+    let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
+    match (seconds / 60, seconds % 60) {
+        (0, seconds) => format!("{seconds}s"),
+        (minutes, 0) => format!("{minutes}m"),
+        (minutes, seconds) => format!("{minutes}m {seconds}s"),
+    }
+}
 
 impl LspManager {
     pub fn new() -> Self {
@@ -751,6 +869,7 @@ impl LspManager {
             pushed_search_paths: None,
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
+            transient_backoff: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
             watcher_rust_reloads: HashMap::new(),
             #[cfg(windows)]
@@ -764,7 +883,77 @@ impl LspManager {
             inspect_closed_documents: HashSet::new(),
             latest_push_for_pull_servers: HashMap::new(),
             latest_pull_for_rust: HashMap::new(),
+            retry_clock: RetryClock::system(),
         }
+    }
+
+    /// For testing: replace the clock that times retries of servers whose
+    /// start failed for a transient reason.
+    #[doc(hidden)]
+    pub fn set_retry_clock(&mut self, clock: RetryClock) {
+        self.retry_clock = clock;
+    }
+
+    /// Remember a failed start of `key` and return the result to report for
+    /// it now. A transient failure opens a backoff window during which later
+    /// requests replay it instead of starting the server.
+    fn record_failed_spawn(
+        &mut self,
+        key: &ServerKey,
+        result: ServerAttemptResult,
+        durability: FailureDurability,
+    ) -> ServerAttemptResult {
+        let now = self.retry_clock.now();
+        let retry_at = match durability {
+            FailureDurability::Permanent => {
+                self.transient_backoff.remove(key);
+                None
+            }
+            FailureDurability::Transient => {
+                let backoff = next_transient_backoff(self.transient_backoff.get(key).copied());
+                self.transient_backoff.insert(key.clone(), backoff);
+                slog_info!(
+                    "lsp start failed transiently server={} root={} retry_after={}",
+                    key.kind.id_str(),
+                    key.root.display(),
+                    format_retry_delay(backoff)
+                );
+                Some(now + backoff)
+            }
+        };
+        let failed = FailedSpawn { result, retry_at };
+        let reported = failed.reported_result(now);
+        self.failed_spawns.insert(key.clone(), failed);
+        reported
+    }
+
+    /// The remembered failure to report instead of starting `key`, or `None`
+    /// when the server should be started: nothing failed, or a transient
+    /// failure's backoff window has passed.
+    fn failure_to_replay(&self, key: &ServerKey) -> Option<ServerAttemptResult> {
+        let failed = self.failed_spawns.get(key)?;
+        let now = self.retry_clock.now();
+        if failed.retry_at.is_some_and(|retry_at| now >= retry_at) {
+            return None;
+        }
+        Some(failed.reported_result(now))
+    }
+
+    /// Log that a start about to run retries a transient failure.
+    fn log_transient_retry(&self, key: &ServerKey) {
+        if self.failed_spawns.contains_key(key) {
+            slog_info!(
+                "lsp start retry server={} root={} reason=transient failure backoff elapsed; retrying now",
+                key.kind.id_str(),
+                key.root.display()
+            );
+        }
+    }
+
+    /// Forget the failure history of a server that has now started.
+    fn note_start_succeeded(&mut self, key: &ServerKey) {
+        self.failed_spawns.remove(key);
+        self.transient_backoff.remove(key);
     }
 
     /// The most recent server-exit log lines, oldest first.
@@ -877,10 +1066,10 @@ impl LspManager {
         let mut candidates = Vec::new();
         let mut producer_failures = Vec::new();
         for candidate in walk.candidates {
-            if let Some(result) = self.failed_spawns.get(&candidate.key) {
+            if let Some(result) = self.failure_to_replay(&candidate.key) {
                 producer_failures.push(ApplicableServerFailure {
                     server_key: candidate.key,
-                    result: result.clone(),
+                    result,
                 });
                 continue;
             }
@@ -991,6 +1180,7 @@ impl LspManager {
                 outcomes.successful.push(candidate.key.clone());
                 continue;
             }
+            self.log_transient_retry(&candidate.key);
             match self.spawn_server_with_timeout(
                 &candidate.definition,
                 &candidate.key.root,
@@ -999,22 +1189,23 @@ impl LspManager {
                 initialize_timeout,
             ) {
                 Ok(client) => {
+                    self.note_start_succeeded(&candidate.key);
                     self.clients.insert(candidate.key.clone(), client);
                     self.server_binaries
                         .insert(candidate.key.clone(), candidate.definition.binary.clone());
                     self.documents.entry(candidate.key.clone()).or_default();
                     outcomes.successful.push(candidate.key.clone());
                 }
-                Err(error) => {
+                Err(failure) => {
                     if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                         // A request-owned timeout says nothing durable about the
                         // producer; a later call with a fresh budget may retry it.
                         outcomes.deadline_exceeded = Some(candidate.key.clone());
                         break;
                     }
-                    let result = classify_spawn_error(&candidate.definition.binary, &error);
-                    self.failed_spawns
-                        .insert(candidate.key.clone(), result.clone());
+                    let result = classify_spawn_error(&candidate.definition.binary, &failure.error);
+                    let result =
+                        self.record_failed_spawn(&candidate.key, result, failure.durability);
                     outcomes.failures.push(ApplicableServerFailure {
                         server_key: candidate.key.clone(),
                         result,
@@ -1047,10 +1238,10 @@ impl LspManager {
             return Some(StartNext::Wait(Arc::clone(&reservation.signal)));
         }
         if after_wait {
-            if let Some(result) = self.failed_spawns.get(key) {
+            if let Some(result) = self.failure_to_replay(key) {
                 outcomes.failures.push(ApplicableServerFailure {
                     server_key: key.clone(),
-                    result: result.clone(),
+                    result,
                 });
                 return None;
             }
@@ -1062,6 +1253,7 @@ impl LspManager {
             config,
         ) {
             Ok(prepared) => {
+                self.log_transient_retry(key);
                 self.starting.insert(
                     key.clone(),
                     StartReservation {
@@ -1073,7 +1265,7 @@ impl LspManager {
                 Some(StartNext::Spawn(prepared))
             }
             Err(error) => {
-                self.record_start_error(candidate, &error, deadline, outcomes);
+                self.record_start_error(candidate, &prepare_failure(error), deadline, outcomes);
                 None
             }
         }
@@ -1123,6 +1315,7 @@ impl LspManager {
                 });
             }
             Ok(client) => {
+                self.note_start_succeeded(key);
                 self.clients.insert(key.clone(), client);
                 self.server_binaries
                     .insert(key.clone(), candidate.definition.binary.clone());
@@ -1130,11 +1323,11 @@ impl LspManager {
                 outcomes.successful.push(key.clone());
             }
             Err(failure) => {
-                let error = self.absorb_spawn_failure(failure);
+                let failure = self.absorb_spawn_failure(failure);
                 if self.clients.contains_key(key) {
                     outcomes.successful.push(key.clone());
                 } else {
-                    self.record_start_error(candidate, &error, deadline, outcomes);
+                    self.record_start_error(candidate, &failure, deadline, outcomes);
                 }
             }
         }
@@ -1159,7 +1352,7 @@ impl LspManager {
     fn record_start_error(
         &mut self,
         candidate: &ApplicableServerCandidate,
-        error: &LspError,
+        failure: &StartFailure,
         deadline: Instant,
         outcomes: &mut ApplicableServerStartOutcomes,
     ) {
@@ -1167,9 +1360,8 @@ impl LspManager {
             outcomes.deadline_exceeded = Some(candidate.key.clone());
             return;
         }
-        let result = classify_spawn_error(&candidate.definition.binary, error);
-        self.failed_spawns
-            .insert(candidate.key.clone(), result.clone());
+        let result = classify_spawn_error(&candidate.definition.binary, &failure.error);
+        let result = self.record_failed_spawn(&candidate.key, result, failure.durability);
         outcomes.failures.push(ApplicableServerFailure {
             server_key: candidate.key.clone(),
             result,
@@ -1196,9 +1388,9 @@ impl LspManager {
     }
 
     /// Return whether a navigation request would need to initialize an applicable
-    /// server. Missing binaries, inapplicable root markers, and cached spawn
-    /// failures stay on the synchronous path because they cannot incur a
-    /// handshake wait.
+    /// server. Missing binaries, inapplicable root markers, and cached start
+    /// failures not yet due for a retry stay on the synchronous path because
+    /// they cannot incur a handshake wait.
     pub fn navigation_requires_deferred_execution(
         &self,
         file_path: &Path,
@@ -1217,7 +1409,7 @@ impl LspManager {
                 if let Some(client) = self.clients.get(&key) {
                     return client.state() != ServerState::Ready;
                 }
-                !self.failed_spawns.contains_key(&key)
+                self.failure_to_replay(&key).is_none()
                     && self.resolve_binary(&definition, &key.root, config).is_ok()
             })
     }
@@ -1253,17 +1445,19 @@ impl LspManager {
             };
 
             if !self.clients.contains_key(&key) {
-                // If we already tried and failed to spawn this server for this
-                // root, return the cached classification without retrying or
-                // re-logging. This prevents per-edit ERROR spam when the user's
-                // environment is missing a dependency the LSP needs (the
-                // typescript-language-server "Could not find a valid TypeScript
-                // installation" case is the canonical example).
-                if let Some(cached) = self.failed_spawns.get(&key) {
+                // If this server already failed to start for this root,
+                // return the remembered failure without retrying or
+                // re-logging. This prevents per-edit ERROR spam when the
+                // user's environment is missing a dependency the LSP needs
+                // (the typescript-language-server "Could not find a valid
+                // TypeScript installation" case is the canonical example).
+                // A transient failure is retried once its backoff window has
+                // passed.
+                if let Some(cached) = self.failure_to_replay(&key) {
                     outcomes.attempts.push(ServerAttempt {
                         server_id,
                         server_name,
-                        result: cached.clone(),
+                        result: cached,
                     });
                     continue;
                 }
@@ -1273,20 +1467,22 @@ impl LspManager {
                 // before spawning a replacement, otherwise leaked servers
                 // accumulate on a live worktree.
                 self.reap_unreferenced_children_for(&key);
+                self.log_transient_retry(&key);
 
                 match self.spawn_server(&def, &key.root, file_path, config) {
                     Ok(client) => {
+                        self.note_start_succeeded(&key);
                         self.clients.insert(key.clone(), client);
                         self.server_binaries.insert(key.clone(), def.binary.clone());
                         self.documents.entry(key.clone()).or_default();
                     }
-                    Err(err) => {
-                        slog_error!("failed to spawn {}: {}", def.name, err);
-                        let result = classify_spawn_error(&def.binary, &err);
+                    Err(failure) => {
+                        slog_error!("failed to spawn {}: {}", def.name, failure.error);
+                        let result = classify_spawn_error(&def.binary, &failure.error);
                         // Remember the failure so subsequent file events skip
                         // this (kind, root) pair instead of producing a fresh
                         // spawn attempt + ERROR log per request.
-                        self.failed_spawns.insert(key.clone(), result.clone());
+                        let result = self.record_failed_spawn(&key, result, failure.durability);
                         outcomes.attempts.push(ServerAttempt {
                             server_id,
                             server_name,
@@ -3245,14 +3441,14 @@ impl LspManager {
             client.exit_report(client.phase(), Some(status), false)
         };
         let reason = format_post_initialize_exit_reason(&binary, &report, err);
+        let durability = exit_durability(&reason, &report.stderr_tail);
         let result = ServerAttemptResult::SpawnFailed { binary, reason };
         self.clients.remove(key);
         self.remember_exit_report(report);
         self.server_binaries.remove(key);
         self.documents.remove(key);
         self.diagnostics.clear_for_server(key);
-        self.failed_spawns.insert(key.clone(), result.clone());
-        Some(result)
+        Some(self.record_failed_spawn(key, result, durability))
     }
 
     /// Store the result of a per-file pull request and return a structured
@@ -3549,6 +3745,7 @@ impl LspManager {
     pub fn clear_failed_spawns(&mut self) -> usize {
         let n = self.failed_spawns.len();
         self.failed_spawns.clear();
+        self.transient_backoff.clear();
         n
     }
 
@@ -3560,9 +3757,12 @@ impl LspManager {
         };
         self.failed_spawns.insert(
             key,
-            ServerAttemptResult::SpawnFailed {
-                binary: "rust-analyzer".to_string(),
-                reason: "test".to_string(),
+            FailedSpawn {
+                result: ServerAttemptResult::SpawnFailed {
+                    binary: "rust-analyzer".to_string(),
+                    reason: "test".to_string(),
+                },
+                retry_at: None,
             },
         );
     }
@@ -4277,7 +4477,7 @@ impl LspManager {
         root: &Path,
         source_file: &Path,
         config: &Config,
-    ) -> Result<LspClient, LspError> {
+    ) -> Result<LspClient, StartFailure> {
         self.spawn_server_with_timeout(def, root, source_file, config, None)
     }
 
@@ -4288,8 +4488,10 @@ impl LspManager {
         source_file: &Path,
         config: &Config,
         initialize_timeout: Option<std::time::Duration>,
-    ) -> Result<LspClient, LspError> {
-        let prepared = self.prepare_spawn(def, root, source_file, config)?;
+    ) -> Result<LspClient, StartFailure> {
+        let prepared = self
+            .prepare_spawn(def, root, source_file, config)
+            .map_err(prepare_failure)?;
         prepared
             .run(initialize_timeout)
             .map_err(|failure| self.absorb_spawn_failure(failure))
@@ -4404,21 +4606,29 @@ impl LspManager {
     }
 
     /// Record a failed spawn's exit details the way an inline spawn does, and
-    /// return the error to report.
-    fn absorb_spawn_failure(&mut self, failure: SpawnFailure) -> LspError {
+    /// return the failure to report.
+    fn absorb_spawn_failure(&mut self, failure: SpawnFailure) -> StartFailure {
         match failure {
             SpawnFailure::NotStarted {
                 error,
                 exit_log_line,
             } => {
                 self.record_exit_log_line(exit_log_line);
-                error
+                let durability = process_start_durability(&error);
+                StartFailure { error, durability }
             }
-            SpawnFailure::Initialize { reason, report } => {
+            SpawnFailure::Initialize {
+                reason,
+                report,
+                durability,
+            } => {
                 // Dropping the client in `PreparedSpawn::run` killed a
                 // still-running server, so the report is complete either way.
                 self.remember_exit_report(*report);
-                LspError::ServerNotReady(reason)
+                StartFailure {
+                    error: LspError::ServerNotReady(reason),
+                    durability,
+                }
             }
         }
     }
@@ -5043,11 +5253,20 @@ enum SpawnFailure {
     Initialize {
         reason: String,
         report: Box<ServerExitReport>,
+        durability: FailureDurability,
     },
 }
 
 impl PreparedSpawn {
     fn inspect_initialize_timeout(&self) -> Duration {
+        self.test_initialize_timeout()
+            .unwrap_or(super::client::HANDSHAKE_REQUEST_TIMEOUT)
+    }
+
+    /// Debug-build test hook: `AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS` in the
+    /// server's environment replaces the handshake budget, so a test can run
+    /// a handshake past it without waiting the real budget out.
+    fn test_initialize_timeout(&self) -> Option<Duration> {
         #[cfg(debug_assertions)]
         if let Some(timeout) = self
             .env
@@ -5055,14 +5274,15 @@ impl PreparedSpawn {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|millis| *millis > 0)
         {
-            return Duration::from_millis(timeout);
+            return Some(Duration::from_millis(timeout));
         }
-        super::client::HANDSHAKE_REQUEST_TIMEOUT
+        None
     }
 
     /// Start the process and run the `initialize` handshake. Touches no
     /// manager state, so it runs without the manager lock.
     fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
+        let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
@@ -5125,10 +5345,19 @@ impl PreparedSpawn {
                     self.root.display()
                 );
             }
+            // A handshake that ran past its budget says only that the server
+            // was slow this time (a cold JDTLS on a large Maven repository
+            // can be); it is killed below and may start fine later.
+            let durability = if matches!(err, LspError::Timeout(_)) {
+                FailureDurability::Transient
+            } else {
+                exit_durability(&reason, &report.stderr_tail)
+            };
             // Dropping the client here kills a still-running server.
             return Err(SpawnFailure::Initialize {
                 reason,
                 report: Box::new(report),
+                durability,
             });
         }
         // The native server is found by package layout alone, so confirm the
@@ -5150,9 +5379,12 @@ impl PreparedSpawn {
                 let _ = client.shutdown();
                 let status = client.wait_for_exit(INITIALIZE_EXIT_WAIT);
                 let report = client.exit_report(ServerPhase::Initialize, status, status.is_none());
+                // AFT's own check refused this binary; starting it again
+                // would be refused the same way.
                 return Err(SpawnFailure::Initialize {
                     reason,
                     report: Box::new(report),
+                    durability: FailureDurability::Permanent,
                 });
             }
         }
@@ -5790,6 +6022,56 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
     env_binary_override_from(kind, |key| std::env::var_os(key))
 }
 
+/// Classify an error raised while preparing a start, before any process
+/// exists. Those errors are a binary that does not resolve or a check of
+/// AFT's own refusing the server (an unusable project TypeScript, no
+/// TypeScript SDK for astro-ls, a missing native TypeScript package); neither
+/// changes until the environment does. Anything else is treated as transient.
+fn prepare_failure(error: LspError) -> StartFailure {
+    let durability = match error {
+        LspError::NotFound(_) | LspError::ServerNotReady(_) => FailureDurability::Permanent,
+        _ => FailureDurability::Transient,
+    };
+    StartFailure { error, durability }
+}
+
+/// Classify a failure to start the server process itself. A binary that is
+/// missing or that the system refuses to execute stays that way; any other
+/// I/O error may not recur.
+fn process_start_durability(error: &LspError) -> FailureDurability {
+    match error {
+        LspError::NotFound(_) => FailureDurability::Permanent,
+        LspError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            FailureDurability::Permanent
+        }
+        _ => FailureDurability::Transient,
+    }
+}
+
+/// Classify a server that died or failed during or after `initialize` from
+/// its failure text and stderr. Only configuration errors AFT recognises are
+/// permanent: typescript-language-server finding no usable TypeScript SDK,
+/// and a rustup proxy whose component is not installed. Anything else is
+/// transient, because wrongly calling a failure permanent leaves the server
+/// off for the whole session while a needless retry costs seconds.
+fn exit_durability(reason: &str, stderr_tail: &str) -> FailureDurability {
+    use super::environmental::{TS_LS5_NO_INSTALLATION, TS_LS6_NO_TSSERVER};
+
+    let names_typescript_sdk_error = [reason, stderr_tail]
+        .iter()
+        .any(|text| text.contains(TS_LS5_NO_INSTALLATION) || text.contains(TS_LS6_NO_TSSERVER));
+    if names_typescript_sdk_error || rustup_missing_component(stderr_tail).is_some() {
+        FailureDurability::Permanent
+    } else {
+        FailureDurability::Transient
+    }
+}
+
 fn env_binary_override_from(
     kind: &ServerKind,
     lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
@@ -5960,6 +6242,193 @@ mod failure_hint_tests {
         let stderr = "Error: Cannot find module '/x/typescript-language-server/lib/cli.mjs'";
         let hint = failure_hint("typescript-language-server", stderr);
         assert!(hint.contains("install -g"), "got: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod transient_retry_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn key() -> ServerKey {
+        ServerKey {
+            kind: ServerKind::Rust,
+            root: PathBuf::from("/tmp/transient-retry-root"),
+        }
+    }
+
+    fn spawn_failed() -> ServerAttemptResult {
+        ServerAttemptResult::SpawnFailed {
+            binary: "rust-analyzer".to_string(),
+            reason: "server not ready: server failed during initialize: timeout".to_string(),
+        }
+    }
+
+    /// A manager whose retry clock stands still until the returned offset
+    /// (milliseconds) is advanced.
+    fn manager_with_clock() -> (LspManager, Arc<AtomicU64>) {
+        let origin = Instant::now();
+        let offset = Arc::new(AtomicU64::new(0));
+        let reader = Arc::clone(&offset);
+        let mut manager = LspManager::new();
+        manager.set_retry_clock(RetryClock::from_fn(move || {
+            origin + Duration::from_millis(reader.load(Ordering::SeqCst))
+        }));
+        (manager, offset)
+    }
+
+    fn reason(result: &ServerAttemptResult) -> &str {
+        match result {
+            ServerAttemptResult::SpawnFailed { reason, .. } => reason,
+            other => panic!("expected SpawnFailed, got {other:?}"),
+        }
+    }
+
+    /// Record one transient failure, then return the window it opened by
+    /// stepping the clock until the failure stops being replayed.
+    fn record_and_measure_window(manager: &mut LspManager, offset: &AtomicU64) -> Duration {
+        let key = key();
+        manager.record_failed_spawn(&key, spawn_failed(), FailureDurability::Transient);
+        let started = offset.load(Ordering::SeqCst);
+        let mut waited = 0;
+        while manager.failure_to_replay(&key).is_some() {
+            offset.fetch_add(1_000, Ordering::SeqCst);
+            waited += 1_000;
+            assert!(waited <= 3_600_000, "retry window never closed");
+        }
+        assert_eq!(offset.load(Ordering::SeqCst), started + waited);
+        Duration::from_millis(waited)
+    }
+
+    #[test]
+    fn transient_backoff_doubles_caps_and_resets_after_a_successful_start() {
+        let (mut manager, offset) = manager_with_clock();
+        let windows = (0..7)
+            .map(|_| record_and_measure_window(&mut manager, &offset).as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(windows, vec![30, 60, 120, 240, 480, 600, 600]);
+
+        manager.note_start_succeeded(&key());
+        assert!(manager.failure_to_replay(&key()).is_none());
+        assert_eq!(
+            record_and_measure_window(&mut manager, &offset),
+            Duration::from_secs(30),
+            "a successful start must reset the backoff"
+        );
+    }
+
+    #[test]
+    fn transient_failure_reason_names_the_next_attempt() {
+        let (mut manager, offset) = manager_with_clock();
+        let reported =
+            manager.record_failed_spawn(&key(), spawn_failed(), FailureDurability::Transient);
+        assert_eq!(
+            reason(&reported),
+            "transient failure, will retry after 30s: server not ready: server failed during initialize: timeout"
+        );
+        offset.fetch_add(29_500, Ordering::SeqCst);
+        let replayed = manager
+            .failure_to_replay(&key())
+            .expect("inside the window");
+        assert!(
+            reason(&replayed).starts_with("transient failure, will retry after 1s: "),
+            "{replayed:?}"
+        );
+        // The wait shown in the first line survives inspect's one-line summary.
+        assert!(replayed
+            .failure_reason()
+            .starts_with("transient failure, will retry after 1s: "));
+        let at_boundary = FailedSpawn {
+            result: spawn_failed(),
+            retry_at: Some(Instant::now()),
+        };
+        assert!(reason(&at_boundary.reported_result(Instant::now()))
+            .starts_with("transient failure, retrying now: "));
+    }
+
+    #[test]
+    fn permanent_failure_replays_unchanged_long_after_any_backoff_window() {
+        let (mut manager, offset) = manager_with_clock();
+        let missing = ServerAttemptResult::BinaryNotInstalled {
+            binary: "rust-analyzer".to_string(),
+        };
+        manager.record_failed_spawn(&key(), missing, FailureDurability::Permanent);
+        offset.fetch_add(24 * 3_600_000, Ordering::SeqCst);
+        assert!(matches!(
+            manager.failure_to_replay(&key()),
+            Some(ServerAttemptResult::BinaryNotInstalled { .. })
+        ));
+        // Configuration changes still clear it, together with any backoff.
+        assert_eq!(manager.clear_failed_spawns(), 1);
+        assert!(manager.failure_to_replay(&key()).is_none());
+    }
+
+    #[test]
+    fn retry_delays_render_in_whole_seconds_rounded_up() {
+        assert_eq!(format_retry_delay(Duration::from_millis(1)), "1s");
+        assert_eq!(format_retry_delay(Duration::from_secs(45)), "45s");
+        assert_eq!(format_retry_delay(Duration::from_secs(120)), "2m");
+        assert_eq!(format_retry_delay(Duration::from_secs(270)), "4m 30s");
+    }
+
+    #[test]
+    fn failure_durability_classification() {
+        use FailureDurability::{Permanent, Transient};
+
+        // Before any process starts.
+        let not_found = LspError::NotFound("rust-analyzer".into());
+        assert_eq!(prepare_failure(not_found).durability, Permanent);
+        let refused = LspError::ServerNotReady("TypeScript unavailable".into());
+        assert_eq!(prepare_failure(refused).durability, Permanent);
+
+        // Starting the process.
+        let io = |kind| LspError::Io(std::io::Error::from(kind));
+        assert_eq!(
+            process_start_durability(&io(std::io::ErrorKind::NotFound)),
+            Permanent
+        );
+        assert_eq!(
+            process_start_durability(&io(std::io::ErrorKind::PermissionDenied)),
+            Permanent
+        );
+        assert_eq!(
+            process_start_durability(&io(std::io::ErrorKind::BrokenPipe)),
+            Transient
+        );
+
+        // A server that died during or after initialize.
+        assert_eq!(
+            exit_durability(
+                "server failed during initialize: server error -32603: Could not find a valid TypeScript installation",
+                ""
+            ),
+            Permanent
+        );
+        assert_eq!(
+            exit_durability(
+                "server crashed during initialize (exit 1)",
+                "provides no tsserver.js"
+            ),
+            Permanent
+        );
+        assert_eq!(
+            exit_durability(
+                "server crashed during initialize (exit 1)",
+                "error: Unknown binary 'rust-analyzer' in official toolchain 'stable-x86_64'"
+            ),
+            Permanent
+        );
+        assert_eq!(
+            exit_durability("server crashed during initialize (exit 3)", "fatal: oops"),
+            Transient
+        );
+        assert_eq!(
+            exit_durability("server exited after initialize (signal 9): broken pipe", ""),
+            Transient
+        );
     }
 }
 

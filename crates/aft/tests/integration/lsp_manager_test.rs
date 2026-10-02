@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1165,6 +1166,226 @@ fn failed_spawn_for_one_root_does_not_block_a_different_root() {
     let outcome_b = manager.ensure_server_for_file_detailed(&main_rs_b, &Config::default());
     assert_eq!(outcome_b.successful.len(), 1);
     assert_eq!(manager.active_client_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Transient start failures (cortexkit/aft#392)
+//
+// A server that missed the `initialize` handshake budget once (Eclipse JDTLS
+// on a cold, large Maven repository) used to be cached as failed until the
+// daemon restarted. Transient failures are now retried after a backoff
+// window; permanent ones (missing binary, recognised configuration errors)
+// still replay until the search paths or the configuration change.
+// ---------------------------------------------------------------------------
+
+/// A retry clock frozen at its creation time that moves only when the test
+/// adds milliseconds to the returned offset.
+fn movable_retry_clock() -> (aft::lsp::manager::RetryClock, Arc<AtomicU64>) {
+    let origin = Instant::now();
+    let offset = Arc::new(AtomicU64::new(0));
+    let reader = Arc::clone(&offset);
+    let clock = aft::lsp::manager::RetryClock::from_fn(move || {
+        origin + Duration::from_millis(reader.load(Ordering::SeqCst))
+    });
+    (clock, offset)
+}
+
+/// How many fake server processes have started, from the files the fake
+/// server writes into `AFT_FAKE_LSP_PID_DIR`.
+fn fake_server_spawns(pid_dir: &std::path::Path) -> usize {
+    fs::read_dir(pid_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn transient_handshake_timeout_is_retried_after_backoff_window() {
+    use aft::lsp::manager::{start_applicable_server_unlocked, walk_applicable_area};
+
+    let (temp, file, _) = rust_fixture_files();
+    let root = file.parent().unwrap().parent().unwrap();
+    let config = Config {
+        project_root: Some(root.to_path_buf()),
+        ..Config::default()
+    };
+    let pid_dir = temp.path().join("spawns");
+    fs::create_dir_all(&pid_dir).unwrap();
+    let (clock, offset) = movable_retry_clock();
+    let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
+    {
+        let mut manager = manager.lock();
+        manager.override_binary(ServerKind::Rust, fake_server_path());
+        manager.set_retry_clock(clock);
+        // A test-sized handshake budget; the fake server ignores the first
+        // `initialize` it ever sees and answers every later one at once.
+        manager.set_extra_env("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS", "300");
+        manager.set_extra_env(
+            "AFT_FAKE_LSP_INIT_NO_REPLY_ONCE",
+            &temp.path().join("init-stalled").display().to_string(),
+        );
+        manager.set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
+    }
+    // The request deadline is far beyond the handshake budget, so the
+    // failure is the server's handshake timeout, not the caller giving up.
+    let start = || {
+        let walk = walk_applicable_area(root, Some(std::slice::from_ref(&file)), &config, None)
+            .expect("walk source");
+        let snapshot = manager.lock().classify_applicable_servers(walk, &config);
+        assert_eq!(snapshot.server_keys.len(), 1);
+        let key = snapshot.server_keys[0].clone();
+        let outcome = start_applicable_server_unlocked(
+            &manager,
+            &snapshot,
+            &key,
+            &config,
+            Instant::now() + Duration::from_secs(10),
+        );
+        (key, outcome)
+    };
+
+    let (key, first) = start();
+    assert!(first.successful.is_empty(), "first start: {first:?}");
+    assert_eq!(first.failures.len(), 1, "first start: {first:?}");
+    assert_eq!(first.deadline_exceeded, None, "first start: {first:?}");
+    assert_eq!(fake_server_spawns(&pid_dir), 1);
+
+    // Inside the backoff window the cached failure is replayed: no spawn.
+    offset.fetch_add(29_000, Ordering::SeqCst);
+    let (_, inside_window) = start();
+    assert!(inside_window.successful.is_empty(), "{inside_window:?}");
+    assert_eq!(inside_window.failures.len(), 1, "{inside_window:?}");
+    assert_eq!(
+        fake_server_spawns(&pid_dir),
+        1,
+        "a request inside the backoff window must not spawn the server"
+    );
+
+    // Once the window has passed, the next request starts the server again,
+    // and this time the handshake succeeds.
+    offset.fetch_add(1_001, Ordering::SeqCst);
+    let (_, after_window) = start();
+    assert_eq!(
+        fake_server_spawns(&pid_dir),
+        2,
+        "expected a second spawn once the backoff window passed: {after_window:?}"
+    );
+    assert_eq!(
+        after_window.successful,
+        vec![key.clone()],
+        "{after_window:?}"
+    );
+    assert_eq!(manager.lock().active_server_keys(), vec![key]);
+
+    // The gap text says the failure is transient and when the next attempt is.
+    let first_reason = first.failures[0].reason();
+    assert!(
+        first_reason.starts_with("transient failure, will retry after 30s: "),
+        "first reason: {first_reason}"
+    );
+    assert!(
+        first_reason.contains("timeout"),
+        "first reason: {first_reason}"
+    );
+    let replayed_reason = inside_window.failures[0].reason();
+    assert!(
+        replayed_reason.starts_with("transient failure, will retry after 1s: "),
+        "replayed reason: {replayed_reason}"
+    );
+    manager.lock().shutdown_all();
+}
+
+/// The file-event path (`lsp_diagnostics`, edits) retries a transient
+/// failure the same way the inspect path does.
+#[test]
+fn transient_handshake_timeout_on_file_events_is_retried_after_backoff_window() {
+    let (temp, main_rs, lib_rs) = rust_fixture_files();
+    let pid_dir = temp.path().join("spawns");
+    fs::create_dir_all(&pid_dir).unwrap();
+    let (clock, offset) = movable_retry_clock();
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    manager.set_retry_clock(clock);
+    manager.set_extra_env("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS", "300");
+    manager.set_extra_env(
+        "AFT_FAKE_LSP_INIT_NO_REPLY_ONCE",
+        &temp.path().join("init-stalled").display().to_string(),
+    );
+    manager.set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
+
+    let first = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    assert!(first.successful.is_empty(), "{first:?}");
+    assert_eq!(fake_server_spawns(&pid_dir), 1);
+    let ServerAttemptResult::SpawnFailed { reason, .. } = &first.attempts[0].result else {
+        panic!("expected a spawn failure: {first:?}");
+    };
+    assert!(
+        reason.starts_with("transient failure, will retry after 30s: "),
+        "{reason}"
+    );
+
+    // Every file event inside the window replays the failure.
+    for _ in 0..5 {
+        offset.fetch_add(5_000, Ordering::SeqCst);
+        let replay = manager.ensure_server_for_file_detailed(&lib_rs, &Config::default());
+        assert!(replay.successful.is_empty(), "{replay:?}");
+    }
+    assert_eq!(
+        fake_server_spawns(&pid_dir),
+        1,
+        "no spawn inside the window"
+    );
+
+    offset.fetch_add(5_000, Ordering::SeqCst);
+    let retried = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    assert_eq!(fake_server_spawns(&pid_dir), 2, "{retried:?}");
+    assert_eq!(retried.successful.len(), 1, "{retried:?}");
+    assert_eq!(manager.active_client_count(), 1);
+    manager.shutdown_all();
+}
+
+/// A missing binary is a permanent failure: it is replayed, without a spawn,
+/// long after any transient backoff window would have passed, even once the
+/// binary exists. Only a search-path or configuration change clears it.
+#[test]
+fn permanent_missing_binary_failure_is_replayed_after_backoff_window() {
+    let (temp, main_rs, _lib_rs) = rust_fixture_files();
+    let pid_dir = temp.path().join("spawns");
+    fs::create_dir_all(&pid_dir).unwrap();
+    let (clock, offset) = movable_retry_clock();
+    let mut manager = LspManager::new();
+    manager.set_retry_clock(clock);
+    manager.set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
+    manager.override_binary(
+        ServerKind::Rust,
+        PathBuf::from("/definitely/missing/fake-lsp-server-XYZZY"),
+    );
+    let first = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    assert!(
+        matches!(
+            first.attempts[0].result,
+            ServerAttemptResult::BinaryNotInstalled { .. }
+        ),
+        "{first:?}"
+    );
+
+    // Make the binary available, then step past the longest backoff.
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    offset.fetch_add(60 * 60 * 1_000, Ordering::SeqCst);
+    let later = manager.ensure_server_for_file_detailed(&main_rs, &Config::default());
+    assert!(
+        matches!(
+            later.attempts[0].result,
+            ServerAttemptResult::BinaryNotInstalled { .. }
+        ),
+        "{later:?}"
+    );
+    assert!(later.successful.is_empty());
+    assert_eq!(
+        fake_server_spawns(&pid_dir),
+        0,
+        "no spawn for a permanent failure"
+    );
+    assert_eq!(manager.active_client_count(), 0);
 }
 
 // ---------------------------------------------------------------------------
