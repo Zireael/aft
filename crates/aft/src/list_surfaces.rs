@@ -149,7 +149,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted, execute_fallback_mode",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted, execute_fallback_mode, ExternalFallbackBody, external_fallback_response",
             },
             ReasonEntry {
                 reason: Reason::Depth,
@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
             },
         ],
     },
@@ -506,6 +506,26 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "selective_definitions, admission_definers, expand_group",
         location_or_primitive: "commands::semantic_search::split_query::MAX_PLACED_DEFINITIONS, MAX_GROUP_EXPANSION",
         reason: "bounds the definitions scored for relevance or carried into the ranking and the alternatives a group expands into; these are ranking inputs, no list is shown to the agent, and the results list is cut and enveloped by the engine",
+    },
+    // Identifier search in another project (external path): the sweep's
+    // results page is the search surface's, registered under its cap reason.
+    ExclusionEntry {
+        file: "commands/semantic_search/external_exact.rs",
+        enclosing_item: "files_with_hits",
+        location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
+        reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "count",
+        location_or_primitive: "commands::semantic_search external grep coverage line walk_truncated",
+        reason: "reads the bounded scan's truncation flag to word the coverage line; nothing is cut here, and the same flag marks the reply incomplete in external_fallback_response",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/nearest_names.rs",
+        enclosing_item: "nearest_names",
+        location_or_primitive: "commands::semantic_search::nearest_names NEAREST_NAME_FILE_LIMIT, NEAREST_NAME_LIMIT",
+        reason: "a not-found answer suggests a few nearest names: the scan reads a bounded number of files and keeps the most similar names; these are suggestions for a name that occurs nowhere, not a cut of matching results",
     },
 ];
 
