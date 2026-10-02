@@ -59,6 +59,8 @@ interface SpawnResult {
 
 export interface V1VersionProbeOptions {
   env?: NodeJS.ProcessEnv;
+  /** Platform whose launcher rules apply to `executable`. Defaults to this process's. */
+  platform?: NodeJS.Platform;
   operatorHome?: string;
   tempParent?: string;
   spawn?: (
@@ -109,6 +111,71 @@ function packageMetadataNearExecutable(
     if (parent === current || current === parse(current).root) return null;
     current = parent;
   }
+}
+
+/** Largest file read as a possible npm launcher; real ones are under 1 KiB. */
+const LAUNCHER_MAX_BYTES = 64 * 1024;
+/** The quoted `"%dp0%\<path>"` operands of an npm `.cmd` launcher. */
+const CMD_LAUNCHER_PATH = /"%~?dp0%?\\([^"%\r\n]+)"/g;
+/** The quoted `"$basedir/<path>"` operands of npm's sh or PowerShell launcher. */
+const SH_LAUNCHER_PATH = /"\$basedir\/([^"$\r\n]+)"/g;
+const BATCH_FILE = /\.(?:cmd|bat)$/i;
+
+/**
+ * The file an npm bin launcher starts, or null when `launcher` is not one.
+ *
+ * On Windows npm does not symlink a package's bin into the prefix: it writes
+ * `opencode.cmd`, an extensionless sh script and `opencode.ps1` that each run
+ * `"%dp0%\node_modules\@opencode\cli\bin\opencode.exe"` (or `$basedir/...`)
+ * relative to their own directory. `realpath` cannot see through a script, so
+ * the package metadata beside the binary was never reached, and Node refuses
+ * to spawn a `.cmd` without a shell, so the version probe failed too.
+ *
+ * Reading the launcher rather than looking for `<dir>/node_modules/<pkg>`:
+ * the launcher names the one package that owns this command, where a prefix
+ * can hold several host packages; it also covers a project-local
+ * `node_modules/.bin` launcher, whose target is `..\@opencode\cli\...`; and
+ * the same path gives the probe a real binary to run without a shell. The
+ * target is the last such operand: a node-script launcher names `node.exe`
+ * first and the script after it.
+ */
+function npmLauncherTarget(launcher: string): string | null {
+  let source: string;
+  try {
+    if (statSync(launcher).size > LAUNCHER_MAX_BYTES) return null;
+    source = readFileSync(launcher, "utf8");
+  } catch {
+    return null;
+  }
+  const operands = [...source.matchAll(CMD_LAUNCHER_PATH)];
+  if (operands.length === 0) operands.push(...source.matchAll(SH_LAUNCHER_PATH));
+  const relativeTarget = operands.at(-1)?.[1];
+  if (!relativeTarget) return null;
+  const target = join(dirname(launcher), ...relativeTarget.split(/[\\/]+/).filter(Boolean));
+  try {
+    return statSync(target).isFile() ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The file to read metadata beside and to run for a version: `executable`
+ * itself, or the binary behind it when it is an npm launcher. Null means it is
+ * a batch file that names no target, which cannot be run without a shell.
+ *
+ * A `.cmd`/`.bat` is never run directly: since Node 18.20.2 / 20.12.2
+ * (CVE-2024-27980) `spawn` rejects one without `shell: true` with EINVAL. On
+ * Windows anything but `.exe`/`.com` is a script as far as process creation
+ * is concerned, which covers the extensionless sh launcher npm also writes.
+ */
+function hostLaunchPath(executable: string, platform: NodeJS.Platform): string | null {
+  const isBatch = BATCH_FILE.test(executable);
+  const isScript = isBatch || (platform === "win32" && !/\.(?:exe|com)$/i.test(executable));
+  if (!isScript) return executable;
+  const target = npmLauncherTarget(executable);
+  if (target) return target;
+  return isBatch ? null : executable;
 }
 
 function packageVersion(metadata: PackageMetadata | null): string | null {
@@ -221,11 +288,17 @@ function probeCreatedIsolatedState(dataRoot: string, stateRoot: string): boolean
  * talking to. CI can enable the strict operator canary used by the load
  * matrix, while production tolerates writes from an OpenCode process that is
  * already using the live operator store.
+ *
+ * An npm launcher is probed through the binary it names (see
+ * `hostLaunchPath`); a batch file that names none is not run at all and
+ * reports no version.
  */
 export function probeOpenCodeV1Version(
   executable: string,
   options: V1VersionProbeOptions = {},
 ): string | null {
+  const launchPath = hostLaunchPath(executable, options.platform ?? process.platform);
+  if (launchPath === null) return null;
   const operatorHome = options.operatorHome ?? homedir();
   const before = snapshotOperatorState(operatorHome);
   const root = mkdtempSync(join(options.tempParent ?? tmpdir(), "aft-opencode-probe-"));
@@ -257,7 +330,7 @@ export function probeOpenCodeV1Version(
   let result: SpawnResult | undefined;
   let probeError: unknown;
   try {
-    result = (options.spawn ?? spawnSync)(executable, ["--standalone", "--version"], {
+    result = (options.spawn ?? spawnSync)(launchPath, ["--standalone", "--version"], {
       cwd: project,
       encoding: "utf8",
       env,
@@ -350,6 +423,13 @@ export function detectOpenCodeHostGeneration(
       findExecutableOnPath(name, dependencies.path, dependencies.platform));
   const openCodeExecutable = findExecutable("opencode");
   const openCode2Executable = findExecutable("opencode2");
+  const platform = dependencies.platform ?? process.platform;
+  // Metadata and identity come from the binary an npm launcher starts, not
+  // from the launcher in the npm prefix (see `npmLauncherTarget`).
+  const hostOf = (executable: string | null): string | null =>
+    executable === null ? null : (hostLaunchPath(executable, platform) ?? executable);
+  const openCodeHost = hostOf(openCodeExecutable);
+  const openCode2Host = hostOf(openCode2Executable);
   const evidence: OpenCodeHostEvidence[] = [];
 
   // The executable NAME is not evidence of a generation: OpenCode 2 installs
@@ -364,19 +444,22 @@ export function detectOpenCodeHostGeneration(
   // Counting it twice reported one GA host as both generations and refused to
   // configure anything. Note this catches only the npm shape: a standalone
   // install's `opencode2` shim is a different file that execs the same binary,
-  // which is why the version has to carry the decision.
+  // which is why the version has to carry the decision. On Windows npm writes
+  // a separate launcher per name, so the comparison is between the binaries
+  // those launchers start.
   const sharedExecutable =
-    openCodeExecutable !== null &&
-    openCode2Executable !== null &&
-    resolvedPath(openCodeExecutable) === resolvedPath(openCode2Executable);
+    openCodeHost !== null &&
+    openCode2Host !== null &&
+    resolvedPath(openCodeHost) === resolvedPath(openCode2Host);
 
-  if (openCodeExecutable) {
-    const v1Metadata = packageMetadataNearExecutable(openCodeExecutable, "opencode-ai");
-    const v2Metadata = v2MetadataNearExecutable(openCodeExecutable);
+  if (openCodeExecutable !== null && openCodeHost !== null) {
+    const v1Metadata = packageMetadataNearExecutable(openCodeHost, "opencode-ai");
+    const v2Metadata = v2MetadataNearExecutable(openCodeHost);
     const metadataVersion = packageVersion(v2Metadata) ?? packageVersion(v1Metadata);
-    const version =
-      metadataVersion ??
-      (dependencies.probeV1Version ?? probeOpenCodeV1Version)(openCodeExecutable);
+    const probeVersion =
+      dependencies.probeV1Version ??
+      ((executable: string) => probeOpenCodeV1Version(executable, { platform }));
+    const version = metadataVersion ?? probeVersion(openCodeExecutable);
     const isV2 = Boolean(v2Metadata) || sharedExecutable || isV2Version(version);
     evidence.push({
       generation: isV2 ? "v2" : "v1",
@@ -391,8 +474,8 @@ export function detectOpenCodeHostGeneration(
   // a V2 install put it there — as its own binary, or as the alias shim that
   // ships beside a standalone V2. It is never executed: booting the other host
   // to ask its version is exactly what this detector exists to avoid.
-  if (openCode2Executable && !sharedExecutable) {
-    const version = packageVersion(v2MetadataNearExecutable(openCode2Executable));
+  if (openCode2Executable !== null && openCode2Host !== null && !sharedExecutable) {
+    const version = packageVersion(v2MetadataNearExecutable(openCode2Host));
     evidence.push({
       generation: "v2",
       executable: openCode2Executable,
