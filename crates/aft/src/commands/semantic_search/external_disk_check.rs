@@ -996,8 +996,8 @@ mod tests {
             vec![root.join("src/a.rs")]
         );
 
-        // Checking the copy again finds nothing left to hash or read, and
-        // still describes the copy against the saved index.
+        // Checking that checked copy again finds nothing left to hash or
+        // read, and still describes the copy against the saved index.
         let before = reindexes_for_test();
         let again = check_against_disk(&index, Some(&checked.index), &root, None);
         assert_eq!(reindexes_for_test() - before, 0);
@@ -1005,9 +1005,10 @@ mod tests {
         assert_eq!(again.applied_digest, checked.applied_digest);
     }
 
-    /// A check its time limit cut short is carried on by the next one after
-    /// the reuse window, from the copy it left, and the reply then counts
-    /// every file the copy holds, not only the second pass.
+    /// A check cut short by its time limit resumes, once the reuse window has
+    /// passed, from the in-memory copy of the index it left; the reply then
+    /// counts every file that copy holds, not only the files the second pass
+    /// processed.
     #[test]
     fn a_capped_check_completes_over_two_windows() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -1206,9 +1207,10 @@ mod tests {
                 Some(index) => (Arc::new(index), "saved"),
                 None => (Arc::new(SearchIndex::build(&root)), "built-now"),
             };
-            // Three fresh capped checks, then capped checks that each resume
-            // from the copy the one before left (as successive windows do),
-            // then one uncapped check from the saved index.
+            // Run three fresh capped checks, then capped checks that each
+            // resume from the in-memory copy left by the preceding check (as
+            // successive reuse windows do), then one uncapped check that
+            // starts from the saved index.
             let mut previous: Option<Arc<SearchIndex>> = None;
             for (label, resume, budgets) in [
                 ("capped", false, None),
