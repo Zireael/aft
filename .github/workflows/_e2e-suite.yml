@@ -227,21 +227,22 @@ jobs:
           run_root="$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID"
           mkdir -p "$run_root"
           current=""
-          for attempt in 1 2 3 4 5 6; do
-            # A commit carries more check runs than the API's default page of
-            # 30, and a rerun job's check run is listed last, so ask for the
-            # largest page GitHub allows.
-            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs?per_page=100"); then
+          for attempt in $(seq 1 24); do
+            # A commit can carry more check runs than one page holds, and a
+            # rerun job's check run is listed last, so walk every page. The
+            # listing also lags the job's start by tens of seconds at times,
+            # so keep asking for up to two minutes.
+            if checks=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs?per_page=100" --jq '.check_runs[]'); then
               current=$(jq -c \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --arg job "OpenCode 2 (Linux Docker)" \
-                '.check_runs[] | select(.details_url | contains("/actions/runs/" + $run_id + "/")) | select(.name | contains($job))' \
+                'select(.details_url | contains("/actions/runs/" + $run_id + "/")) | select(.name | contains($job))' \
                 <<<"$checks" | head -n 1)
             fi
             if [ -n "$current" ]; then
               break
             fi
-            echo "Check run not listed yet (attempt $attempt/6); retrying in 5 seconds"
+            echo "Check run not listed yet (attempt $attempt/24, $(jq -s length <<<"${checks:-}") check runs seen); retrying in 5 seconds"
             sleep 5
           done
           if [ -z "$current" ]; then
