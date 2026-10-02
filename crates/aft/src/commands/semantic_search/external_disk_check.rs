@@ -21,8 +21,9 @@
 //! reflects every file on disk or only part of the project.
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::external_exact::classify_file;
@@ -33,36 +34,77 @@ use crate::semantic_index::SemanticIndex;
 const WALK_BUDGET: Duration = Duration::from_secs(2);
 /// Time allowed, after the walk, for reading changed and new files.
 const REREAD_BUDGET: Duration = Duration::from_secs(1);
+/// How long a finished check keeps answering later queries for the same
+/// saved index before the project is walked again. Agents often send several
+/// queries to another project in a row; each reply that reuses a check says
+/// how old it is.
+const REUSE_WINDOW: Duration = Duration::from_secs(12);
+/// Most projects whose checked index is kept at once.
+const MAX_CHECKED_ROOTS: usize = 8;
+
+/// Walk budget, re-read budget and reuse window.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Budgets {
+    pub walk: Duration,
+    pub reread: Duration,
+    pub reuse_window: Duration,
+}
 
 thread_local! {
-    static BUDGETS_FOR_TEST: Cell<Option<(Duration, Duration)>> = const { Cell::new(None) };
+    static BUDGETS_FOR_TEST: Cell<Option<Budgets>> = const { Cell::new(None) };
 }
 
-/// The walk and re-read budgets, overridable per thread by tests.
-pub(super) fn budgets() -> (Duration, Duration) {
-    BUDGETS_FOR_TEST
-        .with(Cell::get)
-        .unwrap_or((WALK_BUDGET, REREAD_BUDGET))
+#[cfg(test)]
+thread_local! {
+    static WALKS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Run `run` with the walk and re-read budgets replaced on this thread.
+/// The budgets, overridable per thread by tests.
+pub(super) fn budgets() -> Budgets {
+    BUDGETS_FOR_TEST.with(Cell::get).unwrap_or(Budgets {
+        walk: WALK_BUDGET,
+        reread: REREAD_BUDGET,
+        reuse_window: REUSE_WINDOW,
+    })
+}
+
+/// Run `run` with the walk and re-read budgets replaced on this thread. The
+/// reuse window is zero so every query checks the disk afresh.
 #[cfg(test)]
 pub(crate) fn with_budgets_for_test<R>(
     walk: Duration,
     reread: Duration,
     run: impl FnOnce() -> R,
 ) -> R {
+    with_all_budgets_for_test(
+        Budgets {
+            walk,
+            reread,
+            reuse_window: Duration::ZERO,
+        },
+        run,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn with_all_budgets_for_test<R>(budgets: Budgets, run: impl FnOnce() -> R) -> R {
     BUDGETS_FOR_TEST.with(|slot| {
-        let previous = slot.replace(Some((walk, reread)));
+        let previous = slot.replace(Some(budgets));
         let result = run();
         slot.set(previous);
         result
     })
 }
 
+/// How many project walks [`check_against_disk`] has started on this thread.
+#[cfg(test)]
+pub(crate) fn walks_for_test() -> usize {
+    WALKS_FOR_TEST.with(Cell::get)
+}
+
 /// What comparing a saved index with the files on disk found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct DiskCheck {
+pub(crate) struct DiskCheck {
     /// Files the walk reached and compared with the index.
     pub files_examined: usize,
     /// The walk reached every file under the root before its deadline.
@@ -108,7 +150,8 @@ impl DiskCheck {
 }
 
 /// A saved index brought in line with the disk as far as the budgets allowed.
-pub(super) struct CheckedIndex {
+#[derive(Clone, Debug)]
+pub(crate) struct CheckedIndex {
     /// The saved index itself when nothing differed, otherwise an in-memory
     /// copy with the differences applied.
     pub index: Arc<SearchIndex>,
@@ -117,6 +160,108 @@ pub(super) struct CheckedIndex {
     /// were. Two queries over the same unchanged files get the same digest, so
     /// caches keyed by index generation stay usable without mixing versions.
     pub applied_digest: Option<String>,
+    /// Time spent walking the project and comparing metadata.
+    pub walk_time: Duration,
+    /// Time spent reading changed and new files.
+    pub reread_time: Duration,
+}
+
+/// One project's checked index, kept for [`REUSE_WINDOW`].
+#[derive(Debug)]
+struct CheckedOverlay {
+    root: PathBuf,
+    /// Generation of the saved index the check started from.
+    generation: String,
+    /// The saved index and semantic index the check compared; a later query
+    /// reuses the check only while it is answered from these same indexes.
+    saved: Weak<SearchIndex>,
+    semantic: Option<Weak<SemanticIndex>>,
+    checked: CheckedIndex,
+    checked_at: Instant,
+}
+
+/// Recently checked indexes of other projects, at most one per project and
+/// [`MAX_CHECKED_ROOTS`] projects, least recently used dropped first. The
+/// owner drops a project's entry whenever it drops or replaces that project's
+/// borrowed index, so a kept copy never outlives the index it was made from.
+#[derive(Debug, Default)]
+pub(crate) struct CheckedOverlays {
+    entries: VecDeque<CheckedOverlay>,
+}
+
+impl CheckedOverlays {
+    /// The check made for `root` from these same indexes less than `window`
+    /// ago, with its age. An expired or mismatched entry is dropped.
+    pub(super) fn reuse(
+        &mut self,
+        root: &Path,
+        generation: &str,
+        saved: &Arc<SearchIndex>,
+        semantic: Option<&Arc<SemanticIndex>>,
+        window: Duration,
+    ) -> Option<(CheckedIndex, Duration)> {
+        let position = self.entries.iter().position(|entry| entry.root == root)?;
+        let entry = self.entries.remove(position)?;
+        let age = entry.checked_at.elapsed();
+        let same_saved = entry.generation == generation
+            && entry
+                .saved
+                .upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, saved));
+        let same_semantic = match (&entry.semantic, semantic) {
+            (None, None) => true,
+            (Some(kept), Some(current)) => kept
+                .upgrade()
+                .is_some_and(|kept| Arc::ptr_eq(&kept, current)),
+            _ => false,
+        };
+        if age >= window || !same_saved || !same_semantic {
+            return None;
+        }
+        let reused = entry.checked.clone();
+        self.entries.push_back(entry);
+        Some((reused, age))
+    }
+
+    pub(super) fn remember(
+        &mut self,
+        root: &Path,
+        generation: &str,
+        saved: &Arc<SearchIndex>,
+        semantic: Option<&Arc<SemanticIndex>>,
+        checked: CheckedIndex,
+    ) {
+        self.forget_root(root);
+        self.entries.push_back(CheckedOverlay {
+            root: root.to_path_buf(),
+            generation: generation.to_string(),
+            saved: Arc::downgrade(saved),
+            semantic: semantic.map(Arc::downgrade),
+            checked,
+            checked_at: Instant::now(),
+        });
+        while self.entries.len() > MAX_CHECKED_ROOTS {
+            self.entries.pop_front();
+        }
+    }
+
+    pub(crate) fn forget_root(&mut self, root: &Path) {
+        self.entries.retain(|entry| entry.root != root);
+    }
+
+    /// Keep only the projects for which `keep` holds.
+    pub(crate) fn retain_roots(&mut self, keep: impl Fn(&Path) -> bool) {
+        self.entries.retain(|entry| keep(&entry.root));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Compare `index` with the files under `root` and apply what differs.
@@ -129,8 +274,11 @@ pub(super) fn check_against_disk(
     root: &Path,
     semantic: Option<&SemanticIndex>,
 ) -> CheckedIndex {
-    let (walk_budget, reread_budget) = budgets();
-    let walk_deadline = Instant::now() + walk_budget;
+    let budgets = budgets();
+    #[cfg(test)]
+    WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
+    let walk_started = Instant::now();
+    let walk_deadline = walk_started + budgets.walk;
     let stop_requested =
         |deadline: Instant| Instant::now() >= deadline || crate::executor::current_job_cancelled();
 
@@ -206,23 +354,22 @@ pub(super) fn check_against_disk(
         Vec::new()
     };
     check.removed = removed.len();
+    let walk_time = walk_started.elapsed();
 
     if differing.is_empty() && removed.is_empty() {
         return CheckedIndex {
             index: Arc::clone(index),
             check,
             applied_digest: None,
+            walk_time,
+            reread_time: Duration::ZERO,
         };
     }
 
     // Read program source before documentation and data files (the
     // `classify_file` order), so if the deadline stops the re-read, the files
     // a code search most needs current are the ones already read.
-    differing.sort_by(|(left, ..), (right, ..)| {
-        classify_file(left)
-            .cmp(&classify_file(right))
-            .then_with(|| left.cmp(right))
-    });
+    differing.sort_by_cached_key(|(path, ..)| (classify_file(path), path.clone()));
     let mut overlay = SearchIndex::clone(index);
     let mut digest = blake3::Hasher::new();
     for path in &removed {
@@ -230,7 +377,8 @@ pub(super) fn check_against_disk(
         digest.update(b"-");
         digest.update(path.as_os_str().as_encoded_bytes());
     }
-    let reread_deadline = Instant::now() + reread_budget;
+    let reread_started = Instant::now();
+    let reread_deadline = reread_started + budgets.reread;
     for (path, size, modified) in &differing {
         if stop_requested(reread_deadline) {
             break;
@@ -249,6 +397,8 @@ pub(super) fn check_against_disk(
         index: Arc::new(overlay),
         check,
         applied_digest: Some(digest.finalize().to_hex()[..16].to_string()),
+        walk_time,
+        reread_time: reread_started.elapsed(),
     }
 }
 
@@ -268,8 +418,16 @@ fn was_were(count: usize) -> &'static str {
     }
 }
 
-/// The sentence a reply ends with when `check` covered every file.
-pub(super) fn verified_line(check: &DiskCheck, root: &Path) -> String {
+/// ` 6 s ago` for a check reused from an earlier query, empty for one made
+/// for this query.
+pub(super) fn checked_ago(age: Option<Duration>) -> String {
+    age.map(|age| format!(" {} ago", super::format_coarse_age(age)))
+        .unwrap_or_default()
+}
+
+/// The sentence a reply ends with when `check` covered every file. `age` is
+/// how long ago the check was made when an earlier query's check is reused.
+pub(super) fn verified_line(check: &DiskCheck, root: &Path, age: Option<Duration>) -> String {
     let mut differences = Vec::new();
     if check.changed > 0 {
         differences.push(format!("{} changed", files(check.changed)));
@@ -289,9 +447,10 @@ pub(super) fn verified_line(check: &DiskCheck, root: &Path) -> String {
         ));
     }
     let head = format!(
-        "Checked the saved AFT index of {} against all {} on disk",
+        "Checked the saved AFT index of {} against all {} on disk{}",
         root.display(),
-        files(check.files_examined)
+        files(check.files_examined),
+        checked_ago(age)
     );
     if differences.is_empty() {
         format!("{head}; none changed since it was saved.")
@@ -473,6 +632,154 @@ mod tests {
         assert_eq!(again.applied_digest, checked.applied_digest);
     }
 
+    fn borrowed_search_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        crate::context::AppContext,
+    ) {
+        let (dir, root) = project(&[(
+            "src/lib.rs",
+            "// Assemble the zephyrine quokkalith.\npub fn assemble() {}\n",
+        )]);
+        let mut git = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(git.current_dir(&root));
+        assert!(git
+            .args(["init", "-q"])
+            .status()
+            .expect("git init")
+            .success());
+        let storage = tempfile::tempdir().expect("storage");
+        let cache_dir = crate::search_index::resolve_cache_dir(&root, Some(storage.path()));
+        SearchIndex::build(&root).write_to_disk(&cache_dir, None);
+        let session = tempfile::tempdir().expect("session");
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(session.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        (dir, root, storage, session, ctx)
+    }
+
+    fn prose_search(ctx: &crate::context::AppContext, root: &Path) -> serde_json::Value {
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "disk-check-reuse",
+            "command": "semantic_search",
+            "query": "where is the zephyrine quokkalith assembled",
+            "top_k": 5,
+            "path": root.display().to_string(),
+        }))
+        .expect("request");
+        serde_json::to_value(super::super::handle_semantic_search(&request, ctx)).expect("response")
+    }
+
+    /// Queries a few seconds apart reuse one check instead of walking the
+    /// project each time, and say how old the check is; once the window has
+    /// passed the project is walked again.
+    #[test]
+    fn queries_within_the_reuse_window_walk_the_project_once() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_dir, root, _storage, _session, ctx) = borrowed_search_fixture();
+        let long_window = Budgets {
+            walk: Duration::from_secs(5),
+            reread: Duration::from_secs(5),
+            reuse_window: Duration::from_secs(600),
+        };
+
+        let (first, second, walks) = with_all_budgets_for_test(long_window, || {
+            let before = walks_for_test();
+            let first = prose_search(&ctx, &root);
+            let second = prose_search(&ctx, &root);
+            (first, second, walks_for_test() - before)
+        });
+
+        assert_eq!(walks, 1, "two queries inside the window walk once");
+        assert_eq!(first["saved_index_check"]["reused"], false, "{first:#?}");
+        assert_eq!(second["saved_index_check"]["reused"], true, "{second:#?}");
+        let first_text = first["text"].as_str().expect("text");
+        let second_text = second["text"].as_str().expect("text");
+        assert!(
+            first_text.contains("against all 1 file on disk; none changed"),
+            "{first_text}"
+        );
+        assert!(
+            second_text.contains("against all 1 file on disk 0 s ago; none changed"),
+            "{second_text}"
+        );
+        assert_eq!(ctx.with_checked_overlays(|overlays| overlays.len()), 1);
+
+        let expired = Budgets {
+            reuse_window: Duration::ZERO,
+            ..long_window
+        };
+        let (third, walks) = with_all_budgets_for_test(expired, || {
+            let before = walks_for_test();
+            let third = prose_search(&ctx, &root);
+            (third, walks_for_test() - before)
+        });
+        assert_eq!(walks, 1, "a query after the window walks again");
+        assert_eq!(third["saved_index_check"]["reused"], false, "{third:#?}");
+
+        assert!(ctx.evict_idle_artifacts());
+        assert_eq!(
+            ctx.with_checked_overlays(|overlays| overlays.len()),
+            0,
+            "dropping the borrowed index drops its checked copy"
+        );
+    }
+
+    #[test]
+    fn checked_overlays_keep_one_entry_per_root_and_at_most_eight_roots() {
+        let index = Arc::new(SearchIndex::new());
+        let checked = CheckedIndex {
+            index: Arc::clone(&index),
+            check: DiskCheck::default(),
+            applied_digest: None,
+            walk_time: Duration::ZERO,
+            reread_time: Duration::ZERO,
+        };
+        let mut overlays = CheckedOverlays::default();
+        for round in 0..2 {
+            for root in 0..10 {
+                overlays.remember(
+                    Path::new(&format!("/root{root}")),
+                    &format!("generation{round}"),
+                    &index,
+                    None,
+                    checked.clone(),
+                );
+            }
+        }
+        assert_eq!(overlays.len(), MAX_CHECKED_ROOTS);
+        let window = Duration::from_secs(600);
+        assert!(
+            overlays
+                .reuse(Path::new("/root1"), "generation1", &index, None, window)
+                .is_none(),
+            "the least recently used roots were dropped"
+        );
+        assert!(
+            overlays
+                .reuse(Path::new("/root9"), "generation0", &index, None, window)
+                .is_none(),
+            "a check made for an older generation is not reused"
+        );
+        assert!(overlays
+            .reuse(Path::new("/root8"), "generation1", &index, None, window)
+            .is_some());
+        let other = Arc::new(SearchIndex::new());
+        assert!(
+            overlays
+                .reuse(Path::new("/root7"), "generation1", &other, None, window)
+                .is_none(),
+            "a check made from a different saved index is not reused"
+        );
+    }
+
     #[test]
     fn a_walk_stopped_by_its_deadline_is_not_verified_and_drops_nothing() {
         let (_dir, root) = project(&[
@@ -518,6 +825,86 @@ mod tests {
         );
     }
 
+    /// Prints what the check costs on real trees. Nothing is written: a saved
+    /// index is only read from `AFT_DISK_CHECK_PROBE_STORAGE` when the tree has
+    /// one, otherwise one is built in memory.
+    #[test]
+    #[ignore = "measures the disk check on the trees named in AFT_DISK_CHECK_PROBE_ROOTS"]
+    fn disk_check_cost_probe() {
+        let roots = std::env::var("AFT_DISK_CHECK_PROBE_ROOTS").expect("roots");
+        let storage = std::env::var_os("AFT_DISK_CHECK_PROBE_STORAGE").map(PathBuf::from);
+        let uncapped = Budgets {
+            walk: Duration::from_secs(600),
+            reread: Duration::from_secs(600),
+            reuse_window: Duration::ZERO,
+        };
+        for root in roots.split(':') {
+            let root = std::fs::canonicalize(root).expect("root");
+            // With an empty index every file is new and nothing is re-read:
+            // this is the first walk and stat of the tree in this process.
+            let first = with_all_budgets_for_test(
+                Budgets {
+                    reread: Duration::ZERO,
+                    ..uncapped
+                },
+                || check_against_disk(&Arc::new(SearchIndex::new()), &root, None),
+            );
+            eprintln!(
+                "PROBE {} first_walk_ms={} stats={}",
+                root.display(),
+                first.walk_time.as_millis(),
+                first.check.files_examined
+            );
+            let saved = storage.as_ref().and_then(|storage| {
+                let key = crate::search_index::artifact_cache_key(&root);
+                let cache_dir =
+                    crate::search_index::resolve_cache_dir_with_key(&key, Some(storage));
+                match crate::readonly_artifacts::open_search_index_cancellable(
+                    &root,
+                    cache_dir,
+                    10_000_000,
+                    Duration::from_secs(120),
+                    &|| true,
+                ) {
+                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => Some(index),
+                    crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => Some(stale.index),
+                    _ => None,
+                }
+            });
+            let (index, source) = match saved {
+                Some(index) => (Arc::new(index), "saved"),
+                None => (Arc::new(SearchIndex::build(&root)), "built-now"),
+            };
+            for (label, budgets) in [
+                ("capped", None),
+                ("capped", None),
+                ("capped", None),
+                ("uncapped", Some(uncapped)),
+            ] {
+                let run = || check_against_disk(&index, &root, None);
+                let checked = match budgets {
+                    Some(budgets) => with_all_budgets_for_test(budgets, run),
+                    None => run(),
+                };
+                let check = &checked.check;
+                eprintln!(
+                    "PROBE {} index={source} indexed={} {label} walk_ms={} stats={} walk_complete={} changed={} added={} removed={} reread={} not_reread={} reread_ms={}",
+                    root.display(),
+                    index.file_count(),
+                    checked.walk_time.as_millis(),
+                    check.files_examined,
+                    check.walk_complete,
+                    check.changed,
+                    check.added,
+                    check.removed,
+                    check.reread,
+                    check.not_reread,
+                    checked.reread_time.as_millis()
+                );
+            }
+        }
+    }
+
     #[test]
     fn verified_line_names_each_kind_of_difference() {
         let root = Path::new("/p");
@@ -527,14 +914,18 @@ mod tests {
             ..DiskCheck::default()
         };
         assert_eq!(
-            verified_line(&check, root),
+            verified_line(&check, root, None),
             "Checked the saved AFT index of /p against all 12 files on disk; none changed since it was saved."
+        );
+        assert_eq!(
+            verified_line(&check, root, Some(Duration::from_secs(6))),
+            "Checked the saved AFT index of /p against all 12 files on disk 6 s ago; none changed since it was saved."
         );
         check.changed = 2;
         check.added = 1;
         check.removed = 3;
         assert_eq!(
-            verified_line(&check, root),
+            verified_line(&check, root, None),
             "Checked the saved AFT index of /p against all 12 files on disk; since it was saved 2 files changed, 1 file was added, 3 files were deleted, and the current files were searched."
         );
     }

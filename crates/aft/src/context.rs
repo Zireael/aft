@@ -2636,6 +2636,10 @@ enum BorrowedIndexCacheValue {
 struct BorrowedIndexCache {
     entries: VecDeque<(BorrowedIndexCacheKey, BorrowedIndexCacheValue)>,
     resolved_roots: VecDeque<(PathBuf, GitEntrySignature)>,
+    /// Copies of borrowed search indexes recently compared with their
+    /// project's files on disk. Each lives only as long as its project's
+    /// entries here: replacing or dropping them drops the copy too.
+    checked_overlays: crate::commands::semantic_search::external_disk_check::CheckedOverlays,
 }
 
 impl BorrowedIndexCache {
@@ -2676,10 +2680,20 @@ impl BorrowedIndexCache {
             candidate.canonical_root != key.canonical_root
                 || candidate.artifact.path != key.artifact.path
         });
+        // A new search or semantic generation for this project makes its
+        // checked copy describe indexes no longer served.
+        self.checked_overlays.forget_root(&key.canonical_root);
         self.entries.push_back((key, value));
         while self.entries.len() > BORROWED_INDEX_CACHE_CAPACITY {
             self.entries.pop_front();
         }
+        let entries = &self.entries;
+        self.checked_overlays.retain_roots(|root| {
+            entries.iter().any(|(candidate, value)| {
+                candidate.canonical_root == root
+                    && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
+            })
+        });
     }
 
     fn resolved_root(&mut self, requested_root: &Path) -> Option<PathBuf> {
@@ -2709,6 +2723,7 @@ impl BorrowedIndexCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.resolved_roots.clear();
+        self.checked_overlays.clear();
     }
 }
 
@@ -5174,6 +5189,17 @@ impl AppContext {
     #[cfg(test)]
     pub(crate) fn borrowed_index_cache_len_for_test(&self) -> usize {
         self.borrowed_index_cache.lock().entries.len()
+    }
+
+    /// Run `use_overlays` on the recently checked copies of borrowed search
+    /// indexes, under the borrowed-index cache lock.
+    pub(crate) fn with_checked_overlays<R>(
+        &self,
+        use_overlays: impl FnOnce(
+            &mut crate::commands::semantic_search::external_disk_check::CheckedOverlays,
+        ) -> R,
+    ) -> R {
+        use_overlays(&mut self.borrowed_index_cache.lock().checked_overlays)
     }
 
     pub fn configure_generation(&self) -> u64 {

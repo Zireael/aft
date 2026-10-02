@@ -1228,8 +1228,10 @@ mod tests {
         let mut index = SearchIndex::build(&root);
         index.write_to_disk(&cache_dir, None);
         let ctx = render_context(session.path(), storage.path());
+        // Later queries in the loop reuse the first check, so the line may
+        // also say how long ago it was made ("on disk 0 s ago; ...").
         let checked = format!(
-            "Checked the saved AFT index of {} against all {} files on disk; none changed since it was saved.",
+            "Checked the saved AFT index of {} against all {} files on disk",
             root.display(),
             index.file_count()
         );
@@ -1237,13 +1239,23 @@ mod tests {
             "Answered from the saved AFT index of {} (saved ",
             root.display()
         );
-        for query in ["how are unbound rows rejected", "\"unbound rows\""] {
+        let queries = ["how are unbound rows rejected", "\"unbound rows\""];
+        for query in queries {
             for subc in [false, true] {
                 let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
                 assert!(text.contains(&checked), "{query}: {text}");
+                assert!(
+                    text.contains("; none changed since it was saved."),
+                    "{query}: {text}"
+                );
                 assert!(!text.contains(&unchecked), "{query}: {text}");
                 assert!(!text.contains("exact pass:"), "{query}: {text}");
-
+            }
+        }
+        // A zero walk budget stops every check before its first file; the
+        // override also turns reuse off, so each query checks again.
+        for query in queries {
+            for subc in [false, true] {
                 let text = super::super::external_disk_check::with_budgets_for_test(
                     Duration::ZERO,
                     Duration::from_secs(5),

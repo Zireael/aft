@@ -6,7 +6,7 @@ pub mod data_file;
 pub mod evidence_descriptor;
 pub mod exact_lane;
 pub mod extensions;
-mod external_disk_check;
+pub(crate) mod external_disk_check;
 mod external_exact;
 pub mod generation_token;
 pub mod lexical_lane;
@@ -2115,16 +2115,40 @@ fn handle_external_search(
         ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
     ) && !identifier_sweep
     {
-        let checked = external_disk_check::check_against_disk(
-            &search_index,
-            &external_root,
-            usable_semantic_index
-                .as_deref()
-                .filter(|_| semantic_lane_answers),
-        );
-        if search_cancellation_requested() {
-            return cancelled_search_response(req);
-        }
+        let generation = artifacts.search_generation.as_str();
+        let budgets = external_disk_check::budgets();
+        let reused = ctx.with_checked_overlays(|overlays| {
+            overlays.reuse(
+                &external_root,
+                generation,
+                &search_index,
+                usable_semantic_index.as_ref(),
+                budgets.reuse_window,
+            )
+        });
+        let (checked, age) = match reused {
+            Some((checked, age)) => (checked, Some(age)),
+            None => {
+                let checked = external_disk_check::check_against_disk(
+                    &search_index,
+                    &external_root,
+                    usable_semantic_index.as_deref(),
+                );
+                if search_cancellation_requested() {
+                    return cancelled_search_response(req);
+                }
+                ctx.with_checked_overlays(|overlays| {
+                    overlays.remember(
+                        &external_root,
+                        generation,
+                        &search_index,
+                        usable_semantic_index.as_ref(),
+                        checked.clone(),
+                    )
+                });
+                (checked, None)
+            }
+        };
         // Rankings cached for the saved index must not answer for the
         // checked copy, which holds different postings.
         if let Some(digest) = &checked.applied_digest {
@@ -2133,7 +2157,7 @@ fn handle_external_search(
                 artifacts.search_generation.as_str()
             ));
         }
-        disk_check = Some(checked.check);
+        disk_check = Some((checked.check, age));
         checked.index
     } else {
         search_index
@@ -2173,12 +2197,13 @@ fn handle_external_search(
             engine_plan,
         ),
     };
-    if let Some(check) = &disk_check {
+    if let Some((check, age)) = &disk_check {
         disclose_checked_saved_index(
             &mut response,
             &notice_root,
             search_artifact_path.as_deref(),
             check,
+            *age,
             semantic_lane_answers,
         );
     } else if served_from_saved_index {
@@ -2199,12 +2224,15 @@ fn handle_external_search(
 /// what had changed. A check cut short by its time limit keeps the
 /// unchecked-index notice, saying how far the check got, and marks the reply
 /// incomplete. Either way, when the semantic lane answered from a saved
-/// semantic index that predates some files, the reply says how many.
+/// semantic index that predates some files, the reply says how many. `age` is
+/// how long ago the check was made when an earlier query's check was reused;
+/// both sentences then say so.
 fn disclose_checked_saved_index(
     response: &mut Response,
     external_root: &Path,
     search_artifact_path: Option<&Path>,
     check: &external_disk_check::DiskCheck,
+    age: Option<Duration>,
     semantic_lane_answered: bool,
 ) {
     if !response.success {
@@ -2216,11 +2244,15 @@ fn disclose_checked_saved_index(
     if data.contains_key("exact_sweep") {
         return;
     }
-    data.insert("saved_index_check".to_string(), check.to_json());
+    let mut summary = check.to_json();
+    summary["reused"] = serde_json::json!(age.is_some());
+    summary["checked_ms_ago"] =
+        serde_json::json!(age.map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)));
+    data.insert("saved_index_check".to_string(), summary);
     if check.verified() {
         append_reply_paragraph(
             data,
-            &external_disk_check::verified_line(check, external_root),
+            &external_disk_check::verified_line(check, external_root, age),
         );
     } else {
         data.insert("complete".to_string(), serde_json::json!(false));
@@ -2236,7 +2268,10 @@ fn disclose_checked_saved_index(
             response,
             external_root,
             search_artifact_path,
-            Some(&external_disk_check::unverified_detail(check)),
+            Some((
+                &external_disk_check::checked_ago(age),
+                &external_disk_check::unverified_detail(check),
+            )),
         );
     }
 }
@@ -2259,15 +2294,16 @@ fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>,
 ///
 /// Nothing in this session refreshes another project's index, and loading it
 /// does not compare it with the files on disk, so text added or changed since
-/// it was saved can be missing from the results. `checked`, when given, says
-/// how far a time-limited comparison got; without it nothing was compared.
+/// it was saved can be missing from the results. `checked`, when given, is how
+/// long ago a time-limited comparison ran (empty when it ran for this query)
+/// and how far it got; without it nothing was compared.
 /// Replies whose identifier sweep read every changed file from disk (they
 /// carry `exact_sweep`) are already checked and get no notice.
 fn disclose_unverified_saved_index(
     response: &mut Response,
     external_root: &Path,
     search_artifact_path: Option<&Path>,
-    checked: Option<&str>,
+    checked: Option<(&str, &str)>,
 ) {
     if !response.success {
         return;
@@ -2301,8 +2337,8 @@ fn disclose_unverified_saved_index(
             "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
             external_root.display()
         ),
-        Some(checked) => format!(
-            "Answered from the saved AFT index of {}{when}, which was only partly checked against the files on disk: {checked}. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check.",
+        Some((ago, checked)) => format!(
+            "Answered from the saved AFT index of {}{when}, which was only partly checked against the files on disk{ago}: {checked}. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check.",
             external_root.display()
         ),
     };
