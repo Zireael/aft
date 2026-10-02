@@ -1126,8 +1126,18 @@ mod tests {
     /// no score, no empty snippet, no data file).
     fn assert_clean_identifier_text(text: &str, root: &Path, coverage_source: &str) {
         let root_text = root.display().to_string();
+        // Paths render with the platform's separator.
+        let shown = |relative: &str| {
+            relative
+                .split('/')
+                .fold(root.to_path_buf(), |path, part| path.join(part))
+                .display()
+                .to_string()
+        };
         let expected_head = format!(
-            "{root_text}/src/store/pool.ts:2 [exact]\n        requireCredentialStamps?: boolean\n\n{root_text}/src/guard.ts:1 [exact]\n      assert(opts.requireCredentialStamps === true)\n"
+            "{}:2 [exact]\n        requireCredentialStamps?: boolean\n\n{}:1 [exact]\n      assert(opts.requireCredentialStamps === true)\n",
+            shown("src/store/pool.ts"),
+            shown("src/guard.ts")
         );
         assert!(text.starts_with(&expected_head), "{text}");
         let (results, footer) = text.split_once("\n\nFound 8 result(s).\n\n").expect(text);
@@ -1150,7 +1160,8 @@ mod tests {
         }
         assert!(
             blocks[7].starts_with(&format!(
-                "{root_text}/src/legacy.py:1 [variant: require_credential_stamps]\n      def require_credential_stamps(row):"
+                "{}:1 [variant: require_credential_stamps]\n      def require_credential_stamps(row):",
+                shown("src/legacy.py")
             )),
             "{text}"
         );
