@@ -284,6 +284,16 @@ fn open_search_index_from_cache_dir_with_budget(
     open_search_index_cancellable(project_root, cache_dir, max_records, duration, &|| true)
 }
 
+/// Parse another session's saved search index for `project_root`.
+///
+/// `Fresh` here means the snapshot parsed, matches this root's coverage and
+/// ignore rules; it does not mean its records match the files on disk, which
+/// this opener never reads. The result is cached across requests, so the disk
+/// can change after it loads. Callers that answer queries from it must compare
+/// it with the disk themselves: the external `aft_search` path does so on every
+/// query (`semantic_search::external_disk_check`), and a read-only session
+/// reconciles its own borrowed snapshot before publishing it
+/// (`SearchIndex::reconcile_borrowed_snapshot_with_disk`).
 pub(crate) fn open_search_index_cancellable(
     project_root: &Path,
     cache_dir: PathBuf,
