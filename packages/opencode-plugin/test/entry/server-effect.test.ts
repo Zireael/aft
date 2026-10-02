@@ -127,6 +127,9 @@ function hostContext(
 describe("V2 server effect", () => {
   test("each start line names the entry and the Location, and pairs with a stop line", async () => {
     const log = spyOn(logger, "log");
+    // Another suite may have replaced log with a mock that already has calls.
+    // Count only runtime messages from the two Locations created in this test.
+    log.mockClear();
     try {
       const events: string[] = [];
       const effect = makeServerEffect(testDependencies(events));

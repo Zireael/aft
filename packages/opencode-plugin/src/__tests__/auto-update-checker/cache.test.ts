@@ -19,7 +19,9 @@ const terminateNpmProcessTreeMock = mock((proc: childProcess.ChildProcess) => {
 
 // Make npm resolution deterministic so the test does not depend on the host
 // environment having npm on PATH (the resolver now searches beyond PATH).
+const realBridge = await import("@cortexkit/aft-bridge");
 mock.module("@cortexkit/aft-bridge", () => ({
+  ...realBridge,
   resolveNpm: () => ({ command: "/usr/bin/npm", binDir: "/usr/bin" }),
   npmInvocation: (_npm: unknown, args: readonly string[]) => ({
     command: "/usr/bin/npm",
