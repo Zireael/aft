@@ -856,24 +856,40 @@ fn eligible_terminal_rows_observed(
     Ok(EligibleTerminalRows::Count { rows, lock_micros })
 }
 
-fn retention_db_key(db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>) -> usize {
+type SharedDb = std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>;
+
+fn retention_db_key(db: &SharedDb) -> usize {
     std::sync::Arc::as_ptr(db) as usize
 }
 
-fn retention_skip_reasons() -> &'static Mutex<HashMap<usize, RetentionSweepSkipReason>> {
-    static SKIPS: std::sync::OnceLock<Mutex<HashMap<usize, RetentionSweepSkipReason>>> =
+/// Last sweep skip reason per shared connection, keyed by the connection's
+/// allocation address. Each entry holds a `Weak` to that allocation: while the
+/// weak count is non-zero the allocator cannot hand the address to a new
+/// connection, so a reopened database never inherits the previous
+/// connection's skip reason. Entries whose connection was dropped are pruned
+/// on every write so the map stays bounded by the live connections.
+struct RetentionSkip {
+    owner: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
+    reason: RetentionSweepSkipReason,
+}
+
+fn retention_skip_reasons() -> &'static Mutex<HashMap<usize, RetentionSkip>> {
+    static SKIPS: std::sync::OnceLock<Mutex<HashMap<usize, RetentionSkip>>> =
         std::sync::OnceLock::new();
     SKIPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_retention_sweep_skip(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-    reason: Option<RetentionSweepSkipReason>,
-) {
-    let mut skips = retention_skip_reasons().lock();
+fn record_retention_sweep_skip(db: &SharedDb, reason: Option<RetentionSweepSkipReason>) {
+    let mut skips = retention_skips_pruned(retention_skip_reasons().lock());
     match reason {
         Some(reason) => {
-            skips.insert(retention_db_key(db), reason);
+            skips.insert(
+                retention_db_key(db),
+                RetentionSkip {
+                    owner: std::sync::Arc::downgrade(db),
+                    reason,
+                },
+            );
         }
         None => {
             skips.remove(&retention_db_key(db));
@@ -881,13 +897,18 @@ fn record_retention_sweep_skip(
     }
 }
 
-pub fn last_retention_sweep_skip_reason(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-) -> Option<RetentionSweepSkipReason> {
+fn retention_skips_pruned(
+    mut skips: parking_lot::MutexGuard<'static, HashMap<usize, RetentionSkip>>,
+) -> parking_lot::MutexGuard<'static, HashMap<usize, RetentionSkip>> {
+    skips.retain(|_, skip| skip.owner.strong_count() > 0);
+    skips
+}
+
+pub fn last_retention_sweep_skip_reason(db: &SharedDb) -> Option<RetentionSweepSkipReason> {
     retention_skip_reasons()
         .lock()
         .get(&retention_db_key(db))
-        .copied()
+        .map(|skip| skip.reason)
 }
 
 /// Use a separate read-only connection when the shared connection has a database file path;
@@ -1162,6 +1183,48 @@ mod tests {
             [task_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn retention_skip_reason_belongs_to_the_connection_that_recorded_it() {
+        let dir = tempdir().unwrap();
+        let first = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("first.db")).unwrap(),
+        ));
+        record_retention_sweep_skip(
+            &first,
+            Some(RetentionSweepSkipReason::OpeningCountLockBudgetExhausted),
+        );
+        let first_key = retention_db_key(&first);
+        assert_eq!(
+            last_retention_sweep_skip_reason(&first),
+            Some(RetentionSweepSkipReason::OpeningCountLockBudgetExhausted)
+        );
+        drop(first);
+
+        // While the entry exists it keeps the dropped connection's allocation
+        // reserved; once a later write prunes it, the address may be reused,
+        // but then there is no entry to inherit. Either way a new connection
+        // must read no reason.
+        let replacements: Vec<SharedDb> = (0..64)
+            .map(|index| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join(format!("next-{index}.db"))).unwrap(),
+                ))
+            })
+            .collect();
+        for db in &replacements {
+            assert_eq!(last_retention_sweep_skip_reason(db), None);
+        }
+
+        // The next write prunes the dropped connection's entry. Tests running
+        // in parallel share this map, so an entry now at that address may
+        // belong to another live connection, never to the dropped one.
+        record_retention_sweep_skip(&replacements[0], None);
+        assert!(retention_skip_reasons()
+            .lock()
+            .get(&first_key)
+            .is_none_or(|skip| skip.owner.strong_count() > 0));
     }
 
     #[test]
