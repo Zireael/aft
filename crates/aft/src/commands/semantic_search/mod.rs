@@ -2117,8 +2117,8 @@ fn handle_external_search(
     {
         let generation = artifacts.search_generation.as_str();
         let budgets = external_disk_check::budgets();
-        let reused = ctx.with_checked_overlays(|overlays| {
-            overlays.reuse(
+        let lookup = ctx.with_checked_overlays(|overlays| {
+            overlays.lookup(
                 &external_root,
                 generation,
                 &search_index,
@@ -2126,11 +2126,17 @@ fn handle_external_search(
                 budgets.reuse_window,
             )
         });
-        let (checked, age) = match reused {
-            Some((checked, age)) => (checked, Some(age)),
-            None => {
+        let previous = match lookup {
+            external_disk_check::OverlayLookup::Reuse(checked, age) => Ok((checked, age)),
+            external_disk_check::OverlayLookup::Resume(copy) => Err(Some(copy)),
+            external_disk_check::OverlayLookup::Fresh => Err(None),
+        };
+        let (checked, age) = match previous {
+            Ok((checked, age)) => (checked, Some(age)),
+            Err(previous) => {
                 let checked = external_disk_check::check_against_disk(
                     &search_index,
+                    previous.as_ref(),
                     &external_root,
                     usable_semantic_index.as_deref(),
                 );
@@ -2138,8 +2144,9 @@ fn handle_external_search(
                     return cancelled_search_response(req);
                 }
                 crate::slog_debug!(
-                    "external disk check of {}: {} files compared in {} ms, {} re-read in {} ms ({} not re-read, walk complete: {})",
+                    "external disk check of {}{}: {} files compared in {} ms, {} read in {} ms ({} not read, walk complete: {})",
                     external_root.display(),
+                    if previous.is_some() { " (resumed)" } else { "" },
                     checked.check.files_examined,
                     checked.walk_time.as_millis(),
                     checked.check.reread,

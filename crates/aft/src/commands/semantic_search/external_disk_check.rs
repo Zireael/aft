@@ -102,24 +102,32 @@ pub(crate) fn walks_for_test() -> usize {
     WALKS_FOR_TEST.with(Cell::get)
 }
 
-/// What comparing a saved index with the files on disk found.
+/// What comparing a saved index with the files on disk found. Every count
+/// describes the checked copy that answers the query, measured against the
+/// saved index, so a copy completed over several passes reports all of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DiskCheck {
-    /// Files the walk reached and compared with the index.
+    /// Files the latest walk reached and compared with the copy.
     pub files_examined: usize,
-    /// The walk reached every file under the root before its deadline.
+    /// The latest walk reached every file under the root before its deadline.
     pub walk_complete: bool,
-    /// Indexed files whose size or modification time differs from the index.
+    /// Saved files whose bytes on disk differ from the saved index; the copy
+    /// holds their current content.
     pub changed: usize,
-    /// Files on disk the index has no record of.
+    /// Saved files whose modification time differs from the saved index but
+    /// whose bytes, hashed, are the same; their saved postings still answer.
+    pub content_unchanged: usize,
+    /// Files on disk the saved index has no record of.
     pub added: usize,
-    /// Indexed files the finished walk did not find. Only counted when the
-    /// walk completed: an unfinished walk cannot tell missing from unvisited.
+    /// Saved files the finished walk did not find. Only counted when the walk
+    /// completed: an unfinished walk cannot tell missing from unvisited.
     pub removed: usize,
-    /// Changed or new files whose current content was read into the index.
+    /// Changed or new files whose current content the copy holds.
     pub reread: usize,
-    /// Changed or new files found but not read before the deadline; the saved
-    /// index still answers for them (or, for new files, does not know them).
+    /// Files whose size or modification time differs from the copy and that
+    /// were neither hashed nor read before the deadline; the copy still
+    /// answers for them as the saved index does (or, for new files, does not
+    /// know them).
     pub not_reread: usize,
     /// Examined files the saved semantic index describes with older content,
     /// plus new files it has no vectors for. Zero when no semantic index was
@@ -140,6 +148,7 @@ impl DiskCheck {
             "files_examined": self.files_examined,
             "walk_complete": self.walk_complete,
             "changed": self.changed,
+            "content_unchanged": self.content_unchanged,
             "added": self.added,
             "removed": self.removed,
             "reread": self.reread,
@@ -189,25 +198,48 @@ pub(crate) struct CheckedOverlays {
     entries: VecDeque<CheckedOverlay>,
 }
 
+/// What [`CheckedOverlays::lookup`] found for a project.
+pub(crate) enum OverlayLookup {
+    /// A check made less than the reuse window ago from these same indexes,
+    /// with its age: answer from it without walking.
+    Reuse(CheckedIndex, Duration),
+    /// An older check made from the same saved index: walk again, but start
+    /// from its copy, so differences it already read are not read again and a
+    /// check its time limits cut short carries on where it stopped.
+    Resume(Arc<SearchIndex>),
+    /// Nothing usable: check from the saved index.
+    Fresh,
+}
+
 impl CheckedOverlays {
-    /// The check made for `root` from these same indexes less than `window`
-    /// ago, with its age. An expired or mismatched entry is dropped.
-    pub(super) fn reuse(
+    /// What the kept check for `root` can do for a query answered from the
+    /// saved index `saved` (generation `generation`) and semantic index
+    /// `semantic`. An entry for a different saved index is dropped.
+    pub(super) fn lookup(
         &mut self,
         root: &Path,
         generation: &str,
         saved: &Arc<SearchIndex>,
         semantic: Option<&Arc<SemanticIndex>>,
         window: Duration,
-    ) -> Option<(CheckedIndex, Duration)> {
-        let position = self.entries.iter().position(|entry| entry.root == root)?;
-        let entry = self.entries.remove(position)?;
+    ) -> OverlayLookup {
+        let Some(position) = self.entries.iter().position(|entry| entry.root == root) else {
+            return OverlayLookup::Fresh;
+        };
+        let Some(entry) = self.entries.remove(position) else {
+            return OverlayLookup::Fresh;
+        };
         let age = entry.checked_at.elapsed();
         let same_saved = entry.generation == generation
             && entry
                 .saved
                 .upgrade()
                 .is_some_and(|kept| Arc::ptr_eq(&kept, saved));
+        if !same_saved {
+            return OverlayLookup::Fresh;
+        }
+        // The semantic index only feeds a count the next walk recomputes, so
+        // a different one rules out reusing the check, not resuming from it.
         let same_semantic = match (&entry.semantic, semantic) {
             (None, None) => true,
             (Some(kept), Some(current)) => kept
@@ -215,12 +247,12 @@ impl CheckedOverlays {
                 .is_some_and(|kept| Arc::ptr_eq(&kept, current)),
             _ => false,
         };
-        if age >= window || !same_saved || !same_semantic {
-            return None;
+        if age >= window || !same_semantic {
+            return OverlayLookup::Resume(entry.checked.index);
         }
         let reused = entry.checked.clone();
         self.entries.push_back(entry);
-        Some((reused, age))
+        OverlayLookup::Reuse(reused, age)
     }
 
     pub(super) fn remember(
@@ -264,27 +296,94 @@ impl CheckedOverlays {
     }
 }
 
-/// Compare `index` with the files under `root` and apply what differs.
+/// Changed files whose size still matches are hashed this many at a time, so
+/// the re-read deadline is checked between batches.
+const VERIFY_BATCH: usize = 512;
+
+#[cfg(test)]
+thread_local! {
+    /// Most hashed or read files one check may handle, standing in for the
+    /// re-read deadline in tests that need a pass to stop at a known point.
+    static WORK_LIMIT_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
+    static REINDEXES_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_work_limit_for_test<R>(limit: usize, run: impl FnOnce() -> R) -> R {
+    WORK_LIMIT_FOR_TEST.with(|slot| {
+        let previous = slot.replace(Some(limit));
+        let result = run();
+        slot.set(previous);
+        result
+    })
+}
+
+/// How many files [`check_against_disk`] has re-indexed on this thread.
+#[cfg(test)]
+pub(crate) fn reindexes_for_test() -> usize {
+    REINDEXES_FOR_TEST.with(Cell::get)
+}
+
+fn work_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = WORK_LIMIT_FOR_TEST.with(Cell::get) {
+        return limit;
+    }
+    usize::MAX
+}
+
+/// One file the walk reached.
+struct WalkedFile {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+    /// Its size or modification time differs from the copy being checked.
+    differs: bool,
+    /// The difference was resolved: hashed and found unchanged, or read.
+    resolved: bool,
+}
+
+/// Compare the files under `root` with the saved index `saved` and bring a
+/// copy of it in line with them.
+///
+/// `previous`, when given, is the copy an earlier check of this same saved
+/// index produced. The walk then compares the disk with that copy, so only
+/// what changed since, or what the earlier check had no time for, is hashed
+/// or read. The counts in the result always compare the final copy with
+/// `saved`, however many passes built it.
+///
+/// A file whose size still matches but whose modification time differs (every
+/// file of a fresh checkout or worktree) is hashed first and compared with
+/// the content hash the index recorded; only a real content difference is
+/// re-indexed. Hashing and reading share the re-read deadline.
 ///
 /// `semantic`, when given, is the project's saved semantic index; files it
 /// describes with older content are counted in
 /// [`DiskCheck::semantic_outdated`] (vectors cannot be recomputed here).
 pub(super) fn check_against_disk(
-    index: &Arc<SearchIndex>,
+    saved: &Arc<SearchIndex>,
+    previous: Option<&Arc<SearchIndex>>,
     root: &Path,
     semantic: Option<&SemanticIndex>,
 ) -> CheckedIndex {
     let budgets = budgets();
     #[cfg(test)]
     WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
+    let base = previous.unwrap_or(saved);
+    let base_is_saved = Arc::ptr_eq(base, saved);
     let walk_started = Instant::now();
     let walk_deadline = walk_started + budgets.walk;
     let stop_requested =
         |deadline: Instant| Instant::now() >= deadline || crate::executor::current_job_cancelled();
 
     let mut check = DiskCheck::default();
-    let mut seen = vec![false; index.files.len()];
-    let mut differing: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut walked: Vec<WalkedFile> = Vec::new();
+    let mut seen_base = vec![false; base.files.len()];
+    let mut seen_saved = if base_is_saved {
+        Vec::new()
+    } else {
+        vec![false; saved.files.len()]
+    };
     let mut walk_complete = true;
     // `SearchIndex::build` enumerates files with this same walker
     // (`project_walk_builder`, which honours .gitignore and .aftignore and
@@ -302,103 +401,229 @@ pub(super) fn check_against_disk(
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        check.files_examined += 1;
         let size = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         let path = entry.path();
-        let added = match index.path_to_id.get(path) {
-            Some(&file_id) => {
-                if let Some(slot) = seen.get_mut(file_id as usize) {
-                    *slot = true;
-                }
-                let unchanged = index
-                    .files
-                    .get(file_id as usize)
-                    .is_some_and(|recorded| recorded.size == size && recorded.modified == modified);
-                if !unchanged {
-                    check.changed += 1;
-                    differing.push((path.to_path_buf(), size, modified));
-                }
-                false
+        let in_base = base.path_to_id.get(path).copied();
+        if let Some(slot) = in_base.and_then(|file_id| seen_base.get_mut(file_id as usize)) {
+            *slot = true;
+        }
+        let in_saved = if base_is_saved {
+            in_base.is_some()
+        } else {
+            let file_id = saved.path_to_id.get(path).copied();
+            if let Some(slot) = file_id.and_then(|file_id| seen_saved.get_mut(file_id as usize)) {
+                *slot = true;
             }
-            None => {
-                check.added += 1;
-                differing.push((path.to_path_buf(), size, modified));
-                true
-            }
+            file_id.is_some()
         };
+        let matches_base = in_base
+            .and_then(|file_id| base.files.get(file_id as usize))
+            .is_some_and(|recorded| recorded.size == size && recorded.modified == modified);
         if let Some(semantic) = semantic {
             let outdated = match semantic.recorded_stat(path) {
                 Some((recorded_mtime, recorded_size)) => {
                     recorded_mtime != modified
                         || recorded_size.is_some_and(|recorded| recorded != size)
                 }
-                None => added,
+                None => !in_saved,
             };
             if outdated {
                 check.semantic_outdated += 1;
             }
         }
+        walked.push(WalkedFile {
+            path: path.to_path_buf(),
+            size,
+            modified,
+            differs: !matches_base,
+            resolved: false,
+        });
     }
+    check.files_examined = walked.len();
     check.walk_complete = walk_complete;
 
-    let removed: Vec<PathBuf> = if walk_complete {
+    let unseen = |index: &SearchIndex, seen: &[bool]| -> Vec<PathBuf> {
         index
             .files
             .iter()
-            .zip(&seen)
+            .zip(seen)
             .filter(|(entry, seen)| !**seen && !entry.path.as_os_str().is_empty())
             .map(|(entry, _)| entry.path.clone())
             .collect()
-    } else {
-        Vec::new()
     };
-    check.removed = removed.len();
+    let (removed_from_base, removed_from_saved) = if !walk_complete {
+        (Vec::new(), Vec::new())
+    } else if base_is_saved {
+        let removed = unseen(base, &seen_base);
+        (removed.clone(), removed)
+    } else {
+        (unseen(base, &seen_base), unseen(saved, &seen_saved))
+    };
     let walk_time = walk_started.elapsed();
 
-    if differing.is_empty() && removed.is_empty() {
-        return CheckedIndex {
-            index: Arc::clone(index),
-            check,
-            applied_digest: None,
-            walk_time,
-            reread_time: Duration::ZERO,
-        };
+    let mut work: Vec<usize> = (0..walked.len()).filter(|&i| walked[i].differs).collect();
+    let reread_started = Instant::now();
+    let mut copy = None;
+    if !work.is_empty() || !removed_from_base.is_empty() {
+        let mut overlay = SearchIndex::clone(base);
+        for path in &removed_from_base {
+            overlay.remove_file(path);
+        }
+        resolve_differences(&mut overlay, &mut walked, &mut work, budgets.reread);
+        copy = Some(overlay);
     }
+    let reread_time = reread_started.elapsed();
+
+    // Describe the final copy against the saved index.
+    let current: &SearchIndex = copy.as_ref().unwrap_or(base.as_ref());
+    let mut digest_entries: Vec<(&Path, u64, SystemTime)> = Vec::new();
+    for file in &walked {
+        let recorded = saved
+            .path_to_id
+            .get(&file.path)
+            .and_then(|&file_id| saved.files.get(file_id as usize));
+        if file.differs && !file.resolved {
+            check.not_reread += 1;
+            if recorded.is_none() {
+                check.added += 1;
+            }
+            continue;
+        }
+        let held = current
+            .path_to_id
+            .get(&file.path)
+            .and_then(|&file_id| current.files.get(file_id as usize));
+        let Some(held) = held else {
+            // Gone between the walk and the read.
+            continue;
+        };
+        match recorded {
+            None => {
+                check.added += 1;
+                check.reread += 1;
+                digest_entries.push((&file.path, file.size, file.modified));
+            }
+            Some(recorded) if recorded.size == file.size && recorded.modified == file.modified => {}
+            Some(recorded) if recorded.content_hash == held.content_hash => {
+                check.content_unchanged += 1;
+            }
+            Some(_) => {
+                check.changed += 1;
+                check.reread += 1;
+                digest_entries.push((&file.path, file.size, file.modified));
+            }
+        }
+    }
+    check.removed = removed_from_saved.len();
+
+    let applied_digest =
+        (!digest_entries.is_empty() || !removed_from_saved.is_empty()).then(|| {
+            digest_entries.sort();
+            let mut removed: Vec<&PathBuf> = removed_from_saved.iter().collect();
+            removed.sort();
+            let mut digest = blake3::Hasher::new();
+            for path in removed {
+                digest.update(b"-");
+                digest.update(path.as_os_str().as_encoded_bytes());
+            }
+            for (path, size, modified) in digest_entries {
+                digest.update(b"+");
+                digest.update(path.as_os_str().as_encoded_bytes());
+                digest.update(&size.to_le_bytes());
+                let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+                digest.update(&since_epoch.as_nanos().to_le_bytes());
+            }
+            digest.finalize().to_hex()[..16].to_string()
+        });
+
+    CheckedIndex {
+        index: copy.map(Arc::new).unwrap_or_else(|| Arc::clone(base)),
+        check,
+        applied_digest,
+        walk_time,
+        reread_time,
+    }
+}
+
+/// Hash or read the walked files listed in `work` into `copy`, program source
+/// first, until `budget` runs out. Files whose size matches the copy's record
+/// are hashed in parallel batches and only re-indexed when their bytes
+/// differ; a hash match just records the new modification time, so the next
+/// check of this copy sees the file as unchanged.
+fn resolve_differences(
+    copy: &mut SearchIndex,
+    walked: &mut [WalkedFile],
+    work: &mut [usize],
+    budget: Duration,
+) {
+    use crate::cache_freshness::{FileFreshness, FreshnessVerdict, VerifyStrategy};
 
     // Read program source before documentation and data files (the
     // `classify_file` order), so if the deadline stops the re-read, the files
     // a code search most needs current are the ones already read.
-    differing.sort_by_cached_key(|(path, ..)| (classify_file(path), path.clone()));
-    let mut overlay = SearchIndex::clone(index);
-    let mut digest = blake3::Hasher::new();
-    for path in &removed {
-        overlay.remove_file(path);
-        digest.update(b"-");
-        digest.update(path.as_os_str().as_encoded_bytes());
-    }
-    let reread_started = Instant::now();
-    let reread_deadline = reread_started + budgets.reread;
-    for (path, size, modified) in &differing {
-        if stop_requested(reread_deadline) {
-            break;
+    work.sort_by_cached_key(|&i| (classify_file(&walked[i].path), walked[i].path.clone()));
+    let deadline = Instant::now() + budget;
+    let stop_requested = || Instant::now() >= deadline || crate::executor::current_job_cancelled();
+    let mut remaining = work_limit();
+    for batch in work.chunks(VERIFY_BATCH) {
+        if stop_requested() || remaining == 0 {
+            return;
         }
-        overlay.update_file(path);
-        check.reread += 1;
-        digest.update(b"+");
-        digest.update(path.as_os_str().as_encoded_bytes());
-        digest.update(&size.to_le_bytes());
-        let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-        digest.update(&since_epoch.as_nanos().to_le_bytes());
-    }
-    check.not_reread = differing.len() - check.reread;
-
-    CheckedIndex {
-        index: Arc::new(overlay),
-        check,
-        applied_digest: Some(digest.finalize().to_hex()[..16].to_string()),
-        walk_time,
-        reread_time: reread_started.elapsed(),
+        let batch = &batch[..batch.len().min(remaining)];
+        remaining -= batch.len();
+        let mut to_hash = Vec::new();
+        let mut to_read = Vec::new();
+        for &i in batch {
+            let file = &walked[i];
+            let recorded = copy
+                .path_to_id
+                .get(&file.path)
+                .and_then(|&file_id| copy.files.get(file_id as usize));
+            match recorded {
+                Some(recorded) if recorded.size == file.size => to_hash.push((
+                    i,
+                    file.path.clone(),
+                    FileFreshness {
+                        mtime: recorded.modified,
+                        size: recorded.size,
+                        content_hash: recorded.content_hash,
+                    },
+                )),
+                _ => to_read.push(i),
+            }
+        }
+        for (i, path, verdict) in
+            crate::cache_freshness::verify_files_bounded(to_hash, VerifyStrategy::StatFirst)
+        {
+            match verdict {
+                FreshnessVerdict::HotFresh => walked[i].resolved = true,
+                FreshnessVerdict::ContentFresh {
+                    new_mtime,
+                    new_size,
+                } => {
+                    if let Some(&file_id) = copy.path_to_id.get(&path) {
+                        if let Some(entry) =
+                            Arc::make_mut(&mut copy.files).get_mut(file_id as usize)
+                        {
+                            entry.modified = new_mtime;
+                            entry.size = new_size;
+                        }
+                    }
+                    walked[i].resolved = true;
+                }
+                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => to_read.push(i),
+            }
+        }
+        for i in to_read {
+            if stop_requested() {
+                return;
+            }
+            #[cfg(test)]
+            REINDEXES_FOR_TEST.with(|count| count.set(count.get() + 1));
+            copy.update_file(&walked[i].path);
+            walked[i].resolved = true;
+        }
     }
 }
 
@@ -570,7 +795,7 @@ mod tests {
         let (_dir, root) = project(&[("src/lib.rs", "pub fn kept_needle() {}\n")]);
         let index = Arc::new(SearchIndex::build(&root));
 
-        let checked = check_against_disk(&index, &root, None);
+        let checked = check_against_disk(&index, None, &root, None);
 
         assert!(checked.check.verified(), "{:?}", checked.check);
         assert_eq!(checked.check.files_examined, 1);
@@ -597,7 +822,7 @@ mod tests {
         std::fs::write(root.join("src/added.rs"), "pub fn added_needle() {}\n").unwrap();
         assert!(postings_find(&index, &root, "added_needle").is_empty());
 
-        let checked = check_against_disk(&index, &root, None);
+        let checked = check_against_disk(&index, None, &root, None);
 
         assert_eq!(
             checked.check,
@@ -605,6 +830,7 @@ mod tests {
                 files_examined: 3,
                 walk_complete: true,
                 changed: 1,
+                content_unchanged: 0,
                 added: 1,
                 removed: 1,
                 reread: 2,
@@ -628,7 +854,7 @@ mod tests {
         );
         // The saved index itself is left exactly as it was loaded.
         assert!(postings_find(&index, &root, "added_needle").is_empty());
-        let again = check_against_disk(&index, &root, None);
+        let again = check_against_disk(&index, None, &root, None);
         assert_eq!(again.applied_digest, checked.applied_digest);
     }
 
@@ -732,6 +958,102 @@ mod tests {
         );
     }
 
+    /// A fresh checkout or worktree has every file's modification time
+    /// changed and its bytes the same. Those files are hashed and kept on the
+    /// saved postings; only a real content change is re-indexed.
+    #[test]
+    fn mtime_only_changes_are_hashed_not_reindexed() {
+        let (_dir, root) = project(&[
+            ("src/a.rs", "pub fn a_needle() {}\n"),
+            ("src/b.rs", "pub fn b_needle() {}\n"),
+            ("src/c.rs", "pub fn c_needle() {}\n"),
+        ]);
+        for name in ["a", "b", "c"] {
+            backdate(&root.join(format!("src/{name}.rs")));
+        }
+        let index = Arc::new(SearchIndex::build(&root));
+        let touched = filetime::FileTime::from_unix_time(1_100_000_000, 0);
+        for name in ["a", "b"] {
+            filetime::set_file_mtime(root.join(format!("src/{name}.rs")), touched).unwrap();
+        }
+        // Same length, different bytes: only a hash can tell this one changed.
+        std::fs::write(root.join("src/c.rs"), "pub fn x_needle() {}\n").unwrap();
+
+        let before = reindexes_for_test();
+        let checked = check_against_disk(&index, None, &root, None);
+
+        assert_eq!(reindexes_for_test() - before, 1, "only c.rs is re-indexed");
+        assert!(checked.check.verified(), "{:?}", checked.check);
+        assert_eq!(checked.check.content_unchanged, 2);
+        assert_eq!(checked.check.changed, 1);
+        assert_eq!(checked.check.reread, 1);
+        assert_eq!(
+            postings_find(&checked.index, &root, "x_needle"),
+            vec![root.join("src/c.rs")]
+        );
+        assert_eq!(
+            postings_find(&checked.index, &root, "a_needle"),
+            vec![root.join("src/a.rs")]
+        );
+
+        // Checking the copy again finds nothing left to hash or read, and
+        // still describes the copy against the saved index.
+        let before = reindexes_for_test();
+        let again = check_against_disk(&index, Some(&checked.index), &root, None);
+        assert_eq!(reindexes_for_test() - before, 0);
+        assert_eq!(again.check, checked.check);
+        assert_eq!(again.applied_digest, checked.applied_digest);
+    }
+
+    /// A check its time limit cut short is carried on by the next one after
+    /// the reuse window, from the copy it left, and the reply then counts
+    /// every file the copy holds, not only the second pass.
+    #[test]
+    fn a_capped_check_completes_over_two_windows() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_dir, root, _storage, _session, ctx) = borrowed_search_fixture();
+        for file in 0..4 {
+            std::fs::write(
+                root.join(format!("src/added_{file}.rs")),
+                format!("pub fn added_after_save_{file}() {{}}\n"),
+            )
+            .unwrap();
+        }
+
+        let pass = || {
+            with_budgets_for_test(Duration::from_secs(5), Duration::from_secs(5), || {
+                with_work_limit_for_test(2, || {
+                    let before = reindexes_for_test();
+                    let response = prose_search(&ctx, &root);
+                    (response, reindexes_for_test() - before)
+                })
+            })
+        };
+        let (first, first_reads) = pass();
+        let (second, second_reads) = pass();
+
+        assert_eq!(first_reads, 2);
+        assert_eq!(first["complete"], false, "{first:#?}");
+        assert_eq!(first["saved_index_check"]["added"], 4);
+        assert_eq!(first["saved_index_check"]["reread"], 2);
+        assert_eq!(first["saved_index_check"]["not_reread"], 2);
+
+        assert_eq!(
+            second_reads, 2,
+            "the second pass reads only what the first left"
+        );
+        assert_eq!(second["saved_index_check"]["complete"], true, "{second:#?}");
+        assert_eq!(second["saved_index_check"]["reused"], false);
+        assert_eq!(second["saved_index_check"]["added"], 4);
+        assert_eq!(second["saved_index_check"]["reread"], 4);
+        assert_eq!(second["saved_index_check"]["not_reread"], 0);
+        let text = second["text"].as_str().expect("text");
+        assert!(
+            text.contains("against all 5 files on disk; since it was saved 4 files were added"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn checked_overlays_keep_one_entry_per_root_and_at_most_eight_roots() {
         let index = Arc::new(SearchIndex::new());
@@ -756,27 +1078,36 @@ mod tests {
         }
         assert_eq!(overlays.len(), MAX_CHECKED_ROOTS);
         let window = Duration::from_secs(600);
+        let is_fresh = |lookup: OverlayLookup| matches!(lookup, OverlayLookup::Fresh);
         assert!(
-            overlays
-                .reuse(Path::new("/root1"), "generation1", &index, None, window)
-                .is_none(),
+            is_fresh(overlays.lookup(Path::new("/root1"), "generation1", &index, None, window)),
             "the least recently used roots were dropped"
         );
         assert!(
-            overlays
-                .reuse(Path::new("/root9"), "generation0", &index, None, window)
-                .is_none(),
-            "a check made for an older generation is not reused"
+            is_fresh(overlays.lookup(Path::new("/root9"), "generation0", &index, None, window)),
+            "a check made for an older generation is neither reused nor resumed"
         );
-        assert!(overlays
-            .reuse(Path::new("/root8"), "generation1", &index, None, window)
-            .is_some());
+        assert!(matches!(
+            overlays.lookup(Path::new("/root8"), "generation1", &index, None, window),
+            OverlayLookup::Reuse(..)
+        ));
+        assert!(
+            matches!(
+                overlays.lookup(
+                    Path::new("/root6"),
+                    "generation1",
+                    &index,
+                    None,
+                    Duration::ZERO
+                ),
+                OverlayLookup::Resume(_)
+            ),
+            "an expired check of the same saved index is resumed"
+        );
         let other = Arc::new(SearchIndex::new());
         assert!(
-            overlays
-                .reuse(Path::new("/root7"), "generation1", &other, None, window)
-                .is_none(),
-            "a check made from a different saved index is not reused"
+            is_fresh(overlays.lookup(Path::new("/root7"), "generation1", &other, None, window)),
+            "a check made from a different saved index is neither reused nor resumed"
         );
     }
 
@@ -790,7 +1121,7 @@ mod tests {
         std::fs::write(root.join("src/c.rs"), "pub fn c_needle() {}\n").unwrap();
 
         let checked = with_budgets_for_test(Duration::ZERO, Duration::from_secs(5), || {
-            check_against_disk(&index, &root, None)
+            check_against_disk(&index, None, &root, None)
         });
 
         assert!(!checked.check.walk_complete);
@@ -808,7 +1139,7 @@ mod tests {
         std::fs::write(root.join("src/new.rs"), "pub fn new_needle() {}\n").unwrap();
 
         let checked = with_budgets_for_test(Duration::from_secs(5), Duration::ZERO, || {
-            check_against_disk(&index, &root, None)
+            check_against_disk(&index, None, &root, None)
         });
 
         assert!(checked.check.walk_complete);
@@ -847,7 +1178,7 @@ mod tests {
                     reread: Duration::ZERO,
                     ..uncapped
                 },
-                || check_against_disk(&Arc::new(SearchIndex::new()), &root, None),
+                || check_against_disk(&Arc::new(SearchIndex::new()), None, &root, None),
             );
             eprintln!(
                 "PROBE {} first_walk_ms={} stats={}",
@@ -881,20 +1212,21 @@ mod tests {
                 ("capped", None),
                 ("uncapped", Some(uncapped)),
             ] {
-                let run = || check_against_disk(&index, &root, None);
+                let run = || check_against_disk(&index, None, &root, None);
                 let checked = match budgets {
                     Some(budgets) => with_all_budgets_for_test(budgets, run),
                     None => run(),
                 };
                 let check = &checked.check;
                 eprintln!(
-                    "PROBE {} index={source} indexed={} {label} walk_ms={} stats={} walk_complete={} changed={} added={} removed={} reread={} not_reread={} reread_ms={}",
+                    "PROBE {} index={source} indexed={} {label} walk_ms={} stats={} walk_complete={} changed={} content_unchanged={} added={} removed={} reread={} not_reread={} reread_ms={}",
                     root.display(),
                     index.file_count(),
                     checked.walk_time.as_millis(),
                     check.files_examined,
                     check.walk_complete,
                     check.changed,
+                    check.content_unchanged,
                     check.added,
                     check.removed,
                     check.reread,
