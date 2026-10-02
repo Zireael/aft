@@ -445,6 +445,9 @@ trait StatusConsumer {
         identity: BindIdentity,
     ) -> Result<Self::Route, String>;
     fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String>;
+    /// The channel this connection knows the route by, which the daemon's
+    /// route-close pushes name.
+    fn route_channel(&self, route: &Self::Route) -> u16;
     async fn close_handle(&self, route: &Self::Route) -> Result<(), String>;
     async fn request(&self, route: &Self::Route, body: Vec<u8>) -> Result<Vec<u8>, String>;
 }
@@ -488,6 +491,10 @@ impl StatusConsumer for SubcConsumer {
         SubcConsumer::push_events(self, route).map_err(|error| error.to_string())
     }
 
+    fn route_channel(&self, route: &Self::Route) -> u16 {
+        route.channel
+    }
+
     async fn close_handle(&self, route: &Self::Route) -> Result<(), String> {
         SubcConsumer::close_handle(self, route, CloseRouteOptions::default())
             .await
@@ -519,6 +526,10 @@ async fn run_connected_status_dial<C: StatusConsumer>(
     // reopening them (see `close_forbids_reopen`). Cleared when the connection
     // is restored, since a new daemon connection starts a new route history.
     let mut reopen_forbidden: Option<String> = None;
+    // The channel of the route the dial opened last. It outlives the route
+    // itself, because the daemon's close push can arrive after the dial has
+    // already let the route go, and is replaced only by the next open.
+    let mut last_route_channel: Option<u16> = None;
 
     let mut route: Option<C::Route> = None;
     let mut route_events = None;
@@ -548,6 +559,8 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                             Ok(opened_route) => match consumer.push_events(&opened_route) {
                                 Ok(events) => {
                                     route_events = Some(events);
+                                    last_route_channel =
+                                        Some(consumer.route_channel(&opened_route));
                                     route = Some(opened_route);
                                     discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                                 }
@@ -639,6 +652,8 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                         if matches!(state, ConnectionState::Restored { .. }) {
                             reopen_forbidden = None;
                         }
+                        // A new connection numbers its channels afresh.
+                        last_route_channel = None;
                         route = None;
                         route_events = None;
                         client.set_route_live(false);
@@ -656,7 +671,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             }, if control_pushes.is_some() => {
                 match maybe_push {
                     Some(push) => {
-                        if record_forbidden_reopen(&push, &mut reopen_forbidden) {
+                        if record_forbidden_reopen(&push, last_route_channel, &mut reopen_forbidden) {
                             route = None;
                             route_events = None;
                             client.set_route_live(false);
@@ -678,7 +693,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     // whether the next discovery may reopen.
                     if let Some(receiver) = control_pushes.as_mut() {
                         while let Ok(push) = receiver.try_recv() {
-                            record_forbidden_reopen(&push, &mut reopen_forbidden);
+                            record_forbidden_reopen(&push, last_route_channel, &mut reopen_forbidden);
                         }
                     }
                     route = None;
@@ -753,10 +768,34 @@ fn close_forbids_reopen(reason: &str) -> bool {
         )
 }
 
-/// Note a `route.closed` / `route.closing` push for the status holder whose
-/// reason forbids reopening. Returns true when it did.
-fn record_forbidden_reopen(push: &ControlPush, reopen_forbidden: &mut Option<String>) -> bool {
+/// Whether a route-close push is about the route the dial opened last.
+///
+/// A daemon on subc-control 0.27 or later names the client channels a close
+/// covers, so a late push for a route the dial has since replaced cannot end
+/// the new one. An older daemon names none; then the holder's module id alone
+/// decides, as it always has.
+fn push_names_dial_route(push: &ControlPush, last_route_channel: Option<u16>) -> bool {
+    let channels: Vec<u64> = push
+        .body
+        .get("channels")
+        .and_then(Value::as_array)
+        .map(|channels| channels.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    channels.is_empty()
+        || last_route_channel.is_some_and(|channel| channels.contains(&u64::from(channel)))
+}
+
+/// Note a `route.closed` / `route.closing` push for the status holder's route
+/// whose reason forbids reopening. Returns true when it did.
+fn record_forbidden_reopen(
+    push: &ControlPush,
+    last_route_channel: Option<u16>,
+    reopen_forbidden: &mut Option<String>,
+) -> bool {
     if push.body.get("module_id").and_then(Value::as_str) != Some(STATUS_HOLDER_MODULE) {
+        return false;
+    }
+    if !push_names_dial_route(push, last_route_channel) {
         return false;
     }
     let Some(reason) = push
@@ -904,6 +943,10 @@ mod tests {
             Ok(rx)
         }
 
+        fn route_channel(&self, route: &usize) -> u16 {
+            u16::try_from(*route).expect("test routes are small")
+        }
+
         async fn close_handle(&self, _route: &usize) -> Result<(), String> {
             Ok(())
         }
@@ -948,6 +991,16 @@ mod tests {
     /// `route.closed` push, then the end of the route), lets several discovery
     /// cadences pass, and returns how many route opens the dial made.
     async fn route_opens_after_holder_close(reason: &str) -> usize {
+        route_opens_after_holder_close_naming(reason, None).await
+    }
+
+    /// [`route_opens_after_holder_close`] with a push that names the closed
+    /// client `channels`, as a subc-control 0.27 daemon sends it. The test
+    /// consumer's first route is channel 1.
+    async fn route_opens_after_holder_close_naming(
+        reason: &str,
+        channels: Option<&[u16]>,
+    ) -> usize {
         let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
         assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
         let first_request = wire_rx.try_recv().expect("first discovery request");
@@ -973,13 +1026,17 @@ mod tests {
         }
         assert_eq!(attempts.lock().len(), 1, "the holder route opened");
 
+        let mut body = json!({
+            "op": "route.closed",
+            "module_id": STATUS_HOLDER_MODULE,
+            "reason": reason,
+        });
+        if let Some(channels) = channels {
+            body["channels"] = json!(channels);
+        }
         let push = ControlPush {
             op: "route.closed".to_owned(),
-            body: json!({
-                "op": "route.closed",
-                "module_id": STATUS_HOLDER_MODULE,
-                "reason": reason,
-            }),
+            body,
         };
         control_sender
             .lock()
@@ -1017,6 +1074,19 @@ mod tests {
         assert!(
             route_opens_after_holder_close("reload").await > 1,
             "a reload close still reopens on the next discovery"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scope_close_naming_channels_applies_only_to_the_dial_route() {
+        assert_eq!(
+            route_opens_after_holder_close_naming("scope_ended", Some(&[1])).await,
+            1,
+            "a scope close naming the dial's channel must not reopen the route"
+        );
+        assert!(
+            route_opens_after_holder_close_naming("scope_ended", Some(&[7, 9])).await > 1,
+            "a scope close naming only other channels is not about the dial's route"
         );
     }
 

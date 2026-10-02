@@ -1505,3 +1505,17 @@ async fn a_retried_scope_refusal_that_outlasts_the_deadline_keeps_its_code() {
         assert!(daemon.requests().is_empty(), "{code}: nothing was sent");
     }
 }
+
+/// AFT makes its plexus calls as itself, never as a relay of another
+/// principal's tool call, so the body names no `origin` and keeps the plain
+/// two-field shape plexus reads.
+#[test]
+fn plexus_calls_name_no_origin() {
+    let body = github_call(json!({"op": "bindings.read"}));
+    assert_eq!(
+        body,
+        json!({"name": "github", "arguments": {"op": "bindings.read"}})
+    );
+    let call: subc_protocol::tool_call::ToolCallRequest = serde_json::from_value(body).unwrap();
+    assert_eq!(call.origin, None);
+}

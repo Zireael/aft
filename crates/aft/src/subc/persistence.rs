@@ -57,7 +57,6 @@ impl DatabaseWaits {
                 &identity.disabled_tools,
                 crate::bash_background::powershell_available(),
                 &identity.session,
-                identity.scope.is_some(),
                 !matches!(identity.trust, BindTrust::Untrusted),
             )
             .is_err()

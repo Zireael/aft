@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.3.0",
+      "version": "0.4.5",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "0f6c410fd35cb6529b39e066e5eace12000f26c182c6ad5034a2f6dd69c02e1e",
+      "checksum": "068c305434e881773a662aab07193edae5a961b82bbf409712a01aa093af2a23",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.3.0"
+      "release_tag": "cortexkit-role-tool-provider-v0.4.5"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.3.0",
+      "version": "0.4.5",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "a54dd7c8241688e488ca1e961ae6ea1331bcde90d7383fc65c3d6f126bb988f4",
+      "checksum": "1bfed5e7ef0f6ed1db0f5a349eab687fb76502f2901e0888f6f122113cc91d04",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.3.0"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.4.5"
     },
     {
       "name": "cortexkit-role-harness",
@@ -26,7 +26,6 @@
     }
   ],
   "slice_a": {
-    "pending_0_28_cases": ["call_disabled_tool_refused_by_name", "terminal_frame_on_refusal", "schema_pin_malformed_refused"],
     "declaration": {
       "majors": [
         {

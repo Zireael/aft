@@ -5981,6 +5981,7 @@ async fn handle_control_request(
             consumer_capabilities,
             admission_facts: _,
             scope,
+            role_versions,
         } => {
             let route_id = route_key(route_channel, epoch);
             if epoch == 0 {
@@ -5993,6 +5994,16 @@ async fn handle_control_request(
                 )
                 .await;
             }
+            // The consumer's route-open declaration, forwarded unchanged by the
+            // daemon, is the only thing that selects the tool-provider v1 mode.
+            // A tool-provider version AFT does not serve refuses the bind
+            // rather than silently falling back to the legacy grammar.
+            let route_role = match tool_provider::route_role(role_versions.as_ref()) {
+                Ok(role) => role,
+                Err(refusal) => {
+                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
+                }
+            };
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
             if let RouteTarget::ManagementSurface { module_id } = &target {
@@ -6242,7 +6253,7 @@ async fn handle_control_request(
                 project_root: PathBuf::from(&bind_project_root),
                 harness: bind_harness.clone(),
                 session: bind_session.clone(),
-                role: tool_provider::route_role(None).expect("0.27 binds have no role versions"),
+                role: route_role,
                 trust: bind_trust,
                 spawn_principal: AuthenticatedPrincipal::RouteBind {
                     trust: bind_trust.sandbox_trust(),
@@ -6826,6 +6837,30 @@ async fn send_route_bind_error(
     .await
 }
 
+/// [`send_route_bind_error`] for a refusal that carries a machine-readable
+/// `detail`, such as the role versions AFT does serve.
+async fn send_route_bind_error_body(
+    tx: &WriterSender,
+    frame: &Frame,
+    refusal: &ErrorBody,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let body = serde_json::to_vec(refusal).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Error,
+        frame.header.flags,
+        0,
+        0,
+        frame.header.corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_reliable_writer_frame(tx, metrics, response, "RouteBind error").await?;
+    log_route_bind_rejection(&refusal.code, &refusal.message);
+    Ok(())
+}
+
 async fn send_route_bind_error_parts(
     tx: &WriterSender,
     ver: u8,
@@ -7130,7 +7165,6 @@ async fn handle_tool_call(
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
-            identity.scope.is_some(),
             !matches!(identity.trust, BindTrust::Untrusted),
         ) {
             return send_provider_error(tx, metrics, frame, error).await;
@@ -9825,6 +9859,7 @@ mod tests {
                 consumer_capabilities: None,
                 admission_facts: Default::default(),
                 scope: None,
+                role_versions: None,
             };
             let frame = Frame::build_with_version(
                 PROTOCOL_VERSION,

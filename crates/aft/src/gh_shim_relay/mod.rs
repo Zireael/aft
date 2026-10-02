@@ -468,10 +468,7 @@ async fn bindings_read<T: RelayTransport>(
         Ok(connection_id) => connection_id,
         Err(message) => return RelayReply::refused("assertion_handle_malformed", "mint", message),
     };
-    let body = json!({
-        "name": "github",
-        "arguments": {"op": "bindings.read", "connection_id": connection_id},
-    });
+    let body = github_call(json!({"op": "bindings.read", "connection_id": connection_id}));
     match transport
         .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
         .await
@@ -548,14 +545,11 @@ async fn bot_request<T: RelayTransport>(
             );
         }
         let selector = scope_selector(stamp);
-        let body = json!({
-            "name": "github",
-            "arguments": {
-                "op": "bot_request",
-                "request_nonce": nonce,
-                "request": request,
-            },
-        });
+        let body = github_call(json!({
+            "op": "bot_request",
+            "request_nonce": nonce,
+            "request": request,
+        }));
         // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
         // `delegation_withdrawn`, `agent_identity_conflict`, with their
         // `legs_sent`), goes back to the shim as plexus sent it. The write is
@@ -575,15 +569,12 @@ async fn bot_request<T: RelayTransport>(
         Ok(token) => token,
         Err(refusal) => return (refusal, PATH_ASSERTION),
     };
-    let body = json!({
-        "name": "github",
-        "arguments": {
-            "op": "bot_request",
-            "assertion": token,
-            "request_nonce": nonce,
-            "request": request,
-        },
-    });
+    let body = github_call(json!({
+        "op": "bot_request",
+        "assertion": token,
+        "request_nonce": nonce,
+        "request": request,
+    }));
     let reply = match transport
         .plexus(&redeemed.project_root, session, None, body)
         .await
@@ -601,6 +592,24 @@ async fn bot_request<T: RelayTransport>(
         Err(error) => transport_refusal("plexus", error),
     };
     (reply, PATH_ASSERTION)
+}
+
+/// The body of AFT's call to plexus's `github` tool. AFT is the caller here:
+/// it is not relaying a tool call some other principal made, and the agent a
+/// write speaks for reaches plexus through the scope stamp or the minted
+/// assertion. So the request carries no `origin`, which keeps the body the
+/// plain `{name, arguments}` shape plexus already reads.
+fn github_call(arguments: Value) -> Value {
+    serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
+        name: "github".into(),
+        arguments,
+        tool_call_id: None,
+        progress_token: None,
+        call_key: None,
+        schema_pin: None,
+        origin: None,
+    })
+    .expect("a tool call serializes to JSON")
 }
 
 fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {

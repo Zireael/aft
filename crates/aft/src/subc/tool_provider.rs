@@ -23,7 +23,7 @@ pub(super) enum RouteRole {
 }
 
 /// Only an explicit bind declaration selects v1; a call's pins and harness do not.
-/// The 0.27 transport has no role_versions field, so its binds pass None.
+/// The daemon forwards the consumer's route-open `role_versions` unchanged.
 pub(super) fn route_role(
     versions: Option<&BTreeMap<String, String>>,
 ) -> Result<RouteRole, ErrorBody> {
@@ -218,7 +218,11 @@ pub(super) fn catalog(
         let names: Vec<_> = answer.tools.iter().map(|tool| tool.name.as_str()).collect();
         let text = broca_text(&names, worker);
         let digest = composition_digest(&json!({"text": text})).expect("text is JSON");
-        let mut rendered = SystemTextAnswer::new(&digest, &digest).with_text(text);
+        let mut rendered = SystemTextAnswer::new(&digest, &digest)
+            .with_text(text)
+            // The text is composed for exactly the tools served in this reply;
+            // naming them lets a runner refuse the text beside another tool set.
+            .with_tool_names(names.iter().copied());
         rendered.composition_digest = composition;
         answer.system_text = Some(rendered);
     }
@@ -236,27 +240,21 @@ pub(super) fn catalog(
     Ok(serde_json::to_value(answer).expect("catalog is JSON"))
 }
 
+/// Admit a v1 `tool.call` before anything runs. The refusals follow the
+/// contract's order: the call's own shape, then whether the tool is served,
+/// disabled or unavailable, and only then what this route may do with it.
+///
+/// A plain call needs no scope stamp: the contract runs plain calls on an
+/// unscoped route, and the safety boundary is the bind's trust class (shell
+/// tools need an admitted principal) together with the bound session.
 pub(super) fn admit(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
     disabled: &[String],
     powershell_available: bool,
     session: &str,
-    has_scope: bool,
     trusted: bool,
 ) -> Result<(), ErrorBody> {
     check_call(call)?;
-    if session.is_empty() {
-        return Err(errors::invalid_request(
-            "session",
-            "v1 execution requires a bound session",
-        ));
-    }
-    if !has_scope {
-        return Err(errors::invalid_request(
-            "scope",
-            "v1 execution requires a stamped scope",
-        ));
-    }
     if !METADATA.iter().any(|(name, _, _)| *name == call.name) {
         return Err(errors::unknown_tool(&call.name));
     }
@@ -268,6 +266,12 @@ pub(super) fn admit(
             ErrorBody::new(errors::TOOL_UNAVAILABLE, "PowerShell is not available")
                 .with_detail(json!({"tool": call.name, "reason": "under_review"})),
         );
+    }
+    if session.is_empty() {
+        return Err(errors::invalid_request(
+            "session",
+            "v1 execution requires a bound session",
+        ));
     }
     if !trusted
         && matches!(
@@ -342,7 +346,7 @@ mod tests {
 
     #[test]
     fn admission_requires_session() {
-        let error = admit(&call("status", json!({})), &[], true, "", true, true).unwrap_err();
+        let error = admit(&call("status", json!({})), &[], true, "", true).unwrap_err();
         assert_eq!(error.code, errors::INVALID_REQUEST);
         assert_eq!(error.detail.unwrap()["field"], "session");
     }
@@ -354,7 +358,6 @@ mod tests {
             &[],
             true,
             "session",
-            true,
             true,
         )
         .unwrap_err();
@@ -376,7 +379,6 @@ mod tests {
                     true,
                     "session",
                     true,
-                    true,
                 )
                 .unwrap_err();
                 assert_eq!(error.code, errors::TOOL_DISABLED, "{name}");
@@ -388,7 +390,7 @@ mod tests {
     fn admission_refuses_malformed_schema_pin() {
         let mut request = call("status", json!({}));
         request.schema_pin = Some("malformed".into());
-        let error = admit(&request, &[], true, "session", true, true).unwrap_err();
+        let error = admit(&request, &[], true, "session", true).unwrap_err();
         assert_eq!(error.code, errors::INVALID_REQUEST);
         assert_eq!(error.detail.unwrap()["field"], "schema_pin");
     }
@@ -403,6 +405,93 @@ mod tests {
         assert_eq!(actual["implementation_version"], env!("CARGO_PKG_VERSION"));
         actual["implementation_version"] = json!("<built-package-version>");
         assert_eq!(actual, fixtures["slice_a"]["declaration"]);
+    }
+
+    #[test]
+    fn every_served_capability_tag_is_defined_or_aft_namespaced() {
+        // The commons checker accepts the role's defined unprefixed tags and
+        // syntactically valid `<namespace>:<name>/v<N>` tags; AFT's own tags
+        // must sit in the `aft` namespace.
+        for (name, tag, _) in METADATA {
+            if tag.is_empty() {
+                continue;
+            }
+            cortexkit_role_tool_provider::check_capability_tag(tag)
+                .unwrap_or_else(|problem| panic!("{name} carries {tag:?}: {problem}"));
+            if tag.contains(':') {
+                assert!(tag.starts_with("aft:"), "{name} carries foreign {tag:?}");
+            } else {
+                assert!(
+                    cortexkit_role_tool_provider::DEFINED_CAPABILITY_TAGS.contains(tag),
+                    "{name} carries undefined {tag:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn system_text_names_exactly_the_tools_served_beside_it() {
+        for (disabled, available) in [
+            (vec![], false),
+            (vec![], true),
+            (vec!["aft_outline".to_string()], true),
+        ] {
+            let reply = catalog(
+                json!({"system_text": {"preset": "broca", "params": {"worker": true}}}),
+                &disabled,
+                available,
+            )
+            .unwrap();
+            let mut served: Vec<String> = reply["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string())
+                .collect();
+            served.sort();
+            served.dedup();
+            let named: Vec<String> =
+                serde_json::from_value(reply["system_text"]["tool_names"].clone()).unwrap();
+            assert_eq!(named, served, "disabled={disabled:?} pwsh={available}");
+        }
+        // A reply without system text carries no tool names.
+        let reply = catalog(json!({}), &[], true).unwrap();
+        assert!(reply.get("system_text").is_none());
+    }
+
+    #[test]
+    fn no_legacy_tool_name_shadows_a_role_operation() {
+        // Legacy routes answer role.describe and tool.catalog and refuse the
+        // other role ops before the plugin grammar runs, so a tool spelled
+        // like a role op would become unreachable on legacy routes.
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for available in [false, true] {
+            names.extend(tools(&[], available).into_iter().map(|tool| tool.name));
+        }
+        names.extend(METADATA.iter().map(|(name, _, _)| name.to_string()));
+        names.extend(crate::feature_config::CANONICAL_TOOLS.map(String::from));
+        for (alias, canonical) in crate::feature_config::LEGACY_TOOL_ALIASES {
+            names.insert(alias.to_string());
+            names.insert(canonical.to_string());
+        }
+        let prefixed: Vec<String> = names.iter().map(|name| format!("aft_{name}")).collect();
+        names.extend(prefixed);
+        for op in [
+            cortexkit_role_tool_provider::ops::ROLE_DESCRIBE,
+            cortexkit_role_tool_provider::ops::TOOL_CATALOG,
+            cortexkit_role_tool_provider::ops::TOOL_WITHDRAW,
+            cortexkit_role_tool_provider::ops::LATE_RESULTS,
+            cortexkit_role_tool_provider::ops::LATE_RESULTS_ACK,
+            "tool.call",
+        ] {
+            assert!(recognized_operation(op), "{op} is a role operation");
+        }
+        for name in &names {
+            assert!(
+                !recognized_operation(name),
+                "legacy tool name {name:?} is also a role operation"
+            );
+        }
     }
 
     #[test]
@@ -595,16 +684,9 @@ mod tests {
                 json!({"taskId": "task", "task_id": "task"}),
             ] {
                 assert_eq!(
-                    admit(
-                        &call(name, arguments),
-                        &disabled,
-                        true,
-                        "session",
-                        true,
-                        true
-                    )
-                    .unwrap_err()
-                    .code,
+                    admit(&call(name, arguments), &disabled, true, "session", true)
+                        .unwrap_err()
+                        .code,
                     "tool_disabled"
                 );
             }
@@ -617,7 +699,7 @@ mod tests {
             "missing",
         ] {
             assert_eq!(
-                admit(&call(name, json!({})), &[], true, "session", true, true)
+                admit(&call(name, json!({})), &[], true, "session", true)
                     .unwrap_err()
                     .code,
                 "unknown_tool"
@@ -631,27 +713,21 @@ mod tests {
                         &[],
                         true,
                         "",
-                        true,
                         true
                     )
                     .unwrap_err()
                 ),
                 Some("session")
             );
-            assert_eq!(
-                errors::invalid_request_field(
-                    &admit(
-                        &call(name, json!({"command": "echo x"})),
-                        &[],
-                        true,
-                        "session",
-                        false,
-                        true
-                    )
-                    .unwrap_err()
-                ),
-                Some("scope")
-            );
+            // A route without a daemon scope stamp still runs plain calls.
+            assert!(admit(
+                &call(name, json!({"command": "echo x"})),
+                &[],
+                true,
+                "session",
+                true
+            )
+            .is_ok());
         }
         for key in [
             "foreground_orchestrate",
@@ -667,7 +743,7 @@ mod tests {
             };
             assert_eq!(
                 errors::invalid_request_field(
-                    &admit(&call("bash", arguments), &[], true, "session", true, true).unwrap_err()
+                    &admit(&call("bash", arguments), &[], true, "session", true).unwrap_err()
                 ),
                 Some(key)
             );
@@ -679,7 +755,7 @@ mod tests {
             json!({"command": "echo", "ptyRows": 61}),
         ] {
             assert_eq!(
-                admit(&call("bash", arguments), &[], true, "session", true, true)
+                admit(&call("bash", arguments), &[], true, "session", true)
                     .unwrap_err()
                     .code,
                 "invalid_request"
@@ -690,7 +766,6 @@ mod tests {
             &[],
             true,
             "session",
-            true,
             true
         )
         .is_ok());
@@ -700,7 +775,6 @@ mod tests {
                 &[],
                 false,
                 "session",
-                true,
                 true
             )
             .unwrap_err()
@@ -713,7 +787,6 @@ mod tests {
                 &[],
                 true,
                 "session",
-                true,
                 false
             )
             .unwrap_err()
@@ -739,7 +812,7 @@ mod tests {
         ] {
             let mut request = call("bash", json!({"command": "echo"}));
             request.schema_pin = Some(SchemaPin::new("bash", digest, semantics).encode().unwrap());
-            let result = admit(&request, &[], true, "session", true, true);
+            let result = admit(&request, &[], true, "session", true);
             match expected {
                 Some(code) => assert_eq!(result.unwrap_err().code, code),
                 None => assert!(result.is_ok()),
@@ -762,16 +835,33 @@ mod route_tests {
         session: &str,
         disabled: Vec<String>,
     ) -> WriterFrame {
+        let scope = serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap();
+        exchange_with_scope(body, role, session, disabled, Some(scope)).await
+    }
+
+    async fn exchange_with_scope(
+        body: Value,
+        role: RouteRole,
+        session: &str,
+        disabled: Vec<String>,
+        scope: Option<subc_protocol::scope::ScopeStamp>,
+    ) -> WriterFrame {
         let (_dir, root) = test_support::test_root("tool-provider-admission");
         let ctx = test_support::test_ctx();
         ctx.mark_database_runtime_initializing_for_test();
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), ctx));
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
-            root: root.clone(), project_root: root.as_path().into(), harness: "runner".into(), session: session.into(), role,
-            trust: BindTrust::FirstParty, spawn_principal: AuthenticatedPrincipal::FirstParty,
-            consumer_elicitation_capable: false, disabled_tools: Arc::new(disabled),
-            scope: Some(serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": "head", "owner_authorized": true})).unwrap()),
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "runner".into(),
+            session: session.into(),
+            role,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::FirstParty,
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::new(disabled),
+            scope,
         }));
         let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
@@ -982,6 +1072,44 @@ mod route_tests {
         assert_eq!(executor.heavy_permits(), 1);
         release_heavy.send(()).unwrap();
         assert!(heavy.await.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn unscoped_v1_route_runs_plain_calls_and_refuses_unserved_custody_ops() {
+        // A route the daemon stamped with no scope may run plain calls, as
+        // the role contract's plain stamp expects. Withdraw and late results
+        // are not served by AFT on any route yet, so an unscoped request for
+        // them is refused as an unsupported operation without dispatching.
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange_with_scope(
+            json!({"name":"status", "arguments":{}}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        for body in [
+            json!({"name":"tool.withdraw", "arguments":{"call_key":"key"}}),
+            json!({"name":"late_results", "arguments":{"since":null}}),
+            json!({"name":"late_results.ack", "arguments":{"through":"cursor"}}),
+        ] {
+            let reply = exchange_with_scope(
+                body.clone(),
+                RouteRole::ToolProviderV1,
+                "session",
+                vec![],
+                None,
+            )
+            .await;
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(error.code, "unsupported_operation", "{body}");
+        }
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

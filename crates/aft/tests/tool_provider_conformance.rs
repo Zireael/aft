@@ -9,7 +9,7 @@ use cortexkit_role_tool_provider_conformance::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -312,11 +312,29 @@ impl Harness for Subject {
         self.spawn(root).await
     }
 }
+/// Bind a tool-provider v1 route, the way a consumer that declared
+/// `role_versions: {"tool-provider": "v1"}` on route open reaches AFT.
 async fn bind_route(
     handle: &Process,
     project: &Path,
     harness: &str,
     session: &str,
+) -> Result<Route, HarnessError> {
+    bind_route_declaring(
+        handle,
+        project,
+        harness,
+        session,
+        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+    )
+    .await
+}
+async fn bind_route_declaring(
+    handle: &Process,
+    project: &Path,
+    harness: &str,
+    session: &str,
+    role_versions: Option<BTreeMap<String, String>>,
 ) -> Result<Route, HarnessError> {
     let mut wire = handle.stream.lock().await;
     let channel = wire.next_channel;
@@ -334,6 +352,7 @@ async fn bind_route(
         consumer_capabilities: None,
         admission_facts: None,
         scope: None,
+        role_versions,
     };
     write_frame(
         &mut wire.stream,
@@ -531,15 +550,25 @@ async fn slice_a_real_module_conformance_inventory() {
     };
     assert_eq!(enabled, expected("enabled_cases"));
     assert_eq!(skipped, expected("skipped_cases"));
-    // SUBC 0.27 RouteBind has no role_versions field. The real module therefore
-    // selects legacy routes here, not negotiated tool-provider v1 routes.
-    // Keep their failures explicit rather than claiming a successful v1 suite.
-    assert_eq!(failed, expected("pending_0_28_cases"));
-    assert!(matches!(
-        report.verdict,
-        cortexkit_role_tool_provider_conformance::SuiteVerdict::Failed { .. }
-    ));
-    eprintln!("0.27 legacy transport: 12 passed, 3 pending admission, 14 capability skips; NOT a v1 release pass");
+    // Every route is bound with role_versions {"tool-provider": "v1"}, so the
+    // real module admits these calls under the v1 grammar. Every enabled case
+    // must pass; the provider conforms for the capabilities it declares and
+    // the skipped ones remain undeclared.
+    assert!(failed.is_empty(), "failed conformance cases: {failed:?}");
+    eprintln!(
+        "v1 binds: {} passed, {} failed, {} capability skips",
+        enabled.len() - failed.len(),
+        failed.len(),
+        skipped.len()
+    );
+    assert!(
+        matches!(
+            report.verdict,
+            cortexkit_role_tool_provider_conformance::SuiteVerdict::ConformingForDeclaredCapabilities { .. }
+        ),
+        "{:?}",
+        report.verdict
+    );
 }
 
 #[test]
@@ -699,4 +728,21 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     assert!(bind_route(&restarted, &p1, "broca", "unsupported-harness")
         .await
         .is_err());
+    // A tool-provider version AFT does not serve refuses the bind and names
+    // the versions it does serve, instead of falling back to a legacy route.
+    let refused = bind_route_declaring(
+        &restarted,
+        &p1,
+        "runner",
+        "unsupported-version",
+        Some(BTreeMap::from([("tool-provider".into(), "v2".into())])),
+    )
+    .await
+    .err()
+    .expect("an unserved tool-provider version refuses the bind")
+    .to_string();
+    assert!(
+        refused.contains("unsupported_role_version") && refused.contains("[\"v1\"]"),
+        "{refused}"
+    );
 }

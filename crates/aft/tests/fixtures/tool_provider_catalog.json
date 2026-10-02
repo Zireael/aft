@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "088f4d43acad02a0f761f105586e422d250a91d950979e0174d70fb2da537aaf",
-      "catalog_digest": "088f4d43acad02a0f761f105586e422d250a91d950979e0174d70fb2da537aaf",
+      "generation": "3ea48872ab544aef7b39062b2feb14144395d88022e3ed450622c60bee10bc3d",
+      "catalog_digest": "3ea48872ab544aef7b39062b2feb14144395d88022e3ed450622c60bee10bc3d",
       "tools": [
         {
           "name": "status",
@@ -340,22 +340,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -378,7 +374,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -1060,7 +1059,32 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
-        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600"
+        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -1081,8 +1105,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "1ac80232edb7e80d45af10a807abb81b4633f5006eb95c4dff15437faafc2c98",
-      "catalog_digest": "1ac80232edb7e80d45af10a807abb81b4633f5006eb95c4dff15437faafc2c98",
+      "generation": "68e3be8f3653f58ece04341b2990ba8db0ed57d485f9d278e7907844fc5eb05f",
+      "catalog_digest": "68e3be8f3653f58ece04341b2990ba8db0ed57d485f9d278e7907844fc5eb05f",
       "tools": [
         {
           "name": "status",
@@ -1405,22 +1429,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -1443,7 +1463,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -2125,7 +2148,32 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
         "item_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
-        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec"
+        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -2148,8 +2196,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8150d7ea9eed631c542333290b5e984d48bdaaf52c598a060b8ba3652f050d37",
-      "catalog_digest": "8150d7ea9eed631c542333290b5e984d48bdaaf52c598a060b8ba3652f050d37",
+      "generation": "8d85fa6d75c39183eb8a068e9a12e110b320bfcdc24e762a509f909444b4a540",
+      "catalog_digest": "8d85fa6d75c39183eb8a068e9a12e110b320bfcdc24e762a509f909444b4a540",
       "tools": [
         {
           "name": "status",
@@ -2399,22 +2447,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -2437,7 +2481,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -3119,7 +3166,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
         "item_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
-        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b"
+        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -3142,8 +3213,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4ecb4034e6fe73e7767edf2efc28dc84470b2e2c091e964bb782734415a6c1ec",
-      "catalog_digest": "4ecb4034e6fe73e7767edf2efc28dc84470b2e2c091e964bb782734415a6c1ec",
+      "generation": "4075740b6b3738663ca47bb3fd278f51546ddfa1a521a8a5e1b6717fe8f60bf1",
+      "catalog_digest": "4075740b6b3738663ca47bb3fd278f51546ddfa1a521a8a5e1b6717fe8f60bf1",
       "tools": [
         {
           "name": "status",
@@ -3466,22 +3537,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -3504,7 +3571,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -4146,7 +4216,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
-        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4"
+        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -4169,8 +4263,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "114d207b69341841dafdbb035e8ee396864fd587f91746ec4fa118bdea5c7bd3",
-      "catalog_digest": "114d207b69341841dafdbb035e8ee396864fd587f91746ec4fa118bdea5c7bd3",
+      "generation": "aef8f46f693b6a51c3a46e04b73b834f906ccd2381112debb9630a78b0ce8d16",
+      "catalog_digest": "aef8f46f693b6a51c3a46e04b73b834f906ccd2381112debb9630a78b0ce8d16",
       "tools": [
         {
           "name": "status",
@@ -5170,7 +5264,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
-        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44"
+        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -5194,8 +5312,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ec991f81c75a4539248ca15a1ead1de894c8371d932d1a33666c8c8dfc22b646",
-      "catalog_digest": "ec991f81c75a4539248ca15a1ead1de894c8371d932d1a33666c8c8dfc22b646",
+      "generation": "a2435435ef79781d3568609486ede9d95ec7e0bb19957af8c872521a2f458175",
+      "catalog_digest": "a2435435ef79781d3568609486ede9d95ec7e0bb19957af8c872521a2f458175",
       "tools": [
         {
           "name": "status",
@@ -5518,22 +5636,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -5556,7 +5670,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -6149,7 +6266,30 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
-        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375"
+        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "move",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -6173,8 +6313,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d939ac4260d8826a6a4cda5c016585b8f68becb870e8dfc5da74cc5ae02d51ff",
-      "catalog_digest": "d939ac4260d8826a6a4cda5c016585b8f68becb870e8dfc5da74cc5ae02d51ff",
+      "generation": "0b1b55157605ab9cd5c4db9dffaec9189b95d3999ee1a4dcb9cc59516cef7e9a",
+      "catalog_digest": "0b1b55157605ab9cd5c4db9dffaec9189b95d3999ee1a4dcb9cc59516cef7e9a",
       "tools": [
         {
           "name": "status",
@@ -7125,7 +7265,30 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
-        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67"
+        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -7149,8 +7312,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "845b0161c649d389286e7b5169f84c168d0142bcd0bd647c3e22ce6dc8d00288",
-      "catalog_digest": "845b0161c649d389286e7b5169f84c168d0142bcd0bd647c3e22ce6dc8d00288",
+      "generation": "2c45b7b54b395847720035439ed585ee1b722f45417f9bcd3bc4dfda375e8e04",
+      "catalog_digest": "2c45b7b54b395847720035439ed585ee1b722f45417f9bcd3bc4dfda375e8e04",
       "tools": [
         {
           "name": "status",
@@ -7473,22 +7636,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -7511,7 +7670,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -8064,7 +8226,30 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
-        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789"
+        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write"
+        ]
       }
     }
   },
@@ -8088,8 +8273,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "97883a4cc8a5e7ae28571c8c98c4f059997d3a9fd90db14090411c1946cb9f7d",
-      "catalog_digest": "97883a4cc8a5e7ae28571c8c98c4f059997d3a9fd90db14090411c1946cb9f7d",
+      "generation": "889fe22109a8fa968366f237e9e1bab8e2640c3c0cdfb754c837b3cdc3a63dac",
+      "catalog_digest": "889fe22109a8fa968366f237e9e1bab8e2640c3c0cdfb754c837b3cdc3a63dac",
       "tools": [
         {
           "name": "status",
@@ -9000,7 +9185,30 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
-        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc"
+        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "status",
+          "write"
+        ]
       }
     }
   },
@@ -9021,8 +9229,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a74caca37bc81e836d9fc388291e6c6bde751b83e5f9cb6c989068828da7fbdb",
-      "catalog_digest": "a74caca37bc81e836d9fc388291e6c6bde751b83e5f9cb6c989068828da7fbdb",
+      "generation": "2b55dabb81f6cb16d945f2d565a87a79688fba5790837d12289f37f9eeb1e9cc",
+      "catalog_digest": "2b55dabb81f6cb16d945f2d565a87a79688fba5790837d12289f37f9eeb1e9cc",
       "tools": [
         {
           "name": "status",
@@ -9414,22 +9622,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -9452,7 +9656,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -10134,7 +10341,33 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
-        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600"
+        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -10155,8 +10388,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "92cd5a4ac1ad13232b2e488db64b8e1ae2e1318456bea979ce0c2fd0192431f6",
-      "catalog_digest": "92cd5a4ac1ad13232b2e488db64b8e1ae2e1318456bea979ce0c2fd0192431f6",
+      "generation": "4773fe4a4485cf89fa273e18e5373c6277cc9ff30b1d53df0351452163231bf6",
+      "catalog_digest": "4773fe4a4485cf89fa273e18e5373c6277cc9ff30b1d53df0351452163231bf6",
       "tools": [
         {
           "name": "status",
@@ -10548,22 +10781,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -10586,7 +10815,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -11268,7 +11500,33 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
         "item_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
-        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec"
+        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -11291,8 +11549,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d1d715870f7758ff12f02cfe368b0297869a92cb955320dcf7e7319bad10ecbb",
-      "catalog_digest": "d1d715870f7758ff12f02cfe368b0297869a92cb955320dcf7e7319bad10ecbb",
+      "generation": "4df6540e6e71a33287aad86a1083986062ee2dd7d61000a985f2e8a1ff03e3c5",
+      "catalog_digest": "4df6540e6e71a33287aad86a1083986062ee2dd7d61000a985f2e8a1ff03e3c5",
       "tools": [
         {
           "name": "status",
@@ -11611,22 +11869,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -11649,7 +11903,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -12331,7 +12588,32 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
         "item_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
-        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b"
+        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -12354,8 +12636,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a36c671730271dc9964aa90579f667c7debdb34c1b424e1592a4b85182067c5e",
-      "catalog_digest": "a36c671730271dc9964aa90579f667c7debdb34c1b424e1592a4b85182067c5e",
+      "generation": "6110a39cea1472c5e8c74052ffd08849889c5ac3250e8b838ec070f1286edd07",
+      "catalog_digest": "6110a39cea1472c5e8c74052ffd08849889c5ac3250e8b838ec070f1286edd07",
       "tools": [
         {
           "name": "status",
@@ -12747,22 +13029,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -12785,7 +13063,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -13427,7 +13708,32 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
-        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4"
+        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -13450,8 +13756,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c8e4d6e48697ea9a09a023773cd494d7f25f95d421b5123627e88b6bf123a3a0",
-      "catalog_digest": "c8e4d6e48697ea9a09a023773cd494d7f25f95d421b5123627e88b6bf123a3a0",
+      "generation": "020d160747094e44246bc856b9b9e520cc3385f3981fdf7f07a1d8f510603596",
+      "catalog_digest": "020d160747094e44246bc856b9b9e520cc3385f3981fdf7f07a1d8f510603596",
       "tools": [
         {
           "name": "status",
@@ -14520,7 +14826,32 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
-        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44"
+        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -14544,8 +14875,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "10ad6c2a945c819d445fe10378172c72c0dcf0914bf52aea1730fb0835c1c4d4",
-      "catalog_digest": "10ad6c2a945c819d445fe10378172c72c0dcf0914bf52aea1730fb0835c1c4d4",
+      "generation": "85c94f8dc7e240bc85faeb2d8652ff1d22084a475f68020f4e91dd3b3e6f2fc1",
+      "catalog_digest": "85c94f8dc7e240bc85faeb2d8652ff1d22084a475f68020f4e91dd3b3e6f2fc1",
       "tools": [
         {
           "name": "status",
@@ -14937,22 +15268,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -14975,7 +15302,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -15568,7 +15898,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
-        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375"
+        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "move",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -15592,8 +15946,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f8cb5d736436857ad7e15d34e17840efb9286c036c017b3b6ff33eb1d1cd1b10",
-      "catalog_digest": "f8cb5d736436857ad7e15d34e17840efb9286c036c017b3b6ff33eb1d1cd1b10",
+      "generation": "b4f820bd6dccb6e754f2c9bb8e104d5efc32c9e4c18307285635af47c3ea858f",
+      "catalog_digest": "b4f820bd6dccb6e754f2c9bb8e104d5efc32c9e4c18307285635af47c3ea858f",
       "tools": [
         {
           "name": "status",
@@ -16613,7 +16967,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
-        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67"
+        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "status",
+          "write",
+          "zoom"
+        ]
       }
     }
   },
@@ -16637,8 +17015,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bb9f7f0342529049b01450752504eede1b12141e0b30d1bdefcd62bc41910e23",
-      "catalog_digest": "bb9f7f0342529049b01450752504eede1b12141e0b30d1bdefcd62bc41910e23",
+      "generation": "31aa36a249cb9b2ee7a77be97d054f3c7eaa599099b9ed8c3b2d57460b5fb706",
+      "catalog_digest": "31aa36a249cb9b2ee7a77be97d054f3c7eaa599099b9ed8c3b2d57460b5fb706",
       "tools": [
         {
           "name": "status",
@@ -17030,22 +17408,18 @@
         },
         {
           "name": "search",
-          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
-                "type": "string"
-              },
-              "pattern": {
-                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
                 "type": "string"
               },
               "topK": {
@@ -17068,7 +17442,10 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            }
+            },
+            "required": [
+              "query"
+            ]
           }
         },
         {
@@ -17621,7 +17998,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
-        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789"
+        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write"
+        ]
       }
     }
   },
@@ -17645,8 +18046,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c315b548cce7dfa5475f53371d05d0122661098c174e9509622aa684fa4a8640",
-      "catalog_digest": "c315b548cce7dfa5475f53371d05d0122661098c174e9509622aa684fa4a8640",
+      "generation": "dd1c4b24c534d8c6e718863f0cfc2f8125689ece71aa473e1085afa2f42b8d92",
+      "catalog_digest": "dd1c4b24c534d8c6e718863f0cfc2f8125689ece71aa473e1085afa2f42b8d92",
       "tools": [
         {
           "name": "status",
@@ -18626,7 +19027,31 @@
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
         "item_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
-        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc"
+        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "status",
+          "write"
+        ]
       }
     }
   }

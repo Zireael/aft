@@ -3426,6 +3426,7 @@ async fn drive_s1_rejection_daemon(
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -3687,6 +3688,7 @@ async fn drive_readiness_daemon(
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -9401,6 +9403,7 @@ async fn send_route_bind_with_elicitation_capability(
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,
@@ -10371,6 +10374,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -12009,6 +12013,7 @@ async fn send_management_route_bind_with_harness(
             consumer_capabilities: None,
             admission_facts: Default::default(),
             scope: None,
+            role_versions: None,
         },
     )
     .await;
@@ -12221,6 +12226,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         consumer_capabilities,
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,

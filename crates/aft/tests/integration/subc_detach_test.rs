@@ -1038,6 +1038,7 @@ async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harnes
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,
