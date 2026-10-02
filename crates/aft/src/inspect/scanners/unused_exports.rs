@@ -674,6 +674,7 @@ fn scan_non_js_empty_file(path: &Path, project_root: &Path) -> Option<FileScan> 
     let freshness = cache_freshness::collect(&file_path).ok()?;
     let skipped_language = detect_language(&file_path).map(language_name);
     Some(empty_file_scan(
+        project_root,
         file_path,
         relative_file,
         freshness,
@@ -745,11 +746,18 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
     let relative_file = relative_string(project_root, &file_path);
     let freshness = cache_freshness::collect(&file_path).ok()?;
     let Some(lang) = detect_language(&file_path) else {
-        return Some(empty_file_scan(file_path, relative_file, freshness, None));
+        return Some(empty_file_scan(
+            project_root,
+            file_path,
+            relative_file,
+            freshness,
+            None,
+        ));
     };
 
     if !is_js_ts(lang) {
         return Some(empty_file_scan(
+            project_root,
             file_path,
             relative_file,
             freshness,
@@ -758,7 +766,13 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
     }
 
     let Ok((source, tree, import_block)) = parse_file_imports(&file_path, lang) else {
-        return Some(empty_file_scan(file_path, relative_file, freshness, None));
+        return Some(empty_file_scan(
+            project_root,
+            file_path,
+            relative_file,
+            freshness,
+            None,
+        ));
     };
 
     let generated =
@@ -788,12 +802,13 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
 }
 
 fn empty_file_scan(
+    project_root: &Path,
     file_path: PathBuf,
     relative_file: String,
     freshness: cache_freshness::FileFreshness,
     skipped_language: Option<&'static str>,
 ) -> FileScan {
-    let generated = crate::inspect::generated::is_generated_file(Path::new(""), &file_path);
+    let generated = crate::inspect::generated::is_generated_file(project_root, &file_path);
     let contribution = json!({
         "file": relative_file,
         "generated": generated,

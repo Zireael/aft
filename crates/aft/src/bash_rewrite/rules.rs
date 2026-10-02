@@ -1250,6 +1250,10 @@ mod tests {
     use crate::hashline::integration::RegistrationRequest;
     use crate::protocol::DEFAULT_SESSION_ID;
 
+    // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the
+    // WSL launcher, which fails without an installed distribution, so the byte
+    // comparison runs on Unix runners only.
+    #[cfg(unix)]
     #[test]
     fn literal_append_rewrites_match_bash_bytes() {
         use crate::bash_rewrite::parser::tests::LITERAL_APPEND_CASES;

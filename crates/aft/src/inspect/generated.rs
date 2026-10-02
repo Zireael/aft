@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-#[cfg(test)]
+#[cfg(any(test, windows))]
 use std::path::PathBuf;
 use std::path::{Component, Path};
 #[cfg(test)]
@@ -14,8 +14,7 @@ const GENERATED_CONTENT_LINES: usize = 5;
 static FILE_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
-    let relative = path.strip_prefix(project_root).unwrap_or(path);
-    if !relative.is_absolute() && path_has_generated_shape(relative) {
+    if relative_shape_is_generated(project_root, path) {
         return true;
     }
 
@@ -32,9 +31,31 @@ pub(crate) fn is_generated_file_from_source(
     path: &Path,
     source: &str,
 ) -> bool {
-    let relative = path.strip_prefix(project_root).unwrap_or(path);
-    (!relative.is_absolute() && path_has_generated_shape(relative))
-        || source_has_generated_marker(source)
+    relative_shape_is_generated(project_root, path) || source_has_generated_marker(source)
+}
+
+/// Only the part of `path` below `project_root` decides a generated shape;
+/// folders above the project (a checkout under `~/gen/`) must not. On Windows
+/// the root and the path can arrive in different spellings (`\\?\C:\...` from
+/// canonicalization versus `C:\...`), so a failed prefix match is retried on
+/// normalized copies before the path is treated as outside the root.
+pub(crate) fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return path_has_generated_shape(path);
+    }
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return path_has_generated_shape(relative);
+    }
+    #[cfg(windows)]
+    {
+        let root = crate::windows_path::normalize_windows_path(project_root);
+        let path = crate::windows_path::normalize_windows_path(path);
+        let lowercase = |value: &Path| PathBuf::from(value.to_string_lossy().to_lowercase());
+        if let Ok(relative) = lowercase(&path).strip_prefix(lowercase(&root)) {
+            return path_has_generated_shape(relative);
+        }
+    }
+    false
 }
 
 pub(crate) fn is_generated_file_with_cached_hint(
@@ -182,6 +203,25 @@ mod tests {
 
 #[cfg(test)]
 mod audit_regressions {
+    #[cfg(windows)]
+    #[test]
+    fn root_and_path_in_different_windows_spellings() {
+        use std::path::Path;
+        // Canonicalized roots carry the verbatim prefix; scanner paths may not.
+        let root = Path::new(r"\\?\C:\work\gen\proj");
+        assert!(super::relative_shape_is_generated(
+            root,
+            Path::new(r"C:\work\gen\proj\gen\schema_pb.ts")
+        ));
+        assert!(!super::relative_shape_is_generated(
+            root,
+            Path::new(r"c:\Work\Gen\Proj\src\main.ts")
+        ));
+        assert!(!super::relative_shape_is_generated(
+            Path::new(r"C:\work\gen\proj"),
+            Path::new(r"\\?\C:\work\gen\proj\src\main.ts")
+        ));
+    }
     #[test]
     fn generated_parent_is_not_project_content() {
         let dir = tempfile::tempdir().unwrap();
