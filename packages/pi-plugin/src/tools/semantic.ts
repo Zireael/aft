@@ -195,6 +195,11 @@ export function buildSemanticSections(
   const honestyNote = semanticHonestyNote(response, theme);
   if (honestyNote) sections.push(honestyNote);
 
+  // An identifier searched in another project is answered by an exact sweep
+  // whose coverage (complete, or stopped at its time limit) the agent text
+  // ends with; the human view shows the same sentence.
+  const sweepCoverage = asString(asRecord(response.exact_sweep)?.coverage);
+
   const results = asRecords(response.results);
   if (status !== "ready" && results.length === 0) {
     sections.push(backendText ?? theme.fg("muted", "Semantic index is not ready."));
@@ -203,6 +208,7 @@ export function buildSemanticSections(
 
   if (results.length === 0) {
     sections.push(theme.fg("muted", "No matches found."));
+    if (sweepCoverage) sections.push(theme.fg("muted", sweepCoverage));
     return sections;
   }
 
@@ -216,7 +222,16 @@ export function buildSemanticSections(
         const lineText = asString(result.line_text) ?? "";
         const location =
           line !== undefined ? `${line}${column !== undefined ? `:${column}` : ""}` : "?";
-        lines.push(`  ↳ ${theme.fg("muted", `line ${location}`)} ${lineText}`);
+        // Sweep lines say whether they hold the identifier itself or only a
+        // spelling variant of it; plain regex and literal lines carry no
+        // `exact` field and get no marker.
+        const marker =
+          result.exact === true
+            ? ` ${theme.fg("muted", "[exact]")}`
+            : result.exact === false
+              ? ` ${theme.fg("muted", `[variant: ${asString(result.match_text) ?? "?"}]`)}`
+              : "";
+        lines.push(`  ↳ ${theme.fg("muted", `line ${location}`)}${marker} ${lineText}`);
         return;
       }
 
@@ -258,6 +273,7 @@ export function buildSemanticSections(
     });
     sections.push(lines.join("\n"));
   }
+  if (sweepCoverage) sections.push(theme.fg("muted", sweepCoverage));
 
   return sections;
 }
