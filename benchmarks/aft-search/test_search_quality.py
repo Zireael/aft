@@ -22,18 +22,22 @@ from search_quality_lib import (
     SPLIT_ROWS_NOT_APPLICABLE_REASON,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
+    UNREACHABLE_SPLIT_ROWS_FIELD,
+    apply_unreachable_split_rows,
     included_manifest_ids,
     real_query_behavior_diff,
     split_paired_failures,
     split_rows_not_applicable,
     evaluate_predicate,
     mean_metrics,
+    row_metrics,
     total_gate,
     validate_included_row_mechanisms,
     validate_manifest_maintenance_scores,
     validate_manifest_relabels,
     validate_profile_score,
     validate_scored_population,
+    validate_unreachable_split_rows,
 )
 
 
@@ -602,6 +606,103 @@ class LatencyOnlyRankingGateTests(unittest.TestCase):
             result.reasons,
             ("latency_only_ranking_mismatch:row=real_query.followup-census:1",),
         )
+
+
+class UnreachableSplitRowTests(unittest.TestCase):
+    """The `unreachable_split_rows` waiver for absolute split predicates."""
+
+    STALE = "followup-census:910001"
+    ANSWER = "crates/aft/src/commands/ast_search.rs"
+
+    def documents(self, split_paths, prose_paths, *, kind="R1", answer_kind="concept", pattern="ast_grep_search"):
+        """A ranking evaluation with one split row whose answer is ANSWER."""
+        _, reference, score = synthetic_documents()
+        manifest = {"rows": [{"episode_id": self.STALE, "pattern": pattern, "opened_file": self.ANSWER,
+                              "split_kind": kind, "answer_kind": answer_kind}]}
+        row = {"episode_id": self.STALE, "input_form": "split", "answer_kind": answer_kind, "split_kind": kind,
+               "ranked_paths": split_paths, "metrics": row_metrics(split_paths, self.ANSWER),
+               "prose_only": {"ranked_paths": prose_paths, "metrics": row_metrics(prose_paths, self.ANSWER)}}
+        score["rows"] = [row]
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        return reference, score, manifest
+
+    def descriptor(self, predicate="split_rank1_required", episode_id=None):
+        return {"slice_class": "ranking", "targeted_mechanism": "topk_cut", "kind": "ranking",
+                UNREACHABLE_SPLIT_ROWS_FIELD: [{"episode_id": episode_id or self.STALE, "predicate": predicate,
+                                                 "reason": "stale name; prose never ranks the answer"}]}
+
+    def judge(self, reference, score, manifest, descriptor, answer_text="fn handle(req) {}\n"):
+        failures = evaluate_predicate(reference, score, descriptor)
+        return apply_unreachable_split_rows(failures, score, manifest, descriptor, lambda path: answer_text)
+
+    def test_a_verified_unreachable_row_is_waived_and_printed(self) -> None:
+        paths = ["other.rs", "another.rs"]
+        reference, score, manifest = self.documents(paths, paths)
+        self.assertIn(f"split_rank1_required:{self.STALE}", evaluate_predicate(reference, score, self.descriptor()))
+        remaining, notes = self.judge(reference, score, manifest, self.descriptor())
+        self.assertEqual(remaining, [])
+        self.assertEqual(notes, [f"unreachable_split_row_waived:{self.STALE}:split_rank1_required:"
+                                 "split_rank=-:prose_rank=-:pattern_in_answer_file=none:"
+                                 "reason=stale name; prose never ranks the answer"])
+
+    def test_a_waiver_is_refused_when_the_pattern_moved_the_answer(self) -> None:
+        reference, score, manifest = self.documents(["other.rs", self.ANSWER], ["other.rs", "x.rs", self.ANSWER])
+        remaining, notes = self.judge(reference, score, manifest, self.descriptor())
+        self.assertIn(f"split_rank1_required:{self.STALE}", remaining)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      "ranks_differ:split_rank=2:prose_rank=3", remaining)
+        self.assertEqual(notes, [])
+
+    def test_a_waiver_is_refused_when_the_pattern_matches_the_answer_file(self) -> None:
+        paths = ["other.rs", self.ANSWER]
+        reference, score, manifest = self.documents(paths, paths)
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor(),
+                                  answer_text="use x;\n// see ast_grep_search\n")
+        self.assertIn(f"split_rank1_required:{self.STALE}", remaining)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      f"pattern_matches_answer_file:{self.ANSWER}:2", remaining)
+
+    def test_a_waiver_is_refused_when_the_answer_file_cannot_be_read(self) -> None:
+        paths = ["other.rs"]
+        reference, score, manifest = self.documents(paths, paths)
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor(), answer_text=None)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      f"answer_file_unreadable_at_pin:{self.ANSWER}", remaining)
+
+    def test_paired_harm_can_never_be_waived(self) -> None:
+        with self.assertRaisesRegex(InputFault, "predicate_not_waivable:split_paired_harm"):
+            validate_unreachable_split_rows(self.descriptor(predicate="split_paired_harm"))
+        # Even with a valid waiver for the row's absolute predicate, harm stands.
+        reference, score, manifest = self.documents(["x.rs", "y.rs", self.ANSWER], [self.ANSWER])
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor())
+        self.assertTrue(any(item.startswith(f"split_paired_harm:{self.STALE}") for item in remaining), remaining)
+
+    def test_the_validator_refuses_malformed_entries(self) -> None:
+        base = self.descriptor()
+        cases = {
+            "not_a_nonempty_list": [],
+            "keys_must_be_episode_id_predicate_reason": [{"episode_id": self.STALE, "predicate": "split_rank1_required"}],
+            "invalid_episode_id": [{"episode_id": "910001", "predicate": "split_rank1_required", "reason": "r"}],
+            "predicate_not_waivable:shape": [{"episode_id": self.STALE, "predicate": "shape", "reason": "r"}],
+            ":reason": [{"episode_id": self.STALE, "predicate": "split_rank1_required", "reason": "  "}],
+            "duplicate": base[UNREACHABLE_SPLIT_ROWS_FIELD] * 2,
+        }
+        for expected, entries in cases.items():
+            descriptor = dict(base, **{UNREACHABLE_SPLIT_ROWS_FIELD: entries})
+            with self.assertRaisesRegex(InputFault, expected, msg=expected):
+                validate_unreachable_split_rows(descriptor)
+        for slice_class in ("non_ranking", "engine_unwired"):
+            descriptor = dict(base, slice_class=slice_class)
+            with self.assertRaisesRegex(InputFault, "ranking_only"):
+                validate_unreachable_split_rows(descriptor)
+
+    def test_a_waiver_naming_the_wrong_kind_or_a_non_split_row_is_refused(self) -> None:
+        paths = ["other.rs"]
+        reference, score, manifest = self.documents(paths, paths, kind="R4")
+        with self.assertRaisesRegex(InputFault, "predicate_does_not_judge_row"):
+            self.judge(reference, score, manifest, self.descriptor())
+        with self.assertRaisesRegex(InputFault, "not_a_split_row:followup-census:1"):
+            self.judge(reference, score, manifest, self.descriptor(episode_id="followup-census:1"))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 EVIDENCE_SHA = "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17"
 PAGE_SIZE = 50
@@ -639,6 +639,8 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
         if derived != "ranking":
             raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
         fixtures = descriptor.get("fixtures")
+        if UNREACHABLE_SPLIT_ROWS_FIELD in descriptor:
+            raise InputFault(f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:ranking_only")
         if (
             descriptor.get("targeted_mechanism") != "none"
             or descriptor.get("kind") != "harness"
@@ -649,6 +651,7 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
         return dict(descriptor), missing_ranking
     if declared != derived:
         raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
+    validate_unreachable_split_rows(descriptor)
     target = descriptor.get("targeted_mechanism")
     if derived == "ranking":
         if target == "none":
@@ -837,6 +840,147 @@ def split_rows_not_applicable(score: Mapping[str, Any]) -> dict[str, Any] | None
     return {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": rows}
 
 
+UNREACHABLE_SPLIT_ROWS_FIELD = "unreachable_split_rows"
+# The absolute split predicates a descriptor may waive for a row no pattern
+# design can satisfy, with the split kind each one judges. split_paired_harm
+# and every non-split predicate are never waivable.
+WAIVABLE_SPLIT_PREDICATES = {
+    "split_rank1_required": "R1",
+    "split_hit5_required": "R3",
+    "split_hit3_required": "R4",
+    "split_partial_hit_required": "R6",
+}
+EVIDENCE_TREE = Path(__file__).resolve().parent / ".bench" / "repos" / f"aft-evidence-{EVIDENCE_SHA}"
+
+
+def validate_unreachable_split_rows(descriptor: Mapping[str, Any]) -> None:
+    """Refuse a malformed `unreachable_split_rows` entry before anything runs.
+
+    Each entry is exactly {episode_id, predicate, reason}: a valid episode id,
+    one of the absolute split predicates in WAIVABLE_SPLIT_PREDICATES, and a
+    non-empty reason. Only a ranking descriptor runs the split predicates, so
+    only a ranking descriptor may carry the field.
+    """
+    if UNREACHABLE_SPLIT_ROWS_FIELD not in descriptor:
+        return
+    field = UNREACHABLE_SPLIT_ROWS_FIELD
+    if descriptor.get("slice_class") != "ranking":
+        raise InputFault(f"malformed_descriptor:{field}:ranking_only")
+    entries = descriptor[field]
+    if not isinstance(entries, list) or not entries:
+        raise InputFault(f"malformed_descriptor:{field}:not_a_nonempty_list")
+    seen = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping) or set(entry) != {"episode_id", "predicate", "reason"}:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:keys_must_be_episode_id_predicate_reason")
+        episode_id, predicate, reason = entry["episode_id"], entry["predicate"], entry["reason"]
+        if not isinstance(episode_id, str):
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:episode_id")
+        episode_number(episode_id)
+        if predicate not in WAIVABLE_SPLIT_PREDICATES:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:predicate_not_waivable:{predicate}")
+        if not isinstance(reason, str) or not reason.strip():
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:reason")
+        if (episode_id, predicate) in seen:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:duplicate:{episode_id}:{predicate}")
+        seen.add((episode_id, predicate))
+
+
+def read_pinned_answer(path: str) -> str | None:
+    """The gold answer file's text at the evidence pin, or None if absent."""
+    target = EVIDENCE_TREE / path
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _rank_within_ten(paths: Sequence[Any], answer: str) -> int | None:
+    collapsed = collapse_paths(paths)
+    return collapsed.index(answer) + 1 if answer in collapsed else None
+
+
+def _pattern_line_in(pattern: str, text: str) -> tuple[int | None, str | None]:
+    """The first 1-based line of `text` the pattern matches, or a reason the
+    check cannot be made. The pattern is grep syntax; one Python cannot
+    compile is not checkable, so it is never waived."""
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        return None, f"pattern_not_checkable:{error}"
+    for number, line in enumerate(text.splitlines(), start=1):
+        if compiled.search(line):
+            return number, None
+    return None, None
+
+
+def apply_unreachable_split_rows(
+    failures: Sequence[str],
+    score: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    descriptor: Mapping[str, Any],
+    read_answer: Callable[[str], str | None] = read_pinned_answer,
+) -> tuple[list[str], list[str]]:
+    """Waive an absolute split failure for a row no pattern design can satisfy.
+
+    A waiver is honoured only when the run's own data show that (a) the
+    row's split rank equals its prose-only rank, so the pattern did not move
+    the answer, and (b) the row's pattern matches no line of the gold answer
+    file at the evidence pin, so no pattern design could lift it. Otherwise
+    the failure stands and a refusal line says which check failed. Returns
+    the remaining failures and one line per waiver to print.
+    """
+    entries = descriptor.get(UNREACHABLE_SPLIT_ROWS_FIELD) or []
+    if not entries:
+        return list(failures), []
+    manifest_rows = {row.get("episode_id"): row for row in manifest.get("rows", [])}
+    score_rows = {row.get("episode_id"): row for row in score.get("rows", [])}
+    remaining = list(failures)
+    notes: list[str] = []
+    for entry in entries:
+        episode_id, predicate, reason = entry["episode_id"], entry["predicate"], entry["reason"]
+        manifest_row = manifest_rows.get(episode_id)
+        row = score_rows.get(episode_id)
+        if manifest_row is None or row is None or "pattern" not in manifest_row:
+            raise InputFault(f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:not_a_split_row:{episode_id}")
+        if manifest_row.get("split_kind") != WAIVABLE_SPLIT_PREDICATES[predicate]:
+            raise InputFault(
+                f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:predicate_does_not_judge_row:"
+                f"{episode_id}:{predicate}:split_kind={manifest_row.get('split_kind')}"
+            )
+        failure = f"{predicate}:{episode_id}"
+        if failure not in remaining:
+            notes.append(f"unreachable_split_row_unused:{episode_id}:{predicate}:the row passes")
+            continue
+        answer = manifest_row["opened_file"]
+        split_rank = _rank_within_ten(row.get("ranked_paths", []), answer)
+        prose_rank = _rank_within_ten(row.get("prose_only", {}).get("ranked_paths", []), answer)
+        ranks = f"split_rank={split_rank or '-'}:prose_rank={prose_rank or '-'}"
+        text = read_answer(answer)
+        if text is None:
+            line, problem = None, f"answer_file_unreadable_at_pin:{answer}"
+        else:
+            line, problem = _pattern_line_in(str(manifest_row["pattern"]), text)
+        refusal = None
+        if row.get("input_form") != "split":
+            refusal = "not_replayed_in_split_form"
+        elif split_rank != prose_rank:
+            refusal = f"ranks_differ:{ranks}"
+        elif problem is not None:
+            refusal = problem
+        elif line is not None:
+            refusal = f"pattern_matches_answer_file:{answer}:{line}"
+        if refusal is not None:
+            remaining.append(f"unreachable_split_row_refused:{episode_id}:{predicate}:{refusal}")
+            continue
+        remaining.remove(failure)
+        notes.append(
+            f"unreachable_split_row_waived:{episode_id}:{predicate}:{ranks}:"
+            f"pattern_in_answer_file=none:reason={reason}"
+        )
+    return remaining, notes
+
+
 def split_paired_failures(score: Mapping[str, Any]) -> list[str]:
     """Do not let aggregate gains hide harm to an individual concept answer."""
     failures = []
@@ -921,6 +1065,8 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
 class GateResult:
     exit_code: int
     reasons: tuple[str, ...]
+    # Lines the gate prints on success too: waived unreachable split rows.
+    notes: tuple[str, ...] = ()
 
 
 def validate_candidate_page_invariance(
@@ -961,7 +1107,7 @@ def validate_candidate_page_invariance(
             raise InputFault(f"page_invariance_failed:{row.get('episode_id')}:reference_miss_not_reproduced")
 
 
-def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> GateResult:
+def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], read_answer: Callable[[str], str | None] = read_pinned_answer) -> GateResult:
     try:
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
@@ -976,9 +1122,12 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
         validate_scored_population(manifest, score)
         validate_profile_score(score)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
+        notes: list[str] = []
+        if resolved["slice_class"] == "ranking" and not missing:
+            reasons, notes = apply_unreachable_split_rows(reasons, score, manifest, resolved, read_answer)
     except InputFault as error:
         return GateResult(2, (str(error),))
-    return GateResult(1 if reasons else 0, tuple(reasons))
+    return GateResult(1 if reasons else 0, tuple(reasons), tuple(notes))
 
 
 def quantize6(value: float) -> str:

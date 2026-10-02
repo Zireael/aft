@@ -338,6 +338,20 @@ lower MRR@10 with its pattern than without it, regardless of aggregate gains.
 Definition answers are not protected by that paired rule. R1 additionally needs
 rank 1, R3 hit@5, R4 both answers hit@3, and R6 a hit with `complete: false`.
 R5 compares the actual result arrays with prose-only, not just their scores.
+
+A `ranking` descriptor may name split rows that no pattern design can satisfy
+in `unreachable_split_rows`: a list of `{episode_id, predicate, reason}`, where
+`predicate` is one of the absolute split predicates (`split_rank1_required`,
+`split_hit5_required`, `split_hit3_required`, `split_partial_hit_required`) and
+must be the one that judges the row's split kind. `split_paired_harm` and every
+non-split predicate can never be waived, and a malformed entry faults the gate.
+The gate honours an entry only after checking the run's own data: (a) the row's
+split rank equals its prose-only rank, so the pattern did not move the answer,
+and (b) no line of the gold answer file at the evidence pin matches the row's
+pattern, so no pattern design could lift it. A waived row is printed as
+`unreachable_split_row_waived:` with both ranks and the reason; when a check
+fails the failure stands, next to an `unreachable_split_row_refused:` line
+naming the check.
 The reference seeds `fixture_groups.real_query.split` and `shapes.split`.
 
 R3's anchored declaration alternation matches exactly 30 files at the pin,

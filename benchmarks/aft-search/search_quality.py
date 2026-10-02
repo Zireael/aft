@@ -277,6 +277,7 @@ def run(args:argparse.Namespace)->int:
     if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("model_id")!=reference.get("model_id"):
         raise InputFault("corpus_vector_model_mismatch")
     result=total_gate(reference,evaluation_score,manifest,descriptor,paths)
+    for note in result.notes: print(note)
     for reason in result.reasons: print(reason,file=sys.stderr)
     if result.exit_code or not args.rebaseline: return result.exit_code
     recorded=dict(score); recorded.update({"schema":"aft-search-reference-v1","evidence_sha":EVIDENCE_SHA,"manifest_sha256":sha256_file(manifest_path)})
