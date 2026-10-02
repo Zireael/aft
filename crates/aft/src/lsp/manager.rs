@@ -4868,6 +4868,17 @@ fn initialization_options_for_spawn(
     server_root: &Path,
     config: &Config,
 ) -> Result<Option<serde_json::Value>, LspError> {
+    if def.kind == ServerKind::Rust {
+        // Cargo holds its target directory lock throughout a check, including
+        // time spent waiting for compiler resources. Isolate analyzer checks
+        // so they cannot block the user's builds and tests. `true` nests under
+        // Cargo's resolved target directory, including environment/config overrides.
+        let mut options = serde_json::json!({"cargo": {"targetDir": true}});
+        if let Some(configured) = def.initialization_options.clone() {
+            merge_json_override(&mut options, configured);
+        }
+        return Ok(Some(options));
+    }
     if def.kind != ServerKind::Astro {
         return Ok(def.initialization_options.clone());
     }
@@ -7367,5 +7378,50 @@ mod typescript_worktree_tests {
                 crate::lsp::typescript_project::package_json_reads_on_this_thread() - reads
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rust_initialization_options_tests {
+    use super::*;
+
+    #[test]
+    fn rust_target_dir_default_preserves_configured_options() {
+        let config = Config::default();
+        let source = Path::new("src/lib.rs");
+        let root = Path::new(".");
+        let mut def = super::super::registry::servers_for_file(source, &config)
+            .into_iter()
+            .find(|def| def.kind == ServerKind::Rust)
+            .expect("built-in rust-analyzer");
+        let options = initialization_options_for_spawn(&def, source, root, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(options["cargo"]["targetDir"], true);
+        assert_eq!(
+            options["cargo"]["extraArgs"],
+            serde_json::json!(["--locked"])
+        );
+        assert_eq!(
+            options["cargo"]["metadataExtraArgs"],
+            serde_json::json!(["--locked"])
+        );
+        for target in [serde_json::json!("custom-target"), serde_json::json!(false)] {
+            def.initialization_options = Some(serde_json::json!({
+                "cargo": {"targetDir": target, "extraArgs": ["--offline"]},
+                "checkOnSave": false,
+                "check": {"workspace": false}
+            }));
+            let options = initialization_options_for_spawn(&def, source, root, &config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(options, def.initialization_options.clone().unwrap());
+        }
+        def.kind = ServerKind::Python;
+        def.initialization_options = None;
+        assert_eq!(
+            initialization_options_for_spawn(&def, source, root, &config).unwrap(),
+            None
+        );
     }
 }

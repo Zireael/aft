@@ -2740,6 +2740,10 @@ fn real_rust_analyzer_available() -> bool {
 }
 
 fn configured_rust_context(root: &std::path::Path) -> AppContext {
+    configured_rust_context_with_lsp(root, serde_json::json!({}))
+}
+
+fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Value) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
@@ -2758,7 +2762,8 @@ fn configured_rust_context(root: &std::path::Path) -> AppContext {
         "config": crate::helpers::user_config(serde_json::json!({
             "search_index": false,
             "semantic_search": false,
-            "callgraph_store": false
+            "callgraph_store": false,
+            "lsp": lsp
         })),
     }))
     .expect("configure parses");
@@ -3411,4 +3416,126 @@ fn contended_watcher_drains_past_the_backlog_cap_forward_only_config_files() {
         vec![("Cargo.toml".to_string(), 2)],
         "an overflowing backlog keeps only configuration files"
     );
+}
+
+/// A sleeping build script holds Cargo's target lock without consuming CPU.
+/// After a save starts a real analyzer check, an ordinary build must use a
+/// different lock, even when Cargo's base target directory is overridden.
+#[test]
+fn real_rust_analyzer_checks_do_not_block_cargo_build() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "real_rust_analyzer_checks_do_not_block_cargo_build",
+    ) {
+        return;
+    }
+    for mode in ["default", "config", "environment"] {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("workspace");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\".\"]\n[package]\nname = \"lock-isolation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        let source = root.join("src/lib.rs");
+        fs::write(&source, "pub fn value() -> u8 { 1 }\n").unwrap();
+        fs::write(
+            root.join("build.rs"),
+            r#"
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    if std::path::Path::new("armed").exists() {
+        let out = std::env::var("OUT_DIR").unwrap();
+        std::fs::write("check-started", &out).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+    }
+}
+"#,
+        )
+        .unwrap();
+        let base_target = match mode {
+            "config" => {
+                fs::create_dir_all(root.join(".cargo")).unwrap();
+                fs::write(
+                    root.join(".cargo/config.toml"),
+                    "[build]\ntarget-dir = \"configured-target\"\n",
+                )
+                .unwrap();
+                root.join("configured-target")
+            }
+            "environment" => root.join("environment-target"),
+            _ => root.join("target"),
+        };
+        let lsp = if mode == "environment" {
+            serde_json::json!({"servers": {"rust-analyzer": {"env": {
+                "CARGO_TARGET_DIR": base_target.to_string_lossy()
+            }}}})
+        } else {
+            serde_json::json!({})
+        };
+        let generated = Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "{generated:?}");
+        let ctx = configured_rust_context_with_lsp(&root, lsp);
+        let clean = poll_lsp_diagnostics(&ctx, &source, Duration::from_secs(90), |r| {
+            r["complete"] == true
+        });
+        assert_eq!(clean["complete"], true, "{mode}: {clean:#}");
+        fs::write(root.join("armed"), "").unwrap();
+        let write: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "save-lock-fixture", "command": "write",
+            "file": source, "content": "pub fn value() -> u8 { 2 }\n"
+        }))
+        .unwrap();
+        let written = serde_json::to_value(handle_write(&write, &ctx)).unwrap();
+        assert_eq!(written["success"], true, "{written:#}");
+        let started = root.join("check-started");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !started.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            started.exists(),
+            "{mode}: save did not start the build script"
+        );
+        let check_out = fs::read_to_string(&started).unwrap();
+        let mut build = Command::new("cargo");
+        build
+            .args(["build", "--offline", "--locked"])
+            .current_dir(&root);
+        if mode == "environment" {
+            build.env("CARGO_TARGET_DIR", &base_target);
+        }
+        let output = build.output().expect("cargo build");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{mode}: {stderr}");
+        assert!(
+            !stderr.contains("Blocking waiting for file lock on build directory"),
+            "{mode}: cargo build blocked on analyzer check:\n{stderr}"
+        );
+        let analyzer_target = base_target.join("rust-analyzer");
+        assert!(
+            std::path::Path::new(check_out.trim()).starts_with(&analyzer_target),
+            "{mode}: check artifacts at {check_out}, expected {}",
+            analyzer_target.display()
+        );
+        assert!(
+            analyzer_target.join("debug/deps").is_dir(),
+            "check artifacts missing"
+        );
+        eprintln!(
+            "{mode}: analyzer artifacts under {}; cargo build stderr:\n{stderr}",
+            analyzer_target.display()
+        );
+        if let Ok(size) = Command::new("du")
+            .args(["-sk"])
+            .arg(&analyzer_target)
+            .output()
+        {
+            eprintln!(
+                "{mode}: extra target disk KiB: {}",
+                String::from_utf8_lossy(&size.stdout)
+            );
+        }
+    }
 }
