@@ -735,23 +735,12 @@ fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
         )
         .expect("write overlay storm file");
         if index == 0 {
-            let first = storm.join("appeared_0.rs");
             let cap = std::time::Instant::now() + Duration::from_secs(60);
-            let mut last_touch = std::time::Instant::now();
             while !gate.with_extension("waiting").exists() {
                 assert!(
                     std::time::Instant::now() < cap,
                     "refresh never observed quiet gate"
                 );
-                // Linux inotify watches a new directory only after its create
-                // event arrives, so a file written straight into it can go
-                // unseen. Rewrite the first storm file until the refresh
-                // worker reports it is holding at the gate.
-                if last_touch.elapsed() >= Duration::from_millis(200) {
-                    fs::write(&first, "pub fn overlay_storm_0() {}\n")
-                        .expect("rewrite first overlay storm file");
-                    last_touch = std::time::Instant::now();
-                }
                 let _ = status(&mut overlay);
                 thread::sleep(Duration::from_millis(10));
             }
