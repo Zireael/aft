@@ -331,13 +331,7 @@ pub(super) fn sweep(
     }
     outcome.files_discovered = files.len();
 
-    // Source before text before data; byte-wise relative path order inside
-    // each class keeps bounded pages deterministic.
-    files.sort_by(|(left_class, left), (right_class, right)| {
-        left_class
-            .cmp(right_class)
-            .then_with(|| relative_bytes(left, root).cmp(relative_bytes(right, root)))
-    });
+    order_for_search(&mut files, root);
 
     let candidates = index.map(|index| index_candidates(index, terms));
     let mut hits = Vec::new();
@@ -379,6 +373,17 @@ pub(super) fn sweep(
     rank_hits(&mut hits, root);
     outcome.hits = hits;
     outcome
+}
+
+/// Source before text before data, so a sweep that runs out of time has read
+/// the code first; byte-wise relative path order inside each class keeps
+/// bounded pages deterministic.
+fn order_for_search(files: &mut [(FileClass, PathBuf)], root: &Path) {
+    files.sort_by(|(left_class, left), (right_class, right)| {
+        left_class
+            .cmp(right_class)
+            .then_with(|| relative_bytes(left, root).cmp(relative_bytes(right, root)))
+    });
 }
 
 fn relative_bytes<'a>(path: &'a Path, root: &Path) -> &'a [u8] {
@@ -872,6 +877,46 @@ mod tests {
         assert!(
             line.contains("this project's own AFT index answered"),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn files_are_searched_source_first_then_text_then_data() {
+        let root = Path::new("/repo");
+        let mut files: Vec<(FileClass, PathBuf)> = [
+            "research/dumps/0001.body.json",
+            "docs/guide.md",
+            "src/z.ts",
+            "app.log",
+            "lib/a.rs",
+            "README.md",
+        ]
+        .into_iter()
+        .map(|relative| {
+            let path = root.join(relative);
+            (classify_file(&path), path)
+        })
+        .collect();
+        order_for_search(&mut files, root);
+        let order: Vec<_> = files
+            .iter()
+            .map(|(_, path)| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "lib/a.rs",
+                "src/z.ts",
+                "README.md",
+                "docs/guide.md",
+                "app.log",
+                "research/dumps/0001.body.json",
+            ]
         );
     }
 
