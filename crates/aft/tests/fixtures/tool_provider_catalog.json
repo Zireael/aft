@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3ea48872ab544aef7b39062b2feb14144395d88022e3ed450622c60bee10bc3d",
-      "catalog_digest": "3ea48872ab544aef7b39062b2feb14144395d88022e3ed450622c60bee10bc3d",
+      "generation": "382e6fecbdb1f56e7c24ec401538eb294f9013c3beae60f35280794b2ce7ddf7",
+      "catalog_digest": "382e6fecbdb1f56e7c24ec401538eb294f9013c3beae60f35280794b2ce7ddf7",
       "tools": [
         {
           "name": "status",
@@ -340,18 +340,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -374,10 +378,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -1105,8 +1106,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "68e3be8f3653f58ece04341b2990ba8db0ed57d485f9d278e7907844fc5eb05f",
-      "catalog_digest": "68e3be8f3653f58ece04341b2990ba8db0ed57d485f9d278e7907844fc5eb05f",
+      "generation": "705accde120273df68ff5f281e998b5eaeabcb2df319c8547ee4fb9f2963a572",
+      "catalog_digest": "705accde120273df68ff5f281e998b5eaeabcb2df319c8547ee4fb9f2963a572",
       "tools": [
         {
           "name": "status",
@@ -1429,18 +1430,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -1463,10 +1468,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -2196,8 +2198,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8d85fa6d75c39183eb8a068e9a12e110b320bfcdc24e762a509f909444b4a540",
-      "catalog_digest": "8d85fa6d75c39183eb8a068e9a12e110b320bfcdc24e762a509f909444b4a540",
+      "generation": "e9d2bab03e2b17293e4937c560ea9ba9977ccf0c0f2a35ac61aa5346e2975379",
+      "catalog_digest": "e9d2bab03e2b17293e4937c560ea9ba9977ccf0c0f2a35ac61aa5346e2975379",
       "tools": [
         {
           "name": "status",
@@ -2447,18 +2449,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -2481,10 +2487,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -3213,8 +3216,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4075740b6b3738663ca47bb3fd278f51546ddfa1a521a8a5e1b6717fe8f60bf1",
-      "catalog_digest": "4075740b6b3738663ca47bb3fd278f51546ddfa1a521a8a5e1b6717fe8f60bf1",
+      "generation": "9179a0321025871c1f395d5448de17aa1183b4c42a5b2de988e251a58a73cd64",
+      "catalog_digest": "9179a0321025871c1f395d5448de17aa1183b4c42a5b2de988e251a58a73cd64",
       "tools": [
         {
           "name": "status",
@@ -3537,18 +3540,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -3571,10 +3578,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -5312,8 +5316,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a2435435ef79781d3568609486ede9d95ec7e0bb19957af8c872521a2f458175",
-      "catalog_digest": "a2435435ef79781d3568609486ede9d95ec7e0bb19957af8c872521a2f458175",
+      "generation": "2505e30db15bda1a06a4942415855bdbabbadfc15f5c5a49df0692a1b00bfc2c",
+      "catalog_digest": "2505e30db15bda1a06a4942415855bdbabbadfc15f5c5a49df0692a1b00bfc2c",
       "tools": [
         {
           "name": "status",
@@ -5636,18 +5640,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -5670,10 +5678,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -7312,8 +7317,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2c45b7b54b395847720035439ed585ee1b722f45417f9bcd3bc4dfda375e8e04",
-      "catalog_digest": "2c45b7b54b395847720035439ed585ee1b722f45417f9bcd3bc4dfda375e8e04",
+      "generation": "91a26295ebf1d15c6afa74f1ef1e3b1eab68af6290bcbc939bd61c59617f404a",
+      "catalog_digest": "91a26295ebf1d15c6afa74f1ef1e3b1eab68af6290bcbc939bd61c59617f404a",
       "tools": [
         {
           "name": "status",
@@ -7636,18 +7641,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -7670,10 +7679,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -9229,8 +9235,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2b55dabb81f6cb16d945f2d565a87a79688fba5790837d12289f37f9eeb1e9cc",
-      "catalog_digest": "2b55dabb81f6cb16d945f2d565a87a79688fba5790837d12289f37f9eeb1e9cc",
+      "generation": "ae553b962e5eaf7f7cf6884dabc57589375e829d1e40c4f4aa49616c61e24f90",
+      "catalog_digest": "ae553b962e5eaf7f7cf6884dabc57589375e829d1e40c4f4aa49616c61e24f90",
       "tools": [
         {
           "name": "status",
@@ -9622,18 +9628,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -9656,10 +9666,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -10388,8 +10395,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4773fe4a4485cf89fa273e18e5373c6277cc9ff30b1d53df0351452163231bf6",
-      "catalog_digest": "4773fe4a4485cf89fa273e18e5373c6277cc9ff30b1d53df0351452163231bf6",
+      "generation": "246444471251930255a6ff128c22ba040324eb20dcd3fe68132062ac8184c972",
+      "catalog_digest": "246444471251930255a6ff128c22ba040324eb20dcd3fe68132062ac8184c972",
       "tools": [
         {
           "name": "status",
@@ -10781,18 +10788,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -10815,10 +10826,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -11549,8 +11557,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4df6540e6e71a33287aad86a1083986062ee2dd7d61000a985f2e8a1ff03e3c5",
-      "catalog_digest": "4df6540e6e71a33287aad86a1083986062ee2dd7d61000a985f2e8a1ff03e3c5",
+      "generation": "3102572299db871867d156ad36dfef5f47e3c7337a74163b86749e367ea44bdf",
+      "catalog_digest": "3102572299db871867d156ad36dfef5f47e3c7337a74163b86749e367ea44bdf",
       "tools": [
         {
           "name": "status",
@@ -11869,18 +11877,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -11903,10 +11915,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -12636,8 +12645,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6110a39cea1472c5e8c74052ffd08849889c5ac3250e8b838ec070f1286edd07",
-      "catalog_digest": "6110a39cea1472c5e8c74052ffd08849889c5ac3250e8b838ec070f1286edd07",
+      "generation": "22f3f4700d63306027f5dfde735b779a7335c2826e9adca153cb024a44f4a240",
+      "catalog_digest": "22f3f4700d63306027f5dfde735b779a7335c2826e9adca153cb024a44f4a240",
       "tools": [
         {
           "name": "status",
@@ -13029,18 +13038,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -13063,10 +13076,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -14875,8 +14885,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "85c94f8dc7e240bc85faeb2d8652ff1d22084a475f68020f4e91dd3b3e6f2fc1",
-      "catalog_digest": "85c94f8dc7e240bc85faeb2d8652ff1d22084a475f68020f4e91dd3b3e6f2fc1",
+      "generation": "cde9f5b6a2d2706a96e8040515eba40c3b9d675fa4184acf9382071fec0f0e05",
+      "catalog_digest": "cde9f5b6a2d2706a96e8040515eba40c3b9d675fa4184acf9382071fec0f0e05",
       "tools": [
         {
           "name": "status",
@@ -15268,18 +15278,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -15302,10 +15316,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
@@ -17015,8 +17026,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "31aa36a249cb9b2ee7a77be97d054f3c7eaa599099b9ed8c3b2d57460b5fb706",
-      "catalog_digest": "31aa36a249cb9b2ee7a77be97d054f3c7eaa599099b9ed8c3b2d57460b5fb706",
+      "generation": "99ca9e988c12a6ab412b726a1e0abd58f0ba442b9a92dbe985b19d79de02ac38",
+      "catalog_digest": "99ca9e988c12a6ab412b726a1e0abd58f0ba442b9a92dbe985b19d79de02ac38",
       "tools": [
         {
           "name": "status",
@@ -17408,18 +17419,22 @@
         },
         {
           "name": "search",
-          "schema_digest": "e1fc58d4149cd1898a9c102b85a46d5eb11583c320d8e75da01f862173a7752d",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
           "capabilities": [
             "code.search/v1"
           ],
-          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "query": {
-                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
                 "type": "string"
               },
               "topK": {
@@ -17442,10 +17457,7 @@
                 "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
                 "type": "string"
               }
-            },
-            "required": [
-              "query"
-            ]
+            }
           }
         },
         {
