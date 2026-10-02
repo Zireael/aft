@@ -1049,6 +1049,11 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
         text.contains("pub fn needle_symbol() -> bool { false }"),
         "FileSummary snippet should be regenerated from current disk content: {response:?}"
     );
+    assert!(
+        text.contains("The saved semantic index of")
+            && text.contains("predates 1 file that changed or was added since"),
+        "the semantic lane answered from vectors older than the edit, and says so: {text}"
+    );
     handle.join().expect("embedding server thread");
 }
 
@@ -2932,6 +2937,12 @@ fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
     );
     assert_eq!(response["exact_sweep"]["complete"], true);
     assert_eq!(response["exact_sweep"]["used_index"], false);
+    assert!(
+        response["exact_sweep"]["coverage"]
+            .as_str()
+            .is_some_and(|coverage| coverage.starts_with("exact pass: complete; checked all")),
+        "the summary carries the coverage sentence for JSON renderers: {response:#?}"
+    );
     let text = response["text"].as_str().expect("text");
     assert!(
         text.contains("exact pass: complete; checked all"),
