@@ -103,8 +103,9 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         # Compiler warnings (for example the macOS linker's `__eh_frame section too
         # large` note once the lib test binary passes 16 MB of unwind data) print
         # a `warning:` line plus `|` and `= note:` continuation lines before the
-        # listing. They carry no test entries.
-        if stripped.startswith(("warning:", "= note:", "= help:")) or stripped == "|":
+        # listing. sccache prints its own `sccache: warning:` lines when its
+        # server restarts mid-build. None of them carry test entries.
+        if stripped.startswith(("warning:", "= note:", "= help:", "sccache: ")) or stripped == "|":
             continue
 
         if stripped.startswith("Doc-tests "):

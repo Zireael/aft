@@ -128,6 +128,12 @@ export interface ValidatedInputs {
 const TEST_REMOVE_MUTATING = "AFT_OPENCODE2_TEST_REMOVE_MUTATING_TOOL";
 const TEST_EVIDENCE = "AFT_OPENCODE2_TEST_NON_MUTATING_EVIDENCE";
 
+// Tools that need at least one of several arguments. Their schemas cannot say
+// so (hoisted schemas are one flat object without anyOf unions), so `required`
+// is empty while the tool still refuses a call naming none of them; their T2
+// row keeps a missing_target subcase. Names are the matrix's canonical names.
+const TOOLS_REQUIRING_ONE_OF: ReadonlySet<string> = new Set(["search"]);
+
 export const V2_SCHEMA_PROJECTION_EXCLUSIONS = {
   // bash_watch's waiting loop lives in the OpenCode and Pi plugins, not in the
   // module, so the subc tool-schema artifact never carries it. The other bash
@@ -578,7 +584,8 @@ function validateScenarioRows(
       fail("matrix_invalid", `${row.tool}/T2 missing invalid_arguments`);
     }
     const required = schemas[row.tool].required;
-    const needsTarget = Array.isArray(required) && required.length > 0;
+    const needsTarget =
+      (Array.isArray(required) && required.length > 0) || TOOLS_REQUIRING_ONE_OF.has(row.tool);
     const hasMissingTarget = t2.some((scenario) => scenario.subcase === "missing_target");
     if (needsTarget !== hasMissingTarget) {
       fail(
