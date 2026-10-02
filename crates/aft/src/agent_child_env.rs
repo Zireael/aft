@@ -95,19 +95,34 @@ if [ -z "$repo_root" ]; then
   exit 0
 fi
 
-repo_hooks=$(git config --local core.hooksPath 2>/dev/null || :)
-if [ -n "$repo_hooks" ]; then
-  case "$repo_hooks" in
-    /*|[A-Za-z]:[\\/]*) candidate="$repo_hooks/$hook_name" ;;
-    \~/*) candidate="${HOME:-}${repo_hooks#\~}/$hook_name" ;;
-    *) candidate="$repo_root/$repo_hooks/$hook_name" ;;
+# Resolve core.hooksPath from configuration scopes in descending precedence:
+# worktree > local > global > system. We query each scope explicitly because
+# the ambient environment injects a command-scope core.hooksPath pointing to this
+# dispatcher; scoped queries exclude command-scope overrides and reflect the
+# hook path Git would have resolved natively.
+configured_hooks=
+for scope in --worktree --local --global --system; do
+  configured_hooks=$(git config "$scope" --get core.hooksPath 2>/dev/null || :)
+  if [ -n "$configured_hooks" ]; then
+    break
+  fi
+done
+
+if [ -n "$configured_hooks" ]; then
+  case "$configured_hooks" in
+    /*|[A-Za-z]:[\\/]*) candidate="$configured_hooks/$hook_name" ;;
+    \~/*) candidate="${HOME:-}${configured_hooks#\~}/$hook_name" ;;
+    *) candidate="$repo_root/$configured_hooks/$hook_name" ;;
   esac
   dispatch_candidate "$candidate" "$@"
+  # When core.hooksPath is configured, Git checks only that directory and does
+  # not fall back to the default hooks directory if the hook is absent.
+  exit 0
 fi
 
 # Do not use `git rev-parse --git-path hooks/...` here: it honors the injected
 # core.hooksPath and resolves this dispatcher back to itself.
-git_dir=$(git rev-parse --git-dir 2>/dev/null || :)
+git_dir=$(git rev-parse --git-common-dir 2>/dev/null || git rev-parse --git-dir 2>/dev/null || :)
 if [ -n "$git_dir" ]; then
   case "$git_dir" in
     /*|[A-Za-z]:[\\/]*) candidate="$git_dir/hooks/$hook_name" ;;
@@ -2318,6 +2333,342 @@ mod tests {
         let message = commit_message(&repo);
         assert!(message.contains("Co-authored-by: Pair Agent <pair@example.test>"));
         assert!(message.contains("Local-Hook: custom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_scoped_hooks_path_blocks_push_in_linked_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        let storage = temp.path().join("storage");
+        let worktree = temp.path().join("worktree");
+        let hooks_dir = temp.path().join("worktree-hooks");
+
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "initial"],
+            &HashMap::new(),
+        );
+        run_git(
+            temp.path(),
+            &["init", "--quiet", "--bare", remote.to_str().unwrap()],
+            &HashMap::new(),
+        );
+
+        // Enable worktree-specific config isolation so that git config --worktree writes
+        // to config.worktree rather than the shared repository config.
+        run_git(
+            &repo,
+            &["config", "extensions.worktreeConfig", "true"],
+            &HashMap::new(),
+        );
+
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "worktree-branch",
+            ],
+            &HashMap::new(),
+        );
+
+        fs::create_dir_all(&hooks_dir).unwrap();
+        write_executable(
+            &hooks_dir.join("pre-push"),
+            "#!/bin/sh\nprintf '%s\\n' invoked > worktree-pre-push-ran\nexit 1\n",
+        );
+
+        run_git(
+            &worktree,
+            &[
+                "config",
+                "--worktree",
+                "core.hooksPath",
+                hooks_dir.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+
+        let remote_url = format!("file://{}", remote.display());
+        let environment = co_author_environment(&storage);
+
+        let output = std::process::Command::new("git")
+            .args([
+                "push",
+                "--quiet",
+                &remote_url,
+                "HEAD:refs/heads/worktree-branch",
+            ])
+            .current_dir(&worktree)
+            .envs(&environment)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "worktree pre-push hook with exit 1 was not honoured; output: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("worktree-pre-push-ran")).unwrap(),
+            "invoked\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_hooks_path_is_honoured_when_repo_sets_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        let global_config = temp.path().join("global.gitconfig");
+        let global_hooks = temp.path().join("global-hooks");
+
+        initialize_repo(&repo);
+        fs::create_dir_all(&global_hooks).unwrap();
+        write_executable(
+            &global_hooks.join("pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' global-ran > global-pre-commit-ran\n",
+        );
+
+        fs::write(
+            &global_config,
+            format!("[core]\n\thooksPath = {}\n", global_hooks.display()),
+        )
+        .unwrap();
+
+        let mut environment = co_author_environment(&storage);
+        environment.insert(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_config.to_str().unwrap().to_string(),
+        );
+
+        let output = std::process::Command::new("git")
+            .args(["commit", "--quiet", "-m", "global test"])
+            .current_dir(&repo)
+            .envs(&environment)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("global-pre-commit-ran")).unwrap(),
+            "global-ran\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_path_precedence_worktree_beats_local_beats_global() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        let worktree = temp.path().join("worktree");
+        let global_config = temp.path().join("global.gitconfig");
+        let global_hooks = temp.path().join("global-hooks");
+        let local_hooks = temp.path().join("local-hooks");
+        let worktree_hooks = temp.path().join("worktree-hooks");
+
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["commit", "--quiet", "-m", "initial"],
+            &HashMap::new(),
+        );
+
+        run_git(
+            &repo,
+            &["config", "extensions.worktreeConfig", "true"],
+            &HashMap::new(),
+        );
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                worktree.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+            &HashMap::new(),
+        );
+
+        fs::create_dir_all(&global_hooks).unwrap();
+        fs::create_dir_all(&local_hooks).unwrap();
+        fs::create_dir_all(&worktree_hooks).unwrap();
+
+        write_executable(
+            &global_hooks.join("pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' global > which-ran\n",
+        );
+        write_executable(
+            &local_hooks.join("pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' local > which-ran\n",
+        );
+        write_executable(
+            &worktree_hooks.join("pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' worktree > which-ran\n",
+        );
+
+        fs::write(
+            &global_config,
+            format!("[core]\n\thooksPath = {}\n", global_hooks.display()),
+        )
+        .unwrap();
+
+        // 1. All three configured: worktree beats local beats global
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                local_hooks.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+        run_git(
+            &worktree,
+            &[
+                "config",
+                "--worktree",
+                "core.hooksPath",
+                worktree_hooks.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+
+        let mut environment = co_author_environment(&storage);
+        environment.insert(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_config.to_str().unwrap().to_string(),
+        );
+
+        run_git(
+            &worktree,
+            &["commit", "--quiet", "--allow-empty", "-m", "test 1"],
+            &environment,
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("which-ran")).unwrap(),
+            "worktree\n"
+        );
+
+        // 2. Remove worktree setting: local beats global
+        run_git(
+            &worktree,
+            &["config", "--worktree", "--unset", "core.hooksPath"],
+            &HashMap::new(),
+        );
+        run_git(
+            &worktree,
+            &["commit", "--quiet", "--allow-empty", "-m", "test 2"],
+            &environment,
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("which-ran")).unwrap(),
+            "local\n"
+        );
+
+        // 3. Remove local setting: global wins
+        run_git(
+            &repo,
+            &["config", "--local", "--unset", "core.hooksPath"],
+            &HashMap::new(),
+        );
+        run_git(
+            &worktree,
+            &["commit", "--quiet", "--allow-empty", "-m", "test 3"],
+            &environment,
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("which-ran")).unwrap(),
+            "global\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_hooks_path_replaces_default_git_dir_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("storage");
+        let empty_hooks = temp.path().join("empty-hooks");
+
+        initialize_repo(&repo);
+        // Put a hook in .git/hooks that should NOT run when core.hooksPath is configured
+        write_executable(
+            &repo.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\nprintf '%s\\n' default-ran > default-ran\nexit 1\n",
+        );
+
+        fs::create_dir_all(&empty_hooks).unwrap();
+        run_git(
+            &repo,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                empty_hooks.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+
+        let environment = co_author_environment(&storage);
+        let output = std::process::Command::new("git")
+            .args(["commit", "--quiet", "-m", "empty hooks dir"])
+            .current_dir(&repo)
+            .envs(&environment)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "commit should succeed without falling back to .git/hooks: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!repo.join("default-ran").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_git_config_reads_ignore_command_scope_hooks_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        initialize_repo(&repo);
+
+        for scope in ["--worktree", "--local", "--global", "--system"] {
+            let output = std::process::Command::new("git")
+                .args(["config", scope, "--get", "core.hooksPath"])
+                .current_dir(&repo)
+                .envs([
+                    ("GIT_CONFIG_COUNT", "1"),
+                    ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+                    ("GIT_CONFIG_VALUE_0", "/managed/aft/hooks"),
+                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("/managed/aft/hooks"),
+                "scope {scope} leaked command-scope core.hooksPath: {stdout}"
+            );
+        }
     }
 }
 
