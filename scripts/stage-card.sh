@@ -103,6 +103,18 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ "$(stat -f %m "$BIN")" -lt "$BUILD_START" ]; the
   echo "stage-card: $BIN predates this build invocation; refusing to stage a stale binary" >&2
   exit 2
 fi
+# The release profile keeps debug info in the dSYM, so a card must carry no
+# debug map. Entries here mean the toolchain's debug-info pass failed and the
+# build carried on silently (a compiler wrapper that dropped the linker's
+# library path did exactly that across the fleet on 2026-10-02), and the card
+# would embed this machine's build paths.
+if [ "$(uname -s)" = "Darwin" ]; then
+  DEBUG_MAP_ENTRIES="$(nm -a "$BIN" 2>/dev/null | awk '$2 == "-"' | wc -l | tr -d ' ')"
+  if [ "${DEBUG_MAP_ENTRIES:-0}" -ne 0 ]; then
+    echo "stage-card: $BIN carries $DEBUG_MAP_ENTRIES debug-map entries; refusing to stage an unstripped card" >&2
+    exit 2
+  fi
+fi
 
 mkdir -p "$STAGING"
 TMP="$(mktemp "$STAGING/ck-aft.tmp.XXXXXX")"
