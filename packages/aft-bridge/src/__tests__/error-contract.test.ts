@@ -25,6 +25,7 @@ import {
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
 } from "../error-contract.js";
 import {
+  isLocalRouteCloseRejection,
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
   SubcRouteClosedMidCallError,
@@ -102,7 +103,7 @@ describe("isBashTransportDeadError", () => {
       channel: 1,
       epoch: 1,
     } as RouteHandle);
-    const whilePending = new SubcError("route closed by closeRoute", "route_closed");
+    const whilePending = new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller");
 
     expect(classifyBashHostFallbackError(beforeDispatch)).toBe("route closed before dispatch");
     expect(isBashTransportDeadError(beforeDispatch)).toBe(true);
@@ -113,7 +114,7 @@ describe("isBashTransportDeadError", () => {
   test("rejects a request in flight when the plugin closed its route", () => {
     const error = new SubcRouteClosedMidCallError(
       "session closed",
-      new SubcError("route closed by closeRoute", "route_closed"),
+      new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller"),
     );
 
     expect(classifyBashHostFallbackError(error)).toBeUndefined();
@@ -322,13 +323,31 @@ describe("adaptToolError", () => {
     expect(adapted.message).toContain(SUBC_MODULE_RESTART_DISPOSITION);
   });
 
+  test("a local route close is recognised by the client's typed close reason, not its message", () => {
+    // subc-client types its own close of a route or connection as
+    // closed_by_caller; the message text is not part of that contract.
+    expect(
+      isLocalRouteCloseRejection(
+        new SubcError("any wording", "route_closed", undefined, "closed_by_caller"),
+      ),
+    ).toBe(true);
+    for (const error of [
+      new SubcError("route closed by closeRoute", "route_closed"),
+      new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, "reload"),
+      new SubcError("connection closed", "connection_closed", undefined, "connection_lost"),
+      new SubcCallError("not_sent", "route was closed before route.open completed", "route_closed"),
+    ]) {
+      expect(isLocalRouteCloseRejection(error)).toBe(false);
+    }
+  });
+
   test("a local closeRoute with the route_closed code is NOT a GOODBYE, but its outcome is unknown", () => {
     // The route_closed code has two sources: a daemon GOODBYE, and closeRoute,
     // which is the plugin closing its own route, so the module-restart wording
     // would be wrong here. subc-client raises the closeRoute rejection only for
     // a request already pending (and written) on the route, so it carries its
     // own unknown-outcome guidance instead.
-    const local = new SubcError("route closed by closeRoute", "route_closed");
+    const local = new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller");
 
     const adapted = adaptToolError("write", local);
 
@@ -340,7 +359,7 @@ describe("adaptToolError", () => {
   test("a bash call whose route the plugin closed mid-call never gets re-run guidance", () => {
     const midCall = new SubcRouteClosedMidCallError(
       "transport shutting down",
-      new SubcError("route closed by closeRoute", "route_closed"),
+      new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller"),
     );
 
     adaptToolError("bash", midCall);

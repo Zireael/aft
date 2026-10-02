@@ -105,13 +105,17 @@ export class SubcRouteClosedMidCallError extends SubcCallError {
 }
 
 /**
- * subc-client's rejection of a request that was pending on a route when
- * `closeRoute` tore that route down. The client raises it for nothing else: a
- * route closed with no request pending produces no error at all, and a request
- * started on an already-closed route fails with `StaleRouteHandleError`.
+ * subc-client's rejection of a request that was pending when the client itself
+ * closed the route: `closeRoute` tearing that route down, or the client closing
+ * its connection. The client types both with `closeReason: "closed_by_caller"`;
+ * a daemon GOODBYE carries the daemon's reason and a lost connection carries
+ * `"connection_lost"`. A route closed with no request pending produces no error
+ * at all, and a request started on an already-closed route fails with
+ * `StaleRouteHandleError`. A route closed while still opening is reported as a
+ * not-sent `SubcCallError`, which is not a `SubcError` and so never matches.
  */
 export function isLocalRouteCloseRejection(error: unknown): error is SubcError {
-  return error instanceof SubcError && error.message.includes("route closed by closeRoute");
+  return error instanceof SubcError && error.closeReason === "closed_by_caller";
 }
 
 /** The route-close reason that matches a session's teardown, if it was torn down. */

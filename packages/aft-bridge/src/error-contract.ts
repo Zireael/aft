@@ -120,8 +120,8 @@ function isRouteGoodbyeError(error: unknown): boolean {
   // stamps code "route_closed". Match both so a client upgrade cannot
   // silently stop the unknown-outcome disposition from being appended — a
   // false negative here recreates the blind re-run this contract exists to
-  // prevent. "route closed by closeRoute" (same code in newer clients) is the
-  // plugin closing its own route, not a daemon GOODBYE; it gets its own
+  // prevent. A route_closed error the plugin caused by closing its own route
+  // (closeReason "closed_by_caller") is not a daemon GOODBYE; it gets its own
   // unknown-outcome guidance (see isRouteClosedMidCallError), so the message
   // check on the coded arm keeps it out of the module-restart wording.
   if (error.code === undefined) {

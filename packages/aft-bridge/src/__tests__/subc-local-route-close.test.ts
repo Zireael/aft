@@ -256,9 +256,10 @@ function expectUnknownOutcomeForBash(error: unknown, reason: string): void {
   expect(midCall.message).toContain(
     `the command may have run; the route closed mid-call: ${reason}`,
   );
-  // The pool keeps subc-client's own closeRoute rejection as the cause.
+  // The pool keeps subc-client's own rejection as the cause, and recognises it
+  // by the client's typed close reason rather than its message text.
   expect(midCall.cause).toBeInstanceOf(SubcError);
-  expect((midCall.cause as SubcError).message).toBe("route closed by closeRoute");
+  expect((midCall.cause as SubcError).closeReason).toBe("closed_by_caller");
 
   expect(classifyBashHostFallbackError(error)).toBeUndefined();
   const adapted = adaptToolError("bash", error) as Error;
