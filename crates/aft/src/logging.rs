@@ -851,7 +851,20 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis);
+    // Test-only: acknowledge each flush request no sooner than this long after
+    // the writer collects it. The batch delay above does not bound that: a
+    // flush queued near the end of a delayed batch is collected and
+    // acknowledged with it almost at once. Debug builds only.
+    #[cfg(debug_assertions)]
+    let test_flush_hold = std::env::var("AFT_TEST_LOG_FLUSH_HOLD_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
     while let Ok(message) = rx.recv() {
+        #[cfg(debug_assertions)]
+        if let Some(delay) = test_delay {
+            thread::sleep(delay);
+        }
         let mut lines = Vec::new();
         let mut reconfigure = None;
         let mut flushed = None;
@@ -876,15 +889,6 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
             LogMessage::Reconfigure(storage_root) => reconfigure = Some(storage_root),
             LogMessage::Flush(done) => flushed = Some(done),
         }
-        // The delay is applied after the batch is collected, so a flush request
-        // is always acknowledged at least one full delay after it was queued.
-        // Delaying before collection instead let a request that arrived late in
-        // a sleep ride along with that batch, which made a slow writer look
-        // fast at random.
-        #[cfg(debug_assertions)]
-        if let Some(delay) = test_delay {
-            thread::sleep(delay);
-        }
         // Exit can take the sink while the worker is delayed. Serialize terminal
         // writes with rotation and reconfiguration, but not with queue waits.
         let mut slot = shared_sink
@@ -903,6 +907,15 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
         // The channel is FIFO, so every line queued before the flush request
         // has been written by now.
         if let Some(done) = flushed {
+            #[cfg(debug_assertions)]
+            if let Some(hold) = test_flush_hold {
+                // Release the sink first: the exit path takes it to write its
+                // terminal line, and must not wait out this hold.
+                drop(slot);
+                thread::sleep(hold);
+                let _ = done.try_send(());
+                continue;
+            }
             let _ = done.try_send(());
         }
         if let Some(storage_root) = reconfigure {

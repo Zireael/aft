@@ -559,7 +559,7 @@ fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
 
 #[test]
 fn subc_drain_with_slow_writer_persists_terminal_line() {
-    drain_with_live_lsp_servers_and_writer("", false, false, "1000");
+    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"));
 }
 
 /// Binds 34 roots that each start a fake rust-analyzer which never answers
@@ -568,7 +568,7 @@ fn subc_drain_with_slow_writer_persists_terminal_line() {
 /// `NAME=value` assignments for the fake servers; `under_load` keeps every
 /// CPU busy from the drain until the module has exited.
 fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
-    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40");
+    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None);
 }
 
 fn drain_with_live_lsp_servers_and_writer(
@@ -576,6 +576,7 @@ fn drain_with_live_lsp_servers_and_writer(
     under_load: bool,
     active_ort: bool,
     writer_delay: &str,
+    flush_hold: Option<&str>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -635,6 +636,7 @@ fn drain_with_live_lsp_servers_and_writer(
             active_ort,
             true,
             writer_delay,
+            flush_hold,
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -851,6 +853,7 @@ impl ModuleProcess {
             false,
             false,
             "40",
+            None,
         )
     }
 
@@ -863,6 +866,7 @@ impl ModuleProcess {
         active_ort: bool,
         busy_index: bool,
         writer_delay: &str,
+        flush_hold: Option<&str>,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -894,6 +898,11 @@ impl ModuleProcess {
             command.env("AFT_CACHE_DIR", data_home);
             command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
             command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
+        }
+        if let Some(hold) = flush_hold {
+            // A writer this slow cannot acknowledge a flush inside the exit
+            // budget, wherever in its batch delay the request lands.
+            command.env("AFT_TEST_LOG_FLUSH_HOLD_MS", hold);
         }
         if let Some(bin_dir) = bin_dir {
             command.env(
