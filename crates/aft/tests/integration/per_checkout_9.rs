@@ -703,10 +703,12 @@ fn parent_watcher_routes_child_edits_to_the_owning_child() {
             .as_array()
             .is_some_and(|rows| !rows.is_empty())
         {
-            assert!(answer["matches"][0]["file"]
+            // grep reports native paths, so Windows separators are backslashes.
+            let file = answer["matches"][0]["file"]
                 .as_str()
                 .unwrap()
-                .ends_with("child/src/watched.rs"));
+                .replace('\\', "/");
+            assert!(file.ends_with("child/src/watched.rs"), "{answer:#}");
             break;
         }
         assert!(
@@ -1606,10 +1608,12 @@ fn parent_folder_survives_a_real_process_restart() {
     let configured = first.send(&configure_request(&root));
     assert_eq!(configured["success"], true, "{configured:#}");
     let answer = wait_for_match(&mut first);
-    assert!(answer["matches"][0]["file"]
+    // grep reports native paths, so Windows separators are backslashes.
+    let file = answer["matches"][0]["file"]
         .as_str()
         .unwrap()
-        .ends_with("src/lib.rs"));
+        .replace('\\', "/");
+    assert!(file.ends_with("src/lib.rs"), "{answer:#}");
     assert!(first.shutdown().success());
     let before = std::fs::read(&artifact).unwrap();
 
