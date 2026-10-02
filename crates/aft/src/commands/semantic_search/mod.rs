@@ -10547,9 +10547,11 @@ mod tests {
         )
         .expect("write external fixture");
         let ctx = test_context(session.path());
-        let req = semantic_request("budget_disclosure_needle", 10);
+        // Two words: a single identifier is answered by the exact identifier
+        // sweep, which reads every file and so is not reported fully degraded.
+        let req = semantic_request("fn budget_disclosure_needle", 10);
         let params = SemanticSearchParams {
-            query: "budget_disclosure_needle".to_string(),
+            query: "fn budget_disclosure_needle".to_string(),
             top_k: 10,
             offset: 0,
             include_tests: false,
@@ -10582,6 +10584,45 @@ mod tests {
             .as_str()
             .expect("text")
             .ends_with(BORROWED_SEARCH_LOAD_FOOTER));
+    }
+
+    #[test]
+    fn borrowed_load_budget_identifier_sweeps_disk_and_keeps_the_disclosure() {
+        let session = tempfile::tempdir().expect("session root");
+        let external = tempfile::tempdir().expect("external root");
+        std::fs::write(
+            external.path().join("fixture.rs"),
+            "pub fn budget_disclosure_needle() {}\n",
+        )
+        .expect("write external fixture");
+        let ctx = test_context(session.path());
+        let req = semantic_request("budget_disclosure_needle", 10);
+        let params = SemanticSearchParams {
+            query: "budget_disclosure_needle".to_string(),
+            top_k: 10,
+            offset: 0,
+            include_tests: false,
+        };
+        let shape = query_shape::classify(&params.query);
+
+        let response = response_value(handle_external_borrowed_degraded_fallback(
+            &req,
+            &ctx,
+            &params,
+            10,
+            &shape,
+            external.path(),
+            crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["fully_degraded"], false);
+        assert_eq!(response["exact_sweep"]["complete"], true);
+        let text = response["text"].as_str().expect("text");
+        assert!(text.contains("fixture.rs:1 [exact]"), "{text}");
+        assert!(text.contains("exact pass: complete; checked all"), "{text}");
+        assert!(text.ends_with(BORROWED_SEARCH_LOAD_FOOTER), "{text}");
     }
 
     #[test]
