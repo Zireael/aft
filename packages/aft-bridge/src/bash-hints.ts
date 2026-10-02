@@ -2,6 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { relativePathEscapesRoot } from "./path-display.js";
+
 // Helpers for the bash-output hint nudges appended to bash tool results.
 //
 // Shared across harnesses (OpenCode applies it in `tool.execute.after`; Pi
@@ -409,7 +411,7 @@ function nextCwdAfterCd(
 
 function isDirInsideProject(resolvedRoot: string, dir: string): boolean {
   const rel = path.relative(resolvedRoot, path.resolve(dir));
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 function collectPathOperands(firstStage: string, startAfterCommand: number): string[] {
@@ -421,6 +423,8 @@ function collectPathOperands(firstStage: string, startAfterCommand: number): str
   // the grep read as path-less ("in-project cwd") and nudged toward aft_search
   // for a target it could not see - the logs directory, in the field.
   let sawPattern = false;
+  let optionsEnded = false;
+  let optionValue: "pattern" | "file" | "other" | undefined;
 
   while (index < firstStage.length) {
     const tokenResult = readShellToken(firstStage, index);
@@ -433,25 +437,54 @@ function collectPathOperands(firstStage: string, startAfterCommand: number): str
     // `grep p f 2>/dev/null` parks on `>`). This guarantees loop termination.
     if (end <= index) break;
     index = skipSpaces(firstStage, end);
+    // A descriptor before a redirection is shell syntax, not a search path.
+    if (/^\d+$/.test(token) && /[<>]/.test(firstStage[end] ?? "")) break;
 
-    if (token.startsWith("-")) continue;
-    if (!sawPattern && !looksLikePathOperand(token)) {
+    if (optionValue) {
+      if (optionValue === "pattern" || optionValue === "file") sawPattern = true;
+      optionValue = undefined;
+      continue;
+    }
+    if (!optionsEnded && token === "--") {
+      optionsEnded = true;
+      continue;
+    }
+    if (!optionsEnded && token.startsWith("-")) {
+      if (token === "-e" || token === "--regexp") optionValue = "pattern";
+      else if (token === "-f" || token === "--file") optionValue = "file";
+      else if (/^(?:--regexp=|--file=|-e.+|-f.+)/.test(token)) sawPattern = true;
+      else if (
+        [
+          "-A",
+          "-B",
+          "-C",
+          "-m",
+          "--after-context",
+          "--before-context",
+          "--context",
+          "--max-count",
+          "--include",
+          "--exclude",
+          "--exclude-dir",
+          "-g",
+          "--glob",
+          "-t",
+          "--type",
+          "-T",
+          "--type-not",
+        ].includes(token)
+      )
+        optionValue = "other";
+      continue;
+    }
+    if (!sawPattern) {
       sawPattern = true;
       continue;
     }
-    if (looksLikePathOperand(token) || isDynamicPathOperand(token)) operands.push(token);
+    operands.push(token);
   }
 
   return operands;
-}
-
-function looksLikePathOperand(token: string): boolean {
-  return (
-    token.includes("/") ||
-    token.startsWith("~") ||
-    token.startsWith("./") ||
-    token.startsWith("../")
-  );
 }
 
 function isDynamicPathOperand(token: string): boolean {
@@ -476,7 +509,7 @@ function isPathInsideProject(resolvedRoot: string, baseCwd: string, operand: str
   // from the project root after a `cd`), absolute/`~` operands against the FS.
   const resolved = resolvePathOperand(baseCwd, operand);
   const rel = path.relative(resolvedRoot, resolved);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 function shouldSuppressResolvedPath(resolved: string): boolean {

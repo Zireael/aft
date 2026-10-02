@@ -374,7 +374,11 @@ async function runBackgroundUpdateCheck(
     return;
   }
 
-  const channel = extractChannel(pluginInfo.pinnedVersion ?? currentVersion);
+  const channel = extractChannel(
+    pluginInfo.isPinned || pluginInfo.pinnedVersion?.match(/^[A-Za-z][\w-]*$/)
+      ? pluginInfo.pinnedVersion
+      : currentVersion,
+  );
   const latestVersion = await getLatestVersion(channel, {
     registryUrl: options.npmRegistryUrl,
     directory: ctx.directory,

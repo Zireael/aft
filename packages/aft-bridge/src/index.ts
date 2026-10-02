@@ -216,8 +216,10 @@ export type { Logger, LogMeta } from "./logger.js";
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
   containsStandaloneDetachKeyword,
+  detachStripEdits,
   shouldInterruptWaitsForMessage,
   standaloneDetachKeywordRanges,
+  stripDetachKeywordsAndTidyGap,
   stripStandaloneDetachKeywords,
 } from "./message-detach.js";
 export type {
@@ -268,6 +270,7 @@ export {
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
 } from "./path-aliases.js";
+export { relativePathEscapesRoot, shortenHomePath } from "./path-display.js";
 export { withPathPrepended } from "./path-env.js";
 export {
   findExecutableOnPath,

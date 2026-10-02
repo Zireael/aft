@@ -73,7 +73,7 @@ function hostFallbackEnvWithShims(
     ? resolveStoragePath(normalized.AFT_STORAGE_DIR)
     : resolveCortexKitStorageRoot();
   const shimsDir = join(storageRoot, "shims");
-  if (!existsSync(join(shimsDir, "gh"))) return normalized;
+  if (!existsSync(join(shimsDir, platform === "win32" ? "gh.cmd" : "gh"))) return normalized;
 
   const separator = platform === "win32" ? ";" : ":";
   const entries = (inherited ?? "").split(separator).filter((entry) => entry.length > 0);

@@ -2,7 +2,7 @@
  * Shared flat-text formatter for aft_callgraph responses (agent + themed TUI).
  */
 
-import { homedir } from "node:os";
+import { shortenHomePath as shortenPath } from "./path-display.js";
 
 export interface CallgraphTheme {
   fg(role: string, text: string): string;
@@ -39,12 +39,6 @@ function asNumber(value: unknown): number | undefined {
 
 function asBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
-}
-
-function shortenPath(path: string): string {
-  const home = homedir();
-  if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-  return path;
 }
 
 function joinNonEmpty(parts: Array<string | undefined>, separator = " · "): string {

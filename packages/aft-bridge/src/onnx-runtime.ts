@@ -57,6 +57,7 @@ import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
 import { execFileSync } from "./child-process.js";
 import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
+import { relativePathEscapesRoot } from "./path-display.js";
 import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 import { execTarExtractionSync } from "./tar-executable.js";
@@ -871,7 +872,7 @@ function validateExtractedTree(stagingRoot: string): void {
         // A target inside realRoot yields a relative path. If `relative()`
         // returns an absolute path it escaped the root — on POSIX (`/...`) or
         // across Windows drives (`D:\...`, where the win32 check is essential).
-        if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
+        if (relativePathEscapesRoot(rel) || win32.isAbsolute(rel)) {
           throw new Error(
             `extracted symlink ${fullPath} points outside staging root: ${linkTarget}`,
           );
@@ -880,7 +881,7 @@ function validateExtractedTree(stagingRoot: string): void {
       }
 
       const rel = relative(realRoot, fullPath);
-      if (rel.startsWith("..") || isAbsolute(rel) || win32.isAbsolute(rel)) {
+      if (relativePathEscapesRoot(rel) || win32.isAbsolute(rel)) {
         throw new Error(`extracted entry ${fullPath} escapes staging root`);
       }
 

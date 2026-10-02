@@ -44,6 +44,39 @@ export function stripStandaloneDetachKeywords(messageText: string): string {
   return messageText.replace(STANDALONE_DETACH_KEYWORDS_PATTERN, "$1");
 }
 
+/** Strip tokens and tidy only the gaps they leave, preserving unrelated whitespace. */
+export function stripDetachKeywordsAndTidyGap(messageText: string): string {
+  let text = messageText;
+  for (const { start, end, length } of detachStripEdits(messageText).reverse()) {
+    text = text.slice(0, start) + " ".repeat(length) + text.slice(end);
+  }
+  return text;
+}
+
+/** Collapse only horizontal whitespace joined by removing a token; leave code and tables intact. */
+export function detachStripEdits(
+  text: string,
+): Array<{ start: number; end: number; length: number }> {
+  const edits: Array<{ start: number; end: number; length: number }> = [];
+  for (const [tokenStart, tokenEnd] of standaloneDetachKeywordRanges(text)) {
+    let start = tokenStart;
+    let end = tokenEnd;
+    const bridgesGap = /[ \t]/.test(text[start - 1] ?? "") && /[ \t]/.test(text[end] ?? "");
+    if (bridgesGap) {
+      while (start > 0 && /[ \t]/.test(text[start - 1])) start--;
+      while (end < text.length && /[ \t]/.test(text[end])) end++;
+    }
+    const previous = edits.at(-1);
+    if (previous && start <= previous.end) {
+      previous.end = end;
+      previous.length = Math.max(previous.length, bridgesGap ? 1 : 0);
+    } else {
+      edits.push({ start, end, length: bridgesGap ? 1 : 0 });
+    }
+  }
+  return edits;
+}
+
 /**
  * Decide whether a message interrupts the session's blocking waits.
  *

@@ -181,7 +181,7 @@ describe("OpenCode 2 prompt hook keeps mention offsets on their text", () => {
     await runHook(runtime, event);
 
     const text = event.prompt.text;
-    expect(text).toBe("see @src/a.ts and @build with @skill-x");
+    expect(text).toBe("see @src/a.ts and   @build with @skill-x");
     const mentions = [
       ...(event.prompt.files ?? []),
       ...(event.prompt.agents ?? []),
@@ -252,4 +252,17 @@ describe("OpenCode 2 prompt hook failures", () => {
       warn.mockRestore();
     }
   });
+});
+
+test("localized detach cleanup preserves code and mention offsets", async () => {
+  const { runtime } = recordingRuntime();
+  const text = "please  &detach  now\n    print('x')\na\t\tb\n@file";
+  const start = text.indexOf("@file");
+  const event = promptEvent(text);
+  event.prompt.files = [{ mention: { start, end: start + 5, text: "@file" } }];
+  await runHook(runtime, event);
+  expect(event.prompt.text).toBe("please now\n    print('x')\na\t\tb\n@file");
+  const mention = event.prompt.files[0]?.mention;
+  expect(mention?.start).toBe(event.prompt.text.indexOf("@file"));
+  expect(event.prompt.text.slice(mention?.start, mention?.end)).toBe("@file");
 });

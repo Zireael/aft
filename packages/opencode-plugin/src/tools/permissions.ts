@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "@cortexkit/aft-bridge";
+import { execFileSync, relativePathEscapesRoot } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
@@ -243,12 +243,12 @@ export async function askEditPermission(
 
 /**
  * Check if `child` is inside `parent`. Mirrors `AppFileSystem.contains` in
- * opencode core (uses `path.relative` and ensures it doesn't start with `..`).
+ * opencode core (uses `path.relative` and rejects parent-directory segments).
  */
 function containsPath(parent: string, child: string): boolean {
   if (!parent) return false;
   const rel = path.relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 function systemTempRoots(): string[] {

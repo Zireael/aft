@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
+import { relativePathEscapesRoot, shortenHomePath } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { AftRequest } from "../lib/aft-bridge.js";
@@ -350,14 +350,13 @@ function truncate(value: string): string {
 }
 
 function formatHome(path: string): string {
-  const home = homedir();
-  return path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+  return shortenHomePath(path);
 }
 
 function formatProjectPath(path: string, projectRoot: string): string {
   if (!path) return "";
   const rel = relative(projectRoot, path);
-  return rel.startsWith("..") || rel === "" ? path : `./${rel}`;
+  return relativePathEscapesRoot(rel) || rel === "" ? path : `./${rel}`;
 }
 
 function formatSourcePath(path: string | null, projectRoot: string): string | undefined {

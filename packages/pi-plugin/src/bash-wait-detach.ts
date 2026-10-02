@@ -3,7 +3,7 @@ import {
   type AftTransportPool,
   containsStandaloneDetachKeyword,
   shouldInterruptWaitsForMessage,
-  stripStandaloneDetachKeywords,
+  stripDetachKeywordsAndTidyGap as stripStandaloneDetachKeywords,
 } from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
@@ -21,7 +21,7 @@ const EMPTY_DETACH_MESSAGE = "(requested background detach)";
 /** Strip the `&detach` control token before Pi's input transform delivers the user message to the model. */
 export function stripUserMessageDetachKeyword(messageText: string): string {
   if (!containsStandaloneDetachKeyword(messageText)) return messageText;
-  const stripped = stripStandaloneDetachKeywords(messageText).replace(/[ \t]{2,}/g, " ");
+  const stripped = stripStandaloneDetachKeywords(messageText);
   return stripped.trim() === "" ? EMPTY_DETACH_MESSAGE : stripped;
 }
 

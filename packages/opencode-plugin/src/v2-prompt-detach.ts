@@ -7,10 +7,7 @@
  * aborts a sync `bash_watch`, and the operator's `&detach` token is stripped
  * from the text before the model sees it.
  */
-import {
-  standaloneDetachKeywordRanges,
-  stripStandaloneDetachKeywords,
-} from "@cortexkit/aft-bridge";
+import { detachStripEdits } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import { interruptBashWaitsForChatMessage } from "./bash-wait-detach.js";
@@ -80,28 +77,10 @@ function mapOffset(offset: number, edits: readonly TextEdit[]): number {
   return offset + shift;
 }
 
-/**
- * Build an offset mapper from the original prompt text to the text the shared
- * strip produced. The strip works in two stages (drop each standalone
- * `&detach` token, then collapse runs of spaces and tabs left behind to one
- * space), and a token-only message is replaced whole by a fixed notice; the
- * mapper replays the same two stages as edit lists and clamps to the final
- * text for the whole-message replacement.
- */
+/** Move mention positions through the same localized edits used to strip the prompt. */
 function offsetMapper(original: string, finalText: string): (offset: number) => number {
-  const tokenEdits: TextEdit[] = standaloneDetachKeywordRanges(original).map(([start, end]) => ({
-    start,
-    end,
-    length: 0,
-  }));
-  const withoutTokens = stripStandaloneDetachKeywords(original);
-  const whitespaceEdits: TextEdit[] = [...withoutTokens.matchAll(/[ \t]{2,}/g)].map((match) => ({
-    start: match.index ?? 0,
-    end: (match.index ?? 0) + match[0].length,
-    length: 1,
-  }));
-  return (offset) =>
-    Math.min(mapOffset(mapOffset(offset, tokenEdits), whitespaceEdits), finalText.length);
+  const edits = detachStripEdits(original);
+  return (offset) => Math.min(mapOffset(offset, edits), finalText.length);
 }
 
 function mentionCarriers(prompt: V2PromptHookEvent["prompt"]): MentionCarrier[] {

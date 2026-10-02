@@ -54,6 +54,7 @@ import {
   execFileSync,
   execTarExtractionSync,
   getAftLspBinariesDir,
+  relativePathEscapesRoot,
   windowsTarExecutable,
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
@@ -769,7 +770,7 @@ export function validateExtraction(stagingRoot: string): void {
       }
 
       const rel = relative(realStagingRoot, realFull);
-      if (rel.startsWith("..") || resolve(realStagingRoot, rel) !== realFull) {
+      if (relativePathEscapesRoot(rel) || resolve(realStagingRoot, rel) !== realFull) {
         throw new Error(
           `archive entry escapes staging root: ${full} → ${realFull} (zip-slip defense)`,
         );

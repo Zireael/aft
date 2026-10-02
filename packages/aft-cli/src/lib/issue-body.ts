@@ -180,38 +180,40 @@ export function capBodyToGithubLimit(
   const log = body.slice(logBlockStart, logBlockEnd);
   const tail = body.slice(logBlockEnd);
 
-  const overheadBytes = Buffer.byteLength(head, "utf8") + Buffer.byteLength(tail, "utf8");
-  // Reserve room for the truncation marker that we'll prepend to the log
-  // body so the agent / human reading the issue knows lines were dropped.
+  // Keep fence delimiters and harness headings; only log payload lines are disposable.
   const truncationMarker = "[truncated for GitHub 64KB limit — older log lines dropped]\n";
-  const markerBytes = Buffer.byteLength(truncationMarker, "utf8");
-  const logBudget = maxBytes - overheadBytes - markerBytes;
-  if (logBudget <= 0) {
-    // Even with no log content we'd be over budget. Drop the log block
-    // entirely (keep the heading + a stub marker) so the rest survives.
-    return `${head}${truncationMarker}${tail}`;
-  }
-
-  // Drop oldest lines (from the top) until what's left fits the budget.
-  // We split on newlines to preserve line boundaries; binary truncation
-  // would corrupt the final line.
   const lines = log.split("\n");
-  let keepLines = lines;
-  let kept = keepLines.join("\n");
-  while (Buffer.byteLength(kept, "utf8") > logBudget && keepLines.length > 1) {
-    // Drop ~5% from the top each iteration for fast convergence on
-    // very-oversized inputs. Caps at "drop at least one line".
-    const dropCount = Math.max(1, Math.floor(keepLines.length * 0.05));
-    keepLines = keepLines.slice(dropCount);
-    kept = keepLines.join("\n");
+  let inFence = false;
+  let fence = "";
+  const payload: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const delimiter = lines[i].match(/^\s*(`{3,}|~{3,})/);
+    if (delimiter) {
+      if (!inFence) {
+        inFence = true;
+        fence = delimiter[1];
+      } else if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length)
+        inFence = false;
+    } else if (inFence || (lines[i] && !/^#{1,6} /.test(lines[i]))) {
+      payload.push(i);
+    }
   }
-  // Final defensive byte-truncation in case a single huge line still
-  // overshoots (e.g. one log line that itself exceeds the budget).
-  if (Buffer.byteLength(kept, "utf8") > logBudget) {
-    kept = truncateToByteBudget(kept, logBudget);
+  const removed = new Set<number>();
+  const render = () =>
+    `${head}${truncationMarker}${lines.filter((_, i) => !removed.has(i)).join("\n")}${tail}`;
+  let result = render();
+  for (const index of payload) {
+    if (Buffer.byteLength(result, "utf8") <= maxBytes) break;
+    const excess = Buffer.byteLength(result, "utf8") - maxBytes;
+    const bytes = Buffer.byteLength(lines[index], "utf8");
+    if (index === payload.at(-1) && bytes > excess) {
+      lines[index] = truncateToByteBudget(lines[index], bytes - excess);
+    } else {
+      removed.add(index);
+    }
+    result = render();
   }
-
-  return `${head}${truncationMarker}${kept}${tail}`;
+  return result;
 }
 
 /**

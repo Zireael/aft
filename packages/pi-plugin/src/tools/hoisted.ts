@@ -25,6 +25,8 @@ import {
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
   isFindReplaceOnlyEdit,
+  relativePathEscapesRoot,
+  shortenHomePath as shortenPath,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
 import {
@@ -151,7 +153,7 @@ type SearchPathArgSplit = { paths: string[]; missing: string[] };
 
 function containsPath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 /**
@@ -1212,12 +1214,6 @@ export function renderMutationResult(
     expanded: options.expanded,
     context,
   });
-}
-
-function shortenPath(path: string): string {
-  const home = homedir();
-  if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-  return path;
 }
 
 /** Resolve a path argument to an absolute path if it exists, decoding file:

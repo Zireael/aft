@@ -177,7 +177,7 @@ describe("bash host fallback", () => {
 describe("hostFallbackPathWithShims", () => {
   const shimsRoot = resolveCortexKitStorageRoot();
   const shimsDir = join(shimsRoot, "shims");
-  const hasShim = existsSync(join(shimsDir, "gh"));
+  const hasShim = existsSync(join(shimsDir, process.platform === "win32" ? "gh.cmd" : "gh"));
 
   test("prepends the shims dir exactly once when the gh shim exists", () => {
     if (!hasShim) return; // machine without a provisioned shim: covered by the absent case below

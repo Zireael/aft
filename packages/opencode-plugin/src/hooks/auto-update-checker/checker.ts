@@ -175,8 +175,16 @@ export function findPluginEntry(directory: string): PluginEntryInfo | null {
         }
         if (entry.startsWith(`${PACKAGE_NAME}@`)) {
           const pinnedVersion = entry.slice(PACKAGE_NAME.length + 1);
-          const isPinned = pinnedVersion !== "latest";
-          return { entry, isPinned, pinnedVersion: isPinned ? pinnedVersion : null, configPath };
+          const isPinned =
+            /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
+              pinnedVersion,
+            );
+          return {
+            entry,
+            isPinned,
+            pinnedVersion: pinnedVersion === "latest" ? null : pinnedVersion,
+            configPath,
+          };
         }
       }
     } catch {

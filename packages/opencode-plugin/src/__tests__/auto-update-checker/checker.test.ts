@@ -368,3 +368,27 @@ describe("auto-update-checker/checker", () => {
     });
   });
 });
+
+test("update channels are not exact version pins", async () => {
+  const root = fs.mkdtempSync(join(tmpdir(), "aft-channel-pin-"));
+  try {
+    fs.mkdirSync(join(root, ".opencode"));
+    const { findPluginEntry } = await freshCheckerImport();
+    for (const [version, pinned] of [
+      ["latest", false],
+      ["beta", false],
+      ["next", false],
+      ["0.58.2", true],
+      ["^0.58.2", false],
+    ] as const) {
+      fs.writeFileSync(
+        join(root, ".opencode", "opencode.json"),
+        JSON.stringify({ plugin: [`@cortexkit/aft-opencode@${version}`] }),
+      );
+      expect(findPluginEntry(root)?.isPinned).toBe(pinned);
+      expect(findPluginEntry(root)?.pinnedVersion).toBe(version === "latest" ? null : version);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

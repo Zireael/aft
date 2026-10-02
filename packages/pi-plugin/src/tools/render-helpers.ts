@@ -2,7 +2,10 @@
  * Shared Pi TUI rendering helpers for AFT-backed tools.
  */
 
-import { homedir } from "node:os";
+import { shortenHomePath as shortenPath } from "@cortexkit/aft-bridge";
+
+export { shortenPath };
+
 import { type AgentToolResult, renderDiff, type Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 
@@ -52,12 +55,6 @@ export function reuseText(last: Component | undefined): Text {
 
 export function reuseContainer(last: Component | undefined): Container {
   return last instanceof Container ? last : new Container();
-}
-
-export function shortenPath(path: string): string {
-  const home = homedir();
-  if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-  return path;
 }
 
 export function renderToolCall(

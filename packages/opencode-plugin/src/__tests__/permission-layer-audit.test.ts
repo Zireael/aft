@@ -1589,3 +1589,12 @@ describe("session-owned bash artifact reads", () => {
     expect(calls.map((call) => call.command)).not.toContain("bash_artifact_owned");
   });
 });
+
+test("containsPath accepts dot-dot-prefixed child names", async () => {
+  expect(
+    (await import("../tools/permissions.js"))._permissionsInternalsForTest.containsPath(
+      "/project",
+      "/project/..cache/file.ts",
+    ),
+  ).toBe(true);
+});
