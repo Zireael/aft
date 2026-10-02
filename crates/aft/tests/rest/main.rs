@@ -2,6 +2,11 @@
 // second copy of the helper tests in this target.
 use callgraph_store_test::test_helpers;
 
+#[path = "../fake_helper_cache_test.rs"]
+mod fake_helper_cache_test;
+#[path = "../helpers/fake_lsp.rs"]
+mod fake_lsp;
+
 // Include ignored benchmarks and reproductions so they can still run by name
 // without linking a separate test executable for each source file.
 #[path = "../callgraph_borrowed_disclosure_test.rs"]

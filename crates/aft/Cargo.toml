@@ -21,10 +21,6 @@ path = "src/lib.rs"
 name = "aft"
 path = "src/main.rs"
 
-[[bin]]
-name = "fake-lsp-server"
-path = "tests/lsp/fake_server.rs"
-
 [[test]]
 name = "engine"
 path = "tests/engine/main.rs"

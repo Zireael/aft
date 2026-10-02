@@ -444,7 +444,7 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn main() -> io::Result<()> {
+pub(crate) fn main() -> io::Result<()> {
     if let Some(program) = std::env::var_os("AFT_FAKE_LSP_PROXY") {
         return run_proxy(program);
     }

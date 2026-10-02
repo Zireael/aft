@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod fake_lsp;
+
 #[path = "../../src/test_env.rs"]
 mod shared_test_env;
 

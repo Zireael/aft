@@ -595,14 +595,7 @@ fn drain_with_live_lsp_servers_and_writer(
         let stderr_path = logs.path().join("module.stderr");
         let config_dir = config_home.path().join("cortexkit");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let fake = std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let mut path = PathBuf::from(env!("CARGO_BIN_EXE_aft"));
-                path.set_file_name("fake-lsp-server");
-                path
-            });
+        let fake = crate::test_helpers::fake_lsp::fake_server_binary();
         let bin_dir = tempfile::tempdir().unwrap();
         let wrapper = bin_dir.path().join("rust-analyzer");
         std::fs::write(

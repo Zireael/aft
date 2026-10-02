@@ -58,25 +58,7 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
 }
 
 fn fake_server_path() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            option_env!("CARGO_BIN_EXE_fake-lsp-server")
-                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
-                .map(PathBuf::from)
-        })
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
-        .or_else(|| {
-            let mut path = std::env::current_exe().ok()?;
-            path.pop();
-            path.pop();
-            path.push("fake-lsp-server");
-            Some(path)
-        })
-        .filter(|path| path.exists())
-        .expect("fake-lsp-server binary path not set")
+    crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
 fn wait_for_index_ready<F>(aft: &mut AftProcess, mut request: F) -> Value
