@@ -570,3 +570,84 @@ fn callgraph_off_publication_extracts_nothing_and_on_fills_it_in() {
     );
     assert_eq!(callgraph_keys(&report.manifest.unwrap()), 5);
 }
+
+#[test]
+#[ignore = "publication profile over a complete worker checkout; run explicitly"]
+fn worker_checkout_publication_reuses_blobs_across_linked_worktrees() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Instant;
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    let linked = tempdir().unwrap();
+    let archive = Command::new("git")
+        .args(["archive", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(archive.status.success());
+    let mut unpack = Command::new("tar")
+        .arg("-x")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    unpack
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&archive.stdout)
+        .unwrap();
+    assert!(unpack.wait().unwrap().success());
+    git(project.path(), &["init", "--quiet"]);
+    commit(project.path(), "worker checkout profile");
+    git(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let family_a = aft::search_index::artifact_cache_key(project.path());
+    let family_b = aft::search_index::artifact_cache_key(linked.path());
+    assert_eq!(
+        family_a, family_b,
+        "linked checkouts must share the repository family"
+    );
+    let started = Instant::now();
+    let first = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        &family_a,
+        "profile-first",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    let first_elapsed = started.elapsed();
+    let started = Instant::now();
+    let second = publish_checkout(&request(
+        storage.path(),
+        linked.path(),
+        &family_b,
+        "profile-second",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    eprintln!(
+        "worker publication: first={first_elapsed:?} puts={} second={:?} puts={}",
+        first.blob_puts,
+        started.elapsed(),
+        second.blob_puts
+    );
+    assert!(first.published && second.published);
+    assert!(first.blob_puts > 0);
+    assert_eq!(
+        second.blob_puts, 0,
+        "same-commit linked checkout must build no new payloads"
+    );
+}

@@ -191,7 +191,7 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
     }
 }
 
-fn thread_census() -> ThreadCensus {
+pub(crate) fn thread_census() -> ThreadCensus {
     let (count, names) = os_thread_names();
     let total = count as u64;
     let Some(names) = names else {

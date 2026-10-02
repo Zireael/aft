@@ -1025,7 +1025,9 @@ fn spawn_semantic_refresh_worker(
                     }
                 }
 
-                if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                if !project_root.is_dir()
+                    || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                {
                     return;
                 }
 
@@ -1036,7 +1038,8 @@ fn spawn_semantic_refresh_worker(
                 // Interactive QueryBudget embeddings do not run on this worker and
                 // therefore never wait on this maintenance limiter.
                 let Some(_refresh_permit) = limiter.acquire(&project_root, || {
-                    lifecycle.is_current(generation_flag.as_ref(), generation)
+                    project_root.is_dir()
+                        && lifecycle.is_current(generation_flag.as_ref(), generation)
                 }) else {
                     return;
                 };
@@ -1098,7 +1101,9 @@ fn spawn_semantic_refresh_worker(
                     let mut embedded_chunks = 0usize;
                     let mut embed_batches = 0usize;
                     let mut embed = |texts: Vec<String>| {
-                        if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                        if !project_root.is_dir()
+                            || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                        {
                             let snapshot = progress_for_embed.snapshot();
                             slog_info!(
                                 "semantic refresh superseded, stopping after {}/{} batches",
@@ -1214,7 +1219,9 @@ fn spawn_semantic_refresh_worker(
                 let mut embedded_chunks = 0usize;
                 let mut embed_batches = 0usize;
                 let mut embed = |texts: Vec<String>| {
-                    if !lifecycle.is_current(generation_flag.as_ref(), generation) {
+                    if !project_root.is_dir()
+                        || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                    {
                         let snapshot = progress_for_embed.snapshot();
                         slog_info!(
                             "semantic refresh superseded, stopping after {}/{} batches",

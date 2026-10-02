@@ -4442,6 +4442,7 @@ impl AppContext {
 
     pub(crate) fn mark_subc_bound(&self) {
         self.subc_lifecycle.mark_bound();
+        self.inspect_manager.resume_root_work();
         // A views-on semantic lane pauses its fills while the root is unbound
         // past the grace window; resume them now rather than at the next edit.
         self.checkout_semantic.wake();
@@ -4450,6 +4451,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        self.inspect_manager.cancel_root_work();
         self.repeat_breaker.clear();
     }
 
@@ -4472,6 +4474,13 @@ impl AppContext {
         expected_generation: u64,
         action: impl FnOnce() -> R,
     ) -> Option<R> {
+        if self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+            .is_some_and(|root| !root.is_dir())
+        {
+            return None;
+        }
         self.subc_lifecycle.run_if_current(
             self.configure_generation.as_ref(),
             expected_generation,
@@ -6063,7 +6072,12 @@ impl AppContext {
     }
 
     pub fn heavy_root_work_allowed(&self) -> bool {
-        self.heavy_root_work_allowed.load(Ordering::SeqCst) && !self.subc_lifecycle.is_unbound()
+        self.heavy_root_work_allowed.load(Ordering::SeqCst)
+            && !self.subc_lifecycle.is_unbound()
+            && self
+                .canonical_cache_root_opt()
+                .or_else(|| self.config().project_root.clone())
+                .is_none_or(|root| root.is_dir())
     }
 
     fn try_heavy_root_work_allowed(&self) -> Option<bool> {

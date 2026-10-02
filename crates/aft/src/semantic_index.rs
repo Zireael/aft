@@ -2126,14 +2126,6 @@ impl SemanticEmbeddingModel {
         let model = config.model.clone();
 
         let query_embedding_cache = Arc::new(Mutex::new(QueryEmbeddingCache::default()));
-        let tls_config = crate::platform_tls::client_config()
-            .map_err(|error| format!("failed to configure embedding client TLS: {error}"))?;
-        let client = Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
-            .redirect(reqwest::redirect::Policy::none())
-            .use_preconfigured_tls(tls_config)
-            .build()
-            .map_err(|error| format!("failed to configure embedding client: {error}"))?;
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
@@ -2156,7 +2148,7 @@ impl SemanticEmbeddingModel {
                 };
 
                 SemanticEmbeddingEngine::OpenAiCompatible {
-                    client,
+                    client: crate::platform_tls::blocking_client()?,
                     model,
                     base_url,
                     api_key,
@@ -2170,7 +2162,7 @@ impl SemanticEmbeddingModel {
                 let base_url = normalize_base_url(raw)?;
 
                 SemanticEmbeddingEngine::Ollama {
-                    client,
+                    client: crate::platform_tls::blocking_client()?,
                     model,
                     base_url,
                 }

@@ -50,12 +50,41 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
 
 fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) -> InspectResult {
     let started = Instant::now();
+    let cancellation = crate::executor::current_job_cancellation();
+    let cancelled = || {
+        !job.project_root.is_dir()
+            || cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+    };
+    if cancelled() {
+        return InspectResult::failed(
+            job,
+            "TODO scan cancelled: root unbound or missing",
+            started.elapsed(),
+        );
+    }
     memo.reserve_for_scan(job.scope_files.len());
     let per_file: Vec<FileScan> = job
         .scope_files
         .par_iter()
-        .map(|path| memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
+        .filter_map(|path| {
+            let _cancel = cancellation
+                .clone()
+                .map(crate::executor::install_job_cancellation);
+            if cancelled() {
+                return None;
+            }
+            Some(memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
+        })
         .collect();
+    if cancelled() {
+        return InspectResult::failed(
+            job,
+            "TODO scan cancelled: root unbound or missing",
+            started.elapsed(),
+        );
+    }
     if job.is_full_project_scope() {
         memo.prune_to_scope(&job.project_root, &job.scope_files);
     }
@@ -179,17 +208,22 @@ fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
             entry.insert(parser);
         }
 
-        parsers
+        let parser = parsers
             .get_mut(&language)
-            .expect("parser inserted for language")
-            .parse(source, None)
-            .or_else(|| {
-                log::debug!(
-                    "tree-sitter returned no TODO scan tree for {}",
-                    path.display()
-                );
-                None
-            })
+            .expect("parser inserted for language");
+        // Tree-sitter resumes a timed-out parse on the same buffer. Short slices
+        // make a large generated file interruptible without discarding its tree.
+        #[allow(deprecated)]
+        parser.set_timeout_micros(100_000);
+        loop {
+            if crate::executor::current_job_cancelled() || !path.is_file() {
+                parser.reset();
+                return None;
+            }
+            if let Some(tree) = parser.parse(source, None) {
+                return Some(tree);
+            }
+        }
     })
 }
 

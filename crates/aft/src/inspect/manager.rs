@@ -371,7 +371,7 @@ fn run_tier2_pass_with_deadline<T>(
     permit_slot: Option<Tier2PermitSlot>,
     action: impl FnOnce() -> T,
 ) -> (T, bool) {
-    let cancellation = crate::executor::JobCancellation::new();
+    let cancellation = crate::executor::JobCancellation::new().with_root(project_root);
     let parent_cancellation = crate::executor::current_job_cancellation();
     let deadline_cancellation = cancellation.clone();
     let root = project_root.to_path_buf();
@@ -516,6 +516,7 @@ fn cached_tier2_aggregate_usable(
 }
 
 pub struct InspectManager {
+    root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     request_tx: Sender<InspectJob>,
     result_rx: Receiver<InspectResult>,
     #[allow(dead_code)]
@@ -607,8 +608,27 @@ impl InspectManager {
         heavy_root_work_allowed: Arc<AtomicBool>,
         semantic_cold_seed_active: Arc<AtomicBool>,
     ) -> Self {
-        let handles = start_dispatch_loop(worker);
+        let root_work_cancellation = Arc::new(Mutex::new(crate::executor::JobCancellation::new()));
+        let worker_cancellation = Arc::clone(&root_work_cancellation);
+        let guarded_worker: InspectWorker = Arc::new(move |job| {
+            let token = worker_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let token = token.with_root(&job.project_root);
+            let _cancel = crate::executor::install_job_cancellation(token.clone());
+            if token.cancel_requested_before_commit() || !job.project_root.is_dir() {
+                return InspectResult::failed(
+                    &job,
+                    "inspect root is unbound or missing",
+                    Duration::ZERO,
+                );
+            }
+            worker(job)
+        });
+        let handles = start_dispatch_loop(guarded_worker);
         Self {
+            root_work_cancellation,
             request_tx: handles.request_tx,
             result_rx: handles.result_rx,
             pool: handles.pool,
@@ -638,6 +658,28 @@ impl InspectManager {
 
     fn heavy_root_work_allowed(&self) -> bool {
         self.heavy_root_work_allowed.load(Ordering::SeqCst)
+            && !self
+                .root_work_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel_requested_before_commit()
+    }
+
+    pub(crate) fn cancel_root_work(&self) {
+        self.root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_cancel();
+    }
+
+    pub(crate) fn resume_root_work(&self) {
+        let mut token = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.cancel_requested_before_commit() {
+            *token = crate::executor::JobCancellation::new();
+        }
     }
 
     pub(crate) fn set_cold_build_limiter(
@@ -1125,7 +1167,14 @@ impl InspectManager {
 
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
+        let cancellation = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let cancellation = cancellation.with_root(&job.project_root);
         pool.spawn_fifo(move || {
+            let _cancel = crate::executor::install_job_cancellation(cancellation);
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
             let result = manager.tier2_run_with_reuse_job_result_catching(
                 job,
@@ -1245,7 +1294,14 @@ impl InspectManager {
         let categories_for_worker = submission.newly_queued_categories.clone();
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
+        let cancellation = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let cancellation = cancellation.with_root(&snapshot.project_root);
         pool.spawn_fifo(move || {
+            let _cancel = crate::executor::install_job_cancellation(cancellation);
             for category in categories_for_worker {
                 let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
                 let _flight = manager.tier2_flight_exit_guard(job.key.clone());

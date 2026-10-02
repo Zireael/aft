@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 
@@ -75,15 +75,11 @@ impl RerankBackend for RemoteReranker {
         if docs.is_empty() {
             return Ok(Vec::new());
         }
-        let remaining = deadline
+        deadline
             .checked_duration_since(Instant::now())
             .filter(|time| !time.is_zero())
             .ok_or(RerankError::Timeout)?;
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(remaining.min(Duration::from_secs(5)))
-            .timeout(remaining)
-            .build()
+        let client = crate::platform_tls::blocking_client()
             .map_err(|_| RerankError::Unavailable("cannot initialize rerank HTTP client".into()))?;
         let documents: Vec<_> = docs.iter().map(|doc| doc.text).collect();
         let body = if self.tei {
@@ -171,6 +167,7 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::time::Duration;
 
     pub(crate) fn serve(
         body: &'static str,

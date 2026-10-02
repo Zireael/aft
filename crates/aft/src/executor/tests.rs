@@ -4235,3 +4235,84 @@ fn promoted_bind_does_not_freeze_reads_behind_a_stuck_reader() {
     assert_eq!(bind_response.data["code"], "request_cancelled");
     assert!(reader_response.success);
 }
+
+#[test]
+fn quiesce_signals_running_maintenance_and_refuses_late_work() {
+    let (_dir, root) = test_root("quiesce-running");
+    let ctx = test_ctx();
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), Arc::clone(&ctx));
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "running".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                current_job_cancelled(),
+                "running maintenance must observe quiesce"
+            );
+            ok("running")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ctx.mark_subc_unbound();
+    assert_eq!(executor.cancel_root_maintenance(&root), 1);
+    let late = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "late".into(),
+        Box::new(|_| panic!("unbound root admitted maintenance")),
+    );
+    assert!(!recv_async(late, "late unbound maintenance").success);
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "cancelled running maintenance").success);
+    ctx.mark_subc_bound();
+    let rebound = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "rebound".into(),
+        Box::new(|_| {
+            assert!(!current_job_cancelled());
+            ok("rebound")
+        }),
+    );
+    assert!(recv_async(rebound, "rebound maintenance").success);
+}
+
+#[test]
+fn deleted_root_aborts_running_maintenance_without_a_reaper() {
+    let (dir, root) = test_root("deleted-running");
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), test_ctx());
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "deleted".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                current_job_cancelled(),
+                "deletion must abort at the next checkpoint"
+            );
+            ok("deleted")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    dir.close().unwrap();
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "deleted root maintenance").success);
+    let late = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "late".into(),
+        Box::new(|_| panic!("missing root admitted maintenance")),
+    );
+    assert!(!recv_async(late, "late deleted maintenance").success);
+}

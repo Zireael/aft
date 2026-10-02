@@ -175,6 +175,13 @@ pub fn install_standalone_scope(ctx: Arc<AppContext>) -> StandaloneScope {
     }
 }
 
+pub(crate) fn cancel_for_context(ctx: &AppContext) {
+    let context = ctx as *const AppContext as usize;
+    for job in JOBS.lock().values().filter(|job| job.context == context) {
+        job.token.request_cancel();
+    }
+}
+
 /// Scheduling succeeds once ownership has moved to the detached worker.
 /// Callers outside any actor scope (tests and one-shot tools that drain
 /// configure maintenance themselves) retain the synchronous API.
@@ -191,7 +198,10 @@ pub(crate) fn schedule(
         .canonical_cache_root_opt()
         .ok_or("view root is not configured")?;
     let content_generation = ctx.configure_content_generation();
-    let token = JobCancellation::new();
+    if ctx.subc_unbound_quiesced() || !root.is_dir() {
+        return Err("view root is unbound or missing".to_owned());
+    }
+    let token = JobCancellation::new().with_root(&root);
     token.mark_running();
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
@@ -226,6 +236,7 @@ pub(crate) fn schedule(
             loop {
                 if token.cancel_requested_before_commit()
                     || target.ctx.configure_content_generation() != content_generation
+                    || target.ctx.subc_unbound_quiesced()
                     || !target.ctx.config().views.enabled
                 {
                     break;

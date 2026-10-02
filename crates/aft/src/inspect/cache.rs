@@ -342,7 +342,7 @@ impl<T> Default for Tier1FileMemo<T> {
 impl<T> Tier1FileMemo<T> {
     /// Prevent a full-scope scan from evicting entries that the same scan will
     /// need again on its next run. Capacity only grows here; a completed full
-    /// scan shrinks it back to that scan's live file set in [`Self::prune_to_scope`].
+    /// scan shrinks it to the retained entries across all roots.
     pub(crate) fn reserve_for_scan(&self, file_count: usize) {
         let required_capacity = file_count.max(TIER1_FILE_MEMO_MAX_ENTRIES);
         if let Ok(mut state) = self.state.lock() {
@@ -362,7 +362,13 @@ impl<T> Tier1FileMemo<T> {
             state.entries.retain(|path, _| {
                 !path.starts_with(project_root) || live_paths.contains(path.as_path())
             });
-            state.capacity = live_paths.len().max(TIER1_FILE_MEMO_MAX_ENTRIES);
+            // These memos are process-wide. Finishing a small checkout must
+            // not evict the retained corpus of a concurrently scanned root.
+            state.capacity = state
+                .entries
+                .len()
+                .max(live_paths.len())
+                .max(TIER1_FILE_MEMO_MAX_ENTRIES);
             state.retain_live_lru_nodes();
             state.evict_lru();
         }
@@ -2828,6 +2834,32 @@ mod tests {
             "a path outside the latest full scope must be evicted"
         );
         assert_eq!(value, 3);
+    }
+
+    #[test]
+    fn tier1_file_memo_small_root_does_not_evict_other_roots() {
+        let large = tempfile::tempdir().unwrap();
+        let small = tempfile::tempdir().unwrap();
+        let memo = Tier1FileMemo::<usize>::default();
+        let count = TIER1_FILE_MEMO_MAX_ENTRIES + 1;
+        memo.reserve_for_scan(count + 1);
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let path = large.path().join(format!("{index}.txt"));
+            fs::write(&path, "retained").unwrap();
+            memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), index));
+            paths.push(path);
+        }
+        let path = small.path().join("small.txt");
+        fs::write(&path, "small").unwrap();
+        memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), count));
+        memo.prune_to_scope(small.path(), &[path]);
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                memo.get_or_insert_with(path, |_| panic!("small root evicted another root")),
+                index
+            );
+        }
     }
 
     #[test]

@@ -490,6 +490,7 @@ pub struct BindBlockerSnapshot {
 #[derive(Debug, Clone)]
 pub struct JobCancellation {
     inner: Arc<JobCancellationInner>,
+    root: Option<Arc<std::path::PathBuf>>,
 }
 
 #[derive(Debug)]
@@ -512,7 +513,13 @@ impl JobCancellation {
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
             }),
+            root: None,
         }
+    }
+
+    pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
+        self.root = Some(Arc::new(root.to_path_buf()));
+        self
     }
 
     fn mark_running(&self) -> bool {
@@ -639,6 +646,11 @@ impl JobCancellation {
 
     /// True when a cancel won the state race and the job must abort.
     pub fn cancel_requested_before_commit(&self) -> bool {
+        // A deleted checkout cannot publish useful work. Check here as well as
+        // at admission so deletion during a batch does not wait for the reaper.
+        if self.root.as_ref().is_some_and(|root| !root.is_dir()) {
+            self.request_cancel();
+        }
         self.state() == JOB_CANCEL_STATE_CANCELLED
     }
 
@@ -888,6 +900,7 @@ struct RunningJob {
     execution_started: Arc<AtomicBool>,
     completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
+    cancellation: Option<JobCancellation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1122,6 +1135,54 @@ impl Executor {
         if cancelled > 0 {
             self.wake_scheduler();
         }
+        cancelled
+    }
+
+    /// Cancel queued maintenance and signal running root work at its checkpoints.
+    /// Interactive tools other than inspect retain their normal completion path.
+    pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let mut state = self.inner.state.lock();
+        if let Some(actor) = state.actors.get(root_id) {
+            view_publication::cancel_for_context(&actor.ctx);
+        }
+        let mut cancelled = state
+            .actors
+            .get_mut(root_id)
+            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .unwrap_or(0);
+        if let Some(actor) = state.actors.get_mut(root_id) {
+            for lane in [
+                Lane::PureRead,
+                Lane::SerialLspStatus,
+                Lane::HeavyInit,
+                Lane::Mutating,
+                Lane::MaintenanceCommit,
+            ] {
+                for job in actor
+                    .interactive
+                    .queue(lane)
+                    .iter()
+                    .filter(|job| job.command == "inspect")
+                {
+                    if let Some(token) = &job.cancellation {
+                        token.request_cancel();
+                        cancelled += 1;
+                    }
+                }
+            }
+        }
+        for job in state.running_jobs.values() {
+            if &job.root_id == root_id
+                && (job.job_class == JobClass::Maintenance || job.command == "inspect")
+            {
+                if let Some(token) = &job.cancellation {
+                    token.request_cancel();
+                    cancelled += 1;
+                }
+            }
+        }
+        drop(state);
+        self.wake_scheduler();
         cancelled
     }
 
@@ -1553,6 +1614,12 @@ impl Executor {
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
         rerun: Option<RepeatableJob>,
     ) {
+        let cancellation = if job_class == JobClass::Maintenance || command == "inspect" {
+            Some(cancellation.unwrap_or_default())
+        } else {
+            cancellation
+        };
+        let cancellation = cancellation.map(|token| token.with_root(root_id.as_path()));
         let mut rerun = rerun;
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -1565,7 +1632,12 @@ impl Executor {
                 Some(actor) => {
                     let mut admission_error = None;
                     if job_class == JobClass::Maintenance {
-                        if maintenance_coalesce_key
+                        if actor.ctx.subc_unbound_quiesced() || !root_id.as_path().is_dir() {
+                            admission_error = Some(maintenance_cancelled_response(
+                                request_id.clone(),
+                                "maintenance root is unbound or missing",
+                            ));
+                        } else if maintenance_coalesce_key
                             .is_some_and(|key| actor.maintenance.has_maintenance_coalesce_key(key))
                         {
                             admission_error = Some(maintenance_cancelled_response(
@@ -3315,6 +3387,7 @@ fn launch_run_job(
             execution_started: Arc::clone(&run_job.execution_started),
             completion_ownership: Arc::downgrade(&ownership),
             occupancy_reported: false,
+            cancellation: run_job.cancellation.clone(),
         },
     );
     debug_assert!(replaced.is_none());
@@ -3739,6 +3812,12 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             .is_some_and(JobCancellation::cancel_requested_before_commit)
     };
     let run = |job: ExecutorJob| {
+        if cancel_requested()
+            || ((run_job.job_class == JobClass::Maintenance || run_job.command == "inspect")
+                && (run_job.ctx.subc_unbound_quiesced() || !run_job.root_id.as_path().is_dir()))
+        {
+            return cancelled_before_execution();
+        }
         let can_start = run_job
             .cancellation
             .as_ref()
@@ -3824,8 +3903,14 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             // Same gate as reads: the job's mutations are protected by the
             // touched subsystems' own locks, and holding only the read gate
             // lets interactive PureReads overlap freely.
-            let _epoch = run_job.epoch.read();
-            run(job)
+            loop {
+                if cancel_requested() {
+                    return LaneRun::Finished(cancelled_before_execution());
+                }
+                if let Some(_epoch) = run_job.epoch.try_read_for(EPOCH_WAIT_POLL) {
+                    return LaneRun::Finished(run(job));
+                }
+            }
         }
     };
     LaneRun::Finished(response)
