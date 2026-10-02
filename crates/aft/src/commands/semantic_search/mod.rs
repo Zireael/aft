@@ -2137,6 +2137,16 @@ fn handle_external_search(
                 if search_cancellation_requested() {
                     return cancelled_search_response(req);
                 }
+                crate::slog_debug!(
+                    "external disk check of {}: {} files compared in {} ms, {} re-read in {} ms ({} not re-read, walk complete: {})",
+                    external_root.display(),
+                    checked.check.files_examined,
+                    checked.walk_time.as_millis(),
+                    checked.check.reread,
+                    checked.reread_time.as_millis(),
+                    checked.check.not_reread,
+                    checked.check.walk_complete
+                );
                 ctx.with_checked_overlays(|overlays| {
                     overlays.remember(
                         &external_root,
