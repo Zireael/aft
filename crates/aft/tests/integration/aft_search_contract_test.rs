@@ -758,9 +758,10 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     let storage = tempfile::tempdir().expect("storage");
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
-    // A two-word query: a single identifier is answered by the exact
-    // identifier sweep instead, which reads every file and is not degraded
-    // (see external_identifier_without_index_returns_every_source_use_and_no_dump).
+    // This test covers the generic scan, so the query has two words. A query
+    // that is one identifier takes the exact identifier sweep instead, which
+    // reads every file and is not degraded (see
+    // external_identifier_without_index_returns_every_source_use_and_no_dump).
     let response = response_value(handle_semantic_search(
         &request_with_path("fn needle_symbol", Some("literal"), external_project.path()),
         &ctx,
@@ -1050,9 +1051,9 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
     persist_mismatched_semantic_index(external_project.path(), &external_source, storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
-    // A two-word query reaches the ranked lanes; a single identifier is
-    // answered by the exact identifier sweep, which has no semantic lane to
-    // miss and so is not partial.
+    // This test covers the ranked lanes, so the query has two words. A query
+    // that is one identifier takes the exact identifier sweep instead, which
+    // has no semantic lane to miss and so is not partial.
     let response = response_value(handle_semantic_search(
         &request_with_path("fn needle_symbol", None, external_project.path()),
         &ctx,

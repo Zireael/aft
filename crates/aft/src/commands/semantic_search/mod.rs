@@ -2077,7 +2077,8 @@ fn handle_external_search(
         engine_plan.readiness.lexical_index,
         &mut warnings,
     );
-    // Both lanes below can rank from saved index content that nothing checked
+    // The grep and ranked (hybrid/semantic) handlers below can answer from
+    // this project's saved trigram or semantic index, which nothing checked
     // against the files now on disk.
     let served_from_saved_index = matches!(
         artifacts.search,
@@ -2296,8 +2297,8 @@ fn handle_external_bounded_lexical_fallback(
                 walk_truncated: !outcome.fully_covered(),
                 more_available: reply.more_available,
                 engine_capped: false,
-                // Every file was read from disk: an exact answer, not a
-                // degraded one, even though no index was used.
+                // Every file was read from disk, so the answer is not marked
+                // degraded even though no index was used.
                 fully_degraded: false,
                 envelope: reply.envelope,
                 exact_sweep: Some(reply.summary),
@@ -10547,8 +10548,9 @@ mod tests {
         )
         .expect("write external fixture");
         let ctx = test_context(session.path());
-        // Two words: a single identifier is answered by the exact identifier
-        // sweep, which reads every file and so is not reported fully degraded.
+        // This test covers the generic scan, so the query has two words. A
+        // query that is one identifier takes the exact identifier sweep, which
+        // reads every file and so is not reported fully degraded.
         let req = semantic_request("fn budget_disclosure_needle", 10);
         let params = SemanticSearchParams {
             query: "fn budget_disclosure_needle".to_string(),
