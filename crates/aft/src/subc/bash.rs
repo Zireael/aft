@@ -1597,6 +1597,14 @@ mod grant_path_tests {
                 .collect(),
         );
         for (index, (_, root)) in roots.iter().take(4).enumerate() {
+            // Each command polls for its release file. Windows runs bash commands
+            // through PowerShell, so the loop is written in its syntax there.
+            #[cfg(windows)]
+            let command = format!(
+                "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}",
+                releases.0[index].display()
+            );
+            #[cfg(not(windows))]
             let command = format!(
                 "while [ ! -f '{}' ]; do sleep 0.01; done",
                 releases.0[index].display()
