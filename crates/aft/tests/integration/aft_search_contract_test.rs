@@ -1413,11 +1413,10 @@ fn definition_hit_is_rendered_at_its_declaration_line() {
             .contains("pub fn running_tasks(&self)"),
         "{response}"
     );
+    // The rendered header uses the platform's path separator.
+    let header = format!("{}:5", Path::new("src").join("registry.rs").display());
     assert!(
-        response["text"]
-            .as_str()
-            .unwrap()
-            .contains("src/registry.rs:5"),
+        response["text"].as_str().unwrap().contains(&header),
         "{response}"
     );
 }
