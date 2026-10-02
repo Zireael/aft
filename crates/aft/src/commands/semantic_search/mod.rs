@@ -6381,6 +6381,20 @@ mod tests {
         .expect("build semantic search request")
     }
 
+    /// A search request with its own id. Embedding counts are recorded in a
+    /// process-wide map keyed by request id and reset whenever a request with
+    /// that id starts, so a test that reads them must not share the id other
+    /// tests running in parallel use.
+    fn semantic_request_with_id(id: &str, query: &str, top_k: usize) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+        }))
+        .expect("build semantic search request")
+    }
+
     fn semantic_request_with_hint(query: &str, top_k: usize, hint: &str) -> RawRequest {
         serde_json::from_value(serde_json::json!({
             "id": "semantic-search-test",
@@ -6688,11 +6702,15 @@ mod tests {
                 .as_str()
                 .is_some_and(|warning| warning.contains("lexical-only fallback"))));
 
-        let busy_request_id = "semantic-search-test";
+        let busy_request_id = "blocked-local-query-busy";
         let busy_started = Instant::now();
         let busy_response = with_query_budget_for_test(200, || {
             response_value(handle_semantic_search(
-                &semantic_request("how remix panel option state changes", 5),
+                &semantic_request_with_id(
+                    busy_request_id,
+                    "how remix panel option state changes",
+                    5,
+                ),
                 &ctx,
             ))
         });
