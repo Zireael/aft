@@ -20,17 +20,17 @@
   "slices": [
     "split-query-mention-host"
   ],
-  "unreachable_rows": [
+  "unreachable_split_rows": [
     {
       "episode_id": "followup-census:910001",
       "predicate": "split_rank1_required",
-      "reason": "Unreachable by any pattern design. The query alone does not rank the answer (commands/ast_search.rs) in its first ten results, and the pattern ast_grep_search is a stale name: it declares nothing and does not occur in the answer file (its Rust occurrences are a mention in ast_grep_hints.rs and test files), so there is no definition to admit and no mention of the answer to lift. The answer's rank is the query's."
+      "reason": "Unreachable by any pattern design: the query alone never ranks the answer (commands/ast_search.rs) in its first ten results, and the pattern ast_grep_search is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
     },
     {
       "episode_id": "followup-census:910002",
       "predicate": "split_rank1_required",
-      "reason": "Unreachable by any pattern design. The query alone ranks the answer (bash_background/registry.rs) 10th, and the pattern subagent_type is a stale name: it declares nothing and matches only query_shape_test.rs, not the answer, so there is no definition to admit and no mention of the answer to lift. Rank 1 would need the query's own ranking to change."
+      "reason": "Unreachable by any pattern design: the query alone ranks the answer (bash_background/registry.rs) 10th, and the pattern subagent_type is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
     }
   ],
-  "note": "aft_search gains `pattern`. With `query` beside it the ranking is query-primary: the base order is exactly the query-only ranking (exact tier included), and per selective alternative of the pattern a leading query result gets a small bonus for its own matching lines (a declarer at least as much as a mention), and the alternative's best definition is placed right after the best-placed leading result that mentions the name, never above it; with no such result it is admitted only when the query has no semantic lane or the definition is relevant to the query on its own. Declaration-shaped alternatives (`^pub struct Name`) record their definitions, and a single group alternation is judged per branch. No call graph and no clock are consulted, so every page sees one order. The pi-plugin schema gains `pattern`, so real_query.capability.schema_sha256 differs from the reference; a ranking descriptor with a targeted mechanism does not compare the capability block. The unreachable_rows entries document two stale-hint rows that no pattern design can satisfy; the harness has no field that waives a split predicate, so the gate still reports them (see the train notes). Query-only rows are unchanged."
+  "note": "aft_search gains `pattern`. With `query` beside it the ranking is query-primary: the base order is exactly the query-only ranking (exact tier included), and per selective alternative of the pattern a leading query result gets a small bonus for its own matching lines (a declarer at least as much as a mention), and the alternative's best definition is placed right after the best-placed leading result that mentions the name, never above it; with no such result it is admitted only when the query has no semantic lane or the definition is relevant to the query on its own. Declaration-shaped alternatives (`^pub struct Name`) record their definitions, and a single group alternation is judged per branch. No call graph and no clock are consulted, so every page sees one order. The pi-plugin schema gains `pattern`, so real_query.capability.schema_sha256 differs from the reference; a ranking descriptor with a targeted mechanism does not compare the capability block. Rows 910001 and 910002 are listed in unreachable_split_rows: stale-hint rows the gate waives only after verifying that the split rank equals the prose-only rank and that the pattern matches no line of the answer file at the pin. Query-only rows are unchanged."
 }
