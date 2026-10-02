@@ -402,6 +402,31 @@ part, or three lines mentioning all parts, count as exact evidence and
 outrank the file that holds the literal. Identifier-shaped queries run no
 semantic lane, so the rows need no query vectors.
 
+### Definition, receiver.member and missing-name rows
+
+Rows `followup-census:900018`–`900034` are identifier queries (shape
+`identifier`, no semantic lane, so no query vectors) for three engine
+questions:
+
+- `900018`–`900020`, mechanism `identifier_not_definition_first`. The answer
+  is the file that declares the name. `900018` (`line_col_to_byte`, a real
+  agent query from Synapse's rerank-eval corpus, id `aft-030`) has a planning
+  note under `.gsd/` that quotes the declaration and sorts before
+  `crates/aft/src/edit.rs` by path. `900019` (`ctx.set_harness`) and `900020`
+  (`adapter.clearPluginCache`) are census `receiver.member` queries: their
+  text occurs only at call sites, and the answer is the declaration on the
+  receiver's type (`context.rs`, the `HarnessAdapter` interface in
+  `adapters/types.ts`).
+- `900021`–`900034`, mechanism `renamed_or_variant_token`. Every census
+  episode on this repository whose query is one identifier-shaped token that
+  occurs in no file at the pin, and that the agent followed by opening a
+  file. The answer is the file the agent opened next. `answer_key_basis`
+  names the closest name that file holds at the pin, if any. These measure
+  what an agent gets for a name that does not exist.
+
+The score records ranked files only, so no row checks which line a result is
+rendered at.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
@@ -413,6 +438,36 @@ commit message which change moved the rows and why it was the right direction.
 
 Re-records so far:
 
+- 2026-10-02, after train 271's ranking change `894133741` (search a
+  hyphenated query as one literal) landed on `main`, together with the 17
+  identifier rows `900018`–`900034` from `9aaef09d5` (see Definition,
+  receiver.member and missing-name rows above). Recorded on macOS arm64 from a
+  clean release build of unchanged `origin/main` `f15190422` (`aft 0.58.2`, no
+  rustc wrapper, binary sha256
+  `dd4afd242b4947ef77e0d1e3857cefc6637f5d00af192fb5f79e6dc8cc9db8f4`), in two
+  steps on that one binary. First `cost-gate.sh --search-quality --mode
+  record-reference` with the old 76-row manifest: exactly nine rows moved, all
+  hyphenated single-token queries, the eight hyphenated-literal rows
+  `900010`–`900017` (each now ranks its answer first) and `19696`
+  (`cortexkit-store`, a miss before and after, whose candidates no longer lead
+  with files that only mention the parts); the other 67 are byte-equal to the
+  previous reference, and four replays on two builds of that tree produced
+  identical rows. `paged` MRR@10 0.272290 -> 0.371601, hit@5 0.381579 ->
+  0.486842, census-weighted MRR 0.308773 -> 0.455716, `identifier` shape
+  0.182540 -> 0.601852, `phrase_present_not_surfaced` 0.178571 -> 0.933333.
+  Then `--mode record-reference --manifest-changed --old-score <old-manifest
+  replay> --base-ref <first step>` with the 93-row manifest: all 76 old rows
+  are byte-equal to the first step, so the remaining change is the new rows:
+  `paged` MRR@10 0.371601 -> 0.338471 (93 rows), hit@5 0.486842 -> 0.451613,
+  census-weighted MRR 0.455716 -> 0.335822, `identifier` shape 0.601852 ->
+  0.401984, `identifier_not_definition_first` 1.000 -> 0.850 (the three new
+  rows each rank their answer second), new `renamed_or_variant_token` 0.124008
+  (ranks 2, miss, miss, miss, 1, miss, miss, miss, 9, 8, miss, miss, miss,
+  miss in row-ID order). All 93 rows are byte-equal to the reference
+  `9aaef09d5` recorded independently in a Linux aarch64 container at
+  `597e3d13c`. Exact recall stayed 1.000 and concept recall 0.639423. The
+  reference also gains the `split_rows_not_applicable` field, which the
+  harness has written since the joined split-row change.
 - 2026-10-01, when the eight hyphenated-literal rows were added (see
   Hyphenated-literal rows above). Recorded in a Linux aarch64 container on a
   release build of the unchanged engine (`aft 0.58.1`, binary sha256
