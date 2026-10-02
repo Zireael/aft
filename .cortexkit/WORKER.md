@@ -43,6 +43,7 @@ New test files go under `src/__tests__/`. A guard fails the suite on any test fi
 - **Run the plugin end-to-end or permission suites from a worktree under `/tmp`.** The temp-directory permission exemption makes their assertions wrong.
 - **Generate synthetic CPU load** (busy loops, stress tools). To test timing under load, use the injected-delay test hooks (`test-timing-hooks`) or a narrower deadline.
 - **Run `aft_inspect` on Rust files while your own build or tests are compiling.** Its rust-analyzer check can hold the target lock.
+- **Send a `read` in the same step as the bash command whose effect it checks** (for example a `git checkout --` revert). Parallel calls race, and the read can finish first and show the old file. Read in the next step.
 - **Write closing keywords** (`Fixes #N`, `Closes #N`, `Resolves #N`) in commit messages. Write `(#N)`.
 - **Edit `ARCHITECTURE.md` or `STRUCTURE.md`** to log a change.
 

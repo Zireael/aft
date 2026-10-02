@@ -2,5 +2,10 @@
   "agent_name": "AFT",
   "board": {
     "enabled": true
+  },
+  "substrates": {
+    "workloads": {
+      "mason": "broca"
+    }
   }
 }
