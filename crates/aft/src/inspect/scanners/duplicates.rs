@@ -215,7 +215,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
-            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
+            generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
         });
     };
@@ -228,7 +228,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
-            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
+            generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
         });
     }
@@ -237,7 +237,8 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
     let line_count = source_line_count(&source);
     let expected_duplicate = source.contains(EXPECTED_DUPLICATE_MARKER);
-    let generated = crate::inspect::generated::is_generated_file_from_source(path, &source);
+    let generated =
+        crate::inspect::generated::is_generated_file_from_source(&job.project_root, path, &source);
     let tree = parse_source(path, lang, &source)?;
     let mut fragments = Vec::new();
     let mut hash_scratch = Vec::new();

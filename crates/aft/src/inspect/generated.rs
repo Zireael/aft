@@ -14,7 +14,8 @@ const GENERATED_CONTENT_LINES: usize = 5;
 static FILE_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
-    if path_has_generated_shape(path) {
+    let relative = path.strip_prefix(project_root).unwrap_or(path);
+    if !relative.is_absolute() && path_has_generated_shape(relative) {
         return true;
     }
 
@@ -23,15 +24,17 @@ pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
     } else {
         project_root.join(path)
     };
-    if path_has_generated_shape(&absolute) {
-        return true;
-    }
-
     first_lines_have_generated_marker(&absolute)
 }
 
-pub(crate) fn is_generated_file_from_source(path: &Path, source: &str) -> bool {
-    path_has_generated_shape(path) || source_has_generated_marker(source)
+pub(crate) fn is_generated_file_from_source(
+    project_root: &Path,
+    path: &Path,
+    source: &str,
+) -> bool {
+    let relative = path.strip_prefix(project_root).unwrap_or(path);
+    (!relative.is_absolute() && path_has_generated_shape(relative))
+        || source_has_generated_marker(source)
 }
 
 pub(crate) fn is_generated_file_with_cached_hint(
@@ -173,6 +176,37 @@ mod tests {
         ));
         assert!(!source_has_generated_marker(
             "export const handwritten = true;\n// 2\n// 3\n// 4\n// 5\n// DO NOT EDIT"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn generated_parent_is_not_project_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gen/myapp");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        assert!(!super::is_generated_file_from_source(
+            &root,
+            &file,
+            "fn main() {}"
+        ));
+        assert!(super::is_generated_file_from_source(
+            &root,
+            &root.join("src/generated/types.rs"),
+            ""
+        ));
+        assert!(!super::is_generated_file(&root, &file));
+        assert!(!super::is_generated_file(
+            &root,
+            std::path::Path::new("src/main.rs")
+        ));
+        assert!(super::is_generated_file(
+            &root,
+            &root.join("src/generated/types.rs")
         ));
     }
 }

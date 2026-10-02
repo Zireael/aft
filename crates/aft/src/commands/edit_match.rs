@@ -1056,12 +1056,15 @@ pub(crate) fn push_fuzzy_replacement(
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
-    let separator_is_outside = matched.pass > 1
-        && source[end..]
-            .trim_start_matches(|c| c == ' ' || c == '\t')
-            .starts_with('\n');
+    let remaining = source[end..].trim_start_matches([' ', '\t']);
+    let separator_is_outside =
+        matched.pass > 1 && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
     if separator_is_outside && replacement.ends_with('\n') {
-        output.push_str(&replacement[..replacement.len() - 1]);
+        output.push_str(
+            replacement
+                .strip_suffix("\r\n")
+                .unwrap_or(&replacement[..replacement.len() - 1]),
+        );
     } else {
         output.push_str(replacement);
     }
@@ -1528,6 +1531,25 @@ mod replace_all_tests {
         assert_eq!(
             allocations, 1,
             "output construction must not allocate once per match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn fuzzy_crlf_separator_is_not_duplicated() {
+        let source = "a\r\nb\r\nc\r\n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, "a\nb\n");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\r\ny\r\n")
+                .unwrap(),
+            "x\r\ny\r\nc\r\n"
+        );
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\ny\n").unwrap(),
+            "x\ny\r\nc\r\n"
         );
     }
 }

@@ -343,7 +343,8 @@ fn boundary_match(source: &str, needle: &str, start: usize, end: usize, pass: u8
         .sum::<usize>();
     FuzzyMatch {
         byte_start,
-        byte_len: byte_end - byte_start,
+        // Whitespace-only windows can trim the same characters from both ends.
+        byte_len: byte_end.saturating_sub(byte_start),
         pass,
     }
 }
@@ -736,5 +737,21 @@ mod tests {
         assert!(detail.contains("#8 at line 8"));
         assert!(detail.contains("… and 2 more"));
         assert!(!detail.contains("#9 at line 9"));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn whitespace_match_has_valid_range() {
+        for source in ["a\n \nb\n", "a\n   \nb\n", "a\n \u{2003} \nb\n"] {
+            let matches = super::find_all_fuzzy(source, "\t");
+            assert!(!matches.is_empty());
+            for m in matches {
+                assert!(source
+                    .get(m.byte_start..m.byte_start + m.byte_len)
+                    .is_some());
+            }
+        }
     }
 }

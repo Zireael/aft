@@ -921,8 +921,16 @@ fn percent_decode(input: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &input[index + 1..index + 3];
-            if let Ok(value) = u8::from_str_radix(hex, 16) {
+            let hex_digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            {
+                let value = high * 16 + low;
                 out.push(value);
                 index += 3;
                 continue;
@@ -4513,5 +4521,16 @@ mod placeholder_argument_tests {
         )
         .expect("blank files entry is a placeholder");
         assert!(!translated.args.contains_key("files"));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn percent_decode_unicode_literal() {
+        for text in ["%aé.txt", "50%€.txt", "%", "%a", "%gg"] {
+            assert_eq!(super::percent_decode(text), text);
+        }
+        assert_eq!(super::percent_decode("%C3%A9%20"), "é ");
     }
 }

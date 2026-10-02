@@ -45,21 +45,31 @@ fn is_cargo_test_signature_line(line: &str) -> bool {
 }
 
 fn cargo_subcommand(command: &str) -> Option<String> {
-    let mut seen_cargo = false;
-    for token in command.split_whitespace() {
-        if !seen_cargo {
-            if token == "cargo" {
-                seen_cargo = true;
-            }
-            continue;
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "cargo" {
+            break;
         }
-        if token.starts_with('-') {
-            continue;
-        }
+    }
+    while let Some(token) = tokens.next() {
         if crate::compress::is_shell_boundary(token) {
             return None;
         }
-        return Some(token.to_string());
+        if matches!(
+            token,
+            "-Z" | "--config"
+                | "--color"
+                | "--manifest-path"
+                | "--target-dir"
+                | "--lockfile-path"
+                | "-C"
+        ) {
+            if tokens.next().is_none_or(crate::compress::is_shell_boundary) {
+                return None;
+            }
+        } else if !token.starts_with('-') && !token.starts_with('+') {
+            return Some(token.to_string());
+        }
     }
     None
 }
@@ -319,5 +329,27 @@ error: could not compile `demo` (lib test) due to 1 previous error
             cargo_subcommand("cargo test --release").as_deref(),
             Some("test")
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn cargo_global_options_before_subcommand() {
+        for command in [
+            "cargo +nightly test",
+            "cargo --locked test",
+            "cargo -Z unstable-options test",
+            "cargo --config k=v test",
+            "cargo --config=k=v test",
+            "cargo --color always test",
+            "cargo -Zunstable-options test",
+        ] {
+            assert_eq!(
+                super::cargo_subcommand(command).as_deref(),
+                Some("test"),
+                "{command}"
+            );
+        }
     }
 }

@@ -2278,7 +2278,7 @@ fn short_output_tail(output: &str) -> Option<String> {
     let mut tail = lines.join(" | ");
     const MAX_TAIL_CHARS: usize = 500;
     if tail.len() > MAX_TAIL_CHARS {
-        let start = tail.len().saturating_sub(MAX_TAIL_CHARS);
+        let start = tail.floor_char_boundary(tail.len().saturating_sub(MAX_TAIL_CHARS));
         tail = format!("…{}", &tail[start..]);
     }
     Some(tail)
@@ -3475,5 +3475,14 @@ C:\repo\other.go:1:1: other file
         let (go_cmd, _) =
             detect_type_checker(&dir.path().join("main.go"), LangId::Go, &go_config).unwrap();
         assert_eq!(go_cmd, bin_dir.join("go").to_string_lossy());
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn tail_utf8_boundary() {
+        let text = format!("é{}", "x".repeat(499));
+        assert_eq!(super::short_output_tail(&text).unwrap(), format!("…{text}"));
     }
 }

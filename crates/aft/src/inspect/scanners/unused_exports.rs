@@ -761,7 +761,8 @@ fn scan_file(path: &Path, project_root: &Path) -> Option<FileScan> {
         return Some(empty_file_scan(file_path, relative_file, freshness, None));
     };
 
-    let generated = crate::inspect::generated::is_generated_file_from_source(&file_path, &source);
+    let generated =
+        crate::inspect::generated::is_generated_file_from_source(project_root, &file_path, &source);
     let exports = extract_exports(&source, &tree);
     let namespace_members = namespace_member_accesses(&source, &tree, &import_block);
     let mut imports =
