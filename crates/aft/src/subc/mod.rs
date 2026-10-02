@@ -1484,15 +1484,19 @@ fn quiesce_unbound_root(
         // ConfigureTail cannot release gates, install a watcher, or reserve a
         // callgraph build after this transition becomes visible.
         ctx.mark_subc_unbound();
-        ctx.stop_watcher_runtime_in_background();
-        ctx.invalidate_artifacts_after_watcher_gap();
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
     let cancelled = executor.cancel_root_maintenance(root_id);
-    // An unbound root retains reusable artifacts, not active watcher threads.
-    // Stopping the watcher records an observation gap for re-verification on
-    // rebind; otherwise each retired worker checkout keeps a backend alive.
+    // Transient unbind keeps the root WARM: the watcher stays running (its
+    // events accumulate and replay on rebind, so no unobserved gap exists) and
+    // resident artifacts stay resident. Host restarts unbind every root and
+    // rebind seconds later; stopping the watcher here would force strict
+    // re-verification plus a full callgraph rebuild on every restart. The
+    // expensive teardown (watcher stop + gap invalidation) belongs to the
+    // idle-TTL reaper and the root-deleted path.
+    // Executor maintenance and inspect still stop cooperatively: retaining
+    // warm artifacts does not admit new indexing work on an unbound root.
     let discarded = ctx
         .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
         .unwrap_or(0);
@@ -11624,7 +11628,7 @@ mod tests {
     #[test]
     fn unbound_root_quiesces_maintenance_without_removing_actor() {
         let (_root_dir, root) = test_root("unbound-root-quiesce");
-        let ctx = inspect_context(root.as_path());
+        let ctx = test_ctx();
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let mut meta = RootMeta::new(Instant::now());
@@ -11633,7 +11637,7 @@ mod tests {
         meta.maintenance_queued_kinds
             .push_back(MaintenanceDrainKind::ConfigureTail);
         let mut live_roots = HashMap::from([(root.clone(), meta)]);
-        // Seed resident state to verify watcher-gap invalidation on unbind.
+        // Warm state planted before the unbind: quiesce must keep it.
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -11641,8 +11645,9 @@ mod tests {
         ctx.set_cache_writer_capabilities(true, true);
         let pending = root.as_path().join("pending.rs");
         ctx.add_pending_search_index_paths([pending.clone()]);
-        // A stopped watcher leaves a gap; retained disk artifacts must be
-        // strictly verified before a later bind serves them.
+        // A warm verify memo must survive the transient unbind: the watcher
+        // keeps running, so no unobserved window exists and the next warm
+        // reload must not pay a strict full-corpus re-hash.
         let canonical_root = root.as_path().to_path_buf();
         let artifact = canonical_root.join("cache.bin");
         std::fs::write(&artifact, b"warm-artifact").expect("write artifact");
@@ -11660,7 +11665,8 @@ mod tests {
             ),
             crate::cache_freshness::WarmVerifyPlan::Skip
         ));
-        // Shutdown must release the watcher even while the actor is retained.
+        // A live watcher runtime must survive quiesce (its events accumulate
+        // for the rebind replay).
         let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
         let _dispatch_tx = dispatch_tx;
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -11683,14 +11689,15 @@ mod tests {
         assert!(meta.maintenance_pending);
         assert!(meta.maintenance_queued_kinds.is_empty());
         assert!(executor.actor_registered(&root));
-        // Pending reconciliation paths survive for the next bind, but
-        // watcher-maintained resident artifacts cannot remain authoritative.
+        // Transient unbind keeps the root warm: resident artifacts stay
+        // resident, no forced callgraph rebuild is planted, and pending
+        // reconciliation paths survive for the rebind replay.
         assert!(
             ctx.search_index()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "quiesce must invalidate resident artifacts after the watcher stops"
+                .is_some(),
+            "quiesce must not evict resident artifacts"
         );
         assert_eq!(
             ctx.pending_callgraph_store_force_token(),
@@ -11703,7 +11710,7 @@ mod tests {
             "quiesce must retain pending watcher-derived paths"
         );
         assert!(
-            !matches!(
+            matches!(
                 crate::cache_freshness::warm_verify_plan(
                     &canonical_root,
                     crate::cache_freshness::VerifyArtifact::Search,
@@ -11711,11 +11718,11 @@ mod tests {
                 ),
                 crate::cache_freshness::WarmVerifyPlan::Skip
             ),
-            "watcher downtime must invalidate the warm verify memo"
+            "quiesce must not invalidate the warm verify memo"
         );
         assert!(
-            !ctx.watcher_runtime_active(),
-            "quiesce must stop a running watcher"
+            ctx.watcher_runtime_active(),
+            "quiesce must not stop a running watcher"
         );
         ctx.stop_watcher_runtime();
 
@@ -11733,16 +11740,10 @@ mod tests {
     #[test]
     #[ignore = "process thread census requires an isolated test process and real watchers"]
     fn bound_roots_share_http_runtime_threads() {
-        root_thread_census_regression(false);
+        root_thread_census_regression();
     }
 
-    #[test]
-    #[ignore = "process thread census requires an isolated test process and real watchers"]
-    fn quiesced_roots_release_watcher_threads() {
-        root_thread_census_regression(true);
-    }
-
-    fn root_thread_census_regression(quiesce: bool) {
+    fn root_thread_census_regression() {
         let _env_lock = crate::test_env::process_env_lock();
         struct ScopedEnv(&'static str, Option<std::ffi::OsString>);
         impl ScopedEnv {
@@ -11768,7 +11769,6 @@ mod tests {
             return;
         }
         let executor = Arc::new(Executor::new());
-        let mut live_roots = HashMap::new();
         let mut roots = Vec::new();
         let mut models = Vec::new();
         for index in 0..4 {
@@ -11788,7 +11788,6 @@ mod tests {
                 )
                 .unwrap(),
             );
-            live_roots.insert(root.clone(), RootMeta::new(Instant::now()));
             roots.push((dir, root, ctx));
         }
         let bound = crate::lifecycle_census::thread_census();
@@ -11799,39 +11798,6 @@ mod tests {
                 <= before.by_class["reqwest-internal-sync-runtime"] + 1,
             "embedding roots must share one blocking HTTP runtime"
         );
-        if quiesce {
-            for (_, root, _) in &roots {
-                quiesce_unbound_root(root, &mut live_roots, &executor);
-            }
-            for (_, _, ctx) in &roots {
-                wait_for_watcher_count(ctx, 0);
-            }
-            let deadline = Instant::now() + Duration::from_secs(90);
-            loop {
-                let after = crate::lifecycle_census::thread_census();
-                let watchers = |census: &crate::lifecycle_census::ThreadCensus| {
-                    census
-                        .by_class
-                        .iter()
-                        .filter(|(class, _)| {
-                            class.contains("watcher")
-                                || class.contains("fsevents")
-                                || class.as_str() == "notify-rs"
-                        })
-                        .map(|(_, count)| *count)
-                        .sum::<u64>()
-                };
-                if watchers(&after) <= watchers(&before) {
-                    eprintln!("threads quiesced={after:?}");
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "quiesced roots retained watcher threads: {after:?}"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
         for (_, _, ctx) in &roots {
             ctx.stop_watcher_runtime_in_background();
         }

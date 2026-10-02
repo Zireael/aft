@@ -8800,6 +8800,168 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deleted_root_aborts_real_executor_semantic_refresh_between_batches() {
+        executor_semantic_refresh_abandonment(true);
+    }
+
+    #[test]
+    fn quiesced_root_aborts_real_executor_semantic_refresh_between_batches() {
+        executor_semantic_refresh_abandonment(false);
+    }
+
+    fn executor_semantic_refresh_abandonment(delete_root: bool) {
+        use crate::executor::{Executor, Lane};
+        use crate::path_identity::ProjectRootId;
+        use crate::semantic_index::{LocalEmbeddingProvider, SemanticEmbeddingModel};
+
+        struct DelayedEmbedder {
+            batches: Arc<AtomicUsize>,
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
+        impl LocalEmbeddingProvider for DelayedEmbedder {
+            fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                if self.batches.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered
+                        .send(())
+                        .expect("first embedding batch entered");
+                    self.release
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release delayed embedding batch");
+                }
+                Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("semantic project root");
+        let storage = tempfile::tempdir().expect("isolated semantic storage");
+        let root = ProjectRootId::from_path(directory.path()).expect("canonical semantic root");
+        let project_root = root.as_path().to_path_buf();
+        // Multiple chunks in one file ensure another embedding boundary remains
+        // after deletion, without depending on a later filesystem walk.
+        fs::write(
+            project_root.join("lib.rs"),
+            "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 2 }\npub fn gamma() -> u32 { 3 }\n",
+        )
+        .expect("write semantic chunks");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(project_root.clone());
+        ctx.mark_subc_bound();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let batches = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let provider = DelayedEmbedder {
+            batches: Arc::clone(&batches),
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let (observed_tx, observed_rx) = crossbeam_channel::bounded(1);
+        let running = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::HeavyInit,
+            "delayed-semantic-refresh".to_owned(),
+            Box::new(move |ctx| {
+                let (request_tx, request_rx) = crossbeam_channel::unbounded();
+                let (event_tx, event_rx) = crossbeam_channel::unbounded();
+                let worker = super::spawn_semantic_refresh_worker(
+                    project_root.clone(),
+                    SemanticIndex::new(project_root.clone(), 3),
+                    SemanticEmbeddingModel::from_local_provider_for_test(
+                        Box::new(provider),
+                        project_root,
+                    ),
+                    1,
+                    100,
+                    Duration::ZERO,
+                    true,
+                    None,
+                    request_rx,
+                    event_tx,
+                    ctx.subc_lifecycle_admission(),
+                    ctx.configure_generation_flag(),
+                    ctx.configure_generation(),
+                    super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
+                    None,
+                    ctx.semantic_worker_bytes(),
+                );
+                request_tx.send(SemanticRefreshRequest::Corpus).unwrap();
+                // A normally completed worker must also terminate so a missed
+                // cancellation produces an assertion failure, not an idle hang.
+                drop(request_tx);
+                let mut events = Vec::new();
+                loop {
+                    match event_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(event) => events.push(event),
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        Err(error) => panic!("semantic worker did not terminate: {error}"),
+                    }
+                }
+                worker.join().expect("semantic worker exits cleanly");
+                observed_tx.send(events).unwrap();
+                Response::success("delayed-semantic-refresh", json!({ "worker_exited": true }))
+            }),
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("real refresh reached delayed embedding batch");
+        assert_eq!(batches.load(Ordering::SeqCst), 1);
+        if delete_root {
+            directory.close().expect("delete semantic root mid-refresh");
+        } else {
+            ctx.mark_subc_unbound();
+            assert_eq!(executor.cancel_root_maintenance(&root), 1);
+        }
+        release_tx.send(()).expect("release embedding delay");
+        let events = observed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("observe semantic termination");
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), running)
+                    .await
+                    .expect("executor released semantic slot")
+                    .expect("semantic executor completion")
+            });
+        assert!(
+            response.success,
+            "semantic worker panicked: {:?}",
+            response.data
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SemanticRefreshEvent::CorpusStarted { .. }]
+            ),
+            "abandoned refresh must not emit completion or failure payloads: {events:?}"
+        );
+        assert_eq!(
+            batches.load(Ordering::SeqCst),
+            1,
+            "abandoned refresh must abort before its second embedding batch"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !executor.actor_is_idle(&root) {
+            assert!(
+                Instant::now() < deadline,
+                "semantic refresh retained its executor slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn spawn_semantic_corpus_refresh_worker_for_test(
         project_root: PathBuf,
         config: &SemanticBackendConfig,

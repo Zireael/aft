@@ -197,7 +197,28 @@ fn scan_parser_comments(path: &Path, language: LangId, source: &str, file: &str)
     items
 }
 
+#[cfg(all(test, debug_assertions))]
+type ParseDelay = (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
+
+#[cfg(all(test, debug_assertions))]
+static PARSE_DELAYS: OnceLock<Mutex<HashMap<PathBuf, ParseDelay>>> = OnceLock::new();
+
 fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
+    #[cfg(all(test, debug_assertions))]
+    {
+        let delay = PARSE_DELAYS
+            .get()
+            .and_then(|delays| delays.lock().unwrap().remove(path));
+        if let Some((entered, release)) = delay {
+            entered.send(()).expect("TODO file reached parser");
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release delayed TODO parser");
+        }
+    }
     TODOS_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(language) {
@@ -739,6 +760,108 @@ mod tests {
             inspect_writer: true,
             callgraph_writer: true,
             callgraph_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn quiesced_root_aborts_real_executor_todos_scan_mid_parse() {
+        executor_todos_abandonment(false);
+    }
+
+    #[test]
+    fn deleted_root_aborts_real_executor_todos_scan_mid_parse() {
+        executor_todos_abandonment(true);
+    }
+
+    fn executor_todos_abandonment(delete_root: bool) {
+        use crate::context::AppContext;
+        use crate::executor::{Executor, Lane};
+        use crate::parser::TreeSitterProvider;
+        use crate::path_identity::ProjectRootId;
+        use crate::protocol::Response;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("TODO project root");
+        let storage = tempfile::tempdir().expect("isolated TODO storage");
+        let root = ProjectRootId::from_path(directory.path()).expect("canonical TODO root");
+        let path = root.as_path().join("lib.rs");
+        fs::write(&path, "// TODO: retain this marker\npub fn target() {}\n")
+            .expect("write TODO fixture");
+        let job = todos_job(root.as_path(), vec![path.clone()]);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.mark_subc_bound();
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        PARSE_DELAYS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path, (entered_tx, release_rx));
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let running = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::HeavyInit,
+            "delayed-todos-scan".to_owned(),
+            Box::new(move |_| {
+                // Run the real scanner and its Rayon file work, not a closure
+                // that merely asserts the executor token was cancelled.
+                let result = run_todos_scan(&job);
+                result_tx.send(result).unwrap();
+                Response::success(
+                    "delayed-todos-scan",
+                    serde_json::json!({ "scan_exited": true }),
+                )
+            }),
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("real TODO scan read a file and reached its parser");
+        if delete_root {
+            directory.close().expect("delete TODO root mid-scan");
+        } else {
+            ctx.mark_subc_unbound();
+            assert_eq!(executor.cancel_root_maintenance(&root), 1);
+        }
+        release_tx.send(()).expect("release TODO parser delay");
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("TODO scan terminates after abandonment");
+        assert!(
+            matches!(result.outcome, Err(ref error) if error.contains("cancelled")),
+            "abandoned TODO scan must not report a fresh aggregate: {:?}",
+            result.outcome
+        );
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), running)
+                    .await
+                    .expect("executor releases TODO scan slot")
+                    .expect("TODO executor completion")
+            });
+        assert!(
+            response.success,
+            "TODO scanner panicked: {:?}",
+            response.data
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !executor.actor_is_idle(&root) {
+            assert!(
+                Instant::now() < deadline,
+                "TODO scan retained executor slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
