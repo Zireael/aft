@@ -939,7 +939,7 @@ fn format_timestamp(value: &Value) -> Option<String> {
     Some(format_unix_millis_utc(millis.trunc() as i64))
 }
 
-fn format_unix_millis_utc(millis: i64) -> String {
+pub(crate) fn format_unix_millis_utc(millis: i64) -> String {
     let seconds = div_floor_i64(millis, 1000);
     let millisecond = millis.rem_euclid(1000);
     let days = div_floor_i64(seconds, 86_400);

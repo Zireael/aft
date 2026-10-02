@@ -758,8 +758,11 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     let storage = tempfile::tempdir().expect("storage");
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
+    // A two-word query: a single identifier is answered by the exact
+    // identifier sweep instead, which reads every file and is not degraded
+    // (see external_identifier_without_index_returns_every_source_use_and_no_dump).
     let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+        &request_with_path("fn needle_symbol", Some("literal"), external_project.path()),
         &ctx,
     ));
 
@@ -1047,8 +1050,11 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
     persist_mismatched_semantic_index(external_project.path(), &external_source, storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
+    // A two-word query reaches the ranked lanes; a single identifier is
+    // answered by the exact identifier sweep, which has no semantic lane to
+    // miss and so is not partial.
     let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", None, external_project.path()),
+        &request_with_path("fn needle_symbol", None, external_project.path()),
         &ctx,
     ));
 
@@ -2908,6 +2914,10 @@ fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
     assert_every_source_use_first_and_no_dump(&response);
     assert_eq!(response["result_count"], 6);
     assert_eq!(response["complete"], true);
+    assert_eq!(
+        response["fully_degraded"], false,
+        "a sweep that read every file is not a degraded answer"
+    );
     assert_eq!(response["exact_sweep"]["complete"], true);
     assert_eq!(response["exact_sweep"]["used_index"], false);
     let text = response["text"].as_str().expect("text");
@@ -2949,6 +2959,14 @@ fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no
     assert_eq!(response["result_count"], 6);
     assert_eq!(response["exact_sweep"]["used_index"], true);
     assert_eq!(response["exact_sweep"]["complete"], true);
+    assert_eq!(
+        response["complete"], true,
+        "the identifier plan has no semantic lane, so a full sweep is complete"
+    );
+    assert!(
+        response.get("saved_index_unverified").is_none(),
+        "a sweep that read every changed file needs no unchecked-index notice"
+    );
     assert!(
         response["exact_sweep"]["index_answered_files"]
             .as_u64()

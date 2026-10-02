@@ -39,8 +39,7 @@ use super::extensions::{RawQuery, Token};
 use super::SearchShape;
 use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
 use crate::search_index::{
-    decompose_regex, read_searchable_text, FileEntry, GrepMatch, GrepResult, IndexStatus,
-    SearchIndex,
+    decompose_regex, read_searchable_text, FileEntry, GrepMatch, SearchIndex,
 };
 
 /// Wall-clock budget shared by enumeration and reading, the same budget the
@@ -192,6 +191,8 @@ impl HitKind {
 #[derive(Debug, Clone)]
 pub(super) struct SweepHit {
     pub grep: GrepMatch,
+    /// The matched line as displayed: bounded in length, match kept visible.
+    pub snippet: String,
     pub kind: HitKind,
     pub class: FileClass,
     pub definition: bool,
@@ -465,6 +466,8 @@ fn scan_content(
                     line_text,
                     match_text: term.to_string(),
                 },
+                // A long line is cut around the match so the match stays visible.
+                snippet: super::snippet_bounds::window_snippet_line(raw_line, offset - line_start),
                 kind,
                 class,
                 definition: class == FileClass::Source && is_definition_line(raw_line, term),
@@ -560,45 +563,23 @@ pub(super) fn reply(
     let page: Vec<&SweepHit> = outcome.hits.iter().skip(offset).take(top_k).collect();
     let shown = page.len();
     let more_available = offset.saturating_add(shown) < total;
-    let page_result = GrepResult {
-        matches: page.iter().map(|hit| hit.grep.clone()).collect(),
-        total_matches: total,
-        files_searched: outcome.files_checked,
-        files_with_matches: outcome.files_with_hits(),
-        index_status: if outcome.used_index {
-            IndexStatus::Ready
-        } else {
-            IndexStatus::Fallback
-        },
-        // A sweep that stopped early found only some of the matches, so the
-        // "Found N match" footer must mark N as a lower bound.
-        truncated: !outcome.fully_covered(),
-        fully_degraded: false,
-        engine_capped: false,
-        walk_truncated: !outcome.fully_covered(),
-        skipped_foreign_mounts: 0,
-        missing_on_disk: 0,
-        scan_deadline_reached: outcome.scan_stopped,
-    };
-    let mut text = super::format_grep_search_text(&page_result, display_root, "literal");
-    text.push_str("\n\n");
     let exact_count = outcome
         .hits
         .iter()
         .filter(|hit| hit.kind == HitKind::Exact)
         .count();
+    let mut text = render_hits(&page, display_root);
+    text.push_str("\n\n");
     if total == 0 {
         text.push_str(&format!(
-            "No searched line contains `{}`{}.",
+            "No searched line contains `{}`{}.\n",
             terms.identifier,
             variant_list(terms)
         ));
-        text.push('\n');
     } else if exact_count < total {
         text.push_str(&format!(
-            "Lines containing only a spelling variant ({}) are listed after every line containing `{}`.\n",
-            terms.variants.join(", "),
-            terms.identifier
+            "Lines marked [variant: ...] contain only a spelling variant of `{}`; they are listed after every line containing `{}` itself.\n",
+            terms.identifier, terms.identifier
         ));
     }
     text.push_str(&outcome.coverage_line(root));
@@ -647,6 +628,7 @@ pub(super) fn reply(
             serde_json::json!(outcome.files_discovered)
         },
         "files_checked": outcome.files_checked,
+        "files_with_hits": outcome.files_with_hits(),
         "complete": outcome.fully_covered(),
         "used_index": outcome.used_index,
         "index_answered_files": outcome.index_answered,
@@ -668,6 +650,51 @@ fn variant_list(terms: &IdentifierTerms) -> String {
     } else {
         format!(" or a spelling variant ({})", terms.variants.join(", "))
     }
+}
+
+/// Render hits the way ranked `aft_search` results read: a `path:line`
+/// header with an `[exact]` or `[variant: ...]` marker, the matched line
+/// indented below it, and a `Found N result(s).` footer. The reply is held to
+/// the same byte budget as ranked results.
+fn render_hits(page: &[&SweepHit], display_root: &Path) -> String {
+    if page.is_empty() {
+        return "Found 0 results.".to_string();
+    }
+    let mut out =
+        super::snippet_bounds::BudgetedText::new(super::snippet_bounds::SEARCH_MAX_OUTPUT_BYTES);
+    let mut shown = 0usize;
+    for hit in page {
+        let path = hit
+            .grep
+            .file
+            .strip_prefix(display_root)
+            .unwrap_or(&hit.grep.file)
+            .display();
+        let marker = match hit.kind {
+            HitKind::Exact => "[exact]".to_string(),
+            HitKind::Variant => format!("[variant: {}]", hit.grep.match_text),
+        };
+        let separator = if out.is_empty() { "" } else { "\n\n" };
+        if !out.push(&format!("{separator}{path}:{} {marker}", hit.grep.line)) {
+            break;
+        }
+        let line = super::snippet_bounds::cap_snippet_line(&hit.snippet);
+        if !out.push(&format!("\n      {line}")) {
+            break;
+        }
+        shown += 1;
+    }
+    let cut = out.is_cut();
+    let mut text = out.into_string();
+    if cut {
+        text.push_str(&format!(
+            "\n\n(Output reached the {}-byte limit after {shown} of {} results; the rest were not printed. Lower topK or page with offset.)",
+            super::snippet_bounds::SEARCH_MAX_OUTPUT_BYTES,
+            page.len()
+        ));
+    }
+    text.push_str(&format!("\n\nFound {} result(s).", page.len()));
+    text
 }
 
 #[cfg(test)]
@@ -1005,6 +1032,212 @@ mod tests {
         );
         assert!(all.text.contains("exact pass: complete"), "{}", all.text);
         assert_eq!(all.results[0]["source"], "exact");
+    }
+
+    /// The agent-visible text of one `search` tool call, rendered the way each
+    /// transport renders it: the standalone NDJSON `tool_call` path formats the
+    /// response without a finalizer; the subc path also runs the shared
+    /// finalizer, which appends the status bar and checkout notes.
+    fn rendered_search_text(
+        ctx: &crate::context::AppContext,
+        session_root: &Path,
+        external_root: &Path,
+        query: &str,
+        subc: bool,
+    ) -> String {
+        use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
+
+        let args = serde_json::json!({
+            "query": query,
+            "path": external_root.display().to_string(),
+            "topK": 25,
+        });
+        let format_context =
+            crate::subc_format::FormatContext::from_tool_call("search", &args, session_root);
+        let tool_ctx = ToolCallContext {
+            project_root: session_root.to_path_buf(),
+            session_id: Some("external-render".to_string()),
+            request_id: "external-render".to_string(),
+            diagnostics_on_edit: false,
+            preview: false,
+            edit_slot_survives: None,
+            report_registration_downgrade: false,
+            standard_edit_grammar: false,
+            disabled_tools: None,
+            worker_session: false,
+        };
+        let dispatch = |request: crate::protocol::RawRequest, app: &crate::context::AppContext| {
+            assert_eq!(request.command, "semantic_search");
+            crate::commands::semantic_search::handle_semantic_search(&request, app)
+        };
+        let finalizer = |response: &mut crate::protocol::Response, text: &mut String| {
+            crate::response_finalize::finalize_tool_response(
+                response,
+                text,
+                ctx,
+                "external-render",
+                "search",
+                false,
+            );
+        };
+        let finalizer_ref: Option<&crate::run_tool_call::FinalizeFn<'_>> =
+            if subc { Some(&finalizer) } else { None };
+        match run_tool_call(
+            "search",
+            args,
+            &format_context,
+            &tool_ctx,
+            ctx,
+            &dispatch,
+            finalizer_ref,
+            None,
+        ) {
+            ToolCallOutcome::Unary(result) => result.text,
+        }
+    }
+
+    fn git_init(root: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        assert!(status.success());
+    }
+
+    fn render_context(session: &Path, storage: &Path) -> crate::context::AppContext {
+        crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(session.to_path_buf()),
+                storage_dir: Some(storage.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        )
+    }
+
+    /// Checks one rendered identifier reply line by line: every result is a
+    /// `path:line [marker]` header followed by its matched line, then the
+    /// footer and the coverage line. Nothing else may appear (no status note,
+    /// no score, no empty snippet, no data file).
+    fn assert_clean_identifier_text(text: &str, root: &Path, coverage_source: &str) {
+        let root_text = root.display().to_string();
+        let expected_head = format!(
+            "{root_text}/src/store/pool.ts:2 [exact]\n        requireCredentialStamps?: boolean\n\n{root_text}/src/guard.ts:1 [exact]\n      assert(opts.requireCredentialStamps === true)\n"
+        );
+        assert!(text.starts_with(&expected_head), "{text}");
+        let (results, footer) = text.split_once("\n\nFound 8 result(s).\n\n").expect(text);
+        let blocks: Vec<&str> = results.split("\n\n").collect();
+        assert_eq!(blocks.len(), 8, "{text}");
+        for block in &blocks {
+            let (header, snippet) = block.split_once('\n').expect(block);
+            let (location, marker) = header.split_once(' ').expect(header);
+            let (path, line) = location.rsplit_once(':').expect(location);
+            assert!(path.starts_with(&root_text), "absolute path: {header}");
+            assert!(Path::new(path).is_file(), "existing path: {header}");
+            assert!(line.parse::<u32>().is_ok_and(|line| line >= 1), "{header}");
+            assert!(
+                marker == "[exact]" || marker == "[variant: require_credential_stamps]",
+                "{header}"
+            );
+            assert!(snippet.starts_with("      "), "{block}");
+            assert!(!snippet.trim().is_empty(), "{block}");
+            assert!(!snippet.contains('\n'), "one matched line: {block}");
+        }
+        assert!(
+            blocks[7].starts_with(&format!(
+                "{root_text}/src/legacy.py:1 [variant: require_credential_stamps]\n      def require_credential_stamps(row):"
+            )),
+            "{text}"
+        );
+        let footer_lines: Vec<&str> = footer.lines().collect();
+        assert_eq!(footer_lines.len(), 2, "{text}");
+        assert!(
+            footer_lines[0].starts_with("Lines marked [variant: ...]"),
+            "{text}"
+        );
+        assert_eq!(
+            footer_lines[1],
+            format!(
+                "exact pass: complete; checked all 15 files under {root_text} ({coverage_source})"
+            )
+        );
+        for forbidden in [
+            "NaN",
+            "score",
+            "Search status",
+            "[interpreted_as",
+            ".json",
+            "saved AFT index",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn external_identifier_text_reads_cleanly_on_both_transports() {
+        let session = tempfile::tempdir().expect("session");
+        let storage = tempfile::tempdir().expect("storage");
+        let project = identifier_project();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(
+            root.join("src/legacy.py"),
+            "def require_credential_stamps(row):\n    return True\n",
+        )
+        .unwrap();
+        git_init(&root);
+        let ctx = render_context(session.path(), storage.path());
+        for subc in [false, true] {
+            let text = rendered_search_text(&ctx, session.path(), &root, IDENTIFIER, subc);
+            assert_clean_identifier_text(
+                &text,
+                &root,
+                "no AFT index for this project was usable, so files were read from disk",
+            );
+        }
+
+        let cache_dir = crate::search_index::resolve_cache_dir(&root, Some(storage.path()));
+        let mut index = SearchIndex::build(&root);
+        index.write_to_disk(&cache_dir, None);
+        let ctx = render_context(session.path(), storage.path());
+        for subc in [false, true] {
+            let text = rendered_search_text(&ctx, session.path(), &root, IDENTIFIER, subc);
+            assert_clean_identifier_text(
+                &text,
+                &root,
+                "this project's own AFT index answered 7 unchanged files without reading them and 8 files were read from disk",
+            );
+        }
+    }
+
+    #[test]
+    fn unverified_saved_index_answers_say_so_on_both_transports() {
+        let session = tempfile::tempdir().expect("session");
+        let storage = tempfile::tempdir().expect("storage");
+        let project = identifier_project();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        git_init(&root);
+        let cache_dir = crate::search_index::resolve_cache_dir(&root, Some(storage.path()));
+        let mut index = SearchIndex::build(&root);
+        index.write_to_disk(&cache_dir, None);
+        let ctx = render_context(session.path(), storage.path());
+        let expected = format!(
+            "Answered from the saved AFT index of {} (saved ",
+            root.display()
+        );
+        for query in ["how are unbound rows rejected", "\"unbound rows\""] {
+            for subc in [false, true] {
+                let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
+                assert!(text.contains(&expected), "{query}: {text}");
+                assert!(
+                    text.contains(
+                        "which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check."
+                    ),
+                    "{query}: {text}"
+                );
+                assert!(!text.contains("exact pass:"), "{query}: {text}");
+            }
+        }
     }
 
     #[test]

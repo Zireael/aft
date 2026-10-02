@@ -278,6 +278,9 @@ struct ExternalBorrowedArtifacts {
     search: ReadOnlyArtifact<Arc<SearchIndex>>,
     semantic: ReadOnlyArtifact<Arc<SemanticIndex>>,
     search_generation: GenerationToken,
+    /// On-disk file of the borrowed search index, when one exists; its
+    /// modification time says when the index was last saved.
+    search_artifact_path: Option<PathBuf>,
 }
 
 struct ExternalReadinessSource<'a> {
@@ -299,12 +302,14 @@ impl<'a> ExternalReadinessSource<'a> {
 
     fn load(&self) -> &ExternalBorrowedArtifacts {
         self.loaded.get_or_init(|| {
-            let generation = crate::readonly_artifacts::search_index_artifact_generation(
+            let artifact = crate::readonly_artifacts::search_index_artifact_generation(
                 self.root,
                 self.storage_dir,
-            )
-            .map(|artifact| format!("{:?}", artifact.generation))
-            .unwrap_or_else(|| "absent".to_string());
+            );
+            let generation = artifact
+                .as_ref()
+                .map(|artifact| format!("{:?}", artifact.generation))
+                .unwrap_or_else(|| "absent".to_string());
             let mut search = self
                 .ctx
                 .open_borrowed_search_index(self.root, self.storage_dir);
@@ -333,6 +338,7 @@ impl<'a> ExternalReadinessSource<'a> {
                     "borrowed:{}:{generation}",
                     self.root.display()
                 )),
+                search_artifact_path: artifact.map(|artifact| artifact.path),
             }
         })
     }
@@ -2071,8 +2077,21 @@ fn handle_external_search(
         engine_plan.readiness.lexical_index,
         &mut warnings,
     );
+    // Both lanes below can rank from saved index content that nothing checked
+    // against the files now on disk.
+    let served_from_saved_index = matches!(
+        artifacts.search,
+        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
+    ) || matches!(
+        &artifacts.semantic,
+        ReadOnlyArtifact::Fresh(index)
+            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
+            if semantic_fingerprint_matches_session(ctx, index)
+    );
+    let search_artifact_path = artifacts.search_artifact_path.clone();
+    let notice_root = external_root.clone();
 
-    match mode {
+    let mut response = match mode {
         SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
             req,
             ctx,
@@ -2105,6 +2124,93 @@ fn handle_external_search(
             extensions,
             engine_plan,
         ),
+    };
+    if served_from_saved_index {
+        disclose_unverified_saved_index(
+            &mut response,
+            &notice_root,
+            search_artifact_path.as_deref(),
+        );
+    }
+    response
+}
+
+/// Tell the agent that an external reply came from another project's saved
+/// index without a check against that project's files on disk.
+///
+/// Nothing in this session refreshes another project's index, and loading it
+/// does not compare it with the files on disk, so text added or changed since
+/// it was saved can be missing from the results. Replies whose identifier
+/// sweep read every changed file from disk (they carry `exact_sweep`) are
+/// already checked and get no notice.
+fn disclose_unverified_saved_index(
+    response: &mut Response,
+    external_root: &Path,
+    search_artifact_path: Option<&Path>,
+) {
+    if !response.success {
+        return;
+    }
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    if data.contains_key("exact_sweep") {
+        return;
+    }
+    let saved_at = search_artifact_path
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok());
+    let when = saved_at
+        .map(|saved_at| {
+            let millis = saved_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as i64);
+            let age = std::time::SystemTime::now()
+                .duration_since(saved_at)
+                .unwrap_or_default();
+            format!(
+                " (saved {}, {} ago)",
+                crate::subc_format::format_unix_millis_utc(millis - millis.rem_euclid(1000)),
+                format_coarse_age(age)
+            )
+        })
+        .unwrap_or_default();
+    let notice = format!(
+        "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
+        external_root.display()
+    );
+    let text = data
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let text = if text.is_empty() {
+        notice
+    } else {
+        format!("{text}\n\n{notice}")
+    };
+    data.insert("text".to_string(), serde_json::json!(text));
+    data.insert(
+        "saved_index_unverified".to_string(),
+        serde_json::json!({
+            "saved_at_unix_ms": saved_at.and_then(|saved_at| saved_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_millis() as u64)),
+        }),
+    );
+}
+
+/// `45 s`, `12 min`, `6 h`, `3 days`: enough to judge how stale an index is.
+fn format_coarse_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds < 3_600 {
+        format!("{} min", seconds / 60)
+    } else if seconds < 172_800 {
+        format!("{} h", seconds / 3_600)
+    } else {
+        format!("{} days", seconds / 86_400)
     }
 }
 
@@ -2190,6 +2296,9 @@ fn handle_external_bounded_lexical_fallback(
                 walk_truncated: !outcome.fully_covered(),
                 more_available: reply.more_available,
                 engine_capped: false,
+                // Every file was read from disk: an exact answer, not a
+                // degraded one, even though no index was used.
+                fully_degraded: false,
                 envelope: reply.envelope,
                 exact_sweep: Some(reply.summary),
             },
@@ -2264,6 +2373,7 @@ fn handle_external_bounded_lexical_fallback(
             walk_truncated: result.walk_truncated,
             more_available,
             engine_capped: result.engine_capped,
+            fully_degraded: true,
             envelope: Some(envelope),
             exact_sweep: None,
         },
@@ -2278,6 +2388,7 @@ struct ExternalFallbackBody {
     walk_truncated: bool,
     more_available: bool,
     engine_capped: bool,
+    fully_degraded: bool,
     envelope: Option<ListEnvelope>,
     /// Coverage record of an identifier's exact-occurrence sweep.
     exact_sweep: Option<serde_json::Value>,
@@ -2346,7 +2457,7 @@ fn external_fallback_response(
             results: body.results,
             more_available: body.more_available,
             engine_capped: body.engine_capped,
-            fully_degraded: true,
+            fully_degraded: body.fully_degraded,
             warnings,
             extras,
         },
@@ -2639,9 +2750,9 @@ fn handle_external_semantic_or_hybrid_search(
                 query_kind: query_kind_label(shape.kind),
                 semantic_status,
                 status: "ready",
-                complete: semantic_status == "ready"
-                    && !borrow_metadata.stale_cli_snapshot()
-                    && outcome.fully_covered(),
+                // The identifier plan has no semantic lane, so semantic
+                // availability does not make this answer partial.
+                complete: !borrow_metadata.stale_cli_snapshot() && outcome.fully_covered(),
                 text: reply.text,
                 results: reply.results,
                 more_available: reply.more_available,
