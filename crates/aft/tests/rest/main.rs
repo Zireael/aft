@@ -59,5 +59,7 @@ mod status_counts_inspect_seams;
 mod synapse_live_test;
 #[path = "../tool_provider_conformance.rs"]
 mod tool_provider_conformance;
+#[path = "../tool_provider_subc_e2e.rs"]
+mod tool_provider_subc_e2e;
 #[path = "../views_lazy_navigation_profile.rs"]
 mod views_lazy_navigation_profile;
