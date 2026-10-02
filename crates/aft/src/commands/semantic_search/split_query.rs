@@ -294,9 +294,12 @@ impl PatternList {
                 }),
             }
         }
-        // A scan stopped by its file bound, its walk bound or grep's deadline
-        // left files unread.
-        let capped = result.truncated || result.walk_truncated || result.scan_deadline_reached;
+        // A scan stopped by its match bound, its walk bound or grep's
+        // deadline left files unread.
+        let capped = result.truncated
+            || result.walk_truncated
+            || result.scan_deadline_reached
+            || result.walk_bound.is_some();
         Self::from_collection(
             GrepFileCollection {
                 files,
@@ -1658,6 +1661,8 @@ mod tests {
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
             scan_deadline_reached: false,
+            files_read_directly: 4,
+            walk_bound: None,
         };
         let list = PatternList::from_bounded_scan(result, "load");
         assert_eq!(list.len(), 2);
