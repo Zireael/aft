@@ -11688,10 +11688,14 @@ mod split_request_tests {
             assert_eq!(result["matched_by"], by, "{result}");
         }
         let text = response["text"].as_str().expect("text");
+        // The summary line renders the definition site the way every result
+        // path in the reply is rendered: with the platform's separator.
+        let site = Path::new("src").join("loader.rs");
         assert!(
-            text.starts_with(
-                "[pattern `load_config`: 3 files matched, 0 also found by the query; defined in src/loader.rs:1]"
-            ),
+            text.starts_with(&format!(
+                "[pattern `load_config`: 3 files matched, 0 also found by the query; defined in {}:1]",
+                site.display()
+            )),
             "{text}"
         );
         // The semantic lane is off here, so the reply is incomplete; its
