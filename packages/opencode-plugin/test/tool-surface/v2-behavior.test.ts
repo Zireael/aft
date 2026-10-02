@@ -38,6 +38,12 @@ describe("OpenCode V2 shared behavioral cases", () => {
       };
       const dependencies = {
         loadConfig: () => ({}),
+        // Return empty metadata so the real loader's module-global errors and
+        // sources from an earlier test cannot describe this fake config load.
+        configLoadErrors: () => [],
+        configLoadSources: () => [],
+        configLoadTexts: () => new Map(),
+        deliverLoadNotices: () => {},
         // Bootstrap side effects are inert: this test is about tool execution.
         migrateConfigLocations: () => [],
         ensureStorageMigrated: async () => {},

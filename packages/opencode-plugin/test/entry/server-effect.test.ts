@@ -28,6 +28,12 @@ function testDependencies(events: string[]) {
       events.push(`config:${directory}`);
       return {};
     },
+    // The real config loader retains errors, sources and notices in module globals.
+    // Return empty metadata for this fake load rather than reuse an earlier test's load.
+    configLoadErrors: () => [],
+    configLoadSources: () => [],
+    configLoadTexts: () => new Map(),
+    deliverLoadNotices: () => {},
     migrateConfigLocations: () => [],
     ensureStorageMigrated: async () => {},
     ensureOnnxRuntime: async () => null,

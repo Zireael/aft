@@ -14,6 +14,7 @@ All automatically discovered tests below `test/` run in the unit jobs:
 
 - `cancellation/effect-cancellation.test.ts`
 - `entry/server-effect.test.ts`
+- `entry/config-state-isolation.test.ts`
 - `matrix/acceptance-matrix.test.ts`
 - `permissions/ask-site-inventory.test.ts`
 - `permissions/v2-permission.test.ts`
