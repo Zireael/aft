@@ -1206,17 +1206,26 @@ mod tests {
                 Some(index) => (Arc::new(index), "saved"),
                 None => (Arc::new(SearchIndex::build(&root)), "built-now"),
             };
-            for (label, budgets) in [
-                ("capped", None),
-                ("capped", None),
-                ("capped", None),
-                ("uncapped", Some(uncapped)),
+            // Three fresh capped checks, then capped checks that each resume
+            // from the copy the one before left (as successive windows do),
+            // then one uncapped check from the saved index.
+            let mut previous: Option<Arc<SearchIndex>> = None;
+            for (label, resume, budgets) in [
+                ("capped", false, None),
+                ("capped", false, None),
+                ("capped", false, None),
+                ("resumed-1", true, None),
+                ("resumed-2", true, None),
+                ("resumed-3", true, None),
+                ("uncapped", false, Some(uncapped)),
             ] {
-                let run = || check_against_disk(&index, None, &root, None);
+                let base = if resume { previous.clone() } else { None };
+                let run = || check_against_disk(&index, base.as_ref(), &root, None);
                 let checked = match budgets {
                     Some(budgets) => with_all_budgets_for_test(budgets, run),
                     None => run(),
                 };
+                previous = Some(Arc::clone(&checked.index));
                 let check = &checked.check;
                 eprintln!(
                     "PROBE {} index={source} indexed={} {label} walk_ms={} stats={} walk_complete={} changed={} content_unchanged={} added={} removed={} reread={} not_reread={} reread_ms={}",
