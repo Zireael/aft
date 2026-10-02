@@ -3464,7 +3464,7 @@ fn main() {
             _ => root.join("target"),
         };
         let lsp = if mode == "environment" {
-            serde_json::json!({"servers": {"rust-analyzer": {"env": {
+            serde_json::json!({"servers": {"rust": {"env": {
                 "CARGO_TARGET_DIR": base_target.to_string_lossy()
             }}}})
         } else {
