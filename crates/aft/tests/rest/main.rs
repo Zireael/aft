@@ -52,5 +52,7 @@ mod standing_roots_acceptance_test;
 mod status_counts_inspect_seams;
 #[path = "../synapse_live_test.rs"]
 mod synapse_live_test;
+#[path = "../tool_provider_conformance.rs"]
+mod tool_provider_conformance;
 #[path = "../views_lazy_navigation_profile.rs"]
 mod views_lazy_navigation_profile;

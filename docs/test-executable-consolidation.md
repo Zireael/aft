@@ -77,6 +77,20 @@ removed standalone LSP binary names. The compression benchmark command selects
 `rest` with the `compress_spike::` filter. Existing scripts and workflows naming
 `integration`, `watcher_integration` and `sandbox_launch_probe` remain valid.
 
+### Re-applied on the train 274 tree
+
+The fold was re-applied unchanged to a tree that had gained one top-level
+test source since it was written, `tool_provider_conformance.rs`, now a module
+of `rest`. It resolves the `aft` binary through `tests/helpers/aft_binary.rs`,
+which prefers `AFT_TEST_AFT_BINARY`, then nextest's `NEXTEST_BIN_EXE_aft`, then
+Cargo's build-time path, so it keeps working from a relocated nextest archive.
+Pointing `AFT_TEST_AFT_BINARY` at a missing file makes its tests fail at
+launch, which shows the folded module goes through that helper.
+`cargo nextest list -p agent-file-tools --run-ignored all`: 82 to 16 test
+executables, 7541 tests and 89 ignored before and after, and the sorted
+multiset of (source, test name, ignore flag) is identical once the folded
+module prefix is accounted for.
+
 ## Verification limitations
 
 All five folded suites pass: alert 15, engine 204, list-envelope 165, rest 218
