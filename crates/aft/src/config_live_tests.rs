@@ -427,8 +427,10 @@ fn config_file_watch_sees_edits_and_a_directory_created_later() {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }),
     );
-    let wait_for_hit = |label: &str| {
-        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    // Each wait compares against a count taken BEFORE the write: a watch that
+    // fires between the write and a count taken afterwards would otherwise be
+    // folded into the baseline and read as a miss.
+    let wait_for_hit_after = |before: usize, label: &str| {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if hits.load(std::sync::atomic::Ordering::SeqCst) > before {
@@ -440,16 +442,13 @@ fn config_file_watch_sees_edits_and_a_directory_created_later() {
     };
     // Let the watch attach to the root before `.cortexkit` exists.
     std::thread::sleep(Duration::from_millis(500));
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
     write(&file, "{}");
-    wait_for_hit("the directory and file being created");
+    wait_for_hit_after(before, "the directory and file being created");
     std::thread::sleep(Duration::from_millis(500));
     let before = hits.load(std::sync::atomic::Ordering::SeqCst);
     write(&file, r#"{ "format_on_edit": true }"#);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while hits.load(std::sync::atomic::Ordering::SeqCst) == before {
-        assert!(Instant::now() < deadline, "config watch missed an edit");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_hit_after(before, "an edit");
 }
 
 #[test]
