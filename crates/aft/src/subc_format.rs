@@ -2613,16 +2613,25 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
     let body = sections.join("\n");
     // A checkout that reads another checkout's callgraph gets a one-line
     // notice that the callers and line numbers below may not match its own
-    // files. The notice goes first rather than last because a list cut short
-    // must end with its "shown N of M" line.
-    match record
-        .get("borrowed_callgraph")
-        .and_then(Value::as_object)
-        .and_then(|borrowed| string_field(borrowed, "message"))
-    {
-        Some(disclosure) => format!("{disclosure}\n{body}"),
-        None => body,
+    // files, followed, when the answer depends on files the borrowed graph
+    // does not reflect, by a line saying which and what to grep. The notices
+    // go first rather than last because a list cut short must end with its
+    // "shown N of M" line.
+    let notice = |field: &str| {
+        record
+            .get(field)
+            .and_then(Value::as_object)
+            .and_then(|notice| string_field(notice, "message"))
+    };
+    let mut lines: Vec<&str> = ["borrowed_callgraph", "borrowed_coverage"]
+        .into_iter()
+        .filter_map(notice)
+        .collect();
+    if lines.is_empty() {
+        return body;
     }
+    lines.push(&body);
+    lines.join("\n")
 }
 
 fn missing_callgraph_collection(
@@ -4116,6 +4125,15 @@ mod callgraph_format_tests {
         assert_eq!(
             format_callgraph("callers", &borrowed, false),
             "callgraph: borrowed from /owner\n0 callers · 0 file groups"
+        );
+
+        // The note about files the borrowed graph cannot see follows the
+        // disclosure, ahead of the answer.
+        borrowed["borrowed_coverage"] =
+            json!({ "message": "callgraph: the borrowed graph does not reflect 2 files here" });
+        assert_eq!(
+            format_callgraph("callers", &borrowed, false),
+            "callgraph: borrowed from /owner\ncallgraph: the borrowed graph does not reflect 2 files here\n0 callers · 0 file groups"
         );
     }
 }

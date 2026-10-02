@@ -304,6 +304,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "macro note site truncate",
         reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",
     },
+    // The borrowed-graph coverage note on callgraph answers is one summary
+    // line: it names the first few files the borrowed graph does not reflect
+    // and says how many more there are.
+    ExclusionEntry {
+        file: "commands/callgraph_borrowed.rs",
+        enclosing_item: "sample",
+        location_or_primitive: "coverage note file sample take",
+        reason: "summary line naming the first few files a borrowed callgraph does not reflect, with its own 'and N more' count; the counts are in the borrowed_coverage JSON field and the answer's own list keeps its envelope",
+    },
     // The lexical lane's depth tiers are engine-internal cuts over a candidate
     // pool (D_k = 200..3200); the agent never sees this list. The only cut an
     // agent sees is the search surface's topK, which carries the envelope.

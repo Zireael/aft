@@ -410,3 +410,215 @@ fn borrowed_callgraph_answers_disclose_a_checkout_mismatch_and_only_then() {
         rendered(&stale)
     );
 }
+
+fn navigate(ctx: &AppContext, op: &str, root: &Path, file: &str, symbol: &str) -> Response {
+    let req = request(json!({
+        "id": format!("borrowed-{op}"),
+        "command": op,
+        "file": root.join(file),
+        "symbol": symbol,
+        "depth": 1
+    }));
+    match op {
+        "callers" => aft::commands::callers::handle_callers(&req, ctx),
+        "impact" => aft::commands::impact::handle_impact(&req, ctx),
+        other => panic!("unsupported op {other}"),
+    }
+}
+
+/// Ask until the borrowed-graph disclosure counts `changed` differing files,
+/// so the worktree's overlay has seen every file the test wrote.
+fn navigate_once_differing(
+    ctx: &AppContext,
+    op: &str,
+    root: &Path,
+    file: &str,
+    symbol: &str,
+    changed: u64,
+) -> Response {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let response = navigate(ctx, op, root, file, symbol);
+        if response.data["borrowed_callgraph"]["changed_files"].as_u64() == Some(changed) {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{op} never saw {changed} differing files: {:#}",
+            response.data
+        );
+        aft::runtime_drain::drain_watcher_events(ctx);
+        aft::runtime_drain::drain_search_index_events(ctx);
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn second_line(op: &str, response: &Response) -> String {
+    aft::subc_format::format_callgraph(op, &response.data, false)
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A caller of `newCaller`, which nothing in either commit calls.
+const FRESH_CALLER: &str = "import { newCaller } from './new_caller';\n\nexport function freshCaller() {\n  return newCaller();\n}\n";
+
+/// A configured owner at the newest commit, with its graph populated.
+fn owner_with_graph(temp: &Path) -> (PathBuf, String, PathBuf, Arc<AppContext>) {
+    let storage = temp.join("storage");
+    let (owner_root, _, new_commit) = repository(temp);
+    let owner = configure(&owner_root, &storage);
+    populated_callers(&owner, &owner_root, "target");
+    (owner_root, new_commit, storage, owner)
+}
+
+#[test]
+fn a_caller_only_in_a_changed_file_is_found_by_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let (owner_root, new_commit, storage, _owner) = owner_with_graph(temp.path());
+    let worktree = linked_worktree(
+        &owner_root,
+        &temp.path().join("fresh-worktree"),
+        &new_commit,
+    );
+    write(&worktree, "src/fresh.ts", FRESH_CALLER);
+    let ctx = configure(&worktree, &storage);
+
+    let answer = navigate_once_differing(
+        &ctx,
+        "callers",
+        &worktree,
+        "src/new_caller.ts",
+        "newCaller",
+        1,
+    );
+    assert!(answer.success, "callers failed: {answer:?}");
+    assert_eq!(answer.data["complete"], json!(false), "{:#}", answer.data);
+    // The graph has no caller of newCaller; the only one lives in a file the
+    // borrowed graph has never seen, and is found there by name. The import
+    // line names it too but is not a caller.
+    assert_eq!(
+        answer.data["callers"],
+        json!([{
+            "file": "src/fresh.ts",
+            "callers": [{
+                "symbol": "freshCaller",
+                "line": 4,
+                "approximate": true,
+                "resolved_by": "name_match"
+            }]
+        }]),
+        "{:#}",
+        answer.data
+    );
+    assert_eq!(answer.data["total_callers"], json!(1));
+    let text = rendered(&answer);
+    assert_eq!(
+        second_line("callers", &answer),
+        "callgraph: found 1 caller of `newCaller` by name, marked ~, in 1 file here that the borrowed graph does not reflect",
+        "rendered: {text}"
+    );
+    assert!(
+        text.contains("1 caller · 1 file group\nsrc/fresh.ts\n  ↳ freshCaller:4 ~"),
+        "rendered: {text}"
+    );
+
+    let impact = navigate(&ctx, "impact", &worktree, "src/new_caller.ts", "newCaller");
+    assert!(impact.success, "impact failed: {impact:?}");
+    assert_eq!(impact.data["complete"], json!(false));
+    assert_eq!(impact.data["total_affected"], json!(1), "{:#}", impact.data);
+    assert_eq!(impact.data["affected_files"], json!(1), "{:#}", impact.data);
+    let text = aft::subc_format::format_callgraph("impact", &impact.data, false);
+    assert!(
+        text.contains("src/fresh.ts:4\n  ↳ freshCaller ~\n  return newCaller();"),
+        "rendered: {text}"
+    );
+    assert_eq!(
+        second_line("impact", &impact),
+        "callgraph: found 1 call site of `newCaller` by name, marked ~, in 1 file here that the borrowed graph does not reflect"
+    );
+}
+
+#[test]
+fn a_search_cut_short_by_its_file_limit_names_the_files_it_skipped() {
+    let temp = tempfile::tempdir().unwrap();
+    let (owner_root, new_commit, storage, _owner) = owner_with_graph(temp.path());
+    let worktree = linked_worktree(
+        &owner_root,
+        &temp.path().join("padded-worktree"),
+        &new_commit,
+    );
+    // 257 files that sort before the caller's file push it past the search's
+    // limit of 256 files.
+    for index in 0..257 {
+        write(
+            &worktree,
+            &format!("src/pad/p{index:03}.ts"),
+            &format!("export const p{index:03} = {index};\n"),
+        );
+    }
+    write(&worktree, "src/zz_fresh.ts", FRESH_CALLER);
+    let ctx = configure(&worktree, &storage);
+
+    let answer = navigate_once_differing(
+        &ctx,
+        "callers",
+        &worktree,
+        "src/new_caller.ts",
+        "newCaller",
+        258,
+    );
+    assert!(answer.success, "callers failed: {answer:?}");
+    assert_eq!(answer.data["complete"], json!(false));
+    assert_eq!(answer.data["callers"], json!([]), "{:#}", answer.data);
+    let coverage = &answer.data["borrowed_coverage"];
+    let text = rendered(&answer);
+    // On a machine slow enough to reach the deadline first the search stops
+    // earlier; either way the answer is marked partial and names the gap.
+    match coverage["search_limit"].as_str() {
+        Some("files") => {
+            assert_eq!(coverage["files_searched"], json!(256), "{coverage:#}");
+            assert_eq!(coverage["files_not_searched"], json!(2), "{coverage:#}");
+            assert_eq!(
+                second_line("callers", &answer),
+                "callgraph: the borrowed graph does not reflect 258 files here (src/pad/p000.ts, src/pad/p001.ts, src/pad/p002.ts and 255 more); the search stopped at its limit of 256 files with 2 files not searched (src/pad/p256.ts, src/zz_fresh.ts), so grep for `newCaller` to cover the rest",
+                "rendered: {text}"
+            );
+        }
+        Some("deadline") => assert!(
+            text.contains("the search stopped at its time limit")
+                && text.contains("grep for `newCaller` to cover the rest"),
+            "rendered: {text}"
+        ),
+        other => panic!("search was not cut short ({other:?}): {coverage:#}"),
+    }
+    assert!(text.lines().any(|line| line == "0 callers · 0 file groups"));
+}
+
+#[test]
+fn a_clean_worktree_answers_exactly_as_the_owner_does() {
+    let temp = tempfile::tempdir().unwrap();
+    let (owner_root, new_commit, storage, owner) = owner_with_graph(temp.path());
+    let worktree = linked_worktree(
+        &owner_root,
+        &temp.path().join("clean-worktree"),
+        &new_commit,
+    );
+    let ctx = configure(&worktree, &storage);
+    for (op, file, symbol) in [
+        ("callers", "src/target.ts", "target"),
+        ("callers", "src/new_caller.ts", "newCaller"),
+        ("impact", "src/target.ts", "target"),
+        ("impact", "src/new_caller.ts", "newCaller"),
+    ] {
+        let expected = navigate(&owner, op, &owner_root, file, symbol);
+        let answer = navigate(&ctx, op, &worktree, file, symbol);
+        assert_eq!(answer.data, expected.data, "{op} {symbol}");
+        assert_eq!(
+            aft::subc_format::format_callgraph(op, &answer.data, false),
+            aft::subc_format::format_callgraph(op, &expected.data, false),
+            "{op} {symbol}"
+        );
+    }
+}
