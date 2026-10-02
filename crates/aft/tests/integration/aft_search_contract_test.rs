@@ -1498,11 +1498,13 @@ fn missing_identifier_answers_not_found_with_nearest_names() {
     );
 
     let text = response["text"].as_str().unwrap();
+    // Locations use the platform's path separator, like result headers.
+    let state = Path::new("src").join("state.rs").display().to_string();
     assert!(
-        text.starts_with(
+        text.starts_with(&format!(
             "`mark_file_refreshing` not found in this project. Nearest names: \
-             `mark_file_refreshed` (src/state.rs:1), `mark_file_stale` (src/state.rs:2)"
-        ),
+             `mark_file_refreshed` ({state}:1), `mark_file_stale` ({state}:2)"
+        )),
         "{text}"
     );
     let results = response["results"].as_array().unwrap();
