@@ -52,7 +52,10 @@ pub(super) fn assert_answered_by_rewrite(text: &str) {
 
 /// Foreground wait window for the fixtures below: long enough for the quick
 /// command to finish inside it, short enough for the slow one to outlive it.
-pub(super) const REPEAT_FOREGROUND_WAIT_MS: u64 = 1_500;
+/// A loaded Windows runner has taken longer than 1.5 s just to start the
+/// shell for the 0.2 s command, so the window leaves room for that; the slow
+/// command sleeps well past it.
+pub(super) const REPEAT_FOREGROUND_WAIT_MS: u64 = 4_000;
 pub(super) const FINISHED_MARKER: &str = "repeat-native-finished";
 
 /// A native command that finishes inside the foreground wait, so the wait
@@ -68,7 +71,7 @@ pub(super) fn finished_bash_arguments(description: &str) -> Value {
 /// by promoting the command to a background task.
 pub(super) fn promoted_bash_arguments(description: &str) -> Value {
     json!({
-        "command": "sleep 4; echo repeat-native-promoted",
+        "command": "sleep 10; echo repeat-native-promoted",
         "description": description,
     })
 }
