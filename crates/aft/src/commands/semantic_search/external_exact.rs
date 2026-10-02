@@ -1279,5 +1279,9 @@ mod tests {
         ] {
             eprintln!("{key}: {}", response[key]);
         }
+        for subc in [false, true] {
+            let text = rendered_search_text(&ctx, session.path(), &root, &query, subc);
+            eprintln!("RENDERED (subc={subc})\n{text}\nEND");
+        }
     }
 }
