@@ -7942,7 +7942,9 @@ export function bannerUnused() {}
             .cache_for_snapshot(&snapshot)
             .expect("inspect cache");
         let expected = current_project_files(&root, &job.scope_files);
-        assert!(expected.contains_key("src/empty.rs"), "{expected:?}");
+        // Keys are native relative paths, so build this one the same way.
+        let empty_key = relative_cache_key(&root, &root.join("src").join("empty.rs"));
+        assert!(expected.contains_key(&empty_key), "{expected:?}");
 
         let before = load_contributions(cache.as_ref(), &job).expect("load");
         assert_eq!(
