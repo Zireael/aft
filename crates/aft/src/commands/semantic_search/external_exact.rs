@@ -203,7 +203,7 @@ pub(super) struct SweepOutcome {
     pub hits: Vec<SweepHit>,
     /// Files the walk enumerated and kept (tests excluded unless requested).
     pub files_discovered: usize,
-    /// Files decided: answered by the index or read from disk.
+    /// Files whose outcome is known: ruled out by the index or read from disk.
     pub files_checked: usize,
     /// The walk itself stopped at the deadline, so the file total is unknown.
     pub enumeration_stopped: bool,
@@ -211,7 +211,8 @@ pub(super) struct SweepOutcome {
     pub scan_stopped: bool,
     /// Whether a borrowed index was consulted.
     pub used_index: bool,
-    /// Unchanged indexed files the index ruled out without a read.
+    /// Unchanged indexed files the index showed cannot contain a searched
+    /// term, so they were not read.
     pub index_answered: usize,
     /// Files read from disk: changed, new, or index candidates.
     pub files_read: usize,
@@ -569,7 +570,8 @@ pub(super) fn reply(
         } else {
             IndexStatus::Fallback
         },
-        // The footer marks a count that is only a floor.
+        // A sweep that stopped early found only some of the matches, so the
+        // "Found N match" footer must mark N as a lower bound.
         truncated: !outcome.fully_covered(),
         fully_degraded: false,
         engine_capped: false,
@@ -605,7 +607,8 @@ pub(super) fn reply(
         .iter()
         .map(|hit| {
             let mut value = super::grep_match_to_json(&hit.grep, hit.kind.result_source());
-            // Ranked replies mark exact evidence per result; keep that marker.
+            // Ranked aft_search results carry an `exact` field saying whether
+            // the result holds the query verbatim; these results keep it.
             value["exact"] = serde_json::json!(hit.kind == HitKind::Exact);
             value
         })
@@ -850,7 +853,8 @@ mod tests {
     fn unchanged_files_are_answered_by_the_index_and_changed_files_are_read() {
         let project = identifier_project();
         let root = std::fs::canonicalize(project.path()).unwrap();
-        // The index predates the identifier: built while the file held none.
+        // Build the index while `src/late.ts` holds no searched term, then add
+        // the identifier to it, so the index is stale for that one file.
         let late = root.join("src/late.ts");
         std::fs::write(&late, "export const placeholder = 1\n").unwrap();
         let index = {

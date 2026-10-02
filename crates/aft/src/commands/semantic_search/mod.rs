@@ -2156,8 +2156,9 @@ fn handle_external_bounded_lexical_fallback(
 ) -> Response {
     let borrow_metadata = ExternalBorrowMetadata::default();
     let display_root = absolute_display_root(external_root);
-    // An identifier is answered by every line that contains it, searched
-    // source first, rather than by a substring scan in modification-time order.
+    // For an identifier query, list every line that contains the identifier,
+    // reading source files before docs and data, instead of the generic
+    // substring scan below, which reads files newest first.
     if let Some(terms) = external_exact::IdentifierTerms::from_query(&params.query) {
         let outcome = external_exact::sweep(
             external_root,
