@@ -634,8 +634,9 @@ pub(super) fn reply(
         "index_answered_files": outcome.index_answered,
         "files_read": outcome.files_read,
         "oversized_files_skipped": outcome.oversized_skipped,
-        // The same coverage sentence the reply text ends with, for renderers
-        // that draw results from the JSON instead of the text.
+        // The sentence the reply text ends with, saying whether the sweep
+        // checked every file under the root or stopped at its time limit; a
+        // renderer that draws results from this JSON shows it too.
         "coverage": outcome.coverage_line(root),
     });
     SweepReply {
@@ -1261,9 +1262,9 @@ mod tests {
     }
 
     /// Without any index, a prose query is answered by a scan for its literal
-    /// text, and the reply says that in plain words: no index, how many files
-    /// were read, and grep for an exhaustive check. No status jargon, no index
-    /// label and no empty list trailer.
+    /// text, and the reply says that in plain words: that no index exists, how
+    /// many files the scan read, and that the grep tool gives an exhaustive
+    /// check. No status jargon, no index label and no empty list trailer.
     #[test]
     fn unindexed_prose_reply_says_what_was_searched_on_both_transports() {
         let session = tempfile::tempdir().expect("session");

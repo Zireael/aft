@@ -138,8 +138,10 @@ pub(super) fn check_against_disk(
     let mut seen = vec![false; index.files.len()];
     let mut differing: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
     let mut walk_complete = true;
-    // The index was built from this same walk, so a file the walk skips (an
-    // ignored path, a build directory) is one the index never held either.
+    // `SearchIndex::build` enumerates files with this same walker
+    // (`project_walk_builder`, which honours .gitignore and .aftignore and
+    // skips build directories), so a path this walk skips is one the index
+    // never held either, and a file the finished walk does not reach is gone.
     for entry in crate::search_index::project_walk_builder(root).build() {
         if stop_requested(walk_deadline) {
             walk_complete = false;
@@ -213,7 +215,9 @@ pub(super) fn check_against_disk(
         };
     }
 
-    // Source first, so a re-read cut short by its deadline has covered code.
+    // Read program source before documentation and data files (the
+    // `classify_file` order), so if the deadline stops the re-read, the files
+    // a code search most needs current are the ones already read.
     differing.sort_by(|(left, ..), (right, ..)| {
         classify_file(left)
             .cmp(&classify_file(right))
