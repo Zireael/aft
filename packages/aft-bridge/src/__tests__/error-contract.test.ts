@@ -103,7 +103,12 @@ describe("isBashTransportDeadError", () => {
       channel: 1,
       epoch: 1,
     } as RouteHandle);
-    const whilePending = new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller");
+    const whilePending = new SubcError(
+      "route closed by closeRoute",
+      "route_closed",
+      undefined,
+      "closed_by_caller",
+    );
 
     expect(classifyBashHostFallbackError(beforeDispatch)).toBe("route closed before dispatch");
     expect(isBashTransportDeadError(beforeDispatch)).toBe(true);
@@ -347,7 +352,12 @@ describe("adaptToolError", () => {
     // would be wrong here. subc-client raises the closeRoute rejection only for
     // a request already pending (and written) on the route, so it carries its
     // own unknown-outcome guidance instead.
-    const local = new SubcError("route closed by closeRoute", "route_closed", undefined, "closed_by_caller");
+    const local = new SubcError(
+      "route closed by closeRoute",
+      "route_closed",
+      undefined,
+      "closed_by_caller",
+    );
 
     const adapted = adaptToolError("write", local);
 
