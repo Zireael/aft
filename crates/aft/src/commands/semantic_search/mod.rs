@@ -6,6 +6,7 @@ pub mod data_file;
 pub mod evidence_descriptor;
 pub mod exact_lane;
 pub mod extensions;
+mod external_disk_check;
 mod external_exact;
 pub mod generation_token;
 pub mod lexical_lane;
@@ -2077,20 +2078,66 @@ fn handle_external_search(
         engine_plan.readiness.lexical_index,
         &mut warnings,
     );
+    let ranked_mode = matches!(mode, SearchMode::Semantic | SearchMode::Hybrid);
+    let usable_semantic_index = match &artifacts.semantic {
+        ReadOnlyArtifact::Fresh(index)
+        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
+            if semantic_fingerprint_matches_session(ctx, index) =>
+        {
+            Some(Arc::clone(index))
+        }
+        _ => None,
+    };
+    // Only the ranked handler consults the semantic index, and only when the
+    // plan has a semantic lane.
+    let semantic_lane_answers = ranked_mode
+        && engine_plan.contains(SearchLaneKind::Semantic)
+        && usable_semantic_index.is_some();
     // The grep and ranked (hybrid/semantic) handlers below can answer from
-    // this project's saved trigram or semantic index, which nothing checked
-    // against the files now on disk.
+    // this project's saved trigram or semantic index, which loading it never
+    // compared with the files now on disk.
     let served_from_saved_index = matches!(
         artifacts.search,
         ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
-    ) || matches!(
-        &artifacts.semantic,
-        ReadOnlyArtifact::Fresh(index)
-            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
-            if semantic_fingerprint_matches_session(ctx, index)
-    );
+    ) || usable_semantic_index.is_some();
     let search_artifact_path = artifacts.search_artifact_path.clone();
     let notice_root = external_root.clone();
+
+    // Bring the saved trigram index in line with the disk before it answers.
+    // An identifier in a ranked mode is answered by the exact sweep instead,
+    // which compares every file with the saved index itself.
+    let identifier_sweep =
+        ranked_mode && external_exact::IdentifierTerms::from_query(&params.query).is_some();
+    let mut search_generation = artifacts.search_generation.clone();
+    let mut disk_check = None;
+    let search_index = if matches!(
+        artifacts.search,
+        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_)
+    ) && !identifier_sweep
+    {
+        let checked = external_disk_check::check_against_disk(
+            &search_index,
+            &external_root,
+            usable_semantic_index
+                .as_deref()
+                .filter(|_| semantic_lane_answers),
+        );
+        if search_cancellation_requested() {
+            return cancelled_search_response(req);
+        }
+        // Rankings cached for the saved index must not answer for the
+        // checked copy, which holds different postings.
+        if let Some(digest) = &checked.applied_digest {
+            search_generation = GenerationToken::new_with_str(&format!(
+                "{}:disk:{digest}",
+                artifacts.search_generation.as_str()
+            ));
+        }
+        disk_check = Some(checked.check);
+        checked.index
+    } else {
+        search_index
+    };
 
     let mut response = match mode {
         SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
@@ -2107,7 +2154,7 @@ fn handle_external_search(
             &borrow_metadata,
             extensions,
             engine_plan,
-            &artifacts.search_generation,
+            &search_generation,
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
             req,
@@ -2119,35 +2166,108 @@ fn handle_external_search(
             external_root,
             &search_index,
             &artifacts.semantic,
-            &artifacts.search_generation,
+            &search_generation,
             borrow_metadata,
             page_request,
             extensions,
             engine_plan,
         ),
     };
-    if served_from_saved_index {
+    if let Some(check) = &disk_check {
+        disclose_checked_saved_index(
+            &mut response,
+            &notice_root,
+            search_artifact_path.as_deref(),
+            check,
+            semantic_lane_answers,
+        );
+    } else if served_from_saved_index {
         disclose_unverified_saved_index(
             &mut response,
             &notice_root,
             search_artifact_path.as_deref(),
+            None,
         );
     }
     response
 }
 
+/// Report on an external reply whose saved trigram index was compared with
+/// the files on disk first (see `external_disk_check`).
+///
+/// A check that covered every file ends the reply with one line saying so and
+/// what had changed. A check cut short by its time limit keeps the
+/// unchecked-index notice, saying how far the check got, and marks the reply
+/// incomplete. Either way, when the semantic lane answered from a saved
+/// semantic index that predates some files, the reply says how many.
+fn disclose_checked_saved_index(
+    response: &mut Response,
+    external_root: &Path,
+    search_artifact_path: Option<&Path>,
+    check: &external_disk_check::DiskCheck,
+    semantic_lane_answered: bool,
+) {
+    if !response.success {
+        return;
+    }
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    if data.contains_key("exact_sweep") {
+        return;
+    }
+    data.insert("saved_index_check".to_string(), check.to_json());
+    if check.verified() {
+        append_reply_paragraph(
+            data,
+            &external_disk_check::verified_line(check, external_root),
+        );
+    } else {
+        data.insert("complete".to_string(), serde_json::json!(false));
+    }
+    let semantic_line = semantic_lane_answered
+        .then(|| external_disk_check::semantic_outdated_line(check, external_root))
+        .flatten();
+    if let Some(line) = &semantic_line {
+        append_reply_paragraph(data, line);
+    }
+    if !check.verified() {
+        disclose_unverified_saved_index(
+            response,
+            external_root,
+            search_artifact_path,
+            Some(&external_disk_check::unverified_detail(check)),
+        );
+    }
+}
+
+fn append_reply_paragraph(data: &mut serde_json::Map<String, serde_json::Value>, paragraph: &str) {
+    let text = data
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let text = if text.is_empty() {
+        paragraph.to_string()
+    } else {
+        format!("{text}\n\n{paragraph}")
+    };
+    data.insert("text".to_string(), serde_json::json!(text));
+}
+
 /// Tell the agent that an external reply came from another project's saved
-/// index without a check against that project's files on disk.
+/// index without a full check against that project's files on disk.
 ///
 /// Nothing in this session refreshes another project's index, and loading it
 /// does not compare it with the files on disk, so text added or changed since
-/// it was saved can be missing from the results. Replies whose identifier
-/// sweep read every changed file from disk (they carry `exact_sweep`) are
-/// already checked and get no notice.
+/// it was saved can be missing from the results. `checked`, when given, says
+/// how far a time-limited comparison got; without it nothing was compared.
+/// Replies whose identifier sweep read every changed file from disk (they
+/// carry `exact_sweep`) are already checked and get no notice.
 fn disclose_unverified_saved_index(
     response: &mut Response,
     external_root: &Path,
     search_artifact_path: Option<&Path>,
+    checked: Option<&str>,
 ) {
     if !response.success {
         return;
@@ -2176,20 +2296,17 @@ fn disclose_unverified_saved_index(
             )
         })
         .unwrap_or_default();
-    let notice = format!(
-        "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
-        external_root.display()
-    );
-    let text = data
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let text = if text.is_empty() {
-        notice
-    } else {
-        format!("{text}\n\n{notice}")
+    let notice = match checked {
+        None => format!(
+            "Answered from the saved AFT index of {}{when}, which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check.",
+            external_root.display()
+        ),
+        Some(checked) => format!(
+            "Answered from the saved AFT index of {}{when}, which was only partly checked against the files on disk: {checked}. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check.",
+            external_root.display()
+        ),
     };
-    data.insert("text".to_string(), serde_json::json!(text));
+    append_reply_paragraph(data, &notice);
     data.insert(
         "saved_index_unverified".to_string(),
         serde_json::json!({
@@ -2357,9 +2474,41 @@ fn handle_external_bounded_lexical_fallback(
         .iter()
         .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
-    let text = format_grep_search_text(&result, &display_root, interpreted_as);
     let more_available =
         result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
+    if degradation.is_none() {
+        // No index exists, so nothing could rank this query; say so plainly,
+        // with how much of the project the scan for its literal text covered.
+        let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
+        let envelope = if result.walk_truncated {
+            Some(bounded_walk_search_envelope(
+                result_values.len(),
+                more_available,
+                result.engine_capped,
+            ))
+        } else {
+            search_cut_envelope(result_values.len(), more_available, result.engine_capped)
+        };
+        return external_fallback_response(
+            req,
+            params,
+            shape,
+            external_root,
+            None,
+            ExternalFallbackBody {
+                results: result_values,
+                text,
+                walk_truncated: result.walk_truncated,
+                more_available,
+                engine_capped: result.engine_capped,
+                // The reply text states the scan's coverage in plain words.
+                fully_degraded: false,
+                envelope,
+                exact_sweep: None,
+            },
+        );
+    }
+    let text = format_grep_search_text(&result, &display_root, interpreted_as);
     let envelope =
         bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
     external_fallback_response(
@@ -6972,6 +7121,58 @@ fn format_grep_search_text(
 ) -> String {
     let base = crate::commands::grep::format_grep_text(result, project_root);
     format!("{base}\n[interpreted_as: {interpreted_as}]")
+}
+
+/// Reply text for a query against another project that has no AFT index: the
+/// lines holding the query's literal text, if any, then one plain paragraph
+/// saying that no index exists, how much of the project the literal scan
+/// read, and to use grep for an exhaustive check.
+fn unindexed_scan_text(
+    result: &GrepResult,
+    display_root: &Path,
+    external_root: &Path,
+    query: &str,
+) -> String {
+    fn count(count: usize, noun: &str) -> String {
+        if count == 1 {
+            format!("1 {noun}")
+        } else {
+            format!("{count} {noun}s")
+        }
+    }
+    let root = external_root.display();
+    let found = if result.total_matches == 0 {
+        "found no line containing it".to_string()
+    } else {
+        format!(
+            "found {} in {}",
+            count(result.total_matches, "matching line"),
+            count(result.files_with_matches, "file")
+        )
+    };
+    let coverage = if result.walk_truncated {
+        format!(
+            "It read {} under {root} before its file or time limit stopped the scan; the rest of the project was not searched.",
+            count(result.files_searched, "text file")
+        )
+    } else {
+        format!(
+            "It read all {} under {root}.",
+            count(result.files_searched, "text file")
+        )
+    };
+    let paragraph = format!(
+        "No AFT index exists for {root}, so this query could not be ranked by meaning or keywords; AFT only looked for its exact text \"{query}\" and {found}. {coverage} Use grep with path for an exhaustive check, for example on one distinctive word of the query."
+    );
+    if result.matches.is_empty() {
+        return paragraph;
+    }
+    // The listing's own footer would label the index state; the paragraph
+    // below already says there is no index.
+    let mut listed = result.clone();
+    listed.index_status = IndexStatus::Ready;
+    let listing = crate::commands::grep::format_grep_text(&listed, display_root);
+    format!("{listing}\n\n{paragraph}")
 }
 
 /// Snippet line budget by global rank (0-based). The fused score is an

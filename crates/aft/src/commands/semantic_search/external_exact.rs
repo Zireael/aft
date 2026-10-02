@@ -634,6 +634,9 @@ pub(super) fn reply(
         "index_answered_files": outcome.index_answered,
         "files_read": outcome.files_read,
         "oversized_files_skipped": outcome.oversized_skipped,
+        // The same coverage sentence the reply text ends with, for renderers
+        // that draw results from the JSON instead of the text.
+        "coverage": outcome.coverage_line(root),
     });
     SweepReply {
         results,
@@ -1210,8 +1213,11 @@ mod tests {
         }
     }
 
+    /// A saved index compared with every file on disk ends the reply with one
+    /// line saying so; one whose comparison stopped at the time limit keeps
+    /// the unchecked-index notice and says how far the comparison got.
     #[test]
-    fn unverified_saved_index_answers_say_so_on_both_transports() {
+    fn saved_index_answers_say_how_far_they_were_checked_on_both_transports() {
         let session = tempfile::tempdir().expect("session");
         let storage = tempfile::tempdir().expect("storage");
         let project = identifier_project();
@@ -1221,21 +1227,67 @@ mod tests {
         let mut index = SearchIndex::build(&root);
         index.write_to_disk(&cache_dir, None);
         let ctx = render_context(session.path(), storage.path());
-        let expected = format!(
+        let checked = format!(
+            "Checked the saved AFT index of {} against all {} files on disk; none changed since it was saved.",
+            root.display(),
+            index.file_count()
+        );
+        let unchecked = format!(
             "Answered from the saved AFT index of {} (saved ",
             root.display()
         );
         for query in ["how are unbound rows rejected", "\"unbound rows\""] {
             for subc in [false, true] {
                 let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
-                assert!(text.contains(&expected), "{query}: {text}");
+                assert!(text.contains(&checked), "{query}: {text}");
+                assert!(!text.contains(&unchecked), "{query}: {text}");
+                assert!(!text.contains("exact pass:"), "{query}: {text}");
+
+                let text = super::super::external_disk_check::with_budgets_for_test(
+                    Duration::ZERO,
+                    Duration::from_secs(5),
+                    || rendered_search_text(&ctx, session.path(), &root, query, subc),
+                );
+                assert!(text.contains(&unchecked), "{query}: {text}");
                 assert!(
                     text.contains(
-                        "which was not checked against the files on disk: text added or changed since it was saved may be missing. Use grep with path for an exhaustive check."
+                        "which was only partly checked against the files on disk: only 0 files on disk were compared with it before the time limit. Text added or changed since it was saved may be missing from the files not checked. Use grep with path for an exhaustive check."
                     ),
                     "{query}: {text}"
                 );
-                assert!(!text.contains("exact pass:"), "{query}: {text}");
+                assert!(!text.contains(&checked), "{query}: {text}");
+            }
+        }
+    }
+
+    /// Without any index, a prose query is answered by a scan for its literal
+    /// text, and the reply says that in plain words: no index, how many files
+    /// were read, and grep for an exhaustive check. No status jargon, no index
+    /// label and no empty list trailer.
+    #[test]
+    fn unindexed_prose_reply_says_what_was_searched_on_both_transports() {
+        let session = tempfile::tempdir().expect("session");
+        let storage = tempfile::tempdir().expect("storage");
+        let project = identifier_project();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        git_init(&root);
+        let ctx = render_context(session.path(), storage.path());
+        let query = "how are unbound rows rejected";
+        let expected = format!(
+            "No AFT index exists for {root}, so this query could not be ranked by meaning or keywords; AFT only looked for its exact text \"{query}\" and found no line containing it. It read all 14 text files under {root}. Use grep with path for an exhaustive check, for example on one distinctive word of the query.",
+            root = root.display()
+        );
+        for subc in [false, true] {
+            let text = rendered_search_text(&ctx, session.path(), &root, query, subc);
+            assert!(text.starts_with(&expected), "{text}");
+            for forbidden in [
+                "fully degraded",
+                "Search status",
+                "[index: fallback]",
+                "[interpreted_as",
+                "shown 0 of",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
             }
         }
     }

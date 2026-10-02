@@ -771,7 +771,18 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     // disclosure — not dead-end with a not_indexed error (which pushes agents
     // to shell out to grep/bash instead of staying on aft_search).
     assert_eq!(response["success"], true, "expected success: {response:?}");
-    assert_eq!(response["fully_degraded"], true);
+    // The reply says in plain words that no index exists and how much of the
+    // project the literal scan read, so it no longer carries the
+    // `fully_degraded` flag, whose rendering ("Search status: fully
+    // degraded") told the agent nothing it could act on.
+    assert_eq!(response["fully_degraded"], false);
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("No AFT index exists for")
+            && text.contains("It read all 1 text file under")
+            && text.contains("Use grep with path for an exhaustive check"),
+        "expected the plain no-index coverage paragraph: {text}"
+    );
     assert_eq!(response["semantic_status"], "external_unindexed");
     assert_eq!(response["borrowed"], true);
     let results = response["results"].as_array().expect("results array");
@@ -2978,5 +2989,54 @@ fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no
     assert!(
         text.contains("this project's own AFT index answered"),
         "the reply says when the project's own index was used: {text}"
+    );
+}
+
+/// The saved index was written before a file existed. A prose query that only
+/// that file answers must still find it: the saved index is compared with the
+/// disk first, and the new file is read into the copy that answers.
+#[test]
+fn external_prose_query_finds_a_file_added_after_the_saved_index() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (external_project, _source_file, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let added = external_project.path().join("src/quokkalith.rs");
+    fs::write(
+        &added,
+        "// Assemble the zephyrine quokkalith from its parts.\npub fn assemble_zephyrine_quokkalith() {}\n",
+    )
+    .expect("write file added after the index was saved");
+    let session = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path(
+            "where is the zephyrine quokkalith assembled",
+            None,
+            external_project.path(),
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["borrowed"], true);
+    assert!(
+        result_suffixes(&response)
+            .iter()
+            .any(|file| file.ends_with("src/quokkalith.rs")),
+        "the file added after the index was saved must be found: {response:#?}"
+    );
+    assert_eq!(response["saved_index_check"]["complete"], true);
+    assert_eq!(response["saved_index_check"]["added"], 1);
+    assert!(
+        response.get("saved_index_unverified").is_none(),
+        "a saved index compared with every file needs no unchecked notice: {response:#?}"
+    );
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("Checked the saved AFT index of")
+            && text.contains("since it was saved 1 file was added"),
+        "the reply says the index was checked and what changed: {text}"
     );
 }
