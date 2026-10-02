@@ -103,6 +103,7 @@ async fn bind(
             principal: Some(Principal::Direct),
             admission_facts: Default::default(),
             scope: None,
+            role_versions: None,
         })
         .unwrap(),
         out,
