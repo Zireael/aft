@@ -40,6 +40,14 @@ export class RotatingLogSink {
   private queuedRecords = 0;
   private droppedBytes = 0;
   private overflowQueued = false;
+  /**
+   * The log directory was created (or found) by an earlier write. Each write
+   * then appends directly instead of issuing two mkdir calls first; an append
+   * that finds the directory gone recreates it and retries once.
+   */
+  private directoryReady = false;
+  /** mkdir calls issued; tests use it to pin the per-write cost. */
+  private mkdirCalls = 0;
 
   constructor(path: string, options: RotatingLogOptions = {}) {
     this.path = path;
@@ -98,35 +106,53 @@ export class RotatingLogSink {
     await this.queue;
   }
 
-  private async write(data: string): Promise<void> {
+  private async ensureDirectory(): Promise<string> {
     const dir = dirname(this.path);
+    this.mkdirCalls += 2;
     await mkdir(dirname(dir), { recursive: true });
     try {
       await mkdir(dir, { mode: LOG_DIR_MODE });
     } catch (error: unknown) {
       if (!hasCode(error, "EEXIST")) throw error;
     }
-    if (this.estimatedBytes === null) {
-      // First write from this sink: tighten a directory and files left over
-      // from before logs were private. Later files are created owner-only.
-      await tightenIfOwned(dir, LOG_DIR_MODE);
-      await tightenIfOwned(this.path, LOG_FILE_MODE);
-      for (let generation = 1; generation <= this.generations; generation += 1) {
-        await tightenIfOwned(`${this.path}.${generation}`, LOG_FILE_MODE);
-      }
-      try {
-        this.estimatedBytes = (await stat(this.path)).size;
-      } catch (error: unknown) {
-        if (!isMissing(error)) throw error;
-        this.estimatedBytes = 0;
+    this.directoryReady = true;
+    return dir;
+  }
+
+  private async write(data: string): Promise<void> {
+    if (!this.directoryReady || this.estimatedBytes === null) {
+      const dir = await this.ensureDirectory();
+      if (this.estimatedBytes === null) {
+        // First write from this sink: tighten a directory and files left over
+        // from before logs were private. Later files are created owner-only.
+        await tightenIfOwned(dir, LOG_DIR_MODE);
+        await tightenIfOwned(this.path, LOG_FILE_MODE);
+        for (let generation = 1; generation <= this.generations; generation += 1) {
+          await tightenIfOwned(`${this.path}.${generation}`, LOG_FILE_MODE);
+        }
+        try {
+          this.estimatedBytes = (await stat(this.path)).size;
+        } catch (error: unknown) {
+          if (!isMissing(error)) throw error;
+          this.estimatedBytes = 0;
+        }
       }
     }
 
     const bytes = Buffer.byteLength(data);
-    if (this.estimatedBytes > 0 && this.estimatedBytes + bytes > this.maxBytes) {
+    if ((this.estimatedBytes ?? 0) > 0 && (this.estimatedBytes ?? 0) + bytes > this.maxBytes) {
       await this.rotate();
     }
-    await appendFile(this.path, data, { encoding: "utf8", mode: LOG_FILE_MODE });
+    try {
+      await appendFile(this.path, data, { encoding: "utf8", mode: LOG_FILE_MODE });
+    } catch (error: unknown) {
+      if (!isMissing(error)) throw error;
+      // The directory was removed since the last write: recreate it, as the
+      // per-write mkdir used to, and retry once.
+      this.directoryReady = false;
+      await this.ensureDirectory();
+      await appendFile(this.path, data, { encoding: "utf8", mode: LOG_FILE_MODE });
+    }
     this.estimatedBytes = (this.estimatedBytes ?? 0) + bytes;
   }
 

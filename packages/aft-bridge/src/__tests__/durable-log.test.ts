@@ -121,4 +121,35 @@ describe("durable plugin logging", () => {
     expect(modeOf(`${path}.1`)).toBe(0o600);
     expect(readFileSync(path, "utf8")).toBe("old\nnew\n");
   });
+
+  // Every log line went through two mkdir calls before its append. The
+  // directory only needs creating once per sink, and again if it disappears.
+  test("creates the log directory once, not once per write", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "logs", "aft-plugin.log");
+    const sink = new RotatingLogSink(path);
+
+    for (let i = 0; i < 10; i++) sink.append(`line ${i}\n`);
+    await sink.drain();
+
+    expect((sink as unknown as { mkdirCalls: number }).mkdirCalls).toBe(2);
+    expect(readFileSync(path, "utf8").split("\n")).toHaveLength(11);
+  });
+
+  test("recreates a log directory removed between writes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "storage", "logs", "aft-plugin.log");
+    const sink = new RotatingLogSink(path);
+
+    sink.append("before\n");
+    await sink.drain();
+    rmSync(join(root, "storage"), { recursive: true, force: true });
+    sink.append("after\n");
+    await sink.drain();
+
+    expect(readFileSync(path, "utf8")).toBe("after\n");
+    if (process.platform !== "win32") expect(modeOf(join(root, "storage", "logs"))).toBe(0o700);
+  });
 });
