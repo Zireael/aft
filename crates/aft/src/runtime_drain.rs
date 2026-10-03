@@ -3123,7 +3123,7 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             state.view_publication_paths.clear();
             state.view_publication_due = None;
         }
-        Err(_error) => {
+        Err(error) => {
             if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
@@ -3131,11 +3131,18 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             }
             // Inline publication records and logs the failure in the same retry
             // state used by detached jobs. Preserve this drain's path union.
-            state.view_publication_due = ctx
-                .view_publication_retry()
-                .lock()
-                .due()
-                .or_else(|| Some(Instant::now() + Duration::from_secs(1)));
+            let retry_due = ctx.view_publication_retry().lock().due();
+            if retry_due.is_none() {
+                // Admission or thread-spawn failures happen before the shared
+                // publication loop can record them; keep their diagnostic.
+                aft::slog_warn!(
+                    "content-addressed view publication failed root={} error={}",
+                    root.display(),
+                    error
+                );
+            }
+            state.view_publication_due =
+                retry_due.or_else(|| Some(Instant::now() + Duration::from_secs(1)));
         }
     }
 }

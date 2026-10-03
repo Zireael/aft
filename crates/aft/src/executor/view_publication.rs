@@ -57,15 +57,17 @@ impl PublicationRetry {
     }
 
     fn failed(&mut self, root: &std::path::Path, error: &str) {
-        if self.error.as_deref() == Some(error) {
+        // Failed generations have fresh artifact names, so comparing complete
+        // error strings would turn the same storage fault into a new failure
+        // every attempt. Only progress or a checkout change ends the streak.
+        if self.failures > 0 {
             self.failures = self.failures.saturating_add(1);
             self.delay = (self.delay * 2).min(self.maximum);
         } else {
-            self.reset(root);
-            self.error = Some(error.to_owned());
             self.failures = 1;
             self.delay = self.initial;
         }
+        self.error = Some(error.to_owned());
         self.due = Some(Instant::now() + self.delay);
         // Report the first repeat, then summarize the final count on recovery
         // or an edit. A permanently broken checkout must not flood the log.
@@ -394,9 +396,12 @@ pub(crate) fn schedule(
                         break;
                     }
                     Err(error) => {
-                        if token.cancel_requested_before_commit()
-                            || target.ctx.configure_content_generation() != content_generation
-                            || target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none() {
+                        // Root deletion also cancels its token. Retire the view
+                        // before testing cancellation, or the short circuit
+                        // would leave readers attached to a vanished checkout.
+                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none()
+                            || token.cancel_requested_before_commit()
+                            || target.ctx.configure_content_generation() != content_generation {
                             break;
                         }
                         // Retain the complete path union until a successful install;

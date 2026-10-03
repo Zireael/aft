@@ -473,6 +473,22 @@ fn publication_io_error_names_operation_and_path() {
 }
 
 #[test]
+fn publication_failure_streak_survives_changing_artifact_error_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let mut retry = PublicationRetry::default();
+    retry.failed(
+        root.path(),
+        "view I/O failed writing trigram-1.bin: Permission denied",
+    );
+    retry.failed(
+        root.path(),
+        "view I/O failed writing trigram-2.bin: Permission denied",
+    );
+    assert_eq!(retry.failures, 2);
+    assert_eq!(retry.delay, Duration::from_secs(2));
+}
+
+#[test]
 fn publication_repeated_failure_backs_off_and_edit_resets_deadline() {
     let fixture = Fixture::new();
     let root = fixture.job_root();
