@@ -47,6 +47,9 @@ mod db_read_fallback_test;
 // Stands in shell scripts for Apple's developer-tools launcher.
 #[cfg(unix)]
 mod developer_tools_git_test;
+// Syscall census of store durability; uses dyld interposition, so macOS only.
+#[cfg(target_os = "macos")]
+mod durability_census_test;
 // The durable-restart matrix SIGKILLs a child publisher at each failpoint; the
 // kill primitive and the parked-child protocol are POSIX-only.
 #[cfg(unix)]
