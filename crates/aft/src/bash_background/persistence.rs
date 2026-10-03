@@ -1016,6 +1016,17 @@ pub fn uninitialized_layout_is_recent(
             return Ok(age < grace);
         }
     };
+    // Exit files are reserved empty at spawn. A nonempty marker means the
+    // wrapper finished, so missing metadata cannot be the initial-write window.
+    if task
+        .dirs
+        .io
+        .open_file(&task.paths.artifact_name(TaskArtifact::Exit), false)
+        .and_then(|file| file.metadata())
+        .is_ok_and(|meta| meta.len() > 0)
+    {
+        return Ok(false);
+    }
     let modified = match task.paths.layout {
         TaskLayout::Directory => task.dirs.control.modified()?,
         TaskLayout::Flat => task
@@ -1257,7 +1268,8 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
         version,
     )
     .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
-    let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
+    let task: PersistedTask = serde_json::from_str(&content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1563,7 +1575,8 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
         };
         let result = (|| {
             file.write_all(content)?;
-            file.sync_all()?;
+            // Atomic replacement protects readers after a daemon kill. Task
+            // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
             dir.rename(&temporary, name)
         })();
@@ -1581,7 +1594,6 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
 pub fn create_control_file(dirs: &TaskDirs, name: &str, content: &[u8]) -> io::Result<File> {
     let mut file = dirs.control.open_new_file(OsStr::new(name))?;
     file.write_all(content)?;
-    file.sync_all()?;
     file.seek(SeekFrom::Start(0))?;
     validate_regular_handle(&file)?;
     Ok(file)
@@ -1652,7 +1664,7 @@ impl ValidatedArtifact {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(content)?;
-        self.file.sync_all()
+        Ok(())
     }
 
     pub fn try_clone_file(&self) -> io::Result<File> {
@@ -1853,7 +1865,6 @@ impl TaskIoHandles {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(content)?;
-        file.sync_all()?;
         self.write_counter.credit_logical(content.len() as u64);
         Ok(())
     }
@@ -2156,6 +2167,35 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_bash_record_payload_count() {
+        let storage = tempfile::tempdir().unwrap();
+        let task =
+            create_task_layout(storage.path(), "durability", "bash-0000000000000601").unwrap();
+        crate::durability::take();
+        for name in [
+            "command.sh",
+            "wrapper.sh",
+            "environment.bin",
+            "manifest.blake3",
+        ] {
+            create_control_file(&task.dirs, name, b"payload").unwrap();
+        }
+        for state in ["starting", "running", "exited", "completed"] {
+            randomized_atomic_replace(
+                &task.dirs.control,
+                OsStr::new("metadata.json"),
+                state.as_bytes(),
+            )
+            .unwrap();
+        }
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(
+            fs::read(task.dirs.control.path.join("metadata.json")).unwrap(),
+            b"completed"
+        );
+    }
     use super::*;
 
     fn valid_id(suffix: u64) -> String {

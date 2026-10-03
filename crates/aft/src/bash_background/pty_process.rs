@@ -393,7 +393,7 @@ fn write_exit_marker(file: &mut File, marker: &ExitMarker) -> io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(content.as_bytes())?;
-    file.sync_all()
+    Ok(())
 }
 
 // Every test in this module exercises Unix-only PTY paths (`#[cfg(unix)]`

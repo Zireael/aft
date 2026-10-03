@@ -3511,10 +3511,15 @@ impl BgTaskRegistry {
                 Ok(task) => task,
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::NotFound
+                        && !task_artifacts_exist(&session_dir, &metadata.task_id)
                         && !Self::persisted_task_process_is_alive(&metadata)
                         && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
                             || &metadata.session_id != session_id)
                     {
+                        crate::slog_warn!(
+                            "retiring reaped background task {}: reason=missing_layout",
+                            metadata.task_id
+                        );
                         self.retire_already_reaped_orphaned_completion(
                             &metadata.session_id,
                             &metadata.task_id,
@@ -3529,14 +3534,15 @@ impl BgTaskRegistry {
                         continue;
                     }
                     crate::slog_warn!(
-                        "quarantining unresolved background task {}: {error}",
-                        metadata.task_id
+                        "quarantining unresolved background task {}: reason={} error={error}",
+                        metadata.task_id,
+                        replay_record_reason(&error)
                     );
                     if let Err(quarantine_error) = quarantine_task_layout(
                         storage_dir,
                         &session_dir,
                         &metadata.task_id,
-                        "invalid",
+                        replay_record_reason(&error),
                     ) {
                         crate::slog_warn!(
                             "failed to quarantine unresolved background task {} during replay after layout error ({error}): {quarantine_error}",
@@ -3757,6 +3763,7 @@ impl BgTaskRegistry {
                         )
                         .unwrap_or(false) =>
                 {
+                    crate::slog_warn!("deferring background task {task_id} during replay: reason=pending_initial_record");
                     continue;
                 }
                 Err(error) => {
@@ -3767,11 +3774,14 @@ impl BgTaskRegistry {
                         continue;
                     }
                     crate::slog_warn!(
-                        "quarantining unresolved background task {task_id} during replay: {error}"
+                        "quarantining unresolved background task {task_id} during replay: reason={} error={error}", replay_record_reason(&error)
                     );
-                    if let Err(quarantine_error) =
-                        quarantine_task_layout(storage_dir, &dir, &task_id, "invalid")
-                    {
+                    if let Err(quarantine_error) = quarantine_task_layout(
+                        storage_dir,
+                        &dir,
+                        &task_id,
+                        replay_record_reason(&error),
+                    ) {
                         crate::slog_warn!(
                             "failed to quarantine unresolved background task {task_id} during replay after layout error ({error}): {quarantine_error}"
                         );
@@ -3801,11 +3811,14 @@ impl BgTaskRegistry {
                         continue;
                     }
                     crate::slog_warn!(
-                        "quarantining invalid background task metadata {task_id} during replay: {error}"
+                        "quarantining invalid background task metadata {task_id} during replay: reason={} error={error}", replay_record_reason(&error)
                     );
-                    if let Err(quarantine_error) =
-                        quarantine_task_layout(storage_dir, &dir, &task_id, "invalid")
-                    {
+                    if let Err(quarantine_error) = quarantine_task_layout(
+                        storage_dir,
+                        &dir,
+                        &task_id,
+                        replay_record_reason(&error),
+                    ) {
                         crate::slog_warn!(
                             "failed to quarantine invalid background task metadata {task_id} during replay after read error ({error}): {quarantine_error}"
                         );
@@ -7959,6 +7972,23 @@ fn started_instant_from_unix_millis(started_at: u64) -> Instant {
     Instant::now()
         .checked_sub(Duration::from_millis(elapsed_ms))
         .unwrap_or_else(Instant::now)
+}
+
+fn replay_record_reason(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "missing_record",
+        std::io::ErrorKind::InvalidData => "corrupt_record",
+        _ => "invalid_layout",
+    }
+}
+
+fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
+    std::iter::once(session_dir.join(task_id))
+        .chain(
+            ["json", "stdout", "stderr", "pty", "exit"]
+                .map(|suffix| session_dir.join(format!("{task_id}.{suffix}"))),
+        )
+        .any(|path| fs::symlink_metadata(path).is_ok())
 }
 
 fn gc_quarantine(storage_dir: &Path) {
@@ -12623,6 +12653,56 @@ mod tests {
             quarantined, 1,
             "exactly the abandoned layout is quarantined"
         );
+    }
+
+    #[test]
+    fn durability_replay_quarantines_missing_and_torn_records_with_reasons() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let session_dir = session_tasks_dir(storage.path(), "session");
+        for (task_id, bytes) in [
+            ("bash-0000000000000501", None),
+            ("bash-0000000000000502", Some(&b"{"[..])),
+            ("bash-0000000000000503", Some(&b""[..])),
+        ] {
+            let control = session_dir.join(task_id).join("control");
+            fs::create_dir_all(&control).unwrap();
+            fs::create_dir_all(session_dir.join(task_id).join("io")).unwrap();
+            // A finished wrapper proves this is not a concurrent spawn's
+            // brief window between mkdir and the initial metadata write.
+            fs::write(session_dir.join(task_id).join("io/exit"), b"0").unwrap();
+            if let Some(bytes) = bytes {
+                fs::write(control.join("metadata.json"), bytes).unwrap();
+            }
+        }
+        assert!(registry
+            .replay_session_from_disk(storage.path(), "session")
+            .unwrap()
+            .is_empty());
+        let quarantine = storage
+            .path()
+            .join("bash-tasks-quarantine")
+            .join(crate::backup::hash_session("session"));
+        let names: Vec<_> = fs::read_dir(quarantine)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for (task_id, reason) in [
+            ("bash-0000000000000501", "missing_record"),
+            ("bash-0000000000000502", "corrupt_record"),
+            ("bash-0000000000000503", "corrupt_record"),
+        ] {
+            assert!(
+                !session_dir.join(task_id).exists(),
+                "damaged task silently deferred"
+            );
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.contains(task_id) && name.contains(reason)),
+                "named quarantine reason missing: {names:?}"
+            );
+        }
     }
 
     /// Task metadata written by a newer build is refused by name. Neither
