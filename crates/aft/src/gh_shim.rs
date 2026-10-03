@@ -1657,6 +1657,18 @@ fn graphql_query_is_read_only(args: &[OsString]) -> bool {
                 return false;
             };
             if key == "query" {
+                // gh expands repository/branch placeholders in typed fields.
+                // A branch name can contain GraphQL punctuation, so the bytes
+                // inspected here would not necessarily be the document sent.
+                let magic =
+                    value == "--field" || value.starts_with("--field=") || value.starts_with("-F");
+                if magic
+                    && ["{owner}", "{repo}", "{branch}"]
+                        .iter()
+                        .any(|placeholder| text.contains(placeholder))
+                {
+                    return false;
+                }
                 queries.push(text);
             } else if key.starts_with("query[") {
                 // gh's bracket syntax can replace a scalar with an array or
@@ -9226,6 +9238,32 @@ mod tests {
                 ),
                 "{tail:?}"
             );
+        }
+    }
+
+    #[test]
+    fn graphql_magic_query_placeholders_are_uninspectable() {
+        let manifest = fixture_manifest();
+        for placeholder in ["{owner}", "{repo}", "{branch}"] {
+            let query = format!("query={{ field(arg: \"{placeholder}\") }}");
+            for tail in [
+                vec!["-F".to_string(), query.clone()],
+                vec!["--field".to_string(), query.clone()],
+                vec![format!("--field={query}")],
+                vec![format!("-F{query}")],
+            ] {
+                let mut args = os_args(&["api", "graphql"]);
+                args.extend(tail.iter().map(OsString::from));
+                assert!(!graphql_query_is_read_only(&args), "{tail:?}");
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ));
+            }
+            // Raw fields are literal: gh does not expand their placeholders.
+            assert!(graphql_query_is_read_only(&os_args(&[
+                "api", "graphql", "-f", &query
+            ])));
         }
     }
 
