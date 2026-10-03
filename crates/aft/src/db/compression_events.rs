@@ -538,6 +538,8 @@ fn prune_compression_events_in_transaction(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut folded: HashMap<(String, String, Option<String>), (i64, i64, i64)> = HashMap::new();
     let mut deleted = 0;
+    // One compiled statement for the batch instead of one per pruned row.
+    let mut delete = conn.prepare_cached("DELETE FROM compression_events WHERE id = ?1")?;
     for (id, _, harness, project, session, original, compressed, live) in &candidates {
         if *live || *id == max_id {
             continue;
@@ -548,7 +550,7 @@ fn prune_compression_events_in_transaction(
         totals.0 += 1;
         totals.1 += original;
         totals.2 += compressed;
-        deleted += conn.execute("DELETE FROM compression_events WHERE id = ?1", [id])?;
+        deleted += delete.execute([id])?;
     }
     for ((harness, project, session), (events, original, compressed)) in folded {
         conn.execute(

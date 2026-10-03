@@ -660,3 +660,66 @@ fn refresh_releases_the_store_connection_while_it_parses() {
     });
     set_refresh_parse_hook_for_test(&root, None);
 }
+
+/// Statements compiled by a cold build of `files` TS modules and by a
+/// refresh that rewrites every one of them.
+fn build_and_refresh_compiles(dir: &tempfile::TempDir, files: usize) -> (usize, usize) {
+    let root = fixture_root(dir, &format!("project-{files}"));
+    let module = |index: usize, extra: &str| {
+        format!(
+            "import {{ helper }} from \"./lib\";\n\
+             export class Worker{index} {{ run() {{ return helper(); }} }}\n\
+             export function use{index}(worker: any) {{ return worker.run() + helper(); }}\n{extra}"
+        )
+    };
+    let mut paths = vec![write(
+        &root,
+        "src/lib.ts",
+        "export function helper() { return 1; }\n",
+    )];
+    for index in 0..files {
+        paths.push(write(
+            &root,
+            &format!("src/m{index:03}.ts"),
+            &module(index, ""),
+        ));
+    }
+    let (store, cold) =
+        cold_build_counts(&root, &dir.path().join(format!("store-{files}")), &paths);
+    let compiles = install_compile_counter(&store);
+    let mut changed = Vec::new();
+    for index in 0..files {
+        changed.push(write(
+            &root,
+            &format!("src/m{index:03}.ts"),
+            &module(
+                index,
+                &format!("export function added{index}() {{ return 2; }}\n"),
+            ),
+        ));
+    }
+    let (stats, refresh) = measure(&root, compiles, || store.refresh_files(&changed));
+    stats.expect("refresh");
+    (cold.statements_compiled, refresh.statements_compiled)
+}
+
+#[test]
+fn cold_build_and_refresh_compile_statements_independent_of_file_count() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (small_cold, small_refresh) = build_and_refresh_compiles(&dir, 10);
+    let (large_cold, large_refresh) = build_and_refresh_compiles(&dir, 40);
+    eprintln!(
+        "statements compiled: cold 10 files={small_cold} 40 files={large_cold}; \
+         refresh 10 files={small_refresh} 40 files={large_refresh}"
+    );
+    assert!(
+        large_cold.saturating_sub(small_cold) < 30,
+        "30 more files must not compile statements per file or row in a cold build: \
+         {small_cold} vs {large_cold}"
+    );
+    assert!(
+        large_refresh.saturating_sub(small_refresh) < 30,
+        "30 more refreshed files must not compile statements per file or row: \
+         {small_refresh} vs {large_refresh}"
+    );
+}

@@ -75,6 +75,7 @@ const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 /// Keep SQLite's per-connection page cache below the staged build working-set
 /// budget; negative values are KiB per SQLite's `cache_size` pragma.
 const CALLGRAPH_SQLITE_CACHE_KIB: i64 = -8 * 1024;
+const CALLGRAPH_STATEMENT_CACHE_CAPACITY: usize = 96;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// A root removed from `cache-keys.json` cannot be reached by a future checkout.
 /// Wait the same seven-day grace period as cache-key eviction before deleting its
@@ -3993,7 +3994,9 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         }
         let mut statement = self
             .conn
-            .prepare("SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path")
+            .prepare_cached(
+                "SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path",
+            )
             .ok()?;
         let rows = statement
             .query_map(params![caller_file], |row| row.get::<_, String>(0))
@@ -4811,6 +4814,10 @@ impl CallGraphStore {
         read_marker: Option<crate::root_cache::ReadMarker>,
         conn: TrackedConnection,
     ) -> Self {
+        // Builds, refreshes and graph walks reuse a few dozen distinct
+        // statements per row or node; above rusqlite's default of 16 cached
+        // statements they would evict each other and be compiled again.
+        conn.set_prepared_statement_cache_capacity(CALLGRAPH_STATEMENT_CACHE_CAPACITY);
         let write_metrics = callgraph_write_metrics_for_key(&project_key);
         Self {
             project_root,
@@ -5000,7 +5007,7 @@ impl CallGraphStore {
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
         {
-            let mut insert = tx.prepare(
+            let mut insert = tx.prepare_cached(
                 "INSERT OR REPLACE INTO staging_file_inventory(path, size) VALUES(?1, ?2)",
             )?;
             for (path, size) in batch {
@@ -7296,7 +7303,7 @@ fn indexed_file_count(conn: &Connection) -> Result<usize> {
 
 /// Size and hex content hash of every stored file, keyed by relative path.
 fn stored_file_identities(conn: &Connection) -> Result<HashMap<String, (u64, String)>> {
-    let mut statement = conn.prepare("SELECT path, size, content_hash FROM files")?;
+    let mut statement = conn.prepare_cached("SELECT path, size, content_hash FROM files")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -7417,7 +7424,7 @@ fn nodes_for_file_matching_symbol(
          WHERE n.file_path = ?1 AND (n.scoped_name = ?2 OR n.name = ?2)
          ORDER BY n.scoped_name, n.start_line, n.start_col"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![rel_path, symbol], store_node_from_row)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -7438,7 +7445,7 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
          WHERE n.scoped_name = ?1 OR n.name = ?1
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![symbol], store_node_from_row)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -7610,7 +7617,7 @@ fn direct_callers_for_tuple(
     target_file: &str,
     target_symbol: &str,
 ) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
                 src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
@@ -7879,7 +7886,7 @@ fn outgoing_calls_for_node_limited(
     node: &StoreNode,
     limit: usize,
 ) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
@@ -7914,7 +7921,7 @@ fn outgoing_calls_for_node_limited(
 }
 
 fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT r.target_file, r.target_symbol, r.line,
                 r.byte_start, r.byte_end, r.status, r.provenance,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
@@ -8003,7 +8010,7 @@ fn unresolved_calls_for_node_limited(
     node: &StoreNode,
     limit: usize,
 ) -> Result<Vec<StoreUnresolvedCall>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT COALESCE(short_name, full_ref, ''), full_ref, line, byte_start, byte_end
          FROM refs
          WHERE caller_node = ?1
@@ -9484,7 +9491,7 @@ fn clear_path_identity_mismatch_if_consistent(
     if !stale_backend_file_paths(tx, project_root, true)?.is_empty() {
         return Ok(());
     }
-    let mut stmt = tx.prepare("SELECT path FROM files")?;
+    let mut stmt = tx.prepare_cached("SELECT path FROM files")?;
     let paths = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -9742,11 +9749,8 @@ fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -
     };
     let rel_path = relative_path(project_root, path);
     let staged_hash = conn
-        .query_row(
-            "SELECT content_hash FROM files WHERE path = ?1",
-            params![rel_path],
-            |row| row.get::<_, String>(0),
-        )
+        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| row.get::<_, String>(0))
         .optional()?;
     Ok(staged_hash.as_deref() == Some(hash_to_hex(freshness.content_hash).as_str()))
 }
@@ -9764,11 +9768,9 @@ fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
     // (resumed with different content) or pruned from the inventory has a
     // `files` row, and only those pay for the scans. The lookup is on the
     // `files` primary key, which is never dropped.
-    let previously_staged: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
-        params![rel_path],
-        |row| row.get(0),
-    )?;
+    let previously_staged: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)")?
+        .query_row(params![rel_path], |row| row.get(0))?;
     if !previously_staged {
         return Ok(());
     }
@@ -9783,7 +9785,7 @@ fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 fn prune_staged_files_not_in_inventory(conn: &mut Connection) -> Result<()> {
     loop {
         let removed = {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT path
                  FROM files
                  WHERE NOT EXISTS (
@@ -9823,7 +9825,7 @@ fn load_staged_file_batch(
     max_files: usize,
     max_bytes: u64,
 ) -> Result<Option<StagedFileBatch>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT path, size
          FROM staging_file_inventory
          WHERE path > ?1
@@ -9852,7 +9854,8 @@ fn load_staged_file_batch(
 }
 
 fn staged_corpus_fingerprint(conn: &Connection, project_root: &Path) -> Result<String> {
-    let mut statement = conn.prepare("SELECT path FROM staging_file_inventory ORDER BY path")?;
+    let mut statement =
+        conn.prepare_cached("SELECT path FROM staging_file_inventory ORDER BY path")?;
     let mut rows = statement.query([])?;
     let mut fingerprint = CorpusFingerprint::default();
     while let Some(row) = rows.next()? {
@@ -9867,7 +9870,7 @@ fn load_staged_ref_window(
     after_rowid: u64,
     limit: usize,
 ) -> Result<Vec<StagedRef>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT refs.rowid, refs.ref_id, refs.caller_node, refs.caller_file, refs.kind,
                 refs.short_name, refs.full_ref, refs.module_path, refs.import_kind,
                 refs.local_name, refs.requested_name, refs.namespace_alias, refs.wildcard,
@@ -9906,8 +9909,9 @@ fn load_staged_ref_window(
     drop(statement);
 
     let mut dependencies = HashMap::<String, BTreeSet<String>>::new();
-    let mut dependency_statement = conn
-        .prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file")?;
+    let mut dependency_statement = conn.prepare_cached(
+        "SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file",
+    )?;
     for raw in refs.iter_mut().map(|entry| &mut entry.raw) {
         if !dependencies.contains_key(&raw.caller_file) {
             let rows =
@@ -9971,7 +9975,7 @@ fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Resu
 }
 
 fn staged_files_with_status(conn: &Connection, status: &str) -> Result<Vec<String>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM backend_file_state WHERE status = ?1 ORDER BY file_path",
     )?;
     let rows = statement.query_map([status], |row| row.get(0))?;
@@ -10136,7 +10140,7 @@ fn same_workspace_root(a: &Path, b: &Path) -> bool {
 }
 
 fn stored_workspace_roots(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT workspace_root
          FROM backend_file_state
          ORDER BY workspace_root",
@@ -13689,12 +13693,16 @@ impl<'a> LazyDbFileIndexes<'a> {
             return *known;
         }
         let exists = self.timed(|| {
-            self.note_error(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)
+            self.note_error(
+                self.conn
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)
                      OR EXISTS(SELECT 1 FROM nodes WHERE file_path = ?1)",
-                params![rel_path],
-                |row| row.get::<_, bool>(0),
-            ))
+                    )
+                    .and_then(|mut statement| {
+                        statement.query_row(params![rel_path], |row| row.get::<_, bool>(0))
+                    }),
+            )
             .unwrap_or(false)
         });
         self.add_rows(usize::from(exists));
@@ -13809,7 +13817,7 @@ impl<'a> LazyDbFileIndexes<'a> {
             return paths.clone();
         }
         let paths = self.timed(|| {
-            self.note_error(self.conn.prepare(sql).and_then(|mut stmt| {
+            self.note_error(self.conn.prepare_cached(sql).and_then(|mut stmt| {
                 stmt.query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             }))
@@ -14493,17 +14501,17 @@ fn sync_file_dependencies(
         .flat_map(|raw| raw.dependencies.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut select_dependencies =
-        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+        tx.prepare_cached("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
     let stored_dependencies = select_dependencies
         .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
     let mut delete_dependency =
-        tx.prepare("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
+        tx.prepare_cached("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
     for dependency in stored_dependencies.difference(&dependencies) {
         delete_dependency.execute(params![extract.rel_path, dependency])?;
     }
     if insert_missing {
-        let mut insert_dependency = tx.prepare(
+        let mut insert_dependency = tx.prepare_cached(
             "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
         )?;
         for dependency in dependencies.difference(&stored_dependencies) {
@@ -14520,11 +14528,11 @@ fn delete_stale_string_rows(
     owner: &str,
     expected: &BTreeSet<String>,
 ) -> Result<()> {
-    let mut select = tx.prepare(select_sql)?;
+    let mut select = tx.prepare_cached(select_sql)?;
     let stored = select
         .query_map(params![owner], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut delete = tx.prepare(delete_sql)?;
+    let mut delete = tx.prepare_cached(delete_sql)?;
     for key in stored {
         if !expected.contains(&key) {
             delete.execute(params![key])?;
@@ -14541,31 +14549,38 @@ fn upsert_file_extract_prepared(
 ) -> Result<()> {
     insert_file_graph_rows_prepared(statements, extract)?;
     let hash = hash_to_hex(extract.freshness.content_hash);
-    let existing: usize = tx.query_row(
-        "SELECT count(*) FROM backend_file_state
+    let existing: usize = tx
+        .prepare_cached(
+            "SELECT count(*) FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-        params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row(
+            params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
+            |row| row.get(0),
+        )?;
     if existing > 1 {
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM backend_file_state
              WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-            params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
-        )?;
+        )?
+        .execute(params![
+            BACKEND_TREESITTER,
+            workspace_root,
+            extract.rel_path
+        ])?;
     } else if existing == 1 {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE backend_file_state
              SET content_hash = ?4, status = 'fresh', updated_at = ?5
              WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-            params![
-                BACKEND_TREESITTER,
-                workspace_root,
-                extract.rel_path,
-                hash,
-                unix_seconds_now(),
-            ],
-        )?;
+        )?
+        .execute(params![
+            BACKEND_TREESITTER,
+            workspace_root,
+            extract.rel_path,
+            hash,
+            unix_seconds_now(),
+        ])?;
     }
     insert_backend_state_prepared(
         &mut statements.backend_state,
@@ -14601,7 +14616,7 @@ fn upsert_resolved_ref_delta<I: ResolverIndex>(
             .cloned()
             .collect::<BTreeSet<_>>()
     } else {
-        let mut select = tx.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
+        let mut select = tx.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
         let stored = select
             .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
@@ -14618,25 +14633,23 @@ fn upsert_resolved_ref_delta<I: ResolverIndex>(
 
 fn delete_stale_direct_edges(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
     if let Some(expected) = &resolved.edge {
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM edges
              WHERE ref_id = ?1 AND provenance IN (?2, ?3) AND edge_id <> ?4",
-            params![
-                resolved.raw.ref_id,
-                PROVENANCE_TREESITTER,
-                PROVENANCE_VALUE_REF,
-                expected.edge_id,
-            ],
-        )?;
+        )?
+        .execute(params![
+            resolved.raw.ref_id,
+            PROVENANCE_TREESITTER,
+            PROVENANCE_VALUE_REF,
+            expected.edge_id,
+        ])?;
     } else {
-        tx.execute(
-            "DELETE FROM edges WHERE ref_id = ?1 AND provenance IN (?2, ?3)",
-            params![
+        tx.prepare_cached("DELETE FROM edges WHERE ref_id = ?1 AND provenance IN (?2, ?3)")?
+            .execute(params![
                 resolved.raw.ref_id,
                 PROVENANCE_TREESITTER,
                 PROVENANCE_VALUE_REF,
-            ],
-        )?;
+            ])?;
     }
     Ok(())
 }
@@ -14801,17 +14814,36 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
     Ok(())
 }
 
+/// Same-named method candidates by `(method name, language)`. They are read
+/// from `nodes`, which no longer changes once dispatch edges are computed, so
+/// one cache serves every chunk of a build or refresh.
+type DispatchCandidateCache = HashMap<(String, String), Vec<NameMatchCandidate>>;
+/// Distinct method names a dispatch candidate cache keeps before it is reset.
+const DISPATCH_CANDIDATE_CACHE_NAMES: usize = 16_384;
+
+#[cfg(test)]
 fn insert_method_dispatch_edges(
     tx: &Transaction<'_>,
     project_root: &Path,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<BTreeSet<String>> {
+    insert_method_dispatch_edges_cached(tx, project_root, caller_files, &mut HashMap::new())
+}
+
+fn insert_method_dispatch_edges_cached(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    caller_files: Option<&BTreeSet<String>>,
+    candidates_by_name: &mut DispatchCandidateCache,
+) -> Result<BTreeSet<String>> {
     let references = load_name_match_refs(tx, caller_files)?;
     if references.is_empty() {
         return Ok(BTreeSet::new());
     }
+    if candidates_by_name.len() > DISPATCH_CANDIDATE_CACHE_NAMES {
+        candidates_by_name.clear();
+    }
 
-    let mut candidates_by_name: HashMap<(String, String), Vec<NameMatchCandidate>> = HashMap::new();
     let mut source_cache: DispatchSourceCache = HashMap::new();
     let mut edge_ids = BTreeSet::new();
     for reference in references {
@@ -14898,9 +14930,10 @@ fn insert_method_dispatch_edges_chunked(
     ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     let mut inserted = 0usize;
     let mut after_file = String::new();
+    let mut candidates = DispatchCandidateCache::new();
     loop {
         let caller_files = {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT DISTINCT caller_file
                  FROM refs
                  WHERE caller_file > ?1
@@ -14916,7 +14949,13 @@ fn insert_method_dispatch_edges_chunked(
         let Some(last_file) = caller_files.last().cloned() else {
             break;
         };
-        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?.len();
+        inserted += insert_method_dispatch_edges_cached(
+            tx,
+            project_root,
+            Some(&caller_files),
+            &mut candidates,
+        )?
+        .len();
         after_file = last_file;
         completed_files = completed_files
             .saturating_add(caller_files.len())
@@ -14934,7 +14973,7 @@ fn insert_method_dispatch_edge(
     provenance: &str,
 ) -> Result<String> {
     let edge_id = ref_id(&[&reference.ref_id, provenance, "edge"]);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO edges(
             edge_id, ref_id, source_node, target_node, target_file, target_symbol,
             kind, line, provenance
@@ -14956,17 +14995,17 @@ fn insert_method_dispatch_edge(
            OR kind IS NOT excluded.kind
            OR line IS NOT excluded.line
            OR provenance IS NOT excluded.provenance",
-        params![
-            edge_id,
-            &reference.ref_id,
-            &reference.caller_node,
-            &candidate.node_id,
-            &candidate.file_path,
-            &candidate.scoped_name,
-            reference.line as i64,
-            provenance,
-        ],
-    )?;
+    )?
+    .execute(params![
+        edge_id,
+        &reference.ref_id,
+        &reference.caller_node,
+        &candidate.node_id,
+        &candidate.file_path,
+        &candidate.scoped_name,
+        reference.line as i64,
+        provenance,
+    ])?;
     Ok(edge_id)
 }
 
@@ -15015,7 +15054,7 @@ fn changed_dispatch_candidate_names(
         }
         grouped
     }
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT name, scoped_name, kind FROM nodes
          WHERE file_path = ?1 AND kind IN ('method', 'function', 'kernel')",
     )?;
@@ -15074,7 +15113,7 @@ fn dispatch_callers_to_recompute(
     changed_names: &DispatchNames,
 ) -> Result<BTreeSet<String>> {
     let mut callers = roots.clone();
-    let mut by_target = tx.prepare(
+    let mut by_target = tx.prepare_cached(
         "SELECT DISTINCT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.target_file = ?1 AND e.provenance IN (?2, ?3)",
     )?;
@@ -15086,7 +15125,7 @@ fn dispatch_callers_to_recompute(
             callers.insert(row?);
         }
     }
-    let mut by_name = tx.prepare(
+    let mut by_name = tx.prepare_cached(
         "SELECT DISTINCT caller_file FROM refs
          WHERE short_name = ?1 AND +kind = 'call' AND status = 'unresolved'",
     )?;
@@ -15102,7 +15141,7 @@ fn dispatch_callers_to_recompute(
         // name (`Type::method`); match those on the last segment, as name
         // matching does. JS/TS short names are the bare member name, so a
         // change in a JS/TS file never needs this scan.
-        let mut unresolved = tx.prepare(
+        let mut unresolved = tx.prepare_cached(
             "SELECT caller_file, short_name FROM refs
              WHERE kind = 'call' AND status = 'unresolved'
                AND (short_name GLOB '*::*' OR short_name GLOB '*.*' OR short_name GLOB '*->*')",
@@ -15121,7 +15160,7 @@ fn dispatch_callers_to_recompute(
         }
     }
     // A deleted caller's refs and edges are already gone.
-    let mut exists = tx.prepare("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut exists = tx.prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
     let mut present = BTreeSet::new();
     for caller in callers {
         if exists.exists(params![caller])? {
@@ -15139,9 +15178,11 @@ fn refresh_method_dispatch_edges(
     caller_files: &BTreeSet<String>,
 ) -> Result<()> {
     let files = caller_files.iter().cloned().collect::<Vec<_>>();
+    let mut candidates = DispatchCandidateCache::new();
     for chunk in files.chunks(DISPATCH_REFRESH_CHUNK_FILES) {
         let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
-        let expected = insert_method_dispatch_edges(tx, project_root, Some(&chunk))?;
+        let expected =
+            insert_method_dispatch_edges_cached(tx, project_root, Some(&chunk), &mut candidates)?;
         delete_stale_method_dispatch_edges_for_callers(tx, &chunk, &expected)?;
     }
     Ok(())
@@ -15156,12 +15197,12 @@ fn delete_stale_method_dispatch_edges_for_callers(
         return Ok(());
     }
 
-    let mut select = tx.prepare(
+    let mut select = tx.prepare_cached(
         "SELECT e.edge_id
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.provenance IN (?1, ?2) AND r.caller_file = ?3",
     )?;
-    let mut delete = tx.prepare("DELETE FROM edges WHERE edge_id = ?1")?;
+    let mut delete = tx.prepare_cached("DELETE FROM edges WHERE edge_id = ?1")?;
     for caller_file in caller_files {
         let stored = select
             .query_map(
@@ -15368,7 +15409,7 @@ fn load_name_match_candidates(
     method_name: &str,
     lang: &str,
 ) -> Result<Vec<NameMatchCandidate>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT n.id, n.file_path, n.scoped_name, n.kind, n.start_line
          FROM nodes n JOIN files f ON f.path = n.file_path
          WHERE n.name = ?1
@@ -17008,19 +17049,19 @@ fn mark_backend_state(
     let hash = content_hash
         .map(|hash| hash_to_hex(*hash))
         .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR REPLACE INTO backend_file_state(
             backend, workspace_root, file_path, content_hash, status, updated_at
         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path,
-            hash,
-            status,
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path,
+        hash,
+        status,
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
@@ -17056,7 +17097,7 @@ fn backend_file_paths_with_status(
     project_root: &Path,
     status: &str,
 ) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND status = ?3
          ORDER BY file_path",
@@ -17115,15 +17156,15 @@ fn clear_backend_state_for_file(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "DELETE FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path
+    ])?;
     Ok(())
 }
 
@@ -17137,36 +17178,34 @@ fn clear_stale_backend_status_for_file(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE backend_file_state SET status = 'fresh', updated_at = ?4
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3 AND status = 'stale'",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path,
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path,
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
 fn load_file_row(conn: &Connection, rel_path: &str) -> Result<Option<FileRow>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT surface_fingerprint, content_hash, mtime_ns, size FROM files WHERE path = ?1",
-        params![rel_path],
-        |row| {
-            let hash_text: String = row.get(1)?;
-            Ok(FileRow {
-                surface_fingerprint: row.get(0)?,
-                freshness: FileFreshness {
-                    content_hash: hash_from_hex(&hash_text)
-                        .unwrap_or_else(cache_freshness::zero_hash),
-                    mtime: ns_to_system_time(row.get::<_, i64>(2)?),
-                    size: row.get::<_, i64>(3)? as u64,
-                },
-            })
-        },
-    )
+    )?
+    .query_row(params![rel_path], |row| {
+        let hash_text: String = row.get(1)?;
+        Ok(FileRow {
+            surface_fingerprint: row.get(0)?,
+            freshness: FileFreshness {
+                content_hash: hash_from_hex(&hash_text).unwrap_or_else(cache_freshness::zero_hash),
+                mtime: ns_to_system_time(row.get::<_, i64>(2)?),
+                size: row.get::<_, i64>(3)? as u64,
+            },
+        })
+    })
     .optional()
     .map_err(CallGraphStoreError::from)
 }
@@ -17176,7 +17215,7 @@ fn stored_node_ids_match_extract(
     rel_path: &str,
     extract: &FileExtract,
 ) -> Result<bool> {
-    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE file_path = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT id FROM nodes WHERE file_path = ?1")?;
     let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
     let mut stored = BTreeSet::new();
     for row in rows {
@@ -17200,11 +17239,10 @@ fn stored_extract_matches(
     index: &ProjectIndex<'_>,
 ) -> Result<bool> {
     let stored_file = tx
-        .query_row(
-            "SELECT lang, surface_fingerprint FROM files WHERE path = ?1",
-            params![rel_path],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
+        .prepare_cached("SELECT lang, surface_fingerprint FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()?;
     if stored_file
         != Some((
@@ -17215,7 +17253,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_nodes_stmt = tx.prepare(
+    let mut stored_nodes_stmt = tx.prepare_cached(
         "SELECT id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
                 is_default_export, is_type_like, is_callgraph_entry_point, provenance
@@ -17283,7 +17321,7 @@ fn stored_extract_matches(
         .cloned()
         .map(|raw| resolve_ref(raw, index))
         .collect::<Result<Vec<_>>>()?;
-    let mut stored_refs_stmt = tx.prepare(
+    let mut stored_refs_stmt = tx.prepare_cached(
         "SELECT ref_id, caller_node, caller_file, kind, short_name, full_ref,
                 module_path, import_kind, local_name, requested_name, namespace_alias,
                 wildcard, line, byte_start, byte_end, status, target_node,
@@ -17354,7 +17392,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_edges_stmt = tx.prepare(
+    let mut stored_edges_stmt = tx.prepare_cached(
         "SELECT e.edge_id, e.ref_id, e.source_node, e.target_node,
                 e.target_file, e.target_symbol, e.kind, e.line, e.provenance
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
@@ -17404,7 +17442,7 @@ fn stored_extract_matches(
     }
 
     let mut stored_dependencies_stmt =
-        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+        tx.prepare_cached("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
     let stored_dependencies = stored_dependencies_stmt
         .query_map(params![rel_path], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
@@ -17417,7 +17455,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_hints_stmt = tx.prepare(
+    let mut stored_hints_stmt = tx.prepare_cached(
         "SELECT id, method_name, caller_node, file, line, byte_start, byte_end, provenance
          FROM dispatch_hints WHERE file = ?1",
     )?;
@@ -17468,28 +17506,28 @@ fn update_file_fresh_metadata(
     mtime: SystemTime,
     size: u64,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5
          WHERE path = ?1",
-        params![
-            rel_path,
-            hash_to_hex(*hash),
-            system_time_to_ns(mtime),
-            size as i64,
-            unix_seconds_now()
-        ],
-    )?;
-    tx.execute(
+    )?
+    .execute(params![
+        rel_path,
+        hash_to_hex(*hash),
+        system_time_to_ns(mtime),
+        size as i64,
+        unix_seconds_now()
+    ])?;
+    tx.prepare_cached(
         "UPDATE backend_file_state SET content_hash = ?3, status = 'fresh', updated_at = ?5
          WHERE backend = ?1 AND file_path = ?2 AND workspace_root = ?4",
-        params![
-            BACKEND_TREESITTER,
-            rel_path,
-            hash_to_hex(*hash),
-            project_root.display().to_string(),
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        rel_path,
+        hash_to_hex(*hash),
+        project_root.display().to_string(),
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
@@ -17738,7 +17776,7 @@ struct ExportSurface {
 impl ExportSurface {
     fn stored(conn: &Connection, rel_path: &str) -> Result<Self> {
         let mut surface = Self::default();
-        let mut nodes = conn.prepare(
+        let mut nodes = conn.prepare_cached(
             "SELECT name, scoped_name, kind, exported, is_default_export
              FROM nodes WHERE file_path = ?1",
         )?;
@@ -17755,7 +17793,7 @@ impl ExportSurface {
             let (name, scoped_name, kind, exported, is_default_export) = row?;
             surface.note_node(&name, &scoped_name, &kind, exported, is_default_export);
         }
-        let mut refs = conn.prepare(
+        let mut refs = conn.prepare_cached(
             "SELECT kind, module_path, full_ref, wildcard, local_name, requested_name
              FROM refs WHERE caller_file = ?1 AND kind IN ('reexport', 'export_alias')",
         )?;
@@ -17881,7 +17919,7 @@ fn reexporters_of(
     rel_path: &str,
     memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<ReexportRow>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT caller_file, module_path, full_ref, wildcard FROM refs
          WHERE kind = 'reexport'
            AND caller_file IN (SELECT file_path FROM file_dependencies WHERE dep_file = ?1)
@@ -18004,21 +18042,21 @@ fn reexport_consumer_refs(
     }
 
     let mut selected = Vec::new();
-    let mut importers_of = conn.prepare(
+    let mut importers_of = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM file_dependencies WHERE dep_file = ?1 ORDER BY file_path",
     )?;
-    let mut imports_of = conn.prepare(
+    let mut imports_of = conn.prepare_cached(
         "SELECT module_path, local_name, requested_name FROM refs
          WHERE caller_file = ?1 AND kind = 'import'",
     )?;
-    let mut calls_of = conn.prepare(
+    let mut calls_of = conn.prepare_cached(
         "SELECT ref_id, short_name FROM refs
          WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
     )?;
     // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
     // any import row; when the barrel cannot place the name they are stored
     // as resolved to the barrel itself.
-    let mut resolved_to = conn.prepare(
+    let mut resolved_to = conn.prepare_cached(
         "SELECT ref_id, caller_file, short_name FROM refs
          WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
     )?;
@@ -18240,7 +18278,7 @@ fn tsconfig_dirs(
     created: &BTreeSet<String>,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut dirs = BTreeSet::new();
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT path FROM files WHERE path = 'tsconfig.json' OR path GLOB '*/tsconfig.json'",
     )?;
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
@@ -18596,7 +18634,7 @@ fn caller_refs_depending_on(
     rel_path: &str,
     memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT ref_id, kind, caller_file, module_path, target_file FROM refs
          WHERE caller_file = ?1 ORDER BY ref_id",
     )?;
@@ -18646,7 +18684,7 @@ fn refs_by_caller_for_ref_ids(
     ref_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut by_caller: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut stmt = tx.prepare("SELECT caller_file FROM refs WHERE ref_id = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT caller_file FROM refs WHERE ref_id = ?1")?;
     for ref_id in ref_ids {
         if let Some(caller) = stmt
             .query_row(params![ref_id], |row| row.get::<_, String>(0))
@@ -18727,7 +18765,7 @@ fn resolution_change_importers<'a>(
         for name in &change.package_names {
             // `substr` instead of LIKE: package names may contain `_`, a LIKE
             // wildcard.
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT DISTINCT caller_file, kind FROM refs
                  WHERE module_path = ?1
                     OR substr(module_path, 1, length(?1) + 1) = ?1 || '/'",
@@ -18738,7 +18776,7 @@ fn resolution_change_importers<'a>(
             collect(rows);
         }
         if change.bare_imports_under_dir {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT DISTINCT caller_file, kind FROM refs
                  WHERE module_path IS NOT NULL
                    AND module_path <> ''
@@ -18757,7 +18795,7 @@ fn resolution_change_importers<'a>(
 /// Every stored ref of `caller_file`, selected for re-resolution.
 fn all_refs_of_caller(conn: &Connection, caller_file: &str) -> Result<Vec<DependentRefSelection>> {
     let mut statement =
-        conn.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1 ORDER BY ref_id")?;
+        conn.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1 ORDER BY ref_id")?;
     let rows = statement
         .query_map(params![caller_file], |row| row.get::<_, String>(0))?
         .map(|ref_id| {
@@ -18791,22 +18829,18 @@ fn store_resolution_config_fields(
 }
 
 fn delete_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
-    tx.execute(
-        "DELETE FROM file_dependencies WHERE file_path = ?1",
-        params![rel_path],
-    )?;
+    tx.prepare_cached("DELETE FROM file_dependencies WHERE file_path = ?1")?
+        .execute(params![rel_path])?;
     delete_refs_for_caller(tx, rel_path)?;
-    tx.execute(
-        "DELETE FROM dispatch_hints WHERE file = ?1",
-        params![rel_path],
-    )?;
+    tx.prepare_cached("DELETE FROM dispatch_hints WHERE file = ?1")?
+        .execute(params![rel_path])?;
     tx.execute("DELETE FROM nodes WHERE file_path = ?1", params![rel_path])?;
     tx.execute("DELETE FROM files WHERE path = ?1", params![rel_path])?;
     Ok(())
 }
 
 fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
-    let mut stmt = tx.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
     let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
     let mut ids = BTreeSet::new();
     for row in rows {
@@ -18816,8 +18850,8 @@ fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 }
 
 fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()> {
-    let mut delete_edges = tx.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
-    let mut delete_refs = tx.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
+    let mut delete_edges = tx.prepare_cached("DELETE FROM edges WHERE ref_id = ?1")?;
+    let mut delete_refs = tx.prepare_cached("DELETE FROM refs WHERE ref_id = ?1")?;
     for ref_id in ref_ids {
         delete_edges.execute(params![ref_id])?;
         delete_refs.execute(params![ref_id])?;
@@ -18826,7 +18860,7 @@ fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()
 }
 
 fn edge_snapshot_with_conn(conn: &Connection) -> Result<BTreeSet<StoredEdge>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT source.file_path, source.scoped_name, edges.target_file,
                 edges.target_symbol, edges.kind, edges.line
          FROM edges

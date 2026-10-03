@@ -410,7 +410,7 @@ pub(super) fn extend_projection_dependents(
     file: &str,
     callers: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT caller_file FROM refs WHERE target_file = ?1
          UNION SELECT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id WHERE e.target_file = ?1
          UNION SELECT file_path FROM file_dependencies WHERE dep_file = ?1",
