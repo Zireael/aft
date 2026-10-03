@@ -78,6 +78,7 @@ pub mod context;
 pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
+pub(crate) mod durability;
 pub mod edit;
 pub mod effective_path;
 #[doc(hidden)]

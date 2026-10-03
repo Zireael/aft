@@ -680,9 +680,8 @@ fn log_transient_heartbeat_failure(
 /// path never fsyncs the file or its directory. If the machine crashes before
 /// the page cache is written back, the lease on disk just carries an older
 /// heartbeat and looks stale sooner, which the stale-lease rules already
-/// handle. Creating and reclaiming a lease still fsync (see
-/// `create_lock_file_atomically` and the reclaim token), because those decide
-/// who owns the lock.
+/// handle. Creation and reclaim tokens also need only visibility: ownership
+/// depends on a live process identity, which cannot survive a machine crash.
 ///
 /// The rewrite happens in place on the handle whose contents were just checked
 /// for ownership: no new inode per beat, and no window in which the path is
@@ -794,8 +793,7 @@ fn write_lock_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn write_lock_metadata_to_file(file: &mut File, metadata: &LockMetadata) -> io::Result<()> {
-    write_lock_bytes(file, &lock_metadata_bytes(metadata)?)?;
-    sync_lease_file(file)
+    write_lock_bytes(file, &lock_metadata_bytes(metadata)?)
 }
 
 fn create_lock_file_atomically(path: &Path, metadata: &LockMetadata) -> io::Result<()> {
@@ -806,7 +804,6 @@ fn create_lock_file_atomically(path: &Path, metadata: &LockMetadata) -> io::Resu
         drop(file);
 
         fs::hard_link(&tmp_path, path)?;
-        sync_parent(path);
         Ok(())
     })();
 
@@ -966,7 +963,6 @@ struct ReclaimTokenGuard {
 impl Drop for ReclaimTokenGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-        sync_parent(&self.path);
     }
 }
 
@@ -1040,7 +1036,6 @@ fn create_reclaim_token(
         let _ = fs::remove_file(token_path);
         return Err(error);
     }
-    sync_parent(token_path);
     Ok(ReclaimTokenGuard {
         path: token_path.to_path_buf(),
     })
@@ -1109,10 +1104,7 @@ fn malformed_token_pid(token_path: &Path) -> Option<u32> {
 
 fn remove_malformed_reclaim_token(token_path: &Path) -> io::Result<bool> {
     match fs::remove_file(token_path) {
-        Ok(()) => {
-            sync_parent(token_path);
-            Ok(true)
-        }
+        Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
     }
@@ -1233,9 +1225,6 @@ fn remove_stale_reclaim_token(path: &Path) -> io::Result<bool> {
         ExistingReclaimToken::StaleMalformed => remove_malformed_reclaim_token(path)?,
         ExistingReclaimToken::Held(_) | ExistingReclaimToken::Missing => false,
     };
-    if removed {
-        sync_parent(path);
-    }
     Ok(removed)
 }
 
@@ -1381,9 +1370,9 @@ fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result
 
 pub(crate) fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
+        if crate::durability::sync_dir(parent).is_ok() {
+            #[cfg(unix)]
             io_ledger::record(|ledger| ledger.dir_syncs += 1);
-            let _ = dir.sync_all();
         }
     }
 }
@@ -1391,7 +1380,7 @@ pub(crate) fn sync_parent(path: &Path) {
 /// `File::sync_all` for lease files, counted by the test I/O ledger.
 pub(crate) fn sync_lease_file(file: &File) -> io::Result<()> {
     io_ledger::record(|ledger| ledger.file_syncs += 1);
-    file.sync_all()
+    crate::durability::sync_file(file, Path::new("<lease>"))
 }
 
 /// Per-thread counters of the durable I/O that lease code performs: file
@@ -2069,49 +2058,48 @@ mod tests {
         }
     }
 
-    /// Creating a lease and reclaiming a dead owner's lease keep full
-    /// durability: the lease file and its directory entry are fsynced before
-    /// the new owner proceeds.
+    /// The old contract asserted file + directory syncs at creation and during
+    /// reclaim. Ownership instead depends on the live process identity: after
+    /// power loss the owner is dead, and torn leases are stale. The atomic hard
+    /// link and reclaim token still serialize live contenders without making
+    /// those process-lifetime records power-loss durable.
     #[test]
-    fn lease_create_and_reclaim_still_fsync() {
+    fn durability_lease_create_and_reclaim_unsynced() {
         let (_dir, path) = test_lock_path();
         let _ = io_ledger::take();
+        crate::durability::take();
         let guard = acquire_with_config(&path, Some(Duration::from_secs(2)), test_config())
             .expect("create lease");
         let created = io_ledger::take();
         drop(guard);
         assert_eq!(
             (created.file_syncs, created.dir_syncs, created.new_files),
-            (1, DIR_SYNCS_PER_CREATE, 1),
-            "lease creation must fsync the file and the directory: {created:?}"
+            (0, 0, 1),
+            "lease creation must not sync: {created:?}"
         );
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
 
         let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
         write_synthetic_lock(&path, &dead);
         let _ = io_ledger::take();
+        crate::durability::take();
         let guard = acquire_with_config(&path, Some(Duration::from_secs(2)), test_config())
             .expect("reclaim dead lease");
         let reclaimed = io_ledger::take();
         drop(guard);
-        // The first create attempt writes and fsyncs its temp file before the
-        // hard link finds the dead lease (file). Then the reclaim token create
-        // (file + directory), token release (directory), and the new lease
-        // (file + directory).
+        // The failed create's temp file, reclaim token and new lease still
+        // require three inodes, but none need to survive their owner's death.
         assert_eq!(
             (
                 reclaimed.file_syncs,
                 reclaimed.dir_syncs,
                 reclaimed.new_files
             ),
-            (3, 3 * DIR_SYNCS_PER_CREATE, 3),
-            "lease reclaim must keep its fsyncs: {reclaimed:?}"
+            (0, 0, 3),
+            "lease reclaim must not sync: {reclaimed:?}"
         );
+        assert_eq!(crate::durability::sync_count(&crate::durability::take()), 0);
     }
-
-    /// Directory fsyncs recorded per directory-entry change. Windows cannot open
-    /// a directory as a file to sync it, so `sync_parent` is a no-op there and
-    /// records nothing; NTFS journals the entry itself.
-    const DIR_SYNCS_PER_CREATE: u64 = if cfg!(windows) { 0 } else { 1 };
 
     /// A crash after an unsynced rename can leave a zero-length lease. Readers
     /// must treat it as stale: acquisition removes it and takes the lock, the
