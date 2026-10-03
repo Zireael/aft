@@ -67,10 +67,12 @@ pub fn apply_lsp_disambiguation(matches: Vec<SymbolMatch>, hints: &LspHints) -> 
         .filter_map(|(i, m)| {
             let is_aligned = hints.symbols.iter().any(|hint| {
                 let hint_file = strip_file_uri(&hint.file);
+                // The integer range test runs before `paths_match`, which
+                // canonicalizes both paths: most hints fail it for free.
                 hint.name == m.symbol.name
-                    && paths_match(hint_file, &m.file)
                     && hint.line >= m.symbol.range.start_line
                     && hint.line <= m.symbol.range.end_line
+                    && paths_match(hint_file, &m.file)
             });
             if is_aligned {
                 Some(i)
