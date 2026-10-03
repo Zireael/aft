@@ -146,6 +146,84 @@ pub(crate) fn take_projection_mutation_counts_for_test() -> ProjectionMutationCo
     PROJECTION_MUTATION_COUNTS.with(|counts| counts.replace(ProjectionMutationCounts::default()))
 }
 
+/// Work counters for measurement tests: source parses by the store and
+/// resolution-config reads (`package.json`, `tsconfig.json`, `Cargo.toml`).
+/// They are keyed by absolute path because the work runs on build-pool
+/// threads, and tests running in parallel must each count only the files
+/// under their own fixture root.
+#[cfg(test)]
+pub(crate) mod work_counts {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
+        *map.get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
+    fn under(
+        map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>,
+        root: &Path,
+        file_name: Option<&str>,
+    ) -> usize {
+        map.get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .filter(|(path, _)| {
+                file_name.is_none_or(|name| path.file_name().is_some_and(|file| file == name))
+            })
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    pub(crate) fn note_parse(path: &Path) {
+        note(&PARSES, path);
+    }
+
+    pub(crate) fn note_config_read(path: &Path) {
+        note(&CONFIG_READS, path);
+    }
+
+    pub(crate) fn parses_under(root: &Path) -> usize {
+        under(&PARSES, root, None)
+    }
+
+    /// Highest parse count of any single file under `root`.
+    pub(crate) fn max_parses_of_one_file_under(root: &Path) -> usize {
+        PARSES
+            .get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| *count)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn config_reads_under(root: &Path, file_name: Option<&str>) -> usize {
+        under(&CONFIG_READS, root, file_name)
+    }
+
+    pub(crate) fn reset_under(root: &Path) {
+        for map in [&PARSES, &CONFIG_READS] {
+            map.get_or_init(Default::default)
+                .lock()
+                .expect("work counter mutex poisoned")
+                .retain(|path, _| !path.starts_with(root));
+        }
+    }
+}
+
 static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
     OnceLock::new();
 
@@ -1299,6 +1377,8 @@ thread_local! {
 }
 
 mod dead_code_projection;
+#[cfg(test)]
+mod perf_tests;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
     project_dead_code_snapshot_from_view, project_dead_code_snapshot_incremental_with_costs,
@@ -10920,6 +11000,8 @@ fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFr
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
+    #[cfg(test)]
+    work_counts::note_parse(&abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
     let freshness = collect_source_freshness(&abs_path, &source)?;
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;

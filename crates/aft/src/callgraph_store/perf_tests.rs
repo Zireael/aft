@@ -1,0 +1,294 @@
+//! Work-counting measurements and lock-in tests for the call-graph store's
+//! cold build and incremental refresh.
+//!
+//! The counts (files parsed, resolution-config files read, SQL statements
+//! compiled) are deterministic, unlike wall time on a shared machine, so the
+//! lock-in tests assert on them. The ignored real-repository measurement also
+//! writes the graph rows and query outputs to a directory, so two builds of
+//! the store can be compared for identical results.
+
+use super::*;
+use rusqlite::ffi;
+use std::fs;
+use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::AtomicUsize;
+
+extern "C" fn count_statement_compilations(
+    counter: *mut c_void,
+    action: c_int,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+) -> c_int {
+    // SQLite calls the authorizer while it compiles a statement, never while
+    // it runs one, so a statement served from the prepared-statement cache is
+    // not counted. Only the top-level DML actions are counted, which gives one
+    // count per compiled statement (a sub-select adds one more).
+    if matches!(
+        action,
+        ffi::SQLITE_SELECT | ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE
+    ) {
+        // SAFETY: the pointer is a leaked `AtomicUsize` that lives for the
+        // rest of the process (see `install_compile_counter`).
+        unsafe { &*(counter as *const AtomicUsize) }.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    ffi::SQLITE_OK
+}
+
+/// Count every SQL statement compiled on the store's connection from now on.
+pub(super) fn install_compile_counter(store: &CallGraphStore) -> &'static AtomicUsize {
+    let counter: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+    // SAFETY: the handle belongs to a live connection and the callback's data
+    // pointer is never freed.
+    let rc = unsafe {
+        ffi::sqlite3_set_authorizer(
+            conn.handle(),
+            Some(count_statement_compilations),
+            counter as *const AtomicUsize as *mut c_void,
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "install SQLite authorizer");
+    counter
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct WorkCounts {
+    pub parses: usize,
+    pub max_parses_of_one_file: usize,
+    pub package_json_reads: usize,
+    pub tsconfig_reads: usize,
+    pub cargo_toml_reads: usize,
+    pub config_reads: usize,
+    pub statements_compiled: usize,
+    pub wall: Duration,
+}
+
+pub(super) fn measure<T>(
+    root: &Path,
+    compiles: &AtomicUsize,
+    run: impl FnOnce() -> T,
+) -> (T, WorkCounts) {
+    work_counts::reset_under(root);
+    let compiled_before = compiles.load(AtomicOrdering::Relaxed);
+    let started = Instant::now();
+    let value = run();
+    let wall = started.elapsed();
+    let counts = WorkCounts {
+        parses: work_counts::parses_under(root),
+        max_parses_of_one_file: work_counts::max_parses_of_one_file_under(root),
+        package_json_reads: work_counts::config_reads_under(root, Some("package.json")),
+        tsconfig_reads: work_counts::config_reads_under(root, Some("tsconfig.json")),
+        cargo_toml_reads: work_counts::config_reads_under(root, Some("Cargo.toml")),
+        config_reads: work_counts::config_reads_under(root, None),
+        statements_compiled: compiles.load(AtomicOrdering::Relaxed) - compiled_before,
+        wall,
+    };
+    (value, counts)
+}
+
+const GRAPH_TABLES: &[&str] = &[
+    "nodes",
+    "refs",
+    "edges",
+    "file_dependencies",
+    "dispatch_hints",
+    "type_ref_names",
+];
+
+/// Every graph row, sorted, with the fixture root replaced so two copies of
+/// the same tree compare equal.
+fn dump_graph_rows(store: &CallGraphStore) -> String {
+    let root = store.project_root().display().to_string();
+    let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+    let mut out = String::new();
+    for table in GRAPH_TABLES {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table}"))
+            .expect("prepare dump");
+        let columns = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                let mut values = Vec::with_capacity(columns);
+                for index in 0..columns {
+                    values.push(match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                        rusqlite::types::ValueRef::Integer(value) => value.to_string(),
+                        rusqlite::types::ValueRef::Real(value) => value.to_string(),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            String::from_utf8_lossy(value).into_owned()
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => format!("{value:?}"),
+                    });
+                }
+                Ok(values.join("\u{1f}"))
+            })
+            .expect("query dump")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read dump");
+        rows.sort();
+        for row in rows {
+            out.push_str(table);
+            out.push('\t');
+            out.push_str(&row.replace(&root, "<root>"));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `callers`, `call_tree` and `trace_to` output for an evenly spaced sample
+/// of the stored symbols.
+fn dump_query_outputs(store: &CallGraphStore, samples: usize) -> String {
+    let root = store.project_root().display().to_string();
+    let symbols = {
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT file_path, scoped_name FROM nodes ORDER BY file_path, scoped_name",
+            )
+            .expect("prepare symbols");
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query symbols")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read symbols")
+    };
+    let step = (symbols.len() / samples.max(1)).max(1);
+    let mut out = String::new();
+    for (file, symbol) in symbols.iter().step_by(step) {
+        let path = Path::new(file);
+        out.push_str(&format!("== {file} {symbol}\n"));
+        out.push_str(&format!(
+            "callers: {:?}\n",
+            store.callers_of(path, symbol, 2)
+        ));
+        out.push_str(&format!(
+            "call_tree: {:?}\n",
+            store.call_tree(path, symbol, 2)
+        ));
+        out.push_str(&format!(
+            "trace_to: {:?}\n",
+            store.trace_to(path, symbol, 3)
+        ));
+    }
+    out.replace(&root, "<root>")
+}
+
+fn copy_tracked_sources(source: &Path, destination: &Path) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["ls-files", "-z"])
+        .output()
+        .expect("git ls-files");
+    assert!(output.status.success(), "git ls-files failed");
+    for rel in output.stdout.split(|byte| *byte == 0) {
+        if rel.is_empty() {
+            continue;
+        }
+        let rel = Path::new(std::str::from_utf8(rel).expect("utf-8 path"));
+        let wanted = crate::parser::detect_language(rel).is_some()
+            || resolution_config::resolution_config_kind(rel).is_some()
+            || rel
+                .file_name()
+                .is_some_and(|name| name == ".gitignore" || name == ".aftignore");
+        let from = source.join(rel);
+        if !wanted || !from.is_file() || from.is_symlink() {
+            continue;
+        }
+        let to = destination.join(rel);
+        fs::create_dir_all(to.parent().expect("parent")).expect("create parent");
+        fs::copy(&from, &to).expect("copy source file");
+    }
+}
+
+fn report(label: &str, counts: &WorkCounts) {
+    eprintln!(
+        "{label}: parses={} max_parses_of_one_file={} package_json_reads={} tsconfig_reads={} cargo_toml_reads={} config_reads={} statements_compiled={} wall_ms={}",
+        counts.parses,
+        counts.max_parses_of_one_file,
+        counts.package_json_reads,
+        counts.tsconfig_reads,
+        counts.cargo_toml_reads,
+        counts.config_reads,
+        counts.statements_compiled,
+        counts.wall.as_millis()
+    );
+}
+
+/// Cold build and one incremental refresh of a copy of a real repository.
+///
+/// `AFT_CALLGRAPH_MEASURE_ROOT` names the repository, `AFT_CALLGRAPH_MEASURE_EDIT`
+/// a repository-relative file that gets one exported function appended before
+/// the refresh, and the optional `AFT_CALLGRAPH_MEASURE_DUMP` a directory for
+/// the graph rows and query outputs after each step.
+#[test]
+#[ignore = "measurement: needs AFT_CALLGRAPH_MEASURE_ROOT and AFT_CALLGRAPH_MEASURE_EDIT"]
+fn measure_cold_build_and_refresh_on_real_repo() {
+    let source = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_ROOT").expect("root"));
+    let edit = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_EDIT").expect("edit"));
+    let dump = std::env::var_os("AFT_CALLGRAPH_MEASURE_DUMP").map(PathBuf::from);
+    let samples = std::env::var("AFT_CALLGRAPH_MEASURE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200usize);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("project");
+    fs::create_dir_all(&root).expect("create root");
+    let root = fs::canonicalize(root).expect("canonical root");
+    copy_tracked_sources(&source, &root);
+    let files: Vec<PathBuf> = callgraph::walk_project_files(&root).collect();
+    eprintln!("files={}", files.len());
+
+    let store = CallGraphStore::open(dir.path().join("store"), root.clone()).expect("open store");
+    let compiles = install_compile_counter(&store);
+    callgraph::clear_workspace_package_cache();
+    let (stats, cold) = measure(&root, compiles, || store.cold_build(&files));
+    let stats = stats.expect("cold build");
+    report("cold_build", &cold);
+    eprintln!("cold_build stats: {stats:?}");
+    if let Some(dump) = &dump {
+        fs::create_dir_all(dump).expect("create dump dir");
+        fs::write(dump.join("cold_rows.txt"), dump_graph_rows(&store)).expect("write rows");
+        fs::write(
+            dump.join("cold_queries.txt"),
+            dump_query_outputs(&store, samples),
+        )
+        .expect("write queries");
+    }
+
+    let edit_path = root.join(&edit);
+    let addition = match edit_path.extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => "\npub fn aft_measure_added_function() {}\n",
+        Some("py") => "\n\ndef aft_measure_added_function():\n    pass\n",
+        _ => "\nexport function aftMeasureAddedFunction() {}\n",
+    };
+    let mut text = fs::read_to_string(&edit_path).expect("read edit file");
+    text.push_str(addition);
+    fs::write(&edit_path, text).expect("write edit file");
+
+    let (refresh_stats, refresh) = measure(&root, compiles, || {
+        store.refresh_files(std::slice::from_ref(&edit_path))
+    });
+    let refresh_stats = refresh_stats.expect("refresh");
+    report("refresh", &refresh);
+    eprintln!(
+        "refresh stats: dependency_selected_refs={} refreshed_own_files={} surface_changed={:?}",
+        refresh_stats.dependency_selected_refs,
+        refresh_stats.refreshed_own_files,
+        refresh_stats.surface_changed
+    );
+    if let Some(dump) = &dump {
+        fs::write(dump.join("refresh_rows.txt"), dump_graph_rows(&store)).expect("write rows");
+        fs::write(
+            dump.join("refresh_queries.txt"),
+            dump_query_outputs(&store, samples),
+        )
+        .expect("write queries");
+    }
+}

@@ -28,6 +28,8 @@ impl ProjectFacts for DiskFacts {
         self.project_root.join(byte_path(rel)).is_dir()
     }
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        #[cfg(test)]
+        super::work_counts::note_config_read(&self.project_root.join(byte_path(rel)));
         std::fs::read(self.project_root.join(byte_path(rel)))
             .ok()
             .map(Into::into)
