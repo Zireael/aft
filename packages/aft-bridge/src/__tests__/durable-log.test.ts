@@ -133,7 +133,7 @@ describe("durable plugin logging", () => {
     for (let i = 0; i < 10; i++) sink.append(`line ${i}\n`);
     await sink.drain();
 
-    expect((sink as unknown as { mkdirCalls: number }).mkdirCalls).toBe(2);
+    expect(sink.__mkdirCallsForTests()).toBe(2);
     expect(readFileSync(path, "utf8").split("\n")).toHaveLength(11);
   });
 

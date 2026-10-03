@@ -198,9 +198,7 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
   }
   // LCS length of a[0..i] and b[0..j] in the full (untrimmed) table.
   const lcs = (i: number, j: number): number =>
-    i <= prefix || j <= prefix
-      ? Math.min(i, j)
-      : prefix + inner[(i - prefix) * w + (j - prefix)];
+    i <= prefix || j <= prefix ? Math.min(i, j) : prefix + inner[(i - prefix) * w + (j - prefix)];
 
   // Walk back to produce ops in reverse, then reverse at the end.
   const ops: DiffOp[] = [];

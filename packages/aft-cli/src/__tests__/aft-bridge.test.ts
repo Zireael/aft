@@ -23,11 +23,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
-import {
-  createNdjsonLineSplitter,
-  sendAftRequest,
-  sendAftRequests,
-} from "../lib/aft-bridge.js";
+import { createNdjsonLineSplitter, sendAftRequest, sendAftRequests } from "../lib/aft-bridge.js";
 import { CLI } from "../lib/cli.js";
 
 let workDir: string;

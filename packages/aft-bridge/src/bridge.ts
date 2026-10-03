@@ -444,6 +444,11 @@ export class BinaryBridge implements AftProjectTransport {
   private stdoutPendingLength = 0;
   /** Characters examined for newlines; tests use it to prove the scan is linear. */
   private stdoutScannedChars = 0;
+
+  /** Test hook: characters the stdout reader has searched for newlines. */
+  __stdoutScannedCharsForTests(): number {
+    return this.stdoutScannedChars;
+  }
   private stderrBuffer = "";
   /** Ring buffer of the last N stderr lines, cleared on every spawn. */
   private stderrTail: string[] = [];

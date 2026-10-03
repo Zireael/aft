@@ -249,9 +249,7 @@ function buildBridgeError(ctx: BridgeErrorContext): Error {
     const sample = ctx.noiseLines.slice(0, MAX_NOISE_LINES_IN_ERROR).map((line) => `  | ${line}`);
     parts.push(sample.join("\n"));
     if (ctx.noiseLineCount > MAX_NOISE_LINES_IN_ERROR) {
-      parts.push(
-        `  | (… ${ctx.noiseLineCount - MAX_NOISE_LINES_IN_ERROR} more line(s) omitted)`,
-      );
+      parts.push(`  | (… ${ctx.noiseLineCount - MAX_NOISE_LINES_IN_ERROR} more line(s) omitted)`);
     }
     parts.push(
       `\nTry: ${CLI} doctor (full diagnostics) or check ~/.cache/aft/bin/ for the right binary.`,

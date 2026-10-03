@@ -107,7 +107,7 @@ describe("BinaryBridge stdout scan cost", () => {
     expect(completions[0]?.task_id).toBe("task-large");
     expect(completions[0]?.command?.length).toBe(payload.length);
     // Linear: every delivered character is scanned exactly once.
-    expect((bridge as any).stdoutScannedChars).toBe(line.length);
+    expect(bridge.__stdoutScannedCharsForTests()).toBe(line.length);
   });
 
   test("lines that end mid-chunk keep the remainder for the next chunk", () => {

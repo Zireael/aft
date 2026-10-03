@@ -101,6 +101,11 @@ export class RotatingLogSink {
       });
   }
 
+  /** Test hook: mkdir calls this sink has issued. */
+  __mkdirCallsForTests(): number {
+    return this.mkdirCalls;
+  }
+
   /** Wait for queued writes. Intended for shutdown hooks and tests. */
   async drain(): Promise<void> {
     await this.queue;
