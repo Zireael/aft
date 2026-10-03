@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +9,10 @@ use aft::commands::lsp_hover::handle_lsp_hover;
 use aft::commands::lsp_navigation::handle_lsp_navigation_deferred;
 use aft::config::Config;
 use aft::context::AppContext;
+use aft::lsp::diagnostics::DiagnosticsStore;
+use aft::lsp::position::{uri_for_path, uri_to_path};
 use aft::lsp::registry::ServerKind;
+use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
 use aft::response_finalize::DispatchOutcome;
@@ -484,7 +487,7 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
     let config = ctx.config();
     let opened = ctx
         .lsp()
-        .ensure_file_open(&main_rs, &config)
+        .ensure_file_open(&canonical, &config)
         .expect("open main.rs");
     assert_eq!(
         opened.server_keys.len(),
@@ -508,11 +511,8 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
         {
             let mut lsp = ctx.lsp();
             lsp.drain_events();
-            delivered = lsp
-                .diagnostics_store_for_test()
-                .entries_for_file(&canonical)
-                .iter()
-                .any(|(_, entry)| entry.version == Some(1));
+            delivered =
+                published_document_version_reached(lsp.diagnostics_store_for_test(), &canonical, 1);
         }
         if delivered {
             break;
@@ -528,4 +528,54 @@ fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(!ctx.lsp_pending_changes_for_test(), "the backlog drained");
+}
+
+fn published_document_version_reached(
+    diagnostics: &DiagnosticsStore,
+    file: &Path,
+    version: i32,
+) -> bool {
+    // The server publishes the path decoded from its file URI, not the raw
+    // fs::canonicalize spelling (which has a verbatim prefix on Windows).
+    // Round-trip the lookup through the same Windows-aware URI helpers; the
+    // diagnostics store deliberately requires an exact key match.
+    let uri = uri_for_path(file).expect("document URI");
+    let published_path = uri_to_path(&uri).expect("published document path");
+    diagnostics
+        .entries_for_file(&published_path)
+        .iter()
+        .any(|(_, entry)| entry.version == Some(version))
+}
+
+#[test]
+fn published_version_lookup_accepts_plain_and_verbatim_windows_paths() {
+    let plain = Path::new(r"C:\aft-queued-change-path-test\src\main.rs");
+    let verbatim = Path::new(r"\\?\C:\aft-queued-change-path-test\src\main.rs");
+    let mut diagnostics = DiagnosticsStore::new();
+    diagnostics.publish_full(
+        ServerKey {
+            kind: ServerKind::Rust,
+            root: PathBuf::from(r"C:\aft-queued-change-path-test"),
+        },
+        plain.to_path_buf(),
+        Vec::new(),
+        None,
+        Some(1),
+    );
+
+    // Literal Windows spellings exercise the lookup even on Unix hosts. The
+    // store key is the non-verbatim path decoded from a server's file URI.
+    for file in [plain, verbatim] {
+        assert!(
+            published_document_version_reached(&diagnostics, file, 1),
+            "version 1 must be found for {}",
+            file.display()
+        );
+        assert!(!published_document_version_reached(&diagnostics, file, 0));
+    }
+    assert!(!published_document_version_reached(
+        &diagnostics,
+        Path::new(r"C:\aft-queued-change-path-test\src\other.rs"),
+        1,
+    ));
 }
