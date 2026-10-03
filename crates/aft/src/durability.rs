@@ -32,6 +32,7 @@ pub(crate) enum EventKind {
     DirectorySync,
     DirectoryCreated,
     AtomicReplace,
+    CorruptCheckpointSkipped,
 }
 
 #[cfg(test)]
