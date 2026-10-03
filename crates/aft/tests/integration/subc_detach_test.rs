@@ -552,6 +552,15 @@ fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
     );
 }
 
+/// Scoped inspect waits, within its startup budget, for a server it starts:
+/// with every fake server slow to come up (nothing, not even its pid file,
+/// exists for half a second), each inspect still answers only after that
+/// root's server is running, so all 34 pid files exist when the drain starts.
+#[test]
+fn subc_drain_with_slow_starting_lsp_servers_finds_every_server_started() {
+    drain_with_live_lsp_servers("AFT_FAKE_LSP_START_DELAY_MS=500", false, false);
+}
+
 #[test]
 fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
     drain_with_live_lsp_servers("", false, true);
@@ -898,6 +907,18 @@ impl ModuleProcess {
             command.env("AFT_TEST_LOG_FLUSH_HOLD_MS", hold);
         }
         if let Some(bin_dir) = bin_dir {
+            // The test supplies its language servers through `bin_dir`. An
+            // `AFT_LSP_<KIND>_BINARY` override inherited from the runner's
+            // environment (set, for example, to run the real rust-analyzer
+            // suites) would take precedence over PATH, start the real server
+            // instead of the fake one, and leave the fake servers' pid files
+            // unwritten.
+            for (key, _) in std::env::vars_os() {
+                let key = key.to_string_lossy();
+                if key.starts_with("AFT_LSP_") && key.ends_with("_BINARY") {
+                    command.env_remove(key.as_ref());
+                }
+            }
             command.env(
                 "PATH",
                 format!(

@@ -458,6 +458,15 @@ pub(crate) fn main() -> io::Result<()> {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }
     }
+    // AFT_FAKE_LSP_START_DELAY_MS=<ms>: wait before doing anything, like a
+    // server process that is slow to come up on a loaded machine. Nothing,
+    // not even the pid file below, exists until the delay has passed.
+    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     if let Some(pid_dir) = std::env::var_os("AFT_FAKE_LSP_PID_DIR") {
         std::fs::write(
             std::path::Path::new(&pid_dir).join(std::process::id().to_string()),
