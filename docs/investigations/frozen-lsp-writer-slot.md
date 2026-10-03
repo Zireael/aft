@@ -81,3 +81,24 @@ The tests cover full-pipe writes and same-process recovery, silent push
 diagnostics, manager contention, a real edit followed by configure/bind, the
 agent-facing unknown message, and a named writer refusal before the daemon's
 relay deadline. Mutation results are recorded in the delivery declaration.
+
+## Negative controls
+
+Each control used the staged live implementation as its restore point. The
+working-tree diff was non-empty while mutated and empty after checkout and
+touch of the mutated paths. No break was committed.
+
+| Neutralized protection | Expected failing test | Observed failure / unaffected controls |
+| --- | --- | --- |
+| Stdin acknowledgement deadline | `frozen_lsp_stdin_write_is_bounded_and_recovers_without_restart` | `stdin write bound failed: result=Ok(()) elapsed=3.006644917s`; one failure. The edit-rendering test remained green. |
+| Collector caller-side deadline | `post_edit_diagnostics_budget_includes_manager_contention` | `LSP manager contention escaped the diagnostics budget: Timeout`; one failure. The direct stdin bound/recovery test remained green. |
+| Unknown result on notification failure | `frozen_lsp_edit_releases_writer_before_route_bind_deadline` | `lsp_complete` became `true` instead of `false`; one failure. The edit and bind still finished in 414 ms, isolating the result-honesty failure from the timing protection. |
+| Quarantine after silent diagnostics | `frozen_lsp_diagnostics_timeout_stops_consulting_silent_server` | `diagnostics timeout did not mark the silent server unresponsive`; three other frozen-LSP tests remained green. |
+| Live mutating-slot owner census | `bind_overdue_behind_a_mutating_job_names_job_tool_and_age` | `actor_not_ready` instead of `bind_blocked_by_writer`; reader attribution remained green. |
+
+The two collector controls were compiled together but exercised in separate
+runs: manager contention expires before notification, whereas the frozen
+notification returns its write error before the caller's 500 ms deadline.
+Quarantine and writer attribution were also independent controls exercised in
+separate suites. Each run had exactly its named expected failure, not a build
+failure or an unrelated red test.
