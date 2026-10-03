@@ -89,17 +89,23 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     // patterns that parse to multiple AST nodes (e.g. bare `catch` or `finally`
     // clauses). Release builds use panic="unwind", so catch_unwind is effective,
     // but returning an explicit pattern error gives callers a better signal.
-    if let Err(err) = lang.compile_pattern(&pattern) {
-        // Attach a hint when the pattern looks like a common mistake. The
-        // hint helps less-capable agents recover from regex-shaped patterns
-        // and language-specific shape gotchas.
-        let mut message = format!("invalid AST pattern: {}", err);
-        if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
-            message.push_str("\n\n");
-            message.push_str(&hint);
+    // The compiled pattern is kept and reused for every file below.
+    #[cfg(test)]
+    PATTERN_COMPILES.with(|count| count.set(count.get() + 1));
+    let compiled_pattern = match lang.compile_pattern(&pattern) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            // Attach a hint when the pattern looks like a common mistake. The
+            // hint helps less-capable agents recover from regex-shaped patterns
+            // and language-specific shape gotchas.
+            let mut message = format!("invalid AST pattern: {}", err);
+            if let Some(hint) = detect_pattern_hint(&pattern, &lang) {
+                message.push_str("\n\n");
+                message.push_str(&hint);
+            }
+            return Response::error(&req.id, "invalid_pattern", message);
         }
-        return Response::error(&req.id, "invalid_pattern", message);
-    }
+    };
 
     let config = ctx.config();
     let project_root = config
@@ -119,28 +125,6 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Ok(scope) => scope,
         Err(resp) => return resp,
-    };
-
-    // Pre-build the pattern ONCE so we don't re-parse it per file.
-    // Validate first (try_new returns Err on patterns that don't form a single AST node).
-    let compiled_pattern = match lang.compile_pattern(&pattern) {
-        Ok(p) => p,
-        Err(_) => {
-            // Pattern is invalid for this language — return empty result, not error
-            return Response::success(
-                &req.id,
-                serde_json::json!({
-                    "matches": [],
-                    "total_matches": 0,
-                    "files_with_matches": 0,
-                    "files_searched": 0,
-                    "no_files_matched_scope": scope.no_files_matched_scope,
-                    "scope_warnings": scope.scope_warnings,
-                    "complete": true,
-                    "skipped_files": [],
-                }),
-            );
-        }
     };
 
     use rayon::prelude::*;
@@ -290,4 +274,40 @@ fn search_file_compiled(
             result
         })
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pattern compilations `handle_ast_search` did on this thread.
+    static PATTERN_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pattern is validated and searched with one compilation; the
+    /// handler used to compile it a second time after the scope walk.
+    #[test]
+    fn ast_search_compiles_the_pattern_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("a.ts"), "console.log(1);\nconsole.log(2);\n").unwrap();
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            ..crate::config::Config::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "search",
+            "command": "ast_search",
+            "pattern": "console.log($X)",
+            "lang": "typescript",
+        }))
+        .unwrap();
+        let before = PATTERN_COMPILES.with(|count| count.get());
+        let response = serde_json::to_value(handle_ast_search(&request, &ctx)).unwrap();
+        assert_eq!(PATTERN_COMPILES.with(|count| count.get()) - before, 1);
+        assert_eq!(response["total_matches"], 2, "{response}");
+    }
 }
