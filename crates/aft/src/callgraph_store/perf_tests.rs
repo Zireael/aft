@@ -452,15 +452,40 @@ fn cold_build_reads_each_package_json_a_bounded_number_of_times() {
     );
 }
 
+/// Executions of the whole-table scans a Rust qualified call used to repeat:
+/// the Rust file list and the module-reference list. Only the store in
+/// `rust_qualified_call_resolution_scans_tables_independent_of_call_count`
+/// installs the tracer that counts them.
+static RUST_LOOKUP_SCANS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_rust_lookup_scans(sql: &str) {
+    if sql.contains("FROM files WHERE lang = 'rust'")
+        || sql.contains("WHERE kind = 'module' AND module_path IS NOT NULL")
+    {
+        RUST_LOOKUP_SCANS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
 #[test]
-fn rust_qualified_call_resolution_compiles_statements_independent_of_call_count() {
+fn rust_qualified_call_resolution_scans_tables_independent_of_call_count() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut compiled = Vec::new();
+    let mut scans = Vec::new();
     for calls in [20usize, 80] {
         let root = fixture_root(&dir, &format!("project-{calls}"));
         let files = rust_qualified_call_fixture(&root, calls);
-        let (store, counts) =
-            cold_build_counts(&root, &dir.path().join(format!("store-{calls}")), &files);
+        let store = CallGraphStore::open(dir.path().join(format!("store-{calls}")), root.clone())
+            .expect("open store");
+        let compiles = install_compile_counter(&store);
+        store
+            .conn
+            .lock()
+            .expect("callgraph store mutex poisoned")
+            .trace(Some(count_rust_lookup_scans));
+        let scans_before = RUST_LOOKUP_SCANS.load(AtomicOrdering::Relaxed);
+        let (stats, counts) = measure(&root, compiles, || store.cold_build(&files));
+        stats.expect("cold build");
+        scans.push(RUST_LOOKUP_SCANS.load(AtomicOrdering::Relaxed) - scans_before);
         let edges = dump_graph_rows(&store)
             .lines()
             .filter(|line| line.starts_with("edges\t") && line.contains("src/util.rs"))
@@ -468,10 +493,15 @@ fn rust_qualified_call_resolution_compiles_statements_independent_of_call_count(
         assert_eq!(edges, calls * 2, "every qualified call must resolve");
         compiled.push(counts.statements_compiled);
     }
-    let growth = compiled[1].saturating_sub(compiled[0]);
-    eprintln!("statements compiled for 20 and 80 calls: {compiled:?}");
+    eprintln!(
+        "rust lookup scans for 20 and 80 calls: {scans:?}; statements compiled: {compiled:?}"
+    );
+    assert_eq!(
+        scans[0], scans[1],
+        "60 more qualified calls must not rescan the files or module tables: {scans:?}"
+    );
     assert!(
-        growth < 20,
+        compiled[1].saturating_sub(compiled[0]) < 20,
         "60 more qualified calls must not compile statements per call: {compiled:?}"
     );
 }
