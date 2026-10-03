@@ -232,6 +232,8 @@ export function formatCallgraphSections(
         warning,
       ]),
     ];
+    const incompleteReason = asString(record.incomplete_reason);
+    if (incompleteReason) sections.unshift(theme.fg("warning", incompleteReason));
     if (hubSummary) sections.push(hubSummary);
     groups.forEach((group) => {
       sections.push(renderCallersGroupLines(group, theme).join("\n"));
@@ -307,6 +309,8 @@ export function formatCallgraphSections(
         warning,
       ]),
     ];
+    const incompleteReason = asString(record.incomplete_reason);
+    if (incompleteReason) sections.unshift(theme.fg("warning", incompleteReason));
     if (hubSummary) sections.push(hubSummary);
     if (callers.length === 0) sections.push(theme.fg("muted", "No impacted callers found."));
     callers.forEach((caller) => {

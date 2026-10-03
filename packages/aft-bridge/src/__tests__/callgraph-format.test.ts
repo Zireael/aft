@@ -6,6 +6,21 @@ import {
 } from "../callgraph-format.js";
 
 describe("formatCallgraphSections", () => {
+  test("empty callers and impact warn when receiver resolution is incomplete", () => {
+    const reason =
+      "Incomplete: 2 unresolved method call sites; use grep before concluding there are no callers";
+    for (const op of ["callers", "impact"]) {
+      const sections = formatCallgraphSections(op, {
+        callers: [],
+        total_callers: 0,
+        total_affected: 0,
+        complete: false,
+        unresolved_method_calls: 2,
+        incomplete_reason: reason,
+      });
+      expect(sections[0]).toBe(reason);
+    }
+  });
   test("call_tree renders nested children and depth warning", () => {
     const sections = formatCallgraphSections("call_tree", {
       name: "run",
