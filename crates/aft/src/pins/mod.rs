@@ -342,14 +342,69 @@ fn validate_generation(generation: &str) -> Result<(), PinError> {
 fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.sort_unstable();
     encoded.dedup();
-    let mut file = create_private(path)?;
-    for key in encoded {
-        writeln!(file, "{key}")?;
-    }
-    file.sync_all()?;
-    drop(file);
+    let file = create_private(path)?;
+    write_key_lines(file, encoded.iter().map(String::as_str))?;
     fs_lock::sync_parent(path);
     Ok(())
+}
+
+/// Writes one key per line and syncs the file. The lines are assembled in
+/// memory and handed to the kernel in one `write_all`: writing line by line
+/// on an unbuffered `File` costs a system call (or two) per key, which adds
+/// up when a pin lists thousands of blobs.
+pub(crate) fn write_key_lines<'a>(
+    file: File,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    let mut contents = Vec::new();
+    for key in keys {
+        contents.extend_from_slice(key.as_bytes());
+        contents.push(b'\n');
+    }
+    let mut file = work_counters::CountingFile(file);
+    file.write_all(&contents)?;
+    file.sync_all()
+}
+
+/// Counts the system-call work spent writing pin key files, so tests can pin
+/// the number of writes and fsyncs a batch costs. Counting is per thread so
+/// parallel tests do not see each other's work; a thread-local increment is
+/// negligible next to the write and fsync it counts.
+#[doc(hidden)]
+pub mod work_counters {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::{self, Write};
+
+    thread_local! {
+        static WRITES: Cell<u64> = const { Cell::new(0) };
+        static SYNCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Pin key-file `(write calls, fsyncs)` made on this thread so far.
+    pub fn key_file_work() -> (u64, u64) {
+        (WRITES.with(Cell::get), SYNCS.with(Cell::get))
+    }
+
+    pub(crate) struct CountingFile(pub(crate) File);
+
+    impl CountingFile {
+        pub(crate) fn sync_all(&self) -> io::Result<()> {
+            SYNCS.with(|c| c.set(c.get() + 1));
+            self.0.sync_all()
+        }
+    }
+
+    impl Write for CountingFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            WRITES.with(|c| c.set(c.get() + 1));
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
 }
 
 fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {

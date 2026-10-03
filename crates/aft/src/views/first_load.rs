@@ -1427,6 +1427,7 @@ impl CompositePlane for CallgraphBridge {
         let store = owner
             .open_store(FamilyPlane::Callgraph)
             .map_err(|e| error(e.to_string()))?;
+        let mut attachments = Vec::new();
         for (path, entry) in observed {
             if entry.disk == super::snapshot::DiskState::Absent || !self.applies_to(path) {
                 continue;
@@ -1436,8 +1437,16 @@ impl CompositePlane for CallgraphBridge {
                 .get(&FamilyPlane::Callgraph)
                 .and_then(|value| value.downcast_ref::<super::callgraph::CallgraphAttachment>())
                 .ok_or_else(|| error(format!("{path:?}: callgraph attachment missing")))?;
-            live.protect(&[attachment.key])
-                .map_err(|e| error(e.to_string()))?;
+            attachments.push((path, attachment));
+        }
+        // Pin every blob key in one batch before the first put: protecting key
+        // by key rewrote and fsynced the whole pin file once per file.
+        let keys: Vec<_> = attachments
+            .iter()
+            .map(|(_, attachment)| attachment.key)
+            .collect();
+        live.protect(&keys).map_err(|e| error(e.to_string()))?;
+        for (path, attachment) in attachments {
             let bytes = attachment
                 .blob
                 .to_bytes()

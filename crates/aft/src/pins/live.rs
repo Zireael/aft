@@ -13,13 +13,12 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    fs_lock, now_ms, pin_paths, root_cache, validate_generation, write_metadata, PinError,
-    PinMetadata, PinOwner, Protection,
+    fs_lock, now_ms, pin_paths, root_cache, validate_generation, write_key_lines, write_metadata,
+    PinError, PinMetadata, PinOwner, Protection,
 };
 use crate::blob_store::v2::{to_hex, FamilyKey};
 use crate::views::registry::ViewRegistration;
@@ -145,15 +144,11 @@ impl LivePin {
             LIVE_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> Result<(), PinError> {
-            let mut file = OpenOptions::new()
+            let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            for key in &self.keys {
-                writeln!(file, "{key}")?;
-            }
-            file.sync_all()?;
-            drop(file);
+            write_key_lines(file, self.keys.iter().map(String::as_str))?;
             fs_lock::rename_over(&temporary, &self.keys_path)?;
             fs_lock::sync_parent(&self.keys_path);
             Ok(())
@@ -184,5 +179,51 @@ impl Protection for LivePin {
 impl Drop for LivePin {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pins::work_counters::key_file_work;
+
+    fn keys(count: u32) -> Vec<FamilyKey> {
+        (0..count)
+            .map(|index| {
+                let mut bytes = [0u8; 32];
+                bytes[..4].copy_from_slice(&index.to_be_bytes());
+                crate::blob_store::v2::TrigramKey {
+                    content: crate::blob_store::v2::ContentHash::of(&bytes),
+                    policy: crate::blob_store::v2::TrigramPolicy {
+                        max_file_size: 1 << 20,
+                    },
+                }
+                .family_key()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn protecting_a_batch_writes_and_syncs_the_key_file_once() {
+        let view = tempfile::tempdir().unwrap();
+        let mut pin = LivePin::create_in(view.path(), "family".into(), "view".into()).unwrap();
+        let batch = keys(500);
+        let (writes_before, syncs_before) = key_file_work();
+        pin.protect(&batch).unwrap();
+        let (writes_after, syncs_after) = key_file_work();
+        assert_eq!(
+            (writes_after - writes_before, syncs_after - syncs_before),
+            (1, 1),
+            "a batch of 500 keys must cost one write and one fsync"
+        );
+        let mut expected: Vec<String> = batch.iter().map(FamilyKey::to_hex).collect();
+        expected.sort();
+        expected.dedup();
+        let written = fs::read_to_string(pin.keys_path()).unwrap();
+        assert_eq!(written.lines().collect::<Vec<_>>(), expected);
+
+        // Re-protecting keys that are already listed writes nothing.
+        pin.protect(&batch).unwrap();
+        assert_eq!(key_file_work(), (writes_after, syncs_after));
     }
 }

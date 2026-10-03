@@ -879,3 +879,51 @@ fn trigram_materializer_preserves_shared_segment_and_other_planes() {
     adapter.release_generation(&access, "a");
     assert!(adapter.resident("scope", "a").is_none());
 }
+
+#[test]
+fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
+    use aft::pins::work_counters::key_file_work;
+    use aft::views::trigram::materialize;
+    let storage = tempfile::tempdir().unwrap();
+    let root = storage.path().join("checkout");
+    fs::create_dir_all(&root).unwrap();
+    let contents: Vec<(String, Vec<u8>)> = (0..200)
+        .map(|index| {
+            (
+                format!("f{index:03}.txt"),
+                format!("line {index}\n").into_bytes(),
+            )
+        })
+        .collect();
+    for (path, bytes) in &contents {
+        write(&root, path, bytes);
+    }
+    let files: Vec<(&str, &[u8])> = contents
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    let registry = aft::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+    let registration = registry.register_view("scope", &root).unwrap();
+    let mut manifest = generation(&files, "a").manifest().clone();
+    let observed = live_delta::strict_walk(&root, &policy(), 1);
+    let (writes_before, syncs_before) = key_file_work();
+    let materialized = materialize(
+        &registration,
+        &root,
+        &mut manifest,
+        &observed.entries,
+        policy(),
+    )
+    .unwrap();
+    let (writes_after, syncs_after) = key_file_work();
+    // Creating the pin writes an empty key list, the 200 blob keys go in one
+    // batch, and the built segment id is pinned last: three key-file writes,
+    // independent of the number of files.
+    assert_eq!(
+        (writes_after - writes_before, syncs_after - syncs_before),
+        (2, 3),
+        "pinning 200 trigram blobs must not rewrite the key file per blob"
+    );
+    let pinned = fs::read_to_string(materialized.pin.keys_path()).unwrap();
+    assert_eq!(pinned.lines().count(), 201);
+}

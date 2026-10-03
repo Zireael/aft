@@ -570,6 +570,22 @@ pub fn materialize(
         .map_err(|e| plane_error(e.to_string()))?;
     let mut pin =
         crate::pins::LivePin::create(registration).map_err(|e| plane_error(e.to_string()))?;
+    // Pin every blob key in one batch before the first put: protecting key by
+    // key rewrote and fsynced the whole pin file once per file.
+    let keys: Vec<_> = manifest
+        .entries()
+        .filter_map(|(_, entry)| match entry {
+            super::manifest_v2::EntryV2::Regular { content, .. } => Some(
+                crate::blob_store::v2::TrigramKey {
+                    content: *content,
+                    policy,
+                }
+                .family_key(),
+            ),
+            _ => None,
+        })
+        .collect();
+    pin.protect(&keys).map_err(|e| plane_error(e.to_string()))?;
     let mut members = Vec::new();
     for (path, entry) in manifest.entries_mut() {
         let super::manifest_v2::EntryV2::Regular {
@@ -586,8 +602,6 @@ pub fn materialize(
             policy,
         }
         .family_key();
-        pin.protect(&[key])
-            .map_err(|e| plane_error(e.to_string()))?;
         let attachment = observed
             .get(path)
             .and_then(|entry| entry.attachments.get(&FamilyPlane::Trigram))
