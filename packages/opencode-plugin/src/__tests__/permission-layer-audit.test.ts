@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
+import { type BridgePool, execFileSync, type ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
@@ -416,6 +416,50 @@ describe("permission audit regressions", () => {
     expect(grepAskCalls[0]?.always).toEqual(["*"]);
     expect(grepAskCalls[0]?.metadata).toEqual(expect.objectContaining({ pattern: "TODO" }));
     expect(grepCalls).toEqual([]);
+  });
+
+  test("aft_search with a path inside the project's own repository spawns no git probe", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    execFileSync("git", ["init", "-q", project]);
+    await mkdir(path.join(project, "src"), { recursive: true });
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+
+    const probesBefore = _permissionsInternalsForTest.gitRootProbeCount();
+    for (const target of [path.join(project, "src"), path.join(project, "src", "missing.ts")]) {
+      await tools.aft_search.execute({ query: "TODO", hint: "literal", path: target }, sdkCtx);
+    }
+
+    expect(_permissionsInternalsForTest.gitRootProbeCount() - probesBefore).toBe(0);
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(0);
+    expect(calls).toHaveLength(2);
+  });
+
+  test("aft_search still probes git when the project is not a repository top level", async () => {
+    // The project sits inside the AFT checkout without its own repository, so
+    // a path in it belongs to the enclosing repository, whose root is outside
+    // the project: only git can tell, and the external-root ask must fire.
+    const { project } = await makeProjectAndExternalDirs();
+    await mkdir(path.join(project, "src"), { recursive: true });
+    const askCalls: AskCall[] = [];
+    const { tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = createSdkContext(
+      project,
+      recordingAsk(askCalls),
+      // A distinct session: the ask's decision is cached per session and root,
+      // and the AFT checkout root is the external root other tests ask about.
+      "permission-audit-git-probe-session",
+    );
+
+    const probesBefore = _permissionsInternalsForTest.gitRootProbeCount();
+    await tools.aft_search.execute(
+      { query: "TODO", hint: "literal", path: path.join(project, "src") },
+      sdkCtx,
+    );
+
+    expect(_permissionsInternalsForTest.gitRootProbeCount() - probesBefore).toBe(1);
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(1);
   });
 
   test("aft_search external-root permission asks once per root and caches denial", async () => {
