@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["oc2-notices-wakes-guidance"],
+  "note": "OpenCode 2 plugin fixes (#394, #395 part 1); no Rust or ranking-fence files."
+}
