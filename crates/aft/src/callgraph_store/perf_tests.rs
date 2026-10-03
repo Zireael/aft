@@ -723,3 +723,64 @@ fn cold_build_and_refresh_compile_statements_independent_of_file_count() {
          {small_refresh} vs {large_refresh}"
     );
 }
+
+/// realpath calls made by `run` on this thread.
+fn canonicalize_calls<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let before = CANONICALIZE_CALLS.with(std::cell::Cell::get);
+    let value = run();
+    (
+        value,
+        CANONICALIZE_CALLS.with(std::cell::Cell::get) - before,
+    )
+}
+
+#[test]
+fn graph_walks_do_not_resolve_stored_paths_against_the_filesystem_per_node() {
+    use crate::commands::callgraph_store_adapter::{call_tree_result, trace_to_result};
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let length = 24;
+    let mut paths = Vec::new();
+    for index in 0..length {
+        let source = if index + 1 < length {
+            format!(
+                "import {{ f{next} }} from \"./f{next:02}\";\nexport function f{index}() {{ return f{next}(); }}\n",
+                next = index + 1
+            )
+        } else {
+            format!("export function f{index}() {{ return 1; }}\n")
+        };
+        paths.push(write(&root, &format!("src/f{index:02}.ts"), &source));
+    }
+    let (store, _) = cold_build_counts(&root, &dir.path().join("store"), &paths);
+
+    let (tree, tree_realpaths) = canonicalize_calls(|| {
+        call_tree_result(&store, Path::new("src/f00.ts"), "f0", length + 2, true)
+    });
+    let tree = tree.expect("call tree");
+    let mut depth = 0;
+    let mut node = &tree;
+    while let Some(child) = node.children.first() {
+        depth += 1;
+        node = child;
+    }
+    assert_eq!(depth, length - 1, "the whole chain must be walked");
+
+    let last = format!("src/f{:02}.ts", length - 1);
+    let (trace, trace_realpaths) = canonicalize_calls(|| {
+        trace_to_result(
+            &store,
+            Path::new(&last),
+            &format!("f{}", length - 1),
+            40,
+            true,
+        )
+    });
+    let trace = trace.expect("trace");
+    assert!(trace.truncated_paths > 0 || trace.total_paths > 0);
+    eprintln!("realpath calls: call_tree={tree_realpaths} trace_to={trace_realpaths}");
+    assert!(
+        tree_realpaths <= 2 && trace_realpaths <= 2,
+        "a {length}-node walk resolved paths per node: call_tree={tree_realpaths} trace_to={trace_realpaths}"
+    );
+}

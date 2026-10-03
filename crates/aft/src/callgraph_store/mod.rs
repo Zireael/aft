@@ -2875,6 +2875,12 @@ pub trait CallGraphRead {
     fn indexed_file_count(&self) -> Result<usize>;
     fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode>;
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>>;
+    /// `nodes_for` for a file path this store returned (store-relative and
+    /// already resolved), without resolving it against the filesystem again.
+    /// Graph walks call this once per visited node.
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.nodes_for(Path::new(file), symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
     fn direct_callers_for_symbols(
@@ -6231,6 +6237,15 @@ impl CallGraphStore {
         nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
     }
 
+    /// [`CallGraphRead::nodes_for_stored`]: `file` is a path the store
+    /// returned, so it is used as the key without a filesystem lookup.
+    pub fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        nodes_for_file_matching_symbol(&conn, file, symbol)
+    }
+
     /// Return all positional nodes matching a symbol query anywhere in the store.
     pub fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         self.refresh_read_marker()?;
@@ -6997,6 +7012,9 @@ impl CallGraphRead for CallGraphStore {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         CallGraphStore::nodes_for(self, file_rel, symbol)
     }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        CallGraphStore::nodes_for_stored(self, file, symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         CallGraphStore::nodes_matching(self, symbol)
     }
@@ -7105,6 +7123,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         (**self).nodes_for(file_rel, symbol)
     }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        (**self).nodes_for_stored(file, symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         (**self).nodes_matching(symbol)
     }
@@ -7212,6 +7233,9 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     }
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         self.nodes_for(file_rel, symbol)
+    }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.inner.nodes_for_stored(file, symbol)
     }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         self.nodes_matching(symbol)

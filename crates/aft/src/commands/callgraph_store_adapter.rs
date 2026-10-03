@@ -915,17 +915,22 @@ pub fn impact_result(
         .unwrap_or_default();
 
     let mut callers = Vec::new();
+    // Each caller file is read once, however many of its call sites are shown.
+    let mut source_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
     for site in visible_sites {
+        let lines = source_lines
+            .entry(site.caller.file.clone())
+            .or_insert_with(|| read_source_lines(&store.project_root().join(&site.caller.file)));
         callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
             signature: site.caller.signature.clone(),
             is_entry_point: site.caller.is_entry_point,
-            call_expression: read_source_line(
-                &store.project_root().join(&site.caller.file),
-                site.line,
-            ),
+            call_expression: lines
+                .as_ref()
+                .and_then(|lines| lines.get(site.line.saturating_sub(1) as usize))
+                .cloned(),
             parameters: site
                 .caller
                 .signature
@@ -1026,12 +1031,28 @@ fn trace_to_result_with_budget(
             continue;
         };
         let caller_key = (current.node.file.clone(), current.node.symbol.clone());
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            callers_by_symbol.entry(caller_key.clone())
-        {
-            let callers =
-                dedup_call_sites(store.direct_callers_of(Path::new(&caller_key.0), &caller_key.1)?);
-            entry.insert(callers);
+        if !callers_by_symbol.contains_key(&caller_key) {
+            // Fetch this node's callers together with those of every other
+            // queued path end that will still be expanded, in one batched
+            // query, instead of one query per node.
+            let mut wanted = BTreeSet::from([caller_key.clone()]);
+            for (queued, queued_depth) in &queue {
+                if *queued_depth >= effective_max {
+                    continue;
+                }
+                if let Some(end) = queued.last() {
+                    let key = (end.node.file.clone(), end.node.symbol.clone());
+                    if !callers_by_symbol.contains_key(&key) {
+                        wanted.insert(key);
+                    }
+                }
+            }
+            let wanted = wanted.into_iter().collect::<Vec<_>>();
+            let mut fetched = store.direct_callers_for_symbols(&wanted)?;
+            for key in wanted {
+                let callers = dedup_call_sites(fetched.remove(&key).unwrap_or_default());
+                callers_by_symbol.insert(key, callers);
+            }
         }
         let callers = callers_by_symbol
             .get(&caller_key)
@@ -2330,7 +2351,7 @@ fn resolve_exact_symbol(
     fallback: Option<StoreNode>,
 ) -> StoreAdapterResult<Option<ResolvedStoreSymbol>> {
     let nodes = store
-        .nodes_for(Path::new(file), symbol)?
+        .nodes_for_stored(file, symbol)?
         .into_iter()
         .filter(|node| node.symbol == symbol)
         .collect::<Vec<_>>();
@@ -2734,12 +2755,10 @@ fn unqualified_name(symbol: &str) -> &str {
     symbol.rsplit("::").next().unwrap_or(symbol)
 }
 
-fn read_source_line(path: &Path, line: u32) -> Option<String> {
+/// The file's lines, trimmed.
+fn read_source_lines(path: &Path) -> Option<Vec<String>> {
     let source = std::fs::read_to_string(path).ok()?;
-    source
-        .lines()
-        .nth(line.saturating_sub(1) as usize)
-        .map(|line| line.trim().to_string())
+    Some(source.lines().map(|line| line.trim().to_string()).collect())
 }
 
 fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
@@ -3298,12 +3317,15 @@ mod trace_to_tests {
         assert_eq!(result.total_paths, 8);
         assert!(!result.total_paths_is_lower_bound);
         assert_eq!(expansions, 15);
-        assert_eq!(store.total_caller_queries(), 7);
-        assert!(store
-            .caller_queries
-            .borrow()
-            .values()
-            .all(|queries| *queries == 1));
+        // Callers are fetched in frontier batches; summed over the batches,
+        // each of the 7 distinct symbols is requested exactly once.
+        assert_eq!(store.total_caller_queries(), 0);
+        assert_eq!(store.caller_frontier_target_count(), 7);
+        assert!(
+            store.total_caller_frontier_queries() < 7,
+            "callers must be fetched in batches, not once per symbol: {} queries",
+            store.total_caller_frontier_queries()
+        );
     }
 
     #[test]
