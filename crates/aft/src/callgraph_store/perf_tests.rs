@@ -428,27 +428,30 @@ fn cold_build_parses_each_file_once_and_matches_a_reparsing_build() {
 
 #[test]
 fn cold_build_reads_each_package_json_a_bounded_number_of_times() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = fixture_root(&dir, "project");
-    let app_files = 96;
-    let (files, package_jsons) = ts_workspace_fixture(&root, app_files);
-    // Readers sharing one memo can race to the first read of a file, at most
-    // once per parse thread; resolution adds at most one more read.
-    let bound = package_jsons * (build_pool_size() + 1);
+    // Compare two fixture sizes rather than one fixed bound: how many readers
+    // race to the first read of a file depends on the runner's core count, but
+    // with one memo per build the number of reads must not grow with the
+    // number of importers.
+    let reads_for = |app_files: usize| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = fixture_root(&dir, "project");
+        let (files, package_jsons) = ts_workspace_fixture(&root, app_files);
+        let (_store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+        (counts.package_json_reads, package_jsons)
+    };
+    let (small, package_jsons) = reads_for(24);
+    let (large, _) = reads_for(96);
+    // Each package.json can be read once more per parse thread that loses the
+    // race to fill the memo, so a size difference within that slack is noise.
+    let race_slack = package_jsons * build_pool_size();
+    eprintln!("package.json reads: 24 importers={small} 96 importers={large} (slack {race_slack})");
     assert!(
-        app_files > bound,
-        "fixture must import more often than the bound allows a per-file memo"
-    );
-
-    let (_store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
-    eprintln!(
-        "package.json reads: {} (bound {bound})",
-        counts.package_json_reads
+        large < 96,
+        "package.json reads must stay far below the 96 importers: {large}"
     );
     assert!(
-        counts.package_json_reads <= bound,
-        "package.json reads must not scale with importers: {} reads, bound {bound}",
-        counts.package_json_reads
+        large <= small + race_slack,
+        "package.json reads must not scale with importers: {small} for 24, {large} for 96, slack {race_slack}"
     );
 }
 
