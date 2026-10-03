@@ -77,9 +77,12 @@ impl PublicationRetry {
                 "content-addressed view publication failed root={} repeat_count={} retry_ms={} error={}",
                 root.display(), self.failures, self.delay.as_millis(), error
             );
+            #[cfg(test)]
+            tests::record_failure(root, self.delay, self.failures, true);
+        } else {
+            #[cfg(test)]
+            tests::record_failure(root, self.delay, self.failures, false);
         }
-        #[cfg(test)]
-        tests::record_failure(root, self.delay, self.failures, warn);
     }
 }
 
