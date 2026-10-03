@@ -31,6 +31,7 @@ pub(crate) enum EventKind {
     #[cfg_attr(not(unix), allow(dead_code))]
     DirectorySync,
     DirectoryCreated,
+    AtomicReplace,
 }
 
 #[cfg(test)]
@@ -57,6 +58,6 @@ pub(crate) fn take() -> Vec<(EventKind, std::path::PathBuf)> {
 pub(crate) fn sync_count(events: &[(EventKind, std::path::PathBuf)]) -> usize {
     events
         .iter()
-        .filter(|(kind, _)| *kind != EventKind::DirectoryCreated)
+        .filter(|(kind, _)| matches!(kind, EventKind::FileSync | EventKind::DirectorySync))
         .count()
 }

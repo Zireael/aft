@@ -1,6 +1,6 @@
 # Durability per store: measured syncs and a proposal
 
-Status: proposal, nothing implemented. Base commit `c7ecd5490`. Measured on an
+Status: implementation in progress. Base commit `c7ecd5490`. Measured on an
 Apple M5 Max (Mac17,6) running macOS 27.0.1, internal APFS SSD. The machine was
 shared with other build workers the whole time (load average about 48), so wall
 times are noisy. The sync counts are exact and were the same on every repeat.
@@ -296,6 +296,7 @@ and does not sync it (`backup.rs:4695`; trace order: lease → user file →
 3. **One** directory sync after both renames: they are in the same directory.
    Drop the extra dir sync after content and the one after prune.
 4. Post-state pass: temp + rename, **no sync**. It is a best-effort annotation.
+   Implemented correction: fingerprints use a private `post-state.json` sidecar overlaid on reads; an unsynced replacement of durable `meta.json` could tear and lose the whole undo stack, not just fingerprints.
    Alternatively fold it into the next snapshot write.
 5. Leases: no sync (see shared section).
 6. **Add:** when `<path-hash>/` is new, sync the session directory (+1). When the
