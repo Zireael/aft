@@ -88,6 +88,13 @@ function persistFilePathAlias(args: Record<string, unknown>, context: ToolContex
 export const _buildUnifiedDiffForTest = (fp: string, before: string, after: string): string =>
   buildUnifiedDiff(fp, before, after);
 
+/** Test-only export of the line diff behind buildUnifiedDiff. */
+export const _diffLinesForTest = (a: readonly string[], b: readonly string[]) => diffLines(a, b);
+
+/** LCS table cells allocated by diffLines in this process; tests pin the cost. */
+let diffTableCells = 0;
+export const _diffTableCellsForTest = (): number => diffTableCells;
+
 /**
  * Build a unified diff string from before/after content using a proper
  * LCS-based diff algorithm with grouped hunks and 3 lines of context.
@@ -106,9 +113,10 @@ function buildUnifiedDiff(fp: string, before: string, after: string): string {
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
 
-  // LCS is O(n*m) in lines; a 5000x5000 matrix uses ~100 MB and ~250 ms,
-  // which we accept for normal source files. Above that we skip diff
-  // generation rather than block the plugin event loop on a single edit.
+  // LCS is O(n*m) in the lines between the common prefix and suffix; a
+  // whole-file rewrite at 5000x5000 still needs a ~50 MB table and ~250 ms.
+  // Above that we skip diff generation rather than block the plugin event
+  // loop on a single edit.
   // Byte-size gating misses the real cost (a 100 KB minified bundle is one
   // line; a 30 KB markdown file with 1500 lines is the expensive case).
   const LINE_CAP = 5000;
@@ -145,27 +153,54 @@ type DiffOp =
 
 /**
  * LCS-based line diff. Builds a length table then walks back to produce ops.
- * O(n*m) time and space — fine for the 100KB SIZE_CAP guard above.
+ *
+ * Lines shared at the start and end of both files are matched before the
+ * table is built, so its size is (changed region)² rather than (file)²: a
+ * one-line edit in a 3000-line file needs a 2×2 table instead of 3001×3001.
+ * The ops are exactly those of the full-table walk. The walk starts at the
+ * end and takes every equal pair first, which is the common suffix. Inside
+ * the common prefix the full table is known without computing it: the LCS of
+ * the first i lines of `a` and the first j lines of `b` is min(i, j) whenever
+ * min(i, j) is within the prefix, and prefix length plus the trimmed table
+ * otherwise. The walk reads those values, so its tie-breaks match.
  */
 function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
   const n = a.length;
   const m = b.length;
 
-  // dp[i][j] = LCS length of a[0..i] and b[0..j]
-  // Use a flat Uint32Array for memory efficiency on large files.
-  const dp = new Uint32Array((n + 1) * (m + 1));
-  const w = m + 1;
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        dp[i * w + j] = dp[(i - 1) * w + (j - 1)] + 1;
+  let prefix = 0;
+  const maxPrefix = Math.min(n, m);
+  while (prefix < maxPrefix && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  const maxSuffix = maxPrefix - prefix;
+  while (suffix < maxSuffix && a[n - 1 - suffix] === b[m - 1 - suffix]) suffix++;
+
+  // inner[i][j] = LCS length of a[prefix..prefix+i] and b[prefix..prefix+j]
+  // within the trimmed middle. Values never exceed min(innerN, innerM), so a
+  // 16-bit table suffices below 65535 lines and halves the memory.
+  const innerN = n - prefix - suffix;
+  const innerM = m - prefix - suffix;
+  const w = innerM + 1;
+  const cells = (innerN + 1) * w;
+  diffTableCells += cells;
+  const inner = Math.min(innerN, innerM) < 0xffff ? new Uint16Array(cells) : new Uint32Array(cells);
+  for (let i = 1; i <= innerN; i++) {
+    const ai = a[prefix + i - 1];
+    for (let j = 1; j <= innerM; j++) {
+      if (ai === b[prefix + j - 1]) {
+        inner[i * w + j] = inner[(i - 1) * w + (j - 1)] + 1;
       } else {
-        const up = dp[(i - 1) * w + j];
-        const left = dp[i * w + (j - 1)];
-        dp[i * w + j] = up >= left ? up : left;
+        const up = inner[(i - 1) * w + j];
+        const left = inner[i * w + (j - 1)];
+        inner[i * w + j] = up >= left ? up : left;
       }
     }
   }
+  // LCS length of a[0..i] and b[0..j] in the full (untrimmed) table.
+  const lcs = (i: number, j: number): number =>
+    i <= prefix || j <= prefix
+      ? Math.min(i, j)
+      : prefix + inner[(i - prefix) * w + (j - prefix)];
 
   // Walk back to produce ops in reverse, then reverse at the end.
   const ops: DiffOp[] = [];
@@ -176,7 +211,7 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
       ops.push({ tag: "eq", beforeIdx: i - 1, afterIdx: j - 1, line: a[i - 1] });
       i--;
       j--;
-    } else if (dp[(i - 1) * w + j] >= dp[i * w + (j - 1)]) {
+    } else if (lcs(i - 1, j) >= lcs(i, j - 1)) {
       ops.push({ tag: "del", beforeIdx: i - 1, line: a[i - 1] });
       i--;
     } else {
