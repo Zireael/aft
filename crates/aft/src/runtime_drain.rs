@@ -3094,6 +3094,15 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
         state.view_publication_paths.clear();
         return;
     }
+    if let Some(due) = ctx
+        .view_publication_retry()
+        .lock()
+        .due()
+        .filter(|due| Instant::now() < *due)
+    {
+        state.view_publication_due = Some(due);
+        return;
+    }
     let changed = state
         .view_publication_paths
         .iter()
@@ -3114,18 +3123,19 @@ pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSl
             state.view_publication_paths.clear();
             state.view_publication_due = None;
         }
-        Err(error) => {
+        Err(_error) => {
             if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
                 state.view_publication_due = None;
                 state.view_publication_paths.clear();
                 return;
             }
-            aft::slog_warn!(
-                "content-addressed view publication failed root={} error={}",
-                root.display(),
-                error
-            );
-            state.view_publication_due = Some(Instant::now() + Duration::from_secs(1));
+            // Inline publication records and logs the failure in the same retry
+            // state used by detached jobs. Preserve this drain's path union.
+            state.view_publication_due = ctx
+                .view_publication_retry()
+                .lock()
+                .due()
+                .or_else(|| Some(Instant::now() + Duration::from_secs(1)));
         }
     }
 }
@@ -3409,6 +3419,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_changed_paths.clear();
             state.ignore_changed_path_count = 0;
             if ctx.config().views.enabled {
+                ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
@@ -3436,6 +3447,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_changed_paths.clear();
                 state.ignore_changed_path_count = 0;
                 if ctx.config().views.enabled {
+                    ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
@@ -3471,6 +3483,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 };
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
+                    ctx.reset_view_publication_retry();
                     state.view_publication_paths.extend(paths.iter().cloned());
                     state.view_publication_due =
                         Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);

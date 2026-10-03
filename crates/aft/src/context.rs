@@ -2844,6 +2844,7 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    view_publication_retry: parking_lot::Mutex<crate::executor::view_publication::PublicationRetry>,
     deleted_view_root_retired: AtomicBool,
     #[cfg(test)]
     view_publication_attempts: AtomicUsize,
@@ -3503,6 +3504,7 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            view_publication_retry: parking_lot::Mutex::new(Default::default()),
             deleted_view_root_retired: AtomicBool::new(false),
             #[cfg(test)]
             view_publication_attempts: AtomicUsize::new(0),
@@ -6204,6 +6206,7 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        self.reset_view_publication_retry();
         self.checkout_driver.clear();
         self.checkout_semantic.clear();
         *self
@@ -6403,6 +6406,11 @@ impl AppContext {
             phase,
         )
         .map_err(|error| error.to_string())?;
+        // Missing members are valid deletions, but an absent checkout is not
+        // a valid empty view. It may have disappeared during the source walk.
+        if self.retire_deleted_view_root() {
+            return Err("view publication root was deleted".to_owned());
+        }
         let report = assembly.report();
         let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
             .map_err(|error| error.to_string())?;
@@ -6938,12 +6946,24 @@ impl AppContext {
     }
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
+        self.reset_view_publication_retry();
         if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
         // The driver only records the change; the semantic view resolves it
         // on its worker after the quiet window.
         self.checkout_semantic.wake();
+    }
+
+    pub(crate) fn view_publication_retry(
+        &self,
+    ) -> &parking_lot::Mutex<crate::executor::view_publication::PublicationRetry> {
+        &self.view_publication_retry
+    }
+
+    pub(crate) fn reset_view_publication_retry(&self) {
+        let root = self.canonical_cache_root_opt().unwrap_or_default();
+        self.view_publication_retry.lock().reset(&root);
     }
 
     /// Activates a supplied, already loaded checkout runtime for this root.

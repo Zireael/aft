@@ -547,7 +547,10 @@ impl ViewStore {
         let name = GenerationName::parse(generation).ok_or_else(|| {
             ViewError::GenerationMismatch(format!("`{generation}` is not a v2 generation name"))
         })?;
-        let manifest = ManifestV2::from_json_bytes(&fs::read(self.manifest_path(generation)?)?)?;
+        let path = self.manifest_path(generation)?;
+        let manifest = ManifestV2::from_json_bytes(
+            &fs::read(&path).map_err(|error| ViewError::io_at("reading", &path, error))?,
+        )?;
         if manifest.content_fingerprint()? != name.content {
             return Err(ViewError::GenerationMismatch(format!(
                 "manifest {generation} does not match its content fingerprint"
@@ -575,16 +578,20 @@ fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
+            .open(&temporary)
+            .map_err(|error| ViewError::io_at("creating", &temporary, error))?;
+        file.write_all(bytes)
+            .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        file.write_all(b"\n")
+            .map_err(|error| ViewError::io_at("writing", &temporary, error))?;
+        file.sync_all()
+            .map_err(|error| ViewError::io_at("syncing", &temporary, error))?;
         drop(file);
         fs::hard_link(&temporary, path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ViewError::ManifestAlreadyExists(file_name.to_owned())
             } else {
-                ViewError::Io(error)
+                ViewError::io_at("linking manifest to", path, error)
             }
         })?;
         sync_file(path)

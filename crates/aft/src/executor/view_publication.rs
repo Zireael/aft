@@ -8,8 +8,78 @@ use std::{
     collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{atomic::AtomicUsize, Arc, LazyLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+/// One retry deadline for both inline and detached publications of a root.
+/// Keeping it on the context preserves the delay when another scheduler wake
+/// supersedes a detached job without changing the checkout.
+pub(crate) struct PublicationRetry {
+    error: Option<String>,
+    failures: usize,
+    delay: Duration,
+    due: Option<Instant>,
+    initial: Duration,
+    maximum: Duration,
+}
+
+impl Default for PublicationRetry {
+    fn default() -> Self {
+        Self {
+            error: None,
+            failures: 0,
+            delay: Duration::ZERO,
+            due: None,
+            initial: Duration::from_secs(1),
+            maximum: Duration::from_secs(300),
+        }
+    }
+}
+
+impl PublicationRetry {
+    pub(crate) fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    pub(crate) fn reset(&mut self, root: &std::path::Path) {
+        if self.failures > 1 {
+            log::info!(
+                "content-addressed view publication retry reset root={} repeat_count={} error={}",
+                root.display(),
+                self.failures,
+                self.error.as_deref().unwrap_or_default()
+            );
+        }
+        self.error = None;
+        self.failures = 0;
+        self.delay = Duration::ZERO;
+        self.due = None;
+    }
+
+    fn failed(&mut self, root: &std::path::Path, error: &str) {
+        if self.error.as_deref() == Some(error) {
+            self.failures = self.failures.saturating_add(1);
+            self.delay = (self.delay * 2).min(self.maximum);
+        } else {
+            self.reset(root);
+            self.error = Some(error.to_owned());
+            self.failures = 1;
+            self.delay = self.initial;
+        }
+        self.due = Some(Instant::now() + self.delay);
+        // Report the first repeat, then summarize the final count on recovery
+        // or an edit. A permanently broken checkout must not flood the log.
+        let warn = self.failures <= 2;
+        if warn {
+            log::warn!(
+                "content-addressed view publication failed root={} repeat_count={} retry_ms={} error={}",
+                root.display(), self.failures, self.delay.as_millis(), error
+            );
+        }
+        #[cfg(test)]
+        tests::record_failure(root, self.delay, self.failures, warn);
+    }
+}
 
 #[derive(Clone)]
 struct Target {
@@ -197,7 +267,22 @@ pub(crate) fn schedule(
     }
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
-        return ctx.publish_view_paths(paths, allow_blob_put).map(|_| ());
+        if ctx
+            .view_publication_retry()
+            .lock()
+            .due()
+            .is_some_and(|due| Instant::now() < due)
+        {
+            return Err("view publication retry is not due".to_owned());
+        }
+        let result = ctx.publish_view_paths(paths, allow_blob_put).map(|_| ());
+        let root = ctx.canonical_cache_root_opt().unwrap_or_default();
+        let mut retry = ctx.view_publication_retry().lock();
+        match &result {
+            Ok(()) => retry.reset(&root),
+            Err(error) => retry.failed(&root, error),
+        }
+        return result;
     };
     let root = ctx
         .canonical_cache_root_opt()
@@ -250,6 +335,16 @@ pub(crate) fn schedule(
                 {
                     break;
                 }
+                let retry_due = target.ctx.view_publication_retry().lock().due();
+                if let Some(wait) = retry_due
+                    .and_then(|due| due.checked_duration_since(Instant::now()))
+                {
+                    // Recheck the root's shared deadline while waiting: a watcher
+                    // edit can reset it without waiting for the old delay to end.
+                    lifecycle.phase("retry_wait").ok();
+                    token.wait_for_cancellation(wait.min(Duration::from_secs(1)));
+                    continue;
+                }
                 let result = (|| {
                     let _permit = loop {
                         lifecycle
@@ -294,15 +389,19 @@ pub(crate) fn schedule(
                     Ok::<(), String>(())
                 })();
                 match result {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        target.ctx.view_publication_retry().lock().reset(&target.ctx.canonical_cache_root());
+                        break;
+                    }
                     Err(error) => {
-                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none() {
+                        if token.cancel_requested_before_commit()
+                            || target.ctx.configure_content_generation() != content_generation
+                            || target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none() {
                             break;
                         }
-                        log::warn!("content-addressed view publication failed: {}", error);
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.
-                        token.wait_for_cancellation(std::time::Duration::from_secs(1));
+                        target.ctx.view_publication_retry().lock().failed(&target.ctx.canonical_cache_root(), &error);
                     }
                 }
             }

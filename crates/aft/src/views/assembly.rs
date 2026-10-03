@@ -217,6 +217,22 @@ pub fn prepare_checkout(
 
     for tracked in head {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
+        let absolute = request
+            .project_root
+            .join(path_from_bytes(&tracked.rel_path));
+        // HEAD describes committed membership, not the checkout. Check absence
+        // before reusing an unchanged entry as well as when reading changed bytes.
+        // Do not follow symlinks: a dangling link is still a checkout member.
+        if matches!(tracked.mode, GitMode::Regular { .. } | GitMode::Symlink)
+            && working_tree_io(
+                fs::symlink_metadata(&absolute),
+                "reading metadata for",
+                &absolute,
+            )?
+            .is_none()
+        {
+            continue;
+        }
         if !rebuild_all && !request.changed_paths.contains(&tracked.rel_path) {
             if let Some(entry) = previous_entries.get(&tracked.rel_path).filter(|entry| {
                 !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
@@ -245,11 +261,10 @@ pub fn prepare_checkout(
                 source: None,
             }),
             GitMode::Symlink => {
-                let target = read_symlink_bytes(
-                    &request
-                        .project_root
-                        .join(path_from_bytes(&tracked.rel_path)),
-                )?;
+                phase("working_tree_read")?;
+                let Some(target) = read_symlink_bytes(&absolute)? else {
+                    continue;
+                };
                 candidates.push(Candidate {
                     path: rel_path,
                     entry: ManifestEntry::Symlink {
@@ -262,10 +277,10 @@ pub fn prepare_checkout(
                 });
             }
             GitMode::Regular { executable } => {
-                let absolute = request
-                    .project_root
-                    .join(path_from_bytes(&tracked.rel_path));
-                let source = fs::read(&absolute)?;
+                phase("working_tree_read")?;
+                let Some(source) = read_working_tree_file(&absolute)? else {
+                    continue;
+                };
                 let resolution_input = is_resolution_input(&tracked.rel_path);
                 let language = if resolution_input {
                     Some("config".to_string())
@@ -611,7 +626,7 @@ pub fn prepare_checkout(
     }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
-    fs::write(&trigram, [])?;
+    fs::write(&trigram, []).map_err(|error| ViewError::io_at("writing", &trigram, error))?;
     let artifacts = PublicationArtifacts {
         blob_databases: if reused_derived {
             vec![semantic.path().to_path_buf()]
@@ -1286,16 +1301,36 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     }
 }
 
-fn read_symlink_bytes(path: &Path) -> Result<Vec<u8>> {
-    let target = fs::read_link(path)?;
+/// A missing checkout path is a deletion, even if it disappeared after the
+/// membership walk. Other failures must stay errors rather than hide members.
+fn working_tree_io<T>(
+    result: std::io::Result<T>,
+    operation: &'static str,
+    path: &Path,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ViewError::io_at(operation, path, error)),
+    }
+}
+
+pub(crate) fn read_working_tree_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    working_tree_io(fs::read(path), "reading", path)
+}
+
+fn read_symlink_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    let Some(target) = working_tree_io(fs::read_link(path), "reading symlink", path)? else {
+        return Ok(None);
+    };
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
-        Ok(target.as_os_str().as_bytes().to_vec())
+        Ok(Some(target.as_os_str().as_bytes().to_vec()))
     }
     #[cfg(not(unix))]
     {
-        Ok(target.to_string_lossy().as_bytes().to_vec())
+        Ok(Some(target.to_string_lossy().as_bytes().to_vec()))
     }
 }
 

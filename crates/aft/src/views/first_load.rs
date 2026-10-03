@@ -885,9 +885,11 @@ impl FirstLoadDriver for CheckoutDriver {
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
             let path = RelPath::from_os_path(relative)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
-            let bytes = std::fs::read(&absolute).map_err(|error| {
-                SiblingLoader::error(format!("{}: {error}", absolute.display()))
-            })?;
+            let Some(bytes) = super::assembly::read_working_tree_file(&absolute)
+                .map_err(|error| SiblingLoader::error(error.to_string()))?
+            else {
+                continue;
+            };
             let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(&bytes), revision);
             for plane in &self.planes {
                 if plane.applies_to(&path) {
@@ -1148,6 +1150,7 @@ mod composite_tests {
 
     struct Walker {
         fail: AtomicBool,
+        delete_after_listing: AtomicBool,
     }
     impl MembershipWalker for Walker {
         fn files(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, PlaneError> {
@@ -1156,6 +1159,9 @@ mod composite_tests {
                 return Err(SiblingLoader::error(
                     "blocked.rs: membership walk failed after file.rs",
                 ));
+            }
+            if self.delete_after_listing.swap(false, Ordering::SeqCst) {
+                std::fs::remove_file(&first).unwrap();
             }
             Ok(vec![first])
         }
@@ -1247,6 +1253,7 @@ mod composite_tests {
         let owner = registry.register_view("local", root).unwrap();
         let walker = Arc::new(Walker {
             fail: AtomicBool::new(false),
+            delete_after_listing: AtomicBool::new(false),
         });
         let plane = Arc::new(Plane {
             fail: AtomicBool::new(false),
@@ -1268,6 +1275,25 @@ mod composite_tests {
         ));
         (driver, walker, plane, ViewAccess::Owner(owner))
     }
+    #[test]
+    fn composite_reconcile_omits_file_deleted_after_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (driver, walker, _, access) = fixture(root.path(), storage.path());
+        let loader = SiblingLoader::new(driver.clone(), vec![]);
+        let before = loader.load(&access).unwrap();
+        assert_eq!(before.snapshot.membership().len(), 1);
+        walker.delete_after_listing.store(true, Ordering::SeqCst);
+        driver.record_change(RelPath::new(b"file.rs".to_vec()).unwrap());
+        let after = loader.load(&access).unwrap();
+        assert!(after.snapshot.membership().is_empty());
+        assert!(after.pending_planes.is_empty());
+        assert_ne!(
+            before.snapshot.generation().name(),
+            after.snapshot.generation().name()
+        );
+    }
+
     #[test]
     fn composite_driver_hashes_same_bytes_installs_own_generation_and_reports_intent() {
         let root = tempfile::tempdir().unwrap();
