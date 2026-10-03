@@ -61,7 +61,9 @@ pub(crate) fn health_snapshot() -> serde_json::Value {
         "id": id, "kind": "views.publication", "root": job.root, "phase": job.phase,
         "elapsed_ms": job.started.elapsed().as_millis() as u64,
         "phase_ms": job.phase_started.elapsed().as_millis() as u64,
-        "cancel_requested": job.token.cancel_requested_before_commit(), "barrier_holder": false,
+        // A health report only observes: the full check can stat the root and
+        // signal the job, and this runs on the module's frame loop under JOBS.
+        "cancel_requested": job.token.cancel_already_requested(), "barrier_holder": false,
     })).collect())
 }
 

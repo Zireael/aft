@@ -661,7 +661,19 @@ impl JobCancellation {
         self.signal_cancel();
     }
 
+    /// True when a cancel has already won the state race. A pure read: unlike
+    /// [`Self::cancel_requested_before_commit`] it never checks the root on
+    /// disk or the abandon grace and never signals, so it is safe to call
+    /// while holding `wait_lock` and from observers such as health reports.
+    pub fn cancel_already_requested(&self) -> bool {
+        self.state() == JOB_CANCEL_STATE_CANCELLED
+    }
+
     /// True when a cancel won the state race and the job must abort.
+    ///
+    /// This also cancels the job when its root was deleted or abandoned, which
+    /// signals and so takes `wait_lock`. Never call it while holding that lock
+    /// (it is not reentrant), and keep it out of read-only observers.
     pub fn cancel_requested_before_commit(&self) -> bool {
         // A deleted checkout cannot publish useful work. Check here as well as
         // at admission so deletion during a batch does not wait for the reaper.
@@ -682,11 +694,18 @@ impl JobCancellation {
         if self.cancel_requested_before_commit() {
             return true;
         }
-        let mut guard = self.inner.wait_lock.lock();
-        if self.cancel_requested_before_commit() {
-            return true;
+        {
+            let mut guard = self.inner.wait_lock.lock();
+            // Only the pure state read may run under `wait_lock`: the full check
+            // can decide the root is deleted or abandoned and signal, and
+            // signalling takes this same lock. Doing that here deadlocked the
+            // waiting job and then every caller that signalled it, including
+            // the health report on the module's frame loop.
+            if self.cancel_already_requested() {
+                return true;
+            }
+            self.inner.wake.wait_for(&mut guard, timeout);
         }
-        self.inner.wake.wait_for(&mut guard, timeout);
         self.cancel_requested_before_commit()
     }
 

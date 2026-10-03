@@ -2607,6 +2607,64 @@ fn cancel_and_seal_race_has_exactly_one_winner() {
 }
 
 #[test]
+fn wait_for_cancellation_does_not_self_deadlock_when_its_root_vanishes_mid_wait() {
+    // The full cancellation check can decide the root is gone and signal the
+    // job, and signalling takes the same lock the waiter holds. If that check
+    // runs while the waiter still holds the lock, the waiter deadlocks on
+    // itself, and so does anyone who later signals or observes it (on the live
+    // daemon, the health report on the frame loop).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("checkout");
+    std::fs::create_dir(&root).expect("root");
+    let token = JobCancellation::new().with_root(&root);
+    token.mark_running();
+    let waiter = token.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let started = Arc::new(std::sync::Barrier::new(2));
+    let started_waiter = Arc::clone(&started);
+    thread::spawn(move || {
+        started_waiter.wait();
+        // Long enough that the root is removed while this call is waiting.
+        let cancelled = waiter.wait_for_cancellation(Duration::from_millis(400));
+        let _ = done_tx.send(cancelled);
+    });
+    started.wait();
+    thread::sleep(Duration::from_millis(100));
+    std::fs::remove_dir(&root).expect("remove root");
+    let cancelled = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("wait_for_cancellation deadlocked after its root was removed");
+    assert!(cancelled, "a removed root cancels the waiting job");
+    // A second signaller (the reaper, or an observer that signals) must not
+    // block either.
+    let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+    let signaller = token.clone();
+    thread::spawn(move || {
+        signaller.request_cancel();
+        let _ = signal_tx.send(());
+    });
+    signal_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("signalling a job that waited on a removed root blocked");
+}
+
+#[test]
+fn cancel_already_requested_only_reads_and_never_signals() {
+    // Observers such as the health report must not change a job's state by
+    // looking at it, even when its root is gone.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("checkout");
+    std::fs::create_dir(&root).expect("root");
+    let token = JobCancellation::new().with_root(&root);
+    token.mark_running();
+    std::fs::remove_dir(&root).expect("remove root");
+    assert!(!token.cancel_already_requested());
+    assert_eq!(token.state(), JOB_CANCEL_STATE_RUNNING);
+    assert!(token.cancel_requested_before_commit());
+    assert!(token.cancel_already_requested());
+}
+
+#[test]
 fn heavy_init_completion_and_following_read_do_not_wait_on_maintenance_epoch() {
     let executor = test_executor(4, 2, 3, 2);
     let (_dir, root) = test_root("heavy-response-epoch");
