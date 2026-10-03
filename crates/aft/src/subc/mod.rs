@@ -9856,6 +9856,10 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
+#[path = "../../tests/helpers/fake_lsp.rs"]
+mod fake_lsp;
+
+#[cfg(test)]
 mod tests {
     use super::test_support::{
         completion_frame, inspect_context, reap_until_forgotten, route_identity, test_ctx,
@@ -13768,6 +13772,487 @@ mod tests {
         );
         // Refusing the bind also cancelled its queued configure job.
         assert_eq!(bind_response.data["code"], "request_cancelled");
+    }
+
+    #[tokio::test]
+    async fn frozen_lsp_edit_releases_writer_before_route_bind_deadline() {
+        use crate::lsp::client::LspEvent;
+        use crate::lsp::registry::ServerKind;
+
+        let (_dir, root) = test_root("frozen-lsp-edit-bind");
+        let file = root.as_path().join("main.ts");
+        let release = root.as_path().join("resume-lsp");
+        std::fs::write(root.as_path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(root.as_path().join("storage")),
+                ..Default::default()
+            },
+        ));
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
+        ctx.lsp()
+            .notify_file_changed(&file, "// original\n", &ctx.config())
+            .unwrap();
+        let startup_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/frozen")
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "fake server did not freeze"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        // More than any platform's anonymous pipe capacity: didChange must
+        // actually write into a full stdin pipe, not merely wait for diagnostics.
+        let replacement = format!("// edited {}\n", "x".repeat(2 * 1024 * 1024));
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "frozen-edit", "command": "edit_match", "file": file,
+            "match": "// original\n", "replacement": replacement,
+            "diagnostics": true, "wait_ms": 500,
+        }))
+        .unwrap();
+        let started = Instant::now();
+        let (mut edit, _) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "frozen-edit".into(),
+            "edit",
+            Box::new(move |ctx| crate::commands::edit_match::handle_edit_match(&request, ctx)),
+        );
+        let write_deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::metadata(&file).unwrap().len() < 1024 * 1024 {
+            assert!(Instant::now() < write_deadline, "edit never wrote the file");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let configure: RawRequest = serde_json::from_value(json!({
+            "id": "subc-bind-frozen", "command": "configure",
+            "project_root": root.as_path(), "storage_dir": root.as_path().join("storage"),
+            "harness": "opencode", "session_id": "frozen-bind",
+            "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
+                "search_index": false, "semantic_search": false, "callgraph_store": false,
+            }).to_string()}],
+        }))
+        .unwrap();
+        let (mut bind, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-bind-frozen".into(),
+            Box::new(move |ctx| crate::commands::configure::handle_configure(&configure, ctx)),
+        );
+        let route = route_key(71, 1);
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root.clone(),
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-frozen".into(),
+                started_at: Instant::now(),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 71,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation,
+            },
+        )]);
+        let mut installed = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let mut edit_response = None;
+        let mut bind_response = None;
+        let mut edit_elapsed = None;
+        let mut printed_blocker = false;
+        while started.elapsed() < Duration::from_secs(12) {
+            if edit_response.is_none() {
+                if let Ok(response) = edit.try_recv() {
+                    edit_elapsed = Some(started.elapsed());
+                    edit_response = Some(response);
+                }
+            }
+            if let Ok(response) = bind.try_recv() {
+                bind_response = Some(response);
+                break;
+            }
+            if !printed_blocker && started.elapsed() >= ROUTE_BIND_DEADLINE {
+                let snapshot = executor.bind_blocker_snapshot(&root, "subc-bind-frozen");
+                eprintln!(
+                    "{}",
+                    health::pending_bind_breadcrumb(
+                        route,
+                        &root,
+                        started.elapsed(),
+                        "subc-bind-frozen",
+                        &snapshot
+                    )
+                );
+                printed_blocker = true;
+            }
+            expire_overdue_route_binds(
+                &writer_tx,
+                &executor,
+                &mut pending_binds,
+                &mut installed,
+                &metrics,
+            )
+            .await
+            .unwrap();
+            if pending_binds[&route].deadline_reported {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let refusal = writer_rx
+            .try_recv()
+            .ok()
+            .map(|frame| serde_json::from_slice::<Value>(&frame.body).unwrap());
+        eprintln!("frozen LSP reproduction: elapsed_ms={} edit_finished={} bind_finished={} refusal={refusal:?}", started.elapsed().as_millis(), edit_response.is_some(), bind_response.is_some());
+        // Always resume before asserting, including on the broken implementation.
+        std::fs::write(&release, "resume").unwrap();
+        let response = match edit_response {
+            Some(response) => response,
+            None => tokio::time::timeout(Duration::from_secs(15), edit)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        if bind_response.is_none() {
+            let _ = tokio::time::timeout(Duration::from_secs(15), bind)
+                .await
+                .unwrap();
+        }
+        assert!(edit_elapsed.is_some_and(|elapsed| elapsed < Duration::from_secs(2)),
+            "edit with frozen stdin exceeded its bound: elapsed={edit_elapsed:?}; refusal={refusal:?}");
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["lsp_complete"], false, "{response:?}");
+        assert_eq!(
+            response.data["lsp_pending_servers"],
+            json!(["typescript"]),
+            "{response:?}"
+        );
+        assert_eq!(
+            response.data["lsp_status"], "diagnostics unknown (server not responding)",
+            "{response:?}"
+        );
+        assert!(
+            bind_response.is_some_and(|response| response.success),
+            "bind missed its deadline: {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_stdin_write_is_bounded_and_recovers_without_restart() {
+        use crate::lsp::client::{LspClient, LspEvent};
+        use crate::lsp::registry::ServerKind;
+        use lsp_types::notification::{DidChangeTextDocument, DidOpenTextDocument};
+
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("resume");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut client = LspClient::spawn(
+            ServerKind::TypeScript,
+            dir.path().to_path_buf(),
+            &fake_lsp::fake_server_binary(),
+            &[],
+            &HashMap::from([(
+                "AFT_FAKE_LSP_FREEZE_AFTER_OPEN".into(),
+                release.to_str().unwrap().into(),
+            )]),
+            tx,
+            crate::lsp::child_registry::LspChildRegistry::new(),
+        )
+        .unwrap();
+        client.initialize(dir.path(), None).unwrap();
+        let uri = crate::lsp::position::path_to_uri(&dir.path().join("main.ts"))
+            .unwrap()
+            .as_str()
+            .parse::<lsp_types::Uri>()
+            .unwrap();
+        client
+            .send_notification::<DidOpenTextDocument>(lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem::new(
+                    uri.clone(),
+                    "typescript".into(),
+                    0,
+                    "// original\n".into(),
+                ),
+            })
+            .unwrap();
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(15)).unwrap();
+            if matches!(event, LspEvent::Notification { method, .. } if method == "custom/frozen") {
+                break;
+            }
+        }
+        let pid = client.child_pid();
+        let change = |version, text: String| lsp_types::DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), version),
+            content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }],
+        };
+        // The watchdog releases the pipe even if the bound is removed. A red
+        // test should fail an assertion, not strand the test runner in write(2).
+        let watchdog_release = release.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::write(watchdog_release, "resume").unwrap();
+        });
+        let started = Instant::now();
+        let blocked = client
+            .send_notification::<DidChangeTextDocument>(change(1, "x".repeat(2 * 1024 * 1024)));
+        let elapsed = started.elapsed();
+        let skipped =
+            client.send_notification::<DidChangeTextDocument>(change(2, "// later\n".into()));
+        let skipped_elapsed = started.elapsed().saturating_sub(elapsed);
+        let still_alive = !client.child_exited();
+        std::fs::write(&release, "resume").unwrap();
+        let mut resumed = false;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Ok(LspEvent::Notification { method, .. }) =
+                rx.recv_timeout(Duration::from_millis(100))
+            {
+                if method == "textDocument/publishDiagnostics" {
+                    resumed = true;
+                    break;
+                }
+            }
+        }
+        let recovered =
+            client.send_notification::<DidChangeTextDocument>(change(3, "// recovered\n".into()));
+        watchdog.join().unwrap();
+        assert!(
+            blocked.is_err() && elapsed < Duration::from_secs(1),
+            "stdin write bound failed: result={blocked:?} elapsed={elapsed:?}"
+        );
+        assert!(
+            skipped.is_err() && skipped_elapsed < Duration::from_millis(100),
+            "unresponsive server was consulted again: {skipped:?} {skipped_elapsed:?}"
+        );
+        assert!(still_alive, "timeout killed the suspended server");
+        assert!(
+            resumed && recovered.is_ok(),
+            "same server did not recover: {recovered:?}"
+        );
+        assert_eq!(client.child_pid(), pid, "recovery restarted the server");
+    }
+
+    #[tokio::test]
+    async fn bind_overdue_behind_a_mutating_job_names_job_tool_and_age() {
+        let (_dir, root) = test_root("bind-blocked-by-mutation");
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (writer, _) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-5001-1416".into(),
+            "edit",
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                Response::success("subc-5001-1416", json!({}))
+            }),
+        );
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (bind, cancellation) = executor.submit_cancellable_async(
+            root.clone(),
+            Lane::Mutating,
+            "subc-bind-writer".into(),
+            Box::new(|_| Response::success("subc-bind-writer", json!({}))),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !executor
+            .try_bind_blocker_snapshot(&root, "subc-bind-writer")
+            .is_some_and(|snapshot| snapshot.configure_state == "queued")
+        {
+            assert!(Instant::now() < deadline, "bind never queued");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let route = route_key(72, 1);
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root.clone(),
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-writer".into(),
+                started_at: Instant::now().checked_sub(Duration::from_secs(11)).unwrap(),
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 72,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation,
+            },
+        )]);
+        let mut installed = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, mut writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        expire_overdue_route_binds(
+            &writer_tx,
+            &executor,
+            &mut pending_binds,
+            &mut installed,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        release_tx.send(()).unwrap();
+        assert!(writer.await.unwrap().success);
+        assert_eq!(bind.await.unwrap().data["code"], "request_cancelled");
+        let frame = writer_rx.try_recv().expect("refusal before daemon relay");
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "bind_blocked_by_writer", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("job=subc-5001-1416 tool=edit age_ms="),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn post_edit_diagnostics_budget_includes_manager_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.ts");
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = test_ctx();
+        ctx.lsp().override_binary(
+            crate::lsp::registry::ServerKind::TypeScript,
+            fake_lsp::fake_server_binary(),
+        );
+        let guard = ctx.lsp();
+        let held_ctx = Arc::clone(&ctx);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = held_ctx.lsp_notify_and_collect_diagnostics(
+                &file,
+                "// changed\n",
+                Duration::from_millis(100),
+            );
+            tx.send((started.elapsed(), result)).unwrap();
+        });
+        let bounded = rx.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        let (elapsed, outcome) =
+            bounded.expect("LSP manager contention escaped the diagnostics budget");
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(
+            !outcome.complete() && !outcome.pending_servers.is_empty(),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn frozen_lsp_diagnostics_timeout_stops_consulting_silent_server() {
+        use crate::lsp::client::LspEvent;
+        use crate::lsp::registry::ServerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.ts");
+        let release = dir.path().join("resume");
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(&file, "// original\n").unwrap();
+        let ctx = test_ctx();
+        ctx.lsp()
+            .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
+        ctx.lsp()
+            .notify_file_changed(&file, "// original\n", &ctx.config())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/frozen")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server did not freeze");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&file, "// small edit\n").unwrap();
+        let outcome = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// small edit\n",
+            Duration::from_millis(100),
+        );
+        let key = ctx.lsp().active_server_keys().pop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut marked = false;
+        while Instant::now() < deadline {
+            if ctx.lsp().producer_failure(&key) == Some("server not responding") {
+                marked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        let skipped = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// another edit\n",
+            Duration::from_secs(2),
+        );
+        let skipped_elapsed = started.elapsed();
+        let count = ctx.lsp().server_count();
+        std::fs::write(&release, "resume").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut resumed = false;
+        while Instant::now() < deadline {
+            if ctx.lsp().drain_events().into_iter().any(|event| {
+                matches!(event,
+                LspEvent::Notification { method, .. } if method == "custom/resumed")
+            }) {
+                resumed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&file, "// current after resume\n").unwrap();
+        let recovered = ctx.lsp_notify_and_collect_diagnostics(
+            &file,
+            "// current after resume\n",
+            Duration::from_secs(2),
+        );
+        assert!(
+            !outcome.complete() && outcome.diagnostics.is_empty(),
+            "{outcome:?}"
+        );
+        assert!(
+            marked,
+            "diagnostics timeout did not mark the silent server unresponsive"
+        );
+        assert_eq!(count, 1, "timeout removed the suspended server");
+        assert!(
+            resumed && recovered.complete(),
+            "resumed server could not resync the current document: {recovered:?}"
+        );
+        assert!(
+            !skipped.complete() && skipped_elapsed < Duration::from_millis(100),
+            "unresponsive diagnostics were consulted again: {skipped:?} {skipped_elapsed:?}"
+        );
     }
 
     /// Restart-shaped burst: 40 git roots configured together, then their

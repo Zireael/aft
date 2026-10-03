@@ -1255,9 +1255,13 @@ fn append_lsp_error_lines(output: &mut String, data: &Value, trailing_newline: b
 fn append_lsp_server_notes(output: &mut String, data: &Value) {
     let pending = string_array(data.get("lsp_pending_servers"));
     if !pending.is_empty() {
+        let status = data
+            .get("lsp_status")
+            .and_then(Value::as_str)
+            .unwrap_or("Diagnostics are incomplete for this call");
         output.push_str(&format!(
-            "\n\nNote: LSP server(s) did not respond in time: {}. Diagnostics are incomplete for this call; wait for the LSP update and use the next normal aft_inspect, not repeated polling.",
-            pending.join(", ")
+            "\n\nNote: LSP server(s) did not respond in time: {}. {}; wait for the LSP update and use the next normal aft_inspect, not repeated polling.",
+            pending.join(", "), status
         ));
     }
     let exited = string_array(data.get("lsp_exited_servers"));
@@ -1266,6 +1270,23 @@ fn append_lsp_server_notes(output: &mut String, data: &Value) {
             "\n\nNote: LSP server(s) exited during this edit: {}. Their diagnostics could not be collected.",
             exited.join(", ")
         ));
+    }
+}
+
+#[cfg(test)]
+mod edit_diagnostics_tests {
+    #[test]
+    fn frozen_lsp_edit_rendering_reports_diagnostics_unknown() {
+        let data = serde_json::json!({
+            "replacements": 1, "lsp_complete": false, "lsp_diagnostics": [],
+            "lsp_pending_servers": ["typescript"],
+            "lsp_status": "diagnostics unknown (server not responding)",
+        });
+        let output = super::format_edit_response(&data);
+        assert!(
+            output.contains("diagnostics unknown (server not responding)"),
+            "{output}"
+        );
     }
 }
 

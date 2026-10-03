@@ -1076,6 +1076,7 @@ pub(super) fn warn_slow_pending_binds(
                 blockers: vec!["scheduler_busy".to_string()],
                 oldest_queued_writer_age_ms: None,
                 in_flight_readers: Vec::new(),
+                in_flight_writer: None,
                 reader_admissions_while_promoted_writer_waited: 0,
             });
         crate::slog_warn!(
@@ -1091,7 +1092,7 @@ pub(super) fn warn_slow_pending_binds(
     }
 }
 
-fn pending_bind_breadcrumb(
+pub(super) fn pending_bind_breadcrumb(
     route: RouteChannel,
     root_id: &crate::path_identity::ProjectRootId,
     age: Duration,
@@ -1123,8 +1124,18 @@ fn pending_bind_breadcrumb(
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let writer = snapshot
+        .in_flight_writer
+        .as_ref()
+        .map(|writer| {
+            format!(
+                "job={} command={} age_ms={}",
+                writer.request_id, writer.command, writer.started_age_ms,
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], reader_admissions_while_promoted_writer_waited={})",
+        "subc attach: pending RouteBind route {route} for root {} crossed {}ms (configure_request_id={}, configure_state={}, configure_phase_timings=[{}], blockers=[{}], oldest_queued_writer_age_ms={:?}, in_flight_readers=[{}], in_flight_writer=[{}], reader_admissions_while_promoted_writer_waited={})",
         root_id.as_path().display(),
         duration_millis_u64(age),
         configure_request_id,
@@ -1133,6 +1144,7 @@ fn pending_bind_breadcrumb(
         blockers,
         snapshot.oldest_queued_writer_age_ms,
         readers,
+        writer,
         snapshot.reader_admissions_while_promoted_writer_waited,
     )
 }
@@ -1141,12 +1153,14 @@ fn pending_bind_breadcrumb(
 /// behind a reader on its root. Retryable like `actor_not_ready`: the reader
 /// ends eventually, and a later bind can then be admitted.
 pub(super) const BIND_BLOCKED_BY_READER: &str = "bind_blocked_by_reader";
+pub(super) const BIND_BLOCKED_BY_WRITER: &str = "bind_blocked_by_writer";
 
 /// The code and message an overdue route bind is refused with. A bind still
 /// queued while readers run on its root waited for them (a bind that needs
 /// exclusive use of the root cannot start beside readers), so the refusal
 /// names the oldest of them: its job, its tool and how long it has run.
-/// Every other cause keeps the generic `actor_not_ready`.
+/// A running writer can hold the same slot even when there are no readers;
+/// name it rather than suggesting that configure itself is necessarily stuck.
 pub(super) fn route_bind_deadline_refusal(
     age: Duration,
     deadline: Duration,
@@ -1155,6 +1169,17 @@ pub(super) fn route_bind_deadline_refusal(
 ) -> (&'static str, String) {
     let age_ms = duration_millis_u64(age);
     let deadline_ms = duration_millis_u64(deadline);
+    if let Some(writer) = snapshot.in_flight_writer.as_ref().filter(|_| {
+        matches!(
+            snapshot.configure_state,
+            "queued" | "running" | "blocked_by_other_mutating"
+        )
+    }) {
+        return (BIND_BLOCKED_BY_WRITER, format!(
+            "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): a mutating job held this root (job={} tool={} age_ms={}); retry once it finishes or is cancelled",
+            writer.request_id, writer.command, writer.started_age_ms,
+        ));
+    }
     let blocking_reader = (snapshot.configure_state == "queued")
         .then(|| {
             snapshot
@@ -2980,6 +3005,7 @@ mod tests {
                 reader("subc-1-790", "read", 900),
                 reader("subc-1-789", "grep", 840_000),
             ],
+            in_flight_writer: None,
             reader_admissions_while_promoted_writer_waited: 0,
         };
         let age = Duration::from_millis(10_600);
@@ -3028,6 +3054,7 @@ mod tests {
                     blockers: vec![blocker.to_string()],
                     oldest_queued_writer_age_ms: Some(6_000),
                     in_flight_readers: Vec::new(),
+                    in_flight_writer: None,
                     reader_admissions_while_promoted_writer_waited: 0,
                 },
             );

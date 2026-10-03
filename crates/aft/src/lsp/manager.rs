@@ -277,6 +277,9 @@ pub struct PostEditWaitOutcome {
     /// Reported to the agent via `pending_lsp_servers` so they understand
     /// the result is partial.
     pub pending_servers: Vec<ServerKey>,
+    /// Pending producers proven silent by the client, not merely warming,
+    /// unversioned, or unreachable because the manager was busy.
+    pub unresponsive_servers: Vec<ServerKey>,
     /// Servers whose process exited between notification and deadline.
     /// Reported separately so the agent knows the gap is unrecoverable
     /// without a server restart, not "wait longer."
@@ -663,6 +666,7 @@ pub(crate) struct PostEditDiagnosticsWait {
     lookup_path: PathBuf,
     expected_versions: Vec<(ServerKey, i32)>,
     pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
+    responses_at_start: HashMap<ServerKey, u64>,
     event_rx: Receiver<LspEvent>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
@@ -1836,6 +1840,14 @@ impl LspManager {
                     (Ok(()), false)
                 };
                 if let Err(err) = send_result {
+                    if matches!(err, LspError::Timeout(_)) {
+                        // The writer owns the queued frame and can finish it
+                        // after the process resumes. Do not send didOpen twice.
+                        self.documents
+                            .entry(key.clone())
+                            .or_default()
+                            .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    }
                     let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
                     return Err(err);
                 }
@@ -1892,6 +1904,11 @@ impl LspManager {
                     Ok(())
                 };
                 if let Err(err) = send_result {
+                    if let Some(store) = self.documents.get_mut(key) {
+                        // A timed-out write may arrive later. Reserve its
+                        // version, but retain disk drift until a confirmed sync.
+                        store.bump_version_with(&canonical_path, &DiskSnapshot::default());
+                    }
                     let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
                     return Err(err);
                 }
@@ -2012,12 +2029,18 @@ impl LspManager {
             if let Some(version) = current_version {
                 let next_version = version + 1;
                 if let Some(client) = self.clients.get_mut(&key) {
-                    client.send_full_did_change(&uri, next_version, content)?;
+                    let send = client.send_full_did_change(&uri, next_version, content)
                     // AFT has written this content to disk: tell the server
                     // it was saved. rust-analyzer re-runs `cargo check` only
                     // on `didSave`, so without it the compiler errors it
                     // reports keep describing the file before the edit.
-                    send_did_save(client, &uri, content)?;
+                        .and_then(|()| send_did_save(client, &uri, content));
+                    if let Err(err) = send {
+                        if let Some(store) = self.documents.get_mut(&key) {
+                            store.bump_version_with(&canonical_path, &DiskSnapshot::default());
+                        }
+                        return Err(err);
+                    }
                 }
                 if let Some(store) = self.documents.get_mut(&key) {
                     store.bump_version_with(&canonical_path, &disk);
@@ -2027,18 +2050,34 @@ impl LspManager {
             }
 
             if let Some(client) = self.clients.get_mut(&key) {
-                client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                    text_document: TextDocumentItem::new(
-                        uri.clone(),
-                        language_id.clone(),
-                        0,
-                        content.to_string(),
-                    ),
-                })?;
+                let send =
+                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem::new(
+                            uri.clone(),
+                            language_id.clone(),
+                            0,
+                            content.to_string(),
+                        ),
+                    });
+                if let Err(err) = send {
+                    if matches!(err, LspError::Timeout(_)) {
+                        self.documents
+                            .entry(key.clone())
+                            .or_default()
+                            .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    }
+                    return Err(err);
+                }
                 log_did_open_sent(&key, &canonical_path, &language_id);
                 // The content was just written to disk: tell the server it
                 // was saved, so rust-analyzer re-runs `cargo check`.
-                send_did_save(client, &uri, content)?;
+                if let Err(err) = send_did_save(client, &uri, content) {
+                    self.documents
+                        .entry(key.clone())
+                        .or_default()
+                        .open_with(canonical_path.clone(), &DiskSnapshot::default());
+                    return Err(err);
+                }
             }
             self.documents
                 .entry(key.clone())
@@ -3175,6 +3214,14 @@ impl LspManager {
             lookup_path,
             expected_versions: expected_versions.to_vec(),
             pre_snapshot: pre_snapshot.clone(),
+            responses_at_start: expected_versions
+                .iter()
+                .filter_map(|(key, _)| {
+                    self.clients
+                        .get(key)
+                        .map(|client| (key.clone(), client.received_message_count()))
+                })
+                .collect(),
             event_rx: self.event_rx.clone(),
             wake_rx,
             waiter_id,
@@ -3201,6 +3248,13 @@ impl LspManager {
                 wait.exited.push(key.clone());
                 continue;
             }
+            if self
+                .clients
+                .get(key)
+                .is_some_and(LspClient::is_unresponsive)
+            {
+                continue;
+            }
             if let Some(entry) = self
                 .diagnostics
                 .entries_for_file(&wait.lookup_path)
@@ -3216,7 +3270,21 @@ impl LspManager {
             }
         }
 
-        wait.fresh.len() + wait.exited.len() == wait.expected_versions.len()
+        wait.fresh.len()
+            + wait.exited.len()
+            + wait
+                .expected_versions
+                .iter()
+                .filter(|(key, _)| {
+                    !wait.fresh.contains_key(key)
+                        && !wait.exited.contains(key)
+                        && self
+                            .clients
+                            .get(key)
+                            .is_some_and(LspClient::is_unresponsive)
+                })
+                .count()
+            == wait.expected_versions.len()
     }
 
     pub(crate) fn finish_post_edit_diagnostics_wait(
@@ -3224,7 +3292,50 @@ impl LspManager {
         wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
         self.post_edit_waiters.remove(&wait.waiter_id);
-        Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited)
+        for (key, _) in &wait.expected_versions {
+            if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+                continue;
+            }
+            // A provisional or unversioned report still proves the server
+            // answered. Do not quarantine it merely for lacking authority.
+            let answered = self
+                .diagnostics
+                .entries_for_file(&wait.lookup_path)
+                .into_iter()
+                .any(|(stored_key, entry)| {
+                    stored_key == key
+                        && entry.epoch
+                            > wait
+                                .pre_snapshot
+                                .get(key)
+                                .copied()
+                                .unwrap_or_default()
+                                .epoch
+                });
+            if !answered {
+                if let (Some(client), Some(observed)) =
+                    (self.clients.get(key), wait.responses_at_start.get(key))
+                {
+                    client.mark_unresponsive_if_silent(*observed);
+                }
+            }
+        }
+        let unresponsive_servers = wait
+            .expected_versions
+            .iter()
+            .filter_map(|(key, _)| {
+                if wait.fresh.contains_key(key) || wait.exited.contains(key) {
+                    return None;
+                }
+                self.clients
+                    .get(key)
+                    .filter(|client| client.is_unresponsive())
+                    .map(|_| key.clone())
+            })
+            .collect();
+        let mut outcome = Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited);
+        outcome.unresponsive_servers = unresponsive_servers;
+        outcome
     }
 
     /// Register a waiter that blocks on language-server events without the
@@ -3336,6 +3447,7 @@ impl LspManager {
             accepted_snapshots,
             diagnostics,
             pending_servers,
+            unresponsive_servers: Vec::new(),
             exited_servers: exited,
         }
     }

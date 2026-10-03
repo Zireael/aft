@@ -166,6 +166,18 @@ pub fn send_or_queue_lsp_change(
         send_now(&mut lsp);
         return LspChangeDelivery::Sent;
     }
+    queue_lsp_change(manager, slot, config, queue)
+}
+
+/// Queue even when the manager is free. A caller with an expired diagnostics
+/// budget must not spend another handshake or stdin-write budget delivering
+/// the change itself; the coalesced helper reads the latest disk contents.
+pub(crate) fn queue_lsp_change(
+    manager: &Arc<parking_lot::Mutex<LspManager>>,
+    slot: &PendingLspChangeSlot,
+    config: Arc<Config>,
+    queue: impl FnOnce(&mut PendingLspChanges),
+) -> LspChangeDelivery {
     let mut pending = slot.lock();
     if let Some(backlog) = pending.as_mut() {
         queue(backlog);

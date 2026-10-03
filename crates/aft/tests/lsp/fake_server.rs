@@ -486,11 +486,21 @@ pub(crate) fn main() -> io::Result<()> {
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin.lock());
+        let freeze_release = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN");
         loop {
             let message = read_message(&mut reader);
+            let freeze = freeze_release.is_some() && matches!(&message,
+                Ok(Some(ServerMessage::Notification { method, .. })) if method == "textDocument/didOpen");
             let last = !matches!(message, Ok(Some(_)));
             if message_tx.send(message).is_err() || last {
                 break;
+            }
+            // Pausing only the analysis loop would still let this thread drain
+            // stdin, hiding a full-pipe write behind an unbounded message queue.
+            if freeze {
+                while !std::path::Path::new(freeze_release.as_ref().unwrap()).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
     });
@@ -1302,6 +1312,22 @@ pub(crate) fn main() -> io::Result<()> {
                             }));
                         write_publish_diagnostics_versioned(&mut writer, uri, checked, version)?;
                         write_flycheck_progress(&mut writer, "end")?;
+                    }
+                    // Stop reading after a successful handshake and document open.
+                    // The release file lets a test resume the same process without
+                    // relying on platform-specific signals or leaving a stopped child.
+                    if let Some(release) = std::env::var_os("AFT_FAKE_LSP_FREEZE_AFTER_OPEN") {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/frozen", None),
+                        )?;
+                        while !std::path::Path::new(&release).exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/resumed", None),
+                        )?;
                     }
                 }
                 "textDocument/didChange" => {

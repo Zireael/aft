@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, BufWriter};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
@@ -12,6 +12,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use super::writer::LspWriter;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
     Notification, Request, RequestId, Response as JsonRpcResponse, ServerMessage,
@@ -663,7 +664,7 @@ pub struct LspClient {
     /// PID from the shared registry; we capture once rather than reading
     /// `child.id()` later because Drop ordering with the Child can race.
     child_pid: u32,
-    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+    writer: LspWriter,
 
     /// Pending request responses, keyed by request ID.
     pending: Arc<Mutex<PendingMap>>,
@@ -907,11 +908,19 @@ impl LspClient {
         let stderr_closed = Arc::new(AtomicBool::new(false));
         spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail), Arc::clone(&stderr_closed));
 
-        let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        let writer = match LspWriter::spawn(stdin) {
+            Ok(writer) => writer,
+            Err(err) => {
+                kill_lsp_child_group(&mut child);
+                let _ = child.wait();
+                child_registry.untrack(child_pid);
+                return Err(err);
+            }
+        };
         let pending = Arc::new(Mutex::new(PendingMap::new()));
         let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
-        let reader_writer = Arc::clone(&writer);
+        let reader_writer = writer.clone();
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
@@ -923,6 +932,7 @@ impl LspClient {
             loop {
                 match transport::read_message(&mut reader) {
                     Ok(Some(ServerMessage::Response(response))) => {
+                        reader_writer.note_received();
                         if let Ok(mut guard) = reader_pending.lock() {
                             if let Some(tx) = guard.remove(&response.id) {
                                 if tx.send(response).is_err() {
@@ -940,6 +950,7 @@ impl LspClient {
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
+                        reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
                             reader_check_begins.fetch_add(1, Ordering::SeqCst);
                         }
@@ -951,6 +962,7 @@ impl LspClient {
                         });
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
+                        reader_writer.note_received();
                         record_watched_file_registration(
                             &reader_watched_file_registrations,
                             &method,
@@ -974,12 +986,10 @@ impl LspClient {
                         } else {
                             serde_json::Value::Null
                         };
-                        if let Ok(mut w) = reader_writer.lock() {
-                            let response = super::jsonrpc::OutgoingResponse::success(
-                                id.clone(),
-                                response_value,
-                            );
-                            let _ = transport::write_response(&mut *w, &response);
+                        let response =
+                            super::jsonrpc::OutgoingResponse::success(id.clone(), response_value);
+                        if let Ok(payload) = serde_json::to_string(&response) {
+                            reader_writer.send_response(payload);
                         }
                         // Also forward as event for any interested handlers
                         let _ = event_tx.send(LspEvent::ServerRequest {
@@ -1205,12 +1215,31 @@ impl LspClient {
     /// Whether diagnostics from this server instance should be treated as
     /// provisional because rust-analyzer is warming or reported failed analysis.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        matches!(&self.kind, ServerKind::Rust)
-            && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some())
+        self.is_unresponsive()
+            || (matches!(&self.kind, ServerKind::Rust)
+                && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some()))
     }
 
     pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
-        self.rust_analyzer_failure.as_deref()
+        if self.is_unresponsive() {
+            Some("server not responding")
+        } else {
+            self.rust_analyzer_failure.as_deref()
+        }
+    }
+
+    /// A timed-out server stays alive but is not consulted until its reader
+    /// observes another message. A suspended process may belong to the user.
+    pub fn is_unresponsive(&self) -> bool {
+        self.writer.is_unresponsive()
+    }
+
+    pub(crate) fn received_message_count(&self) -> u64 {
+        self.writer.received_count()
+    }
+
+    pub(crate) fn mark_unresponsive_if_silent(&self, observed: u64) {
+        self.writer.mark_unresponsive_if_silent(observed);
     }
 
     /// Recovery must reach healthy quiescence before reports regain authority.
@@ -1662,15 +1691,9 @@ impl LspClient {
         }
 
         let request = Request::new(id.clone(), method, Some(serde_json::to_value(params)?));
-        {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-            if let Err(err) = transport::write_request(&mut *writer, &request) {
-                self.remove_pending(&id);
-                return Err(err.into());
-            }
+        if let Err(err) = self.writer.send(serde_json::to_string(&request)?) {
+            self.remove_pending(&id);
+            return Err(err);
         }
         Ok(PendingLspRequest {
             id,
@@ -1678,7 +1701,7 @@ impl LspClient {
             kind: self.kind.clone(),
             rx,
             pending: Arc::clone(&self.pending),
-            writer: Arc::clone(&self.writer),
+            writer: self.writer.clone(),
         })
     }
 
@@ -1690,23 +1713,13 @@ impl LspClient {
     {
         self.ensure_can_send()?;
         let notification = Notification::new(N::METHOD, Some(serde_json::to_value(params)?));
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-        transport::write_notification(&mut *writer, &notification)?;
-        Ok(())
+        self.writer.send(serde_json::to_string(&notification)?)
     }
 
     /// Write an already serialized notification.
     fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
         self.ensure_can_send()?;
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-        transport::write_message(&mut *writer, json)?;
-        Ok(())
+        self.writer.send(json.to_string())
     }
 
     /// Send `textDocument/didChange` carrying the whole document (see
@@ -1717,6 +1730,7 @@ impl LspClient {
         version: i32,
         text: &str,
     ) -> Result<(), LspError> {
+        self.ensure_can_send()?;
         let json = full_did_change_message(uri, version, text)?;
         self.send_serialized_notification(&json)
     }
@@ -1728,6 +1742,7 @@ impl LspClient {
         uri: &lsp_types::Uri,
         text: Option<&str>,
     ) -> Result<(), LspError> {
+        self.ensure_can_send()?;
         let json = did_save_message(uri, text)?;
         self.send_serialized_notification(&json)
     }
@@ -1930,12 +1945,7 @@ impl LspClient {
     // Used only by the Unix-gated child-spawning test modules.
     #[cfg(all(test, unix))]
     pub(crate) fn poison_writer_for_test(&self) {
-        let writer = Arc::clone(&self.writer);
-        let _ = thread::spawn(move || {
-            let _guard = writer.lock().expect("writer lock");
-            panic!("poison lsp writer for test");
-        })
-        .join();
+        self.writer.poison_for_test();
     }
 
     pub fn state(&self) -> ServerState {
@@ -1951,6 +1961,9 @@ impl LspClient {
     }
 
     fn ensure_can_send(&self) -> Result<(), LspError> {
+        if self.is_unresponsive() {
+            return Err(LspError::ServerNotReady("server not responding".into()));
+        }
         if matches!(self.state, ServerState::ShuttingDown | ServerState::Exited) {
             return Err(LspError::ServerNotReady(format!(
                 "language server {:?} is not ready (state: {:?})",
@@ -2055,7 +2068,7 @@ pub(crate) struct PendingLspRequest {
     kind: ServerKind,
     rx: crossbeam_channel::Receiver<JsonRpcResponse>,
     pending: Arc<Mutex<PendingMap>>,
-    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+    writer: LspWriter,
 }
 
 impl PendingLspRequest {
@@ -2069,11 +2082,10 @@ impl PendingLspRequest {
                 self.remove_pending();
                 let notification =
                     Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
-                let mut writer = self
-                    .writer
-                    .lock()
-                    .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-                transport::write_notification(&mut *writer, &notification)?;
+                self.writer
+                    .mark_unresponsive_if_silent(self.writer.received_count());
+                self.writer
+                    .send_best_effort(serde_json::to_string(&notification)?);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for '{}' response from {:?}",
                     self.method, self.kind

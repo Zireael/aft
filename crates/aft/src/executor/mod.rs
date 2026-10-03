@@ -474,6 +474,7 @@ pub struct BindBlockerSnapshot {
     pub blockers: Vec<String>,
     pub oldest_queued_writer_age_ms: Option<u64>,
     pub in_flight_readers: Vec<BindBlockerReaderSnapshot>,
+    pub in_flight_writer: Option<MutatingLaneSnapshot>,
     pub reader_admissions_while_promoted_writer_waited: u64,
 }
 
@@ -2212,6 +2213,14 @@ impl SchedulerState {
             })
             .collect::<Vec<_>>();
         in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        let in_flight_writer = actor
+            .and_then(|actor| actor.mutating_inflight.as_ref())
+            .map(|job| MutatingLaneSnapshot {
+                root_id: root_id.clone(),
+                request_id: job.request_id.clone(),
+                command: job.command.clone(),
+                started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+            });
 
         let mut blockers = Vec::new();
         if let Some(actor) = actor {
@@ -2291,6 +2300,7 @@ impl SchedulerState {
             blockers,
             oldest_queued_writer_age_ms,
             in_flight_readers,
+            in_flight_writer,
             reader_admissions_while_promoted_writer_waited: actor
                 .map(|actor| actor.reader_admissions_while_promoted_writer_waited)
                 .unwrap_or(0),

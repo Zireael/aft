@@ -13,6 +13,7 @@ pub mod roots;
 pub mod transport;
 pub mod tsconfig_membership;
 pub(crate) mod typescript_project;
+mod writer;
 
 /// LSP subsystem error type.
 #[derive(Debug)]

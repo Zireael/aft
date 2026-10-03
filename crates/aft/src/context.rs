@@ -2958,6 +2958,10 @@ pub struct AppContext {
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// At most one diagnostics collector may outlive its caller's budget.
+    /// Later edits queue their latest disk contents instead of growing a pool
+    /// of threads waiting on a slow handshake or the same manager mutex.
+    lsp_post_edit_worker_running: Arc<AtomicBool>,
     /// Watcher changes waiting for the LSP manager lock. `Some` while the one
     /// helper thread that forwards them exists; drains that find the lock
     /// busy merge into it instead of starting threads of their own (see
@@ -3583,6 +3587,7 @@ impl AppContext {
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
+            lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
             lsp_pending_change_slot: Default::default(),
@@ -10203,28 +10208,92 @@ impl AppContext {
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
         let config = self.config();
-        // Start any missing server without the manager lock (a start is not
-        // charged to the diagnostics budget, as before), then wait for the
-        // lock within that budget. A budget spent waiting queues the change
-        // and reports every server that would have answered as pending: an
-        // empty outcome would read as "checked, no diagnostics".
-        crate::lsp::manager::start_servers_for_file_unlocked(
-            || self.lsp_manager.lock(),
-            file_path,
-            &config,
-        );
-        let lock_wait_started = Instant::now();
-        let locked = self.lsp_manager.try_lock_for(timeout);
-        let timeout = timeout.saturating_sub(lock_wait_started.elapsed());
-        let Some(mut lsp) = locked else {
-            self.lsp_notify_file_changed_queued_with_servers(file_path, &config);
+        let timeout = timeout.min(Duration::from_secs(10));
+        let pending = crate::lsp::manager::PostEditWaitOutcome {
+            pending_servers: crate::lsp::manager::expected_server_keys_for_file(file_path, &config),
+            ..Default::default()
+        };
+        if pending.pending_servers.is_empty() {
+            return pending;
+        }
+        if timeout.is_zero()
+            || self
+                .lsp_post_edit_worker_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            crate::lsp::pending_changes::queue_lsp_change(
+                &self.lsp_manager,
+                &self.lsp_pending_change_slot,
+                config,
+                |pending| pending.queue_document(file_path, !timeout.is_zero()),
+            );
+            return pending;
+        }
+
+        // The executor's writer slot waits only for this fixed budget. Cold
+        // initialization and manager reacquisition can otherwise extend a
+        // diagnostics wait even when the channel wait itself is lock-free.
+        struct RunningCollector(Arc<AtomicBool>);
+        impl Drop for RunningCollector {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let running = RunningCollector(Arc::clone(&self.lsp_post_edit_worker_running));
+        let manager = Arc::clone(&self.lsp_manager);
+        let slot = Arc::clone(&self.lsp_pending_change_slot);
+        let file_path = file_path.to_path_buf();
+        let content = content.to_string();
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if let Err(err) = std::thread::Builder::new()
+            .name("aft-lsp-post-edit".into())
+            .spawn(move || {
+                let outcome = Self::lsp_collect_post_edit_diagnostics(
+                    &manager, &slot, config, &file_path, &content, deadline,
+                );
+                // Release before sending: a sequential caller must not mistake
+                // the completed collector for an overlapping edit.
+                drop(running);
+                let _ = tx.send(outcome);
+            })
+        {
+            crate::slog_warn!("could not start post-edit diagnostics collector: {err}");
+            return pending;
+        }
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(pending)
+    }
+
+    fn lsp_collect_post_edit_diagnostics(
+        manager: &Arc<parking_lot::Mutex<LspManager>>,
+        slot: &crate::lsp::pending_changes::PendingLspChangeSlot,
+        config: Arc<Config>,
+        file_path: &Path,
+        content: &str,
+        deadline: Instant,
+    ) -> crate::lsp::manager::PostEditWaitOutcome {
+        crate::lsp::manager::start_servers_for_file_unlocked(|| manager.lock(), file_path, &config);
+        let locked = manager.try_lock_for(deadline.saturating_duration_since(Instant::now()));
+        if locked.is_none() || Instant::now() >= deadline {
+            drop(locked);
+            // Do not send captured contents after the caller timed out: a
+            // newer edit may already be on disk. The backlog reads it afresh.
+            crate::lsp::pending_changes::queue_lsp_change(
+                manager,
+                slot,
+                Arc::clone(&config),
+                |pending| pending.queue_document(file_path, true),
+            );
             return crate::lsp::manager::PostEditWaitOutcome {
                 pending_servers: crate::lsp::manager::expected_server_keys_for_file(
                     file_path, &config,
                 ),
                 ..Default::default()
             };
-        };
+        }
+        let mut lsp = locked.expect("manager lock acquired before deadline");
 
         // Clear any queued notifications before this write so the wait loop only
         // observes diagnostics triggered by the current change.
@@ -10243,7 +10312,18 @@ impl AppContext {
             Ok(v) => v,
             Err(e) => {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-                return crate::lsp::manager::PostEditWaitOutcome::default();
+                let pending_servers =
+                    crate::lsp::manager::expected_server_keys_for_file(file_path, &config);
+                let unresponsive_servers = pending_servers
+                    .iter()
+                    .filter(|key| lsp.producer_failure(key) == Some("server not responding"))
+                    .cloned()
+                    .collect();
+                return crate::lsp::manager::PostEditWaitOutcome {
+                    pending_servers,
+                    unresponsive_servers,
+                    ..Default::default()
+                };
             }
         };
 
@@ -10259,13 +10339,12 @@ impl AppContext {
         // The manager lock is released while servers work on the pull; the
         // wait registered below re-checks the store, so a publish another
         // drain consumed in the meantime is not missed.
-        let diagnostics_deadline = Instant::now() + timeout;
         drop(lsp);
         if let Err(err) = crate::lsp::manager::pull_file_diagnostics_unlocked(
-            || self.lsp_manager.lock(),
+            || manager.lock(),
             file_path,
             &config,
-            Some(timeout),
+            Some(deadline.saturating_duration_since(Instant::now())),
         ) {
             crate::slog_warn!(
                 "post-edit LSP diagnostic pull failed for {}: {}",
@@ -10273,8 +10352,8 @@ impl AppContext {
                 err
             );
         }
-        let mut lsp = self.lsp_manager.lock();
-        let remaining = diagnostics_deadline.saturating_duration_since(Instant::now());
+        let mut lsp = manager.lock();
+        let remaining = deadline.saturating_duration_since(Instant::now());
 
         // Register the wake receiver while the manager is still locked. Events
         // that raced with registration remain on the raw receiver; events won by
@@ -10292,32 +10371,11 @@ impl AppContext {
             // Waiting on channel activity does not require access to manager
             // state, so other LSP operations can continue their bookkeeping.
             let event = wait.next_event();
-            let mut lsp = self.lsp_manager.lock();
+            let mut lsp = manager.lock();
             complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, event);
         }
 
-        self.lsp_manager
-            .lock()
-            .finish_post_edit_diagnostics_wait(wait)
-    }
-
-    /// Queue a change that may start the file's servers, for a caller that
-    /// could not reach the LSP manager within its budget.
-    fn lsp_notify_file_changed_queued_with_servers(&self, file_path: &Path, config: &Arc<Config>) {
-        crate::lsp::pending_changes::send_or_queue_lsp_change(
-            &self.lsp_manager,
-            &self.lsp_pending_change_slot,
-            Arc::clone(config),
-            |lsp| {
-                let content = std::fs::read_to_string(file_path);
-                if let Ok(content) = content {
-                    if let Err(e) = lsp.notify_file_changed(file_path, &content, config) {
-                        crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-                    }
-                }
-            },
-            |pending| pending.queue_document(file_path, true),
-        );
+        manager.lock().finish_post_edit_diagnostics_wait(wait)
     }
 
     /// Collect custom server root_markers from user config for use in
