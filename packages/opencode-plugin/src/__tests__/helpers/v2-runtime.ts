@@ -28,7 +28,15 @@ export async function bootV2Runtime(config: Record<string, unknown> = {}) {
       prompt: () => Effect.void,
       synthetic: () => Effect.void,
       hook: (name: string, callback: (event: any) => Effect.Effect<unknown>) =>
-        Effect.sync(() => sessionHooks.set(name, callback)),
+        Effect.sync(() => {
+          const previous = sessionHooks.get(name);
+          sessionHooks.set(name, (event) =>
+            Effect.gen(function* () {
+              if (previous) yield* previous(event);
+              yield* callback(event);
+            }),
+          );
+        }),
     },
     tool: {
       hook: (name: string, callback: (event: any) => Effect.Effect<unknown>) =>
