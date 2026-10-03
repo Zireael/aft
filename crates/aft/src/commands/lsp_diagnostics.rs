@@ -480,7 +480,7 @@ fn wait_for_rust_check(
         note_wait_wakeup();
         let (busy, waiting, next_timed_change) = {
             let mut lsp = ctx.lsp();
-            lsp.handle_waited_event(event.take());
+            lsp.handle_waited_event(event);
             let mut busy = Vec::new();
             let mut waiting = false;
             for key in servers {
@@ -546,7 +546,7 @@ fn wait_for_push(
         note_wait_wakeup();
         let all_published = {
             let mut lsp = ctx.lsp();
-            lsp.handle_waited_event(event.take());
+            lsp.handle_waited_event(event);
             let all_published = push_servers.iter().all(|key| {
                 !lsp.has_client(key) || {
                     let pre = pre_push_snapshot.get(key).copied().unwrap_or_default();
