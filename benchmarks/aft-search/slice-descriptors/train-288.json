@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["oc2-host-patch-and-edit-gate"],
+  "note": "OpenCode 2 setup/doctor host patch disable and AFT edit-tool model gate (#395); no Rust or ranking-fence files."
+}
