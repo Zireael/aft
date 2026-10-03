@@ -23,7 +23,7 @@
               "type": "string"
             }
           ],
-          "description": "Hard kill timeout in milliseconds"
+          "description": "Hard kill timeout in milliseconds. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs."
         },
         "workdir": {
           "type": "string",
@@ -44,7 +44,7 @@
         },
         "background": {
           "type": "boolean",
-          "description": "Spawn command in background and return immediately with a task_id. Use bash_watch to wait for completion or output patterns; bash_status for a one-shot snapshot only. Use bash_kill to terminate. Ideal for long-running tasks like builds or dev servers."
+          "description": "Spawn command in background and return immediately with a task_id. Use bash_watch to wait for completion or output patterns; bash_status for a one-shot snapshot only. Use bash_kill to terminate. Ideal for long-running tasks like builds or dev servers. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs."
         },
         "compressed": {
           "type": "boolean",

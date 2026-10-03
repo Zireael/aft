@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e2351681b78ee23106fcc4b33fcd2db3fb19b2c30666711ce19522f45a50c41e",
-      "catalog_digest": "e2351681b78ee23106fcc4b33fcd2db3fb19b2c30666711ce19522f45a50c41e",
+      "generation": "e723115c1a813e4c51598a040053353c76a1e035e1af6ff52eb7488af79b1353",
+      "catalog_digest": "e723115c1a813e4c51598a040053353c76a1e035e1af6ff52eb7488af79b1353",
       "tools": [
         {
           "name": "status",
@@ -52,7 +52,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -75,7 +75,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -1106,8 +1106,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9af55d92c1eb13f47675ef6c7f0919aa1f12bbfb881d7807a5de1c8911d35554",
-      "catalog_digest": "9af55d92c1eb13f47675ef6c7f0919aa1f12bbfb881d7807a5de1c8911d35554",
+      "generation": "3fd032a1de14149f8cbfaf898989b3f88ed29639580c746a7c7f878990a35583",
+      "catalog_digest": "3fd032a1de14149f8cbfaf898989b3f88ed29639580c746a7c7f878990a35583",
       "tools": [
         {
           "name": "status",
@@ -1142,7 +1142,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -1165,7 +1165,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -3216,8 +3216,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "32ae8b3f47b68ada37e55e8808beefe36f12b5a1cad788ffc30584474b808b7b",
-      "catalog_digest": "32ae8b3f47b68ada37e55e8808beefe36f12b5a1cad788ffc30584474b808b7b",
+      "generation": "89a48d33615a7874e0116769a3ce8750600414a6a78f16473d8ee048bc979e2f",
+      "catalog_digest": "89a48d33615a7874e0116769a3ce8750600414a6a78f16473d8ee048bc979e2f",
       "tools": [
         {
           "name": "status",
@@ -3252,7 +3252,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -3275,7 +3275,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -4267,8 +4267,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b2440ec76ef240852ef6c59ab9cc86e0613b11a9b2c36b858c6f419658392663",
-      "catalog_digest": "b2440ec76ef240852ef6c59ab9cc86e0613b11a9b2c36b858c6f419658392663",
+      "generation": "38ea30e0221ae72224be704bb7a4c9f48241af745e575626d95f8fb102ab8bc9",
+      "catalog_digest": "38ea30e0221ae72224be704bb7a4c9f48241af745e575626d95f8fb102ab8bc9",
       "tools": [
         {
           "name": "status",
@@ -4303,7 +4303,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -4326,7 +4326,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -5316,8 +5316,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "25b36e0c4dd0ea838064b6b064e474080b87b094d9d9ec1b9c9246d1189ce106",
-      "catalog_digest": "25b36e0c4dd0ea838064b6b064e474080b87b094d9d9ec1b9c9246d1189ce106",
+      "generation": "81597e58a0e304dcb667b916a32d3f5dd6801782f94b1394340b317a67f500be",
+      "catalog_digest": "81597e58a0e304dcb667b916a32d3f5dd6801782f94b1394340b317a67f500be",
       "tools": [
         {
           "name": "status",
@@ -5352,7 +5352,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -5375,7 +5375,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -6318,8 +6318,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ac048beeddb774879972d831bbf34b03ca645722221311d014433b542d04b1b3",
-      "catalog_digest": "ac048beeddb774879972d831bbf34b03ca645722221311d014433b542d04b1b3",
+      "generation": "79874024a3d8e04b604f142900d402a6874aa7227ed8e85883f1ee6b0057626f",
+      "catalog_digest": "79874024a3d8e04b604f142900d402a6874aa7227ed8e85883f1ee6b0057626f",
       "tools": [
         {
           "name": "status",
@@ -6354,7 +6354,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -6377,7 +6377,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -7317,8 +7317,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8e89f5f2063aab821ead143f3a0fce6647cbb3ce778da3edddf3f03d60f1ad04",
-      "catalog_digest": "8e89f5f2063aab821ead143f3a0fce6647cbb3ce778da3edddf3f03d60f1ad04",
+      "generation": "2000b85c52daa1b3615746bf825ac7632ebc9573d651b5a96c4cfa3ab6a43392",
+      "catalog_digest": "2000b85c52daa1b3615746bf825ac7632ebc9573d651b5a96c4cfa3ab6a43392",
       "tools": [
         {
           "name": "status",
@@ -7353,7 +7353,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -7376,7 +7376,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -8279,8 +8279,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "261159eb5126e36ef7b88b05e650a8aeae348c622f10848cb83bb90b47a03283",
-      "catalog_digest": "261159eb5126e36ef7b88b05e650a8aeae348c622f10848cb83bb90b47a03283",
+      "generation": "f0d73e7213176fb976315bcca91e4cda1eb95d1cba81108b4037a1c93a18038f",
+      "catalog_digest": "f0d73e7213176fb976315bcca91e4cda1eb95d1cba81108b4037a1c93a18038f",
       "tools": [
         {
           "name": "status",
@@ -8315,7 +8315,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -8338,7 +8338,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -9235,8 +9235,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "63d3d5e511aa22445e480fc9bda4e79ab1b56b7fda054303a7a2addd4eb5586f",
-      "catalog_digest": "63d3d5e511aa22445e480fc9bda4e79ab1b56b7fda054303a7a2addd4eb5586f",
+      "generation": "f801a161cb67b7c081bfd28c7352fd97d6527da468c9736b42626dc8da930ccf",
+      "catalog_digest": "f801a161cb67b7c081bfd28c7352fd97d6527da468c9736b42626dc8da930ccf",
       "tools": [
         {
           "name": "status",
@@ -9271,7 +9271,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -9294,7 +9294,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -9340,7 +9340,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -9363,7 +9363,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -10395,8 +10395,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f14dd7b731900892a081d2b0c31b743a227e2b396326129794e7d4fd643f7d97",
-      "catalog_digest": "f14dd7b731900892a081d2b0c31b743a227e2b396326129794e7d4fd643f7d97",
+      "generation": "04652b479f80d853bdaf277d5d4cbafe7981177b2df3e68242a2abdc24013cc7",
+      "catalog_digest": "04652b479f80d853bdaf277d5d4cbafe7981177b2df3e68242a2abdc24013cc7",
       "tools": [
         {
           "name": "status",
@@ -10431,7 +10431,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -10454,7 +10454,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -10500,7 +10500,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -10523,7 +10523,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -11557,8 +11557,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "3706f985abd3634a1600c732b334a9af06a610fbffe557e21697ca2bfc514a06",
-      "catalog_digest": "3706f985abd3634a1600c732b334a9af06a610fbffe557e21697ca2bfc514a06",
+      "generation": "fd7f046949d2f209e3d8383931e8563098289731592dda80835e7ef7d4c243f1",
+      "catalog_digest": "fd7f046949d2f209e3d8383931e8563098289731592dda80835e7ef7d4c243f1",
       "tools": [
         {
           "name": "status",
@@ -11589,7 +11589,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -11612,7 +11612,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -12645,8 +12645,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "6f48baf7df86dbff514bd1378b93bf99eb25babf0f107a9e0bacb8e7de7fe5bb",
-      "catalog_digest": "6f48baf7df86dbff514bd1378b93bf99eb25babf0f107a9e0bacb8e7de7fe5bb",
+      "generation": "0b35b984ed89b92afc3dd1af206802a8ada1528367da75e74c969f36041bd63d",
+      "catalog_digest": "0b35b984ed89b92afc3dd1af206802a8ada1528367da75e74c969f36041bd63d",
       "tools": [
         {
           "name": "status",
@@ -12681,7 +12681,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -12704,7 +12704,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -12750,7 +12750,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -12773,7 +12773,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -13766,8 +13766,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f987ba9a2404c43ee03418a4fd0e8fbc426ad97848c626913e73d4ddb76384d1",
-      "catalog_digest": "f987ba9a2404c43ee03418a4fd0e8fbc426ad97848c626913e73d4ddb76384d1",
+      "generation": "96f108613a0808d9b172a89218af816b4fbdc8ddc3b80b2fd3c53d6e4467e06c",
+      "catalog_digest": "96f108613a0808d9b172a89218af816b4fbdc8ddc3b80b2fd3c53d6e4467e06c",
       "tools": [
         {
           "name": "status",
@@ -13802,7 +13802,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -13825,7 +13825,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -13871,7 +13871,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -13894,7 +13894,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -14885,8 +14885,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b73611a73a739268b8bc42ac3dc481583222656e6dd34b45af2b25252de09d4f",
-      "catalog_digest": "b73611a73a739268b8bc42ac3dc481583222656e6dd34b45af2b25252de09d4f",
+      "generation": "d4c4c9daf5bbf01f3cca295b8afeda44fae30bc07e439ebc02d6ac1274cc9b10",
+      "catalog_digest": "d4c4c9daf5bbf01f3cca295b8afeda44fae30bc07e439ebc02d6ac1274cc9b10",
       "tools": [
         {
           "name": "status",
@@ -14921,7 +14921,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -14944,7 +14944,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -14990,7 +14990,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -15013,7 +15013,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -15957,8 +15957,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "001a41b0b58fc14a4b8444e08fd6c187d8929967f81ecd07ecfb842917c03430",
-      "catalog_digest": "001a41b0b58fc14a4b8444e08fd6c187d8929967f81ecd07ecfb842917c03430",
+      "generation": "e096f624598017b9c0b39ff24b7b5c0fd0b9fbbced33a4bacce8d3709dcc0ef4",
+      "catalog_digest": "e096f624598017b9c0b39ff24b7b5c0fd0b9fbbced33a4bacce8d3709dcc0ef4",
       "tools": [
         {
           "name": "status",
@@ -15993,7 +15993,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -16016,7 +16016,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -16062,7 +16062,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -16085,7 +16085,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -17026,8 +17026,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "220d77917790f5b834c73bda1d3564e888dd14e7b6b4047abc52242be90116ed",
-      "catalog_digest": "220d77917790f5b834c73bda1d3564e888dd14e7b6b4047abc52242be90116ed",
+      "generation": "2a9f6f45e7aca3f7ad648d6c9382f38fe919681d3836ffbaaeb0a82ed1a9a515",
+      "catalog_digest": "2a9f6f45e7aca3f7ad648d6c9382f38fe919681d3836ffbaaeb0a82ed1a9a515",
       "tools": [
         {
           "name": "status",
@@ -17062,7 +17062,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -17085,7 +17085,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -17131,7 +17131,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -17154,7 +17154,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -18058,8 +18058,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e6cd509f427fa10d2276a35536bd8e478ebc9700cf312ba8bf7e21141c9f3a28",
-      "catalog_digest": "e6cd509f427fa10d2276a35536bd8e478ebc9700cf312ba8bf7e21141c9f3a28",
+      "generation": "26571637a497a3bbb90eec3bdaff56ab154fde5fc59c502cc4b48d7004f12da2",
+      "catalog_digest": "26571637a497a3bbb90eec3bdaff56ab154fde5fc59c502cc4b48d7004f12da2",
       "tools": [
         {
           "name": "status",
@@ -18094,7 +18094,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -18117,7 +18117,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {
@@ -18163,7 +18163,7 @@
                 "type": "string"
               },
               "timeout": {
-                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout.",
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
@@ -18186,7 +18186,7 @@
                 "const": "host"
               },
               "background": {
-                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false.",
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
                 "type": "boolean"
               },
               "compressed": {

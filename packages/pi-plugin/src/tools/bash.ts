@@ -166,6 +166,20 @@ const BashBaseParams = {
   ),
 };
 
+/**
+ * `timeout` as shown while background tasks exist. It says up front that a
+ * background task without a timeout is killed after 30 minutes, so a caller
+ * can plan for it before launching. A fixed phrase, not the configured value,
+ * so the prompt is the same for every user.
+ */
+const BashBackgroundTimeoutParam = {
+  timeout: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "Hard kill timeout in milliseconds. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+  ),
+};
+
 const BashWaitParam = {
   wait: Type.Optional(
     Type.Boolean({
@@ -242,6 +256,8 @@ function bashParamsForConfig(
 ): typeof BashParams {
   return Type.Object({
     ...BashBaseParams,
+    // Replaces the base `timeout` in place (the key keeps its position).
+    ...(features.background ? BashBackgroundTimeoutParam : {}),
     ...(features.background ? BashWaitParam : {}),
     ...(features.sandbox ? BashSandboxParam : {}),
     ...(features.background
@@ -301,7 +317,7 @@ function backgroundParamDescription(c: RegisteredCompanions): string {
     controls += " Use bash_status for a one-shot snapshot.";
   }
   if (c.kill) controls += " Use bash_kill to terminate.";
-  return `Spawn command in background and return immediately with a task_id.${controls} Ideal for long-running tasks like builds or dev servers.`;
+  return `Spawn command in background and return immediately with a task_id.${controls} Ideal for long-running tasks like builds or dev servers. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.`;
 }
 
 /**

@@ -442,7 +442,7 @@ export function createBashTool(
           .boolean()
           .optional()
           .describe(
-            `When true, spawn the command in the background and return a taskId${taskControls.length > 0 ? ` for ${taskControls.join("/")}` : ""} instead of waiting for completion. Defaults to false.`,
+            `When true, spawn the command in the background and return a taskId${taskControls.length > 0 ? ` for ${taskControls.join("/")}` : ""} instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.`,
           ),
       }
     : {};
@@ -468,7 +468,7 @@ export function createBashTool(
       .describe("Shell command to execute. Supports pipes, redirection, and normal shell syntax."),
     timeout: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
       initialBashCfg.background
-        ? "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout."
+        ? "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs."
         : "Hard kill cap in milliseconds (positive integer). When omitted, the foreground command can run up to 30 minutes and returns inline when it finishes.",
     ),
     workdir: z
