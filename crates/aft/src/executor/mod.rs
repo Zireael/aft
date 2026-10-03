@@ -491,6 +491,7 @@ pub struct BindBlockerSnapshot {
 pub struct JobCancellation {
     inner: Arc<JobCancellationInner>,
     root: Option<Arc<std::path::PathBuf>>,
+    lifecycle: Option<crate::context::SubcLifecycleAdmission>,
 }
 
 #[derive(Debug)]
@@ -514,12 +515,28 @@ impl JobCancellation {
                 wake: Condvar::new(),
             }),
             root: None,
+            lifecycle: None,
         }
     }
 
     pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
         self.root = Some(Arc::new(root.to_path_buf()));
         self
+    }
+
+    pub(crate) fn with_lifecycle(
+        mut self,
+        lifecycle: crate::context::SubcLifecycleAdmission,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        let mut token = Self::new();
+        token.root = self.root.clone();
+        token.lifecycle = self.lifecycle.clone();
+        token
     }
 
     fn mark_running(&self) -> bool {
@@ -650,6 +667,9 @@ impl JobCancellation {
         // at admission so deletion during a batch does not wait for the reaper.
         if self.root.as_ref().is_some_and(|root| !root.is_dir()) {
             self.request_cancel();
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_if_abandoned(|| self.request_cancel());
         }
         self.state() == JOB_CANCEL_STATE_CANCELLED
     }
@@ -1135,6 +1155,21 @@ impl Executor {
         if cancelled > 0 {
             self.wake_scheduler();
         }
+        cancelled
+    }
+
+    /// Quiesce drops queued maintenance; running jobs consult the lifecycle grace
+    /// through their tokens rather than being abandoned on a short disconnect.
+    pub(crate) fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let cancelled = self
+            .inner
+            .state
+            .lock()
+            .actors
+            .get_mut(root_id)
+            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .unwrap_or(0);
+        self.wake_scheduler();
         cancelled
     }
 
@@ -1643,7 +1678,7 @@ impl Executor {
         } else {
             cancellation
         };
-        let cancellation = cancellation.map(|token| token.with_root(root_id.as_path()));
+        let mut cancellation = cancellation.map(|token| token.with_root(root_id.as_path()));
         let mut rerun = rerun;
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -1654,6 +1689,13 @@ impl Executor {
             match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
+                    if (job_class == JobClass::Maintenance || command == "inspect")
+                        && command != "unbound-teardown-persist"
+                    {
+                        cancellation = cancellation.map(|token| {
+                            token.with_lifecycle(actor.ctx.subc_lifecycle_admission())
+                        });
+                    }
                     let mut admission_error = None;
                     if job_class == JobClass::Maintenance {
                         if (actor.ctx.subc_unbound_quiesced()

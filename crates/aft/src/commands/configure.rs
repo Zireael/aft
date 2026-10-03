@@ -1026,7 +1026,8 @@ fn spawn_semantic_refresh_worker(
                 }
 
                 if !project_root.is_dir()
-                    || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                    || (lifecycle.unbound_past_grace()
+                        || generation_flag.load(Ordering::SeqCst) != generation)
                 {
                     return;
                 }
@@ -1039,7 +1040,8 @@ fn spawn_semantic_refresh_worker(
                 // therefore never wait on this maintenance limiter.
                 let Some(_refresh_permit) = limiter.acquire(&project_root, || {
                     project_root.is_dir()
-                        && lifecycle.is_current(generation_flag.as_ref(), generation)
+                        && (!lifecycle.unbound_past_grace()
+                            && generation_flag.load(Ordering::SeqCst) == generation)
                 }) else {
                     return;
                 };
@@ -1102,7 +1104,8 @@ fn spawn_semantic_refresh_worker(
                     let mut embed_batches = 0usize;
                     let mut embed = |texts: Vec<String>| {
                         if !project_root.is_dir()
-                            || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                            || (lifecycle.unbound_past_grace()
+                                || generation_flag.load(Ordering::SeqCst) != generation)
                         {
                             let snapshot = progress_for_embed.snapshot();
                             slog_info!(
@@ -1220,7 +1223,8 @@ fn spawn_semantic_refresh_worker(
                 let mut embed_batches = 0usize;
                 let mut embed = |texts: Vec<String>| {
                     if !project_root.is_dir()
-                        || !lifecycle.is_current(generation_flag.as_ref(), generation)
+                        || (lifecycle.unbound_past_grace()
+                            || generation_flag.load(Ordering::SeqCst) != generation)
                     {
                         let snapshot = progress_for_embed.snapshot();
                         slog_info!(
@@ -8919,8 +8923,9 @@ mod tests {
         if delete_root {
             directory.close().expect("delete semantic root mid-refresh");
         } else {
+            ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
             ctx.mark_subc_unbound();
-            assert_eq!(executor.cancel_root_maintenance(&root), 1);
+            assert_eq!(executor.cancel_queued_root_maintenance(&root), 0);
         }
         release_tx.send(()).expect("release embedding delay");
         let events = observed_rx

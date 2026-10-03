@@ -204,7 +204,9 @@ pub(crate) fn schedule(
     if ctx.subc_unbound_quiesced() || !root.is_dir() {
         return Err("view root is unbound or missing".to_owned());
     }
-    let token = JobCancellation::new().with_root(&root);
+    let token = JobCancellation::new()
+        .with_root(&root)
+        .with_lifecycle(ctx.subc_lifecycle_admission());
     token.mark_running();
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
@@ -242,7 +244,6 @@ pub(crate) fn schedule(
                 }
                 if token.cancel_requested_before_commit()
                     || target.ctx.configure_content_generation() != content_generation
-                    || target.ctx.subc_unbound_quiesced()
                     || !target.ctx.config().views.enabled
                 {
                     break;

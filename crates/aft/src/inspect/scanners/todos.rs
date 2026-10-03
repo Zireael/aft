@@ -780,15 +780,20 @@ mod tests {
 
     #[test]
     fn quiesced_root_aborts_real_executor_todos_scan_mid_parse() {
-        executor_todos_abandonment(false);
+        executor_todos_abandonment(false, false);
     }
 
     #[test]
     fn deleted_root_aborts_real_executor_todos_scan_mid_parse() {
-        executor_todos_abandonment(true);
+        executor_todos_abandonment(true, false);
     }
 
-    fn executor_todos_abandonment(delete_root: bool) {
+    #[test]
+    fn quiesced_root_rebound_within_grace_completes_real_executor_todos_scan() {
+        executor_todos_abandonment(false, true);
+    }
+
+    fn executor_todos_abandonment(delete_root: bool, rebind: bool) {
         use crate::context::AppContext;
         use crate::executor::{Executor, Lane};
         use crate::parser::TreeSitterProvider;
@@ -811,6 +816,11 @@ mod tests {
                 ..Config::default()
             },
         ));
+        ctx.set_unbound_build_abandon_grace_for_test(if rebind {
+            Duration::from_secs(600)
+        } else {
+            Duration::ZERO
+        });
         ctx.mark_subc_bound();
         let executor = Executor::new();
         executor.register_actor(root.clone(), Arc::clone(&ctx));
@@ -844,17 +854,28 @@ mod tests {
             directory.close().expect("delete TODO root mid-scan");
         } else {
             ctx.mark_subc_unbound();
-            assert_eq!(executor.cancel_root_maintenance(&root), 1);
+            executor.cancel_queued_root_maintenance(&root);
+            if rebind {
+                ctx.mark_subc_bound();
+            }
         }
         release_tx.send(()).expect("release TODO parser delay");
         let result = result_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("TODO scan terminates after abandonment");
-        assert!(
-            matches!(result.outcome, Err(ref error) if error.contains("cancelled")),
-            "abandoned TODO scan must not report a fresh aggregate: {:?}",
-            result.outcome
-        );
+        if rebind {
+            assert!(
+                result.outcome.is_ok(),
+                "short unbind must preserve running TODO scan: {:?}",
+                result.outcome
+            );
+        } else {
+            assert!(
+                matches!(result.outcome, Err(ref error) if error.contains("cancelled")),
+                "abandoned TODO scan must not report a fresh aggregate: {:?}",
+                result.outcome
+            );
+        }
         let response = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()

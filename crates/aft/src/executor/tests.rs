@@ -4237,9 +4237,10 @@ fn promoted_bind_does_not_freeze_reads_behind_a_stuck_reader() {
 }
 
 #[test]
-fn quiesce_signals_running_maintenance_and_refuses_late_work() {
+fn quiesced_root_past_grace_signals_running_maintenance_and_refuses_late_work() {
     let (_dir, root) = test_root("quiesce-running");
     let ctx = test_ctx();
+    ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
     let executor = test_executor(2, 2, 2, 1);
     executor.register_actor(root.clone(), Arc::clone(&ctx));
     let (started_tx, started_rx) = crossbeam_channel::bounded(1);
@@ -4260,7 +4261,7 @@ fn quiesce_signals_running_maintenance_and_refuses_late_work() {
     );
     started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     ctx.mark_subc_unbound();
-    assert_eq!(executor.cancel_root_maintenance(&root), 1);
+    assert_eq!(executor.cancel_queued_root_maintenance(&root), 0);
     let late = executor.submit_maintenance_async(
         root.clone(),
         Lane::HeavyInit,
@@ -4315,4 +4316,36 @@ fn deleted_root_aborts_running_maintenance_without_a_reaper() {
         Box::new(|_| panic!("missing root admitted maintenance")),
     );
     assert!(!recv_async(late, "late deleted maintenance").success);
+}
+
+#[test]
+fn quiesced_root_rebound_within_grace_preserves_running_maintenance() {
+    let (_dir, root) = test_root("short-unbind");
+    let ctx = test_ctx();
+    ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(600));
+    ctx.mark_subc_bound();
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), Arc::clone(&ctx));
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "short-unbind".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                !current_job_cancelled(),
+                "short rebind must preserve running maintenance"
+            );
+            ok("short-unbind")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ctx.mark_subc_unbound();
+    executor.cancel_queued_root_maintenance(&root);
+    ctx.mark_subc_bound();
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "short rebind maintenance").success);
 }

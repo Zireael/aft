@@ -672,13 +672,21 @@ impl InspectManager {
             .request_cancel();
     }
 
+    pub(crate) fn set_root_lifecycle(&self, lifecycle: crate::context::SubcLifecycleAdmission) {
+        let mut token = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *token = token.clone().with_lifecycle(lifecycle);
+    }
+
     pub(crate) fn resume_root_work(&self) {
         let mut token = self
             .root_work_cancellation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if token.cancel_requested_before_commit() {
-            *token = crate::executor::JobCancellation::new();
+            *token = token.fresh();
         }
     }
 

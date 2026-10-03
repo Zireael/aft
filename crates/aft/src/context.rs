@@ -292,7 +292,7 @@ pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120
 /// Serializes the daemon's bound/unbound transition with admission of deferred
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SubcLifecycleAdmission {
     unbound: Arc<parking_lot::Mutex<bool>>,
     /// When the current unbound period started; `None` while bound. Written
@@ -344,6 +344,26 @@ impl SubcLifecycleAdmission {
         self.unbound_since
             .lock()
             .is_some_and(|since| since.elapsed() >= grace)
+    }
+
+    /// Serialize cancellation with rebind: a root rebound before this decision
+    /// cannot have its still-running work cancelled by a stale grace check.
+    pub(crate) fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
+        // A checkpoint may be inside a lifecycle admission closure that already
+        // owns this lock. Defer that checkpoint instead of recursively locking;
+        // the next batch/parser poll makes the synchronized decision.
+        let Some(unbound) = self.unbound.try_lock() else {
+            return;
+        };
+        let grace = Duration::from_millis(self.abandon_grace_ms.load(Ordering::SeqCst));
+        if *unbound
+            && self
+                .unbound_since
+                .lock()
+                .is_some_and(|since| since.elapsed() >= grace)
+        {
+            cancel();
+        }
     }
 
     #[cfg(test)]
@@ -3428,6 +3448,12 @@ impl AppContext {
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let heavy_root_work_allowed = Arc::new(AtomicBool::new(true));
         let semantic_cold_seed_active = Arc::new(AtomicBool::new(false));
+        let subc_lifecycle = SubcLifecycleAdmission::default();
+        let inspect_manager = Arc::new(InspectManager::with_root_work_gates(
+            Arc::clone(&heavy_root_work_allowed),
+            Arc::clone(&semantic_cold_seed_active),
+        ));
+        inspect_manager.set_root_lifecycle(subc_lifecycle.clone());
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<TreeSitterProvider>()
@@ -3511,10 +3537,7 @@ impl AppContext {
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
-            inspect_manager: Arc::new(InspectManager::with_root_work_gates(
-                Arc::clone(&heavy_root_work_allowed),
-                Arc::clone(&semantic_cold_seed_active),
-            )),
+            inspect_manager,
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
             pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
@@ -3556,7 +3579,7 @@ impl AppContext {
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
-            subc_lifecycle: SubcLifecycleAdmission::default(),
+            subc_lifecycle,
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
@@ -4457,7 +4480,6 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
-        self.inspect_manager.cancel_root_work();
         self.repeat_breaker.clear();
     }
 
@@ -9873,6 +9895,7 @@ impl AppContext {
     /// The executor invokes this only after proving the actor has no queued or
     /// running jobs, and always from a detached teardown thread.
     pub(crate) fn teardown_deleted_root(&self) {
+        self.inspect_manager.cancel_root_work();
         self.bash_background.detach();
         self.bash_background.clear_db_pool();
         self.backup.lock().clear_db_pool();

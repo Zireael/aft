@@ -1487,7 +1487,11 @@ fn quiesce_unbound_root(
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
-    let cancelled = executor.cancel_root_maintenance(root_id);
+    let cancelled = if root_id.as_path().is_dir() {
+        executor.cancel_queued_root_maintenance(root_id)
+    } else {
+        executor.cancel_root_maintenance(root_id)
+    };
     // Transient unbind keeps the root WARM: the watcher stays running (its
     // events accumulate and replay on rebind, so no unobserved gap exists) and
     // resident artifacts stay resident. Host restarts unbind every root and
@@ -1495,8 +1499,12 @@ fn quiesce_unbound_root(
     // re-verification plus a full callgraph rebuild on every restart. The
     // expensive teardown (watcher stop + gap invalidation) belongs to the
     // idle-TTL reaper and the root-deleted path.
-    // Executor maintenance and inspect still stop cooperatively: retaining
-    // warm artifacts does not admit new indexing work on an unbound root.
+    // Drop queued maintenance and refuse new work immediately, but preserve
+    // running builds and inspect during the 120-second abandonment grace.
+    // Host/module restarts briefly unbind every root; cancelling here would
+    // throw away fleet-wide cold-build progress on every reconnect. Running
+    // tokens poll the synchronized lifecycle at batch/parse checkpoints and
+    // cancel only past grace, or immediately when the checkout disappears.
     let discarded = ctx
         .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
         .unwrap_or(0);
