@@ -1439,15 +1439,23 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
     // Zoom's own call lists come from the file's syntax tree; its call graph
     // field must say the index is not serving, not present an empty graph.
     assert_eq!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
-    // Once the republish with call graph data lands, callers answers.
+    // Once the republish with call graph data lands, callers answers. Right
+    // after that publication its derived database is checkpointed, and a
+    // reader that meets the checkpoint gets a retryable `callgraph_building`.
+    // That answer is acceptable only once the published generation carries a
+    // call graph: the pointer is read before each request, so "building"
+    // while the generation without call graph data is still current fails.
     let deadline = Instant::now() + DEADLINE;
     loop {
+        let keyed_generation_published = current_generation_has_callgraph(&root, &storage);
         let answer = aft.send(&callers);
         if answer["success"] == true {
             assert!(answer.to_string().contains("caller"), "{answer:#}");
             break;
         }
-        assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
+        if !(keyed_generation_published && answer["code"] == "callgraph_building") {
+            assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
+        }
         assert!(
             Instant::now() < deadline,
             "the call graph was never published"
@@ -1455,6 +1463,19 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         thread::sleep(Duration::from_millis(250));
     }
     assert!(aft.shutdown().success());
+}
+
+/// Whether `root`'s current published view generation carries call graph
+/// data. False while no generation is published or its manifest cannot be
+/// read (a superseded generation may be collected between the two reads).
+fn current_generation_has_callgraph(root: &Path, storage: &Path) -> bool {
+    let view =
+        aft::views::ViewStore::open(storage, &aft::path_identity::project_scope_key(root)).unwrap();
+    let Some(generation) = view.current_generation_read_only().unwrap() else {
+        return false;
+    };
+    view.load_manifest(&generation)
+        .is_ok_and(|manifest| !aft::views::assembly::manifest_lacks_callgraph(&manifest))
 }
 
 /// Publishes `root`'s current view generation with the call graph off, as a

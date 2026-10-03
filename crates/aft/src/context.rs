@@ -12659,6 +12659,124 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    impl ViewsCallgraphFixture {
+        /// Publish the current HEAD as a generation without call graph data,
+        /// as a session with the call graph off does, and pin it as this
+        /// context's view, as configure does when it loads that generation.
+        fn publish_without_callgraph(&self) -> String {
+            let view = self.ctx.view_runtime_snapshot().expect("view runtime");
+            let head = crate::alias::head_tree_entries(&self.root).expect("HEAD entries");
+            let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+            let report = crate::views::assembly::publish_checkout(
+                &crate::views::assembly::AssemblyRequest {
+                    storage: view.storage.clone(),
+                    project_root: self.root.clone(),
+                    family: view.family.clone(),
+                    scope: view.scope.clone(),
+                    desired_head: desired_head.clone(),
+                    changed_paths: Default::default(),
+                    semantic_keys: Default::default(),
+                    require_semantic: false,
+                    allow_blob_put: true,
+                    callgraph: false,
+                },
+            )
+            .expect("keyless view publication");
+            assert!(report.published, "keyless generation must publish");
+            let manifest = report.manifest.expect("published manifest");
+            assert!(crate::views::assembly::manifest_lacks_callgraph(&manifest));
+            let generation = report.generation.expect("published generation");
+            let pin =
+                crate::pins::QueryPin::acquire(&view.view_dir, &generation).expect("query pin");
+            self.ctx.install_view_runtime(
+                ViewRuntimeSnapshot {
+                    generation: Some(generation.clone()),
+                    manifest: Some(manifest),
+                    head_fingerprint: desired_head,
+                    pending_paths: BTreeSet::new(),
+                    ..view
+                },
+                Some(pin),
+            );
+            generation
+        }
+
+        /// Hold the derived database of the pinned generation busy the way a
+        /// writer does mid-maintenance: an exclusive lock that a zero-wait
+        /// reader cannot get past. Waits for the publication's own deferred
+        /// checkpoint first so only this connection holds the file. The lock
+        /// lasts as long as the returned connection.
+        fn hold_pinned_derived_busy(&self) -> rusqlite::Connection {
+            let view = self.ctx.pinned_view_runtime().expect("pinned view runtime");
+            crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
+            let generation = view.generation.expect("pinned generation");
+            let path = crate::views::resolve_derived_path(&view.view_dir, &generation)
+                .expect("derived path");
+            assert!(
+                path.is_file(),
+                "derived database {} missing",
+                path.display()
+            );
+            let holder = rusqlite::Connection::open(&path).expect("derived writer");
+            holder
+                .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+                .expect("exclusive derived lock");
+            holder
+        }
+    }
+
+    /// Whether a generation carries a call graph is a property of its
+    /// manifest alone. A generation published with the call graph off must
+    /// answer "disabled" even while its derived database is busy; answering
+    /// "building, retry" would send the agent into a retry loop for a graph
+    /// that will never be built from this generation.
+    #[test]
+    fn views_keyless_generation_answers_disabled_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish_without_callgraph();
+        let _busy = fixture.hold_pinned_derived_busy();
+
+        let response = fixture.callers();
+
+        assert!(!response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["code"], "callgraph_unavailable",
+            "{:#}",
+            response.data
+        );
+        assert!(
+            response.data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(crate::views::read::CALLGRAPH_DISABLED)),
+            "{:#}",
+            response.data
+        );
+    }
+
+    /// The counterpart: a generation that does carry a call graph, read while
+    /// its derived database is busy, is temporarily unreadable and says so as
+    /// a retryable `callgraph_building`. This also proves the busy hold above
+    /// really blocks a reader that opens the store.
+    #[test]
+    fn views_keyed_generation_answers_building_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish();
+        let _busy = fixture.hold_pinned_derived_busy();
+
+        let response = fixture.callers();
+
+        assert!(!response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["code"], "callgraph_building",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["message"],
+            "callers: persisted callgraph store is busy; retry shortly"
+        );
+    }
+
     #[test]
     fn views_published_navigation_uses_cached_head_without_git_spawns() {
         let fixture = ViewsCallgraphFixture::new();
