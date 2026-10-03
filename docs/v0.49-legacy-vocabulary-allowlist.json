@@ -228,11 +228,11 @@
     },
     {
       "path": "crates/aft/src/compress/mod.rs",
-      "line": 2089,
+      "line": 2110,
       "column": 19,
       "token": "filePath",
       "text": "r#\"[{\"filePath\":\"/repo/src/main.ts\",\"messages\":[],\"errorCount\":0,\"warningCount\":0}]\"#;",
-      "location": "line 2089, column 19",
+      "location": "line 2110, column 19",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
