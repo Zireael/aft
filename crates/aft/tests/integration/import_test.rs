@@ -2541,11 +2541,11 @@ fn organize_imports_ts_preserves_namespace_and_side_effect_imports() {
 
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import 'fs';"),
+        content.contains("import 'fs'\n"),
         "side-effect import must survive alongside namespace import. got:\n{content}"
     );
     assert!(
-        content.contains("import * as fs from 'fs';"),
+        content.contains("import * as fs from 'fs'\n"),
         "namespace import must not be dedup'd as a side-effect import. got:\n{content}"
     );
 
@@ -2580,11 +2580,11 @@ fn organize_imports_ts_preserves_side_effect_and_namespace_imports_reverse_order
 
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import 'fs';"),
+        content.contains("import 'fs'\n"),
         "side-effect import must survive when namespace import appears first. got:\n{content}"
     );
     assert!(
-        content.contains("import * as fs from 'fs';"),
+        content.contains("import * as fs from 'fs'\n"),
         "namespace import must survive when side-effect import appears second. got:\n{content}"
     );
 
@@ -2617,7 +2617,7 @@ fn organize_imports_ts_dedupes_identical_namespace_imports() {
 
     let content = fs::read_to_string(&file).unwrap();
     assert_eq!(
-        content.matches("import * as fs from 'fs';").count(),
+        content.matches("import * as fs from 'fs'").count(),
         1,
         "identical namespace imports should dedupe. got:\n{content}"
     );
@@ -2652,11 +2652,11 @@ fn organize_imports_ts_keeps_distinct_namespace_aliases() {
 
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import * as foo from 'fs';"),
+        content.contains("import * as foo from 'fs'\n"),
         "namespace alias `foo` must survive. got:\n{content}"
     );
     assert!(
-        content.contains("import * as bar from 'fs';"),
+        content.contains("import * as bar from 'fs'\n"),
         "namespace alias `bar` must survive. got:\n{content}"
     );
 
@@ -2688,7 +2688,7 @@ fn organize_imports_ts_sorts_named_specifiers_by_imported_name() {
 
     let content = fs::read_to_string(&file).unwrap();
     assert!(
-        content.contains("import { type Bar, type Foo, stdin as input, useState } from 'x';"),
+        content.contains("import { type Bar, type Foo, stdin as input, useState } from 'x'\n"),
         "named specifiers should sort by imported name, ignoring `type` and aliases. got:\n{content}"
     );
 
@@ -3493,4 +3493,187 @@ fn es_import_commands_preserve_quotes() {
         assert!(organized.contains("import { a } from \"z\";"));
         assert!(organized.contains("import { b } from 'b';"));
     }
+}
+
+/// Semicolon-free import lines must come back semicolon-free: a project using
+/// Biome `semicolons: "asNeeded"` or Prettier `semi: false` fails its format
+/// check when a rewrite adds a terminator the original statement did not have.
+#[test]
+fn es_import_commands_preserve_missing_semicolons() {
+    for (extension, source) in [
+        ("ts", "import type { A, B } from './types.ts'\nimport { z } from 'z'\n\nexport const x = 1\n"),
+        ("tsx", "import type { A, B } from './types.ts'\nimport { z } from 'z'\n\nexport const x = 1\n"),
+        ("js", "import { A, B } from './types.js'\nimport { z } from 'z'\n\nexport const x = 1\n"),
+        ("vue", "<script setup lang=\"ts\">\nimport type { A, B } from './types.ts'\nimport { z } from 'z'\n</script>\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("nosemi.{extension}"));
+        fs::write(&file, source).unwrap();
+        let types = if extension == "js" { "./types.js" } else { "./types.ts" };
+        let mut aft = AftProcess::spawn();
+
+        let response = aft.send(&serde_json::json!({
+            "id": "nosemi-remove", "command": "remove_import", "file": file,
+            "module": types, "name": "A"
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains(&format!("{{ B }} from '{types}'\n")), "{extension} remove:\n{text}");
+
+        let response = send_add_import(&mut aft, "nosemi-merge", file.to_str().unwrap(), "z", Some(&["y"]), None, false);
+        assert_eq!(response["success"], true, "{response}");
+        let text = fs::read_to_string(&file).unwrap();
+        // Vue add_import never merges into an existing statement; it inserts
+        // a new one, which must still follow the semicolon-free majority.
+        let merged = if extension == "vue" { "import { y } from 'z'\n" } else { "import { y, z } from 'z'\n" };
+        assert!(text.contains(merged), "{extension} add to existing:\n{text}");
+
+        let response = send_add_import(&mut aft, "nosemi-new", file.to_str().unwrap(), "c", Some(&["c"]), None, false);
+        assert_eq!(response["success"], true, "{response}");
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(text.contains("import { c } from 'c'\n"), "{extension} add new:\n{text}");
+
+        let response = aft.send(&serde_json::json!({
+            "id": "nosemi-organize", "command": "organize_imports", "file": file
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(!text.contains(';'), "{extension} organize added a semicolon:\n{text}");
+        assert!(text.contains("import { c } from 'c'\n"), "{extension} organize:\n{text}");
+        aft.shutdown();
+    }
+}
+
+/// The same commands on semicolon-terminated imports keep the semicolons.
+#[test]
+fn es_import_commands_keep_semicolons() {
+    for (extension, source) in [
+        ("ts", "import type { A, B } from './types.ts';\nimport { z } from 'z';\n\nexport const x = 1;\n"),
+        ("js", "import { A, B } from './types.ts';\nimport { z } from 'z';\n\nexport const x = 1;\n"),
+        ("vue", "<script setup lang=\"ts\">\nimport type { A, B } from './types.ts';\nimport { z } from 'z';\n</script>\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("semi.{extension}"));
+        fs::write(&file, source).unwrap();
+        let mut aft = AftProcess::spawn();
+
+        let response = aft.send(&serde_json::json!({
+            "id": "semi-remove", "command": "remove_import", "file": file,
+            "module": "./types.ts", "name": "A"
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+        let response = send_add_import(&mut aft, "semi-merge", file.to_str().unwrap(), "z", Some(&["y"]), None, false);
+        assert_eq!(response["success"], true, "{response}");
+        let response = send_add_import(&mut aft, "semi-new", file.to_str().unwrap(), "c", Some(&["c"]), None, false);
+        assert_eq!(response["success"], true, "{response}");
+        let response = aft.send(&serde_json::json!({
+            "id": "semi-organize", "command": "organize_imports", "file": file
+        }).to_string());
+        assert_eq!(response["success"], true, "{response}");
+
+        let text = fs::read_to_string(&file).unwrap();
+        let merged = if extension == "vue" { "import { y } from 'z';\n" } else { "import { y, z } from 'z';\n" };
+        for line in ["{ B } from './types.ts';\n", merged, "import { c } from 'c';\n"] {
+            assert!(text.contains(line), "{extension} missing {line:?}:\n{text}");
+        }
+    }
+}
+
+/// A rewrite keeps the rewritten statement's own terminator even when the
+/// rest of the file disagrees, while a brand-new statement follows the
+/// file's majority.
+#[test]
+fn es_import_rewrites_keep_each_statements_terminator() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mixed.ts");
+    fs::write(
+        &file,
+        "import { a, b } from 'a';\nimport { d } from 'd';\nimport { e, f } from 'e'\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "mixed-remove", "command": "remove_import", "file": file,
+            "module": "e", "name": "e"
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    let response = send_add_import(
+        &mut aft,
+        "mixed-merge",
+        file.to_str().unwrap(),
+        "a",
+        Some(&["c"]),
+        None,
+        false,
+    );
+    assert_eq!(response["success"], true, "{response}");
+    let response = send_add_import(
+        &mut aft,
+        "mixed-new",
+        file.to_str().unwrap(),
+        "g",
+        Some(&["g"]),
+        None,
+        false,
+    );
+    assert_eq!(response["success"], true, "{response}");
+    let text = fs::read_to_string(&file).unwrap();
+    for line in [
+        "import { a, b, c } from 'a';\n",
+        "import { f } from 'e'\n",
+        "import { g } from 'g';\n",
+    ] {
+        assert!(text.contains(line), "missing {line:?}:\n{text}");
+    }
+
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "mixed-organize", "command": "organize_imports", "file": file
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "{response}");
+    let text = fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        text,
+        "import { a, b, c } from 'a';\nimport { d } from 'd';\nimport { f } from 'e'\nimport { g } from 'g';\n"
+    );
+}
+
+/// With no import to copy, a new statement follows the project's Biome
+/// `javascript.formatter.semicolons` setting.
+#[test]
+fn es_add_import_follows_biome_semicolons_without_existing_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::write(
+        root.join("biome.json"),
+        r#"{"javascript":{"formatter":{"semicolons":"asNeeded","quoteStyle":"single"}}}"#,
+    )
+    .unwrap();
+    let file = root.join("empty.ts");
+    fs::write(&file, "export const x = 1\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(&format!(
+        r#"{{"id":"cfg","command":"configure","harness":"opencode","project_root":{}}}"#,
+        serde_json::to_string(root.to_str().unwrap()).unwrap()
+    ));
+    assert_eq!(configure["success"], true, "{configure}");
+
+    let response = send_add_import(
+        &mut aft,
+        "biome-new",
+        file.to_str().unwrap(),
+        "c",
+        Some(&["c"]),
+        None,
+        false,
+    );
+    assert_eq!(response["success"], true, "{response}");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.starts_with("import { c } from 'c'\n"), "{text}");
 }

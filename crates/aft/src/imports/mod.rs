@@ -1294,7 +1294,7 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
     type_only: bool,
     attribute_clause: Option<&str>,
 ) -> String {
-    generate_import_line_with_namespace_and_attribute_clause_and_quote(
+    generate_import_line_with_namespace_and_attribute_clause_and_style(
         lang,
         module_path,
         names,
@@ -1306,7 +1306,10 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
     )
 }
 
-pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_quote(
+/// Generate a line spelled with `style` (quote and terminator) for ES
+/// languages; `None` uses [`quotes::EsImportStyle::default`]. Other language
+/// engines ignore the style.
+pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_style(
     lang: LangId,
     module_path: &str,
     names: &[String],
@@ -1314,7 +1317,7 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_quote
     namespace_import: Option<&str>,
     type_only: bool,
     attribute_clause: Option<&str>,
-    quote: Option<char>,
+    style: Option<quotes::EsImportStyle>,
 ) -> String {
     if matches!(
         lang,
@@ -1327,7 +1330,7 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_quote
             namespace_import,
             type_only,
             attribute_clause,
-            quote.unwrap_or('\''),
+            style.unwrap_or_default(),
         );
     }
 
@@ -1829,7 +1832,7 @@ fn generate_ts_import_line(
         namespace_import,
         type_only,
         None,
-        '\'',
+        quotes::EsImportStyle::default(),
     )
 }
 
@@ -1840,24 +1843,27 @@ fn generate_ts_import_line_with_attribute_clause(
     namespace_import: Option<&str>,
     type_only: bool,
     attribute_clause: Option<&str>,
-    quote: char,
+    style: quotes::EsImportStyle,
 ) -> String {
-    let line = generate_ts_import_line_base(
+    let mut line = generate_ts_import_line_base(
         module_path,
         names,
         default_import,
         namespace_import,
         type_only,
-        quote,
+        style.quote,
     );
-    let Some(attribute_clause) = attribute_clause else {
-        return line;
-    };
-
-    let line = line.strip_suffix(';').unwrap_or(&line);
-    format!("{line} {};", attribute_clause.trim())
+    if let Some(attribute_clause) = attribute_clause {
+        line.push(' ');
+        line.push_str(attribute_clause.trim());
+    }
+    if style.semicolon {
+        line.push(';');
+    }
+    line
 }
 
+/// The statement without its terminator, which the caller adds per style.
 fn generate_ts_import_line_base(
     module_path: &str,
     names: &[String],
@@ -1871,27 +1877,27 @@ fn generate_ts_import_line_base(
 
     // Side-effect import
     if names.is_empty() && default_import.is_none() && namespace_import.is_none() {
-        return format!("import {module_path};");
+        return format!("import {module_path}");
     }
 
     // Namespace import only
     if names.is_empty() && default_import.is_none() {
         if let Some(namespace) = namespace_import {
-            return format!("import {type_prefix}* as {namespace} from {module_path};");
+            return format!("import {type_prefix}* as {namespace} from {module_path}");
         }
     }
 
     // Default + namespace import
     if names.is_empty() {
         if let (Some(def), Some(namespace)) = (default_import, namespace_import) {
-            return format!("import {type_prefix}{def}, * as {namespace} from {module_path};");
+            return format!("import {type_prefix}{def}, * as {namespace} from {module_path}");
         }
     }
 
     // Default import only
     if names.is_empty() && namespace_import.is_none() {
         if let Some(def) = default_import {
-            return format!("import {type_prefix}{def} from {module_path};");
+            return format!("import {type_prefix}{def} from {module_path}");
         }
     }
 
@@ -1900,7 +1906,7 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{{ {names_str} }} from {module_path};");
+        return format!("import {type_prefix}{{ {names_str} }} from {module_path}");
     }
 
     // Namespace + named imports
@@ -1910,7 +1916,7 @@ fn generate_ts_import_line_base(
             sort_named_specifiers(&mut sorted_names);
             let names_str = sorted_names.join(", ");
             return format!(
-                "import {type_prefix}{{ {names_str} }}, * as {namespace} from {module_path};"
+                "import {type_prefix}{{ {names_str} }}, * as {namespace} from {module_path}"
             );
         }
     }
@@ -1921,7 +1927,7 @@ fn generate_ts_import_line_base(
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
         return format!(
-            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from {module_path};"
+            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from {module_path}"
         );
     }
 
@@ -1930,11 +1936,11 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{def}, {{ {names_str} }} from {module_path};");
+        return format!("import {type_prefix}{def}, {{ {names_str} }} from {module_path}");
     }
 
     // Shouldn't reach here, but handle gracefully
-    format!("import {module_path};")
+    format!("import {module_path}")
 }
 
 // ---------------------------------------------------------------------------
@@ -3428,6 +3434,35 @@ import { Config } from '../config';
             false,
         );
         assert_eq!(line, "import React, { useState } from 'react';");
+    }
+
+    #[test]
+    fn generate_es_line_follows_style_terminator() {
+        let render = |semicolon, clause| {
+            generate_import_line_with_namespace_and_attribute_clause_and_style(
+                LangId::TypeScript,
+                "./data.json",
+                &[],
+                Some("data"),
+                None,
+                false,
+                clause,
+                Some(quotes::EsImportStyle {
+                    quote: '\'',
+                    semicolon,
+                }),
+            )
+        };
+        assert_eq!(render(false, None), "import data from './data.json'");
+        assert_eq!(render(true, None), "import data from './data.json';");
+        assert_eq!(
+            render(false, Some("with { type: 'json' }")),
+            "import data from './data.json' with { type: 'json' }"
+        );
+        assert_eq!(
+            render(true, Some("with { type: 'json' }")),
+            "import data from './data.json' with { type: 'json' };"
+        );
     }
 
     #[test]

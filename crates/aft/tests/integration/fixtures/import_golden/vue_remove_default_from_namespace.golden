@@ -3,6 +3,6 @@
 </template>
 
 <script setup lang="ts">
-import * as NS from 'react';
+import * as NS from 'react'
 const x = NS
 </script>

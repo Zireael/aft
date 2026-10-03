@@ -407,6 +407,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         symbol_name,
         Some(source_lang),
         moved_symbol_is_default,
+        &project_root,
     ) {
         Ok(Some(rewritten)) => {
             new_source = rewritten;
@@ -440,6 +441,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             symbol_name,
             detect_language(consumer_file),
             moved_symbol_is_default,
+            &project_root,
         ) {
             Ok(Some(rewritten)) => {
                 if let Some(capture) = consumer_capture {
@@ -1117,6 +1119,7 @@ fn rewrite_consumer_imports(
     symbol_name: &str,
     lang: Option<LangId>,
     moved_symbol_is_default: bool,
+    project_root: &Path,
 ) -> Result<Option<String>, Vec<String>> {
     let Some(lang) = lang else {
         return Ok(None);
@@ -1205,12 +1208,16 @@ fn rewrite_consumer_imports(
 
         let type_only = imp.kind == imports::ImportKind::Type;
         let attribute_clause = imports::es_import_attribute_clause(imp);
+        // Both the kept and the moved statement replace this one, so both keep
+        // its quote and terminator.
+        let style = imports::quotes::statement_style(&imp.raw_text);
         let moved_import = generate_import_for_bindings(
             lang,
             &new_import_path,
             &moved_bindings,
             type_only,
             attribute_clause,
+            style,
         );
 
         if remaining_names.is_empty()
@@ -1219,15 +1226,17 @@ fn rewrite_consumer_imports(
         {
             edits.push((imp.byte_range.clone(), moved_import));
         } else {
-            let kept_import = imports::generate_import_line_with_namespace_and_attribute_clause(
-                lang,
-                &imp.module_path,
-                &remaining_names,
-                remaining_default.as_deref(),
-                remaining_namespace.as_deref(),
-                type_only,
-                attribute_clause,
-            );
+            let kept_import =
+                imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                    lang,
+                    &imp.module_path,
+                    &remaining_names,
+                    remaining_default.as_deref(),
+                    remaining_namespace.as_deref(),
+                    type_only,
+                    attribute_clause,
+                    Some(style),
+                );
             edits.push((
                 imp.byte_range.clone(),
                 format!("{kept_import}\n{moved_import}"),
@@ -1276,8 +1285,11 @@ fn rewrite_consumer_imports(
                 edits.push((module_range, new_import_path.clone()));
             } else {
                 let old_path = &content[module_range];
+                let style = imports::quotes::statement_style(&content[node.byte_range()]);
+                let quote = style.quote;
+                let terminator = if style.semicolon { ";" } else { "" };
                 let replacement = format!(
-                    "export {{ {} }} from '{}';\nexport {{ {} }} from '{}';",
+                    "export {{ {} }} from {quote}{}{quote}{terminator}\nexport {{ {} }} from {quote}{}{quote}{terminator}",
                     remaining_specs.join(", "),
                     old_path,
                     moved_specs.join(", "),
@@ -1293,12 +1305,14 @@ fn rewrite_consumer_imports(
     {
         if let Some(insert_edit) = build_add_moved_import_edit(
             content,
+            &tree,
             &block,
             consumer_file,
             dest_file,
             symbol_name,
             lang,
             moved_symbol_is_default,
+            project_root,
         ) {
             edits.push(insert_edit);
         }
@@ -1311,12 +1325,14 @@ fn rewrite_consumer_imports(
         if let Some(import_specifier) = namespace_plan.import_specifier.as_deref() {
             if let Some(import_edit) = build_add_moved_import_edit(
                 content,
+                &tree,
                 &block,
                 consumer_file,
                 dest_file,
                 import_specifier,
                 lang,
                 false,
+                project_root,
             ) {
                 edits.push(import_edit);
             }
@@ -1744,8 +1760,9 @@ fn generate_import_for_bindings(
     bindings: &MovedImportBindings,
     type_only: bool,
     attribute_clause: Option<&str>,
+    style: imports::quotes::EsImportStyle,
 ) -> String {
-    imports::generate_import_line_with_namespace_and_attribute_clause(
+    imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
         lang,
         module_path,
         &bindings.named,
@@ -1753,6 +1770,7 @@ fn generate_import_for_bindings(
         bindings.namespace_import.as_deref(),
         type_only,
         attribute_clause,
+        Some(style),
     )
 }
 
@@ -1770,12 +1788,14 @@ fn parse_imports_from_content(
 
 fn build_add_moved_import_edit(
     content: &str,
+    tree: &tree_sitter::Tree,
     block: &imports::ImportBlock,
     consumer_file: &Path,
     dest_file: &Path,
     symbol_name: &str,
     lang: LangId,
     moved_symbol_is_default: bool,
+    project_root: &Path,
 ) -> Option<(std::ops::Range<usize>, String)> {
     let new_import_path = compute_relative_import_path(consumer_file, dest_file);
     let names = if moved_symbol_is_default {
@@ -1813,15 +1833,17 @@ fn build_add_moved_import_edit(
 
             let merged_names =
                 super::add_import::merge_named_import_specifiers(&existing.names, &names);
-            let merged_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-                lang,
-                &existing.module_path,
-                &merged_names,
-                existing.default_import.as_deref(),
-                existing.namespace_import.as_deref(),
-                false,
-                imports::es_import_attribute_clause(existing),
-            );
+            let merged_line =
+                imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                    lang,
+                    &existing.module_path,
+                    &merged_names,
+                    existing.default_import.as_deref(),
+                    existing.namespace_import.as_deref(),
+                    false,
+                    imports::es_import_attribute_clause(existing),
+                    Some(imports::quotes::statement_style(&existing.raw_text)),
+                );
             return Some((existing.byte_range.clone(), merged_line));
         }
     }
@@ -1840,7 +1862,7 @@ fn build_add_moved_import_edit(
         let inherited_clause = clauses
             .next()
             .filter(|first| clauses.all(|item| item == *first));
-        imports::generate_import_line_with_namespace_and_attribute_clause(
+        imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
             lang,
             &new_import_path,
             &names,
@@ -1848,6 +1870,13 @@ fn build_add_moved_import_edit(
             None,
             false,
             inherited_clause,
+            Some(imports::quotes::preferred_style(
+                content,
+                tree,
+                lang,
+                consumer_file,
+                Some(project_root),
+            )),
         )
     } else {
         imports::generate_import_line(lang, &new_import_path, &names, default_import, false)
