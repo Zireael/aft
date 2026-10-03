@@ -39,6 +39,7 @@ fn extraction_lookup_work_is_subquadratic() {
     let (_, large) = measured(&synthetic(128), "typescript");
     let small_visits = small.ordinal_visits + small.dispatch_visits;
     let large_visits = large.ordinal_visits + large.dispatch_visits;
+    println!("lookup work for 64 -> 128 functions: {small_visits} -> {large_visits}");
     assert!(small_visits > 0, "lookups must exercise the work counter");
     assert!(
         large_visits <= small_visits * 3,
@@ -207,6 +208,11 @@ fn extraction_corpus_bytes_and_work() {
         let destination = output.join(relative);
         if compare {
             let baseline = std::fs::read(&destination).unwrap();
+            if bytes != baseline {
+                // Keep both payloads when a comparison fails so the differing
+                // fields can be inspected without running another extraction.
+                std::fs::write(destination.with_extension("head.json"), &bytes).unwrap();
+            }
             assert_eq!(bytes.len(), baseline.len(), "length differs: {relative:?}");
             assert!(bytes == baseline, "serialized bytes differ: {relative:?}");
         } else {

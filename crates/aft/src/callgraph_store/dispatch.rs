@@ -477,12 +477,13 @@ pub fn extract(
         if let Some(symbol) =
             symbols_by_name_line.get(&(name.as_str(), node.start_position().row as u32))
         {
+            let symbol = symbol.scoped_name.clone();
             method_names.insert((owner.clone(), name.clone(), trait_name.clone()));
             facts.methods.push(MethodHint {
                 owner,
                 trait_name,
                 name,
-                symbol: symbol.scoped_name.clone(),
+                symbol,
                 has_body: field(*node, &["body"]).is_some(),
                 shape: method_shape(*node, source),
                 private: text(*node, source)
