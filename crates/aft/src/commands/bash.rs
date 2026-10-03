@@ -1108,11 +1108,17 @@ mod tests {
         crate::bash_background::persistence::write_task(&path, &record).unwrap();
     }
 
-    /// A fresh engine context over the same storage that reloads the session's
-    /// tasks from their records, as AFT does after a restart. `window_ms` is
-    /// the worker wait limit the restarted engine grants.
+    /// Simulates an AFT restart: the old engine lets go of its tasks without
+    /// killing them (as an exiting AFT process does), and a fresh engine
+    /// context over the same storage reloads the session's tasks from their
+    /// records. `window_ms` is the worker wait limit the restarted engine
+    /// grants. The old context must be detached first: a real restart never
+    /// leaves the old registry running, and one that still held the child
+    /// would see its own child die when the new engine kills it and record
+    /// `failed` over the same task record.
     #[cfg(unix)]
-    fn restart(project: &Path, storage: &Path, window_ms: u64) -> AppContext {
+    fn restart(old: &AppContext, project: &Path, storage: &Path, window_ms: u64) -> AppContext {
+        old.bash_background().detach();
         let restarted = spawn_test_context(project, storage);
         restarted
             .bash_background()
@@ -1156,13 +1162,12 @@ mod tests {
             "the renewed limit reached the record"
         );
 
-        let restarted = restart(project.path(), storage.path(), 300);
+        let restarted = restart(&ctx, project.path(), storage.path(), 300);
         std::thread::sleep(std::time::Duration::from_millis(1_500));
         let status =
             crate::commands::bash_status::handle(&status_request(&task, false), &restarted).data;
         assert_eq!(status["status"], "running", "{status:?}");
         let _ = restarted.bash_background().kill(&task, session);
-        let _ = ctx.bash_background().kill(&task, session);
     }
 
     /// A reloaded task whose recorded default limit passed during the
@@ -1182,7 +1187,7 @@ mod tests {
         set_recorded_limit(&ctx, &task, 1);
 
         let reloaded_at = std::time::Instant::now();
-        let restarted = restart(project.path(), storage.path(), 3_000);
+        let restarted = restart(&ctx, project.path(), storage.path(), 3_000);
         let status = |restarted: &AppContext| {
             crate::commands::bash_status::handle(&status_request(&task, false), restarted).data
         };
@@ -1224,7 +1229,7 @@ mod tests {
                 .starts_with("killed by AFT's default background limit"),
             "{killed:?}"
         );
-        let _ = ctx.bash_background().kill(&task, session);
+        let _ = restarted.bash_background().kill(&task, session);
     }
 
     /// A caller's explicit `timeout` is never extended, after a restart
@@ -1241,7 +1246,7 @@ mod tests {
         // The caller's timeout passed while AFT was down.
         set_recorded_limit(&ctx, &task, 200);
 
-        let restarted = restart(project.path(), storage.path(), 2 * 3600 * 1000);
+        let restarted = restart(&ctx, project.path(), storage.path(), 2 * 3600 * 1000);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let data =
@@ -1260,7 +1265,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = ctx.bash_background().kill(&task, session);
+        let _ = restarted.bash_background().kill(&task, session);
     }
 
     /// A kill by the caller's own `timeout` is named as that, not as AFT's
