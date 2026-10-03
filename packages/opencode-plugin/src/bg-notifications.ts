@@ -81,6 +81,13 @@ type SessionBgState = {
   wakeRetryAttempts: number;
   wakeHardStopped: boolean;
   forcedDrainCompleted: boolean;
+  /**
+   * A pushed completion for a task this process does not track arrived since
+   * the last successful drain. Only a drain can deliver it (the push path
+   * buffers it), so the next idle tool result must drain even after the
+   * one-time replay drain has run.
+   */
+  untrackedCompletionSinceDrain: boolean;
   unknownCompletions: Array<{ completion: BgCompletion; receivedAt: number }>;
   /**
    * Task IDs spawned since the last session.idle event. Push completions for
@@ -525,6 +532,11 @@ export async function appendInTurnBgCompletions(
     state.pendingLongRunning.length === 0 &&
     state.pendingPatternMatches.length === 0
   ) {
+    // This hook runs after every tool result, AFT or not. With nothing
+    // tracked or pending, a drain can only find something the daemon holds
+    // that this process does not know about; skip the round trip unless
+    // that is possible (see idleDrainMayFindWork).
+    if (!idleDrainMayFindWork(state)) return;
     await drainCompletions(drainContext);
     if (
       state.outstandingTaskIds.size === 0 &&
@@ -1429,10 +1441,33 @@ function isTerminalNudgeError(error: unknown): boolean {
   );
 }
 
+/**
+ * Whether a drain with nothing tracked or pending could still return work:
+ * - no drain has succeeded yet in this session, so completions from before a
+ *   plugin restart may be waiting (the one-time replay drain);
+ * - a pushed completion for an untracked task arrived since the last drain;
+ * - a delivered completion's ack has not been confirmed, and only a drain
+ *   re-acks it.
+ * A task spawned through the bash tool is tracked as outstanding, which takes
+ * the normal drain path, so finishing between two tool results is covered.
+ */
+function idleDrainMayFindWork(state: SessionBgState): boolean {
+  return (
+    !state.forcedDrainCompleted ||
+    state.untrackedCompletionSinceDrain ||
+    state.deliveredAwaitingAckTaskIds.size > 0
+  );
+}
+
 async function drainCompletions(drainContext: DrainContext): Promise<void> {
+  const state = stateFor(drainContext.sessionID);
+  // Clear before sending so a push that lands while the drain is in flight
+  // re-arms the flag; restore it if this drain does not succeed.
+  const hadUntrackedCompletion = state.untrackedCompletionSinceDrain;
+  state.untrackedCompletionSinceDrain = false;
+  let drained = false;
   try {
     const bridge = bridgeForDrain(drainContext);
-    const state = stateFor(drainContext.sessionID);
     const response = await withBgHopTimeout(
       bridge.send(
         "bash_drain_completions",
@@ -1455,6 +1490,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       return;
     }
     state.forcedDrainCompleted = true;
+    drained = true;
     const drainedCompletions = Array.isArray(response.bg_completions)
       ? response.bg_completions.filter(isBgCompletion)
       : [];
@@ -1505,6 +1541,8 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       },
       "warn",
     );
+  } finally {
+    if (!drained && hadUntrackedCompletion) state.untrackedCompletionSinceDrain = true;
   }
 }
 
@@ -1770,6 +1808,7 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       wakeRetryAttempts: 0,
       wakeHardStopped: false,
       forcedDrainCompleted: false,
+      untrackedCompletionSinceDrain: false,
       unknownCompletions: [],
       wakeDeferredTaskIds: new Set(),
       consumedTaskIds: new Set(),
@@ -1848,6 +1887,7 @@ function cleanupIdleSessionStates(now: number): void {
 }
 
 function bufferUnknownCompletion(state: SessionBgState, completion: BgCompletion): void {
+  state.untrackedCompletionSinceDrain = true;
   const now = Date.now();
   pruneUnknownCompletions(state, now);
   state.unknownCompletions = state.unknownCompletions.filter(

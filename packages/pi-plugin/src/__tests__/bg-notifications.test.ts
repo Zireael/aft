@@ -268,6 +268,91 @@ describe("Pi background notifications", () => {
     ]);
   });
 
+  // Every tool result (AFT or not) runs this hook. With no task outstanding
+  // and nothing pending, only the first result needs the replay drain; the
+  // rest must not pay a bridge round trip each.
+  test("idle tool results drain once per session, not once per result", async () => {
+    const send = mock(async () => ({ success: true, bg_completions: [] }));
+    const { ctx } = harness(send);
+
+    for (let i = 0; i < 10; i++) {
+      const content = await appendToolResultBgCompletions(
+        { ctx, directory: "/tmp/project", sessionID: "s1" },
+        [{ type: "text", text: `tool output ${i}` }],
+      );
+      expect(content).toBeUndefined();
+    }
+
+    expect(send.mock.calls.map((call) => call[0])).toEqual(["bash_drain_completions"]);
+  });
+
+  test("a task that finishes between two tool results is delivered on the second", async () => {
+    let held: ReturnType<typeof completion>[] = [];
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: held }
+        : { success: true, acked_task_ids: held.map((c) => c.task_id) },
+    );
+    const { ctx } = harness(send);
+    const drainContext = { ctx, directory: "/tmp/project", sessionID: "s1" };
+
+    expect(
+      await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "first" }]),
+    ).toBeUndefined();
+
+    // The bash tool spawns a background task, which then finishes with no
+    // push frame reaching the plugin; the daemon only holds the completion.
+    trackBgTask("s1", "task-1");
+    held = [completion("task-1", "sleep 1")];
+
+    const second = await appendToolResultBgCompletions(drainContext, [
+      { type: "text", text: "second" },
+    ]);
+    expect(JSON.stringify(second)).toContain("- task task-1 (exit 0)");
+  });
+
+  test("a push for an untracked task re-arms the idle drain", async () => {
+    let held: ReturnType<typeof completion>[] = [];
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: held }
+        : { success: true, acked_task_ids: held.map((c) => c.task_id) },
+    );
+    const { ctx } = harness(send);
+    const drainContext = { ctx, directory: "/tmp/project", sessionID: "s1" };
+
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "first" }]);
+
+    // A completion this process never tracked is buffered by the push
+    // handler, not delivered; the daemon still holds it unacknowledged.
+    held = [completion("task-9", "make")];
+    await handlePushedBgCompletion(
+      { ...drainContext, runtime: { sendUserMessage: mock(async () => {}) } },
+      held[0],
+    );
+
+    const second = await appendToolResultBgCompletions(drainContext, [
+      { type: "text", text: "second" },
+    ]);
+    expect(JSON.stringify(second)).toContain("- task task-9 (exit 0)");
+  });
+
+  test("a failed idle drain is retried on the next tool result", async () => {
+    let fail = true;
+    const send = mock(async () =>
+      fail ? { success: false, message: "busy" } : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const drainContext = { ctx, directory: "/tmp/project", sessionID: "s1" };
+
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "first" }]);
+    fail = false;
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "second" }]);
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "third" }]);
+
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
   test("turn-end wake sends one runtime user message with reminder", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
