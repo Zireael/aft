@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/rerank/remote.rs",
+    "crates/aft/src/semantic_index.rs"
+  ],
+  "slices": [
+    "perf-callgraph-store",
+    "live-daemon-closed-root-work",
+    "stage-card-debug-map-check"
+  ],
+  "note": "The two fenced files change only how the HTTP client is built: embedding (OpenAI-compatible and Ollama) and remote rerank calls now share one process-wide blocking client instead of building one per model or call. Request bodies, timeouts and responses are unchanged, and the benchmark runs local embeddings with rerank off, so every reference row must stay byte-identical. The call-graph work changes build cost only; base-vs-head dumps of every graph row and sampled callers/call_tree/trace_to output were identical on two real repositories."
+}
