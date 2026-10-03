@@ -1612,22 +1612,21 @@ fn api_invocation_writes(args: &[OsString]) -> bool {
         return true;
     };
     let method = shape.effective_method();
-    if matches!(method.as_str(), "GET" | "HEAD") {
-        return false;
-    }
-    // A GraphQL call is always a POST; only a mutation changes anything.
     if shape.path == "/graphql" {
         return !graphql_query_is_read_only(args);
+    }
+    if matches!(method.as_str(), "GET" | "HEAD") {
+        return false;
     }
     true
 }
 
-/// True when every `query` field of a `gh api graphql` call is inline text
-/// with no `mutation` in it. A query read from a file or stdin, a call with
-/// `--input`, or a call with no query field cannot be inspected here, so it
-/// counts as a write.
+/// Admit only inline documents consisting entirely of query operations.
+/// External payloads and unknown argv forms cannot establish that the actual
+/// document sent by gh is the one inspected here, so they fail closed.
 fn graphql_query_is_read_only(args: &[OsString]) -> bool {
     let mut queries = Vec::new();
+    let mut endpoint_seen = false;
     let mut index = 1;
     while index < args.len() {
         let Some(value) = args[index].to_str() else {
@@ -1653,14 +1652,206 @@ fn graphql_query_is_read_only(args: &[OsString]) -> bool {
         } else {
             None
         };
-        if let Some(("query", text)) = field.and_then(|field| field.split_once('=')) {
-            queries.push(text);
+        if let Some(field) = field {
+            let Some((key, text)) = field.split_once('=') else {
+                return false;
+            };
+            if key == "query" {
+                queries.push(text);
+            } else if key.starts_with("query[") {
+                // gh's bracket syntax can replace a scalar with an array or
+                // object. Do not let another field overwrite the inspected query.
+                return false;
+            }
+        } else if matches!(value, "graphql" | "/graphql") && !endpoint_seen {
+            endpoint_seen = true;
+        } else if matches!(
+            value,
+            "--method"
+                | "-X"
+                | "--header"
+                | "-H"
+                | "--hostname"
+                | "--cache"
+                | "--jq"
+                | "-q"
+                | "--template"
+                | "-t"
+        ) {
+            if args.get(index).and_then(|arg| arg.to_str()).is_none() {
+                return false;
+            }
+            index += 1;
+        } else if matches!(
+            value,
+            "--paginate" | "--slurp" | "--silent" | "--include" | "-i" | "--verbose"
+        ) || [
+            "--method=",
+            "-X",
+            "--header=",
+            "-H",
+            "--hostname=",
+            "--cache=",
+            "--jq=",
+            "-q",
+            "--template=",
+            "-t",
+        ]
+        .iter()
+        .any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        }) {
+            // These flags do not supply or replace the request document.
+        } else {
+            return false;
         }
     }
-    !queries.is_empty()
+    endpoint_seen
+        && !queries.is_empty()
         && queries
             .iter()
-            .all(|query| !query.starts_with('@') && !query.contains("mutation"))
+            .all(|query| graphql_document_is_read_only(query))
+}
+
+/// Tokenize just enough GraphQL to identify operation boundaries. Strings
+/// (including block strings) and comments cannot introduce an operation, and
+/// mismatched delimiters or unsupported definitions are never admitted. This
+/// is deliberately not a schema validator: GitHub still validates query fields.
+fn graphql_document_is_read_only(document: &str) -> bool {
+    let Some(tokens) = graphql_tokens(document) else {
+        return false;
+    };
+    let mut index = 0;
+    let mut operations = 0;
+    while index < tokens.len() {
+        if tokens[index] == "query" {
+            index += 1;
+            if tokens.get(index).is_some_and(|token| graphql_name(token)) {
+                index += 1;
+            }
+            if tokens.get(index) == Some(&"(") && !graphql_skip_group(&tokens, &mut index) {
+                return false;
+            }
+            while tokens.get(index) == Some(&"@") {
+                index += 1;
+                if !tokens.get(index).is_some_and(|token| graphql_name(token)) {
+                    return false;
+                }
+                index += 1;
+                if tokens.get(index) == Some(&"(") && !graphql_skip_group(&tokens, &mut index) {
+                    return false;
+                }
+            }
+        }
+        // Both a named query and the bare shorthand must start a selection
+        // set here. In particular mutation, subscription, and fragments are
+        // not accepted as top-level definitions, even when operationName would
+        // select a different operation in the same document.
+        if tokens.get(index) != Some(&"{") || !graphql_skip_group(&tokens, &mut index) {
+            return false;
+        }
+        operations += 1;
+    }
+    operations > 0
+}
+
+fn graphql_name(token: &str) -> bool {
+    token
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+}
+
+fn graphql_tokens(document: &str) -> Option<Vec<&str>> {
+    let bytes = document.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        match bytes[index] {
+            b' ' | b'\t' | b'\r' | b'\n' | b',' => {
+                index += 1;
+                continue;
+            }
+            b'#' => {
+                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                    index += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                let block = bytes[index..].starts_with(b"\"\"\"");
+                let delimiter: &[u8] = if block { b"\"\"\"" } else { b"\"" };
+                index += delimiter.len();
+                loop {
+                    if index >= bytes.len() {
+                        return None;
+                    }
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                    } else if bytes[index..].starts_with(delimiter) {
+                        index += delimiter.len();
+                        break;
+                    } else {
+                        if !block && matches!(bytes[index], b'\r' | b'\n') {
+                            return None;
+                        }
+                        index += 1;
+                    }
+                }
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                index += 1;
+                while index < bytes.len()
+                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                {
+                    index += 1;
+                }
+            }
+            b'!'
+            | b'$'
+            | b'('
+            | b')'
+            | b'.'
+            | b':'
+            | b'='
+            | b'@'
+            | b'['
+            | b']'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'-'
+            | b'0'..=b'9' => index += 1,
+            _ => return None,
+        }
+        tokens.push(&document[start..index]);
+    }
+    Some(tokens)
+}
+
+fn graphql_skip_group(tokens: &[&str], index: &mut usize) -> bool {
+    let mut closers = Vec::new();
+    while let Some(token) = tokens.get(*index) {
+        *index += 1;
+        match *token {
+            "{" => closers.push("}"),
+            "(" => closers.push(")"),
+            "[" => closers.push("]"),
+            "}" | ")" | "]" => {
+                if closers.pop() != Some(*token) {
+                    return false;
+                }
+                if closers.is_empty() {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What a write acts on (see `WriteTarget`), from the same resolver the
@@ -4158,6 +4349,16 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     let Some((method, path, has_fields)) = api_method_and_path(args) else {
         return Classification::Unclassified;
     };
+    if path == "/graphql" {
+        // Like a field-free REST GET, an inspected GraphQL read delegates to
+        // the real gh unchanged under the operator's existing login. It never
+        // mints an assertion or routes through the governed-write relay.
+        return if graphql_query_is_read_only(args) {
+            Classification::Mechanical
+        } else {
+            Classification::Unclassified
+        };
+    }
     let matches = manifest
         .api_rules
         .iter()
@@ -8851,6 +9052,120 @@ mod tests {
             assert!(
                 matches_expected,
                 "negative control {raw_args:?} changed from {expected}: {classification:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn graphql_reads_delegate_unchanged_as_mechanical_operator_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = fixture_manifest();
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "bound-agent".into(),
+        };
+        for query in [
+            r#"{ repository(owner:"o", name:"r") { pullRequest(number:1) { reviewThreads(first:100){nodes{isResolved}} } } }"#,
+            "query Read($n: Int!) { repository { issue(number: $n) { title } } }",
+            "query First { viewer { login } } query Second { viewer { id } }",
+            r#"{ repository(name:"mutation") { mutationField } }"#,
+            "# mutation is only a comment\n{ viewer { login } }",
+            r#"query Read @skip(if: false) { field(arg: "\"}") }"#,
+            "{ field(arg: \"\"\"mutation { text }\"\"\") }",
+        ] {
+            let args = os_args(&[
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={query}"),
+                "-F",
+                "n=1",
+            ]);
+            let classification = classify(&args, &manifest, "macos");
+            assert!(
+                matches!(classification, Classification::Mechanical),
+                "{query}: {classification:?}"
+            );
+            assert!(!api_invocation_writes(&args));
+            assert_eq!(
+                dispatch_r3(
+                    &args,
+                    classification,
+                    &manifest,
+                    &paths,
+                    &rung,
+                    &binding,
+                    TEST_NOW,
+                    |forwarded| {
+                        assert_eq!(forwarded, args);
+                        73
+                    }
+                ),
+                73
+            );
+            assert!(!paths.seam_state.exists());
+            assert!(!paths.bypass_audit.exists());
+        }
+    }
+
+    #[test]
+    fn graphql_mutations_subscriptions_and_uninspectable_queries_are_refused() {
+        let manifest = fixture_manifest();
+        for tail in [
+            &[][..],
+            &["-f", "query=mutation { addStar }"],
+            &["-f", "query=subscription { events }"],
+            &[
+                "-f",
+                "query=query Read { viewer { login } } mutation Write { addStar }",
+                "-f",
+                "operationName=Write",
+            ],
+            &["-F", "query=@-"],
+            &["-f", "query=@file"],
+            &["--input", "body.json", "-f", "query={ viewer { login } }"],
+            &["--input=-", "-f", "query={ viewer { login } }"],
+            &[
+                "-f",
+                "query={ viewer { login } }",
+                "-f",
+                "query=mutation { addStar }",
+            ],
+            &[
+                "-f",
+                "query={ viewer { login } }",
+                "-f",
+                "query[]=mutation { addStar }",
+            ],
+            &["-f", "query={ viewer { login }"],
+            &["-f", "query=not_a_document"],
+            &["-f", "query={ field(arg: \"unterminated) }"],
+            &["-f", "query={ field(arg: [1, 2) }"],
+            &[
+                "-f",
+                "query={ field(arg: \"\"\"text\"\"\") } mutation { addStar }",
+            ],
+            &[
+                "-f",
+                "query=query Read($n: Int!) { viewer { login } } subscription Watch { events }",
+            ],
+            &["-f", "query={ viewer { login } }", "--unknown"],
+            &["-X", "GET", "-f", "query=mutation { addStar }"],
+        ] {
+            let mut args = os_args(&["api", "graphql"]);
+            args.extend(os_args(tail));
+            assert!(!graphql_query_is_read_only(&args), "{tail:?}");
+            assert!(api_invocation_writes(&args), "{tail:?}");
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ),
+                "{tail:?}"
             );
         }
     }
