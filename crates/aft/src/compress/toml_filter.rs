@@ -512,8 +512,10 @@ fn apply_plain_cap_streaming(filter: &TomlFilter, output: &str) -> CompressionRe
         KeepMode::Tail => 0,
         KeepMode::Middle => max_lines / 2,
     };
+    // Head mode buffers the head plus a tail window's worth of the latest lines;
+    // the shared head/tail plan then decides the real split below.
     let tail_count = match filter.keep {
-        KeepMode::Head => 0,
+        KeepMode::Head => crate::compress::line_cut::TAIL_WINDOW_LINES.min(max_lines),
         KeepMode::Tail => max_lines,
         KeepMode::Middle => max_lines - head_count,
     };
@@ -547,14 +549,27 @@ fn apply_plain_cap_streaming(filter: &TomlFilter, output: &str) -> CompressionRe
         .into_iter()
         .map(|line| truncate_line(line, filter.line_max))
         .collect();
-    let text = selected.join("\n");
 
     if kept_line_count <= max_lines {
-        return CompressionResult::new(text);
+        return CompressionResult::new(selected.join("\n"));
     }
     if max_lines == 0 {
         return CompressionResult::with_inner_drop(String::new(), false);
     }
+    if matches!(filter.keep, KeepMode::Head) {
+        // `selected` holds the first `max_lines` lines followed by up to a tail
+        // window of the last lines, so planning over it picks the same lines as
+        // planning over the whole output; only the omitted count must come from
+        // the real line total.
+        let plan = crate::compress::line_cut::plan_head_tail(selected.len(), max_lines, |index| {
+            selected[index].len()
+        })
+        .expect("more lines than the cap");
+        let omitted = kept_line_count - plan.head - plan.tail;
+        let kept = crate::compress::line_cut::render_cut(&selected, plan, omitted, "lines");
+        return CompressionResult::with_inner_drop(kept.join("\n"), false);
+    }
+    let text = selected.join("\n");
     if matches!(filter.keep, KeepMode::Tail) && !strip_removed_lines {
         return CompressionResult::with_prefix_drop(
             text,
@@ -647,7 +662,9 @@ fn cap_lines(
     }
 
     let kept = match keep {
-        KeepMode::Head => lines.iter().take(max_lines).cloned().collect::<Vec<_>>(),
+        // A head cap still keeps the final lines: tools print their verdict
+        // last, and a filter that asked for the head would otherwise hide it.
+        KeepMode::Head => crate::compress::line_cut::cap_lines_head_tail(lines, max_lines, "lines"),
         KeepMode::Tail => lines
             .iter()
             .skip(lines.len().saturating_sub(max_lines))
@@ -913,7 +930,10 @@ keep = "tail"
     }
 
     #[test]
-    fn cap_head_keeps_first_n_lines() {
+    fn cap_head_keeps_head_and_final_line() {
+        // keep = "head" used to drop the last lines outright. Tools print their
+        // verdict last, so a head cap now keeps a tail window too and marks
+        // the cut in the middle; the marker is not one of the shown lines.
         let filter = parse(
             r#"
 [filter]
@@ -926,10 +946,10 @@ keep = "head"
         );
         let input = "1\n2\n3\n4";
         let out = apply_filter(&filter, input);
-        assert_eq!(out.text, "1\n2");
+        assert_eq!(out.text, "1\n... 2 lines omitted ...\n4");
         assert!(out.had_inner_drop);
         assert!(!out.offset_hint_eligible);
-        assert_eq!(out.text.lines().count(), 2);
+        assert_eq!(crate::list_surfaces::bash::count_output_lines(&out.text), 2);
     }
 
     #[test]

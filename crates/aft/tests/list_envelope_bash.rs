@@ -415,6 +415,214 @@ fn test_append_envelope_trailer_excludes_metadata() {
     assert_eq!(unchanged, "first\nsecond\n");
 }
 
+/// Output shaped like a multi-phase Rust test gate script: cargo build noise,
+/// two cargo test runs, a nextest-style phase, and the gate's own verdict as
+/// the last line. The verdict is outside cargo's grammar, which is exactly what
+/// a summary extractor that recognises the cargo lines is tempted to drop.
+fn gate_shaped_output(verdict: &str) -> String {
+    let mut lines = vec!["== phase 1: build ==".to_string()];
+    for index in 0..39 {
+        lines.push(format!("   Compiling crate_{index} v0.1.{index}"));
+    }
+    lines.push("    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.2s".into());
+    lines.push("== phase 2: unit tests ==".into());
+    lines.push("running 100 tests".into());
+    for index in 0..100 {
+        lines.push(format!("test module_{index}::works ... ok"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out".into(),
+    );
+    lines.push("== phase 3: integration tests ==".into());
+    lines.push("running 100 tests".into());
+    for index in 0..100 {
+        lines.push(format!("test integration_{index} ... ok"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out".into(),
+    );
+    lines.push("== phase 4: nextest ==".into());
+    for index in 0..30 {
+        lines.push(format!(
+            "        PASS [   0.0{}s] crate::case_{index}",
+            index % 10
+        ));
+    }
+    lines.push("     Summary [  12.345s] 30 tests run: 30 passed, 0 skipped".into());
+    lines.push("phase timings: build 41s, unit 3s, integration 9s, nextest 12s".into());
+    lines.push(verdict.to_string());
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+#[test]
+fn gate_script_verdict_survives_compression() {
+    let input = gate_shaped_output("GATE PASSED: all phases green");
+    assert_eq!(
+        input.lines().count(),
+        283,
+        "fixture mirrors the reported run"
+    );
+
+    let registry = build_registry(builtin_filters::ALL, None, None);
+    let result =
+        compress_with_registry_exit_code("scripts/rust-test-gate.sh", &input, Some(0), &registry);
+    assert_eq!(result.input_line_count, 283);
+    assert_eq!(
+        result.text.trim_end().lines().last(),
+        Some("GATE PASSED: all phases green"),
+        "the gate verdict must be the final compressed line:\n{}",
+        result.text
+    );
+}
+
+#[test]
+fn gate_script_trailer_counts_kept_lines_but_not_the_marker() {
+    let input = gate_shaped_output("GATE PASSED: all phases green");
+    let registry = build_registry(builtin_filters::ALL, None, None);
+    let result =
+        compress_with_registry_exit_code("scripts/rust-test-gate.sh", &input, Some(0), &registry);
+
+    // The cargo sniffer keeps its five summary lines; the gate's last five lines
+    // follow after a marker for the 29 nextest lines between them.
+    let expected = "    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.2s\n\
+         running 100 tests\n\
+         test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         running 100 tests\n\
+         test result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+         ... 29 lines omitted ...\n\
+         \x20       PASS [   0.08s] crate::case_28\n\
+         \x20       PASS [   0.09s] crate::case_29\n\
+         \x20    Summary [  12.345s] 30 tests run: 30 passed, 0 skipped\n\
+         phase timings: build 41s, unit 3s, integration 9s, nextest 12s\n\
+         GATE PASSED: all phases green";
+    assert_eq!(result.text, expected);
+
+    let mut rendered = result.text.clone();
+    let envelope =
+        append_envelope_trailer(&mut rendered, result.input_line_count).expect("lines dropped");
+    assert_eq!(
+        envelope.shown, 10,
+        "5 summary lines + 5 final lines, marker excluded"
+    );
+    assert_eq!(envelope.total, Total::Exact(283));
+    assert!(
+        rendered.ends_with("GATE PASSED: all phases green\nshown 10 of 283 lines (cap)"),
+        "{rendered}"
+    );
+}
+
+/// A cargo test run long enough to be cut, with failures, ending in cargo's
+/// own verdict line.
+fn cargo_failed_output(trailing: Option<&str>) -> String {
+    let mut text = String::from(
+        "   Compiling demo v0.1.0 (/work/demo)\n\
+         \x20   Finished `test` profile [unoptimized + debuginfo] target(s) in 3.10s\n\
+         \x20    Running unittests src/lib.rs (target/debug/deps/demo-0123456789abcdef)\n\n\
+         running 250 tests\n",
+    );
+    for index in 0..248 {
+        text.push_str(&format!("test case_{index} ... ok\n"));
+    }
+    text.push_str("test bad_one ... FAILED\ntest bad_two ... FAILED\n\nfailures:\n\n");
+    for name in ["bad_one", "bad_two"] {
+        text.push_str(&format!(
+            "---- {name} stdout ----\nthread '{name}' panicked at src/lib.rs:10:5:\nassertion failed: left == right\n\n"
+        ));
+    }
+    text.push_str("failures:\n    bad_one\n    bad_two\n\n");
+    text.push_str(
+        "test result: FAILED. 248 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s\n",
+    );
+    if let Some(trailing) = trailing {
+        text.push('\n');
+        text.push_str(trailing);
+        text.push('\n');
+    }
+    text
+}
+
+#[test]
+fn cargo_test_failed_verdict_is_the_final_line() {
+    let verdict =
+        "test result: FAILED. 248 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s";
+    let registry = build_registry(builtin_filters::ALL, None, None);
+
+    // A failing exit makes the failure guard hand the whole output to the
+    // generic compressor; the verdict must still end it.
+    let input = cargo_failed_output(None);
+    let result = compress_with_registry_exit_code("cargo test", &input, Some(101), &registry);
+    assert_eq!(
+        result.text.trim_end().lines().last(),
+        Some(verdict),
+        "{}",
+        result.text
+    );
+
+    // With no exit code the cargo extractor itself runs and cuts the output.
+    let result = compress_with_registry_exit_code("cargo test", &input, None, &registry);
+    assert!(
+        result.text.lines().count() < input.lines().count(),
+        "output was cut"
+    );
+    assert_eq!(
+        result.text.trim_end().lines().last(),
+        Some(verdict),
+        "{}",
+        result.text
+    );
+
+    // cargo prints its rerun hint after the verdict; that line is the end now
+    // and must survive the summary extraction.
+    let input = cargo_failed_output(Some("error: test failed, to rerun pass `--lib`"));
+    for exit_code in [Some(101), None] {
+        let result = compress_with_registry_exit_code("cargo test", &input, exit_code, &registry);
+        assert_eq!(
+            result.text.trim_end().lines().last(),
+            Some("error: test failed, to rerun pass `--lib`"),
+            "{}",
+            result.text
+        );
+        assert!(result.text.contains(verdict), "{}", result.text);
+    }
+}
+
+#[test]
+fn generic_ten_thousand_line_output_keeps_its_final_line() {
+    let input: String = (1..=10_000).map(|index| format!("row {index}\n")).collect();
+    let registry = build_registry(builtin_filters::ALL, None, None);
+    let result = compress_with_registry_exit_code("./emit-rows", &input, Some(0), &registry);
+    assert_eq!(result.input_line_count, 10_000);
+    assert_eq!(result.text.trim_end().lines().last(), Some("row 10000"));
+}
+
+#[test]
+fn bun_test_wrapper_keeps_lines_after_its_summary() {
+    let mut input = String::from("bun test v1.2.0\n\n");
+    for index in 0..120 {
+        input.push_str(&format!("(pass) suite > case {index} [0.10ms]\n"));
+    }
+    input.push_str(
+        "\n 120 pass\n 0 fail\n 240 expect() calls\nRan 120 tests across 4 files. [1.20s]\n",
+    );
+    input.push_str("wrapper: all bun suites green\n");
+    let registry = build_registry(builtin_filters::ALL, None, None);
+    let result = compress_with_registry_exit_code("./scripts/check.sh", &input, Some(0), &registry);
+    assert!(
+        result.text.lines().count() < input.lines().count(),
+        "output was cut"
+    );
+    assert_eq!(
+        result.text.trim_end().lines().last(),
+        Some("wrapper: all bun suites green"),
+        "{}",
+        result.text
+    );
+}
+
 #[cfg(unix)]
 fn configure_real_bash(aft: &mut AftProcess, project: &Path) {
     let response = aft.send(
@@ -721,6 +929,83 @@ fn real_live_status_stays_raw_without_an_envelope() {
         .to_string(),
     );
     assert_eq!(killed["success"], true, "kill failed: {killed:?}");
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_gate_script_output_ends_with_verdict_then_trailer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().expect("project tempdir");
+    configure_real_bash(&mut aft, project.path());
+    let fixture = project.path().join("gate-output.txt");
+    fs::write(
+        &fixture,
+        gate_shaped_output("GATE PASSED: all phases green"),
+    )
+    .unwrap();
+    let script = project.path().join("rust-test-gate.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ncat {}\n", shell_quote(&fixture)),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let reply = aft.send(
+        &serde_json::json!({
+            "id": "real-gate-script",
+            "command": "bash",
+            "params": {
+                "command": shell_quote(&script),
+                "foreground_orchestrate": true,
+                "block_to_completion": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(reply["success"], true, "gate script failed: {reply:?}");
+    assert_real_bash_envelope(&reply, "output", 283);
+    let output = reply["output"].as_str().expect("gate output");
+    assert!(
+        output.ends_with("GATE PASSED: all phases green\nshown 10 of 283 lines (cap)"),
+        "{output}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_ten_thousand_line_output_keeps_final_line_and_counts_shown_lines() {
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().expect("project tempdir");
+    configure_real_bash(&mut aft, project.path());
+    let reply = aft.send(
+        &serde_json::json!({
+            "id": "real-ten-thousand",
+            "command": "bash",
+            "params": {
+                "command": "seq 1 10000",
+                "foreground_orchestrate": true,
+                "block_to_completion": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(reply["success"], true, "seq failed: {reply:?}");
+    assert_real_bash_envelope(&reply, "output", 10_000);
+    let output = reply["output"].as_str().expect("seq output");
+    let numbered = output
+        .lines()
+        .filter(|line| !line.is_empty() && line.bytes().all(|byte| byte.is_ascii_digit()))
+        .count();
+    assert_eq!(reply[WIRE_KEY]["shown"], numbered, "{output}");
+    assert!(
+        output.ends_with(&format!("10000\nshown {numbered} of 10000 lines (cap)")),
+        "{output}"
+    );
     assert!(aft.shutdown().success());
 }
 

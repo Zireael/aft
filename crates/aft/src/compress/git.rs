@@ -329,13 +329,12 @@ fn looks_like_pull_marker(line: &str) -> bool {
     trimmed == "Fast-forward" || trimmed.starts_with("Merge made by ")
 }
 
-fn cap_git_lines(mut lines: Vec<String>, summary_name: &str, keep_lines: usize) -> String {
-    if lines.len() > keep_lines {
-        let omitted = lines.len() - keep_lines;
-        lines.truncate(keep_lines);
-        lines.push(format!("... ({} more {})", omitted, summary_name));
-    }
-    trim_trailing_lines(&lines.join("\n"))
+fn cap_git_lines(lines: Vec<String>, summary_name: &str, keep_lines: usize) -> String {
+    // Head plus tail: `git stash pop` and `git pull` end with their outcome
+    // ("Dropped refs/stash@{0}", the files-changed summary), so the cut goes in
+    // the middle rather than after the first lines.
+    let kept = crate::compress::line_cut::cap_lines_head_tail(&lines, keep_lines, summary_name);
+    trim_trailing_lines(&kept.join("\n"))
 }
 
 fn compress_status(output: &str) -> String {

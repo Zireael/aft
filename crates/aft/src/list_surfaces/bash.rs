@@ -28,7 +28,8 @@ pub const REASON_KIND: ReasonKind = ReasonKind::Selecting;
 /// Narrowing parameters: bash accepts no narrowing parameter.
 pub const NARROW: &[&str] = &[];
 
-/// Count output lines, excluding recovery metadata and the canonical cap trailer.
+/// Count output lines, excluding recovery metadata, the omitted-lines marker a
+/// compressor puts where it cut, and the canonical cap trailer.
 #[inline]
 pub fn count_output_lines(output: &str) -> usize {
     output
@@ -48,7 +49,9 @@ pub fn count_output_lines(output: &str) -> usize {
                     })
                 })
             });
-            !recovery_marker && !trailer
+            !recovery_marker
+                && !trailer
+                && !crate::compress::line_cut::is_omitted_lines_marker(line)
         })
         .count()
 }

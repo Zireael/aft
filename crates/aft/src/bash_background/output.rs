@@ -221,11 +221,63 @@ pub fn cap_head_tail_with_marker(
     } else {
         tail_start
     };
+    let (head_end, tail_start) = snap_cut_to_lines(
+        input,
+        head_end,
+        tail_start,
+        threshold_bytes.saturating_sub(marker.len() + 1),
+    );
 
     CappedText {
         text: marker_capped_output(input, head_end, tail_start, marker, threshold_bytes),
         truncated: true,
     }
+}
+
+/// Move a head/tail byte cut onto line boundaries.
+///
+/// The bash `shown N of M lines` trailer counts the lines around the cut, so a
+/// cut through the middle of a line would show a fragment and count it as a
+/// line. The head therefore ends after its last complete line and the tail
+/// starts at its first complete line; both moves only shrink the kept text.
+/// One exception: when the byte cut lands inside the final line, the tail is
+/// widened to that whole line (the verdict of most commands) and the head gives
+/// up bytes to pay for it, as long as the final line fits `budget` (the bytes
+/// available for head plus tail). A final line larger than that is still cut.
+fn snap_cut_to_lines(
+    input: &str,
+    head_end: usize,
+    tail_start: usize,
+    budget: usize,
+) -> (usize, usize) {
+    let line_start_at_or_before = |index: usize| input[..index].rfind('\n').map_or(0, |at| at + 1);
+    let bytes = input.as_bytes();
+    let mut head = if head_end == 0 || bytes[head_end - 1] == b'\n' {
+        head_end
+    } else {
+        line_start_at_or_before(head_end)
+    };
+    if tail_start >= input.len() {
+        return (head, tail_start);
+    }
+
+    let content_end = input.trim_end_matches(['\n', '\r']).len();
+    let final_line_start = line_start_at_or_before(content_end);
+    let mut tail = tail_start;
+    if tail_start > 0 && bytes[tail_start - 1] != b'\n' {
+        if tail_start <= final_line_start {
+            tail = input[tail_start..]
+                .find('\n')
+                .map_or(tail_start, |at| tail_start + at + 1);
+        } else if input.len() - final_line_start <= budget {
+            tail = final_line_start;
+            let head_budget = budget - (input.len() - final_line_start);
+            if head > head_budget {
+                head = line_start_at_or_before(floor_char_boundary(input, head_budget));
+            }
+        }
+    }
+    (head.min(tail), tail)
 }
 
 fn append_marker_line(input: &str, marker: &str) -> String {
@@ -384,6 +436,40 @@ mod tests {
         assert!(capped.truncated);
         assert!(capped.text.len() <= 10, "{}", capped.text.len());
         assert!(capped.text.contains("[x]"));
+    }
+
+    #[test]
+    fn marker_cap_cuts_on_line_boundaries() {
+        let input: String = (1..=2_000).map(|index| format!("{index}\n")).collect();
+        let capped = cap_head_tail_with_marker(&input, 1_000, 300, 600, "[cut]");
+        assert!(capped.text.len() <= 1_000, "{}", capped.text.len());
+        let (head, tail) = capped.text.split_once("[cut]\n").expect("marker line");
+        assert!(head.ends_with('\n'), "head ends on a whole line: {head:?}");
+        let numbers = |text: &str| -> Vec<usize> {
+            text.lines()
+                .map(|line| line.parse().expect("whole number line"))
+                .collect()
+        };
+        let head = numbers(head);
+        let tail = numbers(tail);
+        assert_eq!(head[0], 1);
+        assert!(head.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert!(tail.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        assert_eq!(tail.last(), Some(&2_000));
+    }
+
+    #[test]
+    fn marker_cap_keeps_an_oversized_final_line_whole_when_it_fits() {
+        let verdict = format!("VERDICT {}", "v".repeat(700));
+        let input = format!("{}{verdict}\n", "noise line\n".repeat(200));
+        let capped = cap_head_tail_with_marker(&input, 1_000, 300, 600, "[cut]");
+        assert!(capped.text.len() <= 1_000, "{}", capped.text.len());
+        assert!(
+            capped.text.ends_with(&format!("[cut]\n{verdict}\n")),
+            "{}",
+            capped.text
+        );
+        assert!(capped.text.starts_with("noise line\n"));
     }
 
     #[test]

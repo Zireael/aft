@@ -1,5 +1,6 @@
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
+use crate::compress::line_cut::ensure_final_lines;
 use crate::compress::{CompressionResult, Compressor};
 
 pub struct CargoCompressor;
@@ -117,6 +118,7 @@ fn compress_build_like(output: &str) -> CompressionResult {
 
     let capped = cap_classified_blocks(blocks);
     CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+        .map_text(|text| ensure_final_lines(output, text))
 }
 
 fn starts_next_build_message(line: &str) -> bool {
@@ -187,7 +189,10 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
             })
             .map(|line| (*line).to_string())
             .collect();
-        return CompressionResult::new(trim_trailing_lines(&result.join("\n")));
+        return CompressionResult::new(ensure_final_lines(
+            output,
+            &trim_trailing_lines(&result.join("\n")),
+        ));
     }
 
     let mut blocks = Vec::new();
@@ -247,6 +252,7 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
 
     let capped = cap_classified_blocks(blocks);
     CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+        .map_text(|text| ensure_final_lines(output, text))
 }
 
 fn trim_trailing_lines(input: &str) -> String {
