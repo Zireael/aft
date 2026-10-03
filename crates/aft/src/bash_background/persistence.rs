@@ -484,6 +484,9 @@ pub enum BgMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTask {
     pub schema_version: u32,
+    /// Storage namespace captured at spawn, independent of later route binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     pub task_id: String,
     pub session_id: String,
     pub command: String,
@@ -528,6 +531,10 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
+    /// Who started the task and the key they gave the call. Absent on records
+    /// written before AFT recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_key: Option<super::TaskCallKey>,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -560,8 +567,10 @@ impl PersistedTask {
         notify_on_completion: bool,
         compressed: bool,
     ) -> Self {
+        let call_key = Some(super::call_key_for_new_task(&task_id));
         Self {
             schema_version: SCHEMA_VERSION,
+            harness: super::route_harness().map(|harness| harness.storage_segment()),
             task_id,
             session_id,
             command,
@@ -589,6 +598,7 @@ impl PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            call_key,
         }
     }
 
@@ -661,7 +671,8 @@ impl PersistedTask {
 
 impl From<BashTaskRow> for PersistedTask {
     fn from(row: BashTaskRow) -> Self {
-        if let Ok(task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+        if let Ok(mut task) = serde_json::from_str::<PersistedTask>(&row.metadata) {
+            task.harness = Some(row.harness.clone());
             return task;
         }
         let status = match row.status.as_str() {
@@ -679,6 +690,7 @@ impl From<BashTaskRow> for PersistedTask {
         let finished_at = row.completed_at.and_then(|value| u64::try_from(value).ok());
         Self {
             schema_version: SCHEMA_VERSION,
+            harness: Some(row.harness.clone()),
             task_id: row.task_id,
             session_id: row.session_id,
             command: row.command,
@@ -706,6 +718,7 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            call_key: None,
         }
     }
 }
@@ -1030,6 +1043,7 @@ pub fn quarantine_task_layout(
                         .is_some_and(|name| name.starts_with(&flat_prefix))
             })
             .collect::<Vec<_>>();
+        refuse_quarantine_of_newer_task(session_dir, &selected)?;
         quarantine_names(storage_dir, session_dir, &session, selected, reason)
     })();
     result.map_err(|error| {
@@ -1050,6 +1064,7 @@ pub fn quarantine_invalid_entry(
 ) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         let session = PinnedDir::open(session_dir)?;
+        refuse_quarantine_of_newer_task(session_dir, &[entry.to_os_string()])?;
         quarantine_names(
             storage_dir,
             session_dir,
@@ -1067,6 +1082,40 @@ pub fn quarantine_invalid_entry(
             ),
         )
     })
+}
+
+/// Task metadata written by a newer build is not invalid; it is unreadable by
+/// this build only. Replay, relaxed lookup and GC all quarantine through the
+/// two functions above, so refusing here keeps such a task in place under its
+/// original path whichever of them got here. Each entry is either a task
+/// directory (`<id>/control/metadata.json`) or a flat-layout file
+/// (`<id>.json`).
+fn refuse_quarantine_of_newer_task(session_dir: &Path, names: &[OsString]) -> io::Result<()> {
+    for name in names {
+        let entry = session_dir.join(name);
+        let metadata_path = if entry.is_dir() {
+            entry.join(CONTROL_DIR).join(METADATA_FILE)
+        } else if entry.extension() == Some(OsStr::new("json")) {
+            entry
+        } else {
+            continue;
+        };
+        let version = fs::read(&metadata_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("schema_version")?.as_u64());
+        let Some(version) = version else {
+            continue;
+        };
+        if let Some(refusal) = crate::persisted_format::UnsupportedPersistedFormat::check(
+            crate::persisted_format::PersistedStore::BashTask,
+            &metadata_path,
+            version,
+        ) {
+            return Err(crate::persisted_format::refuse(refusal).into_io_error());
+        }
+    }
+    Ok(())
 }
 
 fn quarantine_names(
@@ -1159,7 +1208,7 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
 
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let mut file = open_validated_path(path, false)?;
-    read_task_file(&mut file)
+    read_task_file(&mut file, path)
 }
 
 pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
@@ -1168,7 +1217,7 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
         TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
     };
     let mut file = open_metadata_through_replacement(&task.dirs.control, &name)?;
-    let metadata = read_task_file(&mut file)?;
+    let metadata = read_task_file(&mut file, &task.dirs.control.path().join(&name))?;
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1178,10 +1227,23 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
     Ok(metadata)
 }
 
-fn read_task_file(file: &mut File) -> io::Result<PersistedTask> {
+fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
+    // The version is read before the full shape, so metadata written by a
+    // newer build is refused by name (and kept out of quarantine) instead of
+    // failing as an unparseable task.
+    let version = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_u64());
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::BashTask,
+        path,
+        path,
+        version,
+    )
+    .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
     let task: PersistedTask = serde_json::from_str(&content).map_err(io::Error::other)?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
         return Err(io::Error::new(
@@ -1430,7 +1492,14 @@ pub fn write_kill_marker_if_absent(paths: &TaskPaths) -> io::Result<()> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        let result = match open_task_artifact(paths, TaskArtifact::Exit) {
+        // The exit file is opened writable so an empty one can be filled in
+        // place; a read-only handle cannot be truncated (ftruncate fails with
+        // EINVAL on macOS and Linux). Writing in place keeps the file the
+        // child's inherited exit handle points at. If the path is replaced
+        // after this open, the handle refers to the unlinked original, whose
+        // zero link count makes validation report a concurrent replace, and
+        // the retry below re-opens the replacement.
+        let result = match open_task_artifact_for_write(paths, TaskArtifact::Exit) {
             Ok(file) if file.len()? > 0 => Ok(()),
             Ok(mut file) => file.replace_contents(b"killed"),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1563,6 +1632,8 @@ impl ValidatedArtifact {
         Ok(bytes)
     }
 
+    /// Requires a handle from `open_task_artifact_for_write`; a read-only
+    /// handle fails the truncate with EINVAL.
     pub fn replace_contents(&mut self, content: &[u8]) -> io::Result<()> {
         validate_regular_handle(&self.file)?;
         self.file.set_len(0)?;
@@ -1593,6 +1664,22 @@ pub fn open_task_artifact(
     paths: &TaskPaths,
     artifact: TaskArtifact,
 ) -> io::Result<ValidatedArtifact> {
+    open_task_artifact_with_access(paths, artifact, false)
+}
+
+/// Like `open_task_artifact`, but the handle can also rewrite the artifact.
+fn open_task_artifact_for_write(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+) -> io::Result<ValidatedArtifact> {
+    open_task_artifact_with_access(paths, artifact, true)
+}
+
+fn open_task_artifact_with_access(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+    write: bool,
+) -> io::Result<ValidatedArtifact> {
     validate_task_id(&paths.task_id)?;
     let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
     if resolved.paths.layout != paths.layout {
@@ -1611,7 +1698,7 @@ pub fn open_task_artifact(
     let file = resolved
         .dirs
         .io
-        .open_file(&resolved.paths.artifact_name(artifact), false)?;
+        .open_file(&resolved.paths.artifact_name(artifact), write)?;
     ValidatedArtifact::new(file)
 }
 

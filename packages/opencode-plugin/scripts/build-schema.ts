@@ -649,6 +649,60 @@ function buildSchema(): Record<string, unknown> {
         description: "External semantic backend configuration for embedding and retrieval.",
       },
 
+      search: {
+        type: "object",
+        properties: {
+          rerank: {
+            type: "object",
+            properties: {
+              backend: {
+                type: "string",
+                enum: ["off", "onnx", "remote", "synapse"],
+                default: "off",
+                description:
+                  "Cross-encoder reranker for the head of aft_search results. Only prose questions are reranked, and exact matches keep their order. 'off' keeps fused order, 'onnx' runs a local model through ONNX Runtime (downloaded in the background on first use), 'remote' calls a Cohere-style /rerank endpoint, 'synapse' uses CortexKit Synapse. A project config may only set 'off'.",
+              },
+              model: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Reranker model. For onnx: bge-reranker-base (default), bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for remote and synapse. User config only.",
+              },
+              endpoint: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Base URL of the remote rerank endpoint; AFT appends /rerank. Prefix with tei+ for a TEI server. User config only.",
+              },
+              api_key_env: {
+                type: "string",
+                minLength: 1,
+                description:
+                  "Environment variable holding the remote rerank endpoint's API key. User config only.",
+              },
+              top_n: {
+                type: "integer",
+                minimum: 1,
+                default: 20,
+                description:
+                  "How many leading results are reranked (default 20, at most 200). User config only.",
+              },
+              timeout_ms: {
+                type: "integer",
+                minimum: 1,
+                default: 1500,
+                description:
+                  "Reranking budget per search in milliseconds (default 1500, clamped to 50..15000). On timeout the fused order is kept. User config only.",
+              },
+            },
+            additionalProperties: false,
+            description: "Optional cross-encoder reranking of aft_search results. Default off.",
+          },
+        },
+        additionalProperties: false,
+        description: "aft_search settings.",
+      },
+
       bridge: {
         type: "object",
         properties: {
@@ -684,6 +738,26 @@ function buildSchema(): Record<string, unknown> {
         additionalProperties: false,
         description:
           "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
+      },
+
+      opencode: {
+        type: "object",
+        properties: {
+          server_url: {
+            type: "string",
+            format: "uri",
+            description:
+              "Base URL of the OpenCode 2 server AFT raises permission prompts on, e.g. http://127.0.0.1:4096. When set, AFT uses it instead of discovering the server it runs inside. Point it at the host/port given to OpenChamber (OPENCODE_HOST / OPENCODE_PORT). Read at startup.",
+          },
+          server_password_env: {
+            type: "string",
+            description:
+              "Name of the environment variable holding that server's password (Basic auth, username opencode). A variable name, never the password itself. Default: OpenCode's own OPENCODE_PASSWORD, then OPENCODE_SERVER_PASSWORD.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "OpenCode 2 server used for permission prompts. User-scoped only — a project config cannot set this block, because it decides where permission prompts are sent.",
       },
 
       github: {

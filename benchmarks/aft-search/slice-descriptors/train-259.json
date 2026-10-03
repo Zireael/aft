@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "undo-route-namespace",
+    "inspect-rust-flycheck-freshness",
+    "shell-surface-conditionals"
+  ],
+  "note": "subc_tool_schemas.json changes only tool description text (pty sentence) from the shell surface conditionals; undo namespace and rust-analyzer save/check freshness touch no ranking code. Ranked rows must stay byte-identical."
+}

@@ -293,6 +293,38 @@ pub(super) fn build_manifest() -> ModuleManifest {
     build_manifest_for_host(crate::bash_background::powershell_available())
 }
 
+/// [`build_manifest`] minus every tool whose canonical name is in `disabled`,
+/// so a consumer that builds its tool surface from the catalog never offers
+/// them. The list
+/// is the one read when the module connects; dispatch still refuses a disabled
+/// tool that is called anyway.
+pub(super) fn build_manifest_without(disabled: &[String]) -> ModuleManifest {
+    filter_manifest_tools(build_manifest(), disabled)
+}
+
+/// Attach the provenance AFT declares on its HELLO. `None` (no launch nonce)
+/// leaves the manifest without a provenance block, as before.
+pub(super) fn declare_provenance(
+    manifest: &mut ModuleManifest,
+    provenance: Option<subc_protocol::manifest::ManifestProvenance>,
+) {
+    if provenance.is_some() {
+        manifest.provenance = provenance;
+    }
+}
+
+pub(super) fn filter_manifest_tools(
+    mut manifest: ModuleManifest,
+    disabled: &[String],
+) -> ModuleManifest {
+    for role in &mut manifest.provides {
+        if let ProviderRole::ToolProvider { tools, .. } = role {
+            tools.retain(|tool| crate::tool_gate::catalog_keeps(&tool.name, disabled));
+        }
+    }
+    manifest
+}
+
 /// Builds the manifest for a host where PowerShell is or is not runnable.
 ///
 /// The `powershell` tool is advertised only when `pwsh` resolves, checked when
@@ -321,7 +353,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // module as ready, which is the behaviour before readiness existed.
     //
     // The builder leaves `capabilities`, `self_signals` and `provenance`
-    // unset, so none of them reaches the wire. `consumes` is descriptive (the
+    // unset, so neither of the first two reaches the wire; `provenance` is
+    // added at HELLO time by `declare_provenance`, because where the launch
+    // nonce came from is a fact about the running process, not the build.
+    // `consumes` is descriptive (the
     // daemon doesn't read it) and lists the modules AFT opens routes to: the
     // fleet status holder always, and synapse only when it is the configured
     // embedding backend. The manifest is static, so the config-dependent synapse
@@ -756,6 +791,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_advertised_mutating_tool_has_explicit_persistence_classification() {
+        let manifest = build_manifest_for_host(true);
+        let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+            panic!("expected ToolProvider");
+        };
+        let mut mutations = 0;
+        for tool in tools {
+            if tool.execution_mode == ExecutionMode::Mutating {
+                mutations += 1;
+                assert!(
+                    crate::persistence_gate::classification(&tool.name).is_some(),
+                    "new mutating tool {} needs an explicit persistence classification",
+                    tool.name
+                );
+            }
+        }
+        assert!(
+            mutations > 0,
+            "the production catalog must contain mutations"
+        );
+    }
+
     /// Serializes the HELLO manifest with the two volatile parts replaced by
     /// markers: the crate version (changes every release) and each tool's
     /// embedded schema/description (regenerated from the plugin tool map).
@@ -1128,15 +1186,19 @@ mod tests {
                 false,
             )
         };
-        vec![
-            orchestrate::format_background_launch(task, false),
-            orchestrate::format_background_launch(task, true),
-            orchestrate::format_promotion_message(task, None, 30_000),
-            orchestrate::format_wait_detach_message(task),
-            orchestrate::format_module_drain_detach_message(task),
-            running_status("pty"),
-            running_status("pipes"),
-        ]
+        let mut texts = Vec::new();
+        // Both roles' wording: a catalog consumer may be a delegated worker.
+        for worker_session in [false, true] {
+            texts.extend([
+                orchestrate::format_background_launch(task, false, worker_session),
+                orchestrate::format_background_launch(task, true, worker_session),
+                orchestrate::format_promotion_message(task, None, 30_000, worker_session),
+                orchestrate::format_wait_detach_message(task, worker_session),
+                orchestrate::format_module_drain_detach_message(task, worker_session),
+            ]);
+        }
+        texts.extend([running_status("pty"), running_status("pipes")]);
+        texts
     }
 
     /// A consumer that builds its tool surface from this catalog can only offer

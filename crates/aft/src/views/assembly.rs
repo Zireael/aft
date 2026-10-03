@@ -8,9 +8,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
-use crate::blob_store::{
-    BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome, CALLGRAPH_PRODUCER_VERSION,
-};
+use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
 use crate::callgraph_store::join::CallgraphBlob;
 use crate::parser::detect_language;
 use crate::path_status::PathStatusStore;
@@ -33,6 +31,12 @@ pub struct AssemblyRequest {
     pub semantic_keys: BTreeMap<Vec<u8>, String>,
     pub require_semantic: bool,
     pub allow_blob_put: bool,
+    /// False when the root's call graph is off: no callgraph payload is
+    /// extracted and regular entries carry no callgraph key. Extraction parses
+    /// every changed source file, which dominates a first publication. An
+    /// entry published without a key is re-extracted once the call graph is
+    /// turned on.
+    pub callgraph: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +158,7 @@ pub fn prepare_checkout(
     request: &AssemblyRequest,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    publication_delay_for_test();
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
     // Every publisher (scheduler, migration import, tests) reaches this point
     // with the HEAD fingerprint it observed, so the read-path cache that
@@ -213,7 +218,9 @@ pub fn prepare_checkout(
     for tracked in head {
         let rel_path = RelPath::new(tracked.rel_path.clone())?;
         if !rebuild_all && !request.changed_paths.contains(&tracked.rel_path) {
-            if let Some(entry) = previous_entries.get(&tracked.rel_path) {
+            if let Some(entry) = previous_entries.get(&tracked.rel_path).filter(|entry| {
+                !(request.callgraph && lacks_callgraph_key(entry, &tracked.rel_path))
+            }) {
                 candidates.push(Candidate {
                     path: rel_path,
                     entry: entry.clone(),
@@ -268,8 +275,14 @@ pub fn prepare_checkout(
                 };
                 let (key, payload) = language
                     .as_deref()
+                    .filter(|_| request.callgraph)
                     .map(|language| {
-                        let key = CallgraphKey::for_current(&source, language).full_key();
+                        let key = CallgraphKey::from_bytes(
+                            &source,
+                            language,
+                            crate::views::callgraph::PRODUCER,
+                        )
+                        .full_key();
                         let key_hex = key.to_hex();
                         let callgraph_is_current = previous_entries
                             .get(&tracked.rel_path)
@@ -1128,6 +1141,43 @@ impl PublicationClosure for SqliteClosure {
     }
 }
 
+/// Integration tests make a publication slow on purpose, without a large
+/// checkout, by setting `AFT_TEST_VIEW_PUBLICATION_DELAY_MS`: requests must
+/// keep being answered while a publication runs.
+fn publication_delay_for_test() {
+    if let Some(millis) = std::env::var("AFT_TEST_VIEW_PUBLICATION_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+    }
+}
+
+/// True when `manifest` was published with the call graph off: some source
+/// file has a callgraph language but no callgraph key. Such a generation's
+/// derived database holds no call graph at all, so a reader must report the
+/// call graph unavailable rather than answer from it.
+pub fn manifest_lacks_callgraph(manifest: &super::Manifest) -> bool {
+    manifest
+        .entries()
+        .any(|(path, entry)| lacks_callgraph_key(entry, path.as_bytes()))
+}
+
+/// True when `entry` is a source file published while the call graph was off:
+/// it has a callgraph language but no callgraph key.
+fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {
+    let ManifestEntry::Regular {
+        planes,
+        resolution_input,
+        ..
+    } = entry
+    else {
+        return false;
+    };
+    planes.callgraph.is_none()
+        && (*resolution_input || detect_language(&path_from_bytes(rel_path)).is_some())
+}
+
 fn missing_callgraph_payload(
     store: &BlobStore,
     key: &FullKey,
@@ -1146,13 +1196,13 @@ fn missing_callgraph_payload(
         return Ok(None);
     }
     let blob = if resolution_input {
-        CallgraphBlob::config(source.to_vec(), CALLGRAPH_PRODUCER_VERSION)
+        CallgraphBlob::config(source.to_vec(), crate::views::callgraph::PRODUCER)
     } else {
         CallgraphBlob::extract(
             std::str::from_utf8(source)
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
             language,
-            CALLGRAPH_PRODUCER_VERSION,
+            crate::views::callgraph::PRODUCER,
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
     };
@@ -1170,7 +1220,8 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "corrupt", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
+            .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();
@@ -1191,7 +1242,8 @@ mod reuse_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(dir.path(), "reuse", BlobPlane::Callgraph).unwrap();
         let source = b"export function target() {}";
-        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let key = CallgraphKey::from_bytes(source, "typescript", crate::views::callgraph::PRODUCER)
+            .full_key();
         let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
             .unwrap()
             .unwrap();

@@ -198,11 +198,14 @@ mod tests {
         assert!(!visited.contains(&member.join("src/nested")));
 
         // Backslash-separated input is normalized before counting components.
-        let windows_style = format!("{}\\crates\\[ab]*\\Cargo.toml", root.path().display())
-            .replace('/', "\\");
+        let windows_style =
+            format!("{}\\crates\\[ab]*\\Cargo.toml", root.path().display()).replace('/', "\\");
         let (matches, visited) = observed_glob(&windows_style);
         assert_eq!(matches, vec![manifest]);
-        assert!(!visited.contains(&deep), "backslash pattern exceeded its depth");
+        assert!(
+            !visited.contains(&deep),
+            "backslash pattern exceeded its depth"
+        );
     }
 
     #[test]

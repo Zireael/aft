@@ -117,4 +117,28 @@ impl SearchTrailer {
             SEARCH_NARROW_FIELDS,
         )
     }
+
+    /// Projection for a list built partly from an input whose examination
+    /// stopped at a file or time bound (a split request's pattern). Files
+    /// the examination never read are neither ranked nor counted, so the
+    /// total is a lower bound and the cut is attributed to the budget even
+    /// when the page holds the whole list.
+    pub fn bounded_input_projection(&self) -> ListEnvelope {
+        let mut causes = vec![Reason::Budget];
+        match self.stop_state {
+            StopState::S2Exhausted => {}
+            StopState::S1MoreAtDepth => causes.push(Reason::Cap),
+            StopState::S3DepthCap => causes.push(Reason::Depth),
+        }
+        let total = match self.total {
+            SearchTotal::Exact(value) | SearchTotal::AtLeast(value) => Total::AtLeast(value),
+        };
+        ListEnvelope::new(
+            self.shown,
+            total,
+            Unit::Results,
+            causes,
+            SEARCH_NARROW_FIELDS,
+        )
+    }
 }

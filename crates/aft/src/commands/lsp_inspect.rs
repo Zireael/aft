@@ -58,8 +58,12 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         .collect::<Vec<_>>();
     if !outcomes.successful.is_empty() {
         let pull_results = {
-            let mut lsp = ctx.lsp();
-            match lsp.pull_file_diagnostics(&canonical, &config) {
+            match crate::lsp::manager::pull_file_diagnostics_unlocked(
+                || ctx.lsp(),
+                &canonical,
+                &config,
+                None,
+            ) {
                 Ok(results) => results,
                 Err(err) => {
                     crate::slog_warn!("[lsp_inspect] pull_file_diagnostics failed: {err}");
@@ -124,6 +128,7 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>(),
             "matching_servers": matching_servers,
+            "lsp_runtime_notes": ctx.lsp().runtime_notes(),
             "pull_results": pull_results_json,
             "diagnostics_complete": diagnostics_gaps.is_empty(),
             "diagnostics_gaps": diagnostics_gaps,
@@ -167,7 +172,7 @@ fn inspect_server(
         "binary_source": binary_source,
         "workspace_root": workspace_root.as_ref().map(|path| path.display().to_string()),
         "spawn_status": spawn_status,
-        "args": def.args,
+        "args": binary_path.as_deref().map(|path| def.spawn_args_for_binary(path)).unwrap_or_else(|| def.args.clone()),
     })
 }
 

@@ -136,17 +136,18 @@ function normalizeZoomTargets(record: Record<string, unknown>): void {
       throw new InvalidRequestError(`'targets[${index}].path' must be a non-empty string`);
     }
     const source = target as Record<string, unknown>;
-    // Model calls sometimes serialize an omitted target as an entirely empty
-    // target object. Preserve that sentinel so the tool can ignore it while
-    // still rejecting any target that supplies a real symbol with an empty path.
-    const emptyTarget =
-      source.symbol === "" &&
-      ((hasOwn(source, "path") && source.path === "") ||
-        (hasOwn(source, "filePath") && source.filePath === ""));
+    // Models that fill every declared property serialize an omitted target as
+    // an entry whose path and symbol are all blank. Preserve that placeholder
+    // untouched so the tool can drop it. An entry with only a symbol (or only
+    // a path) is not refused here either: the server reports it as its own
+    // per-target error line and still answers the rest of the batch.
+    const blank = (value: unknown) =>
+      value === undefined || value === null || (typeof value === "string" && !value.trim());
+    const emptyTarget = blank(source.symbol) && blank(source.path) && blank(source.filePath);
     if (emptyTarget) return { ...source };
     const normalized = { ...source };
     try {
-      normalizeAliasPair(normalized, "path", "filePath", true);
+      normalizeAliasPair(normalized, "path", "filePath", false);
     } catch (error) {
       if (error instanceof InvalidRequestError) {
         throw new InvalidRequestError(

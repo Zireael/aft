@@ -31,7 +31,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "bash_kill: missing task_id");
     };
 
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let result = ctx
         .bash_background()
         .kill(&task_id, req.session())

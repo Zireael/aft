@@ -1,5 +1,6 @@
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::GenericCompressor;
+use crate::compress::line_cut::ensure_final_lines;
 use crate::compress::{CompressionResult, Compressor};
 
 pub struct CargoCompressor;
@@ -45,21 +46,31 @@ fn is_cargo_test_signature_line(line: &str) -> bool {
 }
 
 fn cargo_subcommand(command: &str) -> Option<String> {
-    let mut seen_cargo = false;
-    for token in command.split_whitespace() {
-        if !seen_cargo {
-            if token == "cargo" {
-                seen_cargo = true;
-            }
-            continue;
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "cargo" {
+            break;
         }
-        if token.starts_with('-') {
-            continue;
-        }
+    }
+    while let Some(token) = tokens.next() {
         if crate::compress::is_shell_boundary(token) {
             return None;
         }
-        return Some(token.to_string());
+        if matches!(
+            token,
+            "-Z" | "--config"
+                | "--color"
+                | "--manifest-path"
+                | "--target-dir"
+                | "--lockfile-path"
+                | "-C"
+        ) {
+            if tokens.next().is_none_or(crate::compress::is_shell_boundary) {
+                return None;
+            }
+        } else if !token.starts_with('-') && !token.starts_with('+') {
+            return Some(token.to_string());
+        }
     }
     None
 }
@@ -107,6 +118,7 @@ fn compress_build_like(output: &str) -> CompressionResult {
 
     let capped = cap_classified_blocks(blocks);
     CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+        .map_text(|text| ensure_final_lines(output, text))
 }
 
 fn starts_next_build_message(line: &str) -> bool {
@@ -177,7 +189,10 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
             })
             .map(|line| (*line).to_string())
             .collect();
-        return CompressionResult::new(trim_trailing_lines(&result.join("\n")));
+        return CompressionResult::new(ensure_final_lines(
+            output,
+            &trim_trailing_lines(&result.join("\n")),
+        ));
     }
 
     let mut blocks = Vec::new();
@@ -237,6 +252,7 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
 
     let capped = cap_classified_blocks(blocks);
     CompressionResult::with_class_drops(trim_trailing_lines(&capped.text), capped.dropped_by_class)
+        .map_text(|text| ensure_final_lines(output, text))
 }
 
 fn trim_trailing_lines(input: &str) -> String {
@@ -319,5 +335,27 @@ error: could not compile `demo` (lib test) due to 1 previous error
             cargo_subcommand("cargo test --release").as_deref(),
             Some("test")
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn cargo_global_options_before_subcommand() {
+        for command in [
+            "cargo +nightly test",
+            "cargo --locked test",
+            "cargo -Z unstable-options test",
+            "cargo --config k=v test",
+            "cargo --config=k=v test",
+            "cargo --color always test",
+            "cargo -Zunstable-options test",
+        ] {
+            assert_eq!(
+                super::cargo_subcommand(command).as_deref(),
+                Some("test"),
+                "{command}"
+            );
+        }
     }
 }

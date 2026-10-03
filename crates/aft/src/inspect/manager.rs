@@ -13,8 +13,9 @@ use super::cache::{InspectCache, InspectCacheRead, InspectDbTimings, Tier2Contri
 use super::dispatch::{default_worker, start_dispatch_loop, InspectWorker};
 use super::freshness::{verify_contribution_file, ContributionFreshness};
 use super::job::{
-    is_test_file, CallgraphSnapshot, FileContribution, InspectCategory, InspectJob, InspectResult,
-    InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope, PendingWaitCause,
+    is_test_tree_file, CallgraphSnapshot, ExcludedTestTally, FileContribution, InspectCategory,
+    InspectJob, InspectResult, InspectScanSuccess, InspectSnapshot, JobKey, JobOutcome, JobScope,
+    PendingWaitCause,
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
@@ -370,7 +371,7 @@ fn run_tier2_pass_with_deadline<T>(
     permit_slot: Option<Tier2PermitSlot>,
     action: impl FnOnce() -> T,
 ) -> (T, bool) {
-    let cancellation = crate::executor::JobCancellation::new();
+    let cancellation = crate::executor::JobCancellation::new().with_root(project_root);
     let parent_cancellation = crate::executor::current_job_cancellation();
     let deadline_cancellation = cancellation.clone();
     let root = project_root.to_path_buf();
@@ -515,6 +516,7 @@ fn cached_tier2_aggregate_usable(
 }
 
 pub struct InspectManager {
+    root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     request_tx: Sender<InspectJob>,
     result_rx: Receiver<InspectResult>,
     #[allow(dead_code)]
@@ -553,6 +555,11 @@ pub struct InspectManager {
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
+    /// Project roots whose latest dead-code pass found the analysis
+    /// unavailable because the root is borrow-only. That result is not stored
+    /// in the inspect cache, so status readers consult this set instead of a
+    /// cached count from an earlier pass.
+    dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl InspectManager {
@@ -601,8 +608,27 @@ impl InspectManager {
         heavy_root_work_allowed: Arc<AtomicBool>,
         semantic_cold_seed_active: Arc<AtomicBool>,
     ) -> Self {
-        let handles = start_dispatch_loop(worker);
+        let root_work_cancellation = Arc::new(Mutex::new(crate::executor::JobCancellation::new()));
+        let worker_cancellation = Arc::clone(&root_work_cancellation);
+        let guarded_worker: InspectWorker = Arc::new(move |job| {
+            let token = worker_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let token = token.with_root(&job.project_root);
+            let _cancel = crate::executor::install_job_cancellation(token.clone());
+            if token.cancel_requested_before_commit() || !job.project_root.is_dir() {
+                return InspectResult::failed(
+                    &job,
+                    "inspect root is unbound or missing",
+                    Duration::ZERO,
+                );
+            }
+            worker(job)
+        });
+        let handles = start_dispatch_loop(guarded_worker);
         Self {
+            root_work_cancellation,
             request_tx: handles.request_tx,
             result_rx: handles.result_rx,
             pool: handles.pool,
@@ -617,6 +643,7 @@ impl InspectManager {
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
+            dead_code_borrow_only_roots: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
@@ -631,6 +658,36 @@ impl InspectManager {
 
     fn heavy_root_work_allowed(&self) -> bool {
         self.heavy_root_work_allowed.load(Ordering::SeqCst)
+            && !self
+                .root_work_cancellation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel_requested_before_commit()
+    }
+
+    pub(crate) fn cancel_root_work(&self) {
+        self.root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_cancel();
+    }
+
+    pub(crate) fn set_root_lifecycle(&self, lifecycle: crate::context::SubcLifecycleAdmission) {
+        let mut token = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *token = token.clone().with_lifecycle(lifecycle);
+    }
+
+    pub(crate) fn resume_root_work(&self) {
+        let mut token = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if token.cancel_requested_before_commit() {
+            *token = token.fresh();
+        }
     }
 
     pub(crate) fn set_cold_build_limiter(
@@ -850,7 +907,7 @@ impl InspectManager {
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {
-        if !job.inspect_writer || !job.callgraph_writer {
+        if job_is_borrow_only(job) {
             InspectBuilderState::BuildDenied.as_str().to_string()
         } else {
             self.tier2_builder_state_detail(job.category)
@@ -1118,7 +1175,14 @@ impl InspectManager {
 
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
+        let cancellation = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let cancellation = cancellation.with_root(&job.project_root);
         pool.spawn_fifo(move || {
+            let _cancel = crate::executor::install_job_cancellation(cancellation);
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
             let result = manager.tier2_run_with_reuse_job_result_catching(
                 job,
@@ -1238,7 +1302,14 @@ impl InspectManager {
         let categories_for_worker = submission.newly_queued_categories.clone();
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
+        let cancellation = self
+            .root_work_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let cancellation = cancellation.with_root(&snapshot.project_root);
         pool.spawn_fifo(move || {
+            let _cancel = crate::executor::install_job_cancellation(cancellation);
             for category in categories_for_worker {
                 let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
                 let _flight = manager.tier2_flight_exit_guard(job.key.clone());
@@ -1278,6 +1349,17 @@ impl InspectManager {
             .try_lock()
             .ok()
             .map(|in_flight| in_flight.keys().any(|key| key.category.is_tier2()))
+    }
+
+    /// Hold the in-flight job map for the duration of `while_held`, so a test
+    /// can prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while_held();
     }
 
     #[cfg(test)]
@@ -1622,6 +1704,7 @@ impl InspectManager {
         inspect_dir: PathBuf,
         project_root: PathBuf,
     ) -> (Option<usize>, Option<usize>, Option<usize>) {
+        let dead_code_unavailable = self.dead_code_borrow_only_unavailable(&project_root);
         let Ok(cache) = self.cache_for_paths(inspect_dir, project_root) else {
             return (None, None, None);
         };
@@ -1646,10 +1729,35 @@ impl InspectManager {
                 })
         };
         (
-            count_of(InspectCategory::DeadCode),
+            if dead_code_unavailable {
+                None
+            } else {
+                count_of(InspectCategory::DeadCode)
+            },
             count_of(InspectCategory::UnusedExports),
             count_of(InspectCategory::Duplicates),
         )
+    }
+
+    /// Whether the latest dead-code pass for `project_root` found dead code
+    /// unavailable because the root is borrow-only.
+    pub fn dead_code_borrow_only_unavailable(&self, project_root: &Path) -> bool {
+        let root = crate::inspect::job::canonicalize_normalized(project_root);
+        self.dead_code_borrow_only_roots
+            .lock()
+            .map(|roots| roots.contains(&root))
+            .unwrap_or(false)
+    }
+
+    fn set_dead_code_borrow_only_unavailable(&self, project_root: &Path, unavailable: bool) {
+        let root = crate::inspect::job::canonicalize_normalized(project_root);
+        if let Ok(mut roots) = self.dead_code_borrow_only_roots.lock() {
+            if unavailable {
+                roots.insert(root);
+            } else {
+                roots.remove(&root);
+            }
+        }
     }
 
     /// Latest project-wide TODO count, or `None` when no project-scoped todos
@@ -1824,6 +1932,33 @@ impl InspectManager {
                 message: "inspect Tier-2 waiter dropped without a terminal outcome".to_string(),
             },
         }
+    }
+
+    /// Run against the request's already waited, pinned view reader. This path
+    /// bypasses background reuse so a previous generation cannot answer a newer
+    /// request. An unavailable reader never falls back to a legacy database.
+    pub fn tier2_run_with_pinned_view(
+        self: &Arc<Self>,
+        mut snapshot: InspectSnapshot,
+        category: InspectCategory,
+        scope: JobScope,
+        store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
+    ) -> JobOutcome {
+        let projected = store.as_ref().and_then(|store| {
+            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                .ok()
+                .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+        });
+        let mut config = (*snapshot.config).clone();
+        config.indexes.callgraph = false;
+        snapshot.config = Arc::new(config);
+        let mut job = self.tier2_reuse_job(snapshot, category, projected);
+        job.scope_files = scope_files(
+            &job.project_root,
+            &JobScope::for_project(job.project_root.clone()),
+        );
+        let result = run_tier2_scan(&job, None);
+        filter_outcome_for_scope(self.completion_outcome(result), &scope)
     }
 
     /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
@@ -2372,6 +2507,61 @@ impl InspectManager {
         }
     }
 
+    /// Scans the expected dead-code files that have no stored facts, with the
+    /// call graph already attached to `aggregate_job`, and stores the result.
+    /// Returns the new contribution-set hash when anything was stored.
+    ///
+    /// A file that still yields no contribution after this scan is left out of
+    /// the rollup (logged) rather than blocking it: the scanner produces a
+    /// contribution for every file it is given, so this only covers a file
+    /// that vanished or was renamed between the walk and the scan.
+    fn fill_missing_dead_code_facts(
+        &self,
+        aggregate_job: &InspectJob,
+        cache: &InspectCache,
+        expected_files: &BTreeMap<String, PathBuf>,
+        contributions: &[FileContribution],
+    ) -> Result<Option<String>, String> {
+        let missing = dead_code_files_without_facts(
+            &aggregate_job.project_root,
+            expected_files,
+            contributions,
+        );
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        let mut fill_job = aggregate_job.clone();
+        fill_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+        fill_job.scope_files = missing.clone();
+        let oxc_result = self.oxc_result_for_scan(&fill_job, &fill_job.scope_files, &missing)?;
+        let filled = run_tier2_scan(&fill_job, oxc_result.as_ref())
+            .outcome
+            .map_err(|message| {
+                format!("dead_code scan of files without facts failed: {message}")
+            })?;
+        let still_missing = missing.len().saturating_sub(filled.contributions.len());
+        if still_missing > 0 {
+            crate::slog_warn!(
+                "tier2 dead_code: {still_missing} of {} files produced no dead-code facts after a rescan; rolling up without them",
+                missing.len()
+            );
+        }
+        if filled.contributions.is_empty() {
+            return Ok(None);
+        }
+        let (hash, _timings) = cache
+            .apply_contribution_updates_for_config(
+                aggregate_job.category,
+                Tier2ContributionUpdates {
+                    upserts: filled.contributions,
+                    ..Tier2ContributionUpdates::default()
+                },
+                aggregate_job.config.as_ref(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Some(hash))
+    }
+
     fn tier2_quick_reuse_success(
         &self,
         job: &InspectJob,
@@ -2442,6 +2632,15 @@ impl InspectManager {
         let phase_started = Instant::now();
         let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
+        // Every file in the walked scope (the same `.aftignore`-aware walk
+        // that defines `scope_files`) gets a dead-code contribution whenever it
+        // is scanned with a call graph, including empty, unparseable,
+        // generated and unsupported-language files.
+        let expected_dead_code_files = if job.category == InspectCategory::DeadCode {
+            current_by_relative.clone()
+        } else {
+            BTreeMap::new()
+        };
         let cached_relative = cached_records
             .iter()
             .map(freshness_record_relative_key)
@@ -2789,30 +2988,73 @@ impl InspectManager {
             }
             phases.snapshot += snapshot_started.elapsed();
         }
-        if options.require_callgraph_snapshot
-            && aggregate_job.category == InspectCategory::DeadCode
+        if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
-            if let Some(reason) = callgraph_path_identity_gap(job) {
+            if options.require_callgraph_snapshot {
+                if let Some(reason) = callgraph_path_identity_gap(job) {
+                    return Ok(InspectScanSuccess {
+                        scanned_files: scan_files,
+                        contributions: Vec::new(),
+                        aggregate: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
+                            job.scope_files.len(),
+                            Some(&reason),
+                        ),
+                    });
+                }
+            }
+            // A borrow-only root (a worktree reading the main checkout's
+            // stores) cannot build the call graph dead code needs, so retrying
+            // cannot help. Return an unavailable result that names this cause
+            // and carries no count, so it is not mistaken for zero dead code.
+            if job.config.indexes.callgraph && job_is_borrow_only(job) {
+                self.set_dead_code_borrow_only_unavailable(&job.project_root, true);
                 return Ok(InspectScanSuccess {
                     scanned_files: scan_files,
                     contributions: Vec::new(),
-                    aggregate: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_with_reason(
-                        job.scope_files.len(),
-                        Some(&reason),
-                    ),
+                    aggregate:
+                        crate::inspect::scanners::dead_code::borrow_only_unavailable_aggregate(
+                            job.scope_files.len(),
+                        ),
                 });
             }
-            return Err(format!(
-                "tier2 dead_code aggregate did not complete; builder_state={}",
-                self.builder_state_detail_for_job(job)
-            ));
+            if options.require_callgraph_snapshot {
+                return Err(format!(
+                    "tier2 dead_code aggregate did not complete; builder_state={}",
+                    self.builder_state_detail_for_job(job)
+                ));
+            }
         }
         let rollup_started = Instant::now();
         if crate::executor::current_job_cancelled() {
             return Err("tier2 pass cancelled before rollup".to_string());
         }
-        let contributions = load_contributions(cache, &aggregate_job)?;
+        if aggregate_job.category == InspectCategory::DeadCode {
+            // This pass reached a rollup, so dead code is not borrow-only
+            // unavailable any more.
+            self.set_dead_code_borrow_only_unavailable(&job.project_root, false);
+        }
+        let mut contributions = load_contributions(cache, &aggregate_job)?;
+        if aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job.callgraph_snapshot.is_some()
+        {
+            // Files scanned while no call graph was ready produce no dead-code
+            // facts. If the graph became ready before this rollup, rolling up
+            // the partial set would report those files' findings as absent (an
+            // empty set reads as zero dead code). Scan the missing files now,
+            // with the graph this rollup uses, so the result is complete and a
+            // pass can never stay incomplete.
+            let filled = self.fill_missing_dead_code_facts(
+                &aggregate_job,
+                cache,
+                &expected_dead_code_files,
+                &contributions,
+            )?;
+            if let Some(hash) = filled {
+                contribution_set_hash = hash;
+                contributions = load_contributions(cache, &aggregate_job)?;
+            }
+        }
         let aggregate = if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_some()
         {
@@ -4340,6 +4582,33 @@ fn relative_cache_key(project_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+/// Whether the job runs in a borrow-only root: one that may not write the
+/// inspect store or build the call-graph store (a worktree that reads the main
+/// checkout's stores). Builder state reports this as `build_denied`.
+fn job_is_borrow_only(job: &InspectJob) -> bool {
+    !job.inspect_writer || !job.callgraph_writer
+}
+
+/// The expected files (keyed like freshness records) that have no dead-code
+/// facts among `contributions`. Coverage is keyed by each contribution's file
+/// path relative to the root, the same key the inspect store uses, so a
+/// payload `file` spelled differently (canonicalized) cannot read as missing.
+fn dead_code_files_without_facts(
+    project_root: &Path,
+    expected_files: &BTreeMap<String, PathBuf>,
+    contributions: &[FileContribution],
+) -> Vec<PathBuf> {
+    let covered = contributions
+        .iter()
+        .map(|contribution| relative_cache_key(project_root, &contribution.file_path))
+        .collect::<BTreeSet<_>>();
+    expected_files
+        .iter()
+        .filter(|(relative, _)| !covered.contains(*relative))
+        .map(|(_, path)| path.clone())
+        .collect()
+}
+
 fn load_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     job: &InspectJob,
@@ -4553,7 +4822,7 @@ fn roll_up_dead_code_contributions(
     drill_down_limit: Option<usize>,
 ) -> Value {
     let Some(snapshot) = job.callgraph_snapshot.as_deref() else {
-        return super::scanners::dead_code::callgraph_unavailable_aggregate(job.scope_files.len());
+        return super::scanners::dead_code::callgraph_unavailable_aggregate_for_job(job);
     };
 
     let public_api_files = super::scanners::dead_code::collect_public_api_files(&job.project_root);
@@ -4617,15 +4886,15 @@ fn roll_up_unused_exports_contributions(
     let test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for scan in &parsed {
         if public_api_files.contains(&scan.file) {
             continue;
         }
-        // Mirror the fresh-scan path: fixtures/corpora/mock data are consumed
-        // by path, never imported, so their exports always look unused.
-        if super::job::is_test_support_file(&scan.file) {
-            continue;
-        }
+        // Mirror the fresh-scan path: test files and fixtures are analyzed for
+        // the product exports they keep live, but their own exports are
+        // withheld from the product count and tallied as excluded.
+        let test_tree = is_test_tree_file(&scan.file);
         let generated_file = super::generated::is_generated_file_with_cached_hint(
             &job.project_root,
             &scan.file,
@@ -4636,6 +4905,7 @@ fn roll_up_unused_exports_contributions(
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
                     LivenessVerdict::Used => continue,
+                    LivenessVerdict::Uncertain if test_tree => continue,
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
                         if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -4665,7 +4935,7 @@ fn roll_up_unused_exports_contributions(
                 if imported {
                     continue;
                 }
-                if uncertain {
+                if uncertain && !test_tree {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
                         uncertain_items.push(json!({
@@ -4686,6 +4956,10 @@ fn roll_up_unused_exports_contributions(
                 "kind": export.kind,
                 "line": export.line,
             });
+            if test_tree {
+                excluded.record(&scan.file);
+                continue;
+            }
             if let Some(provenance) = &export.provenance {
                 item["provenance"] = json!(provenance);
             }
@@ -4744,6 +5018,7 @@ fn roll_up_unused_exports_contributions(
         "uncertain_items": uncertain_items,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
+    excluded.write_into(&mut aggregate);
     if !parse_errors.is_empty() {
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
@@ -4821,12 +5096,12 @@ fn roll_up_unused_exports_oxc_contributions(
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for file in &oxc_result.files {
-        if public_api_files.contains(&file.relative_file)
-            || super::job::is_test_support_file(&file.relative_file)
-        {
+        if public_api_files.contains(&file.relative_file) {
             continue;
         }
+        let test_tree = is_test_tree_file(&file.relative_file);
         let generated_file = generated_by_file
             .get(&file.relative_file)
             .copied()
@@ -4840,9 +5115,7 @@ fn roll_up_unused_exports_oxc_contributions(
         for export in &file.exports {
             match export.verdict {
                 LivenessVerdict::Used => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -4860,8 +5133,33 @@ fn roll_up_unused_exports_oxc_contributions(
                             test_only_count += 1;
                             test_only_items.push(item);
                         }
+                    } else if export.only_same_file_references {
+                        // Mirror the fresh scan: an export referenced only
+                        // inside its own file is an unused export.
+                        if test_tree {
+                            excluded.record(&file.relative_file);
+                            continue;
+                        }
+                        let mut item = json!({
+                            "file": file.relative_file,
+                            "symbol": export.symbol,
+                            "kind": export.kind,
+                            "line": export.line,
+                            "provenance": export.provenance,
+                            "reason": super::scanners::unused_exports::ONLY_SAME_FILE_REFERENCES_REASON,
+                        });
+                        add_oxc_reexport_contexts(&mut item, &export.also_reexported);
+                        if generated_file {
+                            item["generated"] = json!(true);
+                            generated_count += 1;
+                            generated_items.push(item);
+                        } else {
+                            count += 1;
+                            items.push(item);
+                        }
                     }
                 }
+                LivenessVerdict::Uncertain if test_tree => {}
                 LivenessVerdict::Uncertain => {
                     uncertain_count += 1;
                     if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -4878,9 +5176,7 @@ fn roll_up_unused_exports_oxc_contributions(
                     }
                 }
                 LivenessVerdict::Unused => {
-                    if !is_test_file(&file.relative_file)
-                        && !export.test_only_reference_files.is_empty()
-                    {
+                    if !test_tree && !export.test_only_reference_files.is_empty() {
                         let mut item = json!({
                             "file": file.relative_file,
                             "symbol": export.symbol,
@@ -4901,6 +5197,10 @@ fn roll_up_unused_exports_oxc_contributions(
                         continue;
                     }
                     if export.has_references {
+                        continue;
+                    }
+                    if test_tree {
+                        excluded.record(&file.relative_file);
                         continue;
                     }
                     let mut item = json!({
@@ -4980,6 +5280,7 @@ fn roll_up_unused_exports_oxc_contributions(
         "uncertain_items": uncertain_items,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
     });
+    excluded.write_into(&mut aggregate);
     if !parse_errors.is_empty() {
         aggregate["parse_errors"] = Value::Array(parse_errors);
     }
@@ -7521,6 +7822,218 @@ export function bannerUnused() {}
         );
     }
 
+    /// A Rust binary crate with one live and one dead function, plus `extra`
+    /// edge-case files, with a ready call-graph store. Returns the manager,
+    /// snapshot and a job for one dead-code pass.
+    fn dead_code_edge_case_fixture(
+        extra: &[(&str, &str)],
+    ) -> (tempfile::TempDir, PathBuf, InspectManager, InspectSnapshot) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        write_fixture_file(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"edge-cases\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            3_200_000_000,
+        );
+        write_fixture_file(
+            &root,
+            "src/main.rs",
+            "mod dead;\nfn main() {\n    dead::live();\n}\n",
+            3_200_000_001,
+        );
+        write_fixture_file(
+            &root,
+            "src/dead.rs",
+            "pub fn live() {}\npub fn planted_dead() {}\n",
+            3_200_000_002,
+        );
+        for (index, (relative, contents)) in extra.iter().enumerate() {
+            write_fixture_file(&root, relative, contents, 3_200_000_010 + index as i64);
+        }
+
+        let inspect_dir = root.join(".aft-cache").join("opencode").join("inspect");
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
+        let project_files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        store.cold_build(&project_files).expect("cold build store");
+        drop(store);
+
+        let config = Arc::new(crate::config::Config {
+            project_root: Some(root.clone()),
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
+            ..crate::config::Config::default()
+        });
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir,
+            config,
+            Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        );
+        (dir, root, InspectManager::new(), snapshot)
+    }
+
+    /// Runs one dead-code pass over an edge-case fixture and checks the rollup
+    /// completes with every walked file covered by stored facts.
+    fn assert_dead_code_rollup_completes_with(extra: &[(&str, &str)]) -> Value {
+        let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(extra);
+        let job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
+        let aggregate = manager
+            .tier2_run_with_reuse_job_result_with_options(
+                job,
+                Tier2ReuseOptions {
+                    require_callgraph_snapshot: true,
+                    ..Tier2ReuseOptions::default()
+                },
+                None,
+            )
+            .outcome
+            .unwrap_or_else(|error| panic!("dead-code rollup must complete: {error}"))
+            .aggregate;
+        assert_eq!(
+            aggregate["callgraph_available"], true,
+            "the rollup must use the call graph: {aggregate:#}"
+        );
+        assert!(
+            aggregate_has_file_symbol(&aggregate, "src/dead.rs", "planted_dead"),
+            "the planted dead function must be reported: {aggregate:#}"
+        );
+        assert!(
+            !aggregate_has_file_symbol(&aggregate, "src/dead.rs", "live"),
+            "{aggregate:#}"
+        );
+
+        let walked = crate::callgraph::walk_project_files(&root)
+            .map(|path| relative_cache_key(&root, &path))
+            .collect::<BTreeSet<_>>();
+        let cache = manager
+            .cache_for_snapshot(&snapshot)
+            .expect("inspect cache");
+        let stored = cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .expect("load contributions")
+            .into_iter()
+            .map(|record| record.file_path.to_string_lossy().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            stored, walked,
+            "every walked file must have stored dead-code facts"
+        );
+        aggregate
+    }
+
+    #[test]
+    fn dead_code_rollup_completes_with_an_empty_rust_file() {
+        assert_dead_code_rollup_completes_with(&[("src/empty.rs", "")]);
+    }
+
+    #[test]
+    fn dead_code_rollup_completes_with_a_comment_only_file() {
+        assert_dead_code_rollup_completes_with(&[(
+            "src/comments.rs",
+            "// only a line comment\n/* and a block comment */\n",
+        )]);
+    }
+
+    #[test]
+    fn dead_code_rollup_completes_with_a_file_that_fails_to_parse() {
+        assert_dead_code_rollup_completes_with(&[(
+            "src/broken.rs",
+            "pub fn broken( {\n    let = ;\n",
+        )]);
+    }
+
+    #[test]
+    fn dead_code_rollup_completes_with_a_language_without_a_dead_code_scanner() {
+        let aggregate =
+            assert_dead_code_rollup_completes_with(&[("scripts/build.groovy", "println 'x'\n")]);
+        assert!(
+            aggregate["languages_skipped"]
+                .as_array()
+                .is_some_and(|languages| !languages.is_empty()),
+            "the unsupported language must be reported as skipped: {aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn dead_code_rollup_completes_with_a_generated_file() {
+        let aggregate = assert_dead_code_rollup_completes_with(&[(
+            "src/generated.rs",
+            "// Code generated by fixture. DO NOT EDIT.\npub fn generated_dead() {}\n",
+        )]);
+        assert_eq!(
+            aggregate["count"], 1,
+            "generated findings stay out of the headline count: {aggregate:#}"
+        );
+        assert_eq!(aggregate["generated_count"], 1, "{aggregate:#}");
+    }
+
+    /// A file excluded by `.aftignore` is outside the walked scope, so the
+    /// coverage check never requires facts for it.
+    #[test]
+    fn dead_code_rollup_completes_with_an_aftignored_file() {
+        assert_dead_code_rollup_completes_with(&[
+            (".aftignore", "ignored/\n"),
+            ("ignored/skip.rs", "pub fn ignored_dead() {}\n"),
+        ]);
+    }
+
+    /// Facts missing at rollup time (files scanned before the call graph was
+    /// ready) are filled by scanning those files with the rollup's graph, so a
+    /// pass completes instead of failing until some later pass.
+    #[test]
+    fn missing_dead_code_facts_are_filled_before_rollup() {
+        let (_dir, root, manager, snapshot) = dead_code_edge_case_fixture(&[("src/empty.rs", "")]);
+        let mut job = manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
+        job.scope_files = scope_files(&root, &JobScope::for_project(root.clone()));
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&snapshot.inspect_dir, &root).expect("store dir");
+        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
+            .expect("open store")
+            .expect("store is ready");
+        job.callgraph_snapshot = Some(Arc::new(
+            project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot"),
+        ));
+        drop(store);
+        let cache = manager
+            .cache_for_snapshot(&snapshot)
+            .expect("inspect cache");
+        let expected = current_project_files(&root, &job.scope_files);
+        // Keys are native relative paths, so build this one the same way.
+        let empty_key = relative_cache_key(&root, &root.join("src").join("empty.rs"));
+        assert!(expected.contains_key(&empty_key), "{expected:?}");
+
+        let before = load_contributions(cache.as_ref(), &job).expect("load");
+        assert_eq!(
+            dead_code_files_without_facts(&root, &expected, &before).len(),
+            expected.len(),
+            "control: a fresh cache has no facts"
+        );
+        let hash = manager
+            .fill_missing_dead_code_facts(&job, cache.as_ref(), &expected, &before)
+            .expect("fill succeeds");
+        assert!(hash.is_some(), "facts were stored");
+        let after = load_contributions(cache.as_ref(), &job).expect("load");
+        assert!(
+            dead_code_files_without_facts(&root, &expected, &after).is_empty(),
+            "every expected file must have facts after the fill"
+        );
+        assert_eq!(
+            manager
+                .fill_missing_dead_code_facts(&job, cache.as_ref(), &expected, &after)
+                .expect("second fill"),
+            None,
+            "nothing to fill once covered"
+        );
+    }
+
     fn aggregate_has_file_symbol(aggregate: &Value, file: &str, symbol: &str) -> bool {
         aggregate
             .get("items")
@@ -9426,9 +9939,10 @@ mod tier2_deadline_tests {
     fn tier2_pass_deadline_cooperative_stub_returns_within_grace() {
         let limiter = cold_build_limiter::isolated_limiter(1);
         let permit = limiter.try_acquire().expect("test permit");
+        let root = tempfile::tempdir().expect("existing deadline-test root");
         let started = Instant::now();
         let (value, timed_out) = run_tier2_pass_with_deadline(
-            Path::new("/tmp/tier2-timeout"),
+            root.path(),
             InspectCategory::Duplicates,
             Duration::from_millis(20),
             Some(Arc::new(Mutex::new(Some(permit)))),

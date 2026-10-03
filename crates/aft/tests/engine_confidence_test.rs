@@ -92,6 +92,7 @@ fn key(label: &str) -> CanonicalListKey {
         snapshot_generation: "confidence-generation-1".to_string(),
         normalized_query: label.to_string(),
         include_tests: false,
+        split: None,
     }
 }
 

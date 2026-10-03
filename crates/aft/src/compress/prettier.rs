@@ -139,28 +139,10 @@ fn is_success_duration_line(trimmed: &str) -> bool {
 fn finish(input: &str) -> String {
     let stripped = strip_ansi(input);
     let deduped = dedup_consecutive(&stripped);
-    cap_lines(
+    crate::compress::line_cut::cap_text_head_tail(
         &middle_truncate(&deduped, 32 * 1024, 16 * 1024, 16 * 1024),
         MAX_LINES,
     )
-}
-
-fn cap_lines(input: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = input.lines().collect();
-    if lines.len() <= max_lines {
-        return input.trim_end().to_string();
-    }
-    let mut kept = lines
-        .iter()
-        .take(max_lines)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    kept.push_str(&format!(
-        "\n... truncated {} lines",
-        lines.len() - max_lines
-    ));
-    kept
 }
 
 #[cfg(test)]

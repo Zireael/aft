@@ -219,6 +219,11 @@ pub(super) struct BashDetachTarget {
     /// `wait: true`: the session's wait-mode registration is ended rather than
     /// only the foreground-task registration.
     pub(super) wait_mode: bool,
+    /// The caller is a delegated worker; picks the wording of the detach text.
+    pub(super) worker_session: bool,
+    /// v1 without late_results cannot leave a shell action running after its reply.
+    /// Drain and cancellation therefore kill the task instead of promoting it.
+    pub(super) server_completion: bool,
     pub(super) registry: crate::bash_background::BgTaskRegistry,
     pub(super) request_id: String,
     pub(super) ver: u8,

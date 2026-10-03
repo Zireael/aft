@@ -6,9 +6,7 @@ use std::time::{Duration, Instant};
 use crate::context::AppContext;
 use crate::grep_executor::bounded_fallback_walk_files;
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{
-    build_path_filters, has_any_project_file_from, resolve_search_scope, sort_paths_by_mtime_desc,
-};
+use crate::search_index::{build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc};
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
 
@@ -85,6 +83,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     let total_started = Instant::now();
+    let mut parent_gaps = Vec::new();
     let (
         mut files,
         walk_truncated,
@@ -94,7 +93,20 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_has_files,
         scope_probe,
         skipped_foreign_mounts,
-    ) = if search_roots.len() == 1 {
+    ) = if let Some(answer) = crate::views::parent::glob_fan_out(ctx, &search_roots, pattern) {
+        // A parent folder session answers from its child repositories' indexes.
+        parent_gaps = answer.gaps;
+        (
+            answer.files,
+            false,
+            "index",
+            answer.entries_visited,
+            Duration::ZERO,
+            answer.scope_has_files,
+            Duration::ZERO,
+            0,
+        )
+    } else if search_roots.len() == 1 {
         let discovery = glob_root(
             ctx,
             &project_root,
@@ -204,6 +216,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
+    crate::views::parent::attach_gaps(&mut body, parent_gaps);
 
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());
@@ -250,11 +263,6 @@ fn missing_on_disk_note(dropped: usize, budget_exhausted: bool) -> String {
     note
 }
 
-fn scope_has_files(project_root: &Path, search_root: &Path) -> bool {
-    let catch_all = build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
-    has_any_project_file_from(project_root, search_root, &catch_all)
-}
-
 fn glob_root(
     ctx: &AppContext,
     project_root: &Path,
@@ -274,6 +282,9 @@ fn glob_root(
             _ => None,
         }
     };
+    let index_covers_root = indexed_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.has_file_in_scope(&search_scope.root));
     let indexed = indexed_snapshot.map(|snapshot| {
         let (files, scope_has_files, entries_visited) =
             snapshot.glob_profiled(pattern, &search_scope.root, false);
@@ -291,7 +302,7 @@ fn glob_root(
 
     match indexed {
         Some(discovery)
-            if discovery.scope_has_files
+            if index_covers_root
                 || crate::grep_executor::is_same_directory(&search_scope.root, project_root) =>
         {
             discovery
@@ -314,7 +325,7 @@ fn glob_root(
                 {
                     let walk_time = walk_started.elapsed();
                     let scope_started = Instant::now();
-                    let scope_has_files = scope_has_files(project_root, &search_scope.root);
+                    let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
                     return GlobDiscovery {
                         files: outcome.files,
                         walk_truncated: outcome.walk_truncated,
@@ -344,7 +355,7 @@ fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn fallback_glob(
-    project_root: &std::path::Path,
+    _project_root: &std::path::Path,
     search_root: &std::path::Path,
     pattern: &str,
 ) -> GlobDiscovery {
@@ -359,7 +370,9 @@ fn fallback_glob(
     let outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
     let walk_time = walk_started.elapsed();
     let scope_started = Instant::now();
-    let scope_has_files = scope_has_files(project_root, search_root);
+    // Reuse the filtered walk; an incomplete walk cannot prove an empty scope.
+    let scope_has_files =
+        !outcome.files.is_empty() || outcome.walk_truncated || outcome.skipped_foreign_mounts > 0;
     GlobDiscovery {
         files: outcome.files,
         walk_truncated: outcome.walk_truncated,

@@ -42,6 +42,17 @@ pub(super) struct BashDeferredCompletion {
     fatal: bool,
 }
 
+#[cfg(test)]
+impl BashDeferredCompletion {
+    pub(super) fn response_for_test(&self) -> &Response {
+        &self
+            .result
+            .as_ref()
+            .expect("bash completion result")
+            .response
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct BashTranslatedSettings {
     background: bool,
@@ -63,6 +74,7 @@ enum BashSpawnControl {
         timeout: Option<u64>,
         wait_window_ms: u64,
         detach_on_user_message: bool,
+        worker_session: bool,
     },
 }
 
@@ -146,7 +158,9 @@ async fn observe_deferred_bash_wait(
 /// executor and off the module loop's thread: promotion writes task metadata.
 fn detach_held_bash_in_background(target: drain::BashDetachTarget) {
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
+        if target.server_completion {
+            let _ = target.registry.kill(&target.task_id, &target.session_id);
+        } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
             log::warn!(
                 "subc attach: could not hand bash task {} to the background after answering its call: {error}",
                 target.task_id
@@ -182,11 +196,22 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         );
         let frame = match (reason, routes.get(&route)) {
             (_, None) => None,
+            (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
+                Some(build_error_frame(
+                    target.ver,
+                    route.channel,
+                    route.epoch,
+                    corr,
+                    target.flags,
+                    "cancelled",
+                    "server-owned call ended during module drain",
+                )?)
+            }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
                 let response = Response::success(
                     &target.request_id,
                     json!({
-                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id),
+                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
@@ -290,11 +315,17 @@ fn finalized_bash_result(
     session_id: &str,
     format_context: &crate::subc_format::FormatContext,
     allow_bg_completions: bool,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
     // The bash formatter never renders `bg_completions`, so formatting before finalization
     // yields the same text and lets the finalizer append the status bar to it.
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
+    // Observe before finalizing: the status bar the finalizer appends carries
+    // moving counts that would make identical results hash differently.
+    if let Some(repeat) = repeat {
+        repeat.observe(ctx, &mut text);
+    }
     crate::response_finalize::finalize_tool_response(
         &mut response,
         &mut text,
@@ -314,11 +345,16 @@ fn bash_result_from_response(
     ToolCallResult { text, response }
 }
 
-fn bash_background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+fn bash_background_launch_response(
+    request_id: &str,
+    task_id: &str,
+    is_pty: bool,
+    worker_session: bool,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty),
+            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -334,6 +370,7 @@ fn finish_bash_spawn_immediate(
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashSpawnControl>>,
     allow_bg_completions: bool,
+    repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
     let result = finalized_bash_result(
         response,
@@ -341,6 +378,7 @@ fn finish_bash_spawn_immediate(
         session_id,
         format_context,
         allow_bg_completions,
+        repeat.take(),
     );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
@@ -360,6 +398,7 @@ fn finish_bash_poll_done(
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
     allow_bg_completions: bool,
+    repeat: &mut Option<crate::run_tool_call::RepeatObservation>,
 ) -> Response {
     let result = finalized_bash_result(
         response,
@@ -367,6 +406,7 @@ fn finish_bash_poll_done(
         session_id,
         format_context,
         allow_bg_completions,
+        repeat.take(),
     );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
@@ -399,7 +439,11 @@ pub(super) fn submit_deferred_bash(
     bind_trust: BindTrust,
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
+    call_key: Option<String>,
     permissions_granted: Option<Vec<String>>,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
+    worker_session: bool,
+    server_completion: bool,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -409,6 +453,14 @@ pub(super) fn submit_deferred_bash(
     let session_for_spawn = session_id.clone();
     let project_root_for_spawn = project_root.clone();
     let format_context_for_spawn = format_context.clone();
+    // A call that returns its result ends in exactly one of three places: the
+    // spawn job answers it at once (a rewritten command, an error, or a
+    // background launch), a poll job answers it when the foreground wait
+    // finishes, or the promote job answers it when the wait window closes. Each
+    // gets its own copy; only the one that answers observes the call. A held
+    // call the module loop answers instead (drain or cancel) carries no result
+    // and is not observed.
+    let mut repeat_for_spawn = repeat.clone();
     let spawn_rx = executor.submit_async(
         root_for_spawn,
         Lane::Mutating,
@@ -428,6 +480,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         false,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -463,6 +516,7 @@ pub(super) fn submit_deferred_bash(
                             &mut spawn_text_tx,
                             &mut spawn_control_tx,
                             true,
+                            &mut repeat_for_spawn,
                         );
                     }
                 };
@@ -475,6 +529,18 @@ pub(super) fn submit_deferred_bash(
                         Value::Array(grants.into_iter().map(Value::String).collect()),
                     );
                 }
+                // `worker_session` comes from the plugin-set field of the subc
+                // call body, never from the agent's arguments: an agent must not be able to claim it is a
+                // worker to lift the default hard kill on its command.
+                translated
+                    .args
+                    .remove(crate::protocol::WORKER_SESSION_FIELD);
+                if worker_session {
+                    translated.args.insert(
+                        crate::protocol::WORKER_SESSION_FIELD.to_string(),
+                        Value::Bool(true),
+                    );
+                }
                 let settings = bash_settings_from_translated(&translated.args);
                 let raw_req = RawRequest {
                     id: request_id_for_spawn.clone(),
@@ -483,9 +549,14 @@ pub(super) fn submit_deferred_bash(
                     session_id: Some(session_for_spawn.clone()),
                     params: Value::Object(translated.args),
                 };
-                let response =
+                let (response, storage_dir) =
                     crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
-                        dispatch(raw_req, ctx)
+                        crate::bash_background::with_call_key(call_key, || {
+                            (
+                                dispatch(raw_req, ctx),
+                                crate::bash_background::task_storage_dir(ctx),
+                            )
+                        })
                     });
                 if !response.success {
                     return finish_bash_spawn_immediate(
@@ -496,6 +567,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -513,6 +585,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 };
                 if response.data.get("status").and_then(Value::as_str) != Some("running") {
@@ -524,6 +597,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -533,9 +607,13 @@ pub(super) fn submit_deferred_bash(
                     .and_then(Value::as_str)
                     .unwrap_or("pipes");
                 let is_pty = mode == "pty" || settings.pty;
-                if is_pty || settings.background {
-                    let response =
-                        bash_background_launch_response(&request_id_for_spawn, &task_id, is_pty);
+                if !server_completion && (is_pty || settings.background) {
+                    let response = bash_background_launch_response(
+                        &request_id_for_spawn,
+                        &task_id,
+                        is_pty,
+                        worker_session,
+                    );
                     return finish_bash_spawn_immediate(
                         response,
                         ctx,
@@ -544,6 +622,7 @@ pub(super) fn submit_deferred_bash(
                         &mut spawn_text_tx,
                         &mut spawn_control_tx,
                         true,
+                        &mut repeat_for_spawn,
                     );
                 }
 
@@ -554,14 +633,12 @@ pub(super) fn submit_deferred_bash(
                         settings.wait,
                     );
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-                let storage_dir =
-                    crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
                 let project_root = ctx.config().project_root.clone();
                 // Register the session as detachable exactly like the
                 // standalone path (bash_orchestrate) does: without this, a
                 // bash_wait_detach signal finds no active wait and wait:true
                 // blocks through user messages.
-                let detach_on_user_message = settings.wait;
+                let detach_on_user_message = settings.wait && !server_completion;
                 ctx.bash_background()
                     .register_foreground_task(&session_for_spawn, &task_id);
                 if detach_on_user_message {
@@ -579,6 +656,7 @@ pub(super) fn submit_deferred_bash(
                         timeout: settings.timeout,
                         wait_window_ms,
                         detach_on_user_message,
+                        worker_session,
                     });
                 }
                 response
@@ -633,6 +711,7 @@ pub(super) fn submit_deferred_bash(
                 timeout,
                 wait_window_ms,
                 detach_on_user_message,
+                worker_session,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -663,9 +742,12 @@ pub(super) fn submit_deferred_bash(
                     timeout,
                     wait_window_ms,
                     detach_on_user_message,
+                    worker_session,
                     format_context,
                     cancel,
                     claim,
+                    repeat,
+                    server_completion,
                 )
                 .await;
             }
@@ -711,9 +793,12 @@ async fn run_deferred_bash_wait(
     timeout: Option<u64>,
     wait_window_ms: u64,
     detach_on_user_message: bool,
+    worker_session: bool,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
+    server_completion: bool,
 ) {
     let Some(wait_ctx) = executor.actor_context(&root) else {
         send_bash_deferred_completion(
@@ -741,6 +826,8 @@ async fn run_deferred_bash_wait(
             task_id: task_id.clone(),
             session_id: session_id.clone(),
             wait_mode: detach_on_user_message,
+            worker_session,
+            server_completion,
             registry: registry.clone(),
             request_id: request_id.clone(),
             ver,
@@ -775,6 +862,7 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        if server_completion { let _ = registry.kill(&task_id, &session_id); }
                         release_wait_registration(
                             &registry,
                             &session_id,
@@ -819,7 +907,7 @@ async fn run_deferred_bash_wait(
                 // a background task so its request can answer before the drain
                 // deadline. The command keeps running and its completion is
                 // delivered like any promoted task's.
-                let drain_detach_due = cancel.drain.is_active();
+                let drain_detach_due = cancel.drain.is_active() && !server_completion;
                 if !target_finished && !detach_pending && !promotion_due && !drain_detach_due {
                     continue;
                 }
@@ -833,6 +921,7 @@ async fn run_deferred_bash_wait(
                 let project_root_for_poll = project_root.clone();
                 let format_context_for_poll = format_context.clone();
                 let claim_for_poll = Arc::clone(&claim);
+                let mut repeat_for_poll = repeat.clone();
                 let poll_rx = executor.submit_async(
                     root_for_poll,
                     Lane::PureRead,
@@ -877,6 +966,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     true,
+                                    &mut repeat_for_poll,
                                 );
                             };
 
@@ -890,6 +980,7 @@ async fn run_deferred_bash_wait(
                                         &task_id_for_poll,
                                         &session_for_poll,
                                         &request_id_for_poll,
+                                        worker_session,
                                     );
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
@@ -910,6 +1001,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     false,
+                                    &mut repeat_for_poll,
                                 );
                             }
                             if detach_on_user_message
@@ -926,6 +1018,7 @@ async fn run_deferred_bash_wait(
                                     &task_id_for_poll,
                                     &session_for_poll,
                                     &request_id_for_poll,
+                                    worker_session,
                                 );
                                 ctx.bash_background().end_wait_mode_session(
                                     &session_for_poll,
@@ -939,6 +1032,7 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     false,
+                                    &mut repeat_for_poll,
                                 );
                             }
                             match crate::commands::bash_orchestrate::decide_bash_step(
@@ -971,6 +1065,7 @@ async fn run_deferred_bash_wait(
                                         &mut poll_text_tx,
                                         &mut poll_control_tx,
                                         true,
+                                        &mut repeat_for_poll,
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
@@ -1093,7 +1188,9 @@ async fn run_deferred_bash_wait(
                             session_id.clone(),
                             timeout,
                             wait_window_ms,
+                            worker_session,
                             format_context.clone(),
+                            repeat.clone(),
                         )
                         .await;
                         let fatal = response_is_fatal_panic(&result.response);
@@ -1127,7 +1224,9 @@ async fn submit_bash_promote(
     session_id: String,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
     format_context: crate::subc_format::FormatContext,
+    repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let request_id_for_promote = request_id.clone();
@@ -1159,6 +1258,7 @@ async fn submit_bash_promote(
                         timeout,
                         wait_window_ms,
                         &request_id_for_promote,
+                        worker_session,
                     )
                 };
                 let result = finalized_bash_result(
@@ -1167,6 +1267,7 @@ async fn submit_bash_promote(
                     &session_for_promote,
                     &format_context_for_promote,
                     false,
+                    repeat,
                 );
                 let ToolCallResult { text, response } = result;
                 let _ = text_tx.send(text);
@@ -1349,7 +1450,7 @@ mod grant_path_tests {
         );
         let dispatch = submit.find("dispatch(raw_req, ctx)").unwrap();
         let mode_branch = submit
-            .find("if is_pty || settings.background")
+            .find("if !server_completion && (is_pty || settings.background)")
             .expect("background/PTY branch");
         let foreground_wait = submit
             .find("select_foreground_wait_window_ms")
@@ -1376,7 +1477,9 @@ mod grant_path_tests {
             std::path::PathBuf::from("/bin/bash"),
             None,
             None,
-            raw_params.get("timeout").and_then(Value::as_u64),
+            crate::bash_background::HardKill::from_timeout_ms(
+                raw_params.get("timeout").and_then(Value::as_u64),
+            ),
             ctx,
             false,
             false,
@@ -1387,6 +1490,83 @@ mod grant_path_tests {
             Vec::new(),
             None,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
+        for (background, pty) in [(false, false), (true, false), (false, true)] {
+            let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");
+            let ctx = super::super::test_support::test_ctx();
+            ctx.update_config(|config| config.foreground_wait_window_ms = 10);
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (completion_tx, mut completion_rx) = mpsc::channel(8);
+            let (touch_tx, _touch_rx) = mpsc::channel(8);
+            let started = Instant::now();
+            submit_deferred_bash(
+                &executor,
+                &completion_tx,
+                &touch_tx,
+                &metrics,
+                running_bash_stub,
+                root.clone(),
+                root.as_path().into(),
+                "v1-session".into(),
+                "v1-shell".into(),
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                1,
+                Flags::new(false, Priority::Interactive, false),
+                PROTOCOL_VERSION,
+                json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
+                crate::subc_format::FormatContext::default(),
+                BashWaitCancel {
+                    connection: PersistentCancelSignal::new(),
+                    route: PersistentCancelSignal::new(),
+                    drain: drain::ModuleDrainWindow::default(),
+                },
+                BindTrust::FirstParty,
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "returned before command completion"
+            );
+            let response = completion.response_for_test();
+            assert_ne!(
+                response.data.get("status").and_then(Value::as_str),
+                Some("running")
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), completion_rx.recv())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    struct DeferredWaitReleaseGuard(Vec<std::path::PathBuf>);
+
+    impl Drop for DeferredWaitReleaseGuard {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::write(path, b"release");
+            }
+        }
     }
 
     #[tokio::test]
@@ -1409,7 +1589,26 @@ mod grant_path_tests {
             roots.push((dir, root));
         }
 
+        let releases = DeferredWaitReleaseGuard(
+            roots
+                .iter()
+                .take(4)
+                .map(|(_, root)| root.as_path().join("release"))
+                .collect(),
+        );
         for (index, (_, root)) in roots.iter().take(4).enumerate() {
+            // Each command polls for its release file. Windows runs bash commands
+            // through PowerShell, so the loop is written in its syntax there.
+            #[cfg(windows)]
+            let command = format!(
+                "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 10 }}",
+                releases.0[index].display()
+            );
+            #[cfg(not(windows))]
+            let command = format!(
+                "while [ ! -f '{}' ]; do sleep 0.01; done",
+                releases.0[index].display()
+            );
             let connection = PersistentCancelSignal::new();
             let route = PersistentCancelSignal::new();
             submit_deferred_bash(
@@ -1430,9 +1629,9 @@ mod grant_path_tests {
                 Flags::new(false, Priority::Passive, false),
                 PROTOCOL_VERSION,
                 json!({
-                    "command": "sleep 1",
+                    "command": command,
                     "wait": true,
-                    "timeout": 5_000,
+                    "timeout": 60_000,
                 }),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
@@ -1444,10 +1643,14 @@ mod grant_path_tests {
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
                 None,
                 None,
+                None,
+                None,
+                false,
+                false,
             );
         }
 
-        let waits_started_by = Instant::now() + Duration::from_secs(2);
+        let waits_started_by = Instant::now() + Duration::from_secs(60);
         while metrics
             .deferred_bash_waits_in_flight
             .load(Ordering::Relaxed)
@@ -1462,24 +1665,31 @@ mod grant_path_tests {
 
         // Every caller keeps its tool call open until the command actually exits.
         assert!(completion_rx.try_recv().is_err());
-
-        // Let at least one legacy poll interval elapse: an on-worker waiter would
-        // have occupied all four maintenance-eligible seats by now.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(completion_rx.try_recv().is_err());
+        assert_eq!(
+            executor
+                .try_dispatch_liveness_snapshot()
+                .expect("dispatch liveness")
+                .running
+                .maintenance,
+            0,
+            "parked waits must not hold maintenance workers"
+        );
 
         let admitted = executor.submit_maintenance_async(
             roots[4].1.clone(),
             Lane::MaintenanceCommit,
             "fresh-configure-tail".to_string(),
-            Box::new(|_| Response::success("fresh-configure-tail", json!({ "drained": true }))),
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(150));
+                Response::success("fresh-configure-tail", json!({ "drained": true }))
+            }),
         );
-        let response = tokio::time::timeout(Duration::from_millis(75), admitted)
+        let response = tokio::time::timeout(Duration::from_secs(60), admitted)
             .await
             .expect("maintenance admission must not wait for deferred bash")
             .expect("executor maintenance response");
         assert!(response.success);
-        let maintenance_released_by = Instant::now() + Duration::from_millis(75);
+        let maintenance_released_by = Instant::now() + Duration::from_secs(60);
         loop {
             let running = executor
                 .try_dispatch_liveness_snapshot()
@@ -1496,16 +1706,26 @@ mod grant_path_tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        // Maintenance must complete while the commands are still held, not
+        // merely finish faster than a wall-clock threshold on an idle machine.
+        assert!(completion_rx.try_recv().is_err());
+        assert_eq!(
+            metrics
+                .deferred_bash_waits_in_flight
+                .load(Ordering::Relaxed),
+            4
+        );
+        drop(releases);
         // Require each long command's ordinary terminal response and exact formatted text.
         for _ in 0..4 {
-            let completion = tokio::time::timeout(Duration::from_secs(3), completion_rx.recv())
+            let completion = tokio::time::timeout(Duration::from_secs(60), completion_rx.recv())
                 .await
                 .expect("deferred completion deadline")
                 .expect("deferred completion");
             let result = completion.result.expect("terminal bash result");
             assert!(result.response.success);
             assert_eq!(result.text, "");
-            tokio::time::timeout(Duration::from_secs(1), poll_touch_rx.recv())
+            tokio::time::timeout(Duration::from_secs(60), poll_touch_rx.recv())
                 .await
                 .expect("poll touch deadline")
                 .expect("poll touch");
@@ -1571,6 +1791,10 @@ mod grant_path_tests {
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
             None,
             None,
+            None,
+            None,
+            false,
+            false,
         );
 
         let started_by = Instant::now() + Duration::from_secs(3);
@@ -1579,7 +1803,10 @@ mod grant_path_tests {
             .load(Ordering::Relaxed)
             < 1
         {
-            assert!(Instant::now() < started_by, "deferred bash wait never started");
+            assert!(
+                Instant::now() < started_by,
+                "deferred bash wait never started"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let registry = executor
@@ -1628,6 +1855,12 @@ mod grant_path_tests {
             .await
             .expect("deferred completion deadline")
             .expect("deferred completion");
-        assert!(completion.result.expect("terminal bash result").response.success);
+        assert!(
+            completion
+                .result
+                .expect("terminal bash result")
+                .response
+                .success
+        );
     }
 }

@@ -70,8 +70,10 @@ pub mod commands;
 pub mod compress;
 pub mod config;
 pub mod config_fix;
+pub mod config_live;
 pub mod config_resolve;
 pub mod context;
+pub(crate) mod database_open;
 pub mod db;
 pub mod developer_tools;
 pub mod edit;
@@ -101,6 +103,7 @@ pub mod inspect;
 pub mod jsonc;
 pub mod jsonc_edit;
 pub mod language;
+pub mod launch_nonce;
 pub mod legacy_partitions;
 pub(crate) mod lifecycle_census;
 pub mod list_envelope;
@@ -116,18 +119,21 @@ pub mod migrate_storage;
 pub mod migration;
 pub mod ndjson_text;
 pub mod ort_lifecycle;
+pub mod ort_pin;
 pub(crate) mod os_metadata;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;
 pub mod path_status;
 pub mod pattern_compile;
+pub mod persisted_format;
 pub mod pins;
 mod platform_tls;
 pub mod process_io;
 pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
+pub mod reader_floor;
 pub mod readonly_artifacts;
 pub mod refresh;
 pub mod response_finalize;
@@ -151,6 +157,7 @@ pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
+pub mod tool_gate;
 pub mod tool_path;
 pub mod url_fetch;
 pub mod views;
@@ -169,6 +176,8 @@ pub mod windows_shell;
 
 #[cfg(test)]
 mod gate_hermeticity_tests;
+#[cfg(test)]
+pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
 pub(crate) mod test_allocations;
 #[cfg(test)]
@@ -342,3 +351,5 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
+
+pub(crate) mod persistence_gate;

@@ -18,6 +18,122 @@ Anything not named below is `gh_shim_unclassified` (exit 86, nothing sent). The
 refusal names the verb the classifier decided on, because the decision is made
 on the verb alone.
 
+## Commands on repositories no bot is bound to
+
+A command aimed at a repository the signed manifest binds no bot to cannot be
+bot speech, and upstream `gh` would run it under the operator's own login.
+Unless it is known to be safe (below), such a command is refused with
+`gh_shim_unbound_target` (exit 86, nothing sent) unless
+`GH_SHIM_BYPASS=operator` is set. For example:
+
+```text
+gh-shim: gh_shim_unbound_target: `issue comment` targets earendil-works/pi, which is not a bot-bound repository (the signed gh routing manifest binds no bot to it); bot speech is not possible there, and upstream gh would run it under the operator's own login. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.
+```
+
+With the bypass the command runs under the operator's own `gh`. Before starting
+it, the shim appends and syncs an audit line in the same format the bypass
+writes for `pr merge` and `release create`: `{as_of_unix_secs, tuple,
+repository}`, where `tuple` is the verb (`repo create`) or
+`api:<METHOD>:<endpoint>` and `repository` is `null` when none is known.
+
+**What passes through.** The check is a safe list, not a list of writes: a
+verb or subcommand the shim does not recognise (`codespace create`, or one a
+future `gh` adds, even under a listed verb such as `config`) is refused like
+any other write. Every entry is an exact subcommand. Only these pass through
+unapproved:
+
+- reads: `issue`/`pr`/`release`/`repo`/`run`/`workflow`/`label`/`cache`
+  views, lists and downloads, `search` `issues`/`prs`/`repos`/`code`/`commits`,
+  `status`, `org list`, `gist` `list`/`view`, `secret list`, `variable`
+  `list`/`get`, `ruleset` `list`/`view`/`check`, `project`
+  `list`/`view`/`field-list`/`item-list`, `ssh-key list`, `gpg-key list`,
+  `codespace list`, `release verify`/`verify-asset`, `attestation verify`,
+  `extension list`/`search`, and the `list`/`view` actions of
+  `repo deploy-key` and `repo autolink`;
+- commands that act only on the local machine: `auth status` (without a token
+  flag), `config` `get`/`set`/`list`/`clear-cache`, `alias`
+  `list`/`set`/`delete`/`import` (managing aliases), `completion` for bash,
+  zsh, fish or powershell, `help` alone or for a gh command or help topic,
+  `version`, `repo clone`, `gist clone`, `pr checkout`, and
+  `browse --no-browser` with at most one location argument;
+- anything with `--help`, and `gh` with no verb;
+- `gh api` reads: GET or HEAD (a method named with `--method`/`-X`, else POST
+  once a field or `--input` is given, as upstream `gh` decides), and a
+  `gh api graphql` call whose inline `query` holds no `mutation`.
+
+A flag before the verb (`gh --something search issues`) is one the shim does
+not model, so it cannot tell which verb upstream `gh` would run; the command
+is refused. A value flag the shim reads as a subcommand (`gh status -o org`)
+is refused the same way.
+
+Running an extension (`gh extension exec`, or `gh <extension>`) or an alias
+(`gh <alias>`) is not on the list: an extension is a program and an alias can
+expand to `api --method POST` or a shell command, so either can write with the
+operator's token where the shim cannot see it.
+
+## The operator's gh credentials
+
+`gh auth token` and `gh auth status --show-token` (or `-t`) print the
+operator's GitHub token into the agent's session, and with the token an agent
+could call the GitHub API directly, around the shim. `gh auth login`,
+`logout`, `refresh`, `switch` and `setup-git`, and any other `auth`
+subcommand, change the operator's gh login or git's credential configuration.
+With a verified manifest all of these are refused with
+`gh_shim_operator_credentials` (exit 86, nothing sent) wherever they run, in a
+bound checkout or not, unless `GH_SHIM_BYPASS=operator` is set:
+
+```text
+gh-shim: gh_shim_operator_credentials: `auth token` prints the operator's GitHub token into this agent's session, and with it an agent could call the GitHub API directly, around the shim. The operator can approve it: re-run with GH_SHIM_BYPASS=operator, and the shim records an operator-attributed audit line.
+```
+
+With the bypass the command runs after an audit line
+`{as_of_unix_secs, tuple: "auth token", repository: null}`.
+
+**`gh auth status`.** Without a token flag, and while a signed routing
+manifest is installed, the shim answers `gh auth status` itself, from local
+state only: it runs neither the real `gh` nor a governance probe. The answer
+names the repository resolved from the working directory (or `GH_REPO`), the
+bot identity governed writes use there (or that the repository is unbound, so
+writes are refused unless the operator bypass applies), the manifest version
+and whether it verified, and whether governed routing is ready, from the last
+recorded rung. It exits 0 when governed writes work in that repository and 1
+otherwise, with one `Governed writes unavailable: <reason>` line per reason,
+mirroring upstream `gh`'s not-logged-in status. Only `--hostname github.com`
+(`-h`) is accepted; other flags are refused by name. With no manifest
+installed, or with `github.shim` turned off, `gh auth status` passes through to
+the real `gh` unchanged and reports the operator's own login.
+
+**What the target is.** The same resolver the governed rows use: `--repo`/`-R`,
+a thread URL, a `gh repo` subcommand's repository positional (`gh repo delete
+owner/name`), a `/repos/<owner>/<name>` endpoint, `GH_REPO`, then the working
+directory's `origin`. When that target is bound, the governed path applies
+unchanged, and the bypass there still reaches only manifest-declared
+administration. A command that is not bot speech, run from inside a bound
+checkout, also stays on the governed path whatever it names, as before.
+
+**Account writes** never have a binding, so they need the bypass even from a
+bound checkout: `repo create` (a new repository cannot be bound yet),
+`repo fork`, `gist` writes, `ssh-key`/`gpg-key` add and delete, `project`
+writes, and `gh api` writes to an endpoint outside `/repos/<owner>/<name>`
+(such as `POST /user/repos` or a GraphQL mutation).
+
+**No determinable target.** A command not on the safe list whose target cannot
+be resolved (nothing named and no github.com `origin`, or a `--repo` that is
+not a github.com `owner/name`) is refused the same way, and the refusal says
+why.
+
+The check needs a verified signed manifest to compare against. Without one (no
+manifest installed, or one that never verified) nothing is bound and the shim
+passes commands through as before. An installed manifest that fails validation
+after an earlier one verified (a regressed manifest) already refuses every
+command that is not a read. Destructive forms keep their own refusal, and
+`github.shim: false` turns the whole shim off.
+
+The operator's own terminal is not affected. The shim runs only where AFT puts
+its `shims` directory first on `PATH`, which it does for the bash and PTY
+children it spawns for agents; it never edits shell startup files or the
+terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
+
 ## Rows
 
 | Row | Class | Since |
@@ -29,15 +145,37 @@ on the verb alone.
 | `issue close`, `issue reopen`, `pr close`, `pr reopen` | SPEECH-AS-BOT | v12 |
 | **`issue create`** | **SPEECH-AS-BOT** | **v14** |
 | **`api` PATCH `/repos/*/*/issues/comments/*`** | **SPEECH-AS-BOT** | **v14** |
+| **`pr create`** (same-repository head, `--base` required) | **SPEECH-AS-BOT** | **v16** |
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
+| `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `release edit`, `release upload` | ADMINISTRATION | v13 |
 | `api` PUT and DELETE `/repos/*/*/branches/*/protection` | ADMINISTRATION | v13 |
 | **`issue edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | **`pr edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | **`label create`, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | `release delete`, `release delete-asset`, and any `release` verb with a `--delete-*` flag | refused as destructive | — |
+
+`run cancel` uses the same operator gate as `run rerun`: without
+`GH_SHIM_BYPASS=operator` it returns `gh_shim_admin_tier`; with the bypass
+it appends and syncs the audit before upstream execution. Hung CI runs can
+otherwise hold a seat until GitHub's timeout. `--force` is allowed because it
+only changes the single selected run's cancellation endpoint to `force-cancel`,
+not the scope of the operation (checked against gh 2.93.0 help and source).
+Neither rerun nor cancel belongs in the unbound safe-read list: the existing
+unbound-write refusal and audited bypass apply unchanged. The signed manifest
+must declare cancellation at v15 or later on the bound-repository path; older
+manifests retain their existing behavior. Code availability is not activation:
+the credential-custody owner (CKCRED) signs the exact unsigned payload bytes for
+an envelope-version-2 manifest, and the Subconscious daemon owner (SUBC)
+coordinates placement. Production payloads and signing handoffs stay
+outside git in `.alfonso/ceremonies/gh-routing-manifest-v15/`, never in public
+docs or test fixtures. Prepare the payload from the trusted production v13
+envelope with `python3 scripts/prepare-gh-shim-v15.py /path/to/v13-envelope.json`;
+the script prints its SHA-256 and defaults to that private ceremony directory.
+An optional second argument selects another output path. Verify the printed hash
+before signing, and do not re-serialize the payload after signing.
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
 `platform` list on tuples and API rules alike, so no row is OS-neutral.
@@ -84,6 +222,51 @@ dropping a flag would change what the caller asked for.
 Ownership is the route holder's check: the comment's author must be the calling
 seat's bot. PATCH on any other path — including `/repos/*/*/issues/*`, the issue
 itself — is not admitted by this row, and every other PATCH stays as v13 has it.
+
+## The v16 row: `pr create`
+
+Bots may open pull requests. Opening one proposes a change under the bot
+identity and lands nothing, so it is speech, the same class as `issue create`;
+merging stays operator-only on the admin `pr merge` row. The manifest must
+declare `pr create` at v16 or later: under v15 and earlier it refuses as
+`gh_shim_unclassified` (undeclared), even if an older manifest carries the row.
+
+Declared `fields-only` (a pull request has no number until it exists) with the
+body fields `title`, `body`, `base`, `head`, `draft`, in that order. The shim
+reads only that exact declaration; a signed row naming other fields refuses.
+The request travels in the same envelope as `issue create`:
+`{"action":"pr create","target":{},"body":{"title","body","base","head","draft"}}`
+plus the repository, which Plexus checks against the bot's binding.
+
+Admitted: `--title`/`-t`, `--body`/`-b`, `--body-file`/`-F` (read by the shim,
+including the stdin spelling `-`, and sent as text), `--base`/`-B`,
+`--head`/`-H`, `--draft`/`-d` (sent as a boolean, `false` when absent), and
+`--repo`/`-R`. Each value flag may appear once.
+
+`--base`, `--head` and `--title` are required on the governed path and refuse
+as `gh_shim_unclassified` when missing or empty. Upstream `gh` would default the
+base to the repository's default branch and the head to the local branch, or
+prompt; the shim can look up neither and does not guess.
+
+The head must be a branch of the target repository. A cross-repository head
+(`owner:branch`) refuses as `gh_shim_unsupported_flag` before anything is sent.
+Whether the head branch exists is GitHub's check: its refusal (for example a
+422 for an invalid `head`) comes back from Plexus as a `gh_shim_seam_refusal`
+carrying Plexus's code verbatim, and is not retried or handed to upstream `gh`.
+
+Refused with `gh_shim_unsupported_flag` (exit 86, nothing sent): `--assignee`,
+`--reviewer`, `--label`, `--milestone`, `--project` (and their short forms `-a`,
+`-r`, `-l`, `-m`, `-p`), `--fill`/`-f`, `--fill-first`, `--fill-verbose`,
+`--web`/`-w`, `--editor`/`-e`, `--template`/`-T`, `--recover`, `--dry-run`, and
+`--no-maintainer-edit`. Any other flag or a positional argument refuses as
+`gh_shim_unclassified`. On success the shim prints the new pull request's URL,
+as `gh pr create` does.
+
+Prepare the unsigned payload from the unsigned v15 bytes with
+`python3 scripts/prepare-gh-shim-v16.py /path/to/unsigned-v15.json`; it writes
+to `.alfonso/ceremonies/gh-routing-manifest-v16/` by default and prints the
+SHA-256. It adds the one row and its canonicalization and keeps every other
+byte of v15.
 
 ## Operator label rows (v14)
 

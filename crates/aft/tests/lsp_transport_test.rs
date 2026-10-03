@@ -11,28 +11,7 @@ fn framed_message(json: &str) -> Vec<u8> {
 }
 
 fn fake_server_binary() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            option_env!("CARGO_BIN_EXE_fake-lsp-server")
-                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
-                .map(PathBuf::from)
-        })
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
-        .or_else(|| {
-            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let workspace_root = manifest_dir.parent()?.parent()?;
-            Some(
-                workspace_root
-                    .join("target")
-                    .join("debug")
-                    .join("fake-lsp-server"),
-            )
-        })
-        .filter(|path| path.exists())
-        .expect("fake-lsp-server binary path not set")
+    crate::fake_lsp::fake_server_binary()
 }
 
 struct FakeServerProcess {

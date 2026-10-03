@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 use lsp_types::FileChangeType;
 use serde_json::Value;
 
+use crate::commands::delete_tree::{
+    delete_recorded_tree, plan_file_backups, walk_tree, BudgetExceeded, BudgetLimit, CollectError,
+    FileBackup, NodeKind, RecursiveDeleteBackupBudget, TreeManifest, UnsupportedKind,
+};
 use crate::context::AppContext;
 use crate::edit;
 use crate::protocol::{RawRequest, Response};
@@ -37,12 +41,29 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
     let recursive = req
         .params
         .get("recursive")
-        .and_then(|v| v.as_bool())
+        .and_then(crate::subc_translate::model_boolean)
         .unwrap_or(false);
-    let mut budget = RecursiveDeleteBackupBudget::for_request(ctx);
+    let mut budget = budget_for_request(ctx);
 
+    let parsed_files = match req.params.get("files") {
+        Some(Value::String(raw)) => match serde_json::from_str::<Vec<String>>(raw) {
+            Ok(files) => Some(serde_json::json!(files)),
+            Err(_) => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "delete_file: 'files' must be an array of paths",
+                )
+            }
+        },
+        _ => None,
+    };
     // Batch mode: `files: [...]`
-    if let Some(files) = req.params.get("files").and_then(|v| v.as_array()) {
+    if let Some(files) = parsed_files
+        .as_ref()
+        .or_else(|| req.params.get("files"))
+        .and_then(Value::as_array)
+    {
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         for value in files {
@@ -136,32 +157,53 @@ fn delete_one_or_dir(
         Err(resp) => return Err(resp),
     };
 
-    if is_symlink(&path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to inspect '{}': {}", file, e),
-        )
-    })? {
-        return Err(Response::error(
-            &req.id,
-            "invalid_request",
-            format!(
-                "delete_file: refusing to delete symlink '{}'; symlink undo is not supported",
-                file
-            ),
-        ));
+    // Inspect the entry itself, never what a symlink points at: a link must be
+    // treated as a link even when its target is a directory or is missing.
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Response::error(
+                &req.id,
+                "file_not_found",
+                format!("delete_file: file not found: {}", file),
+            ));
+        }
+        Err(e) => {
+            return Err(Response::error(
+                &req.id,
+                "io_error",
+                format!("delete_file: failed to inspect '{}': {}", file, e),
+            ));
+        }
+    };
+    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+    let is_symlink = metadata.file_type().is_symlink();
+    let is_dir = metadata.is_dir();
+    let no_backup = no_backup_reason(ctx, &path, is_dir);
+
+    if is_symlink && no_backup.is_none() {
+        let unsupported = crate::commands::delete_tree::symlink_support(&path).map_err(|e| {
+            Response::error(
+                &req.id,
+                "io_error",
+                format!("delete_file: failed to read symlink '{}': {}", file, e),
+            )
+        })?;
+        if let Some(kind) = unsupported {
+            log_refusal("invalid_request", &path, &[(kind, 1)]);
+            return Err(Response::error(
+                &req.id,
+                "invalid_request",
+                format!(
+                    "delete_file: refusing to delete symlink '{}': {}",
+                    file,
+                    unsupported_symlink_reason(kind)
+                ),
+            ));
+        }
     }
 
-    if !path.exists() {
-        return Err(Response::error(
-            &req.id,
-            "file_not_found",
-            format!("delete_file: file not found: {}", file),
-        ));
-    }
-
-    if path.is_dir() {
+    if is_dir {
         if !recursive {
             return Err(Response::error(
                 &req.id,
@@ -172,48 +214,71 @@ fn delete_one_or_dir(
                 ),
             ));
         }
-        return delete_directory(req, ctx, &path, file, op_id, budget);
+        return delete_directory(req, ctx, &path, file, op_id, budget, no_backup);
     }
 
-    if !path.is_file() {
-        return Err(Response::error(
-            &req.id,
-            "unsupported_directory_contents",
-            format!(
-                "delete_file: refusing to delete unsupported non-regular file '{}'; undo cannot restore this file type",
-                file
-            ),
-        ));
+    if let Some(reason) = no_backup {
+        // Nothing here would be backed up, so there is no undo whose shape a
+        // symlink, hard link, or special file could break: delete the entry
+        // itself (never a link's target) and report why undo is unavailable.
+        return delete_entry_without_backup(req, ctx, &path, file, op_id, reason);
     }
 
-    if has_multiple_hard_links(&path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!("delete_file: failed to inspect '{}': {}", file, e),
+    let mut warnings = Vec::new();
+    let backup_id = if is_symlink {
+        // The symlink itself is backed up (its target text), never the file
+        // it points at.
+        edit::auto_backup(
+            ctx,
+            req.session(),
+            &path,
+            "delete_file: pre-delete backup",
+            Some(op_id),
         )
-    })? {
-        return Err(Response::error(
-            &req.id,
-            "unsupported_directory_contents",
-            format!(
-                "delete_file: refusing to delete hard-linked file '{}'; undo cannot restore hard-link topology",
-                file
-            ),
-        ));
+    } else if metadata.is_file() {
+        if file_link_count(&metadata) > 1 {
+            // Because the other hard links are outside this delete, undo
+            // restores this file as an independent copy that no longer shares
+            // changes with those links.
+            warnings.push(detached_hard_link_warning(file));
+            ctx.backup().lock().snapshot_detached_hard_link_with_op(
+                req.session(),
+                &path,
+                "delete_file: pre-delete backup",
+                op_id,
+            )
+        } else {
+            edit::auto_backup(
+                ctx,
+                req.session(),
+                &path,
+                "delete_file: pre-delete backup",
+                Some(op_id),
+            )
+        }
+    } else {
+        match crate::commands::delete_tree::special_file_kind(&metadata.file_type()) {
+            None => {
+                warnings.push(socket_warning(file));
+                Ok(None)
+            }
+            Some(kind) => {
+                log_refusal("unsupported_directory_contents", &path, &[(kind, 1)]);
+                return Err(Response::error(
+                    &req.id,
+                    "unsupported_directory_contents",
+                    format!(
+                        "delete_file: refusing to delete '{}': {}",
+                        file,
+                        unsupported_kind_reason(kind)
+                    ),
+                ));
+            }
+        }
     }
-
-    // Backup before deletion
-    let backup_id = edit::auto_backup(
-        ctx,
-        req.session(),
-        &path,
-        "delete_file: pre-delete backup",
-        Some(op_id),
-    )
     .map_err(|e| Response::error(&req.id, e.code(), e.to_string()))?;
 
-    // Delete the file
+    // `remove_file` unlinks a symlink itself, never its target.
     if let Err(e) = std::fs::remove_file(&path) {
         // A failed remove leaves this file unchanged. Discard its snapshot so
         // the failed request does not become a phantom undo operation.
@@ -238,6 +303,9 @@ fn delete_one_or_dir(
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    if !warnings.is_empty() {
+        result["warnings"] = serde_json::json!(warnings);
+    }
     edit::attach_backup_skipped_reason(
         &mut result,
         ctx,
@@ -248,29 +316,84 @@ fn delete_one_or_dir(
     Ok(result)
 }
 
-fn is_symlink(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_symlink()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
+/// Why nothing at `path` would be backed up, if that holds for the whole
+/// entry. A directory is judged by itself; any other entry by the directory
+/// that holds it, because judging a symlink by its own path would resolve the
+/// link and judge wherever it points instead.
+fn no_backup_reason(
+    ctx: &AppContext,
+    path: &Path,
+    is_dir: bool,
+) -> Option<crate::backup::BackupSkippedReason> {
+    let container = if is_dir {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    ctx.backup().lock().whole_tree_skip_reason(container)
+}
+
+/// Delete one non-directory entry that would not be backed up anyway.
+fn delete_entry_without_backup(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    file: &str,
+    op_id: &str,
+    reason: crate::backup::BackupSkippedReason,
+) -> Result<serde_json::Value, Response> {
+    // `remove_file` unlinks a symlink itself, never its target.
+    std::fs::remove_file(path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!("delete_file: failed to delete: {}", e),
+        )
+    })?;
+    ctx.backup()
+        .lock()
+        .record_skipped_without_snapshot(req.session(), path, op_id, reason);
+    ctx.lsp_notify_watched_config_file(path, FileChangeType::DELETED);
+    let mut result = serde_json::json!({
+        "file": file,
+        "deleted": true,
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, Some(path));
+    Ok(result)
 }
 
 #[cfg(unix)]
-fn has_multiple_hard_links(path: &Path) -> std::io::Result<bool> {
-    Ok(std::fs::metadata(path)?.nlink() > 1)
+fn file_link_count(metadata: &std::fs::Metadata) -> u64 {
+    metadata.nlink()
 }
 
 #[cfg(not(unix))]
-fn has_multiple_hard_links(_path: &Path) -> std::io::Result<bool> {
-    Ok(false)
+fn file_link_count(_metadata: &std::fs::Metadata) -> u64 {
+    1
 }
 
-/// Recursively delete a directory after backing up every file inside.
+fn detached_hard_link_warning(path: &str) -> String {
+    format!(
+        "{path}: this file was hard-linked to paths outside this delete; undo restores its content as an independent copy that no longer shares data with them"
+    )
+}
+
+fn socket_warning(path: &str) -> String {
+    format!(
+        "{path}: socket deleted and not restorable by undo (a socket holds no data, and one recreated by undo would have no process listening on it)"
+    )
+}
+
+/// Recursively delete a directory after backing up every entry inside.
 ///
-/// Every file backup uses the same `op_id` so a single `aft_safety undo`
-/// restores the entire tree atomically. Guardrails reject symlinks and empty
-/// directories until backup metadata can preserve those node types.
+/// The tree is walked once into a manifest, without following symlinks or
+/// entering another filesystem. Every entry is backed up under the same
+/// `op_id`, so a single `aft_safety undo` restores the whole tree: directories
+/// (including empty ones, with their modes), file contents, hard links
+/// (relinked), and symlinks (their exact target text, never the target).
+/// Sockets are deleted with a warning that undo does not restore them. Mount
+/// points, FIFOs, device nodes and symlinks undo cannot recreate exactly are
+/// refused before anything is backed up or deleted.
 fn delete_directory(
     req: &RawRequest,
     ctx: &AppContext,
@@ -278,10 +401,11 @@ fn delete_directory(
     original: &str,
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
+    no_backup: Option<crate::backup::BackupSkippedReason>,
 ) -> Result<serde_json::Value, Response> {
     // A vanished mounted child can make std::fs::ReadDir::drop panic after
-    // closedir returns ENXIO, aborting the daemon. Capture the root device before
-    // either recursive pass so neither validation nor backup collection crosses it.
+    // closedir returns ENXIO, aborting the daemon. Capture the root device
+    // before walking so the walk never crosses it.
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(path).map_err(|e| {
         Response::error(
             &req.id,
@@ -292,10 +416,14 @@ fn delete_directory(
             ),
         )
     })?;
-    // Bound the backup before anything else walks the tree: validation below
-    // reads every directory, so it runs only on a tree already known to fit.
-    let collected = match collect_files_within_budget(path, &boundary, budget) {
-        Ok(collected) => collected,
+    if let Some(reason) = no_backup {
+        return delete_directory_without_backups(
+            req, ctx, path, original, op_id, &boundary, reason,
+        );
+    }
+
+    let manifest = match walk_tree(path, &boundary, budget) {
+        Ok(manifest) => manifest,
         Err(CollectError::OverBudget(exceeded)) => {
             return Err(over_budget_response(req, original, exceeded, budget));
         }
@@ -310,104 +438,173 @@ fn delete_directory(
             ));
         }
     };
-
-    let unsupported_paths =
-        validate_directory_for_recursive_delete(path, &boundary).map_err(|e| {
-            Response::error(
-                &req.id,
-                "io_error",
-                format!(
-                    "delete_file: failed to validate directory '{}': {}",
-                    original, e
-                ),
-            )
-        })?;
-    if !unsupported_paths.is_empty() {
+    if !manifest.unsupported.is_empty() {
+        log_refusal(
+            "unsupported_directory_contents",
+            path,
+            &manifest.unsupported_counts(),
+        );
         return Err(Response::error(
             &req.id,
             "unsupported_directory_contents",
-            unsupported_directory_contents_message(&unsupported_paths),
+            unsupported_contents_message(&manifest),
         ));
     }
 
-    let files_to_backup = collected.files;
-
+    let file_plan = plan_file_backups(&manifest);
+    let mut warnings = Vec::new();
     let mut backup_ids: Vec<String> = Vec::new();
     let mut backed_up_paths: Vec<PathBuf> = Vec::new();
-    for file_path in &files_to_backup {
-        match edit::auto_backup(
-            ctx,
-            req.session(),
-            file_path,
-            "delete_file: pre-delete backup (directory contents)",
-            Some(op_id),
-        ) {
+    let description = "delete_file: pre-delete backup (directory contents)";
+    // Entries are backed up in walk order: each directory before its
+    // contents, and each hard link after the path whose content it shares.
+    for entry in &manifest.entries {
+        let entry_path = entry.path.as_path();
+        let display = entry_path.display().to_string();
+        let snapshot = match entry.kind {
+            NodeKind::Directory => ctx.backup().lock().snapshot_directory_with_op(
+                req.session(),
+                entry_path,
+                description,
+                op_id,
+            ),
+            NodeKind::Symlink => {
+                edit::auto_backup(ctx, req.session(), entry_path, description, Some(op_id))
+            }
+            NodeKind::Socket => {
+                warnings.push(socket_warning(&display));
+                Ok(None)
+            }
+            NodeKind::File { .. } => match file_plan.get(&entry.path) {
+                Some(FileBackup::LinkTo(first)) => ctx.backup().lock().snapshot_hard_link_with_op(
+                    req.session(),
+                    entry_path,
+                    first,
+                    description,
+                    op_id,
+                ),
+                Some(FileBackup::Content { detached: true }) => {
+                    warnings.push(detached_hard_link_warning(&display));
+                    ctx.backup().lock().snapshot_detached_hard_link_with_op(
+                        req.session(),
+                        entry_path,
+                        description,
+                        op_id,
+                    )
+                }
+                _ => edit::auto_backup(ctx, req.session(), entry_path, description, Some(op_id)),
+            },
+        };
+        match snapshot {
             Ok(Some(id)) => {
                 backup_ids.push(id);
-                backed_up_paths.push(file_path.clone());
+                backed_up_paths.push(entry.path.clone());
             }
             Ok(None) => {}
             Err(e) => {
-                // Directory mutation has not started, so snapshots already
-                // captured by this failed request must not enter undo history.
+                // Nothing has been deleted yet, so snapshots already captured
+                // by this failed request must not enter undo history.
                 discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
                 return Err(Response::error(
                     &req.id,
                     e.code(),
                     format!(
                         "delete_file: backup failed for '{}' inside '{}': {}",
-                        file_path.display(),
-                        original,
-                        e
+                        display, original, e
                     ),
                 ));
             }
         }
     }
 
-    if let Err(e) = std::fs::remove_dir_all(path) {
-        // Recursive removal may fail after deleting part of the tree. Keep
-        // backups for missing files, but discard entries for files left intact.
+    #[cfg(debug_assertions)]
+    inject_entry_for_tests(path);
+
+    if let Err(stopped) = delete_recorded_tree(&manifest) {
+        // Keep backups for entries that are gone, so undo can bring them back,
+        // and discard those for entries still present, so undo does not
+        // overwrite them with an older copy.
         let not_deleted_paths = backed_up_paths
             .iter()
-            .filter(|file_path| std::fs::symlink_metadata(file_path).is_ok())
+            .filter(|entry_path| std::fs::symlink_metadata(entry_path).is_ok())
             .cloned()
             .collect::<Vec<_>>();
         discard_delete_backups(ctx, req.session(), op_id, &not_deleted_paths);
-        return Err(Response::error(
-            &req.id,
+        for entry in &manifest.entries {
+            if entry.kind != NodeKind::Directory && std::fs::symlink_metadata(&entry.path).is_err()
+            {
+                ctx.lsp_notify_watched_config_file(&entry.path, FileChangeType::DELETED);
+            }
+        }
+        crate::slog_warn!(
+            "delete_file stopped recursive delete of '{}' partway at '{}': {}",
+            original,
+            stopped.path.display(),
+            stopped.reason
+        );
+        return Err(Response::error_with_data(
+            req.id.clone(),
             "io_error",
             format!(
-                "delete_file: failed to remove directory '{}': {}",
-                original, e
+                "delete_file: stopped deleting '{}' partway: could not remove '{}': {}. Entries already removed can be restored with undo; '{}' and whatever still holds it were left in place.",
+                original,
+                stopped.path.display(),
+                stopped.reason,
+                stopped.path.display()
             ),
+            serde_json::json!({
+                "partial": true,
+                "stopped_at": stopped.path.display().to_string(),
+            }),
         ));
     }
 
-    budget.files_left = budget.files_left.saturating_sub(collected.entries_counted);
-    budget.bytes_left = budget.bytes_left.saturating_sub(collected.bytes_counted);
+    budget.files_left = budget.files_left.saturating_sub(manifest.entries_counted);
+    budget.bytes_left = budget.bytes_left.saturating_sub(manifest.bytes_counted);
 
-    // Notify LSP for every file that disappeared so watched-file diagnostics
+    // Notify LSP for every entry that disappeared so watched-file diagnostics
     // refresh.
-    for file_path in &files_to_backup {
-        ctx.lsp_notify_watched_config_file(file_path.as_path(), FileChangeType::DELETED);
+    let mut files_deleted = 0usize;
+    let mut directories_deleted = 0usize;
+    for entry in &manifest.entries {
+        if entry.kind == NodeKind::Directory {
+            directories_deleted += 1;
+        } else {
+            files_deleted += 1;
+            ctx.lsp_notify_watched_config_file(&entry.path, FileChangeType::DELETED);
+        }
     }
 
     log::debug!(
-        "delete_file: recursively removed directory '{}' ({} file(s))",
+        "delete_file: recursively removed directory '{}' ({} file(s), {} directories)",
         original,
-        files_to_backup.len()
+        files_deleted,
+        directories_deleted
     );
 
     let mut result = serde_json::json!({
         "file": original,
         "deleted": true,
         "is_directory": true,
-        "files_deleted": files_to_backup.len(),
+        "files_deleted": files_deleted,
+        "directories_deleted": directories_deleted,
         "backup_ids": backup_ids,
     });
+    if !warnings.is_empty() {
+        result["warnings"] = serde_json::json!(warnings);
+    }
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
     Ok(result)
+}
+
+/// Test hook for the race between backup and removal: in debug builds, when
+/// `AFT_TEST_RECURSIVE_DELETE_INJECT` names a path relative to the tree root,
+/// create that file after the backups and before anything is removed.
+#[cfg(debug_assertions)]
+fn inject_entry_for_tests(root: &Path) {
+    if let Some(relative) = std::env::var_os("AFT_TEST_RECURSIVE_DELETE_INJECT") {
+        let _ = std::fs::write(root.join(relative), "created during the delete");
+    }
 }
 
 fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &[PathBuf]) {
@@ -417,69 +614,111 @@ fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &
     }
 }
 
-/// Guardrail for recursive deletes: the backup/undo format currently records
-/// only file contents. Reject directory trees that contain entries undo cannot
-/// restore atomically (symlinks and empty directories) before taking backups or
-/// deleting anything.
-fn validate_directory_for_recursive_delete(
-    dir: &Path,
+/// Recursively delete a directory none of whose entries would be backed up
+/// (it is under a system temp directory, or backups are disabled).
+///
+/// With no undo to keep whole, symlinks, hard links, empty directories and
+/// special files need no refusal and there is no copy to budget. A directory
+/// on another filesystem is still refused: removing the tree would descend into
+/// it and delete that filesystem's contents.
+fn delete_directory_without_backups(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    original: &str,
+    op_id: &str,
     boundary: &crate::walk_boundary::DeviceBoundary,
-) -> std::io::Result<Vec<String>> {
-    let mut unsupported_paths = Vec::new();
-    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
-        unsupported_paths.push(dir.display().to_string());
-        return Ok(unsupported_paths);
+    reason: crate::backup::BackupSkippedReason,
+) -> Result<serde_json::Value, Response> {
+    let mut files = Vec::new();
+    let mut mounts = Vec::new();
+    collect_for_unbacked_delete(path, boundary, &mut files, &mut mounts).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: failed to walk directory '{}': {}",
+                original, e
+            ),
+        )
+    })?;
+    if !mounts.is_empty() {
+        log_refusal(
+            "unsupported_directory_contents",
+            path,
+            &[(UnsupportedKind::OtherFilesystem, mounts.len())],
+        );
+        return Err(Response::error(
+            &req.id,
+            "unsupported_directory_contents",
+            other_filesystem_message(&mounts),
+        ));
     }
-    validate_directory_entries(dir, boundary, &mut unsupported_paths)?;
-    Ok(unsupported_paths)
+
+    // Rust's remove_dir_all unlinks symlinks without following them.
+    std::fs::remove_dir_all(path).map_err(|e| {
+        Response::error(
+            &req.id,
+            "io_error",
+            format!(
+                "delete_file: failed to remove directory '{}': {}",
+                original, e
+            ),
+        )
+    })?;
+    ctx.backup()
+        .lock()
+        .record_skipped_without_snapshot(req.session(), path, op_id, reason);
+    for file_path in &files {
+        ctx.lsp_notify_watched_config_file(file_path.as_path(), FileChangeType::DELETED);
+    }
+
+    let mut result = serde_json::json!({
+        "file": original,
+        "deleted": true,
+        "is_directory": true,
+        "files_deleted": files.len(),
+        "backup_ids": Vec::<String>::new(),
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
+    Ok(result)
 }
 
-fn validate_directory_entries(
+/// Collect every non-directory entry (for change notifications) and every
+/// directory on another filesystem, without following symlinks.
+fn collect_for_unbacked_delete(
     dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    unsupported_paths: &mut Vec<String>,
+    files: &mut Vec<PathBuf>,
+    mounts: &mut Vec<String>,
 ) -> std::io::Result<()> {
-    let mut entries = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        entries.push(entry?);
-    }
-
-    if entries.is_empty() {
-        unsupported_paths.push(dir.display().to_string());
-        return Ok(());
-    }
-
-    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            unsupported_paths.push(path.display().to_string());
-        } else if file_type.is_dir() {
-            if !boundary.should_descend(&path)? {
-                // Report this as unsupported before mutation. Silently skipping it
-                // would leave the mounted directory behind after partial deletion.
-                unsupported_paths.push(path.display().to_string());
-                continue;
-            }
-            validate_directory_entries(&path, boundary, unsupported_paths)?;
-        } else if file_type.is_file() {
-            if has_multiple_hard_links(&path)? {
-                unsupported_paths.push(path.display().to_string());
+        // `DirEntry::file_type` does not follow symlinks.
+        if entry.file_type()?.is_dir() {
+            if boundary.should_descend(&path)? {
+                collect_for_unbacked_delete(&path, boundary, files, mounts)?;
+            } else {
+                mounts.push(path.display().to_string());
             }
         } else {
-            unsupported_paths.push(path.display().to_string());
+            files.push(path);
         }
     }
-
     Ok(())
 }
 
-fn unsupported_directory_contents_message(paths: &[String]) -> String {
-    const MAX_PATHS: usize = 5;
-
+fn other_filesystem_message(paths: &[String]) -> String {
     let mut message = String::from(
-        "aft_delete with recursive: true does not yet support directory trees containing symlinks, empty directories, hard links, mounted directories from another filesystem, sockets, device nodes, or other non-regular files. Restore would not recover these entries atomically.",
+        "aft_delete refuses to delete a directory tree that contains a mount point of another filesystem: removing the tree would delete that filesystem's contents. Unmount it first.",
     );
+    append_offending_paths(&mut message, paths);
+    message
+}
+
+fn append_offending_paths(message: &mut String, paths: &[String]) {
+    const MAX_PATHS: usize = 5;
     message.push_str(" Offending path(s): ");
     message.push_str(
         &paths
@@ -492,152 +731,80 @@ fn unsupported_directory_contents_message(paths: &[String]) -> String {
     if paths.len() > MAX_PATHS {
         message.push_str(&format!(", ... and {} more", paths.len() - MAX_PATHS));
     }
+}
+
+fn unsupported_contents_message(manifest: &TreeManifest) -> String {
+    let mut kinds = manifest
+        .unsupported_counts()
+        .into_iter()
+        .map(|(kind, _)| unsupported_kind_reason(kind))
+        .collect::<Vec<_>>();
+    kinds.dedup();
+    let mut message = format!(
+        "aft_delete with recursive: true refuses this directory tree because it contains entries undo cannot restore or that removing would reach beyond the tree: {}. Nothing was deleted.",
+        kinds.join("; ")
+    );
+    let paths = manifest
+        .unsupported
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect::<Vec<_>>();
+    append_offending_paths(&mut message, &paths);
     message
 }
 
-/// How much one `delete_file` call may still copy into the undo store for
-/// recursive directory deletes. Shared by every directory in a batch, because
-/// the whole call holds the root's write lane while it copies.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RecursiveDeleteBackupBudget {
-    /// Files still allowed. Every non-directory entry counts, including
-    /// entries later refused as unsupported, so the walk itself stays bounded.
-    files_left: usize,
-    /// Bytes still allowed, counting only files small enough to be copied.
-    bytes_left: u64,
-    /// The backup store's per-file limit; larger files are skipped by the
-    /// store and so cost no copy.
-    per_file_limit: Option<u64>,
-    /// Whether backups are captured at all. With backups disabled by user
-    /// config nothing is copied, so there is nothing to bound.
-    enabled: bool,
-}
-
-impl RecursiveDeleteBackupBudget {
-    pub(crate) fn new(
-        policy: crate::backup::BackupPolicy,
-        max_files: usize,
-        max_bytes: u64,
-    ) -> Self {
-        Self {
-            files_left: max_files,
-            bytes_left: max_bytes,
-            per_file_limit: policy.max_file_size,
-            enabled: policy.enabled && policy.max_file_size != Some(0),
+/// Plain-language reason a kind of entry is refused.
+fn unsupported_kind_reason(kind: UnsupportedKind) -> &'static str {
+    match kind {
+        UnsupportedKind::OtherFilesystem => {
+            "a mount point of another filesystem (removing it would delete that filesystem's contents; unmount it first)"
         }
-    }
-
-    fn for_request(ctx: &AppContext) -> Self {
-        Self::new(
-            ctx.backup().lock().policy(),
-            crate::backup::RECURSIVE_DELETE_BACKUP_MAX_FILES,
-            crate::backup::RECURSIVE_DELETE_BACKUP_MAX_BYTES,
-        )
+        UnsupportedKind::Fifo => "a named pipe (FIFO), which undo does not recreate",
+        UnsupportedKind::Device => {
+            "a device node, which undo could not recreate without special privileges"
+        }
+        UnsupportedKind::SymlinkNonUtf8Target | UnsupportedKind::WindowsSymlink => {
+            "a symlink undo cannot recreate exactly"
+        }
+        UnsupportedKind::Other => "a special file undo cannot recreate",
     }
 }
 
-/// Which budget a recursive delete walk ran out of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BudgetLimit {
-    Files,
-    Bytes,
-}
-
-/// A walk stopped because the tree needs more backup than the budget allows.
-/// The counts are what the walk had seen when it stopped, so they are lower
-/// bounds on the tree's real size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BudgetExceeded {
-    pub(crate) limit: BudgetLimit,
-    pub(crate) files_counted: usize,
-    pub(crate) bytes_counted: u64,
-}
-
-#[derive(Debug)]
-pub(crate) enum CollectError {
-    Io(std::io::Error),
-    OverBudget(BudgetExceeded),
-}
-
-impl From<std::io::Error> for CollectError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
+fn unsupported_symlink_reason(kind: UnsupportedKind) -> &'static str {
+    match kind {
+        UnsupportedKind::SymlinkNonUtf8Target => {
+            "its target is not valid UTF-8, and undo could not recreate it exactly"
+        }
+        UnsupportedKind::WindowsSymlink => {
+            "undo cannot yet recreate symlinks on Windows with their file or directory type"
+        }
+        other => unsupported_kind_reason(other),
     }
 }
 
-/// Files a recursive delete will back up, with what they cost.
-#[derive(Debug, Default)]
-pub(crate) struct CollectedFiles {
-    pub(crate) files: Vec<PathBuf>,
-    pub(crate) entries_counted: usize,
-    pub(crate) bytes_counted: u64,
+/// Log a refusal with its code and how many offending entries of each kind
+/// it found, so refusals can be counted from the daemon log.
+fn log_refusal(code: &str, target: &Path, counts: &[(UnsupportedKind, usize)]) {
+    let counts = counts
+        .iter()
+        .map(|(kind, count)| format!("{}={}", kind.as_str(), count))
+        .collect::<Vec<_>>()
+        .join(" ");
+    crate::slog_warn!(
+        "delete_file refused '{}': code={} offending: {}",
+        target.display(),
+        code,
+        counts
+    );
 }
 
-/// Walk a directory recursively, collecting all regular file paths, and stop
-/// the moment the tree needs more backup than `budget` allows. The walk must
-/// stop at the cap rather than count the whole tree first: a tree large enough
-/// to refuse can also be large enough that counting it is itself slow.
-///
-/// Symlinks and other non-regular entries are counted but not collected; the
-/// validation pass that follows refuses them. Directories on another
-/// filesystem are not entered, and validation refuses them as well.
-pub(crate) fn collect_files_within_budget(
-    dir: &Path,
-    boundary: &crate::walk_boundary::DeviceBoundary,
-    budget: &RecursiveDeleteBackupBudget,
-) -> Result<CollectedFiles, CollectError> {
-    let mut collected = CollectedFiles::default();
-    collect_files_into(dir, boundary, budget, &mut collected)?;
-    Ok(collected)
+fn budget_for_request(ctx: &AppContext) -> RecursiveDeleteBackupBudget {
+    RecursiveDeleteBackupBudget::new(
+        ctx.backup().lock().policy(),
+        crate::backup::RECURSIVE_DELETE_BACKUP_MAX_FILES,
+        crate::backup::RECURSIVE_DELETE_BACKUP_MAX_BYTES,
+    )
 }
-
-fn collect_files_into(
-    dir: &Path,
-    boundary: &crate::walk_boundary::DeviceBoundary,
-    budget: &RecursiveDeleteBackupBudget,
-    out: &mut CollectedFiles,
-) -> Result<(), CollectError> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            if boundary.should_descend(&path)? {
-                collect_files_into(&path, boundary, budget, out)?;
-            }
-            continue;
-        }
-
-        out.entries_counted += 1;
-        if budget.enabled && out.entries_counted > budget.files_left {
-            return Err(CollectError::OverBudget(BudgetExceeded {
-                limit: BudgetLimit::Files,
-                files_counted: out.entries_counted,
-                bytes_counted: out.bytes_counted,
-            }));
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        // `DirEntry::metadata` does not follow symlinks, and only regular
-        // files reach this point.
-        let len = entry.metadata()?.len();
-        let copied = budget.per_file_limit.is_none_or(|limit| len <= limit);
-        if copied {
-            out.bytes_counted = out.bytes_counted.saturating_add(len);
-            if budget.enabled && out.bytes_counted > budget.bytes_left {
-                return Err(CollectError::OverBudget(BudgetExceeded {
-                    limit: BudgetLimit::Bytes,
-                    files_counted: out.entries_counted,
-                    bytes_counted: out.bytes_counted,
-                }));
-            }
-        }
-        out.files.push(path);
-    }
-    Ok(())
-}
-
 fn format_mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
@@ -655,28 +822,39 @@ fn over_budget_response(
     let used_files = max_files.saturating_sub(budget.files_left);
     let used_bytes = max_bytes.saturating_sub(budget.bytes_left);
     let counted = match exceeded.limit {
-        BudgetLimit::Files => format!("at least {} files", exceeded.files_counted),
+        BudgetLimit::Files => format!("at least {} entries", exceeded.files_counted),
         BudgetLimit::Bytes => format!(
-            "at least {} in {} files",
+            "at least {} in {} entries",
             format_mib(exceeded.bytes_counted),
             exceeded.files_counted
         ),
     };
     let earlier = if used_files > 0 || used_bytes > 0 {
         format!(
-            " Earlier directories in this call already used {} files and {}.",
+            " Earlier directories in this call already used {} entries and {}.",
             used_files,
             format_mib(used_bytes)
         )
     } else {
         String::new()
     };
+    crate::slog_warn!(
+        "delete_file refused recursive delete of '{}': code=recursive_delete_backup_too_large limit={} entries_counted_at_least={} bytes_counted_at_least={}",
+        original,
+        match exceeded.limit {
+            BudgetLimit::Files => "entries",
+            BudgetLimit::Bytes => "bytes",
+        },
+        exceeded.files_counted,
+        exceeded.bytes_counted
+    );
     Response::error_with_data(
         req.id.clone(),
         "recursive_delete_backup_too_large",
         format!(
-            "delete_file: refusing to delete '{original}': its undo backup would copy {counted} \
-             (limit per call: {max_files} files and {}); counting stopped at the limit.{earlier} \
+            "delete_file: refusing to delete '{original}': its undo backup would record {counted} \
+             (limit per call: {max_files} entries, counting files, directories and links, and {}); \
+             counting stopped at the limit.{earlier} \
              Nothing was deleted. Delete it in smaller pieces to keep undo, or, when no undo \
              is needed, remove it with bash `rm -rf`.",
             format_mib(max_bytes)
@@ -693,94 +871,4 @@ fn over_budget_response(
             "counting_stopped_early": true,
         }),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backup::BackupPolicy;
-    use crate::walk_boundary::DeviceBoundary;
-
-    fn write_tree(root: &Path, files: usize, bytes_each: usize) {
-        for index in 0..files {
-            let dir = root.join(format!("d{}", index / 50));
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(format!("f{index}")), vec![b'x'; bytes_each]).unwrap();
-        }
-    }
-
-    fn collect(
-        root: &Path,
-        policy: BackupPolicy,
-        max_files: usize,
-        max_bytes: u64,
-    ) -> Result<CollectedFiles, CollectError> {
-        let boundary = DeviceBoundary::for_root(root).unwrap();
-        let budget = RecursiveDeleteBackupBudget::new(policy, max_files, max_bytes);
-        collect_files_within_budget(root, &boundary, &budget)
-    }
-
-    #[test]
-    fn file_budget_stops_the_walk_one_past_the_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        write_tree(dir.path(), 1_500, 8);
-
-        let Err(CollectError::OverBudget(exceeded)) =
-            collect(dir.path(), BackupPolicy::default(), 1_000, u64::MAX)
-        else {
-            panic!("a 1,500-file tree must exceed a 1,000-file budget");
-        };
-        assert_eq!(exceeded.limit, BudgetLimit::Files);
-        // Counting the whole tree before comparing would report 1,500 here.
-        assert_eq!(exceeded.files_counted, 1_001);
-    }
-
-    #[test]
-    fn byte_budget_counts_only_files_the_store_would_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        write_tree(dir.path(), 200, 1_024);
-
-        let Err(CollectError::OverBudget(exceeded)) =
-            collect(dir.path(), BackupPolicy::default(), usize::MAX, 100 * 1_024)
-        else {
-            panic!("200 KiB of files must exceed a 100 KiB budget");
-        };
-        assert_eq!(exceeded.limit, BudgetLimit::Bytes);
-        assert_eq!(exceeded.files_counted, 101);
-        assert_eq!(exceeded.bytes_counted, 101 * 1_024);
-
-        // With a per-file limit below every file's size the store copies
-        // nothing, so the same tree fits a byte budget of zero.
-        let small_files_only = BackupPolicy {
-            max_file_size: Some(512),
-            ..BackupPolicy::default()
-        };
-        let collected = collect(dir.path(), small_files_only, usize::MAX, 0).unwrap();
-        assert_eq!(collected.files.len(), 200);
-        assert_eq!(collected.bytes_counted, 0);
-    }
-
-    #[test]
-    fn tree_within_budget_collects_every_file() {
-        let dir = tempfile::tempdir().unwrap();
-        write_tree(dir.path(), 120, 16);
-
-        let collected = collect(dir.path(), BackupPolicy::default(), 120, 120 * 16).unwrap();
-        assert_eq!(collected.files.len(), 120);
-        assert_eq!(collected.entries_counted, 120);
-        assert_eq!(collected.bytes_counted, 120 * 16);
-    }
-
-    #[test]
-    fn disabled_backups_leave_the_walk_unbounded() {
-        let dir = tempfile::tempdir().unwrap();
-        write_tree(dir.path(), 30, 16);
-
-        let disabled = BackupPolicy {
-            enabled: false,
-            ..BackupPolicy::default()
-        };
-        let collected = collect(dir.path(), disabled, 1, 1).unwrap();
-        assert_eq!(collected.files.len(), 30);
-    }
 }

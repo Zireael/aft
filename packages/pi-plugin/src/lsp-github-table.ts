@@ -10,9 +10,10 @@
  * NOTE: terraform-ls uses HashiCorp's release API, not GitHub. It's a
  * separate code path; not included in this table.
  *
- * NOTE: oxlint is bundled inside the project's `node_modules/@oxlint/*`
- * package via the existing project-node_modules resolution. AFT does not
- * download it independently. Excluded from this table.
+ * NOTE: install oxlint in the project (`npm install --save-dev oxlint`).
+ * AFT resolves `node_modules/.bin/oxlint` and starts it with `--lsp`, or
+ * prefers the standalone `oxc_language_server` shipped by older releases.
+ * It stays project-managed rather than being downloaded by AFT.
  *
  * NOTE: kotlin-language-server is hosted on JetBrains CDN, not GitHub.
  * Skipped from auto-download for v0.17.0 — users install via Homebrew /

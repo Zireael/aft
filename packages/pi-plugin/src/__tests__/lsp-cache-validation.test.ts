@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { runAutoInstall } from "../lsp-auto-install.js";
-import { runGithubAutoInstall } from "../lsp-github-install.js";
+import { __githubBinaryHashCountForTests, runGithubAutoInstall } from "../lsp-github-install.js";
 
 const roots = new Set<string>();
 let releaseEnv: (() => void) | undefined;
@@ -81,5 +82,43 @@ describe("cached LSP validation before lsp_paths_extra", () => {
     const quarantine = join(root, "lsp-binaries", ".quarantine", "clangd");
     expect(existsSync(quarantine)).toBe(true);
     expect(readdirSync(quarantine).length).toBeGreaterThan(0);
+  });
+
+  // Startup validates each cached binary, and the refresh after background
+  // installs settle validates them all again. A binary is tens to hundreds of
+  // MB, so an unchanged one must be hashed once per process, not per check.
+  test("an unchanged GitHub cached binary is hashed once across repeated validation", async () => {
+    const root = await tempCache();
+    const pkgDir = join(root, "lsp-binaries", "clangd");
+    const binDir = join(pkgDir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const binary = join(binDir, "clangd");
+    writeFileSync(binary, "clangd-binary");
+    writeFileSync(
+      join(pkgDir, ".aft-installed"),
+      JSON.stringify({
+        version: "21.1.0",
+        installedAt: "now",
+        binarySha256: createHash("sha256").update("clangd-binary").digest("hex"),
+      }),
+    );
+
+    const before = __githubBinaryHashCountForTests();
+    const result = runGithubAutoInstall(new Set(), {
+      autoInstall: false,
+      graceDays: 7,
+      versions: {},
+      disabled: new Set(),
+    });
+    expect(result.cachedBinDirs).toContain(binDir);
+    expect(result.getCachedBinDirs()).toContain(binDir);
+    expect(result.getCachedBinDirs()).toContain(binDir);
+    expect(__githubBinaryHashCountForTests() - before).toBe(1);
+
+    // A changed binary is hashed again and caught by the recorded digest.
+    writeFileSync(binary, "tampered-binary");
+    expect(result.getCachedBinDirs()).not.toContain(binDir);
+    expect(__githubBinaryHashCountForTests() - before).toBe(2);
+    expect(existsSync(join(root, "lsp-binaries", ".quarantine", "clangd"))).toBe(true);
   });
 });

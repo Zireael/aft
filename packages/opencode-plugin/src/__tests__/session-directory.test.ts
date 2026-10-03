@@ -99,7 +99,7 @@ describe("session-directory", () => {
     expect(getSessionDirectoryCached("ses_missing")).toBeNull();
   });
 
-  test("does not cache transient errors (so a temporary failure can recover)", async () => {
+  test("caches transient errors briefly so later calls do not immediately refetch", async () => {
     let calls = 0;
     const client = {
       session: {
@@ -112,9 +112,10 @@ describe("session-directory", () => {
     };
 
     expect(await getSessionDirectory(client, "ses_flaky", "/cwd")).toBeNull();
-    // Cache entry should not be set on error — next call retries.
-    expect(getSessionDirectoryCached("ses_flaky")).toBeUndefined();
-    expect(await getSessionDirectory(client, "ses_flaky", "/cwd")).toBe("/recovered");
+    // The fallback is provisional, but repeated tool calls must not hammer the host.
+    expect(getSessionDirectoryCached("ses_flaky")).toBeNull();
+    expect(await getSessionDirectory(client, "ses_flaky", "/cwd")).toBeNull();
+    expect(calls).toBe(1);
   });
 
   test("returns null and caches when the session has no directory field", async () => {

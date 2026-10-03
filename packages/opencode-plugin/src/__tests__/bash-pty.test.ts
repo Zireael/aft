@@ -105,19 +105,90 @@ describe("OpenCode bash PTY layer", () => {
     expect(lastCall?.params).toMatchObject({ pty: true, background: true });
   });
 
-  test("Test 21: subagent pty true is rejected", async () => {
-    const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+  function asSubagent(pluginCtx: PluginContext): void {
     pluginCtx.client = {
       session: { get: async () => ({ data: { parentID: "parent" } }) },
       lsp: {},
       find: {},
     } as PluginContext["client"];
+  }
+
+  test("Test 21a: subagent pty true runs as a background PTY task when subagent_background is on", async () => {
+    // `bash.subagent_background` defaults to true, so a subagent can hold a
+    // background task, and a PTY session is one. It is driven with the same
+    // bash_write and bash_status calls a primary session uses.
+    const outputPath = await spill("raw pty bytes");
+    const { ctx: pluginCtx, calls } = ctx((command) => {
+      if (command === "bash") {
+        return {
+          success: true,
+          status: "running",
+          task_id: "bash-subagent-pty",
+          output: "PTY task started: bash-subagent-pty.",
+        };
+      }
+      if (command === "bash_write") return { success: true, bytes_written: 9 };
+      return {
+        success: true,
+        status: "running",
+        mode: "pty",
+        output_path: outputPath,
+        pty_screen: ">>> print(1)\n1",
+      };
+    });
+    asSubagent(pluginCtx);
+
+    const started = toolResultText(
+      await createBashTool(pluginCtx).execute({ command: "python", pty: true }, runtime()),
+    );
+    expect(started).toContain("bash-subagent-pty");
+    expect(calls.at(-1)).toMatchObject({
+      command: "bash",
+      params: { pty: true, background: true, block_to_completion: false },
+    });
+
+    const written = await createBashWriteTool(pluginCtx).execute(
+      { taskId: "bash-subagent-pty", input: "print(1)\n" },
+      runtime(),
+    );
+    expect(written).toContain('"bytes_written": 9');
+    expect(calls.at(-1)).toMatchObject({
+      command: "bash_write",
+      params: { task_id: "bash-subagent-pty", input: "print(1)\n" },
+    });
+
+    const screen = await createBashStatusTool(pluginCtx).execute(
+      { taskId: "bash-subagent-pty", outputMode: "screen" },
+      runtime(),
+    );
+    expect(screen).toContain(">>> print(1)");
+    expect(screen).not.toContain("raw pty bytes");
+  });
+
+  test("Test 21b: subagent pty true is refused when subagent_background is off", async () => {
+    const { ctx: pluginCtx, calls } = ctx(() => ({ success: true }));
+    pluginCtx.config = { bash: { subagent_background: false } } as PluginContext["config"];
+    asSubagent(pluginCtx);
     const bash = createBashTool(pluginCtx);
     await expect(
       bash.execute({ command: "python", pty: true, background: true }, runtime()),
     ).rejects.toThrow(
-      "PTY mode is not available in subagent sessions; subagents cannot drive interactive terminals.",
+      "pty:true is unavailable in this subagent session because bash.subagent_background is false; run the command without pty.",
     );
+    expect(calls.filter((call) => call.command === "bash")).toEqual([]);
+  });
+
+  test("pty parameter mentions the subagent refusal only when subagent_background is off", () => {
+    const describePty = (config: PluginContext["config"]): string => {
+      const { ctx: pluginCtx } = ctx(() => ({ success: true }));
+      pluginCtx.config = config;
+      const pty = createBashTool(pluginCtx).args.pty as { description?: string };
+      return pty.description ?? "";
+    };
+    expect(describePty({} as PluginContext["config"])).not.toContain("subagent");
+    expect(
+      describePty({ bash: { subagent_background: false } } as PluginContext["config"]),
+    ).toContain("Unavailable in subagent sessions because bash.subagent_background is false.");
   });
 
   test("Test 22: bash_write schema accepts taskId/input", () => {

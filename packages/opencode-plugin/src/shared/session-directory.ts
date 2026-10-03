@@ -19,11 +19,63 @@
  * `packages/opencode/src/session/registry.ts`. Until then this
  * workaround makes AFT robust against the wrong cwd.
  */
+import { Effect } from "effect";
+
 import { sessionWarn } from "../logger.js";
 
 interface SessionInfo {
   directory?: string;
 }
+
+/**
+ * OpenCode 2 passes its plugin context where OpenCode 1 passes the SDK client
+ * (`entry/server-runtime.mjs` hands the context over as `client`). That context
+ * has a different session API, verified against the `v2` branch of the OpenCode repository:
+ *
+ * - `session.get` takes `{ sessionID }` and returns an Effect of `Session.Info`
+ *   (packages/client/src/effect/api/api.ts `SessionGetOperation`,
+ *   packages/plugin/src/effect/plugin.ts `Context`). Calling it the OpenCode 1
+ *   way builds an Effect that never runs, and awaiting an Effect yields the
+ *   Effect itself, so no directory was ever read.
+ * - `Session.Info` has no `directory`; the session's working directory is
+ *   `location.directory`, a required `Location.Ref`
+ *   (packages/schema/src/session.ts `Info`, packages/schema/src/location.ts
+ *   `Ref`). For a session created in a linked git worktree it is that worktree.
+ *
+ * It is told apart from an OpenCode 1 SDK client by having a string
+ * `location.directory` next to a `session.get` function; the OpenCode 2 entry
+ * refuses to boot without that `location`, and `subagent-detect.ts` uses the
+ * same test for its own session lookup.
+ */
+interface V2SessionInfo {
+  location?: { directory?: unknown };
+}
+
+interface V2PluginContextShape {
+  location: { directory: string };
+  session: {
+    get(input: { sessionID: string }): Effect.Effect<V2SessionInfo | undefined, unknown>;
+  };
+}
+
+function isV2PluginContext(client: unknown): client is V2PluginContextShape {
+  if (!client || typeof client !== "object") return false;
+  const candidate = client as { location?: { directory?: unknown }; session?: { get?: unknown } };
+  return (
+    typeof candidate.location?.directory === "string" &&
+    typeof candidate.session?.get === "function"
+  );
+}
+
+/**
+ * How long a session lookup may run on either host version. Tool routing
+ * awaits this lookup, so an unresponsive host must not hold the call forever.
+ * After this budget the call proceeds with its own directory instead.
+ */
+export const LOOKUP_TIMEOUT_MS = 1_000;
+export const V2_SESSION_LOOKUP_TIMEOUT_MS = LOOKUP_TIMEOUT_MS;
+/** A failed lookup is provisional; retry later without querying on every call. */
+export const FAILED_LOOKUP_RETRY_MS = 30_000;
 
 interface OpenCodeClientShape {
   session?: {
@@ -36,14 +88,15 @@ interface OpenCodeClientShape {
 }
 
 interface CacheEntry {
-  /** Resolved directory, or `null` if lookup failed and we should not retry. */
+  /** Resolved directory, or `null` while a failed lookup is cooling down. */
   directory: string | null;
-  /** Wall-clock timestamp of the cache entry, used only for LRU eviction. */
+  /** When the answer was recorded; failed lookups become retryable after 30 seconds. */
   recordedAt: number;
 }
 
 const CACHE_MAX_ENTRIES = 200;
 const cache = new Map<string, CacheEntry>();
+const inflight = new Map<string, Promise<string | null>>();
 
 /**
  * Resolve the project directory the session was created with from the SDK's
@@ -64,17 +117,63 @@ export async function getSessionDirectory(
   if (!sessionId) return null;
 
   const cached = cache.get(sessionId);
-  if (cached) {
+  if (
+    cached &&
+    (cached.directory !== null || Date.now() - cached.recordedAt < FAILED_LOOKUP_RETRY_MS)
+  ) {
     // Refresh LRU position
     cache.delete(sessionId);
     cache.set(sessionId, cached);
     return cached.directory;
   }
 
+  const pending = inflight.get(sessionId);
+  if (pending) return pending;
+  const lookup = boundedLookup(client, sessionId, fallbackDirectory).finally(() => {
+    inflight.delete(sessionId);
+  });
+  inflight.set(sessionId, lookup);
+  return lookup;
+}
+
+/** Ignore late answers: a timed-out lookup must not overwrite a later retry. */
+async function boundedLookup(
+  client: unknown,
+  sessionId: string,
+  fallbackDirectory: string,
+): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        sessionWarn(
+          sessionId,
+          `[aft-plugin] session lookup did not answer within ${LOOKUP_TIMEOUT_MS}ms; using the call's directory for now`,
+        );
+        resolve(null);
+      }, LOOKUP_TIMEOUT_MS);
+    });
+    const directory = await Promise.race([
+      lookupSessionDirectory(client, sessionId, fallbackDirectory),
+      timeout,
+    ]);
+    setCache(sessionId, directory);
+    return directory;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function lookupSessionDirectory(
+  client: unknown,
+  sessionId: string,
+  fallbackDirectory: string,
+): Promise<string | null> {
+  if (isV2PluginContext(client)) return lookupV2SessionDirectory(client, sessionId);
+
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
   if (!sessionApi || typeof sessionApi.get !== "function") {
-    setCache(sessionId, null);
     return null;
   }
 
@@ -96,7 +195,7 @@ export async function getSessionDirectory(
       dir = session.directory;
     }
   } catch (err) {
-    // Don't poison the cache on transient errors — but do log once.
+    // The bounded caller caches failures briefly so a struggling host is not polled per call.
     sessionWarn(
       sessionId,
       `[aft-plugin] session.get lookup failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -104,7 +203,43 @@ export async function getSessionDirectory(
     return null;
   }
 
-  setCache(sessionId, dir);
+  return dir;
+}
+
+/**
+ * OpenCode 2 lookup: run the context's `session.get` Effect under a timeout and
+ * read `location.directory`.
+ *
+ * The outer bounded lookup applies the same retry policy as OpenCode 1.
+ * The Effect timeout also interrupts the abandoned V2 lookup; fallback remains
+ * the tool call's runtime.directory (the host's Location directory), never
+ * the main checkout.
+ */
+async function lookupV2SessionDirectory(
+  context: V2PluginContextShape,
+  sessionId: string,
+): Promise<string | null> {
+  let dir: string | null = null;
+  let failure: string | undefined;
+  try {
+    const session = await Effect.runPromise(
+      Effect.timeout(
+        context.session.get({ sessionID: sessionId }) as Effect.Effect<V2SessionInfo | undefined>,
+        V2_SESSION_LOOKUP_TIMEOUT_MS,
+      ),
+    );
+    const directory = session?.location?.directory;
+    if (typeof directory === "string" && directory.length > 0) dir = directory;
+    else failure = "the session record has no location.directory";
+  } catch (err) {
+    failure = err instanceof Error ? err.message || err.name : String(err);
+  }
+  if (failure !== undefined) {
+    sessionWarn(
+      sessionId,
+      `[aft-plugin] OpenCode 2 session lookup failed (${failure}); tool paths and bash use the Location directory ${context.location.directory} for this session`,
+    );
+  }
   return dir;
 }
 
@@ -134,6 +269,10 @@ export function getSessionDirectoryCached(
   if (!sessionId) return undefined;
   const cached = cache.get(sessionId);
   if (!cached) return undefined;
+  if (cached.directory === null && Date.now() - cached.recordedAt >= FAILED_LOOKUP_RETRY_MS) {
+    cache.delete(sessionId);
+    return undefined;
+  }
   return cached.directory;
 }
 
@@ -148,7 +287,7 @@ export function warmSessionDirectory(
   fallbackDirectory: string,
 ): void {
   if (!sessionId) return;
-  if (cache.has(sessionId)) return;
+  if (getSessionDirectoryCached(sessionId) !== undefined) return;
   void getSessionDirectory(client, sessionId, fallbackDirectory);
 }
 
@@ -210,5 +349,6 @@ export async function verifySessionDirectory(
 /** Test-only: clear the cache between unit tests. */
 export function _resetSessionDirectoryCacheForTest(): void {
   cache.clear();
+  inflight.clear();
   verifyCache.clear();
 }

@@ -111,7 +111,12 @@ export interface ApiControlPlan {
   expected_status?: number;
   expected_stdout_pattern?: string;
   forbidden_stdout_pattern?: string;
-  purpose: "abort" | "permission" | "smoke";
+  /**
+   * What the control is for. `abort` also drives the harness's interruption
+   * bookkeeping; `message` sends the session a new prompt while a call is in
+   * flight, for rows that check what a mid-call message does to that call.
+   */
+  purpose: "abort" | "permission" | "smoke" | "message";
 }
 
 /** One entry of the ordered ruleset OpenCode evaluates for a session. */
@@ -164,6 +169,8 @@ export interface ScenarioDefinition {
   expected_fail_issue?: string;
   preconditions?: ScenarioPrecondition[];
   project_config?: Record<string, unknown>;
+  /** Environment overrides for this scenario's isolated host and native engine. */
+  env?: Record<string, string>;
   metadata?: Record<string, unknown>;
   /** Added by the loader so fixture paths can stay registration-relative. */
   registration_path?: string;

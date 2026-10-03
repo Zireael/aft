@@ -94,3 +94,6 @@ spikes/*/Cargo.lock
 
 # Same-SHA binary staged into the OpenCode 2 Docker build context
 .aft-opencode2-artifact/
+
+# Isolated allocation-soak clones and profiler output must not be indexed or committed.
+/.malloc-experiment/

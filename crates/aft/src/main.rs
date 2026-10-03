@@ -73,6 +73,22 @@ fn exit_after_log_flush(code: i32) -> i32 {
 }
 
 fn main() {
+    // The subc daemon hands a supervised module its launch nonce through an
+    // inherited pipe (and, for now, an environment copy). Take it before
+    // anything else can run: this is the only moment the process has one
+    // thread and no children, so the pipe is read and closed and both
+    // variables are removed before any child (the login-shell PATH probe
+    // below included) could inherit them. Standalone mode has no nonce and
+    // never touches the descriptor.
+    if parse_subc_arg(std::env::args_os().skip(1)).is_some() {
+        aft::launch_nonce::capture_at_startup();
+    }
+
+    // Record ORT_DYLIB_PATH as the spawner passed it, before anything in this
+    // process can export its own value: only a spawn-time value is an operator
+    // override of the ONNX Runtime library pin.
+    aft::ort_pin::capture_spawn_ort_dylib_path();
+
     // `gh` is a compatibility entry point for the upstream GitHub CLI. Handle
     // it before scanning AFT's global arguments; otherwise `gh --version` would
     // be mistaken for AFT's own `--version` flag.
@@ -112,6 +128,15 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    // `--formats` reports the highest on-disk format version of every store
+    // this build reads. Placement compares it with the storage root's reader
+    // floor, so it must stay side-effect free: no storage, no logging, no
+    // PATH probe.
+    if std::env::args().nth(1).as_deref() == Some("--formats") {
+        println!("{}", aft::persisted_format::formats_json());
+        return;
     }
 
     // Handle --version before starting the normal application.
@@ -186,6 +211,14 @@ fn main() {
         }
     }
 
+    // `aft cache prune-legacy` is the only command that deletes legacy
+    // (pre-view) index sets. Like `backups`, it runs before logging and the
+    // application start, so it never opens a store it may be moving aside.
+    if std::env::args().nth(1).as_deref() == Some("cache") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::prune_legacy::run(args));
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();
@@ -233,6 +266,11 @@ fn main() {
     // (split-brain index state). tokio runs ONLY inside run_subc_mode.
     if let Some(connection_file) = parse_subc_arg(std::env::args_os().skip(1)) {
         aft::slog_info!("subc mode, pid {}", std::process::id());
+        aft::launch_nonce::log_capture_outcome();
+        // The supervised module holds the secret it authenticates to the
+        // daemon with, so it loads only an ONNX Runtime it could hash first
+        // (see ort_pin), never one found by bare name on the loader search path.
+        aft::ort_pin::require_pinned_onnx_runtime();
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
         let app = App::default_shared();
@@ -248,12 +286,60 @@ fn main() {
         // there is no plugin to relay on-disk config, so this is how a gateway
         // user's aft.jsonc reaches AFT.
         let user_config_path = aft::subc_config::cortexkit_user_config_path();
+        // AFT_TEST_HOLD_ORT_SECTION holds an ORT section open during shutdown,
+        // without loading ORT or relying on inference speed. Release builds
+        // ignore the environment variable.
+        #[cfg(debug_assertions)]
+        let _held_ort =
+            std::env::var_os("AFT_TEST_HOLD_ORT_SECTION").and_then(|_| aft::ort_lifecycle::enter());
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => {
                 aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
-                aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
-                aft::ort_lifecycle::quiesce_before_return(0);
+                // ORT work persists nothing needed by the next module. Close the
+                // ORT work gate without waiting and skip native teardown if work
+                // is active: waiting would only spend the restart budget.
+                aft::slog_info!(
+                    "subc exit phase=ort_quiesce active={} budget_ms=0 elapsed_ms={}",
+                    aft::ort_lifecycle::active_sections(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let native_idle = aft::ort_lifecycle::close_and_wait(Duration::ZERO);
+                aft::slog_info!(
+                    "subc exit phase=ort_done native_idle={} elapsed_ms={}",
+                    native_idle,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flush_wait = aft::subc::exit_log_flush_wait();
+                aft::slog_info!(
+                    "subc exit phase=log_flush budget_ms={} elapsed_ms={}",
+                    flush_wait.as_millis(),
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                let flushed = aft::logging::flush_durable_log(flush_wait);
+                aft::slog_info!(
+                    "subc exit phase=log_flush_done flushed={} elapsed_ms={}",
+                    flushed,
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                // A bounded queue flush can expire on a slow writer. Take its
+                // sink and persist the terminal marker directly so later writes
+                // cannot rotate it away before either kind of process exit.
+                let terminal = format!(
+                    "subc exit phase=process_exit mode={} elapsed_ms={}",
+                    if native_idle {
+                        "return"
+                    } else {
+                        "skip_native_teardown"
+                    },
+                    aft::subc::exit_elapsed().as_millis()
+                );
+                if let Err(error) = aft::logging::write_terminal_log_sync(&terminal) {
+                    eprintln!("[aft] terminal log persistence failed: {error}; {terminal}");
+                }
+                if !native_idle {
+                    aft::ort_lifecycle::exit_without_native_teardown(0);
+                }
                 return;
             }
             // A lost connection is a restart request, not a failure to attach:
@@ -324,12 +410,23 @@ fn main() {
     // SemanticIndexEvent::Ready) get processed and their status_changed
     // push frames emitted. Without the wake, the sidebar can stay stuck
     // on "loading" indefinitely until the next request happens to arrive.
+    //
+    // A deferred request's worker also wakes this loop through
+    // `deferred_wake_rx` once its response is ready, so the response is written
+    // straight away. The pending poll interval below is only a fallback for
+    // deferred responses whose producers do not send that wake.
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
-    const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let pending_poll_interval = standalone_pending_poll_interval();
     let mut pending = PendingResponses::default();
     let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
     let mut queued_lines = VecDeque::new();
-    let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
+    let (line_tx, line_rx) = crossbeam_channel::unbounded::<io::Result<String>>();
+    let (deferred_wake_tx, deferred_wake_rx) = crossbeam_channel::bounded::<()>(1);
+    // Holding a sender here keeps the wake channel connected for the whole
+    // loop even if the process-wide slot was already taken, so waiting on it
+    // can never spin on a disconnected receiver.
+    let _deferred_wake_keepalive = deferred_wake_tx.clone();
+    let _ = DEFERRED_RESPONSE_WAKER.set(deferred_wake_tx);
     let mut graceful_stdin_shutdown = false;
     // While an edit waits on its type checker (see
     // `dispatch_with_offloaded_validation`), `validation_gate` holds that
@@ -375,14 +472,24 @@ fn main() {
         } else if pending.is_empty() {
             DRAIN_INTERVAL
         } else {
-            PENDING_POLL_INTERVAL
+            pending_poll_interval
         };
         let line_result = if let Some(result) = queued_lines.pop_front() {
             result
         } else {
-            match line_rx.recv_timeout(recv_timeout) {
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) if gated => {
+            match wait_for_loop_input(&line_rx, &deferred_wake_rx, recv_timeout) {
+                LoopInput::Line(result) => result,
+                LoopInput::DeferredResponseReady => {
+                    // A deferred worker finished: write its response now
+                    // instead of at the next poll. Runtime drains keep their
+                    // own schedule (the timeout branches below).
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                LoopInput::Timeout if gated => {
                     // Runtime drains stay paused while the edit finishes,
                     // exactly as they were while an edit ran inline; only the
                     // edit's own deferred response is polled.
@@ -392,7 +499,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) if gated => {
+                LoopInput::Disconnected if gated => {
                     // Stdin closed with requests still held behind the edit:
                     // finish the edit and replay them before shutting down.
                     thread::sleep(VALIDATION_GATE_POLL_INTERVAL);
@@ -402,7 +509,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+                LoopInput::Timeout => {
                     // Periodic drain so push frames flow even without requests.
                     // The request-critical configure prefix runs before a cooperative
                     // suffix step; storage-wide sweeps run on separate threads.
@@ -426,7 +533,7 @@ fn main() {
                     }
                     continue;
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                LoopInput::Disconnected => {
                     // Human-readable reason line; the phase markers below cover the
                     // shutdown sequence itself. protocol_test asserts this banner.
                     aft::slog_info!("stdin closed, shutting down");
@@ -482,6 +589,8 @@ fn main() {
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
                 runtime.note_request();
+                // Keep the query snapshot/gaps pinned through standalone finalization.
+                let _request_pin = runtime.pin_config();
                 let gates_on_validation = offloads_full_validation(&req, runtime);
                 let dispatch_result = if req.command == "cancel_request" {
                     Ok(DispatchOutcome::Immediate(handle_cancel_request(
@@ -599,17 +708,55 @@ fn main() {
         }
     }
     aft::slog_info!("shutdown phase=pending_responses_drained");
+    // Everything from here to exit fits in the exit budget measured from this
+    // point: the index flushes end by `flush_deadline`, then LSP shutdown
+    // takes at most its own budget.
+    let drained_at = Instant::now();
     if graceful_stdin_shutdown {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
-        flush_indexes_on_graceful_shutdown(&registry);
+        let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
+        let runtime = Arc::clone(registry.current());
+        aft::slog_info!("shutdown phase=search_index_flush_start");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
+        });
+        let search_wait = aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT
+            .min(flush_deadline.saturating_duration_since(Instant::now()));
+        let flushed = rx.recv_timeout(search_wait);
+        aft::slog_info!(
+            "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
+            flushed.is_ok(),
+            flushed.unwrap_or(false),
+            shutdown_started.elapsed().as_millis()
+        );
+        aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
+        let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
+        aft::slog_info!(
+            "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
+            outcome.as_str(),
+            outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
+            shutdown_started.elapsed().as_millis()
+        );
+        if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
+            aft::slog_warn!(
+                "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
+                aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
+            );
+        }
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
+    let mut clients = Vec::new();
     for runtime in registry.iter() {
-        runtime.lsp().shutdown_all();
+        clients.extend(runtime.lsp().take_all_clients());
         runtime.bash_background().detach();
     }
+    aft::lsp::manager::LspManager::shutdown_taken_clients(
+        clients,
+        registry.app().lsp_child_registry(),
+    );
     aft::slog_info!("shutdown phase=runtime_cleanup_done");
     aft::artifact_owner::shutdown_heartbeat_thread();
     aft::slog_info!(
@@ -629,6 +776,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
+        aft::config_live::drain_config_reload(runtime);
         aft::runtime_drain::drain_search_index_events(runtime);
         aft::runtime_drain::drain_callgraph_store_events(runtime);
         aft::runtime_drain::drain_semantic_index_events(runtime);
@@ -669,6 +817,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     // Preserve the dependency order: install finished search artifacts before
     // watcher deltas, then advance the other build channels and diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);
+    aft::config_live::drain_config_reload(runtime);
     aft::runtime_drain::drain_search_index_events(runtime);
     aft::runtime_drain::drain_callgraph_store_events(runtime);
     aft::runtime_drain::drain_semantic_index_events(runtime);
@@ -686,8 +835,64 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     );
 }
 
+/// Default interval at which the standalone loop polls deferred responses that
+/// did not wake it.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn standalone_pending_poll_interval() -> Duration {
+    // Test seam: stretching the fallback poll lets a test prove that a deferred
+    // response is written because its worker woke the loop, not because the
+    // poll came round.
+    std::env::var("AFT_TEST_PENDING_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(PENDING_POLL_INTERVAL)
+}
+
+/// Wakes the standalone loop when a deferred worker has its response ready.
+/// It is set only by the standalone loop; elsewhere (the subc daemon, unit
+/// tests) waking is a no-op and those callers poll as before.
+static DEFERRED_RESPONSE_WAKER: std::sync::OnceLock<crossbeam_channel::Sender<()>> =
+    std::sync::OnceLock::new();
+
+fn wake_standalone_loop_for_deferred_response() {
+    if let Some(waker) = DEFERRED_RESPONSE_WAKER.get() {
+        // A full slot already holds an unread wake, and one wake makes the
+        // loop poll every pending response, so dropping this one loses nothing.
+        let _ = waker.try_send(());
+    }
+}
+
+/// What the standalone loop woke up for.
+enum LoopInput {
+    /// A line read from stdin.
+    Line(io::Result<String>),
+    /// A deferred worker finished and its response can be written.
+    DeferredResponseReady,
+    /// Nothing arrived within the wait; time for periodic work.
+    Timeout,
+    /// Stdin closed and every line it produced has been received.
+    Disconnected,
+}
+
+fn wait_for_loop_input(
+    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
+    deferred_wake_rx: &crossbeam_channel::Receiver<()>,
+    timeout: Duration,
+) -> LoopInput {
+    crossbeam_channel::select! {
+        recv(line_rx) -> line => match line {
+            Ok(line) => LoopInput::Line(line),
+            Err(_) => LoopInput::Disconnected,
+        },
+        recv(deferred_wake_rx) -> _ => LoopInput::DeferredResponseReady,
+        default(timeout) => LoopInput::Timeout,
+    }
+}
+
 fn collect_queued_lines(
-    line_rx: &mpsc::Receiver<io::Result<String>>,
+    line_rx: &crossbeam_channel::Receiver<io::Result<String>>,
     queued_lines: &mut VecDeque<io::Result<String>>,
 ) -> usize {
     while let Ok(line) = line_rx.try_recv() {
@@ -703,6 +908,7 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
 fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     for (runtime_index, runtime) in registry.iter().enumerate() {
         let started = Instant::now();
@@ -1036,8 +1242,53 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs inside `dispatch` after the request pinned its config snapshot.
+    static DISPATCH_CONFIG_PROBE: std::cell::RefCell<Option<Box<dyn Fn(&AppContext)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn dispatch_config_probe_for_test(ctx: &AppContext) {
+    DISPATCH_CONFIG_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow().as_ref() {
+            probe(ctx);
+        }
+    });
+}
+
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if ctx.claim_database_runtime_retry(&req.command) {
+        ctx.retry_database_runtime();
+    }
+    if let Some(response) = ctx.database_runtime_refusal(&req.id, &req.command) {
+        return response;
+    }
+    // Every read of `ctx.config()` in this request sees the snapshot published
+    // when it was admitted, so a live config reload switches over between
+    // requests, never in the middle of one (path restriction, sandbox).
+    let _config_pin = ctx.pin_config();
+    // A detached view publication commits only between standalone requests,
+    // never in the middle of one (uncontended in subc mode).
+    let _publication_gate = aft::executor::standalone_request_gate();
+    #[cfg(test)]
+    dispatch_config_probe_for_test(ctx);
+    let mut response = dispatch_command(req, ctx);
+    aft::response_finalize::attach_checkout_query_gaps(&mut response, ctx);
+    // Every mutation this request made is on disk now; record what it left so
+    // a later undo can tell AFT's own result from a change made outside AFT.
+    ctx.backup().lock().record_post_mutation_states();
+    response
+}
+
+fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
+    // A parent folder session answers index-backed commands from its child
+    // repositories' own indexes (grep and glob fan out inside their handlers).
+    if let Some(response) = aft::views::parent::route(&req, ctx) {
+        return response;
+    }
     match req.command.as_str() {
         "ping" => Response::success(&req.id, serde_json::json!({ "command": "pong" })),
         "version" => Response::success(
@@ -1250,10 +1501,13 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     let worker_session_id = req.session_id.clone();
     let disconnected_request_id = request_id.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    let admitted_config = ctx.config();
     thread::spawn(move || {
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let response = log_ctx::with_session(worker_session_id, || dispatch(req, &ctx));
         let _ = tx.send(response);
+        wake_standalone_loop_for_deferred_response();
     });
 
     DispatchOutcome::Deferred(PendingResponse {
@@ -1307,6 +1561,10 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 }
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    // The request is admitted here: pin the published config so every handler
+    // below, and every worker thread a deferred handler starts, uses this
+    // snapshot even if a live config reload publishes while it runs.
+    let _config_pin = ctx.pin_config();
     aft::commands::tool_call::register_dispatch(dispatch);
     if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
         return handle_dispatch_deferred(req, Arc::clone(ctx));
@@ -1320,11 +1578,18 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
             Arc::clone(ctx),
         );
     }
-    if matches!(req.command.as_str(), "bash" | "powershell")
-        && aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req)
-    {
-        let spawn_response = aft::commands::bash::handle(&req, ctx);
-        return aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response);
+    if matches!(req.command.as_str(), "bash" | "powershell") {
+        // A top-level bash request is a model's bash call sent straight from a
+        // plugin; the tool-call runner and subc reach the bash handler through
+        // `dispatch` and observe their own calls, so only this entry observes.
+        let repeat = aft::commands::bash_orchestrate::raw_bash_repeat(&req);
+        let outcome = if aft::commands::bash_orchestrate::foreground_orchestrate_enabled(&req) {
+            let spawn_response = aft::commands::bash::handle(&req, ctx);
+            aft::commands::bash_orchestrate::build_bash_outcome(&req, ctx, spawn_response)
+        } else {
+            DispatchOutcome::Immediate(dispatch(req, ctx))
+        };
+        return repeat.observe_outcome(ctx, outcome);
     }
     if req.command == "read" {
         return aft::commands::read::build_read_outcome(req, ctx);
@@ -1428,7 +1693,9 @@ fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> 
     let worker_session_id = req.session_id.clone();
     let (tx, rx) = mpsc::channel::<OffloadedEditEvent>();
     let started_tx = tx.clone();
+    let admitted_config = ctx.config();
     thread::spawn(move || {
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let result = catch_unwind(AssertUnwindSafe(|| {
             aft::edit::with_full_validation_start_hook(
                 Box::new(move || {
@@ -3211,7 +3478,7 @@ mod watcher_filter_tests {
         RenameMode,
     };
     use notify::EventKind;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Wait budget for an async dispatch (semantic-refresh request / status
@@ -3445,17 +3712,10 @@ mod watcher_filter_tests {
 
     #[test]
     fn watcher_drain_refreshes_open_callgraph_store() {
-        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                30
-            )),
-            "a prior callgraph refresh worker should fully stop before this test"
-        );
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
+        let worker =
+            aft::callgraph_store::isolated_callgraph_refresh_worker_for_test(root.to_path_buf());
         let source = root.join("main.ts");
         std::fs::write(
             &source,
@@ -3503,18 +3763,41 @@ mod watcher_filter_tests {
             "export function entry() { newLeaf(); }\nfunction oldLeaf() {}\nfunction newLeaf() {}\n",
         )
         .unwrap();
-        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
-            root.to_path_buf(),
-            Duration::from_millis(350),
-            false,
-        );
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.to_path_buf());
         tx.send(WatcherDispatchEvent::Paths(vec![source])).unwrap();
-        let drain_started = Instant::now();
-        drain_watcher_events(&ctx);
-        assert!(
-            drain_started.elapsed() < Duration::from_millis(250),
-            "watcher drain waited for the callgraph store write"
-        );
+        // If drain starts waiting for the write, this thread cannot release it.
+        // The supervisor's hang cap catches that deadlock without measuring CPU speed.
+        std::thread::scope(|scope| {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            let ctx_ref = &ctx;
+            scope.spawn(move || {
+                drain_watcher_events(ctx_ref);
+                done_tx.send(()).unwrap();
+            });
+            let drained = done_rx.recv_timeout(Duration::from_secs(60));
+            if drained.is_err() {
+                drop(release);
+                panic!("watcher drain waited for the callgraph store write");
+            }
+            held.recv_timeout(Duration::from_secs(60))
+                .expect("fixture worker never took the refresh");
+            let store = ctx
+                .callgraph_store()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            let tree = store
+                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+                .unwrap();
+            assert_eq!(
+                tree.children[0].name, "oldLeaf",
+                "the held worker must not publish early"
+            );
+            release.send(()).unwrap();
+        });
 
         let store = {
             let guard = ctx
@@ -3526,26 +3809,17 @@ mod watcher_filter_tests {
                 .map(std::sync::Arc::clone)
                 .expect("store remains open")
         };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            let tree = store
-                .call_tree(std::path::Path::new("main.ts"), "entry", 1)
-                .unwrap();
-            if tree.children[0].name == "newLeaf" {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "async callgraph refresh did not publish the changed edge"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                1
-            ))
+            worker.wait(Duration::from_secs(60)),
+            "fixture refresh worker hung"
         );
-        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(root);
+        let tree = store
+            .call_tree(std::path::Path::new("main.ts"), "entry", 1)
+            .unwrap();
+        assert_eq!(
+            tree.children[0].name, "newLeaf",
+            "async callgraph refresh did not publish the changed edge"
+        );
     }
 
     #[test]
@@ -4899,5 +5173,54 @@ mod watcher_filter_tests {
         let snapshot = recv_status_changed(&rx);
         assert!(snapshot["status_bar"].get("errors").is_none());
         assert_eq!(ctx.status_bar_counts(), None);
+    }
+}
+
+#[cfg(test)]
+mod config_pin_tests {
+    use super::{dispatch, DISPATCH_CONFIG_PROBE};
+    use aft::config::Config;
+    use aft::context::AppContext;
+    use aft::parser::TreeSitterProvider;
+    use aft::protocol::RawRequest;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn dispatch_keeps_the_config_it_was_admitted_with() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        assert!(!ctx.config().restrict_to_project_root);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_probe = Arc::clone(&seen);
+        DISPATCH_CONFIG_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |ctx: &AppContext| {
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+                // A live config reload publishes from another thread while
+                // this request is running.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        ctx.update_config(|config| config.restrict_to_project_root = true)
+                    });
+                });
+                seen_in_probe
+                    .lock()
+                    .unwrap()
+                    .push(ctx.config().restrict_to_project_root);
+            }));
+        });
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "pin",
+            "command": "ping",
+        }))
+        .unwrap();
+        let response = dispatch(request, &ctx);
+        DISPATCH_CONFIG_PROBE.with(|probe| probe.borrow_mut().take());
+
+        assert!(response.success);
+        assert_eq!(*seen.lock().unwrap(), vec![false, false]);
+        // The next request sees the publication.
+        assert!(ctx.config().restrict_to_project_root);
     }
 }

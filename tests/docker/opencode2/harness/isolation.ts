@@ -121,6 +121,7 @@ export async function createScenarioIsolation(options: {
   binaryPath?: string;
   mockBaseUrl: string;
   projectConfig?: Record<string, unknown>;
+  scenarioEnv?: Record<string, string>;
   /** The provider object this host generation was observed to accept. */
   providerConfig: Record<string, unknown>;
   /** The opencode.json key that provider object goes under. */
@@ -278,6 +279,7 @@ export async function createScenarioIsolation(options: {
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    ...options.scenarioEnv,
     HOME: paths.home,
     XDG_CONFIG_HOME: paths.config,
     XDG_DATA_HOME: paths.data,

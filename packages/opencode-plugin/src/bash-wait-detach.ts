@@ -3,7 +3,7 @@ import {
   type AftTransportPool,
   containsStandaloneDetachKeyword,
   shouldInterruptWaitsForMessage,
-  stripStandaloneDetachKeywords,
+  stripDetachKeywordsAndTidyGap as stripStandaloneDetachKeywords,
 } from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
@@ -48,9 +48,7 @@ export function stripUserMessageDetachKeyword(output: unknown): string {
   const original = parts.map((part) => part.text).join("\n");
   if (!containsStandaloneDetachKeyword(original)) return original;
 
-  const stripped = parts
-    .map((part) => stripStandaloneDetachKeywords(part.text))
-    .map((text) => text.replace(/[ \t]{2,}/g, " "));
+  const stripped = parts.map((part) => stripStandaloneDetachKeywords(part.text));
   if (stripped.join("\n").trim() === "") {
     if (parts[0]) parts[0].text = EMPTY_DETACH_MESSAGE;
     for (const part of parts.slice(1)) part.text = "";

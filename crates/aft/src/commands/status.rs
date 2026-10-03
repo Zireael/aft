@@ -9,6 +9,10 @@ use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 pub struct CompressionStats {
     pub project: CompressionAggregateSerde,
     pub session: CompressionAggregateSerde,
+    /// True when another thread held the database connection, so the totals
+    /// are the last ones this process computed (zero if it never had any).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -227,6 +231,29 @@ impl AppContext {
             }
         };
 
+        // An index whose artifact a newer build wrote is refused, not rebuilt:
+        // report it as unavailable with the refusal instead of the loading or
+        // failed state the refused load left behind.
+        let refused_info = |plane| {
+            crate::feature_status::storage_refusal(self, plane).map(|refusal| {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "state": "unavailable",
+                    "reason": refusal.to_string(),
+                })
+            })
+        };
+        let search_index_info = if config.indexes.trigram {
+            refused_info(crate::feature_status::IndexPlane::Trigram).unwrap_or(search_index_info)
+        } else {
+            search_index_info
+        };
+        let semantic_index_info = if config.indexes.semantic {
+            refused_info(crate::feature_status::IndexPlane::Semantic).unwrap_or(semantic_index_info)
+        } else {
+            semantic_index_info
+        };
+
         // Disk cache sizes — scoped to the **current project** only.
         //
         // Both trigram (`<storage_dir>/index/<key>/`) and semantic
@@ -327,6 +354,29 @@ impl AppContext {
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
         let mut degraded_reasons = self.degraded_reasons();
+        // Everything under the storage root that this build refused because a
+        // newer build wrote it (or the reader floor requires a newer reader).
+        let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
+        for refusal in &storage_refusals {
+            let reason = refusal.reason();
+            if !degraded_reasons.contains(&reason) {
+                degraded_reasons.push(reason);
+            }
+        }
+        let storage_refusals = storage_refusals
+            .iter()
+            .map(|refusal| {
+                serde_json::json!({
+                    "code": crate::persisted_format::CODE,
+                    "store": refusal.store.name(),
+                    "path": refusal.path.display().to_string(),
+                    "found": refusal.found,
+                    "supported": refusal.supported,
+                    "message": refusal.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
         // Git being off is a machine-wide, per-process fact rather than a
         // property of this root, so it is added here instead of being
         // recorded by configure. Status renderers print each reason as-is.
@@ -435,6 +485,7 @@ impl AppContext {
             "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
+            "storage_refusals": storage_refusals,
             "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,
@@ -488,18 +539,31 @@ impl AppContext {
         let Some(db) = self.db() else {
             return compression;
         };
-        let Ok(conn) = db.lock() else {
-            return compression;
-        };
-
         let harness = self.harness().storage_segment();
         let project_key = crate::path_identity::project_scope_key(&project_root);
-        if let Ok((project, session)) = self.compression_aggregate_cache().aggregates_for_session(
-            &conn,
-            &harness,
-            &project_key,
-            session_id,
-        ) {
+        let cache = self.compression_aggregate_cache();
+        // Status is polled with a short client timeout and must answer from
+        // memory. The connection mutex can be held for as long as another
+        // thread's statement waits on a different process's lock, so never
+        // block on it: fall back to the last totals this process computed.
+        let conn = match db.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                compression.stale = true;
+                if let Some((project, session)) =
+                    cache.cached_for_session(&harness, &project_key, session_id)
+                {
+                    compression.project = project.into();
+                    compression.session = session.into();
+                }
+                return compression;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return compression,
+        };
+
+        if let Ok((project, session)) =
+            cache.aggregates_for_session(&conn, &harness, &project_key, session_id)
+        {
             compression.project = project.into();
             compression.session = session.into();
         }

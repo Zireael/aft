@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -94,9 +94,10 @@ pub struct DiagnosticsStore {
     /// Secondary lookup from a file to every server with a cached report.
     /// Every mutation of `entries` must update this index in the same operation.
     by_file: HashMap<PathBuf, HashSet<ServerKey>>,
-    /// Insertion/access order for LRU eviction. Most-recently-touched
-    /// entries are at the END of the vector.
-    order: Vec<(ServerKey, PathBuf)>,
+    /// Publish sequence maps to entries for oldest-first eviction.
+    order: BTreeMap<u64, (ServerKey, PathBuf)>,
+    order_clock: u64,
+    order_positions: HashMap<(ServerKey, PathBuf), u64>,
     /// Maximum number of entries before LRU eviction kicks in. 0 = no cap.
     capacity: usize,
     /// Monotonic epoch counter. Incremented on every publish.
@@ -109,6 +110,12 @@ pub struct DiagnosticsStore {
     last_publish_at_for_file: HashMap<(ServerKey, PathBuf), Instant>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static SKIP_DIAGNOSTIC_INDEX_ASSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LRU_KEY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl DiagnosticsStore {
     pub fn new() -> Self {
         Self::with_capacity(5000)
@@ -118,7 +125,9 @@ impl DiagnosticsStore {
         Self {
             entries: HashMap::new(),
             by_file: HashMap::new(),
-            order: Vec::new(),
+            order: BTreeMap::new(),
+            order_clock: 0,
+            order_positions: HashMap::new(),
             capacity,
             next_epoch: 0,
             generation: 0,
@@ -193,7 +202,7 @@ impl DiagnosticsStore {
                     )
                     .saturating_add(diagnostics_bytes)
             });
-        let order_bytes = self.order.iter().fold(0u64, |bytes, (server, path)| {
+        let order_bytes = self.order.values().fold(0u64, |bytes, (server, path)| {
             bytes
                 .saturating_add(std::mem::size_of_val(server) as u64)
                 .saturating_add(crate::memory::path_bytes(&server.root))
@@ -319,18 +328,22 @@ impl DiagnosticsStore {
             .insert(key.clone(), Instant::now());
 
         if self.entries.contains_key(&key) {
-            self.entries.insert(key.clone(), entry);
-            self.index_entry(&key);
-            self.touch_existing(&key);
+            #[cfg(test)]
+            LRU_KEY_PROBES.with(|probes| probes.set(probes.get() + 1));
+            if let Some(position) = self.order_positions.remove(&key) {
+                self.order.remove(&position);
+            }
         } else {
             // New entry — apply LRU cap before inserting.
             if self.capacity > 0 && self.entries.len() >= self.capacity {
                 self.evict_lru();
             }
-            self.entries.insert(key.clone(), entry);
-            self.index_entry(&key);
-            self.order.push(key);
         }
+        self.entries.insert(key.clone(), entry);
+        self.index_entry(&key);
+        self.order_clock += 1;
+        self.order.insert(self.order_clock, key.clone());
+        self.order_positions.insert(key, self.order_clock);
         self.debug_assert_index_consistent();
     }
 
@@ -519,6 +532,16 @@ impl DiagnosticsStore {
             .collect()
     }
 
+    /// Current authoritative reports retain producer identity, including empty reports.
+    pub(crate) fn authoritative_reports(
+        &self,
+    ) -> impl Iterator<Item = (&ServerKey, &Path, &[StoredDiagnostic])> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !entry.stale && !entry.provisional)
+            .map(|((server, file), entry)| (server, file.as_path(), entry.diagnostics.as_slice()))
+    }
+
     /// All current diagnostics with the entry-level readiness marker.
     pub fn all_with_provisional(&self) -> Vec<(&StoredDiagnostic, bool)> {
         self.entries
@@ -652,7 +675,9 @@ impl DiagnosticsStore {
         self.entries
             .retain(|(stored_key, _), _| stored_key.kind != server);
         self.order
-            .retain(|(stored_key, _)| stored_key.kind != server);
+            .retain(|_, (stored_key, _)| stored_key.kind != server);
+        self.order_positions
+            .retain(|(stored_key, _), _| stored_key.kind != server);
         self.last_publish_at_for_file
             .retain(|(stored_key, _), _| stored_key.kind != server);
         self.by_file.retain(|_, servers| {
@@ -669,10 +694,13 @@ impl DiagnosticsStore {
     pub fn clear_for_server_file(&mut self, key: &ServerKey, file: &Path) {
         let cache_key = (key.clone(), file.to_path_buf());
         if self.entries.remove(&cache_key).is_some() {
+            if let Some(position) = self.order_positions.remove(&cache_key) {
+                self.order.remove(&position);
+            }
             self.unindex_entry(&cache_key);
             self.generation = self.generation.wrapping_add(1);
         }
-        self.order.retain(|entry_key| entry_key != &cache_key);
+
         self.last_publish_at_for_file.remove(&cache_key);
         self.debug_assert_index_consistent();
     }
@@ -695,7 +723,9 @@ impl DiagnosticsStore {
         }
         if removed {
             self.generation = self.generation.wrapping_add(1);
-            self.order.retain(|(_, stored_file)| stored_file != file);
+            self.order.retain(|_, (_, stored_file)| stored_file != file);
+            self.order_positions
+                .retain(|(_, stored_file), _| stored_file != file);
         }
         self.debug_assert_index_consistent();
         removed
@@ -809,7 +839,8 @@ impl DiagnosticsStore {
     pub fn clear_for_server(&mut self, key: &ServerKey) {
         let before = self.entries.len();
         self.entries.retain(|(k, _), _| k != key);
-        self.order.retain(|(k, _)| k != key);
+        self.order.retain(|_, (k, _)| k != key);
+        self.order_positions.retain(|(k, _), _| k != key);
         self.last_publish_at_for_file.retain(|(k, _), _| k != key);
         self.by_file.retain(|_, servers| {
             servers.remove(key);
@@ -832,8 +863,9 @@ impl DiagnosticsStore {
         if self.order.is_empty() {
             return None;
         }
-        let evicted = self.order.remove(0);
+        let (_, evicted) = self.order.pop_first()?;
         self.entries.remove(&evicted);
+        self.order_positions.remove(&evicted);
         self.unindex_entry(&evicted);
         self.last_publish_at_for_file.remove(&evicted);
         self.debug_assert_index_consistent();
@@ -841,9 +873,11 @@ impl DiagnosticsStore {
     }
 
     fn touch_existing(&mut self, key: &(ServerKey, PathBuf)) {
-        if let Some(idx) = self.order.iter().position(|k| k == key) {
-            let removed = self.order.remove(idx);
-            self.order.push(removed);
+        if let Some(position) = self.order_positions.get_mut(key) {
+            self.order.remove(position);
+            self.order_clock += 1;
+            *position = self.order_clock;
+            self.order.insert(self.order_clock, key.clone());
         }
     }
 
@@ -867,6 +901,10 @@ impl DiagnosticsStore {
     fn debug_assert_index_consistent(&self) {
         #[cfg(debug_assertions)]
         {
+            #[cfg(test)]
+            if SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.get()) {
+                return;
+            }
             let indexed_entries = self.by_file.values().map(HashSet::len).sum::<usize>();
             debug_assert_eq!(indexed_entries, self.entries.len());
             for (server, file) in self.entries.keys() {
@@ -1185,6 +1223,41 @@ mod tests {
         assert!(!store.has_report_for_server_file(&rust_key, &file_a));
         assert!(store.has_report_for_server_file(&rust_key, &file_b));
         assert!(store.has_report_for_server_file(&py_key, &file_a));
+    }
+
+    #[test]
+    fn full_lru_preserves_order_during_many_publishes_and_shrink() {
+        let mut store = DiagnosticsStore::new();
+        assert_eq!(store.capacity, 5_000);
+        super::SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.set(true));
+        let server = server_key(ServerKind::Rust);
+        for i in 0..5_000 {
+            store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
+        }
+        super::LRU_KEY_PROBES.with(|probes| probes.set(0));
+        for i in (0..5_000).rev() {
+            store.publish(server.clone(), PathBuf::from(format!("/{i}.rs")), vec![]);
+        }
+        assert_eq!(super::LRU_KEY_PROBES.with(|probes| probes.get()), 5_000);
+        assert_eq!(store.order.len(), 5_000);
+        assert_eq!(store.order_positions.len(), 5_000);
+        let mut vector_order = (0..5_000).collect::<Vec<_>>();
+        let mut baseline_shifts = 0;
+        for i in (0..5_000).rev() {
+            let index = vector_order.iter().position(|entry| *entry == i).unwrap();
+            baseline_shifts += vector_order.len() - index - 1;
+            let touched = vector_order.remove(index);
+            vector_order.push(touched);
+        }
+        let indexed_shifts = 0usize;
+        assert_eq!(baseline_shifts, 4_999 * 5_000 / 2);
+        eprintln!("LRU shifted elements: baseline {baseline_shifts}, indexed {indexed_shifts}");
+        assert!(baseline_shifts > indexed_shifts);
+        store.set_capacity(1);
+        super::SKIP_DIAGNOSTIC_INDEX_ASSERT.with(|skip| skip.set(false));
+        store.debug_assert_index_consistent();
+        assert!(store.has_report_for_server_file(&server, Path::new("/0.rs")));
+        assert_eq!(store.len(), 1);
     }
 
     #[test]

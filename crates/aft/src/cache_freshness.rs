@@ -341,7 +341,7 @@ pub(crate) fn verify_files_bounded<K: Send>(
     }
 }
 
-fn strict_verify_pool_size() -> usize {
+pub(crate) fn strict_verify_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
@@ -418,11 +418,55 @@ pub fn watched_hash_file_count_for_debug() -> usize {
         .map_or(0, |(_, count)| *count)
 }
 
+#[cfg(test)]
+static WATCHED_VERIFY_STATS: OnceLock<Mutex<Option<VerifyStatWatch>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct VerifyStatWatch {
+    root: PathBuf,
+    pub(crate) calls: Vec<(PathBuf, std::thread::ThreadId)>,
+}
+
+#[cfg(test)]
+pub(crate) fn watch_verify_stats(root: &Path) {
+    *WATCHED_VERIFY_STATS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = Some(VerifyStatWatch {
+        root: root.to_path_buf(),
+        calls: Vec::new(),
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_verify_stats() -> VerifyStatWatch {
+    WATCHED_VERIFY_STATS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn record_metadata_call(path: &Path) {
+    if let Some(watch) = WATCHED_VERIFY_STATS.get() {
+        let mut watch = watch.lock().unwrap();
+        if let Some(watch) = watch.as_mut().filter(|watch| path.starts_with(&watch.root)) {
+            watch
+                .calls
+                .push((path.to_path_buf(), std::thread::current().id()));
+        }
+    }
+}
+
 fn verify_file_inner(
     path: &Path,
     cached: &FileFreshness,
     hash_matching_metadata: bool,
 ) -> FreshnessVerdict {
+    #[cfg(test)]
+    record_metadata_call(path);
     let Ok(metadata) = fs::metadata(path) else {
         return FreshnessVerdict::Deleted;
     };

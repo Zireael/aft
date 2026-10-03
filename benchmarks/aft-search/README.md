@@ -266,6 +266,188 @@ The pinned tree also carries `.alfonso/reports/search-fusion-quality.md`,
 which quotes these fixture queries. Both replays exclude it from the index;
 see the corpus hygiene section below.
 
+### Rows the reference may record as a miss
+
+The paged replay faults on any row whose ranking depends on page size (the
+`topK` 10, 25 and 50 invariance plans must agree). One manifest field relaxes
+that for the reference only: `reference_not_page_invariant`, a one-line reason
+naming the engine defect. A row carrying it that breaks page invariance is
+recorded as a miss (every metric 0) with `page_invariance_failed` on the score
+row, so a reference can be taken on an engine that still has the defect and
+the fix can be measured against it.
+
+The field never excuses a changed engine. Under a `ranking` descriptor,
+`total_gate` faults on any evaluated score row that broke page invariance,
+flagged or not, so the change that fixes the defect must make every row
+invariant. Under a `non_ranking` or `engine_unwired` descriptor the engine is
+unchanged, so a flagged row must reproduce the reference's recorded miss
+exactly (the same `page_invariance_failed` record, every metric 0), and a row
+the reference scored normally must not fail. That lets the train carrying
+the rows and their reference land before the train that fixes the engine. A row without the field faults at
+replay time exactly as before. Set the field only on rows added to measure a
+known paging defect, never on a row that used to pass: there it would turn a
+regression into a quiet miss. Remove it in its own change once the defect is
+fixed, not in the same train as a reference re-record.
+
+The field is set on six regex identifier rows,
+`followup-census:900003`-`900008` (#375): the regex route on the recording
+engine kept the first matches its scan met, in parallel scan order, and
+sorted only those, so its pages depended on page size. The seventh regex row,
+`900009`, has fewer matching lines than the smallest invariance page, so that
+engine replays it invariantly and it carries no flag. Rows with between about
+ten and forty matching lines were left out: on that engine they pass or fail
+page invariance from run to run, so no reference taken on it would repeat.
+
+### Split query/pattern rows
+
+The gate manifest adds 12 hand-split rows, `followup-census:910001`–`910012`,
+under the mechanism `split_query_pattern_fusion` and benchmark-only shape `split`.
+The pin is AFT commit `30d4a64f99b3`; this shape does not extend that commit's
+router enum. The R1–R7 categories describe these fusion scenarios. Counts are
+R1=2 (stale mention), R2=2 (broad Error/Result), R3=1 (moderate selectivity),
+R4=2 (one dual-answer input, definition and concept), R5=2 (empty/whitespace),
+R6=1 (semantic building), R7=2 (mixed-selectivity alternation). Each has
+`row_source`, `answer_key_basis`, and `answer_kind: concept|definition`.
+`author_split_rows.py` reproduces the hand splits of retained census queries and
+labels constructed inputs honestly rather than giving them invented telemetry.
+
+The unchanged binary runs **joined form**: `query + " " + pattern` when the
+pattern has non-whitespace content; otherwise it sends exactly `query`, with no
+trailing space. A split-capable binary sends `query` and `pattern` separately,
+including an empty pattern. Capability is probed on the actual binary with
+`pattern: "["`: `success: false, code: invalid_pattern` means supported,
+success means the legacy engine ignored the parameter, and any other error is a
+hard fault. The score records `pattern_probe`, `pattern_declared`, and each split
+row's `input_form`. Joined references are measurement of the old engine, never
+split measurements, so the split predicates (the joined-candidate refusal, the
+paired rule and the R1-R6 requirements below) do not judge a joined row. When
+the probe reports `ignored_pattern`, the engine cannot run split form at all:
+its joined split rows are recorded as not applicable and skipped by those
+predicates under every descriptor class. The score names them in
+`split_rows_not_applicable` (rows and reason), and both the runner and the gate
+print a `split_rows_not_applicable:` line. They still count in the real-query
+aggregates, which compare the joined replay with the joined reference. Once an
+engine honours `pattern`, its candidate must be split form: a joined row then
+faults with `split_candidate_required`, and every split predicate applies.
+
+Every split row also runs **prose-only**, at the same scoring depth and page
+profile. Paged replays verify invariance for both forms. The score carries the
+prose requests, paths, metrics and `paired_mrr_delta`; the runner prints the
+per-row deltas. The ranking predicate fails if **any concept-answer row** has
+lower MRR@10 with its pattern than without it, regardless of aggregate gains.
+Definition answers are not protected by that paired rule. R1 additionally needs
+rank 1, R3 hit@5, R4 both answers hit@3, and R6 a hit with `complete: false`.
+R5 compares the actual result arrays with prose-only, not just their scores.
+
+A `ranking` descriptor may name split rows that no pattern design can satisfy
+in `unreachable_split_rows`: a list of `{episode_id, predicate, reason}`, where
+`predicate` is one of the absolute split predicates (`split_rank1_required`,
+`split_hit5_required`, `split_hit3_required`, `split_partial_hit_required`) and
+must be the one that judges the row's split kind. `split_paired_harm` and every
+non-split predicate can never be waived, and a malformed entry faults the gate.
+The gate honours an entry only after checking the run's own data: (a) the row's
+split rank equals its prose-only rank, so the pattern did not move the answer,
+and (b) no line of the gold answer file at the evidence pin matches the row's
+pattern, so no pattern design could lift it. A waived row is printed as
+`unreachable_split_row_waived:` with both ranks and the reason; when a check
+fails the failure stands, next to an `unreachable_split_row_refused:` line
+naming the check.
+The reference seeds `fixture_groups.real_query.split` and `shapes.split`.
+
+R3's anchored declaration alternation matches exactly 30 files at the pin,
+checked by a named harness test. `expected_prose_overlap: 5` is informational:
+five selected declarations concern output compression, and the other files
+concern unrelated systems. Actual prose-lane membership depends on the semantic
+index, so exact overlap is not a gate. Split scores preserve the pattern summary
+and the first eight text lines for inspection. R6 uses a separate AFT process
+whose corpus embeddings are held by an event while query embeddings and the
+model-initialization probe remain available. The runner waits for the trigram
+index's `ready` status and the semantic index's `building` status (or its initial
+`loading / embedding_symbols` stage);
+it does not race a normally progressing semantic index or alter the 56 old rows.
+
+`split-tuning-manifest.json` contains **8 additional tuning-only rows**
+(`920001`–`920008`), with disjoint query/pattern pairs. Neither these rows nor
+their scores can enter the gate/reference. They are for search-engine developers to
+tune weights, damping and RRF constants, without training on the gate answers:
+
+```bash
+python3 benchmarks/aft-search/run_real_query.py --tuning-only \
+  --manifest benchmarks/aft-search/split-tuning-manifest.json --profile paged \
+  --binary target/release/aft \
+  --exact-score benchmarks/aft-search/.bench/search-quality/exact.json \
+  --concept-score benchmarks/aft-search/.bench/search-quality/concept.json \
+  --output benchmarks/aft-search/.bench/search-quality/tuning.json
+```
+
+`split-query-vectors.bin` supplements, rather than replaces, the original chunk
+and query pack. It holds real MiniLM vectors for both the joined and prose-only
+texts of gate and tuning rows. The manifest binds its digest; the loader verifies
+model/pin/template/dimension and refuses conflicting overlap with the old pack.
+The existing row bindings, original pack, and concept query pack stay untouched.
+To reproduce authoring (requires the managed model cache):
+
+```bash
+python3 benchmarks/aft-search/author_split_rows.py
+cd benchmarks/aft-search
+uv run --with onnxruntime==1.24.4 --with tokenizers==0.22.2 --with numpy \
+  python3 capture_split_query_vectors.py --allow-vector-authoring
+```
+
+Tuning rows added later (920009-920011, concept answers that call the named
+symbol) carry their vectors in `split-tuning-vectors.bin`, bound only by the
+tuning manifest, so the gate's pack and manifest stay byte-identical:
+`capture_split_query_vectors.py --allow-vector-authoring --tuning-only`.
+Set `AFT_SEARCH_SPLIT_TRACE=1` in the engine's environment to record each split
+row's `split_trace` (how every leading result was placed) in the score.
+
+Descriptor suggestion for a change adding benchmark rows and harness support: `slice_class: non_ranking`,
+`kind: harness`, `targeted_mechanism: none`, `fixtures: ["harness-goldens"]`.
+For the subsequent engine implementation change: `slice_class: ranking`, `kind: ranking`,
+`targeted_mechanism: split_query_pattern_fusion`; its MRR@10 must strictly improve,
+with exact/concept recall, shape floors, page invariance and paired checks intact.
+
+### Hyphenated-literal rows
+
+Rows `followup-census:900010`–`900017` (mechanism
+`phrase_present_not_surfaced`, shape `identifier`) are single kebab-case
+literals an agent searches for by name: a hash domain tag
+(`aft-ignore-rules-v1`), a log reason code (`drop-no-compatible-handler`), an
+LSP binary name (`haskell-language-server-wrapper`), a request id
+(`doctor-removal-status`), a digest constant (`aft-escalation-payload-v3`), a
+cargo directive (`rerun-if-changed`) and two thread names (`aft-lsp-idle-reap`,
+`aft-mem-sampler`). Each occurs in exactly one file at the pin, and that file
+is the answer. They measure whether a hyphenated query is searched as one
+string: an engine that splits it into its parts lets a field named after one
+part, or three lines mentioning all parts, count as exact evidence and
+outrank the file that holds the literal. Identifier-shaped queries run no
+semantic lane, so the rows need no query vectors.
+
+### Definition, receiver.member and missing-name rows
+
+Rows `followup-census:900018`–`900034` are identifier queries (shape
+`identifier`, no semantic lane, so no query vectors) for three engine
+questions:
+
+- `900018`–`900020`, mechanism `identifier_not_definition_first`. The answer
+  is the file that declares the name. `900018` (`line_col_to_byte`, a real
+  agent query from Synapse's rerank-eval corpus, id `aft-030`) has a planning
+  note under `.gsd/` that quotes the declaration and sorts before
+  `crates/aft/src/edit.rs` by path. `900019` (`ctx.set_harness`) and `900020`
+  (`adapter.clearPluginCache`) are census `receiver.member` queries: their
+  text occurs only at call sites, and the answer is the declaration on the
+  receiver's type (`context.rs`, the `HarnessAdapter` interface in
+  `adapters/types.ts`).
+- `900021`–`900034`, mechanism `renamed_or_variant_token`. Every census
+  episode on this repository whose query is one identifier-shaped token that
+  occurs in no file at the pin, and that the agent followed by opening a
+  file. The answer is the file the agent opened next. `answer_key_basis`
+  names the closest name that file holds at the pin, if any. These measure
+  what an agent gets for a name that does not exist.
+
+The score records ranked files only, so no row checks which line a result is
+rendered at.
+
 ### Re-recording the reference
 
 `real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
@@ -276,6 +458,80 @@ with `cost-gate.sh --search-quality --mode record-reference`, and say in the
 commit message which change moved the rows and why it was the right direction.
 
 Re-records so far:
+
+- 2026-10-02, after train 271's ranking change `894133741` (search a
+  hyphenated query as one literal) landed on `main`, together with the 17
+  identifier rows `900018`–`900034` from `9aaef09d5` (see Definition,
+  receiver.member and missing-name rows above). Recorded on macOS arm64 from a
+  clean release build of unchanged `origin/main` `f15190422` (`aft 0.58.2`, no
+  rustc wrapper, binary sha256
+  `dd4afd242b4947ef77e0d1e3857cefc6637f5d00af192fb5f79e6dc8cc9db8f4`), in two
+  steps on that one binary. First `cost-gate.sh --search-quality --mode
+  record-reference` with the old 76-row manifest: exactly nine rows moved, all
+  hyphenated single-token queries, the eight hyphenated-literal rows
+  `900010`–`900017` (each now ranks its answer first) and `19696`
+  (`cortexkit-store`, a miss before and after, whose candidates no longer lead
+  with files that only mention the parts); the other 67 are byte-equal to the
+  previous reference, and four replays on two builds of that tree produced
+  identical rows. `paged` MRR@10 0.272290 -> 0.371601, hit@5 0.381579 ->
+  0.486842, census-weighted MRR 0.308773 -> 0.455716, `identifier` shape
+  0.182540 -> 0.601852, `phrase_present_not_surfaced` 0.178571 -> 0.933333.
+  Then `--mode record-reference --manifest-changed --old-score <old-manifest
+  replay> --base-ref <first step>` with the 93-row manifest: all 76 old rows
+  are byte-equal to the first step, so the remaining change is the new rows:
+  `paged` MRR@10 0.371601 -> 0.338471 (93 rows), hit@5 0.486842 -> 0.451613,
+  census-weighted MRR 0.455716 -> 0.335822, `identifier` shape 0.601852 ->
+  0.401984, `identifier_not_definition_first` 1.000 -> 0.850 (the three new
+  rows each rank their answer second), new `renamed_or_variant_token` 0.124008
+  (ranks 2, miss, miss, miss, 1, miss, miss, miss, 9, 8, miss, miss, miss,
+  miss in row-ID order). All 93 rows are byte-equal to the reference
+  `9aaef09d5` recorded independently in a Linux aarch64 container at
+  `597e3d13c`. Exact recall stayed 1.000 and concept recall 0.639423. The
+  reference also gains the `split_rows_not_applicable` field, which the
+  harness has written since the joined split-row change.
+- 2026-10-01, when the eight hyphenated-literal rows were added (see
+  Hyphenated-literal rows above). Recorded in a Linux aarch64 container on a
+  release build of the unchanged engine (`aft 0.58.1`, binary sha256
+  `0b2b34cce5ba...`), with `run_search_quality.py --mode record-reference
+  --manifest-changed`. The same binary with the old manifest reproduced all 68
+  reference rows byte-for-byte, and with the new manifest those 68 rows are
+  byte-equal again. `paged` real-query MRR@10 0.297672 -> 0.272290 (76 rows),
+  hit@5 0.426471 -> 0.381579, census-weighted MRR 0.436247 -> 0.308773; the
+  `phrase_present_not_surfaced` mechanism 0.666667 -> 0.178571 and the
+  `identifier` shape 0.283333 -> 0.182540. No old row moved: the changes are
+  solely the new rows, whose answer ranks are, in row-ID order, 6, miss, miss,
+  miss, miss, 7, miss, 7 (MRR@10 0.056548 across the eight). Exact recall
+  stayed 1.000 and concept recall 0.639423, re-measured in the recording run.
+- 2026-09-29, when 12 query/pattern rows were added (see Split query/pattern
+  rows above). Recorded in Linux x86_64 on the unchanged local-main release
+  build `d361e160d142` (`aft 0.58.0`, binary sha256
+  `0c8b5d45de80313d8842d31a4ddc2b68a156c7824bc90a04ba635db180df0325`).
+  The binary's invalid-pattern probe reported legacy/ignored input, so all
+  new rows are joined-form references. The old manifest replay reproduced all
+  56 reference rows byte-for-byte, and the expanded replay preserved those
+  same 56 rows byte-for-byte. A second expanded replay reproduced all 68 rows.
+  Exact recall stayed 1.000 and concept recall stayed 0.639423, re-measured.
+  `paged` real-query MRR@10 0.317708 -> 0.297672, hit@5 0.446429 -> 0.426471;
+  the added split mechanism/shape/fixture group has MRR@10 0.204167,
+  hit@1 0.166667, hit@5 0.333333. Census-weighted report-only MRR
+  0.434615 -> 0.436247. No old answer moved: aggregate changes are solely
+  the addition of new rows, not a ranking change. Joined answer ranks, in
+  row-ID order: miss, miss, miss, miss, miss, 1, 5, miss, 4, 1, miss, miss.
+  R6's held semantic build returned `complete: false`; the initial index reports
+  `loading / embedding_symbols` while unpublished, and search reports `building`.
+  The gate was green with a `non_ranking`/`harness` descriptor against
+  `d361e160`, the local-main base. `origin/main` was still behind that base's
+  engine-unwired per-checkout-index change, so the local-main base avoids mixing
+  its descriptor class with this benchmark change.
+
+  Recording procedure: old-manifest `cost-gate.sh --search-quality --mode verify`
+  on that binary, then `--mode record-reference --manifest-changed --old-score
+  <old-score> --base-ref d361e160`. The real-query stage initially failed because
+  the fixture also held model initialization; after exempting the initialization
+  probe, awaiting `embedding_symbols`, and permitting the explicit building
+  response for that fixture client only, the failed stage was rerun and the
+  resulting score recorded with `search_quality.py` using the same arguments.
+  A full `cost-gate.sh --search-quality --mode evaluate` replay then passed.
 
 - 2026-09-18, after ranking slice 3, and 2026-09-20, after the `includeTests`
   coercion moved the capability schema hash. Both are written up in
@@ -410,6 +666,84 @@ Re-records so far:
   shows that the root `.aftignore` written into the copy did not itself
   enter the index. Exact recall is unchanged at 1.000; it scores against the
   pinned external clones, not the evidence tree.
+- 2026-09-29, when seven regex identifier rows were added
+  (`followup-census:900003`-`900009`, mechanism
+  `identifier_not_definition_first`, #375). Each query is an identifier
+  alternation an agent ran in this repository, and its answer is the file
+  that declares the identifiers; the row's `row_source` and
+  `answer_key_basis` say where it came from and where the declaration sits
+  at the pin. The engine was unchanged: one release build of the base commit
+  in a Linux aarch64 container (`aft 0.58.0`, binary sha256
+  `bdcbf20ba992...`), `paged` profile. That binary with the old manifest
+  reproduced the old reference, all 49 rows byte-equal; with the new manifest
+  the 49 rows are again byte-equal. The old regex route broke page invariance
+  on these rows, so six of them carry `reference_not_page_invariant` (see
+  Rows the reference may record as a miss) and five were recorded as misses;
+  `900008` replayed invariantly and scored rank 1, `900009` (no flag) rank 1.
+  Two recording runs gave scores that differ only in `baseline_sha256`, the
+  recorder's note of the reference file present when each ran. Real-query `paged` MRR@10
+  0.220238 -> 0.228423 (56 rows), census-weighted MRR 0.162052 -> 0.239927,
+  the new `regex` shape and `identifier_not_definition_first` mechanism both
+  MRR@10 0.285714. Exact recall (1.000) and concept recall are unchanged.
+- 2026-09-29, after train 238 ranked the complete regex/literal candidate set
+  before cutting each page (#375). Replayed the unchanged 56-row reference on
+  release builds of `57fb117b9` and `2b7e26e4e` in the same Linux aarch64
+  container. The old binary reproduced every reference row byte-for-byte;
+  the new binary changed only the seven regex rows, `followup-census:900003`–
+  `900009`. Rows `900003`–`900007` went from recorded page-invariance misses
+  to invariant rank-1 hits. Row `900008` was already a scored rank-1 hit,
+  but its retrieval depth fell 31 -> 3 and two lower-ranked paths swapped.
+  Row `900009` kept its ranked paths and rank-1 hit while its retrieval depth
+  fell 8 -> 2. The complete-set ranking removes scan-order paging defects
+  without displacing any other row. Re-recorded with
+  `scripts/telemetry/cost-gate.sh --search-quality --mode record-reference`
+  on the release build of `2b7e26e4e` (Linux aarch64, binary sha256
+  `11ade1376560...`). `paged` MRR@10 0.228423 -> 0.317708, hit@5 0.357143
+  -> 0.446429, census-weighted MRR 0.239927 -> 0.434615; the
+  `identifier_not_definition_first` MRR@10 rose 0.285714 -> 1.000000.
+  Exact recall stayed 1.000 and concept recall stayed 0.639423, both
+  re-measured in the recording run. The six `reference_not_page_invariant`
+  flags remain for a separate change.
+
+## Measuring a reranker (report-only)
+
+`search.rerank` is off in the product and in every runner above. Environment
+variables, read by `bench_rerank.py`, make the exact-recall, concept-recall and
+real-query runners configure one instead, without changing a run when unset:
+
+- `AFT_SEARCH_BENCH_RERANK`: the `search.rerank` block as JSON, for example
+  `{"backend": "onnx", "model": "gte-reranker-modernbert-base", "timeout_ms": 15000}`
+  or `{"backend": "remote", "endpoint": "http://127.0.0.1:8091", "model": "..."}`.
+- `AFT_SEARCH_BENCH_RERANK_CACHE`: the model cache the ONNX reranker reads
+  (it becomes the AFT process's `FASTEMBED_CACHE_DIR`). The pack replays block
+  downloads, so put the pinned snapshot there first, and nothing else: the
+  replay must not find an embedding model to fall back on. The ONNX backend
+  also needs `ORT_DYLIB_PATH` pointing at the managed ONNX Runtime.
+- `AFT_SEARCH_BENCH_RERANK_LOG`: a JSON-lines file of every search (latency
+  and the `rerank skipped: ...` note when there was one), plus each runner's
+  warm-up. The scores keep their normal shape; the log is how a reader sees
+  whether the reranker ran or was skipped.
+- `AFT_SEARCH_BENCH_SETTLE_SECONDS`: after the index reports ready, wait at
+  least this long and until the semantic entry count is steady. It works
+  around the macOS watcher burst described above: with `30`, a macOS
+  `paged` replay of the unchanged engine reproduced the Linux reference
+  byte-for-byte on all 68 rows.
+
+Before the scored rows, each runner lets the reranker score the tuning-only
+split rows' queries (never scored, and present in the vector packs), so no row
+is measured against a backend that is still loading or on its slow first
+inference. Use a generous `timeout_ms` to measure ranking; with the default
+1.5 s a CPU backend times out under load, and a timed-out list keeps fused
+order.
+
+`run_rerank_probe.py` measures the rest on the same pinned AFT evidence tree
+and vector packs as the real-query replay:
+config-to-installed time and memory on a tiny project, cold and warm
+per-search latency, resident memory and CPU time sampled every 100 ms (also
+for an out-of-process backend with `--extra-pid`), in-process repeat and
+paging consistency, and, with `--proxy-upstream`, the backend stalling,
+answering 503, recovering and being killed. `rerank_score_proxy.py` is the
+loopback adapter it puts in front of `llama-server --reranking` for that.
 
 ## Prefrontal search-miss rows
 

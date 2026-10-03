@@ -20,9 +20,10 @@ import { registerSemanticTool } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
 /**
- * Registration predicates for the Pi/OMP adapter. Each flag is exactly "the
- * canonical name is not in the resolved disabled list"; nothing else (index
- * state, runtime gates) removes a registration.
+ * Registration predicates for the Pi/OMP adapter. Each flag is "the canonical
+ * name is not in the resolved disabled list", except that the bash companions
+ * also need `bash.background`. Nothing else (index state, other runtime gates)
+ * removes a registration.
  */
 export interface PiToolSurface {
   hoistBash: boolean;
@@ -149,10 +150,27 @@ export function piHashlineDowngrade(
       };
 }
 
+/**
+ * The surface with `restrictToProjectRoot` read from `ctx.config` at each
+ * access. Tools capture the surface when they register, and a live config
+ * reload replaces `ctx.config`, so the path restriction follows the file
+ * while the registration flags stay as loaded.
+ */
+export function withLiveRestriction(surface: PiToolSurface, ctx: PluginContext): PiToolSurface {
+  return Object.defineProperty({ ...surface }, "restrictToProjectRoot", {
+    enumerable: true,
+    get: () => ctx.config.restrict_to_project_root ?? false,
+  });
+}
+
 /** Resolve the registration predicates used by Pi's production registration path. */
 export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiToolSurface {
   const disabled = new Set(resolvedDisabledTools(config));
   const ok = (name: string): boolean => !disabled.has(name);
+  // The companions only act on background tasks, so they also need
+  // `bash.background`; `registerBashCompanionTools` applies the same rule.
+  const background = resolveBashConfig(config).background;
+  const companion = (name: string): boolean => background && ok(name);
   const powershellEnabled =
     (pi ? piPowerShellEnabledFromHost(pi) : undefined) ?? resolvePiPowerShellFallback(config);
 
@@ -177,10 +195,10 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
     move: ok("aft_move"),
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
-    bashStatus: ok("bash_status"),
-    bashWatch: ok("bash_watch"),
-    bashWrite: ok("bash_write"),
-    bashKill: ok("bash_kill"),
+    bashStatus: companion("bash_status"),
+    bashWatch: companion("bash_watch"),
+    bashWrite: companion("bash_write"),
+    bashKill: companion("bash_kill"),
   };
 }
 
@@ -231,9 +249,10 @@ export function bindToolRegistrationFunnel(
 export function registerPiToolSurface(
   pi: ExtensionAPI,
   ctx: PluginContext,
-  surface: PiToolSurface,
+  loadedSurface: PiToolSurface,
   harness?: PiHarness,
 ): void {
+  const surface = withLiveRestriction(loadedSurface, ctx);
   const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
   // The bash runtime gate (`bash.enabled`) never removes a registration; the
   // engine answers `bash_disabled` when it is off.

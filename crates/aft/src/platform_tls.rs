@@ -22,3 +22,20 @@ pub(crate) fn client_config() -> Result<ClientConfig, String> {
         })
         .clone()
 }
+
+static BLOCKING_CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+
+/// Share reqwest's blocking runtime across roots. Deadlines belong to requests,
+/// not clients, so one root's budget cannot change another root's connection pool.
+pub(crate) fn blocking_client() -> Result<reqwest::blocking::Client, String> {
+    BLOCKING_CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .use_preconfigured_tls(client_config()?)
+                .build()
+                .map_err(|error| format!("failed to configure HTTP client: {error}"))
+        })
+        .clone()
+}

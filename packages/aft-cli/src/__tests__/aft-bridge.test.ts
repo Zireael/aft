@@ -23,7 +23,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
-import { sendAftRequest, sendAftRequests } from "../lib/aft-bridge.js";
+import { createNdjsonLineSplitter, sendAftRequest, sendAftRequests } from "../lib/aft-bridge.js";
 import { CLI } from "../lib/cli.js";
 
 let workDir: string;
@@ -311,5 +311,36 @@ describe("sendAftRequests — process error handling", () => {
     // first; either way it should be an Error with a useful message.
     expect(caught).not.toBe(null);
     expect(caught?.message.length).toBeGreaterThan(0);
+  });
+});
+
+describe("createNdjsonLineSplitter", () => {
+  // A large response arrives as many pipe chunks before its newline. Each
+  // character is searched for a newline once; rescanning the pending line per
+  // chunk made one multi-megabyte response quadratic in its length.
+  test("a line split across many chunks is scanned once, not once per chunk", () => {
+    const lines: string[] = [];
+    const splitter = createNdjsonLineSplitter((line) => {
+      lines.push(line);
+      return false;
+    });
+    const line = `${JSON.stringify({ id: "a", success: true, body: "x".repeat(4 * 1024 * 1024) })}\n`;
+    const chunkSize = 64 * 1024;
+    for (let offset = 0; offset < line.length; offset += chunkSize) {
+      splitter.push(line.slice(offset, offset + chunkSize));
+    }
+    expect(lines).toEqual([line.trim()]);
+    expect(splitter.scannedChars).toBe(line.length);
+  });
+
+  test("keeps carry-over across single-character chunks and stops when told", () => {
+    const lines: string[] = [];
+    const splitter = createNdjsonLineSplitter((line) => {
+      lines.push(line);
+      return line === "stop";
+    });
+    for (const ch of "  one \r\n\ntw") splitter.push(ch);
+    splitter.push("o\nstop\nafter\n");
+    expect(lines).toEqual(["one", "", "two", "stop"]);
   });
 });

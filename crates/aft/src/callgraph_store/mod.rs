@@ -38,11 +38,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tree_sitter::{Node, Parser};
 
 const SCHEMA_VERSION: i64 = 1;
+/// Highest callgraph generation schema this build reads (and writes).
+pub const STORE_FORMAT_VERSION: u32 = SCHEMA_VERSION as u32;
 const BACKEND_TREESITTER: &str = "treesitter";
 pub(crate) const PROVENANCE_TREESITTER: &str = "treesitter+resolver";
 const PROVENANCE_NAME_MATCH: &str = "name_match";
 const PROVENANCE_TYPE_MATCH: &str = "type_match";
 const PROVENANCE_VALUE_REF: &str = "value_ref";
+/// Ref kind for a call written directly in a `macro_rules!` template; the
+/// macro name is stored in `local_name`. Never resolved into an edge.
+pub(crate) const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
+/// Ref kind for an identifier inside a Rust macro token tree that could not be
+/// parsed as Rust. Never resolved into an edge.
+pub(crate) const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 const NAME_MATCH_SCORE_THRESHOLD: f64 = 2.0;
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
@@ -67,6 +75,7 @@ const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 /// Keep SQLite's per-connection page cache below the staged build working-set
 /// budget; negative values are KiB per SQLite's `cache_size` pragma.
 const CALLGRAPH_SQLITE_CACHE_KIB: i64 = -8 * 1024;
+const CALLGRAPH_STATEMENT_CACHE_CAPACITY: usize = 96;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// A root removed from `cache-keys.json` cannot be reached by a future checkout.
 /// Wait the same seven-day grace period as cache-key eviction before deleting its
@@ -136,6 +145,84 @@ pub(super) fn note_projection_journal_append_for_test() {
 #[cfg(test)]
 pub(crate) fn take_projection_mutation_counts_for_test() -> ProjectionMutationCounts {
     PROJECTION_MUTATION_COUNTS.with(|counts| counts.replace(ProjectionMutationCounts::default()))
+}
+
+/// Work counters for measurement tests: source parses by the store and
+/// resolution-config reads (`package.json`, `tsconfig.json`, `Cargo.toml`).
+/// They are keyed by absolute path because the work runs on build-pool
+/// threads, and tests running in parallel must each count only the files
+/// under their own fixture root.
+#[cfg(test)]
+pub(crate) mod work_counts {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+    fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
+        *map.get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .entry(path.to_path_buf())
+            .or_default() += 1;
+    }
+
+    fn under(
+        map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>,
+        root: &Path,
+        file_name: Option<&str>,
+    ) -> usize {
+        map.get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .filter(|(path, _)| {
+                file_name.is_none_or(|name| path.file_name().is_some_and(|file| file == name))
+            })
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    pub(crate) fn note_parse(path: &Path) {
+        note(&PARSES, path);
+    }
+
+    pub(crate) fn note_config_read(path: &Path) {
+        note(&CONFIG_READS, path);
+    }
+
+    pub(crate) fn parses_under(root: &Path) -> usize {
+        under(&PARSES, root, None)
+    }
+
+    /// Highest parse count of any single file under `root`.
+    pub(crate) fn max_parses_of_one_file_under(root: &Path) -> usize {
+        PARSES
+            .get_or_init(Default::default)
+            .lock()
+            .expect("work counter mutex poisoned")
+            .iter()
+            .filter(|(path, _)| path.starts_with(root))
+            .map(|(_, count)| *count)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn config_reads_under(root: &Path, file_name: Option<&str>) -> usize {
+        under(&CONFIG_READS, root, file_name)
+    }
+
+    pub(crate) fn reset_under(root: &Path) {
+        for map in [&PARSES, &CONFIG_READS] {
+            map.get_or_init(Default::default)
+                .lock()
+                .expect("work counter mutex poisoned")
+                .retain(|path, _| !path.starts_with(root));
+        }
+    }
 }
 
 static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
@@ -469,6 +556,121 @@ mod write_amplification_tests {
     }
 
     #[test]
+    fn callgraph_reader_setup_does_not_read_locked_schema() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("locked.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE meta (k TEXT, v TEXT); BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let reader = open_readonly_connection(&path)
+            .expect("reader setup must not read a schema held by a writer");
+        let error = database_ready(&reader).unwrap_err();
+        assert!(error.is_transient_lock_contention(), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A store built before the latest resolver change carries the previous
+    /// build-output version in its fingerprint. It must not be served (that
+    /// would keep the old resolutions forever); a cold build replaces it and
+    /// stamps the current fingerprint.
+    #[test]
+    fn store_stamped_with_previous_build_output_version_is_rebuilt_not_reused() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fingerprint-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn kept() {}\n").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let source = root.join("src/lib.rs");
+        let dir = root.join(".store");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let published_path =
+            |dir: &Path| resolve_ready_target(dir, &project_key).map(|(path, _generation)| path);
+
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        drop(store);
+        let path = published_path(&dir).expect("control: a current build is published");
+        assert!(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .is_some(),
+            "control: a store with the current fingerprint is served"
+        );
+
+        let previous = schema_fingerprint_for("v10-rust-macro-templates");
+        assert_ne!(previous, schema_fingerprint());
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET v = ?1 WHERE k = 'fingerprint'",
+                params![previous],
+            )
+            .unwrap();
+
+        assert!(
+            !db_path_ready(&path),
+            "an old-fingerprint store is not ready"
+        );
+        assert!(
+            published_path(&dir).is_none(),
+            "no ready generation may be resolved from an old-fingerprint store"
+        );
+        assert!(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .is_none(),
+            "readers must not reuse an old-fingerprint store"
+        );
+        assert!(
+            project_dead_code_snapshot(&path).is_err(),
+            "dead-code projection must refuse an old-fingerprint store"
+        );
+
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        drop(store);
+        let rebuilt = published_path(&dir).expect("the rebuild is published");
+        let fingerprint: String = open_readonly_connection(&rebuilt)
+            .unwrap()
+            .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fingerprint, schema_fingerprint());
+    }
+
+    #[test]
+    fn callgraph_readonly_open_is_retryable_while_legacy_writer_is_locked() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let store_dir = temp.path().join("store");
+        let store = CallGraphStore::open(store_dir.clone(), root.clone()).unwrap();
+        let path = store.sqlite_path.clone();
+        drop(store);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
     fn callgraph_writer_and_reader_use_bounded_normal_pragmas() {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
@@ -500,7 +702,165 @@ mod write_amplification_tests {
         let synchronous: i64 = conn
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .unwrap();
-        assert_eq!(synchronous, 1);
+        assert_eq!(
+            synchronous, 2,
+            "readers retain SQLite's default durability setting"
+        );
+    }
+
+    /// A store whose pointer is published and whose `meta` says ready must be
+    /// readable from that moment on. Here another process holds a read open on
+    /// the just-published generation (a readiness probe, or a second AFT reading
+    /// the shared store) while the builder opens its own writer handle on it.
+    /// When the generation was published in rollback-journal mode, that writer
+    /// had to switch it to WAL under an exclusive lock, waited for the outside
+    /// read to end, and meanwhile SQLite refused every new reader, so queries
+    /// answered "building" for a published, ready store.
+    #[test]
+    fn published_generation_stays_readable_while_its_first_writer_opens_beside_a_held_read() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        fs::write(
+            &source,
+            "export function main() { helper(); }\nfunction helper() {}\n",
+        )
+        .unwrap();
+        let callgraph_dir = temp.path().join("store");
+        fs::create_dir_all(&callgraph_dir).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let lease = acquire_writer_lease(&callgraph_dir, &project_key, &root)
+            .unwrap()
+            .expect("writer lease");
+
+        // Publish exactly as a cold build does, stopping before the builder
+        // opens its own handle on the published generation.
+        let (_stats, generation) = CallGraphStore::cold_build_publish_locked(
+            &callgraph_dir,
+            &root,
+            &project_key,
+            std::slice::from_ref(&source),
+            0,
+            Arc::clone(&lease),
+        )
+        .unwrap();
+        let gen_path = callgraph_dir.join(&generation);
+
+        let outside_reader =
+            Connection::open_with_flags(&gen_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        outside_reader.execute_batch("BEGIN").unwrap();
+        let ready: String = outside_reader
+            .query_row("SELECT v FROM meta WHERE k = 'ready'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ready, "1", "the generation is published and ready");
+
+        let writer = {
+            let callgraph_dir = callgraph_dir.clone();
+            let root = root.clone();
+            let project_key = project_key.clone();
+            let generation = generation.clone();
+            std::thread::spawn(move || {
+                CallGraphStore::open_generation(
+                    &callgraph_dir,
+                    root,
+                    project_key,
+                    generation,
+                    lease,
+                )
+            })
+        };
+        // Read once the writer has either finished opening or started a
+        // rollback-journal write that it cannot commit while the outside read
+        // is open. The bound stays under the writer's five-second busy timeout
+        // so a blocked writer is still blocked when the read happens.
+        let journal = sqlite_file_set_path(&gen_path, "-journal");
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !writer.is_finished() && !journal.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let read = CallGraphStore::open_readonly(callgraph_dir.clone(), root.clone());
+
+        outside_reader.execute_batch("COMMIT").unwrap();
+        let writer_store = writer
+            .join()
+            .expect("writer thread joined")
+            .expect("the builder's writer handle opens");
+        let reader = read
+            .expect("read-only open of the published generation")
+            .expect("a published, ready generation must be readable while its writer opens");
+        assert_eq!(
+            reader.inner.generation.as_deref(),
+            Some(generation.as_str())
+        );
+        drop(writer_store);
+    }
+
+    /// Legacy migrations publish through their own path, and a backup copy is
+    /// written in rollback mode. It must be in WAL mode by the time its pointer
+    /// is published, before any writer opens it, or its first writer locks
+    /// readers out of a published store in the same way a cold build did.
+    #[test]
+    fn migrated_generation_is_published_in_wal_mode() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let callgraph_dir = temp.path().join("store");
+        fs::create_dir_all(&callgraph_dir).unwrap();
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        let lease = acquire_writer_lease(&callgraph_dir, &project_key, &root)
+            .unwrap()
+            .expect("writer lease");
+        let generation = migration_generation_file_name(&project_key, "backup");
+        let temp_path = migration_temp_path(&callgraph_dir, &generation);
+        {
+            let conn = Connection::open(&temp_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta (k TEXT, v TEXT);")
+                .unwrap();
+        }
+        assert_eq!(
+            &fs::read(&temp_path).unwrap()[18..20],
+            &[1, 1],
+            "the migrated copy starts in rollback mode"
+        );
+        let legacy_dir = temp.path().join("legacy");
+        let source = LegacyCallgraphTarget {
+            partition: LegacyCallgraphPartition {
+                harness: "opencode".to_string(),
+                dir: legacy_dir.clone(),
+                key: project_key.clone(),
+                bytes: 1,
+                freshness: None,
+            },
+            sqlite_path: legacy_dir.join("legacy.sqlite"),
+            generation: None,
+            source_bytes: 1,
+            source_blake3: "0".repeat(64),
+        };
+
+        let published = publish_migrated_generation(
+            &callgraph_dir,
+            &project_key,
+            &generation,
+            &temp_path,
+            &source,
+            1,
+            lease,
+            "sqlite_backup",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_pointer(&callgraph_dir, &project_key).as_deref(),
+            Some(published.as_str())
+        );
+        // Bytes 18 and 19 of the SQLite header are the file format write and
+        // read versions: 1 for a rollback journal, 2 for WAL.
+        assert_eq!(
+            &fs::read(callgraph_dir.join(&published)).unwrap()[18..20],
+            &[2, 2],
+            "a published migration generation must already be in WAL mode"
+        );
     }
 
     #[test]
@@ -1018,6 +1378,8 @@ thread_local! {
 }
 
 mod dead_code_projection;
+#[cfg(test)]
+mod perf_tests;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
     project_dead_code_snapshot_from_view, project_dead_code_snapshot_incremental_with_costs,
@@ -1783,6 +2145,57 @@ impl RefreshWorker {
 
 static CALLGRAPH_REFRESH_WORKER: OnceLock<Mutex<Option<Arc<RefreshWorker>>>> = OnceLock::new();
 
+static ISOLATED_REFRESH_TEST_WORKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<RefreshWorker>>>> =
+    OnceLock::new();
+
+/// A fixture-owned worker avoids waiting behind other roots' held test gates.
+#[doc(hidden)]
+pub struct CallgraphRefreshTestWorker {
+    root: PathBuf,
+    worker: Arc<RefreshWorker>,
+}
+
+impl CallgraphRefreshTestWorker {
+    /// Wait on the worker's idle notification, not on a polling cadence.
+    pub fn wait(&self, hang_cap: Duration) -> bool {
+        let queue = self.worker.shared.queue.lock().unwrap();
+        let (queue, _) = self
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, hang_cap, |queue| {
+                queue.active.is_some() || !queue.order.is_empty()
+            })
+            .unwrap();
+        queue.active.is_none() && queue.order.is_empty()
+    }
+}
+
+impl Drop for CallgraphRefreshTestWorker {
+    fn drop(&mut self) {
+        ISOLATED_REFRESH_TEST_WORKERS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.root);
+        let _ = self.worker.shutdown_with_budget(Duration::from_secs(60));
+        clear_callgraph_refresh_worker_test_seam(&self.root);
+    }
+}
+
+#[doc(hidden)]
+pub fn isolated_callgraph_refresh_worker_for_test(root: PathBuf) -> CallgraphRefreshTestWorker {
+    let worker = RefreshWorker::spawn();
+    assert!(ISOLATED_REFRESH_TEST_WORKERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(root.clone(), Arc::clone(&worker))
+        .is_none());
+    CallgraphRefreshTestWorker { root, worker }
+}
+
 pub fn enqueue_callgraph_store_refresh(
     callgraph_dir: PathBuf,
     project_root: PathBuf,
@@ -1851,13 +2264,16 @@ fn enqueue_callgraph_store_refresh_inner(
     if paths.is_empty() {
         return true;
     }
-    let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
-    let worker = {
+    let isolated = ISOLATED_REFRESH_TEST_WORKERS
+        .get()
+        .and_then(|workers| workers.lock().unwrap().get(&project_root).cloned());
+    let worker = isolated.unwrap_or_else(|| {
+        let slot = CALLGRAPH_REFRESH_WORKER.get_or_init(|| Mutex::new(None));
         let mut worker = slot
             .lock()
             .expect("callgraph refresh worker mutex poisoned");
         Arc::clone(worker.get_or_insert_with(RefreshWorker::spawn))
-    };
+    });
     worker.enqueue(
         RefreshRoot {
             callgraph_dir,
@@ -1909,6 +2325,90 @@ pub(crate) fn retire_ignored_refresh_paths(
 
 pub fn flush_callgraph_store_refreshes_on_graceful_shutdown() -> bool {
     flush_callgraph_store_refreshes_with_budget(REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET)
+}
+
+/// How long a graceful exit may take once in-flight requests are drained:
+/// index flushes, then LSP shutdown. The daemon kills a module that takes
+/// longer than 25 s to exit, and a restart waits on this exit, so it is kept
+/// to about 2 s.
+pub const EXIT_BUDGET_AFTER_DRAIN: Duration = Duration::from_secs(2);
+
+/// How long the search-index flush may hold a graceful exit.
+pub const EXIT_SEARCH_INDEX_FLUSH_WAIT: Duration = Duration::from_millis(300);
+
+// The index flushes get what the exit budget leaves after LSP shutdown, and
+// the call-graph flush must still have time after the search-index wait.
+const _: () = assert!(
+    EXIT_SEARCH_INDEX_FLUSH_WAIT.as_millis()
+        + REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET.as_millis()
+        + crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis()
+        < EXIT_BUDGET_AFTER_DRAIN.as_millis(),
+    "the exit budget must cover the index flushes and LSP shutdown"
+);
+
+/// When the index flushes of a graceful exit must be finished, so that LSP
+/// shutdown still fits in the exit budget. `drained_at` is when the process
+/// finished draining its in-flight requests.
+pub fn exit_index_flush_deadline(drained_at: Instant) -> Instant {
+    drained_at + EXIT_BUDGET_AFTER_DRAIN - crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET
+}
+
+/// What happened to queued call-graph refreshes at process exit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitCallgraphFlush {
+    /// Every queued refresh finished and the worker stopped.
+    Drained,
+    /// The worker's own flush budget ran out; unfinished refreshes were
+    /// deferred to the next start.
+    Deferred,
+    /// The flush had not returned by the exit deadline (for example the
+    /// worker was still finishing a refresh or a store checkpoint), so exit
+    /// went ahead without it. The next start rebuilds or refreshes the graph.
+    Abandoned,
+}
+
+impl ExitCallgraphFlush {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drained => "drained",
+            Self::Deferred => "deferred",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+/// Flush queued call-graph refreshes for a graceful exit, waiting no later
+/// than `deadline`. The flush's own budget bounds its wait for the worker,
+/// but not the join of a worker still inside a refresh or checkpoint, so it
+/// runs on its own thread and exit stops waiting for it at the deadline.
+pub fn flush_callgraph_store_refreshes_before(deadline: Instant) -> ExitCallgraphFlush {
+    run_exit_callgraph_flush_before(
+        deadline,
+        flush_callgraph_store_refreshes_on_graceful_shutdown,
+    )
+}
+
+/// [`flush_callgraph_store_refreshes_before`] with the flush supplied, so a
+/// test can hold it open.
+#[doc(hidden)]
+pub fn run_exit_callgraph_flush_before(
+    deadline: Instant,
+    flush: impl FnOnce() -> bool + Send + 'static,
+) -> ExitCallgraphFlush {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("aft-callgraph-exit-flush".to_string())
+        .spawn(move || {
+            let _ = tx.send(flush());
+        });
+    if spawned.is_err() {
+        return ExitCallgraphFlush::Abandoned;
+    }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(true) => ExitCallgraphFlush::Drained,
+        Ok(false) => ExitCallgraphFlush::Deferred,
+        Err(_) => ExitCallgraphFlush::Abandoned,
+    }
 }
 
 #[doc(hidden)]
@@ -1971,6 +2471,9 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
         };
 
         let store = process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes);
+        let root = batch.root.clone();
+        // Release catch-up tickets before publishing idle to event waiters.
+        drop(batch);
 
         let mut queue = shared
             .queue
@@ -1982,14 +2485,12 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
         drop(queue);
 
         if became_idle {
-            let checkpoint_due = idle_checkpoint_due(
-                last_idle_checkpoints.get(&batch.root).copied(),
-                Instant::now(),
-            );
+            let checkpoint_due =
+                idle_checkpoint_due(last_idle_checkpoints.get(&root).copied(), Instant::now());
             if checkpoint_due {
                 if let Some(store) = store {
                     if store.checkpoint_wal_truncate() {
-                        last_idle_checkpoints.insert(batch.root.clone(), Instant::now());
+                        last_idle_checkpoints.insert(root.clone(), Instant::now());
                     }
                 }
             }
@@ -2058,7 +2559,8 @@ fn process_callgraph_refresh_batch(
         // The gate is deliberately after open_ready so tests can hold a failed
         // open between its result and the defer that parks the batch.
         let _ = gate.held_tx.send(());
-        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+        // Dropping the fixture's release sender also unblocks a panicking test.
+        let _ = gate.release_rx.recv();
     }
     let store = match opened {
         Ok(Some(store)) => store,
@@ -2350,6 +2852,10 @@ pub struct CallGraphStore {
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
     write_metrics: Arc<CallgraphWriteMetrics>,
+    /// Held by each multi-step writer (refresh, stale marking, cold build) for
+    /// its whole run, outside `conn`, so a refresh can release `conn` while it
+    /// parses files without another write landing in between.
+    writer_serial: Mutex<()>,
     conn: Mutex<TrackedConnection>,
 }
 
@@ -2357,6 +2863,7 @@ pub struct CallGraphStore {
 pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
     _view_pin: Option<Arc<crate::pins::QueryPin>>,
+    _generation_pin: Option<Arc<crate::views::snapshot::OpenGeneration>>,
 }
 
 pub trait CallGraphRead {
@@ -2368,6 +2875,12 @@ pub trait CallGraphRead {
     fn indexed_file_count(&self) -> Result<usize>;
     fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode>;
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>>;
+    /// `nodes_for` for a file path this store returned (store-relative and
+    /// already resolved), without resolving it against the filesystem again.
+    /// Graph walks call this once per visited node.
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.nodes_for(Path::new(file), symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>>;
     fn direct_callers_of(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreCallSite>>;
     fn direct_callers_for_symbols(
@@ -2397,6 +2910,19 @@ pub trait CallGraphRead {
     fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>>;
+    /// Raw ref rows of `kind` whose short name is `short_name`, resolved or
+    /// not, at most `limit` of them in file and line order. `callers` uses it
+    /// to find macro invocations and macro facts by name. Stores that keep no
+    /// such rows answer with none.
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        let _ = (kind, short_name, limit);
+        Ok(Vec::new())
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -2700,6 +3226,7 @@ impl StoreCallSite {
     pub fn supplemental_resolution(&self) -> Option<&str> {
         match self.provenance.as_str() {
             PROVENANCE_NAME_MATCH | PROVENANCE_TYPE_MATCH => Some(self.provenance.as_str()),
+            "dispatch" => Some("possible_target (dispatch)"),
             _ => None,
         }
     }
@@ -2713,6 +3240,17 @@ pub struct StoreUnresolvedCall {
     pub line: u32,
     pub byte_start: usize,
     pub byte_end: usize,
+}
+
+/// One raw ref row located by name; see `CallGraphRead::ref_sites_named`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRefSite {
+    pub file: String,
+    /// Scoped name of the symbol containing the ref, when it has a node.
+    pub caller_symbol: Option<String>,
+    pub line: u32,
+    /// For macro-template call refs, the macro (`name!`) making the call.
+    pub local_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3142,7 +3680,8 @@ impl ResolverIndex for ProjectIndex<'_> {
 /// staging to `resolving`. Resolution replaces `refs` rows only to add status,
 /// target, and provenance outputs, and inserts `edges`; `DbFileIndex` reads none
 /// of those output columns. Its inputs therefore stay immutable for an instance,
-/// so the memo needs no generation key or slice-fence invalidation.
+/// so the memo needs no generation key or slice-fence invalidation. For the
+/// same reason one `DiskIndexMemos` serves every caller file of the pass.
 struct DiskProjectIndex<'a> {
     project_root: &'a Path,
     conn: &'a Connection,
@@ -3150,22 +3689,35 @@ struct DiskProjectIndex<'a> {
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
     module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
-    file_index_memo: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
-    module_parent_memo: RefCell<HashMap<String, Option<(String, String)>>>,
+    memos: &'a DiskIndexMemos,
     memoize_resolver_indexes: bool,
+}
+
+/// Resolver lookups shared by every caller file of one cold-build resolution
+/// pass. Before this was per caller file, each caller reloaded the same target
+/// indexes and rescanned every module reference and Rust file.
+#[derive(Default)]
+struct DiskIndexMemos {
+    file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    /// Target file -> first `(declaring file, module path)` naming it, in
+    /// `(caller_file, module_path)` order, built by one scan of the module
+    /// references on first use.
+    module_parents: RefCell<Option<Rc<HashMap<String, (String, String)>>>>,
+    /// Every stored Rust file, in path order.
+    rust_files: RefCell<Option<Rc<Vec<String>>>>,
 }
 
 impl DiskProjectIndex<'_> {
     fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
         if self.memoize_resolver_indexes {
-            if let Some(cached) = self.file_index_memo.borrow().get(rel_path).cloned() {
+            if let Some(cached) = self.memos.file_indexes.borrow().get(rel_path).cloned() {
                 return cached;
             }
         }
 
         let loaded = self.load_file_index(rel_path).map(Rc::new);
         if self.memoize_resolver_indexes {
-            let mut memo = self.file_index_memo.borrow_mut();
+            let mut memo = self.memos.file_indexes.borrow_mut();
             if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
                 // Keep the active caller's index hot even when an unusually broad
                 // resolution walk exhausts the bounded target-file memo.
@@ -3183,17 +3735,15 @@ impl DiskProjectIndex<'_> {
     fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
         let lang: String = self
             .conn
-            .query_row(
-                "SELECT lang FROM files WHERE path = ?1",
-                params![rel_path],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT lang FROM files WHERE path = ?1")
+            .ok()?
+            .query_row(params![rel_path], |row| row.get(0))
             .optional()
             .ok()??;
         let mut index = DbFileIndex::empty(lang_from_label(&lang));
         let mut nodes = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, name, scoped_name, kind, exported, is_default_export
                  FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
             )
@@ -3219,7 +3769,7 @@ impl DiskProjectIndex<'_> {
 
         let mut refs = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
                   FROM refs
                   WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')
@@ -3260,26 +3810,61 @@ impl DiskProjectIndex<'_> {
         Some(index)
     }
 
+    fn module_refs(&self) -> Vec<(String, String)> {
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT caller_file, module_path FROM refs
+             WHERE kind = 'module' AND module_path IS NOT NULL
+             ORDER BY caller_file, module_path",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
     fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT caller_file, module_path FROM refs
-                 WHERE kind = 'module' AND module_path IS NOT NULL
-                 ORDER BY caller_file, module_path",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()?;
-        for row in rows.flatten() {
-            if self.module_target(&row.0, &row.1).as_deref() == Some(target_file) {
-                return Some(row);
+        self.module_refs()
+            .into_iter()
+            .find(|row| self.module_target(&row.0, &row.1).as_deref() == Some(target_file))
+    }
+
+    /// Every module reference's target, first declaration winning, so each
+    /// later lookup is one map probe instead of a scan of every module row.
+    fn module_parents(&self) -> Rc<HashMap<String, (String, String)>> {
+        if let Some(parents) = self.memos.module_parents.borrow().as_ref() {
+            return Rc::clone(parents);
+        }
+        let mut parents = HashMap::new();
+        for row in self.module_refs() {
+            if let Some(target) = self.module_target(&row.0, &row.1) {
+                parents.entry(target).or_insert(row);
             }
         }
-        None
+        let parents = Rc::new(parents);
+        *self.memos.module_parents.borrow_mut() = Some(Rc::clone(&parents));
+        parents
+    }
+
+    fn rust_files(&self) -> Rc<Vec<String>> {
+        if let Some(files) = self.memos.rust_files.borrow().as_ref() {
+            return Rc::clone(files);
+        }
+        let files = self
+            .conn
+            .prepare_cached("SELECT path FROM files WHERE lang = 'rust' ORDER BY path")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default();
+        let files = Rc::new(files);
+        *self.memos.rust_files.borrow_mut() = Some(Rc::clone(&files));
+        files
     }
 }
 
@@ -3299,20 +3884,9 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
         if self.memoize_resolver_indexes {
-            if let Some(cached) = self.module_parent_memo.borrow().get(target_file).cloned() {
-                return cached;
-            }
+            return self.module_parents().get(target_file).cloned();
         }
-
-        let parent = self.load_module_parent(target_file);
-        if self.memoize_resolver_indexes {
-            let mut memo = self.module_parent_memo.borrow_mut();
-            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
-                memo.clear();
-            }
-            memo.insert(target_file.to_string(), parent.clone());
-        }
-        parent
+        self.load_module_parent(target_file)
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -3354,12 +3928,9 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn contains_file(&self, file: &str) -> bool {
         self.conn
-            .query_row(
-                "SELECT 1 FROM files WHERE path = ?1 LIMIT 1",
-                params![file],
-                |_| Ok(()),
-            )
-            .is_ok()
+            .prepare_cached("SELECT 1 FROM files WHERE path = ?1 LIMIT 1")
+            .and_then(|mut statement| statement.exists(params![file]))
+            .unwrap_or(false)
     }
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
@@ -3418,9 +3989,20 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         if let Some(target) = check(caller_file.to_string()) {
             return Some(target);
         }
+        if self.memoize_resolver_indexes {
+            // One path-ordered list for the whole pass instead of a scan of
+            // the files table per qualified call.
+            return self
+                .rust_files()
+                .iter()
+                .filter(|path| path.as_str() != caller_file)
+                .find_map(|path| check(path.clone()));
+        }
         let mut statement = self
             .conn
-            .prepare("SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path")
+            .prepare_cached(
+                "SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path",
+            )
             .ok()?;
         let rows = statement
             .query_map(params![caller_file], |row| row.get::<_, String>(0))
@@ -3454,6 +4036,7 @@ impl CallGraphStore {
                 "writer capability denied; use the read-only callgraph opener".to_string(),
             ));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
@@ -3488,6 +4071,10 @@ impl CallGraphStore {
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
         let project_key = crate::search_index::artifact_cache_key(&project_root);
+        // A generation written by a newer build is refused by name rather than
+        // reported as not built (which would send callers to a cold build) or
+        // served from an older legacy partition.
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         if let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         {
             let conn = open_readonly_connection(&sqlite_path)?;
@@ -3578,6 +4165,7 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         let Some((sqlite_path, generation)) = resolve_ready_target(&callgraph_dir, &project_key)
         else {
             return Ok(None);
@@ -3669,6 +4257,7 @@ impl CallGraphStore {
                 "{operation} could not acquire writer capability"
             )));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
@@ -3709,6 +4298,7 @@ impl CallGraphStore {
                 "callgraph ensure could not acquire writer capability".to_string(),
             ));
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
@@ -3795,6 +4385,7 @@ impl CallGraphStore {
         else {
             return Ok(None);
         };
+        refuse_newer_published_format(&callgraph_dir, &project_key)?;
         std::fs::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
 
@@ -3852,6 +4443,7 @@ impl CallGraphStore {
         chunk_size: usize,
         writer_lease: Arc<crate::root_cache::WriterLease>,
     ) -> Result<(ColdBuildStats, String)> {
+        refuse_newer_published_format(callgraph_dir, project_key)?;
         if let Some((previous_root, remaining)) =
             rebuild_cooldown_denial(callgraph_dir, project_key, project_root, Instant::now())
         {
@@ -3986,6 +4578,11 @@ impl CallGraphStore {
             drop(_files);
 
             notify_cold_build_swap_observer(&temp_path, &gen_path);
+
+            // No pointer names the new file yet, so nothing else has it open:
+            // this is the one moment its journal mode can change without
+            // locking out readers of a published store.
+            switch_generation_to_wal_before_publication(&gen_path);
 
             // Atomically publish the new generation, then best-effort GC old ones.
             verify_writer_lease(&writer_lease)?;
@@ -4223,6 +4820,10 @@ impl CallGraphStore {
         read_marker: Option<crate::root_cache::ReadMarker>,
         conn: TrackedConnection,
     ) -> Self {
+        // Builds, refreshes and graph walks reuse a few dozen distinct
+        // statements per row or node; above rusqlite's default of 16 cached
+        // statements they would evict each other and be compiled again.
+        conn.set_prepared_statement_cache_capacity(CALLGRAPH_STATEMENT_CACHE_CAPACITY);
         let write_metrics = callgraph_write_metrics_for_key(&project_key);
         Self {
             project_root,
@@ -4236,6 +4837,7 @@ impl CallGraphStore {
             read_marker,
             database_ready: AtomicBool::new(false),
             write_metrics,
+            writer_serial: Mutex::new(()),
             conn: Mutex::new(conn),
         }
     }
@@ -4411,7 +5013,7 @@ impl CallGraphStore {
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
         {
-            let mut insert = tx.prepare(
+            let mut insert = tx.prepare_cached(
                 "INSERT OR REPLACE INTO staging_file_inventory(path, size) VALUES(?1, ?2)",
             )?;
             for (path, size) in batch {
@@ -4485,6 +5087,16 @@ impl CallGraphStore {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
+        // One parse pool, one module-resolution memo for the parallel parses,
+        // and the resolver inputs of every file parsed by this process, all
+        // shared by both passes so no file is parsed twice when it fits.
+        let pool = BuildPool::new();
+        let extraction_memo = callgraph::ModuleResolutionMemo::default();
+        let mut retained_callers = RetainedCallerData::new(retained_caller_budget());
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
@@ -4561,7 +5173,11 @@ impl CallGraphStore {
                 }
 
                 notify_cold_build_extract_observer(&needs_extract);
-                let build = build_extracts_parallel(&self.project_root, &needs_extract);
+                let build =
+                    pool.build_extracts(&self.project_root, &needs_extract, &extraction_memo);
+                for extract in &build.extracts {
+                    retained_callers.retain(&extract.rel_path, &extract.data);
+                }
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
                 let tx = conn.transaction()?;
@@ -4648,6 +5264,9 @@ impl CallGraphStore {
 
         note_cold_build_phase("resolution");
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        // Resolver lookups are shared by every caller and window: their inputs
+        // are final once extraction ends (see `DiskProjectIndex`).
+        let index_memos = DiskIndexMemos::default();
         let total_refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
         let mut resolved_refs =
             query_count(&conn, "SELECT COUNT(*) FROM refs WHERE status <> 'staged'")? as usize;
@@ -4658,6 +5277,21 @@ impl CallGraphStore {
             let Some(last_rowid) = staged.last().map(|entry| entry.rowid) else {
                 break;
             };
+
+            // Callers this process did not extract (a resumed build, or past
+            // the retention budget) are parsed here, in parallel and before
+            // the write transaction opens.
+            let mut missing = BTreeSet::new();
+            for entry in &staged {
+                if !retained_callers.contains(&entry.raw.caller_file) {
+                    missing.insert(entry.raw.caller_file.clone());
+                }
+            }
+            let parsed_callers = pool.resolution_caller_data(
+                &self.project_root,
+                missing.into_iter().collect(),
+                &extraction_memo,
+            );
 
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
@@ -4672,20 +5306,18 @@ impl CallGraphStore {
                         .position(|entry| entry.raw.caller_file != caller_file)
                         .map(|relative| offset + relative)
                         .unwrap_or(staged.len());
-                    let caller_extract = build_file_extract(
-                        &self.project_root,
-                        &self.project_root.join(&caller_file),
-                    );
-                    if let Ok(caller_extract) = caller_extract {
+                    let caller_data = retained_callers
+                        .get(&caller_file)
+                        .or_else(|| parsed_callers.get(&caller_file));
+                    if let Some(caller_data) = caller_data {
                         let index = DiskProjectIndex {
                             project_root: &self.project_root,
                             conn: &tx,
                             caller_file: &caller_file,
-                            caller_data: &caller_extract.data,
+                            caller_data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
                             module_resolution_memo,
-                            file_index_memo: RefCell::new(HashMap::new()),
-                            module_parent_memo: RefCell::new(HashMap::new()),
+                            memos: &index_memos,
                             memoize_resolver_indexes,
                         };
                         for staged_ref in &staged[offset..end] {
@@ -4771,9 +5403,21 @@ impl CallGraphStore {
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
-        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        // Writers on this store take `writer_serial` for their whole run, so
+        // the connection lock can be released while files are parsed: readers
+        // of the store are not blocked by the parse, and no other write can
+        // change what this refresh read before the parse.
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         let total_changes_before = conn.total_changes();
+        // One module memo and one parse pool for every file this refresh
+        // parses and every import it checks.
+        let memo = callgraph::ModuleResolutionMemo::default();
+        let pool = BuildPool::new();
         let mut changed = Vec::new();
         let mut surface_changed = BTreeSet::new();
         let mut deleted = BTreeSet::new();
@@ -4817,7 +5461,8 @@ impl CallGraphStore {
                     ExportSurface::stored(&conn, &rel_path)?
                         .changed_names(&ExportSurface::default()),
                 ));
-                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                let dependent_refs =
+                    ref_ids_depending_on(&conn, &self.project_root, &rel_path, None, &memo)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
@@ -4837,6 +5482,8 @@ impl CallGraphStore {
             // extracted below resolve their imports against that cache.
             callgraph::clear_workspace_package_cache_under(&self.project_root);
         }
+        // Inputs whose content changed, in input order, for the parallel parse.
+        let mut to_parse: Vec<(PathBuf, String, Option<FileRow>)> = Vec::new();
         for input in changed_files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
@@ -4862,7 +5509,7 @@ impl CallGraphStore {
                             .changed_names(&ExportSurface::default()),
                     ));
                     let dependent_refs =
-                        ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                        ref_ids_depending_on(&conn, &self.project_root, &rel_path, None, &memo)?;
                     profile.dependency_selection += started.elapsed();
                     record_dependent_refs(
                         &mut selected_ref_ids,
@@ -4906,8 +5553,13 @@ impl CallGraphStore {
                                 ExportSurface::stored(&conn, &rel_path)?
                                     .changed_names(&ExportSurface::default()),
                             ));
-                            let dependent_refs =
-                                ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                            let dependent_refs = ref_ids_depending_on(
+                                &conn,
+                                &self.project_root,
+                                &rel_path,
+                                None,
+                                &memo,
+                            )?;
                             profile.dependency_selection += started.elapsed();
                             record_dependent_refs(
                                 &mut selected_ref_ids,
@@ -4920,9 +5572,23 @@ impl CallGraphStore {
                     FreshnessVerdict::Stale => {}
                 }
             }
+            to_parse.push((abs_path, rel_path, old_row));
+        }
 
-            let started = Instant::now();
-            let extract = match build_file_extract(&self.project_root, &abs_path) {
+        // Parse the changed inputs with the connection released.
+        drop(conn);
+        let started = Instant::now();
+        let parse_paths = to_parse
+            .iter()
+            .map(|(abs_path, _, _)| abs_path.clone())
+            .collect::<Vec<_>>();
+        note_refresh_parse_for_test(&self.project_root);
+        let parsed = pool.parse_files(&self.project_root, &parse_paths, &memo);
+        profile.parse += started.elapsed();
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+
+        for ((abs_path, rel_path, old_row), extract) in to_parse.into_iter().zip(parsed) {
+            let extract = match extract {
                 Ok(extract) => extract,
                 // One file that is not UTF-8 must not fail the whole batch.
                 // A failed batch is marked stale, every later refresh retries
@@ -4930,7 +5596,6 @@ impl CallGraphStore {
                 // unavailable for good. The file is left out of the graph and
                 // recorded as undecodable instead.
                 Err(error) if is_undecodable_source(&error) => {
-                    profile.parse += started.elapsed();
                     log_undecodable_source(&self.project_root, &rel_path);
                     if old_row.is_some() && deleted.insert(rel_path.clone()) {
                         // Its stored rows describe bytes that are gone. Drop
@@ -4942,8 +5607,13 @@ impl CallGraphStore {
                             ExportSurface::stored(&conn, &rel_path)?
                                 .changed_names(&ExportSurface::default()),
                         ));
-                        let dependent_refs =
-                            ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                        let dependent_refs = ref_ids_depending_on(
+                            &conn,
+                            &self.project_root,
+                            &rel_path,
+                            None,
+                            &memo,
+                        )?;
                         profile.dependency_selection += started.elapsed();
                         record_dependent_refs(
                             &mut selected_ref_ids,
@@ -4959,7 +5629,6 @@ impl CallGraphStore {
                 }
                 Err(error) => return Err(error),
             };
-            profile.parse += started.elapsed();
             let surface_is_changed = old_row
                 .as_ref()
                 .map(|row| row.surface_fingerprint != extract.surface_fingerprint)
@@ -4979,7 +5648,20 @@ impl CallGraphStore {
                     rel_path.clone(),
                     stored_surface.changed_names(&ExportSurface::from_extract(&extract)),
                 ));
-                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                // Only refs whose binding the change can move are selected:
+                // see `dependency_change`.
+                let change = if old_row.is_some() {
+                    dependency_change(&conn, &rel_path, &extract)?
+                } else {
+                    None
+                };
+                let dependent_refs = ref_ids_depending_on(
+                    &conn,
+                    &self.project_root,
+                    &rel_path,
+                    change.as_ref(),
+                    &memo,
+                )?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
@@ -5032,7 +5714,7 @@ impl CallGraphStore {
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
-                    ref_ids_depending_on(&conn, &self.project_root, &barrel)?,
+                    ref_ids_depending_on(&conn, &self.project_root, &barrel, None, &memo)?,
                 );
                 surface_changes.push((barrel, None));
             }
@@ -5046,7 +5728,7 @@ impl CallGraphStore {
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
-                    caller_refs_depending_on(&conn, &self.project_root, importer, file)?,
+                    caller_refs_depending_on(&conn, &self.project_root, importer, file, &memo)?,
                 );
             }
         }
@@ -5060,6 +5742,7 @@ impl CallGraphStore {
                     &file,
                     changed_names,
                     &created_reexporters,
+                    &memo,
                 )?,
             );
         }
@@ -5070,30 +5753,47 @@ impl CallGraphStore {
             selected_refs_by_caller.keys().cloned().collect();
         touched_callers.extend(candidate_own_refresh.iter().cloned());
 
-        let mut caller_extracts: HashMap<String, FileExtract> = HashMap::new();
+        // Dependents are parsed in parallel with the connection released, then
+        // taken in caller order so the first failure is the one reported.
+        let mut dependents = Vec::new();
         for rel_path in &touched_callers {
-            if deleted.contains(rel_path) {
-                continue;
-            }
-            if let Some(extract) = changed_extracts.get(rel_path) {
-                caller_extracts.insert(rel_path.clone(), extract.clone());
+            if deleted.contains(rel_path) || changed_extracts.contains_key(rel_path) {
                 continue;
             }
             let abs_path = self.project_root.join(rel_path);
             if abs_path.exists() {
-                let started = Instant::now();
-                let extract = match build_file_extract(&self.project_root, &abs_path) {
-                    Ok(extract) => extract,
-                    // A dependent that no longer decodes keeps its stored
-                    // rows until its own change event refreshes it.
-                    Err(error) if is_undecodable_source(&error) => {
-                        log_undecodable_source(&self.project_root, rel_path);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                profile.dependent_parse += started.elapsed();
-                caller_extracts.insert(rel_path.clone(), extract);
+                dependents.push((rel_path.clone(), abs_path));
+            }
+        }
+        drop(conn);
+        let started = Instant::now();
+        let dependent_paths = dependents
+            .iter()
+            .map(|(_, abs_path)| abs_path.clone())
+            .collect::<Vec<_>>();
+        let parsed_dependents = pool.parse_files(&self.project_root, &dependent_paths, &memo);
+        profile.dependent_parse += started.elapsed();
+        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+
+        let mut caller_extracts: HashMap<String, FileExtract> = HashMap::new();
+        for rel_path in &touched_callers {
+            if let Some(extract) = changed_extracts.get(rel_path) {
+                if !deleted.contains(rel_path) {
+                    caller_extracts.insert(rel_path.clone(), extract.clone());
+                }
+            }
+        }
+        for ((rel_path, _), extract) in dependents.into_iter().zip(parsed_dependents) {
+            match extract {
+                Ok(extract) => {
+                    caller_extracts.insert(rel_path, extract);
+                }
+                // A dependent that no longer decodes keeps its stored
+                // rows until its own change event refreshes it.
+                Err(error) if is_undecodable_source(&error) => {
+                    log_undecodable_source(&self.project_root, &rel_path);
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -5392,6 +6092,10 @@ impl CallGraphStore {
 
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
         self.verify_writer_lease()?;
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
@@ -5476,6 +6180,23 @@ impl CallGraphStore {
         indexed_file_count(&conn)
     }
 
+    /// Size and content hash of every stored file, keyed by root-relative
+    /// path with `/` separators: the source snapshot the graph describes.
+    /// Files over the hash size cap, or whose stored hash does not parse,
+    /// carry the zero hash, so only their size is known.
+    pub fn file_identities(&self) -> Result<HashMap<String, (u64, blake3::Hash)>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        Ok(stored_file_identities(&conn)?
+            .into_iter()
+            .map(|(path, (size, hash))| {
+                let hash = hash_from_hex(&hash).unwrap_or_else(cache_freshness::zero_hash);
+                (path, (size, hash))
+            })
+            .collect())
+    }
+
     /// Compare the stored per-file size and content hash with the files on
     /// disk, for when watcher events were lost. At most `max_examined` walked
     /// files are compared; the bound is applied to the walk itself, so a huge
@@ -5514,6 +6235,15 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
         nodes_for_file_matching_symbol(&conn, &rel_path, symbol)
+    }
+
+    /// [`CallGraphRead::nodes_for_stored`]: `file` is a path the store
+    /// returned, so it is used as the key without a filesystem lookup.
+    pub fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        nodes_for_file_matching_symbol(&conn, file, symbol)
     }
 
     /// Return all positional nodes matching a symbol query anywhere in the store.
@@ -5682,17 +6412,48 @@ impl CallGraphStore {
         unresolved_calls_for_node(&conn, node)
     }
 
+    pub fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        ref_sites_named(&conn, kind, short_name, limit)
+    }
+
     pub fn call_tree(
         &self,
         file_rel: &Path,
         symbol: &str,
         max_depth: usize,
     ) -> Result<callgraph::CallTreeNode> {
-        let node = self.node_for(file_rel, symbol)?;
+        self.refresh_read_marker()?;
+        let abs_path = normalize_file_path(&self.project_root, file_rel)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
+        let mut visited = HashSet::new();
+        let mut remaining = callgraph::CALL_TREE_NODE_BUDGET;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
-        let mut visited = HashSet::new();
-        call_tree_inner(&conn, &node, max_depth, 0, &mut visited)
+        let node = resolve_node_for_rel(&conn, &rel_path, symbol)?;
+        let mut tree = call_tree_inner(
+            &conn,
+            &node,
+            max_depth.min(100),
+            0,
+            &mut visited,
+            &mut remaining,
+        )?;
+        if remaining == 0 && tree.truncated > 0 {
+            tree.work_gap = Some(callgraph::CallTreeWorkGap {
+                complete: false,
+                nodes_examined: callgraph::CALL_TREE_NODE_BUDGET,
+                gap: callgraph::CALL_TREE_WORK_GAP.into(),
+            });
+        }
+        Ok(tree)
     }
 
     pub fn trace_to(
@@ -5923,6 +6684,38 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    /// Open only the selected derived database, without legacy fallback. The
+    /// caller must retain the pinned generation for the lifetime of this reader.
+    pub(crate) fn open_pinned_derived(
+        project_root: PathBuf,
+        family: String,
+        view_dir: PathBuf,
+        generation: &str,
+    ) -> Result<Self> {
+        let sqlite_path = crate::views::resolve_derived_path(&view_dir, generation)
+            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
+        let conn = open_readonly_connection(&sqlite_path)?;
+        ensure_database_ready(&conn)?;
+        let mut inner = CallGraphStore::from_connection(
+            project_root,
+            family,
+            sqlite_path,
+            view_dir,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        );
+        inner.manifest_view = true;
+        inner.database_ready.store(true, AtomicOrdering::Release);
+        Ok(Self {
+            inner,
+            _view_pin: None,
+            _generation_pin: None,
+        })
+    }
+
     pub(crate) fn open_manifest_view(
         project_root: PathBuf,
         family: String,
@@ -5957,7 +6750,37 @@ impl ReadonlyCallGraphStore {
         Ok(Self {
             inner,
             _view_pin: pin,
+            _generation_pin: None,
         })
+    }
+
+    pub(crate) fn retain_generation(
+        mut self,
+        generation: Arc<crate::views::snapshot::OpenGeneration>,
+    ) -> Self {
+        self._generation_pin = Some(generation);
+        self
+    }
+
+    pub fn dispatch_site_counts(
+        &self,
+    ) -> Result<Option<BTreeMap<String, crate::views::materialization::dispatch::SiteCounts>>> {
+        let connection = self
+            .inner
+            .conn
+            .lock()
+            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='view_dispatch_sites')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(Some(crate::views::materialization::dispatch::counts(
+            &connection,
+        )?))
     }
 
     pub fn reader_kind(&self) -> &'static str {
@@ -5972,6 +6795,7 @@ impl ReadonlyCallGraphStore {
         Self {
             inner,
             _view_pin: None,
+            _generation_pin: None,
         }
     }
 
@@ -6035,6 +6859,12 @@ impl ReadonlyCallGraphStore {
 
     pub fn indexed_file_count(&self) -> Result<usize> {
         self.inner.indexed_file_count()
+    }
+
+    /// This reader's stored file identities; see
+    /// [`CallGraphStore::file_identities`].
+    pub fn file_identities(&self) -> Result<HashMap<String, (u64, blake3::Hash)>> {
+        self.inner.file_identities()
     }
 
     /// Compare this reader's stored files with the disk; see
@@ -6110,6 +6940,15 @@ impl ReadonlyCallGraphStore {
         self.inner.unresolved_calls_of(node)
     }
 
+    pub fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.inner.ref_sites_named(kind, short_name, limit)
+    }
+
     pub fn call_tree(
         &self,
         file_rel: &Path,
@@ -6173,6 +7012,9 @@ impl CallGraphRead for CallGraphStore {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         CallGraphStore::nodes_for(self, file_rel, symbol)
     }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        CallGraphStore::nodes_for_stored(self, file, symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         CallGraphStore::nodes_matching(self, symbol)
     }
@@ -6216,6 +7058,14 @@ impl CallGraphRead for CallGraphStore {
     }
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         CallGraphStore::unresolved_calls_of(self, node)
+    }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        CallGraphStore::ref_sites_named(self, kind, short_name, limit)
     }
     fn call_tree(
         &self,
@@ -6273,6 +7123,9 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         (**self).nodes_for(file_rel, symbol)
     }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        (**self).nodes_for_stored(file, symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         (**self).nodes_matching(symbol)
     }
@@ -6316,6 +7169,14 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         (**self).unresolved_calls_of(node)
+    }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        (**self).ref_sites_named(kind, short_name, limit)
     }
     fn call_tree(
         &self,
@@ -6373,6 +7234,9 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     fn nodes_for(&self, file_rel: &Path, symbol: &str) -> Result<Vec<StoreNode>> {
         self.nodes_for(file_rel, symbol)
     }
+    fn nodes_for_stored(&self, file: &str, symbol: &str) -> Result<Vec<StoreNode>> {
+        self.inner.nodes_for_stored(file, symbol)
+    }
     fn nodes_matching(&self, symbol: &str) -> Result<Vec<StoreNode>> {
         self.nodes_matching(symbol)
     }
@@ -6417,6 +7281,14 @@ impl CallGraphRead for ReadonlyCallGraphStore {
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         self.unresolved_calls_of(node)
     }
+    fn ref_sites_named(
+        &self,
+        kind: &str,
+        short_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoreRefSite>> {
+        ReadonlyCallGraphStore::ref_sites_named(self, kind, short_name, limit)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -6455,7 +7327,7 @@ fn indexed_file_count(conn: &Connection) -> Result<usize> {
 
 /// Size and hex content hash of every stored file, keyed by relative path.
 fn stored_file_identities(conn: &Connection) -> Result<HashMap<String, (u64, String)>> {
-    let mut statement = conn.prepare("SELECT path, size, content_hash FROM files")?;
+    let mut statement = conn.prepare_cached("SELECT path, size, content_hash FROM files")?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -6576,7 +7448,7 @@ fn nodes_for_file_matching_symbol(
          WHERE n.file_path = ?1 AND (n.scoped_name = ?2 OR n.name = ?2)
          ORDER BY n.scoped_name, n.start_line, n.start_col"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![rel_path, symbol], store_node_from_row)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -6597,7 +7469,7 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
          WHERE n.scoped_name = ?1 OR n.name = ?1
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col"
     };
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![symbol], store_node_from_row)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -6769,7 +7641,7 @@ fn direct_callers_for_tuple(
     target_file: &str,
     target_symbol: &str,
 ) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
                 src.id, src.file_path, src.scoped_name, src.name, src.kind, src.start_line,
@@ -7030,7 +7902,15 @@ fn nodes_for_symbol_tuples(
 }
 
 fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    outgoing_calls_for_node_limited(conn, node, usize::MAX)
+}
+
+fn outgoing_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreCallSite>> {
+    let mut stmt = conn.prepare_cached(
         "SELECT e.target_file, e.target_symbol, e.line,
                 r.byte_start, r.byte_end, r.status, e.provenance,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
@@ -7041,28 +7921,31 @@ fn outgoing_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<St
          LEFT JOIN (nodes tgt JOIN files tgt_file ON tgt_file.path = tgt.file_path)
              ON tgt.id = e.target_node
          WHERE e.kind = 'call' AND e.source_node = ?1
-         ORDER BY r.byte_start, r.line, r.ref_id",
+          ORDER BY r.byte_start, r.line, r.ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id], |row| {
-        let target = optional_store_node_from_row_at(row, 7)?;
-        Ok(StoreCallSite {
-            caller: node.clone(),
-            target_file: row.get(0)?,
-            target_symbol: row.get(1)?,
-            target,
-            line: row.get::<_, i64>(2)?.max(0) as u32,
-            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
-            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
-            resolved: row.get::<_, String>(5)? == "resolved",
-            provenance: row.get(6)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            let target = optional_store_node_from_row_at(row, 7)?;
+            Ok(StoreCallSite {
+                caller: node.clone(),
+                target_file: row.get(0)?,
+                target_symbol: row.get(1)?,
+                target,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+                resolved: row.get::<_, String>(5)? == "resolved",
+                provenance: row.get(6)?,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
 fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreCallSite>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT r.target_file, r.target_symbol, r.line,
                 r.byte_start, r.byte_end, r.status, r.provenance,
                 tgt.id, tgt.file_path, tgt.scoped_name, tgt.name, tgt.kind, tgt.start_line,
@@ -7108,11 +7991,50 @@ fn resolved_self_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<V
         .map_err(Into::into)
 }
 
+fn ref_sites_named(
+    conn: &Connection,
+    kind: &str,
+    short_name: &str,
+    limit: usize,
+) -> Result<Vec<StoreRefSite>> {
+    // The LIMIT bounds the work: the short-name index yields matching rows
+    // and SQLite stops once `limit` of them are sorted out.
+    let mut stmt = conn.prepare_cached(
+        "SELECT r.caller_file, n.scoped_name, r.line, r.local_name
+         FROM refs r
+         LEFT JOIN nodes n ON n.id = r.caller_node
+         WHERE r.short_name = ?1 AND r.kind = ?2
+         ORDER BY r.caller_file, r.line, r.ref_id
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![short_name, kind, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok(StoreRefSite {
+                file: row.get(0)?,
+                caller_symbol: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                local_name: row.get(3)?,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn unresolved_calls_for_node(
     conn: &Connection,
     node: &StoreNode,
 ) -> Result<Vec<StoreUnresolvedCall>> {
-    let mut stmt = conn.prepare(
+    unresolved_calls_for_node_limited(conn, node, usize::MAX)
+}
+
+fn unresolved_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreUnresolvedCall>> {
+    let mut stmt = conn.prepare_cached(
         "SELECT COALESCE(short_name, full_ref, ''), full_ref, line, byte_start, byte_end
          FROM refs
          WHERE caller_node = ?1
@@ -7121,31 +8043,43 @@ fn unresolved_calls_for_node(
            AND NOT EXISTS (
                SELECT 1 FROM edges e WHERE e.ref_id = refs.ref_id AND e.kind = 'call'
            )
-         ORDER BY byte_start, line, ref_id",
+          ORDER BY byte_start, line, ref_id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![node.node_id], |row| {
-        Ok(StoreUnresolvedCall {
-            caller: node.clone(),
-            symbol: row.get(0)?,
-            full_ref: row.get(1)?,
-            line: row.get::<_, i64>(2)?.max(0) as u32,
-            byte_start: row.get::<_, i64>(3)?.max(0) as usize,
-            byte_end: row.get::<_, i64>(4)?.max(0) as usize,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![node.node_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+        |row| {
+            Ok(StoreUnresolvedCall {
+                caller: node.clone(),
+                symbol: row.get(0)?,
+                full_ref: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                byte_start: row.get::<_, i64>(3)?.max(0) as usize,
+                byte_end: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<StoreForwardCall>> {
+    forward_calls_for_node_limited(conn, node, usize::MAX)
+}
+
+fn forward_calls_for_node_limited(
+    conn: &Connection,
+    node: &StoreNode,
+    limit: usize,
+) -> Result<Vec<StoreForwardCall>> {
     let mut calls = Vec::new();
     calls.extend(
-        outgoing_calls_for_node(conn, node)?
+        outgoing_calls_for_node_limited(conn, node, limit)?
             .into_iter()
             .map(StoreForwardCall::Resolved),
     );
     calls.extend(
-        unresolved_calls_for_node(conn, node)?
+        unresolved_calls_for_node_limited(conn, node, limit)?
             .into_iter()
             .map(StoreForwardCall::Unresolved),
     );
@@ -7154,6 +8088,7 @@ fn forward_calls_for_node(conn: &Connection, node: &StoreNode) -> Result<Vec<Sto
             .cmp(&right.byte_start())
             .then(left.line().cmp(&right.line()))
     });
+    calls.truncate(limit);
     Ok(calls)
 }
 
@@ -7188,7 +8123,9 @@ fn call_tree_inner(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<(String, String)>,
+    remaining: &mut usize,
 ) -> Result<callgraph::CallTreeNode> {
+    *remaining -= 1;
     let visit_key = (node.file.clone(), node.symbol.clone());
     if visited.contains(&visit_key) {
         return Ok(callgraph::CallTreeNode {
@@ -7199,6 +8136,7 @@ fn call_tree_inner(
             resolved: true,
             children: Vec::new(),
             depth_limited: false,
+            work_gap: None,
             truncated: 0,
         });
     }
@@ -7209,17 +8147,28 @@ fn call_tree_inner(
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
-        let calls = forward_calls_for_node(conn, node)?;
+        let calls = forward_calls_for_node_limited(conn, node, remaining.saturating_add(1))?;
         for call in calls {
+            if *remaining == 0 {
+                truncated += 1;
+                break;
+            }
             match call {
                 StoreForwardCall::Resolved(site) => {
                     if let Some(target) = site.target {
-                        let child =
-                            call_tree_inner(conn, &target, max_depth, current_depth + 1, visited)?;
+                        let child = call_tree_inner(
+                            conn,
+                            &target,
+                            max_depth,
+                            current_depth + 1,
+                            visited,
+                            remaining,
+                        )?;
                         depth_limited |= child.depth_limited;
                         truncated += child.truncated;
                         children.push(child);
                     } else {
+                        *remaining -= 1;
                         children.push(callgraph::CallTreeNode {
                             name: site.target_symbol,
                             file: site.target_file,
@@ -7228,11 +8177,13 @@ fn call_tree_inner(
                             resolved: false,
                             children: Vec::new(),
                             depth_limited: false,
+                            work_gap: None,
                             truncated: 0,
                         });
                     }
                 }
                 StoreForwardCall::Unresolved(call) => {
+                    *remaining -= 1;
                     children.push(callgraph::CallTreeNode {
                         name: call.symbol,
                         file: call.caller.file,
@@ -7241,6 +8192,7 @@ fn call_tree_inner(
                         resolved: false,
                         children: Vec::new(),
                         depth_limited: false,
+                        work_gap: None,
                         truncated: 0,
                     });
                 }
@@ -7261,6 +8213,7 @@ fn call_tree_inner(
         children,
         depth_limited,
         truncated,
+        work_gap: None,
     })
 }
 
@@ -7953,6 +8906,9 @@ fn publish_migrated_generation(
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
         crate::fs_lock::sync_parent(&gen_path);
+        // A backup copy is written in rollback mode; switch it while no
+        // pointer names it, as a cold build does.
+        switch_generation_to_wal_before_publication(&gen_path);
 
         verify_writer_lease(&writer_lease)?;
         publish_pointer(callgraph_dir, project_key, generation)?;
@@ -8216,15 +9172,13 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         SqliteStore::CallgraphGeneration,
     )?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(reader_busy_timeout())?;
+    // Readers do not change durability or journal settings: even synchronous
+    // reads the schema and can block behind an exclusive writer before setup.
+    // Fail fast so repeated readiness probes cannot accumulate busy waits on
+    // the request thread; callers report contention as a retryable build.
+    conn.busy_timeout(Duration::ZERO)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
-}
-
-fn reader_busy_timeout() -> Duration {
-    let jitter = (now_nanos() % 500) as u64;
-    Duration::from_millis(250 + jitter)
 }
 
 fn sqlite_readonly_uri(path: &Path) -> String {
@@ -8275,6 +9229,45 @@ fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
+}
+
+/// Put a renamed, not yet published generation into WAL mode.
+///
+/// The staging database is switched to rollback (DELETE) journaling before the
+/// rename so the moved file holds every committed page on its own. Published
+/// that way, the first writer to open it (the builder's own handle, or a later
+/// refresh) must switch it back to WAL, and on a rollback-journal database that
+/// switch is a write transaction that needs an exclusive lock on the file. The
+/// writer waits for that lock (up to its busy timeout) for as long as any other
+/// connection, in this process or another, keeps a read open, and while it
+/// waits SQLite refuses every new reader with SQLITE_BUSY. Query readers do not
+/// wait on a busy store, so a store that was published and ready answered
+/// "building" for that whole time. Switching here, before the pointer names the
+/// file, means a published generation is already in WAL mode, where writers
+/// never need an exclusive lock and never block readers.
+///
+/// A failure is logged and publication goes ahead: the rollback-mode file is
+/// still a complete, correct generation, only one whose first writer briefly
+/// locks readers out.
+fn switch_generation_to_wal_before_publication(path: &Path) {
+    let switched = (|| -> Result<String> {
+        let conn = TrackedConnection::open(path, SqliteStore::CallgraphGeneration)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?)
+    })();
+    match switched {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+        Ok(mode) => crate::slog_warn!(
+            "callgraph generation {} stayed in {} journal mode before publication",
+            path.display(),
+            mode
+        ),
+        Err(error) => crate::slog_warn!(
+            "callgraph generation {} could not switch to WAL before publication: {}",
+            path.display(),
+            error
+        ),
+    }
 }
 
 /// A copied migration generation may carry a WAL sidecar. Checkpoint only the
@@ -8522,7 +9515,7 @@ fn clear_path_identity_mismatch_if_consistent(
     if !stale_backend_file_paths(tx, project_root, true)?.is_empty() {
         return Ok(());
     }
-    let mut stmt = tx.prepare("SELECT path FROM files")?;
+    let mut stmt = tx.prepare_cached("SELECT path FROM files")?;
     let paths = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -8670,13 +9663,33 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Build-output version folded into the store fingerprint. Bump it whenever
+/// the BUILD OUTPUT changes (new edge sources, broader call extraction, new
+/// resolution rules) even if the table SHAPE is unchanged: a store stamped
+/// with another version is not ready, so every root rebuilds once and picks up
+/// the new edges instead of serving resolutions from an older binary.
+///
+/// - v10: calls written inside `macro_rules!` templates are stored as call
+///   references, and identifiers inside macro bodies that could not be parsed
+///   are stored as mentions.
+/// - v11: more Rust calls resolve to their definition (stored as call edges):
+///   paths resolve child modules first (`registry::f()` inside `mod.rs`), use
+///   lists bind `{self, ..}` and aliased entries, use paths may start with a
+///   workspace crate or an earlier `use`, imported calls follow re-exports to
+///   the definition, and a file-level function wins over imports from nested
+///   scopes. Stores built before v11 hold the old, partly unresolved edges.
+const BUILD_OUTPUT_VERSION: &str = "v11-rust-path-resolution";
+
 fn schema_fingerprint() -> String {
-    // Bump the trailing content-version whenever the BUILD OUTPUT changes (new
-    // edge sources, broader call extraction) even if the table SHAPE is
-    // unchanged, so existing on-disk stores rebuild and pick up the new edges.
-    // Rust scoped aliases, inline modules, reexports, and turbofish calls now add edges.
+    schema_fingerprint_for(BUILD_OUTPUT_VERSION)
+}
+
+fn schema_fingerprint_for(build_output_version: &str) -> String {
+    // The version string names the latest change to what a build stores; older
+    // changes (scoped aliases, inline modules, re-exports, turbofish calls) are
+    // covered because any change of the string forces a rebuild.
     let input =
-        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:v9-rust-resolver-batch");
+        format!("callgraph_store:v{SCHEMA_VERSION}:positional:raw-ref:{build_output_version}");
     hash_to_hex(blake3::hash(input.as_bytes()))
 }
 
@@ -8760,11 +9773,8 @@ fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -
     };
     let rel_path = relative_path(project_root, path);
     let staged_hash = conn
-        .query_row(
-            "SELECT content_hash FROM files WHERE path = ?1",
-            params![rel_path],
-            |row| row.get::<_, String>(0),
-        )
+        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| row.get::<_, String>(0))
         .optional()?;
     Ok(staged_hash.as_deref() == Some(hash_to_hex(freshness.content_hash).as_str()))
 }
@@ -8782,11 +9792,9 @@ fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
     // (resumed with different content) or pruned from the inventory has a
     // `files` row, and only those pay for the scans. The lookup is on the
     // `files` primary key, which is never dropped.
-    let previously_staged: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
-        params![rel_path],
-        |row| row.get(0),
-    )?;
+    let previously_staged: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)")?
+        .query_row(params![rel_path], |row| row.get(0))?;
     if !previously_staged {
         return Ok(());
     }
@@ -8801,7 +9809,7 @@ fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 fn prune_staged_files_not_in_inventory(conn: &mut Connection) -> Result<()> {
     loop {
         let removed = {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT path
                  FROM files
                  WHERE NOT EXISTS (
@@ -8841,7 +9849,7 @@ fn load_staged_file_batch(
     max_files: usize,
     max_bytes: u64,
 ) -> Result<Option<StagedFileBatch>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT path, size
          FROM staging_file_inventory
          WHERE path > ?1
@@ -8870,7 +9878,8 @@ fn load_staged_file_batch(
 }
 
 fn staged_corpus_fingerprint(conn: &Connection, project_root: &Path) -> Result<String> {
-    let mut statement = conn.prepare("SELECT path FROM staging_file_inventory ORDER BY path")?;
+    let mut statement =
+        conn.prepare_cached("SELECT path FROM staging_file_inventory ORDER BY path")?;
     let mut rows = statement.query([])?;
     let mut fingerprint = CorpusFingerprint::default();
     while let Some(row) = rows.next()? {
@@ -8885,7 +9894,7 @@ fn load_staged_ref_window(
     after_rowid: u64,
     limit: usize,
 ) -> Result<Vec<StagedRef>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT refs.rowid, refs.ref_id, refs.caller_node, refs.caller_file, refs.kind,
                 refs.short_name, refs.full_ref, refs.module_path, refs.import_kind,
                 refs.local_name, refs.requested_name, refs.namespace_alias, refs.wildcard,
@@ -8924,8 +9933,9 @@ fn load_staged_ref_window(
     drop(statement);
 
     let mut dependencies = HashMap::<String, BTreeSet<String>>::new();
-    let mut dependency_statement = conn
-        .prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file")?;
+    let mut dependency_statement = conn.prepare_cached(
+        "SELECT dep_file FROM file_dependencies WHERE file_path = ?1 ORDER BY dep_file",
+    )?;
     for raw in refs.iter_mut().map(|entry| &mut entry.raw) {
         if !dependencies.contains_key(&raw.caller_file) {
             let rows =
@@ -8989,7 +9999,7 @@ fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Resu
 }
 
 fn staged_files_with_status(conn: &Connection, status: &str) -> Result<Vec<String>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM backend_file_state WHERE status = ?1 ORDER BY file_path",
     )?;
     let rows = statement.query_map([status], |row| row.get(0))?;
@@ -9154,7 +10164,7 @@ fn same_workspace_root(a: &Path, b: &Path) -> bool {
 }
 
 fn stored_workspace_roots(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT workspace_root
          FROM backend_file_state
          ORDER BY workspace_root",
@@ -9301,10 +10311,62 @@ fn resolve_ready_target(
     None
 }
 
+/// Schema version recorded in the published generation (or, with no pointer,
+/// the legacy single-file database), read through a read-only connection.
+/// `None` when nothing is published or its version cannot be read; those are
+/// ordinary "not built" cases handled by readiness checks.
+fn published_schema_version(callgraph_dir: &Path, project_key: &str) -> Option<(PathBuf, u64)> {
+    let target = match read_pointer(callgraph_dir, project_key) {
+        Some(generation) => callgraph_dir.join(generation),
+        None => legacy_sqlite_path(callgraph_dir, project_key),
+    };
+    if !target.is_file() {
+        return None;
+    }
+    let conn = open_readonly_connection(&target).ok()?;
+    let raw: String = conn
+        .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .ok()??;
+    let version = raw.trim().parse::<u64>().ok()?;
+    Some((target, version))
+}
+
+/// Refuse, by name, a published generation whose schema version is above
+/// [`STORE_FORMAT_VERSION`] (or any store while the storage root's reader
+/// floor is above it). The refusal covers the whole `callgraph_dir`, so no
+/// cold build, migration or pointer flip replaces the newer generation.
+pub(crate) fn check_published_format(
+    callgraph_dir: &Path,
+    project_key: &str,
+) -> std::result::Result<(), crate::persisted_format::UnsupportedPersistedFormat> {
+    let published = published_schema_version(callgraph_dir, project_key);
+    let path = published
+        .as_ref()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| callgraph_dir.to_path_buf());
+    crate::persisted_format::gate(
+        crate::persisted_format::PersistedStore::CallgraphStore,
+        &path,
+        callgraph_dir,
+        published.map(|(_, version)| version),
+    )
+}
+
+fn refuse_newer_published_format(callgraph_dir: &Path, project_key: &str) -> Result<()> {
+    check_published_format(callgraph_dir, project_key)
+        .map_err(|refusal| CallGraphStoreError::Unavailable(refusal.to_string()))
+}
+
 /// Atomically publish `generation` as the current store by flipping the pointer
 /// file. Writes a temp file, fsyncs, then renames over the pointer — never
 /// replacing an open DB file, so it succeeds cross-platform.
 fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) -> Result<()> {
+    // Last line of defence: never move the pointer away from a generation
+    // written by a newer build, whichever path got here.
+    refuse_newer_published_format(callgraph_dir, project_key)?;
     let pointer = pointer_path(callgraph_dir, project_key);
     let tmp = callgraph_dir.join(format!(
         "{project_key}.current.tmp.{}.{}",
@@ -10029,6 +11091,42 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
 /// starves the bridge so interactive tools time out (the same starvation the
 /// v0.35 embedder and the inspect Tier-2 pool already cap). 8MB worker stacks
 /// match the main thread, since the extract walks tree-sitter ASTs.
+#[cfg(test)]
+type RefreshParseHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static REFRESH_PARSE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, RefreshParseHook>>> = OnceLock::new();
+
+/// Run `hook` each time a refresh of `project_root` starts parsing, with the
+/// store's connection released (None removes it).
+#[cfg(test)]
+fn set_refresh_parse_hook_for_test(project_root: &Path, hook: Option<RefreshParseHook>) {
+    let mut hooks = REFRESH_PARSE_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("refresh parse hook mutex poisoned");
+    match hook {
+        Some(hook) => hooks.insert(project_root.to_path_buf(), hook),
+        None => hooks.remove(project_root),
+    };
+}
+
+#[cfg(test)]
+fn note_refresh_parse_for_test(project_root: &Path) {
+    let hook = REFRESH_PARSE_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("refresh parse hook mutex poisoned")
+        .get(project_root)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn note_refresh_parse_for_test(_project_root: &Path) {}
+
 fn build_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -10037,62 +11135,250 @@ fn build_pool_size() -> usize {
         .clamp(1, 8)
 }
 
-fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtractsResult {
-    let extract_one = |path: &PathBuf| match build_file_extract(project_root, path) {
-        Ok(extract) => Ok(extract),
-        Err(error) => {
-            let abs_path =
-                normalize_file_path(project_root, path).unwrap_or_else(|_| path.to_path_buf());
-            let rel_path = relative_path(project_root, &abs_path);
-            let freshness = cache_freshness::collect(&abs_path).ok();
-            let undecodable = is_undecodable_source(&error);
-            if undecodable {
-                log_undecodable_source(project_root, &rel_path);
-            } else {
-                log::debug!(
-                    "callgraph store: skipping {} during cold build: {}",
-                    abs_path.display(),
-                    error
-                );
+/// The bounded parse pool of one cold build or refresh, created once and
+/// reused by every batch instead of spawning fresh threads per batch.
+/// Its threads start on first use with more than one file, so a refresh of a
+/// single file never spawns them.
+struct BuildPool(std::cell::OnceCell<Option<rayon::ThreadPool>>);
+
+impl BuildPool {
+    fn new() -> Self {
+        Self(std::cell::OnceCell::new())
+    }
+
+    fn install<R: Send>(&self, run: impl FnOnce() -> R + Send) -> R {
+        let pool = self.0.get_or_init(|| {
+            // Fall back to the global pool only if the bounded pool can't be
+            // constructed.
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(build_pool_size())
+                .thread_name(|index| format!("aft-callgraph-build-{index}"))
+                .stack_size(8 * 1024 * 1024)
+                .build()
+            {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    log::warn!(
+                        "callgraph store: bounded build pool unavailable ({error}); using global pool"
+                    );
+                    None
+                }
             }
-            Err(ExtractFailure {
-                rel_path,
-                freshness,
-                undecodable,
-            })
-        }
-    };
-
-    let run = || -> Vec<std::result::Result<FileExtract, ExtractFailure>> {
-        files.par_iter().map(extract_one).collect()
-    };
-
-    // Run inside a dedicated bounded pool when one builds; fall back to the
-    // global pool only if the bounded pool can't be constructed.
-    let results = match rayon::ThreadPoolBuilder::new()
-        .num_threads(build_pool_size())
-        .thread_name(|index| format!("aft-callgraph-build-{index}"))
-        .stack_size(8 * 1024 * 1024)
-        .build()
-    {
-        Ok(pool) => pool.install(run),
-        Err(error) => {
-            log::warn!(
-                "callgraph store: bounded build pool unavailable ({error}); using global pool"
-            );
-            run()
-        }
-    };
-
-    let mut extracts = Vec::new();
-    let mut failures = Vec::new();
-    for result in results {
-        match result {
-            Ok(extract) => extracts.push(extract),
-            Err(failure) => failures.push(failure),
+        });
+        match pool {
+            Some(pool) => pool.install(run),
+            None => run(),
         }
     }
-    BuildExtractsResult { extracts, failures }
+
+    /// Parse `paths` into store rows, results in input order.
+    fn parse_files(
+        &self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> Vec<Result<FileExtract>> {
+        let parse = |path: &PathBuf| build_file_extract_with_memo(project_root, path, memo);
+        if paths.len() <= 1 {
+            return paths.iter().map(parse).collect();
+        }
+        self.install(|| paths.par_iter().map(parse).collect())
+    }
+
+    fn build_extracts(
+        &self,
+        project_root: &Path,
+        files: &[PathBuf],
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> BuildExtractsResult {
+        let extract_one =
+            |path: &PathBuf| match build_file_extract_with_memo(project_root, path, memo) {
+                Ok(extract) => Ok(extract),
+                Err(error) => {
+                    let abs_path = normalize_file_path(project_root, path)
+                        .unwrap_or_else(|_| path.to_path_buf());
+                    let rel_path = relative_path(project_root, &abs_path);
+                    let freshness = cache_freshness::collect(&abs_path).ok();
+                    let undecodable = is_undecodable_source(&error);
+                    if undecodable {
+                        log_undecodable_source(project_root, &rel_path);
+                    } else {
+                        log::debug!(
+                            "callgraph store: skipping {} during cold build: {}",
+                            abs_path.display(),
+                            error
+                        );
+                    }
+                    Err(ExtractFailure {
+                        rel_path,
+                        freshness,
+                        undecodable,
+                    })
+                }
+            };
+        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> = if files.len() <= 1 {
+            files.iter().map(extract_one).collect()
+        } else {
+            self.install(|| files.par_iter().map(extract_one).collect())
+        };
+
+        let mut extracts = Vec::new();
+        let mut failures = Vec::new();
+        for result in results {
+            match result {
+                Ok(extract) => extracts.push(extract),
+                Err(failure) => failures.push(failure),
+            }
+        }
+        BuildExtractsResult { extracts, failures }
+    }
+
+    /// Resolver inputs of `rel_paths`, parsed in parallel. A file that no
+    /// longer parses is left out, and its references stay unresolved.
+    fn resolution_caller_data(
+        &self,
+        project_root: &Path,
+        rel_paths: Vec<String>,
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> HashMap<String, FileCallData> {
+        if rel_paths.is_empty() {
+            return HashMap::new();
+        }
+        self.install(|| {
+            rel_paths
+                .into_par_iter()
+                .filter_map(|rel_path| {
+                    let extract = build_file_extract_with_memo(
+                        project_root,
+                        &project_root.join(&rel_path),
+                        memo,
+                    )
+                    .ok()?;
+                    Some((rel_path, resolution_caller_data(&extract.data)))
+                })
+                .collect()
+        })
+    }
+}
+
+/// Upper bound on the estimated bytes of caller data a cold build keeps from
+/// extraction for resolution. Files past it are parsed a second time during
+/// resolution, which keeps the build's working set bounded on huge corpora.
+const COLD_BUILD_RETAINED_CALLER_BYTES: usize = 48 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_CALLER_BUDGET_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_retained_caller_budget_for_test(budget: Option<usize>) {
+    RETAINED_CALLER_BUDGET_FOR_TEST.with(|cell| cell.set(budget));
+}
+
+fn retained_caller_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = RETAINED_CALLER_BUDGET_FOR_TEST.with(Cell::get) {
+        return budget;
+    }
+    COLD_BUILD_RETAINED_CALLER_BYTES
+}
+
+/// The part of each extracted file that resolution reads (see
+/// `resolution_caller_data`), kept from the extraction pass so the
+/// resolution pass does not parse the file again.
+struct RetainedCallerData {
+    by_file: HashMap<String, FileCallData>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl RetainedCallerData {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            by_file: HashMap::new(),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn retain(&mut self, rel_path: &str, data: &FileCallData) {
+        let weight = resolution_caller_data_weight(rel_path, data);
+        if self.retained_bytes.saturating_add(weight) > self.max_bytes {
+            return;
+        }
+        self.retained_bytes += weight;
+        self.by_file
+            .insert(rel_path.to_string(), resolution_caller_data(data));
+    }
+
+    fn contains(&self, rel_path: &str) -> bool {
+        self.by_file.contains_key(rel_path)
+    }
+
+    fn get(&self, rel_path: &str) -> Option<&FileCallData> {
+        self.by_file.get(rel_path)
+    }
+}
+
+/// A copy of `data` with only what reference resolution reads: the import
+/// block, symbol metadata, exported and default-export names, and the names
+/// (not the call sites) of the symbols that contain calls, which symbol
+/// lookup also searches.
+fn resolution_caller_data(data: &FileCallData) -> FileCallData {
+    FileCallData {
+        calls_by_symbol: data
+            .calls_by_symbol
+            .keys()
+            .map(|symbol| (symbol.clone(), Vec::new()))
+            .collect(),
+        value_refs_by_symbol: HashMap::new(),
+        macro_body_calls_by_macro: HashMap::new(),
+        macro_mentions_by_symbol: HashMap::new(),
+        exported_symbols: data.exported_symbols.clone(),
+        symbol_metadata: data.symbol_metadata.clone(),
+        default_export_symbol: data.default_export_symbol.clone(),
+        import_block: data.import_block.clone(),
+        lang: data.lang,
+    }
+}
+
+fn resolution_caller_data_weight(rel_path: &str, data: &FileCallData) -> usize {
+    const ENTRY: usize = 96;
+    let imports = data
+        .import_block
+        .imports
+        .iter()
+        .map(|import| {
+            ENTRY * 2
+                + import.module_path.len()
+                + import.raw_text.len()
+                + import
+                    .names
+                    .iter()
+                    .map(|name| ENTRY + name.len())
+                    .sum::<usize>()
+                + import.default_import.as_deref().map_or(0, str::len)
+                + import.namespace_import.as_deref().map_or(0, str::len)
+        })
+        .sum::<usize>();
+    let metadata = data
+        .symbol_metadata
+        .iter()
+        .map(|(name, meta)| {
+            ENTRY * 2
+                + name.len()
+                + meta.signature.as_deref().map_or(0, str::len)
+                + meta.entry_point_attribute.as_deref().map_or(0, str::len)
+        })
+        .sum::<usize>();
+    let names = data
+        .calls_by_symbol
+        .keys()
+        .chain(data.exported_symbols.iter())
+        .map(|name| ENTRY + name.len())
+        .sum::<usize>();
+    ENTRY * 4 + rel_path.len() + imports + metadata + names
 }
 
 fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
@@ -10112,9 +11398,28 @@ fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFr
     })
 }
 
+#[cfg(test)]
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
+    build_file_extract_with_memo(
+        project_root,
+        path,
+        &callgraph::ModuleResolutionMemo::default(),
+    )
+}
+
+/// Parse one file into its store rows. `memo` caches module resolution
+/// (including every `package.json`/`tsconfig.json` read on the way); a build
+/// or refresh passes one memo for all of its files so a config file shared by
+/// many importers is read and parsed once instead of once per import.
+fn build_file_extract_with_memo(
+    project_root: &Path,
+    path: &Path,
+    memo: &callgraph::ModuleResolutionMemo,
+) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
+    #[cfg(test)]
+    work_counts::note_parse(&abs_path);
     let source = std::fs::read_to_string(&abs_path)?;
     let freshness = collect_source_freshness(&abs_path, &source)?;
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
@@ -10127,26 +11432,21 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
         .collect();
+    let disk = DiskFacts::new(project_root);
+    let facts = FactPaths {
+        root: project_root,
+        facts: &disk,
+    };
     let import_dependencies = import_dependencies(
         project_root,
         &abs_path,
         &data.import_block.imports,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
+        memo,
+        &facts,
     );
     let line_index = LineIndex::new(&source);
-    let reexports = collect_reexport_refs(
-        project_root,
-        &abs_path,
-        &rel_path,
-        &source,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
-    );
+    let reexports =
+        collect_reexport_refs(project_root, &abs_path, &rel_path, &source, memo, &facts);
     let rust_reexports = if lang == LangId::Rust {
         collect_rust_pub_use_reexport_refs(
             project_root,
@@ -10154,10 +11454,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &rel_path,
             &data.import_block.imports,
             &line_index,
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
+            &facts,
         )
     } else {
         ReexportRefs {
@@ -10179,16 +11476,29 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &node_by_scoped,
         &import_dependencies,
     ));
+    // Macro facts are stored as refs of their own kinds. The resolver only
+    // binds `call` and `value_ref` rows, so these never become edges; the
+    // `callers` query reads them by name (see `macro_ref_sites`).
+    raw_refs.extend(build_macro_body_call_refs(
+        &rel_path,
+        &data,
+        &node_by_scoped,
+    ));
+    raw_refs.extend(build_callable_refs(
+        &rel_path,
+        &data.macro_mentions_by_symbol,
+        &node_by_scoped,
+        &BTreeSet::new(),
+        MACRO_MENTION_REF_KIND,
+    ));
     raw_refs.extend(build_import_refs(
         project_root,
         &abs_path,
         &rel_path,
         &data.import_block.imports,
         &line_index,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
+        memo,
+        &facts,
     ));
     if lang == LangId::Rust {
         raw_refs.extend(build_rust_module_refs(
@@ -10196,10 +11506,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &abs_path,
             &rel_path,
             &source,
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
+            &facts,
         ));
     }
     let mut surface_parts = reexports.surface_parts;
@@ -10337,6 +11644,28 @@ fn build_call_refs(
     )
 }
 
+/// Refs for calls written directly in `macro_rules!` templates. The refs table
+/// keeps no caller symbol column (only a caller node, and a macro is not a
+/// node), so the macro name (`name!`) is kept in `local_name`, which call refs
+/// otherwise fill with the callee name.
+fn build_macro_body_call_refs(
+    rel_path: &str,
+    data: &FileCallData,
+    node_by_scoped: &HashMap<String, String>,
+) -> Vec<RawRef> {
+    let mut refs = build_callable_refs(
+        rel_path,
+        &data.macro_body_calls_by_macro,
+        node_by_scoped,
+        &BTreeSet::new(),
+        MACRO_BODY_CALL_REF_KIND,
+    );
+    for raw in &mut refs {
+        raw.local_name = raw.caller_symbol.clone();
+    }
+    refs
+}
+
 fn build_value_ref_refs(
     rel_path: &str,
     data: &FileCallData,
@@ -10407,6 +11736,7 @@ fn build_import_refs(
     rel_path: &str,
     imports: &[ImportStatement],
     line_index: &LineIndex,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> Vec<RawRef> {
     let mut refs = Vec::new();
@@ -10439,7 +11769,13 @@ fn build_import_refs(
             line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            dependencies: module_dependencies(project_root, abs_path, &import.module_path, facts),
+            dependencies: module_dependencies_with_memo(
+                project_root,
+                abs_path,
+                &import.module_path,
+                memo,
+                facts,
+            ),
         });
     }
     refs
@@ -10790,6 +12126,7 @@ fn collect_reexport_refs(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> ReexportRefs {
     let mut raw_refs = Vec::new();
@@ -10843,7 +12180,13 @@ fn collect_reexport_refs(
             line,
             byte_start: start,
             byte_end: end,
-            dependencies: module_dependencies(project_root, abs_path, &module_path, facts),
+            dependencies: module_dependencies_with_memo(
+                project_root,
+                abs_path,
+                &module_path,
+                memo,
+                facts,
+            ),
         });
     }
     ReexportRefs {
@@ -11411,15 +12754,54 @@ fn resolve_rust_target<I: ResolverIndex>(
         }
     }
 
+    // A file-level function of the caller's own file wins over imports. Rust
+    // rejects a file-level `use` that binds the same name as a file-level item,
+    // so any import of this name sits in a nested scope (typically
+    // `mod tests { use super::{..}; }`); applying it to the whole file
+    // resolved ordinary same-file calls through the wrong module.
+    if let Some(local) =
+        rust_unique_file_level_function(caller_file, full_ref, short_name, caller_data)
+    {
+        return Some(local);
+    }
+
     for import in &caller_data.import_block.imports {
         if let Some((target_file, target_symbol)) =
-            rust_target_for_use(index, caller_file, import, short_name)
+            rust_target_for_use(index, caller_file, import, short_name, caller_data)
         {
             return Some(("resolved".to_string(), target_file, target_symbol));
         }
     }
 
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
+}
+
+fn rust_unique_file_level_function(
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+) -> Option<(String, String, String)> {
+    if full_ref.contains("::") || !callgraph::is_bare_callee(full_ref, short_name) {
+        return None;
+    }
+    // The only symbol with this unqualified name must be the file-level one
+    // itself; with a same-named nested item the call could mean either.
+    let symbol =
+        callgraph::resolve_symbol_query_in_data(caller_data, Path::new(caller_file), short_name)
+            .ok()?;
+    let is_file_level_function = symbol == short_name
+        && caller_data
+            .symbol_metadata
+            .get(short_name)
+            .is_some_and(|meta| meta.kind == SymbolKind::Function);
+    is_file_level_function.then(|| {
+        (
+            "resolved_local".to_string(),
+            caller_file.to_string(),
+            symbol,
+        )
+    })
 }
 
 fn rust_target_for_qualified<I: ResolverIndex>(
@@ -11449,18 +12831,24 @@ fn rust_target_for_qualified<I: ResolverIndex>(
             }
         }
 
-        let module_segments = rust_resolve_segments_with_index(index, caller_file, &path_refs)?;
-        if let Some(target) =
-            rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
+        // A path that does not resolve under one reading may under another, and
+        // a later alias candidate may still match, so try them all in order.
+        for module_segments in
+            rust_resolve_segment_candidates_with_index(index, caller_file, &path_refs)
         {
-            return Some(target);
-        }
-        if let Some(target_file) = rust_file_for_segments(index, caller_file, &module_segments) {
-            return Some(rust_resolve_reexport_if_symbol_missing(
-                index,
-                target_file,
-                requested_symbol.clone(),
-            ));
+            if let Some(target) =
+                rust_inline_scoped_target(index, caller_file, &module_segments, &requested_symbol)
+            {
+                return Some(target);
+            }
+            if let Some(target_file) = rust_file_for_segments(index, caller_file, &module_segments)
+            {
+                return Some(rust_resolve_reexport_if_symbol_missing(
+                    index,
+                    target_file,
+                    requested_symbol.clone(),
+                ));
+            }
         }
     }
     None
@@ -11504,12 +12892,12 @@ fn rust_module_path_candidates(
             if !rust_import_is_visible_to_call(import, raw) {
                 continue;
             }
-            let Some((local_name, mut path_segments)) = rust_module_alias_segments(import) else {
-                continue;
-            };
-            if local_name == first {
-                path_segments.extend(segments[1..].iter().map(|segment| (*segment).to_string()));
-                rust_push_unique_path_candidate(&mut candidates, path_segments);
+            for (local_name, mut path_segments) in rust_module_alias_segments(import) {
+                if local_name == first {
+                    path_segments
+                        .extend(segments[1..].iter().map(|segment| (*segment).to_string()));
+                    rust_push_unique_path_candidate(&mut candidates, path_segments);
+                }
             }
         }
     }
@@ -11533,31 +12921,75 @@ fn rust_import_is_visible_to_call(import: &ImportStatement, raw: &RawRef) -> boo
     import.byte_range.start <= raw.byte_start
 }
 
-fn rust_module_alias_segments(import: &ImportStatement) -> Option<(String, Vec<String>)> {
-    let path = import.module_path.trim().trim_end_matches(';').trim();
-    if path.contains("::{") || path.contains('{') || path.contains('*') {
-        return None;
+/// Module names a `use` declaration binds: `use a::b;` / `use a::b as c;`
+/// bind one, and a use list binds `self` (the prefix module itself, as in
+/// `use crate::cache_freshness::{self, FileFreshness};`) plus each lowercase
+/// entry. Upper-camel names are types, not modules, and are skipped.
+fn rust_module_alias_segments(import: &ImportStatement) -> Vec<(String, Vec<String>)> {
+    let path = rust_use_body(&import.raw_text)
+        .unwrap_or(&import.module_path)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if path.contains('*') {
+        return Vec::new();
+    }
+    let split_path = |path: &str| {
+        path.split("::")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let is_module_name = |name: &str| {
+        !name.is_empty() && name != "_" && !name.chars().next().is_some_and(char::is_uppercase)
+    };
+    if let Some((prefix, rest)) = path.split_once("::{") {
+        if rest.contains('{') {
+            return Vec::new();
+        }
+        let prefix_segments = split_path(prefix);
+        return rest
+            .trim_end_matches('}')
+            .split(',')
+            .filter_map(|specifier| {
+                let specifier = specifier.trim();
+                let (path_without_alias, alias) = specifier
+                    .split_once(" as ")
+                    .map(|(left, right)| (left.trim(), Some(right.trim())))
+                    .unwrap_or((specifier, None));
+                let segments = if path_without_alias == "self" {
+                    prefix_segments.clone()
+                } else {
+                    let mut segments = prefix_segments.clone();
+                    segments.extend(split_path(path_without_alias));
+                    segments
+                };
+                let local_name = alias
+                    .map(str::to_string)
+                    .or_else(|| segments.last().cloned())?;
+                is_module_name(&local_name).then_some((local_name, segments))
+            })
+            .collect();
+    }
+    if path.contains('{') {
+        return Vec::new();
     }
     let (path_without_alias, alias) = path
         .split_once(" as ")
         .map(|(left, right)| (left.trim(), Some(right.trim())))
         .unwrap_or((path, None));
-    let segments = path_without_alias
-        .split("::")
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    let local_name = alias.or_else(|| segments.last().copied())?.to_string();
-    if local_name.chars().next().is_some_and(char::is_uppercase) {
-        return None;
+    let segments = split_path(path_without_alias);
+    let Some(local_name) = alias
+        .map(str::to_string)
+        .or_else(|| segments.last().cloned())
+    else {
+        return Vec::new();
+    };
+    if !is_module_name(&local_name) {
+        return Vec::new();
     }
-    Some((
-        local_name,
-        segments
-            .into_iter()
-            .map(|segment| segment.to_string())
-            .collect(),
-    ))
+    vec![(local_name, segments)]
 }
 
 fn rust_inline_scoped_target<I: ResolverIndex>(
@@ -11574,16 +13006,28 @@ fn rust_target_for_use<I: ResolverIndex>(
     caller_file: &str,
     import: &ImportStatement,
     short_name: &str,
+    caller_data: &FileCallData,
 ) -> Option<(String, String)> {
-    let path = import.module_path.trim().trim_end_matches(';');
+    let imports = &caller_data.import_block.imports;
+    let path = rust_use_body(&import.raw_text)
+        .unwrap_or(&import.module_path)
+        .trim()
+        .trim_end_matches(';');
     if let Some(brace_start) = path.find("::{") {
         let prefix = &path[..brace_start];
-        if import.names.iter().any(|name| name == short_name) {
+        // `use m::{f as g};` binds `g`; resolve the imported `f`.
+        let imported = import.names.iter().find_map(|name| {
+            (crate::imports::specifier_local_name(name) == short_name)
+                .then(|| crate::imports::specifier_imported_name(name).to_string())
+        });
+        if let Some(imported) = imported {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
-            let module_segments =
-                rust_resolve_segments_with_index(index, caller_file, &prefix_segments)?;
-            let file = rust_file_for_segments(index, caller_file, &module_segments)?;
-            return Some((file, short_name.to_string()));
+            let file = rust_use_module_file(index, caller_file, &prefix_segments, imports)?;
+            // The module may only re-export the item (`pub use inner::{f};`);
+            // follow that to the definition, as qualified paths already do.
+            return Some(rust_resolve_reexport_if_symbol_missing(
+                index, file, imported,
+            ));
         }
         return None;
     }
@@ -11600,10 +13044,58 @@ fn rust_target_for_use<I: ResolverIndex>(
     if segments.len() < 2 {
         return None;
     }
-    let module_segments =
-        rust_resolve_segments_with_index(index, caller_file, &segments[..segments.len() - 1])?;
-    let file = rust_file_for_segments(index, caller_file, &module_segments)?;
-    Some((file, segments.last().unwrap_or(&short_name).to_string()))
+    let file = rust_use_module_file(index, caller_file, &segments[..segments.len() - 1], imports)?;
+    Some(rust_resolve_reexport_if_symbol_missing(
+        index,
+        file,
+        segments.last().unwrap_or(&short_name).to_string(),
+    ))
+}
+
+/// The file of the module a `use` path names. A path may start with another
+/// workspace crate (`use aft::callgraph_store::{..}` in an integration test or
+/// a binary), which is checked first, as qualified call paths do. It may also
+/// start with a module another `use` in the same file brought into scope
+/// (`use aft::search::{paging};` then `use paging::{build};`).
+fn rust_use_module_file<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    module_segments: &[&str],
+    imports: &[ImportStatement],
+) -> Option<String> {
+    if let Some(file) = rust_use_module_file_direct(index, caller_file, module_segments) {
+        return Some(file);
+    }
+    let (first, rest) = module_segments.split_first()?;
+    imports
+        .iter()
+        .flat_map(rust_module_alias_segments)
+        .filter(|(local_name, _)| local_name == first)
+        .find_map(|(_, mut alias_segments)| {
+            alias_segments.extend(rest.iter().map(|segment| (*segment).to_string()));
+            let alias_refs = alias_segments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            rust_use_module_file_direct(index, caller_file, &alias_refs)
+        })
+}
+
+fn rust_use_module_file_direct<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    module_segments: &[&str],
+) -> Option<String> {
+    if !matches!(
+        module_segments.first().copied(),
+        Some("crate" | "self" | "super") | None
+    ) {
+        if let Some(file) = rust_workspace_file_for_segments(index, module_segments) {
+            return Some(file);
+        }
+    }
+    let resolved = rust_resolve_segments_with_index(index, caller_file, module_segments)?;
+    rust_file_for_segments(index, caller_file, &resolved)
 }
 
 fn rust_workspace_file_for_segments<I: ResolverIndex>(
@@ -11754,14 +13246,41 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
     caller_file: &str,
     segments: &[&str],
 ) -> Option<Vec<String>> {
-    let caller_segments = if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file)
-    {
+    rust_resolve_segments_from(rust_caller_module_segments(index, caller_file), segments)
+}
+
+fn rust_caller_module_segments<I: ResolverIndex>(index: &I, caller_file: &str) -> Vec<String> {
+    if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file) {
         Vec::new()
     } else {
         rust_registered_module_segments(index, caller_file)
             .unwrap_or_else(|| rust_module_segments_for_rel(caller_file))
-    };
-    rust_resolve_segments_from(caller_segments, segments)
+    }
+}
+
+/// Module paths a path's leading segments can denote, most likely first. A
+/// bare first segment (`registry::f()` inside `bash_background/mod.rs`) is, in
+/// Rust 2018, relative to the current module, so a child module is tried
+/// before the crate-relative sibling reading `rust_resolve_segments_from` uses.
+fn rust_resolve_segment_candidates_with_index<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    segments: &[&str],
+) -> Vec<Vec<String>> {
+    let caller_segments = rust_caller_module_segments(index, caller_file);
+    let mut candidates = Vec::new();
+    if segments
+        .first()
+        .is_some_and(|first| !matches!(*first, "crate" | "self" | "super"))
+    {
+        let mut child = caller_segments.clone();
+        child.extend(segments.iter().map(|item| item.to_string()));
+        candidates.push(child);
+    }
+    if let Some(resolved) = rust_resolve_segments_from(caller_segments, segments) {
+        rust_push_unique_path_candidate(&mut candidates, resolved);
+    }
+    candidates
 }
 
 fn rust_resolve_segments(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
@@ -12198,12 +13717,16 @@ impl<'a> LazyDbFileIndexes<'a> {
             return *known;
         }
         let exists = self.timed(|| {
-            self.note_error(self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)
+            self.note_error(
+                self.conn
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)
                      OR EXISTS(SELECT 1 FROM nodes WHERE file_path = ?1)",
-                params![rel_path],
-                |row| row.get::<_, bool>(0),
-            ))
+                    )
+                    .and_then(|mut statement| {
+                        statement.query_row(params![rel_path], |row| row.get::<_, bool>(0))
+                    }),
+            )
             .unwrap_or(false)
         });
         self.add_rows(usize::from(exists));
@@ -12318,7 +13841,7 @@ impl<'a> LazyDbFileIndexes<'a> {
             return paths.clone();
         }
         let paths = self.timed(|| {
-            self.note_error(self.conn.prepare(sql).and_then(|mut stmt| {
+            self.note_error(self.conn.prepare_cached(sql).and_then(|mut stmt| {
                 stmt.query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             }))
@@ -13002,17 +14525,17 @@ fn sync_file_dependencies(
         .flat_map(|raw| raw.dependencies.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut select_dependencies =
-        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+        tx.prepare_cached("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
     let stored_dependencies = select_dependencies
         .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
     let mut delete_dependency =
-        tx.prepare("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
+        tx.prepare_cached("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
     for dependency in stored_dependencies.difference(&dependencies) {
         delete_dependency.execute(params![extract.rel_path, dependency])?;
     }
     if insert_missing {
-        let mut insert_dependency = tx.prepare(
+        let mut insert_dependency = tx.prepare_cached(
             "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
         )?;
         for dependency in dependencies.difference(&stored_dependencies) {
@@ -13029,11 +14552,11 @@ fn delete_stale_string_rows(
     owner: &str,
     expected: &BTreeSet<String>,
 ) -> Result<()> {
-    let mut select = tx.prepare(select_sql)?;
+    let mut select = tx.prepare_cached(select_sql)?;
     let stored = select
         .query_map(params![owner], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut delete = tx.prepare(delete_sql)?;
+    let mut delete = tx.prepare_cached(delete_sql)?;
     for key in stored {
         if !expected.contains(&key) {
             delete.execute(params![key])?;
@@ -13050,31 +14573,38 @@ fn upsert_file_extract_prepared(
 ) -> Result<()> {
     insert_file_graph_rows_prepared(statements, extract)?;
     let hash = hash_to_hex(extract.freshness.content_hash);
-    let existing: usize = tx.query_row(
-        "SELECT count(*) FROM backend_file_state
+    let existing: usize = tx
+        .prepare_cached(
+            "SELECT count(*) FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-        params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row(
+            params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
+            |row| row.get(0),
+        )?;
     if existing > 1 {
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM backend_file_state
              WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-            params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
-        )?;
+        )?
+        .execute(params![
+            BACKEND_TREESITTER,
+            workspace_root,
+            extract.rel_path
+        ])?;
     } else if existing == 1 {
-        tx.execute(
+        tx.prepare_cached(
             "UPDATE backend_file_state
              SET content_hash = ?4, status = 'fresh', updated_at = ?5
              WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-            params![
-                BACKEND_TREESITTER,
-                workspace_root,
-                extract.rel_path,
-                hash,
-                unix_seconds_now(),
-            ],
-        )?;
+        )?
+        .execute(params![
+            BACKEND_TREESITTER,
+            workspace_root,
+            extract.rel_path,
+            hash,
+            unix_seconds_now(),
+        ])?;
     }
     insert_backend_state_prepared(
         &mut statements.backend_state,
@@ -13110,7 +14640,7 @@ fn upsert_resolved_ref_delta<I: ResolverIndex>(
             .cloned()
             .collect::<BTreeSet<_>>()
     } else {
-        let mut select = tx.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
+        let mut select = tx.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
         let stored = select
             .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<BTreeSet<_>>>()?;
@@ -13127,25 +14657,23 @@ fn upsert_resolved_ref_delta<I: ResolverIndex>(
 
 fn delete_stale_direct_edges(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
     if let Some(expected) = &resolved.edge {
-        tx.execute(
+        tx.prepare_cached(
             "DELETE FROM edges
              WHERE ref_id = ?1 AND provenance IN (?2, ?3) AND edge_id <> ?4",
-            params![
-                resolved.raw.ref_id,
-                PROVENANCE_TREESITTER,
-                PROVENANCE_VALUE_REF,
-                expected.edge_id,
-            ],
-        )?;
+        )?
+        .execute(params![
+            resolved.raw.ref_id,
+            PROVENANCE_TREESITTER,
+            PROVENANCE_VALUE_REF,
+            expected.edge_id,
+        ])?;
     } else {
-        tx.execute(
-            "DELETE FROM edges WHERE ref_id = ?1 AND provenance IN (?2, ?3)",
-            params![
+        tx.prepare_cached("DELETE FROM edges WHERE ref_id = ?1 AND provenance IN (?2, ?3)")?
+            .execute(params![
                 resolved.raw.ref_id,
                 PROVENANCE_TREESITTER,
                 PROVENANCE_VALUE_REF,
-            ],
-        )?;
+            ])?;
     }
     Ok(())
 }
@@ -13310,17 +14838,36 @@ fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<(
     Ok(())
 }
 
+/// Same-named method candidates by `(method name, language)`. They are read
+/// from `nodes`, which no longer changes once dispatch edges are computed, so
+/// one cache serves every chunk of a build or refresh.
+type DispatchCandidateCache = HashMap<(String, String), Vec<NameMatchCandidate>>;
+/// Distinct method names a dispatch candidate cache keeps before it is reset.
+const DISPATCH_CANDIDATE_CACHE_NAMES: usize = 16_384;
+
+#[cfg(test)]
 fn insert_method_dispatch_edges(
     tx: &Transaction<'_>,
     project_root: &Path,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<BTreeSet<String>> {
+    insert_method_dispatch_edges_cached(tx, project_root, caller_files, &mut HashMap::new())
+}
+
+fn insert_method_dispatch_edges_cached(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    caller_files: Option<&BTreeSet<String>>,
+    candidates_by_name: &mut DispatchCandidateCache,
+) -> Result<BTreeSet<String>> {
     let references = load_name_match_refs(tx, caller_files)?;
     if references.is_empty() {
         return Ok(BTreeSet::new());
     }
+    if candidates_by_name.len() > DISPATCH_CANDIDATE_CACHE_NAMES {
+        candidates_by_name.clear();
+    }
 
-    let mut candidates_by_name: HashMap<(String, String), Vec<NameMatchCandidate>> = HashMap::new();
     let mut source_cache: DispatchSourceCache = HashMap::new();
     let mut edge_ids = BTreeSet::new();
     for reference in references {
@@ -13407,9 +14954,10 @@ fn insert_method_dispatch_edges_chunked(
     ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     let mut inserted = 0usize;
     let mut after_file = String::new();
+    let mut candidates = DispatchCandidateCache::new();
     loop {
         let caller_files = {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT DISTINCT caller_file
                  FROM refs
                  WHERE caller_file > ?1
@@ -13425,7 +14973,13 @@ fn insert_method_dispatch_edges_chunked(
         let Some(last_file) = caller_files.last().cloned() else {
             break;
         };
-        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?.len();
+        inserted += insert_method_dispatch_edges_cached(
+            tx,
+            project_root,
+            Some(&caller_files),
+            &mut candidates,
+        )?
+        .len();
         after_file = last_file;
         completed_files = completed_files
             .saturating_add(caller_files.len())
@@ -13443,7 +14997,7 @@ fn insert_method_dispatch_edge(
     provenance: &str,
 ) -> Result<String> {
     let edge_id = ref_id(&[&reference.ref_id, provenance, "edge"]);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO edges(
             edge_id, ref_id, source_node, target_node, target_file, target_symbol,
             kind, line, provenance
@@ -13465,17 +15019,17 @@ fn insert_method_dispatch_edge(
            OR kind IS NOT excluded.kind
            OR line IS NOT excluded.line
            OR provenance IS NOT excluded.provenance",
-        params![
-            edge_id,
-            &reference.ref_id,
-            &reference.caller_node,
-            &candidate.node_id,
-            &candidate.file_path,
-            &candidate.scoped_name,
-            reference.line as i64,
-            provenance,
-        ],
-    )?;
+    )?
+    .execute(params![
+        edge_id,
+        &reference.ref_id,
+        &reference.caller_node,
+        &candidate.node_id,
+        &candidate.file_path,
+        &candidate.scoped_name,
+        reference.line as i64,
+        provenance,
+    ])?;
     Ok(edge_id)
 }
 
@@ -13524,7 +15078,7 @@ fn changed_dispatch_candidate_names(
         }
         grouped
     }
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT name, scoped_name, kind FROM nodes
          WHERE file_path = ?1 AND kind IN ('method', 'function', 'kernel')",
     )?;
@@ -13583,7 +15137,7 @@ fn dispatch_callers_to_recompute(
     changed_names: &DispatchNames,
 ) -> Result<BTreeSet<String>> {
     let mut callers = roots.clone();
-    let mut by_target = tx.prepare(
+    let mut by_target = tx.prepare_cached(
         "SELECT DISTINCT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.target_file = ?1 AND e.provenance IN (?2, ?3)",
     )?;
@@ -13595,7 +15149,7 @@ fn dispatch_callers_to_recompute(
             callers.insert(row?);
         }
     }
-    let mut by_name = tx.prepare(
+    let mut by_name = tx.prepare_cached(
         "SELECT DISTINCT caller_file FROM refs
          WHERE short_name = ?1 AND +kind = 'call' AND status = 'unresolved'",
     )?;
@@ -13611,7 +15165,7 @@ fn dispatch_callers_to_recompute(
         // name (`Type::method`); match those on the last segment, as name
         // matching does. JS/TS short names are the bare member name, so a
         // change in a JS/TS file never needs this scan.
-        let mut unresolved = tx.prepare(
+        let mut unresolved = tx.prepare_cached(
             "SELECT caller_file, short_name FROM refs
              WHERE kind = 'call' AND status = 'unresolved'
                AND (short_name GLOB '*::*' OR short_name GLOB '*.*' OR short_name GLOB '*->*')",
@@ -13630,7 +15184,7 @@ fn dispatch_callers_to_recompute(
         }
     }
     // A deleted caller's refs and edges are already gone.
-    let mut exists = tx.prepare("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut exists = tx.prepare_cached("SELECT 1 FROM files WHERE path = ?1")?;
     let mut present = BTreeSet::new();
     for caller in callers {
         if exists.exists(params![caller])? {
@@ -13648,9 +15202,11 @@ fn refresh_method_dispatch_edges(
     caller_files: &BTreeSet<String>,
 ) -> Result<()> {
     let files = caller_files.iter().cloned().collect::<Vec<_>>();
+    let mut candidates = DispatchCandidateCache::new();
     for chunk in files.chunks(DISPATCH_REFRESH_CHUNK_FILES) {
         let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
-        let expected = insert_method_dispatch_edges(tx, project_root, Some(&chunk))?;
+        let expected =
+            insert_method_dispatch_edges_cached(tx, project_root, Some(&chunk), &mut candidates)?;
         delete_stale_method_dispatch_edges_for_callers(tx, &chunk, &expected)?;
     }
     Ok(())
@@ -13665,12 +15221,12 @@ fn delete_stale_method_dispatch_edges_for_callers(
         return Ok(());
     }
 
-    let mut select = tx.prepare(
+    let mut select = tx.prepare_cached(
         "SELECT e.edge_id
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
          WHERE e.provenance IN (?1, ?2) AND r.caller_file = ?3",
     )?;
-    let mut delete = tx.prepare("DELETE FROM edges WHERE edge_id = ?1")?;
+    let mut delete = tx.prepare_cached("DELETE FROM edges WHERE edge_id = ?1")?;
     for caller_file in caller_files {
         let stored = select
             .query_map(
@@ -13877,7 +15433,7 @@ fn load_name_match_candidates(
     method_name: &str,
     lang: &str,
 ) -> Result<Vec<NameMatchCandidate>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT n.id, n.file_path, n.scoped_name, n.kind, n.start_line
          FROM nodes n JOIN files f ON f.path = n.file_path
          WHERE n.name = ?1
@@ -15517,19 +17073,19 @@ fn mark_backend_state(
     let hash = content_hash
         .map(|hash| hash_to_hex(*hash))
         .unwrap_or_else(|| hash_to_hex(cache_freshness::zero_hash()));
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR REPLACE INTO backend_file_state(
             backend, workspace_root, file_path, content_hash, status, updated_at
         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path,
-            hash,
-            status,
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path,
+        hash,
+        status,
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
@@ -15565,7 +17121,7 @@ fn backend_file_paths_with_status(
     project_root: &Path,
     status: &str,
 ) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND status = ?3
          ORDER BY file_path",
@@ -15624,15 +17180,15 @@ fn clear_backend_state_for_file(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "DELETE FROM backend_file_state
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path
+    ])?;
     Ok(())
 }
 
@@ -15646,36 +17202,34 @@ fn clear_stale_backend_status_for_file(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE backend_file_state SET status = 'fresh', updated_at = ?4
          WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3 AND status = 'stale'",
-        params![
-            BACKEND_TREESITTER,
-            project_root.display().to_string(),
-            rel_path,
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        project_root.display().to_string(),
+        rel_path,
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
 fn load_file_row(conn: &Connection, rel_path: &str) -> Result<Option<FileRow>> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT surface_fingerprint, content_hash, mtime_ns, size FROM files WHERE path = ?1",
-        params![rel_path],
-        |row| {
-            let hash_text: String = row.get(1)?;
-            Ok(FileRow {
-                surface_fingerprint: row.get(0)?,
-                freshness: FileFreshness {
-                    content_hash: hash_from_hex(&hash_text)
-                        .unwrap_or_else(cache_freshness::zero_hash),
-                    mtime: ns_to_system_time(row.get::<_, i64>(2)?),
-                    size: row.get::<_, i64>(3)? as u64,
-                },
-            })
-        },
-    )
+    )?
+    .query_row(params![rel_path], |row| {
+        let hash_text: String = row.get(1)?;
+        Ok(FileRow {
+            surface_fingerprint: row.get(0)?,
+            freshness: FileFreshness {
+                content_hash: hash_from_hex(&hash_text).unwrap_or_else(cache_freshness::zero_hash),
+                mtime: ns_to_system_time(row.get::<_, i64>(2)?),
+                size: row.get::<_, i64>(3)? as u64,
+            },
+        })
+    })
     .optional()
     .map_err(CallGraphStoreError::from)
 }
@@ -15685,7 +17239,7 @@ fn stored_node_ids_match_extract(
     rel_path: &str,
     extract: &FileExtract,
 ) -> Result<bool> {
-    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE file_path = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT id FROM nodes WHERE file_path = ?1")?;
     let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
     let mut stored = BTreeSet::new();
     for row in rows {
@@ -15709,11 +17263,10 @@ fn stored_extract_matches(
     index: &ProjectIndex<'_>,
 ) -> Result<bool> {
     let stored_file = tx
-        .query_row(
-            "SELECT lang, surface_fingerprint FROM files WHERE path = ?1",
-            params![rel_path],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
+        .prepare_cached("SELECT lang, surface_fingerprint FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()?;
     if stored_file
         != Some((
@@ -15724,7 +17277,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_nodes_stmt = tx.prepare(
+    let mut stored_nodes_stmt = tx.prepare_cached(
         "SELECT id, file_path, name, scoped_name, kind, start_line, start_col,
                 end_line, end_col, range_ordinal, signature, exported,
                 is_default_export, is_type_like, is_callgraph_entry_point, provenance
@@ -15792,7 +17345,7 @@ fn stored_extract_matches(
         .cloned()
         .map(|raw| resolve_ref(raw, index))
         .collect::<Result<Vec<_>>>()?;
-    let mut stored_refs_stmt = tx.prepare(
+    let mut stored_refs_stmt = tx.prepare_cached(
         "SELECT ref_id, caller_node, caller_file, kind, short_name, full_ref,
                 module_path, import_kind, local_name, requested_name, namespace_alias,
                 wildcard, line, byte_start, byte_end, status, target_node,
@@ -15863,7 +17416,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_edges_stmt = tx.prepare(
+    let mut stored_edges_stmt = tx.prepare_cached(
         "SELECT e.edge_id, e.ref_id, e.source_node, e.target_node,
                 e.target_file, e.target_symbol, e.kind, e.line, e.provenance
          FROM edges e JOIN refs r ON r.ref_id = e.ref_id
@@ -15913,7 +17466,7 @@ fn stored_extract_matches(
     }
 
     let mut stored_dependencies_stmt =
-        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+        tx.prepare_cached("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
     let stored_dependencies = stored_dependencies_stmt
         .query_map(params![rel_path], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<_>>>()?;
@@ -15926,7 +17479,7 @@ fn stored_extract_matches(
         return Ok(false);
     }
 
-    let mut stored_hints_stmt = tx.prepare(
+    let mut stored_hints_stmt = tx.prepare_cached(
         "SELECT id, method_name, caller_node, file, line, byte_start, byte_end, provenance
          FROM dispatch_hints WHERE file = ?1",
     )?;
@@ -15977,28 +17530,28 @@ fn update_file_fresh_metadata(
     mtime: SystemTime,
     size: u64,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "UPDATE files SET content_hash = ?2, mtime_ns = ?3, size = ?4, indexed_at = ?5
          WHERE path = ?1",
-        params![
-            rel_path,
-            hash_to_hex(*hash),
-            system_time_to_ns(mtime),
-            size as i64,
-            unix_seconds_now()
-        ],
-    )?;
-    tx.execute(
+    )?
+    .execute(params![
+        rel_path,
+        hash_to_hex(*hash),
+        system_time_to_ns(mtime),
+        size as i64,
+        unix_seconds_now()
+    ])?;
+    tx.prepare_cached(
         "UPDATE backend_file_state SET content_hash = ?3, status = 'fresh', updated_at = ?5
          WHERE backend = ?1 AND file_path = ?2 AND workspace_root = ?4",
-        params![
-            BACKEND_TREESITTER,
-            rel_path,
-            hash_to_hex(*hash),
-            project_root.display().to_string(),
-            unix_seconds_now(),
-        ],
-    )?;
+    )?
+    .execute(params![
+        BACKEND_TREESITTER,
+        rel_path,
+        hash_to_hex(*hash),
+        project_root.display().to_string(),
+        unix_seconds_now(),
+    ])?;
     Ok(())
 }
 
@@ -16008,13 +17561,32 @@ struct DependentRefSelection {
     caller_file: String,
 }
 
+/// What a changed file's dependents can observe of the change, when that can
+/// be narrowed (see `dependency_change`).
+struct DependencyChange {
+    /// Every name and scoped name of a node that was added, removed, or
+    /// changed kind or export flags.
+    names: BTreeSet<String>,
+    /// The ids of the file's nodes after the change.
+    node_ids: HashSet<String>,
+}
+
+/// Refs that may resolve differently now that `rel_path` changed: refs bound
+/// to it, and refs of the files that import it. With a `change` (see
+/// `dependency_change`), only calls and value references are selected: one
+/// bound to `rel_path` when its target node is gone or its name changed, and
+/// one in an importer when its name, or the local name an import binds to
+/// it, is a changed name. With None every such ref is selected.
 fn ref_ids_depending_on(
     conn: &Connection,
     project_root: &Path,
     rel_path: &str,
+    change: Option<&DependencyChange>,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file,
+                r.short_name, r.target_node
          FROM refs r
          WHERE r.caller_file IN (
              SELECT file_path FROM file_dependencies WHERE dep_file = ?1
@@ -16022,26 +17594,199 @@ fn ref_ids_depending_on(
             OR r.target_file = ?1
          ORDER BY r.ref_id",
     )?;
-    let rows = stmt.query_map(params![rel_path], |row| {
-        Ok(RefDependencyRow {
-            ref_id: row.get(0)?,
-            kind: row.get(1)?,
-            caller_file: row.get(2)?,
-            module_path: row.get(3)?,
-            target_file: row.get(4)?,
-        })
-    })?;
+    let rows = stmt
+        .query_map(params![rel_path], |row| {
+            Ok((
+                RefDependencyRow {
+                    ref_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    caller_file: row.get(2)?,
+                    module_path: row.get(3)?,
+                    target_file: row.get(4)?,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut bound_by_caller: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut ids = Vec::new();
-    for row in rows {
-        let row = row?;
-        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
-            ids.push(DependentRefSelection {
-                ref_id: row.ref_id,
-                caller_file: row.caller_file,
-            });
+    for (row, short_name, target_node) in rows {
+        match change {
+            Some(change) => {
+                // Only calls and value references resolve to a target. The
+                // other refs of an importer (imports, re-exports, module
+                // declarations) resolve the same whatever the file defines.
+                if !matches!(row.kind.as_str(), "call" | "value_ref") {
+                    continue;
+                }
+                let name = short_name.as_deref().map(callee_last_segment);
+                if name.is_some_and(|name| change.names.contains(name)) {
+                    // A changed name can bind or unbind this ref.
+                } else if row.target_file.as_deref() == Some(rel_path) {
+                    // Still bound to a node that exists unchanged.
+                    if target_node
+                        .as_ref()
+                        .is_some_and(|node| change.node_ids.contains(node))
+                    {
+                        continue;
+                    }
+                } else {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if !bound_by_caller.contains_key(&row.caller_file) {
+                        let bound = import_names_bound_in(conn, &row.caller_file, &change.names)?;
+                        bound_by_caller.insert(row.caller_file.clone(), bound);
+                    }
+                    if !bound_by_caller[&row.caller_file].contains(name) {
+                        continue;
+                    }
+                }
+            }
+            None => {
+                if !ref_dependency_row_depends_on(project_root, &row, rel_path, memo) {
+                    continue;
+                }
+            }
         }
+        ids.push(DependentRefSelection {
+            ref_id: row.ref_id,
+            caller_file: row.caller_file,
+        });
     }
     Ok(ids)
+}
+
+/// Local names `caller_file`'s imports bind to any of `names` (an aliased
+/// `import { a as b }` binds `b` to `a`). Every import row of the file is
+/// read, not only those naming the changed file, which can only select more.
+fn import_names_bound_in(
+    conn: &Connection,
+    caller_file: &str,
+    names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT local_name, requested_name FROM refs WHERE caller_file = ?1 AND kind = 'import'",
+    )?;
+    let rows = statement.query_map(params![caller_file], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    let mut bound = BTreeSet::new();
+    for row in rows {
+        let (local_names, requested_names) = row?;
+        bound.extend(import_names_bound_to(
+            local_names.as_deref(),
+            requested_names.as_deref(),
+            names,
+        ));
+    }
+    Ok(bound)
+}
+
+/// What dependents of a changed file can observe of the change: the names
+/// under which a symbol was added, removed, or changed kind or export flags,
+/// and the node ids after the change. None (every call of every importer
+/// depends on the file) when the file's import, module, re-export or
+/// export-alias rows changed, or a default export changed: those can rebind a
+/// call by a name that is not the changed symbol's own.
+fn dependency_change(
+    conn: &Connection,
+    rel_path: &str,
+    extract: &FileExtract,
+) -> Result<Option<DependencyChange>> {
+    type StructuralRef = (
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+    const STRUCTURAL_KINDS: &[&str] = &["import", "module", "reexport", "export_alias"];
+    let mut stored_refs = conn
+        .prepare_cached(
+            "SELECT kind, module_path, full_ref, wildcard, local_name, requested_name FROM refs
+             WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')",
+        )?
+        .query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<StructuralRef>>>()?;
+    let mut new_refs = extract
+        .raw_refs
+        .iter()
+        .filter(|raw| STRUCTURAL_KINDS.contains(&raw.kind.as_str()))
+        .map(|raw| {
+            (
+                raw.kind.clone(),
+                raw.module_path.clone(),
+                raw.full_ref.clone(),
+                raw.wildcard,
+                raw.local_name.clone(),
+                raw.requested_name.clone(),
+            )
+        })
+        .collect::<Vec<StructuralRef>>();
+    stored_refs.sort();
+    new_refs.sort();
+    if stored_refs != new_refs {
+        return Ok(None);
+    }
+
+    let stored_nodes = conn
+        .prepare_cached(
+            "SELECT name, scoped_name, kind, exported, is_default_export
+             FROM nodes WHERE file_path = ?1",
+        )?
+        .query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let new_nodes = extract
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.name.clone(),
+                node.scoped_name.clone(),
+                node.kind.clone(),
+                node.exported,
+                node.is_default_export,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeSet::new();
+    for (name, scoped_name, _, _, is_default_export) in
+        stored_nodes.symmetric_difference(&new_nodes)
+    {
+        if *is_default_export {
+            return Ok(None);
+        }
+        names.insert(callee_last_segment(scoped_name).to_string());
+        names.insert(scoped_name.clone());
+        names.insert(name.clone());
+    }
+    Ok(Some(DependencyChange {
+        names,
+        node_ids: extract.nodes.iter().map(|node| node.id.clone()).collect(),
+    }))
 }
 
 /// What one file offers to a resolution walk: each exported name with what it
@@ -16055,7 +17800,7 @@ struct ExportSurface {
 impl ExportSurface {
     fn stored(conn: &Connection, rel_path: &str) -> Result<Self> {
         let mut surface = Self::default();
-        let mut nodes = conn.prepare(
+        let mut nodes = conn.prepare_cached(
             "SELECT name, scoped_name, kind, exported, is_default_export
              FROM nodes WHERE file_path = ?1",
         )?;
@@ -16072,7 +17817,7 @@ impl ExportSurface {
             let (name, scoped_name, kind, exported, is_default_export) = row?;
             surface.note_node(&name, &scoped_name, &kind, exported, is_default_export);
         }
-        let mut refs = conn.prepare(
+        let mut refs = conn.prepare_cached(
             "SELECT kind, module_path, full_ref, wildcard, local_name, requested_name
              FROM refs WHERE caller_file = ?1 AND kind IN ('reexport', 'export_alias')",
         )?;
@@ -16196,8 +17941,9 @@ fn reexporters_of(
     conn: &Connection,
     project_root: &Path,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<ReexportRow>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT caller_file, module_path, full_ref, wildcard FROM refs
          WHERE kind = 'reexport'
            AND caller_file IN (SELECT file_path FROM file_dependencies WHERE dep_file = ?1)
@@ -16217,7 +17963,7 @@ fn reexporters_of(
         let Some(module_path) = module_path else {
             continue;
         };
-        if module_ref_can_name(project_root, &caller_file, &module_path, rel_path) {
+        if module_ref_can_name(project_root, &caller_file, &module_path, rel_path, memo) {
             reexporters.push(ReexportRow {
                 caller_file,
                 full_ref,
@@ -16269,6 +18015,7 @@ fn reexport_consumer_refs(
     rel_path: &str,
     changed: Option<BTreeSet<String>>,
     created_reexporters: &BTreeMap<String, Vec<ReexportRow>>,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
     if changed.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
@@ -16278,7 +18025,7 @@ fn reexport_consumer_refs(
     let mut barrels: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
     let mut queue = VecDeque::from([(rel_path.to_string(), changed)]);
     while let Some((file, names)) = queue.pop_front() {
-        let mut reexporters = reexporters_of(conn, project_root, &file)?;
+        let mut reexporters = reexporters_of(conn, project_root, &file, memo)?;
         if let Some(created) = created_reexporters.get(&file) {
             reexporters.extend(created.iter().cloned());
         }
@@ -16319,21 +18066,21 @@ fn reexport_consumer_refs(
     }
 
     let mut selected = Vec::new();
-    let mut importers_of = conn.prepare(
+    let mut importers_of = conn.prepare_cached(
         "SELECT DISTINCT file_path FROM file_dependencies WHERE dep_file = ?1 ORDER BY file_path",
     )?;
-    let mut imports_of = conn.prepare(
+    let mut imports_of = conn.prepare_cached(
         "SELECT module_path, local_name, requested_name FROM refs
          WHERE caller_file = ?1 AND kind = 'import'",
     )?;
-    let mut calls_of = conn.prepare(
+    let mut calls_of = conn.prepare_cached(
         "SELECT ref_id, short_name FROM refs
          WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
     )?;
     // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
     // any import row; when the barrel cannot place the name they are stored
     // as resolved to the barrel itself.
-    let mut resolved_to = conn.prepare(
+    let mut resolved_to = conn.prepare_cached(
         "SELECT ref_id, caller_file, short_name FROM refs
          WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
     )?;
@@ -16380,7 +18127,7 @@ fn reexport_consumer_refs(
                     let Some(module_path) = module_path else {
                         continue;
                     };
-                    if !module_ref_can_name(project_root, &importer, &module_path, barrel) {
+                    if !module_ref_can_name(project_root, &importer, &module_path, barrel, memo) {
                         continue;
                     }
                     bound.extend(import_names_bound_to(
@@ -16555,7 +18302,7 @@ fn tsconfig_dirs(
     created: &BTreeSet<String>,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut dirs = BTreeSet::new();
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT path FROM files WHERE path = 'tsconfig.json' OR path GLOB '*/tsconfig.json'",
     )?;
     for row in statement.query_map([], |row| row.get::<_, String>(0))? {
@@ -16909,8 +18656,9 @@ fn caller_refs_depending_on(
     project_root: &Path,
     caller_file: &str,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT ref_id, kind, caller_file, module_path, target_file FROM refs
          WHERE caller_file = ?1 ORDER BY ref_id",
     )?;
@@ -16926,7 +18674,7 @@ fn caller_refs_depending_on(
     let mut selected = Vec::new();
     for row in rows {
         let row = row?;
-        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
+        if ref_dependency_row_depends_on(project_root, &row, rel_path, memo) {
             selected.push(DependentRefSelection {
                 ref_id: row.ref_id,
                 caller_file: row.caller_file,
@@ -16960,7 +18708,7 @@ fn refs_by_caller_for_ref_ids(
     ref_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut by_caller: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut stmt = tx.prepare("SELECT caller_file FROM refs WHERE ref_id = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT caller_file FROM refs WHERE ref_id = ?1")?;
     for ref_id in ref_ids {
         if let Some(caller) = stmt
             .query_row(params![ref_id], |row| row.get::<_, String>(0))
@@ -17041,7 +18789,7 @@ fn resolution_change_importers<'a>(
         for name in &change.package_names {
             // `substr` instead of LIKE: package names may contain `_`, a LIKE
             // wildcard.
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT DISTINCT caller_file, kind FROM refs
                  WHERE module_path = ?1
                     OR substr(module_path, 1, length(?1) + 1) = ?1 || '/'",
@@ -17052,7 +18800,7 @@ fn resolution_change_importers<'a>(
             collect(rows);
         }
         if change.bare_imports_under_dir {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT DISTINCT caller_file, kind FROM refs
                  WHERE module_path IS NOT NULL
                    AND module_path <> ''
@@ -17071,7 +18819,7 @@ fn resolution_change_importers<'a>(
 /// Every stored ref of `caller_file`, selected for re-resolution.
 fn all_refs_of_caller(conn: &Connection, caller_file: &str) -> Result<Vec<DependentRefSelection>> {
     let mut statement =
-        conn.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1 ORDER BY ref_id")?;
+        conn.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1 ORDER BY ref_id")?;
     let rows = statement
         .query_map(params![caller_file], |row| row.get::<_, String>(0))?
         .map(|ref_id| {
@@ -17105,22 +18853,18 @@ fn store_resolution_config_fields(
 }
 
 fn delete_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
-    tx.execute(
-        "DELETE FROM file_dependencies WHERE file_path = ?1",
-        params![rel_path],
-    )?;
+    tx.prepare_cached("DELETE FROM file_dependencies WHERE file_path = ?1")?
+        .execute(params![rel_path])?;
     delete_refs_for_caller(tx, rel_path)?;
-    tx.execute(
-        "DELETE FROM dispatch_hints WHERE file = ?1",
-        params![rel_path],
-    )?;
+    tx.prepare_cached("DELETE FROM dispatch_hints WHERE file = ?1")?
+        .execute(params![rel_path])?;
     tx.execute("DELETE FROM nodes WHERE file_path = ?1", params![rel_path])?;
     tx.execute("DELETE FROM files WHERE path = ?1", params![rel_path])?;
     Ok(())
 }
 
 fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
-    let mut stmt = tx.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
+    let mut stmt = tx.prepare_cached("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
     let rows = stmt.query_map(params![rel_path], |row| row.get::<_, String>(0))?;
     let mut ids = BTreeSet::new();
     for row in rows {
@@ -17130,8 +18874,8 @@ fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 }
 
 fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()> {
-    let mut delete_edges = tx.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
-    let mut delete_refs = tx.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
+    let mut delete_edges = tx.prepare_cached("DELETE FROM edges WHERE ref_id = ?1")?;
+    let mut delete_refs = tx.prepare_cached("DELETE FROM refs WHERE ref_id = ?1")?;
     for ref_id in ref_ids {
         delete_edges.execute(params![ref_id])?;
         delete_refs.execute(params![ref_id])?;
@@ -17140,7 +18884,7 @@ fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()
 }
 
 fn edge_snapshot_with_conn(conn: &Connection) -> Result<BTreeSet<StoredEdge>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT source.file_path, source.scoped_name, edges.target_file,
                 edges.target_symbol, edges.kind, edges.line
          FROM edges
@@ -17311,6 +19055,7 @@ fn ref_dependency_row_depends_on(
     project_root: &Path,
     row: &RefDependencyRow,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> bool {
     if row.target_file.as_deref() == Some(rel_path) {
         return true;
@@ -17322,7 +19067,7 @@ fn ref_dependency_row_depends_on(
         // reference only resolves once its target is callable).
         "call" | "value_ref" => true,
         "import" | "reexport" => row.module_path.as_deref().is_some_and(|module_path| {
-            module_ref_can_name(project_root, &row.caller_file, module_path, rel_path)
+            module_ref_can_name(project_root, &row.caller_file, module_path, rel_path, memo)
         }),
         "export_alias" => false,
         _ => false,
@@ -17337,56 +19082,47 @@ fn module_ref_can_name(
     caller_file: &str,
     module_path: &str,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> bool {
-    if module_dependencies_for_ref(project_root, caller_file, module_path).contains(rel_path) {
+    let disk = DiskFacts::new(project_root);
+    let facts = FactPaths {
+        root: project_root,
+        facts: &disk,
+    };
+    if module_dependencies_with_memo(
+        project_root,
+        &project_root.join(caller_file),
+        module_path,
+        memo,
+        &facts,
+    )
+    .contains(rel_path)
+    {
         return true;
     }
     Path::new(caller_file)
         .extension()
         .and_then(|ext| ext.to_str())
         == Some("rs")
-        && rust_declared_module_path_target(
-            project_root,
-            caller_file,
-            module_path,
-            &callgraph::ModuleResolutionMemo::default(),
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
-        )
-        .as_deref()
+        && rust_declared_module_path_target(project_root, caller_file, module_path, memo, &facts)
+            .as_deref()
             == Some(rel_path)
-}
-
-fn module_dependencies_for_ref(
-    project_root: &Path,
-    caller_file: &str,
-    module_path: &str,
-) -> BTreeSet<String> {
-    module_dependencies(
-        project_root,
-        &project_root.join(caller_file),
-        module_path,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
-    )
 }
 
 fn import_dependencies(
     project_root: &Path,
     abs_path: &Path,
     imports: &[ImportStatement],
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     for import in imports {
-        deps.extend(module_dependencies(
+        deps.extend(module_dependencies_with_memo(
             project_root,
             abs_path,
             &import.module_path,
+            memo,
             facts,
         ));
     }
@@ -17726,21 +19462,90 @@ fn normalize_project_file_path(project_root: &Path, path: &Path) -> Result<(Path
     Ok((abs_path, rel_path))
 }
 
+#[cfg(test)]
+thread_local! {
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `std::fs::canonicalize`, counted in tests. Each call is a `realpath`, which
+/// on macOS costs one `getattrlist` per path component.
+fn fs_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    std::fs::canonicalize(path)
+}
+
 /// Canonicalize an existing path or the deepest existing ancestor of a deleted
 /// one. This keeps watcher deletion events in the same identity domain as the
 /// files indexed before the deletion.
+///
+/// The resolver also calls this for every candidate it probes (`tsconfig.json`
+/// in each ancestor directory, `index.ts` beside each import), and most probes
+/// name a file that does not exist.
 fn canonicalize_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
+    if let Ok(canonical) = fs_canonicalize(path) {
         return canonical;
     }
+    canonicalize_missing_absolute_path(path).unwrap_or_else(|| canonicalize_missing_path(path))
+}
 
+/// The deepest-existing-ancestor form of an absolute path made only of normal
+/// components, found by walking up from the parent. A missing probe usually
+/// sits in an existing directory, so this costs one more `canonicalize`; the
+/// component-by-component walk in [`canonicalize_missing_path`] costs one per
+/// component, each of them a full `realpath` from the root.
+///
+/// It returns what that walk returns: canonicalizing an ancestor also resolves
+/// every ancestor above it, so the first ancestor that canonicalizes is the
+/// deepest one the walk would reach. `None` hands paths with `..`, relative
+/// paths or no parent to the walk. A Windows drive or verbatim prefix before
+/// the root is allowed, since `canonicalize` returns such paths there.
+fn canonicalize_missing_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components().peekable();
+    if matches!(components.peek(), Some(std::path::Component::Prefix(_))) {
+        components.next();
+    }
+    if components.next() != Some(std::path::Component::RootDir) {
+        return None;
+    }
+    let names = components
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (existing, canonical) =
+        path.ancestors()
+            .skip(1)
+            .enumerate()
+            .find_map(|(depth_above, ancestor)| {
+                fs_canonicalize(ancestor)
+                    .ok()
+                    .map(|canonical| (names.len() - 1 - depth_above, canonical))
+            })?;
+    // The walk checks the first missing component the same way: a name that
+    // exists but cannot be resolved (a dangling symlink, a file used as a
+    // directory) leaves the whole path as given.
+    match std::fs::symlink_metadata(canonical.join(names[existing])) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut resolved = canonical;
+            resolved.extend(&names[existing..]);
+            Some(resolved)
+        }
+        _ => Some(path.to_path_buf()),
+    }
+}
+
+/// Resolve a missing path component by component, keeping the unresolved tail
+/// and applying `..` to it lexically.
+fn canonicalize_missing_path(path: &Path) -> PathBuf {
     let mut resolved = PathBuf::new();
     let mut missing = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 resolved.push(component.as_os_str());
-                if let Ok(canonical) = std::fs::canonicalize(&resolved) {
+                if let Ok(canonical) = fs_canonicalize(&resolved) {
                     resolved = canonical;
                 }
             }
@@ -17756,7 +19561,7 @@ fn canonicalize_path(path: &Path) -> PathBuf {
             std::path::Component::Normal(name) => {
                 if missing.is_empty() {
                     let candidate = resolved.join(name);
-                    match std::fs::canonicalize(&candidate) {
+                    match fs_canonicalize(&candidate) {
                         Ok(canonical) => resolved = canonical,
                         Err(_) => match std::fs::symlink_metadata(&candidate) {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -20959,8 +22764,14 @@ export function leaf() {}
         {
             let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
             let tx = conn.transaction().expect("dependency transaction");
-            let dependent_refs = ref_ids_depending_on(&tx, project_root, "src/index.ts")
-                .expect("dependent refs for barrel");
+            let dependent_refs = ref_ids_depending_on(
+                &tx,
+                project_root,
+                "src/index.ts",
+                None,
+                &callgraph::ModuleResolutionMemo::default(),
+            )
+            .expect("dependent refs for barrel");
             let selected_ref_ids = dependent_refs
                 .iter()
                 .map(|dependent_ref| dependent_ref.ref_id.clone())
@@ -20998,9 +22809,12 @@ export function leaf() {}
             .refresh_files(std::slice::from_ref(&index_path))
             .expect("incremental refresh");
         assert_eq!(stats.surface_changed, vec!["src/index.ts".to_string()]);
-        assert!(
-            stats.dependency_selected_refs > 0,
-            "barrel surface edit should select dependent refs"
+        // No consumer calls the added `extra`, and the consumers' `target()`
+        // calls stay bound to an unchanged node, so nothing needs re-resolving;
+        // the rows below must still match a cold rebuild.
+        assert_eq!(
+            stats.dependency_selected_refs, 0,
+            "an export no consumer names must not re-resolve the barrel's consumers"
         );
 
         let cold_store = CallGraphStore::open(
@@ -21161,6 +22975,8 @@ export function leaf() {}
             data: FileCallData {
                 calls_by_symbol: HashMap::new(),
                 value_refs_by_symbol: HashMap::new(),
+                macro_body_calls_by_macro: HashMap::new(),
+                macro_mentions_by_symbol: HashMap::new(),
                 exported_symbols: Vec::new(),
                 symbol_metadata: HashMap::new(),
                 default_export_symbol: None,
@@ -21884,6 +23700,130 @@ edition = "2021"
             "src/lib.rs",
             "project_range",
             "src/alternate/custom.rs",
+            "run",
+        );
+    }
+
+    #[test]
+    fn rust_path_calls_resolve_child_modules_use_list_self_and_crate_paths() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "path-forms-fixture");
+        write_file(
+            root,
+            "src/lib.rs",
+            "pub mod alerts;\npub mod cache;\npub mod net;\n",
+        );
+        // The binary reaches the library through the crate name, both as a
+        // qualified call and through an aliased `use` list entry whose module
+        // was itself brought into scope by an earlier `use`.
+        write_file(
+            root,
+            "src/main.rs",
+            "use path_forms_fixture::{alerts};\nuse alerts::{normalize as tidy};\n\nfn main() {\n    path_forms_fixture::net::start();\n    tidy(\"x\");\n}\n",
+        );
+        // `registry::` names a child module of `net`; `cache::` is bound by
+        // the `self` entry of a use list.
+        write_file(
+            root,
+            "src/net/mod.rs",
+            r#"mod registry;
+use crate::cache::{self, Cache};
+
+pub fn start() {
+    registry::resolve_shell();
+    cache::warm();
+    let _ = Cache;
+}
+"#,
+        );
+        write_file(root, "src/net/registry.rs", "pub fn resolve_shell() {}\n");
+        write_file(
+            root,
+            "src/cache.rs",
+            "pub struct Cache;\n\npub fn warm() {\n    crate::alerts::build(\"x\");\n}\n",
+        );
+        // `normalize` is called from a struct-literal field; the file also has
+        // a nested `use super::{normalize}` that must not redirect that call
+        // to the parent module.
+        write_file(
+            root,
+            "src/alerts.rs",
+            r#"pub struct Alert {
+    pub message: String,
+}
+
+pub fn build(message: &str) -> Alert {
+    Alert {
+        message: normalize(message),
+    }
+}
+
+pub fn normalize(message: &str) -> String {
+    message.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize, Alert};
+
+    #[test]
+    fn normalizes() {
+        let _ = Alert { message: normalize(" x ") };
+    }
+}
+"#,
+        );
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/net/mod.rs", "start", "src/main.rs", "main");
+        assert_direct_caller(
+            &store,
+            "src/net/registry.rs",
+            "resolve_shell",
+            "src/net/mod.rs",
+            "start",
+        );
+        assert_direct_caller(&store, "src/cache.rs", "warm", "src/net/mod.rs", "start");
+        assert_direct_caller(&store, "src/alerts.rs", "build", "src/cache.rs", "warm");
+        assert_direct_caller(
+            &store,
+            "src/alerts.rs",
+            "normalize",
+            "src/alerts.rs",
+            "build",
+        );
+        assert_direct_caller(&store, "src/alerts.rs", "normalize", "src/main.rs", "main");
+    }
+
+    #[test]
+    fn rust_use_list_import_through_crate_visible_reexport_targets_definition() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_rust_manifest(root, "reexport-import-fixture");
+        write_file(root, "src/lib.rs", "mod store;\npub mod inspect;\n");
+        write_file(
+            root,
+            "src/store/mod.rs",
+            "mod projection;\npub(crate) use projection::{project_snapshot};\n",
+        );
+        write_file(
+            root,
+            "src/store/projection.rs",
+            "pub fn project_snapshot() {}\n",
+        );
+        write_file(
+            root,
+            "src/inspect.rs",
+            "use crate::store::{project_snapshot};\n\npub fn run() {\n    project_snapshot();\n}\n",
+        );
+
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/store/projection.rs",
+            "project_snapshot",
+            "src/inspect.rs",
             "run",
         );
     }
@@ -23358,6 +25298,91 @@ mod refresh_index_load_log_tests {
         assert!(!index_load_is_notable(&profile(249, 49_999)));
         assert!(index_load_is_notable(&profile(250, 0)));
         assert!(index_load_is_notable(&profile(0, 50_000)));
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_path_tests {
+    use super::*;
+
+    fn canonicalize_calls<T>(run: impl FnOnce() -> T) -> (T, usize) {
+        let before = CANONICALIZE_CALLS.with(std::cell::Cell::get);
+        let value = run();
+        (
+            value,
+            CANONICALIZE_CALLS.with(std::cell::Cell::get) - before,
+        )
+    }
+
+    fn deep_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        let deep = root.join("packages/plugin/src/features/magic-context/dreamer/nested");
+        std::fs::create_dir_all(&deep).expect("deep dirs");
+        (dir, root, deep)
+    }
+
+    // The resolver probes a missing `tsconfig.json` in every ancestor of every
+    // importing file. Each probe must cost a fixed number of `realpath` calls,
+    // not one per path component: on a real checkout the per-component walk
+    // made a callgraph refresh issue millions of `getattrlist` calls a minute.
+    #[test]
+    fn missing_probe_canonicalizes_its_parent_not_every_ancestor() {
+        let (_dir, root, deep) = deep_fixture();
+        let probe = deep.join("tsconfig.json");
+
+        let (canonical, calls) = canonicalize_calls(|| canonicalize_path(&probe));
+        assert_eq!(canonical, probe);
+        assert!(
+            calls <= 2,
+            "one missing probe took {calls} canonicalize calls for {} components",
+            probe.components().count()
+        );
+
+        let disk = disk_facts::DiskFacts::new(&root);
+        let facts = facts::FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        let (found, calls) = canonicalize_calls(|| facts.is_file(&probe));
+        assert!(!found);
+        assert!(calls <= 2, "resolver probe took {calls} canonicalize calls");
+    }
+
+    #[test]
+    fn missing_path_shortcut_matches_the_component_walk() {
+        let (_dir, root, deep) = deep_fixture();
+        std::fs::write(deep.join("file.ts"), "").expect("file");
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases = vec![
+            deep.join("tsconfig.json"),
+            deep.join("missing/also-missing/index.ts"),
+            root.join("missing"),
+            // A regular file used as a directory is not a missing ancestor.
+            deep.join("file.ts/index.ts"),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&deep, root.join("linked")).expect("dir link");
+            std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling"))
+                .expect("dangling link");
+            cases.push(root.join("linked/tsconfig.json"));
+            cases.push(root.join("linked/missing/index.ts"));
+            cases.push(root.join("dangling/index.ts"));
+        }
+        for case in cases {
+            assert_eq!(
+                canonicalize_path(&case),
+                canonicalize_missing_path(&case),
+                "{}",
+                case.display()
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            canonicalize_path(&root.join("linked/tsconfig.json")),
+            deep.join("tsconfig.json")
+        );
     }
 }
 

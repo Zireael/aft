@@ -39,7 +39,7 @@ pub struct TerminalRowsPrune {
     pub remaining_candidates: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TerminalPruneCandidate {
     harness: String,
     session_id: String,
@@ -59,7 +59,9 @@ pub(crate) struct TerminalPrunePlan {
     cutoff: i64,
 }
 
-#[derive(Debug)]
+/// Cloned per attempt when a retention transaction retries after finding
+/// another process's write lock, since each attempt consumes its copy.
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedTerminalPrune {
     identities: Vec<TerminalPruneCandidate>,
     probed_candidates: usize,
@@ -211,14 +213,19 @@ pub fn terminal_rows_eligible_count(conn: &Connection, now_ms: i64) -> rusqlite:
         [cutoff],
         |row| row.get::<_, i64>(0),
     )?;
-    // Start from the normally tiny watch table instead of running a correlated
-    // watch lookup for every retained task row in a large backlog.
+    // Start from the normally tiny watch table instead of visiting every retained
+    // task row. A plain JOIN leaves the order to the planner, which prefers the
+    // `status` index on `bash_tasks` and then reads every terminal row's table
+    // page to test `completed_at`: on a machine with 160k retained tasks that is
+    // a read of the whole table on every health report. SQLite never reorders a
+    // CROSS JOIN, so the watch table stays the outer loop and each watch costs
+    // one primary-key lookup.
     let watched_terminal_rows = conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM (
                 SELECT task.harness, task.session_id, task.task_id
                 FROM bash_pattern_watches AS watch
-                JOIN bash_tasks AS task
+                CROSS JOIN bash_tasks AS task
                   ON task.harness = watch.harness
                  AND task.session_id = watch.session_id
                  AND task.task_id = watch.task_id
@@ -470,25 +477,6 @@ pub fn list_bash_tasks_for_session(
     Ok(rows)
 }
 
-pub fn list_bash_tasks_by_id(
-    conn: &Connection,
-    harness: &str,
-    task_id: &str,
-) -> rusqlite::Result<Vec<BashTaskRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
-                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
-                compressed, timeout_ms, completion_delivered, output_bytes, metadata
-         FROM bash_tasks
-         WHERE harness = ?1 AND task_id = ?2
-         ORDER BY started_at DESC",
-    )?;
-    let rows = stmt
-        .query_map(params![harness, task_id], map_bash_task_row)?
-        .collect();
-    rows
-}
-
 /// The recorded process identity of one `bash_tasks` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashTaskProcessIds {
@@ -498,42 +486,67 @@ pub struct BashTaskProcessIds {
     pub started_at: i64,
 }
 
-/// SQLite's default host-parameter limit is 999 on older builds; stay under
-/// it with room for the harness parameter.
+/// SQLite's default host-parameter limit is 999 on older builds; stay well
+/// under it with room for the harness parameter.
 const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
 
-/// Recorded pids for every row of `task_ids` under `harness`, in any session.
+/// Every distinct harness with a `bash_tasks` row, found by one index seek
+/// per harness rather than by reading the table.
+fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT MIN(harness) FROM bash_tasks WHERE harness > ?1")?;
+    let mut harnesses = Vec::new();
+    let mut after = String::new();
+    while let Some(next) = stmt.query_row(params![after], |row| row.get::<_, Option<String>>(0))? {
+        harnesses.push(next.clone());
+        after = next;
+    }
+    Ok(harnesses)
+}
+
+/// Recorded pids for every row of `task_ids`, under any harness and session.
 ///
 /// The persisted-task GC asks this once per session directory instead of
 /// once per task, so a sweep takes the shared aft.db mutex a handful of times
 /// rather than once for every task on the machine. Only rows with a recorded
-/// pid or pgid are returned.
+/// pid or pgid are returned. Task ids are unique across harnesses, and routes
+/// from several harnesses share one project root, so a caller asking whether
+/// a task directory still belongs to a live process must not restrict the
+/// lookup to one harness.
+///
+/// No index leads with `task_id`, so a lookup without a harness would read
+/// the whole table. Instead each harness is queried through the
+/// harness-keyed project-lookup index, which reads that harness's index
+/// entries and fetches only the matching rows.
 pub fn list_bash_task_process_ids(
     conn: &Connection,
-    harness: &str,
     task_ids: &[String],
 ) -> rusqlite::Result<Vec<BashTaskProcessIds>> {
     let mut found = Vec::new();
-    for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
-        let placeholders = vec!["?"; chunk.len()].join(", ");
-        let sql = format!(
-            "SELECT task_id, pid, pgid, started_at
-             FROM bash_tasks
-             WHERE harness = ? AND task_id IN ({placeholders})
-               AND (pid IS NOT NULL OR pgid IS NOT NULL)"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let params = std::iter::once(harness).chain(chunk.iter().map(String::as_str));
-        let rows = stmt.query_map(params_from_iter(params), |row| {
-            Ok(BashTaskProcessIds {
-                task_id: row.get(0)?,
-                pid: row.get(1)?,
-                pgid: row.get(2)?,
-                started_at: row.get(3)?,
-            })
-        })?;
-        for row in rows {
-            found.push(row?);
+    if task_ids.is_empty() {
+        return Ok(found);
+    }
+    for harness in bash_task_harnesses(conn)? {
+        for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT task_id, pid, pgid, started_at
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_project_lookup
+                 WHERE harness = ? AND task_id IN ({placeholders})
+                   AND (pid IS NOT NULL OR pgid IS NOT NULL)"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params = std::iter::once(harness.as_str()).chain(chunk.iter().map(String::as_str));
+            let rows = stmt.query_map(params_from_iter(params), |row| {
+                Ok(BashTaskProcessIds {
+                    task_id: row.get(0)?,
+                    pid: row.get(1)?,
+                    pgid: row.get(2)?,
+                    started_at: row.get(3)?,
+                })
+            })?;
+            for row in rows {
+                found.push(row?);
+            }
         }
     }
     Ok(found)
@@ -684,6 +697,176 @@ mod tests {
         assert!(
             plan.contains("idx_bash_tasks_terminal_retention"),
             "terminal retention count did not use its age index: {plan}"
+        );
+    }
+
+    /// Pages a cold connection pulls from the database file while counting.
+    fn cold_count_page_reads(path: &Path, now_ms: i64) -> (usize, i32) {
+        let conn = crate::db::open_readonly(path).unwrap();
+        let mut current = 0;
+        let mut highwater = 0;
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                1,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        let eligible = terminal_rows_eligible_count(&conn, now_ms).unwrap();
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        (eligible, current)
+    }
+
+    // Health reports call this count every few seconds. Its cost must follow
+    // the handful of watched tasks and old rows, not the whole task history:
+    // a join order that walks every terminal row reads the entire table.
+    #[test]
+    fn terminal_retention_count_reads_pages_for_watches_not_history() {
+        const RECENT_TERMINAL_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let now_ms = 100 * TERMINAL_ROW_RETENTION_AGE_MS;
+        let old = now_ms - TERMINAL_ROW_RETENTION_AGE_MS - 1;
+        let recent = now_ms - 1;
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |task: &str, completed_at: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     started_at, completed_at, completion_delivered)
+                 VALUES ('opencode', 'session', ?1, 'project', ?2, '.', 'completed', 0, ?3, 1)",
+                params![task, "x".repeat(2_000), completed_at],
+            )
+            .unwrap();
+        };
+        // Recent history: retained, so never eligible, but it dominates the table.
+        for index in 0..RECENT_TERMINAL_ROWS {
+            insert(&format!("recent-{index}"), recent);
+        }
+        for task in ["old-watched", "old-plain-1", "old-plain-2"] {
+            insert(task, old);
+        }
+        for (task, watch) in [("old-watched", "w1"), ("recent-7", "w2")] {
+            tx.execute(
+                "INSERT INTO bash_pattern_watches
+                    (harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at)
+                 VALUES ('opencode', 'session', ?1, ?2, 'literal', 'x', 0)",
+                params![task, watch],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > RECENT_TERMINAL_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let (eligible, page_reads) = cold_count_page_reads(&path, now_ms);
+
+        // The watched old row stays; the two unwatched old rows are eligible.
+        assert_eq!(eligible, 2);
+        assert!(
+            page_reads < 64,
+            "counting two watches and three old rows read {page_reads} of {table_pages} pages"
+        );
+    }
+
+    /// The persisted-task GC asks for recorded pids once per session
+    /// directory. The lookup covers every harness but must stay on the
+    /// harness-keyed index: reading the whole task history per directory is
+    /// the cost it exists to avoid.
+    #[test]
+    fn process_id_lookup_reads_pages_for_requested_tasks_not_history() {
+        const HISTORY_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |harness: &str, task: &str, pid: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     pid, pgid, started_at)
+                 VALUES (?1, 'session', ?2, 'project', ?3, '.', 'completed', ?4, ?4, 0)",
+                params![harness, task, "x".repeat(2_000), pid],
+            )
+            .unwrap();
+        };
+        for index in 0..HISTORY_ROWS {
+            let harness = if index % 4 == 0 { "runner" } else { "opencode" };
+            insert(harness, &format!("history-{index}"), 1_000 + index);
+        }
+        insert("opencode", "wanted-opencode", 7);
+        insert("runner", "wanted-runner", 8);
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > HISTORY_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let conn = crate::db::open_readonly(&path).unwrap();
+        let cache_misses = |reset: i32| {
+            let (mut current, mut highwater) = (0, 0);
+            let status = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    &mut current,
+                    &mut highwater,
+                    reset,
+                )
+            };
+            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        cache_misses(1);
+        let mut found = list_bash_task_process_ids(
+            &conn,
+            &[
+                "wanted-opencode".to_string(),
+                "wanted-runner".to_string(),
+                "never-written".to_string(),
+            ],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.task_id, row.pid))
+        .collect::<Vec<_>>();
+        let page_reads = cache_misses(0);
+        found.sort();
+
+        assert_eq!(
+            found,
+            [
+                ("wanted-opencode".to_string(), Some(7)),
+                ("wanted-runner".to_string(), Some(8)),
+            ],
+            "the lookup must find the tasks under every harness"
+        );
+        assert!(
+            i64::from(page_reads) < table_pages / 10,
+            "looking up three task ids read {page_reads} of {table_pages} pages"
         );
     }
 }

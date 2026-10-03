@@ -12,7 +12,7 @@ For the removal order and harness-specific registration steps, see [Uninstall](.
 
 OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.
 
-`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
+`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls in a main session, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. A delegated (subagent) session is not bounded by it: it cannot be woken once its turn ends, so its `bash_watch` without a timeout waits until the command finishes. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
 
 On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
 
@@ -244,10 +244,12 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "restrict_to_project_root": false,
 
   // OpenCode plugin only. When true, the auto-update hook installs newer
-  // @cortexkit/aft-opencode versions automatically when you have @latest in your
-  // OpenCode config.plugin entry. When false, the hook still notifies you that an
-  // update is available but does not install it. Local-dev (file://) and pinned
-  // (@x.y.z) installs always notify-only regardless of this setting.
+  // @cortexkit/aft-opencode versions automatically when your OpenCode plugin
+  // entry is unpinned (no version, or a `latest` tag). When false, the hook still
+  // notifies you that an update is available but does not install it. Local-dev
+  // (file://) and pinned (@x.y.z) installs always notify-only regardless of this
+  // setting. `aft setup` and `aft doctor --fix` write a pinned entry matching the
+  // CLI version, so update by running `npx @cortexkit/aft@latest doctor --fix`.
   // Default: true. USER-only — strict-allowlist trust boundary refuses to honor
   // this field from project-level config to prevent hostile repos from silently
   // suppressing security updates.
@@ -310,8 +312,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "background": false,
 
     // Allow subagents to run background bash. When false, `background: true`
-    // is converted to a foreground call that blocks up to the hard cap, and an
-    // async `bash_watch` becomes a sync wait. Default true because workers are
+    // is converted to a foreground call that blocks up to the hard cap (the
+    // 30-minute default unless `timeout` is passed; only a `wait: true` call
+    // without a timeout runs with no hard kill), and an async `bash_watch`
+    // becomes a sync wait that lasts until the command finishes. Default true
+    // because workers are
     // multi-turn and use bash_watch to wait. OpenCode applies it to sessions
     // with a parent session; Pi applies it to headless runs (`pi -p`,
     // `--mode json`) and to processes started with MAGIC_CONTEXT_PI_SUBAGENT=1,
@@ -409,6 +414,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "write": false   // Create and edit conversation comments (implies read).
   },
 
+  // User-only. OpenCode 2 server AFT raises permission prompts on. Absent by
+  // default: AFT then finds the server it runs inside. See "OpenCode 2
+  // permission prompts" below.
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "server_password_env": "OPENCODE_SERVER_PASSWORD"  // a variable NAME, never the password
+  },
+
   // Git co-authorship for commits made by AFT-spawned agent children.
   // "off" (default) | "auto" | an explicit "Name <email>" identity.
   // User and project tiers are accepted; normal project-over-user precedence applies.
@@ -437,6 +450,45 @@ A hashline mutation attempts to register every affected path before changing fil
 
 Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` removes either, AFT keeps the ordinary edit/read behavior for the registered tools and emits exactly one configure-time warning per load: `hashline_read_disabled` when `read` is disabled (it takes precedence), otherwise `hashline_edit_disabled`. No other tool is unregistered.
 
+## Search reranking
+
+`search.rerank` lets a cross-encoder reorder the head of `aft_search` results. It is off by default.
+
+```jsonc
+{
+  "search": {
+    "rerank": {
+      "backend": "off",          // "off" (default) | "onnx" | "remote" | "synapse"
+      // "model": "...",           // onnx: bge-reranker-base (default), bge-reranker-v2-m3,
+                                  //   jina-reranker-v1-turbo or gte-reranker-modernbert-base.
+                                  // remote and synapse: required; the model the service serves.
+      // "endpoint": "https://host/v1",   // remote only: base URL; AFT appends /rerank
+      // "api_key_env": "RERANK_API_KEY",  // remote only: env var holding the key (not the key)
+      "top_n": 20,                // results reranked per search (default 20, at most 200; the
+                                  //   backend caps it too: 64 for onnx, 20 for remote and synapse)
+      "timeout_ms": 1500          // budget per search (default 1500, clamped to 50..15000)
+    }
+  }
+}
+```
+
+What gets reranked:
+
+- **Prose questions only.** A query that is wholly an identifier, a path, a regex, an error code or one quoted literal is not reranked; it keeps the fused order and its response carries no rerank note. Mixed queries (prose words around an identifier) are reranked.
+- **Exact matches keep their order.** Results with exact evidence keep the engine's order and positions; only the first `top_n` non-exact results of the first result block are reordered, and only among the positions they already held. Results below them are untouched.
+- Each candidate is scored as `path:line`, a name line (the symbol's name, or for a whole-file result the query's identifier found in the file, else the file name), and up to about 1 KB of its text.
+- Scoring never blocks a search. While a backend is still being built, or when it times out, is busy or fails, the search keeps the fused order and appends `(rerank skipped: <reason>)` to the response. The first outcome for a result list (an order or a skip) is reused for every later page of that list, so pages never repeat or lose results.
+
+**Trust boundary:** `search.rerank` is user config. A project config may only set `"backend": "off"`; any other project-tier rerank key, including `backend` set to something else, `model`, `endpoint`, `api_key_env`, `top_n` and `timeout_ms`, is dropped with a configuration warning. The same applies to a project `harnesses.<name>.search` block. A repository can turn reranking off for itself, but it cannot turn it on or point it at a server.
+
+Backends:
+
+- **`synapse`** runs the model in CortexKit Synapse. It needs AFT running under the CortexKit daemon with Synapse registered; outside it the backend reports itself unavailable and searches keep the fused order. `model` names the Synapse rerank model.
+- **`onnx`** runs a pinned model locally through ONNX Runtime. The model is downloaded and hash-checked in the background on first use (about 0.15 to 2.3 GB depending on the model), and searches are not reranked until it is loaded. It is CPU-heavy: about 2 s and several CPU-seconds per reranked search on a laptop, more when the machine is busy, so it suits idle machines. With the default `timeout_ms` a busy CPU often skips instead of reranking.
+- **`remote`** calls a Cohere-style `POST <endpoint>/rerank` (`model`, `query`, `documents`, `top_n` in; `results[{index, relevance_score}]` out, scores in [0, 1]). This works with OpenRouter, Voyage, Cohere and other compatible services, and with a Hugging Face TEI server when the endpoint carries the `tei+` prefix (`tei+http://host:8080`). At most 20 candidates are sent per search. Redirects are refused, and errors never include the key or response bodies.
+
+See [Synapse search backends](synapse-search-backends.md) for the wire details of `remote` and `synapse`.
+
 ## GitHub integration
 
 The user-only `github` block controls the complete GitHub surface. `shim` defaults to `true`; `read` and `write` default to `false`. Set all three to `false` for zero AFT-originated `gh` traffic. GitHub capabilities never unregister host tools. Project `github` blocks are ignored with a configuration warning because repositories cannot grant themselves network-backed capabilities or vary host-wide tool descriptions.
@@ -464,6 +516,34 @@ Every enabled GitHub resource read fetches live data; a prior read never satisfi
 ```
 
 If no fallback copy exists, the live-fetch error is returned unchanged. Successful structured `gh` mutations invalidate matching fallback copies, and concurrent reads of the same resource share one in-flight live fetch.
+
+## OpenCode 2 permission prompts
+
+When OpenCode 2's permission rules resolve a tool call to "ask" (a `bash` command your rules ask about, an edit outside the project, and so on), AFT raises the prompt through the OpenCode server's HTTP API. It has to find that server first, and it must be the server AFT is running inside: OpenCode 2 loads the AFT plugin into its server process, so the server showing your session is the very process AFT runs in, and that process's ID identifies it.
+
+Without any setting, AFT finds it on its own:
+
+- a service registration (`$XDG_STATE_HOME/opencode/service*.json`) is used only if the process ID recorded in it is the ID of the server process AFT runs in. A TUI's managed background service registers itself too; a plain `opencode serve` running beside it never sends its prompts there;
+- otherwise AFT asks the operating system which TCP ports its own process listens on (`lsof` on macOS and Linux, `/proc` on Linux without `lsof`, `netstat` on Windows) and uses the password OpenCode itself adopted from `OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD`. The username is always `opencode`. AFT never guesses ports: the password is only ever sent to ports this process listens on, never to other servers on `4096` and the ports after it. An explicit `--port` must be one of those ports; if the lookup itself fails, AFT uses a `--port` on the command line and otherwise refuses.
+
+Every candidate is checked once with an authenticated call to `/api/info`, which reports the ID of the process serving it; that must be the server process AFT runs in before any prompt is sent.
+
+Some servers cannot be found this way: `opencode --standalone` runs a private server on a random port and hides its password from plugins, and `opencode serve` started without `OPENCODE_SERVER_PASSWORD` generates a password nobody else can read. Prompts then fail closed (the call is refused, never allowed), and the refusal and the plugin log say why and how to fix it. The fix is either to start OpenCode with `OPENCODE_SERVER_PASSWORD` set, or to name the server explicitly:
+
+```jsonc
+{
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "server_password_env": "OPENCODE_SERVER_PASSWORD"
+  }
+}
+```
+
+`server_url` replaces discovery. `server_password_env` names the environment variable that holds the server's password, never the password itself; when it is absent AFT uses `OPENCODE_PASSWORD`, then `OPENCODE_SERVER_PASSWORD`. Both are read when OpenCode starts.
+
+**OpenChamber and other UIs** that start `opencode serve` for you: set `server_url` to the same host and port you gave the UI (`OPENCODE_HOST` / `OPENCODE_PORT` for OpenChamber), and make sure the server is started with a password AFT can read (for example `OPENCODE_SERVER_PASSWORD` in the environment the UI starts it in).
+
+The `opencode` block is honored only in your user config. A project config that sets it is ignored with a warning, because a repository could otherwise send your permission prompts to a server it controls.
 
 ## Git co-authorship
 
@@ -538,6 +618,16 @@ block, including `[]`, wins over every generated name. Project configs cannot
 disable `aft_safety` or host tool slots, whether directly or through a legacy
 key.
 
+A configuration AFT cannot use — a file that does not parse, a rejected key such
+as `gh_read` or `gh_shim.enabled`, or a missing `subc.connection_file` — no
+longer falls back to defaults. The plugin still loads, every AFT tool call
+returns the error and how to fix it, the sidebar and status show it, and no
+indexing starts until the file is fixed and the host restarted.
+
+When `FASTEMBED_CACHE_DIR` is not set, the local embedding model is cached in
+`$XDG_CACHE_HOME/fastembed` if `XDG_CACHE_HOME` is an absolute path, otherwise
+`~/.cache/fastembed`.
+
 ### Earlier migrations
 
 v0.18 reorganized experimental flags. Old config files using the flat shape:
@@ -594,6 +684,19 @@ only if their binary can be resolved from project `node_modules/.bin`, AFT's man
 | bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
 | yaml-language-server | `.yaml .yml` | `yaml-language-server` |
 
+**TypeScript 7 and later** ship no `tsserver.js`, so `typescript-language-server` cannot
+serve them. When the nearest installed `node_modules/typescript/package.json` reports version
+7 or later, AFT starts the compiler's own language server instead: the platform package's
+`@typescript/typescript-<os>-<cpu>/lib/tsc --lsp --stdio`, run directly rather than through the
+Node wrapper in `node_modules/.bin`. Its id is `typescript-native`. Each TypeScript 7
+installation gets its own server, separate from `typescript-language-server`, so a monorepo that
+mixes TypeScript 5 and 7 packages runs
+both. The choice follows what is installed, never the lockfile. `lsp.disabled: ["typescript"]`
+turns both off; `typescript-native` turns off only the native server. If the platform package is
+missing, or the installed version is unreadable, AFT reports a named gap and starts nothing.
+The built-in `typescript-language-server` is only swapped when you have not pointed the
+`typescript` server at another binary.
+
 **Experimental:** `ty` (Astral's Python type checker) — gated behind
 `experimental.lsp_ty: true` or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright
 unless you also disable Pyright via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"`
@@ -613,7 +716,7 @@ configuration above shows registering `tinymist` for Typst files. Required field
 `args`, `root_markers` (defaults to `[".git"]`), `disabled`.
 
 **Disabling a built-in:** add the server's id to `lsp.disabled`. Built-in ids are
-`typescript`, `python` (Pyright), `rust` (rust-analyzer), `go` (gopls), `bash`,
+`typescript`, `typescript-native` (TypeScript 7+), `python` (Pyright), `rust` (rust-analyzer), `go` (gopls), `bash`,
 `yaml`, and `ty`. Custom servers use the key you registered them under in
 `lsp.servers`. IDs are case-insensitive.
 
@@ -739,3 +842,14 @@ also stop triggering reindexing.
 Naming a file explicitly in `grep` (e.g. `path: "captures/log.txt"`) searches it
 even when it is gitignored or `.aftignore`d, matching ripgrep — an explicitly
 named file is always searched.
+
+## Oxlint language server
+
+Install Oxlint in the project with `npm install --save-dev oxlint` and add an
+`.oxlintrc.json` or `.oxlintrc` configuration file to enable its JS/TS diagnostics.
+AFT starts `node_modules/.bin/oxlint --lsp` (supported since Oxlint 1.29.0).
+If the project's `node_modules/.bin/oxc_language_server` is present, AFT prefers
+that standalone server with no arguments, including when both binaries exist.
+This supports older releases that lack `--lsp` without probing the version on
+every start. AFT does not auto-install Oxlint; the project's dependency controls
+its version. Current releases such as 1.86.0 use `oxlint --lsp` only.

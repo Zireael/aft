@@ -202,6 +202,17 @@ describe("capBodyToGithubLimit", () => {
     ].join("\n");
   }
 
+  test("caps session-specific logs without discarding the report header", () => {
+    const body = makeBody({ logLineCount: 5000, lineSize: 200 }).replace(
+      "## Logs (last 200 lines per harness)",
+      "## Logs (last 200 lines for session ses_target; project /projects/target, 10:00–10:05)",
+    );
+    const capped = capBodyToGithubLimit(body, 60_000);
+    expect(capped).toContain("## Logs (last 200 lines for session ses_target");
+    expect(capped).toContain("[truncated for GitHub 64KB limit — older log lines dropped]");
+    expect(Buffer.byteLength(capped, "utf8")).toBeLessThanOrEqual(60_000);
+  });
+
   test("returns body unchanged when already within budget", () => {
     const body = makeBody({ logLineCount: 20 });
     const capped = capBodyToGithubLimit(body, 100_000);

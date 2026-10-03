@@ -344,6 +344,10 @@ CREATE INDEX idx_bash_pattern_watches_task
 pub enum OpenError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
+    InitializationFailed {
+        step: &'static str,
+        error: rusqlite::Error,
+    },
     DowngradeRefused {
         db_version: u32,
         supported: u32,
@@ -360,6 +364,7 @@ impl fmt::Display for OpenError {
         match self {
             OpenError::Io(error) => write!(f, "database I/O error: {error}"),
             OpenError::Sqlite(error) => write!(f, "sqlite error: {error}"),
+            OpenError::InitializationFailed { step, error } => write!(f, "sqlite {step}: {error}"),
             OpenError::DowngradeRefused {
                 db_version,
                 supported,
@@ -374,11 +379,29 @@ impl fmt::Display for OpenError {
     }
 }
 
+impl OpenError {
+    pub(crate) fn is_busy(&self) -> bool {
+        let error = match self {
+            Self::Sqlite(error)
+            | Self::InitializationFailed { error, .. }
+            | Self::MigrationFailed { error, .. } => error,
+            _ => return false,
+        };
+        is_busy_error(error)
+    }
+}
+
 impl std::error::Error for OpenError {}
 
 impl From<std::io::Error> for OpenError {
     fn from(error: std::io::Error) -> Self {
         OpenError::Io(error)
+    }
+}
+
+impl From<(&'static str, rusqlite::Error)> for OpenError {
+    fn from((step, error): (&'static str, rusqlite::Error)) -> Self {
+        Self::InitializationFailed { step, error }
     }
 }
 
@@ -394,16 +417,227 @@ impl From<rusqlite::Error> for OpenError {
 /// current schema version up to [`CURRENT_SCHEMA_VERSION`], and returns the
 /// configured connection.
 pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
+    open_with_mode(path, OpenMode::Deferred)
+}
+
+pub(crate) const TOOL_RETRY_BUSY_WAIT: Duration = Duration::from_millis(250);
+
+/// How long a statement on an open AFT connection waits for another process's
+/// lock before SQLite reports `database is locked`.
+pub(crate) const STEADY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// True for SQLite's lock-contention results (`SQLITE_BUSY`, `SQLITE_LOCKED`).
+pub(crate) fn is_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Why a [`maintenance_write`] did not run its work to completion.
+#[derive(Debug)]
+pub(crate) enum MaintenanceWriteError {
+    /// Another thread in this process held the connection mutex at the first
+    /// attempt. Losing the mutex is routine for maintenance, which runs later.
+    MutexHeld,
+    /// Another process kept the SQLite write lock for the whole wait budget.
+    Busy(rusqlite::Error),
+    /// The connection mutex was poisoned by a panic in another thread.
+    Poisoned,
+    /// The work failed for a reason other than lock contention.
+    Failed(rusqlite::Error),
+}
+
+/// Run maintenance writes on the shared connection without ever holding the
+/// process-wide connection mutex while SQLite waits for another process's
+/// write lock.
+///
+/// Each attempt takes the mutex with `try_lock` and runs `work` with SQLite's
+/// busy handler switched off, so a foreign write lock fails the attempt at
+/// once instead of sleeping inside it. Between attempts the mutex is released
+/// and this thread sleeps, so requests reading the database run meanwhile.
+/// Attempts repeat until `budget` has passed on the wall clock.
+///
+/// A busy timeout alone cannot give that bound. SQLite's default busy handler
+/// counts its nominal sleeps (1, 2, 5, 10 ... ms) instead of reading the clock,
+/// so when each sleep overshoots, as on a loaded or throttled machine, a
+/// 250 ms timeout can hold the mutex for one to several seconds.
+///
+/// `work` must be safe to repeat: a busy attempt has rolled back its
+/// transaction, and the steady busy wait is restored before every release.
+pub(crate) fn maintenance_write<T>(
+    db: &std::sync::Mutex<TrackedConnection>,
+    budget: Duration,
+    mut work: impl FnMut(&mut TrackedConnection) -> rusqlite::Result<T>,
+) -> Result<T, MaintenanceWriteError> {
+    const FIRST_RETRY_SLEEP: Duration = Duration::from_millis(2);
+    const LONGEST_RETRY_SLEEP: Duration = Duration::from_millis(25);
+
+    let deadline = std::time::Instant::now() + budget;
+    let mut sleep = FIRST_RETRY_SLEEP;
+    let mut last_busy = None;
+    loop {
+        match db.try_lock() {
+            Ok(mut conn) => {
+                let result = with_busy_wait(&mut *conn, Duration::ZERO, &mut work);
+                drop(conn);
+                match result {
+                    Ok(value) => return Ok(value),
+                    Err(error) if is_busy_error(&error) => last_busy = Some(error),
+                    Err(error) => return Err(MaintenanceWriteError::Failed(error)),
+                }
+            }
+            // Only the first attempt treats a held mutex as a reason to stop.
+            // Once SQLite has reported the database busy, a request that took
+            // the mutex in the pause is expected and the next attempt follows.
+            Err(std::sync::TryLockError::WouldBlock) if last_busy.is_none() => {
+                return Err(MaintenanceWriteError::MutexHeld)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(MaintenanceWriteError::Poisoned)
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(MaintenanceWriteError::Busy(
+                last_busy.expect("a retried attempt found the database busy"),
+            ));
+        }
+        std::thread::sleep(sleep.min(deadline - now));
+        sleep = (sleep * 2).min(LONGEST_RETRY_SLEEP);
+    }
+}
+
+/// Run `work` on a connection with a different busy wait, restoring the steady
+/// wait afterwards whether or not `work` succeeded.
+fn with_busy_wait<C, T>(
+    conn: &mut C,
+    wait: Duration,
+    work: impl FnOnce(&mut C) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T>
+where
+    C: std::ops::DerefMut<Target = Connection>,
+{
+    conn.busy_timeout(wait)?;
+    let result = work(conn);
+    let restored = conn.busy_timeout(STEADY_BUSY_TIMEOUT);
+    let value = result?;
+    restored?;
+    Ok(value)
+}
+
+/// How long a maintenance write keeps retrying while another process holds
+/// the write lock on `aft.db`, before it defers to its next run.
+///
+/// `AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS` replaces `default` so integration
+/// tests can make the budget much longer than any request's latency budget: a
+/// maintenance path that waits while holding the connection mutex then delays
+/// reads by that whole budget, which no scheduling noise can explain away.
+pub(crate) fn maintenance_busy_budget(default: Duration) -> Duration {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("AFT_TEST_MAINTENANCE_BUSY_BUDGET_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_millis)
+        })
+        .unwrap_or(default)
+}
+
+/// Minimum spacing between runs of the once-a-minute storage maintenance
+/// (write-ledger fold, bash task retention).
+///
+/// `AFT_TEST_MAINTENANCE_INTERVAL_MS` shortens it so integration tests can
+/// observe several runs; production always uses one minute.
+pub(crate) fn maintenance_interval() -> Duration {
+    static INTERVAL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("AFT_TEST_MAINTENANCE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map_or(Duration::from_secs(60), Duration::from_millis)
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    Deferred,
+    SingleAttempt,
+}
+
+pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
+    // Refuse a newer schema before the PRAGMAs below, which would otherwise
+    // switch journal modes and create tables on a database this build cannot
+    // read. `run_migrations` repeats the check for databases this peek cannot
+    // open read-only.
+    if let Some(db_version) = peek_schema_version(path) {
+        if db_version > CURRENT_SCHEMA_VERSION {
+            return Err(OpenError::DowngradeRefused {
+                db_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+    }
 
-    let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
-    apply_pragmas(&conn)?;
-    run_migrations(&mut conn)?;
-    Ok(conn)
+    if mode == OpenMode::SingleAttempt {
+        // Request-path retries must not repeat the deferred ten-second wait.
+        let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
+        apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
+        run_migrations(&mut conn)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        return Ok(conn);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut backoff = Duration::from_millis(10);
+    let mut conn = loop {
+        match TrackedConnection::open(path, SqliteStore::AftDb).map_err(OpenError::from) {
+            Ok(conn) => break conn,
+            Err(error) if error.is_busy() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    backoff.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    loop {
+        // WAL journal transitions can return BUSY without calling SQLite's busy
+        // handler. Retry initialization on the owning connection, not a second
+        // descriptor; failed migration transactions have rolled back by here.
+        let result = (|| {
+            apply_pragmas_with_timeout(
+                &conn,
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(Duration::from_millis(100)),
+            )?;
+            run_migrations(&mut conn)?;
+            Ok::<(), OpenError>(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.busy_timeout(Duration::from_secs(5))?;
+                return Ok(conn);
+            }
+            Err(error) if error.is_busy() && std::time::Instant::now() < deadline => {
+                std::thread::sleep(
+                    backoff.min(deadline.saturating_duration_since(std::time::Instant::now())),
+                );
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Open an existing AFT database without creating, migrating, or mutating it.
@@ -420,14 +654,48 @@ pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
     Ok(conn)
 }
 
+/// Schema version of an existing AFT database, read through a read-only
+/// connection so nothing about the file changes. `None` when the file is
+/// absent, cannot be opened read-only, has no schema table yet, or is locked
+/// right now: the peek never waits, because the full open that follows has
+/// its own bounded busy handling and repeats the version check.
+pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn = open_readonly(path).ok()?;
+    conn.busy_timeout(Duration::ZERO).ok()?;
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if !has_table {
+        return None;
+    }
+    current_schema_version(&conn).ok()
+}
+
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
 pub fn apply_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    // Set the wait policy before WAL can acquire its journal lock. Otherwise a
-    // concurrently opening daemon may fail immediately instead of honoring it.
-    conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    apply_pragmas_with_timeout(conn, Duration::from_secs(5)).map_err(|(_, error)| error)
+}
+
+fn apply_pragmas_with_timeout(
+    conn: &Connection,
+    timeout: Duration,
+) -> Result<(), (&'static str, rusqlite::Error)> {
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| ("PRAGMA foreign_keys", e))?;
+    // WAL transitions may bypass this handler; open also retries explicitly.
+    conn.busy_timeout(timeout)
+        .map_err(|e| ("busy_timeout", e))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| ("PRAGMA journal_mode=WAL", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| ("PRAGMA synchronous", e))?;
     Ok(())
 }
 
@@ -652,6 +920,174 @@ mod tests {
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
     ];
+
+    /// Opens `aft.db` twice: the first connection plays this process's shared
+    /// one, the second plays another process that takes the write lock.
+    fn shared_and_foreign(
+        dir: &Path,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<TrackedConnection>>,
+        TrackedConnection,
+    ) {
+        let path = dir.join("aft.db");
+        let shared = open(&path).expect("open shared connection");
+        let foreign = open(&path).expect("open foreign connection");
+        (std::sync::Arc::new(std::sync::Mutex::new(shared)), foreign)
+    }
+
+    fn write_state(conn: &mut TrackedConnection, value: &str) -> rusqlite::Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO harness_state(harness, key, value, updated_at) VALUES ('h', 'k', ?1, 0)
+             ON CONFLICT(harness, key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        tx.commit()
+    }
+
+    #[test]
+    fn maintenance_write_leaves_the_mutex_free_while_another_process_holds_the_write_lock() {
+        let dir = tempdir().unwrap();
+        let (shared, foreign) = shared_and_foreign(dir.path());
+        foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let budget = Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let shared = std::sync::Arc::clone(&shared);
+            let attempted = std::sync::Arc::clone(&attempted);
+            std::thread::spawn(move || {
+                maintenance_write(&shared, budget, |conn| {
+                    attempted.store(true, std::sync::atomic::Ordering::Release);
+                    write_state(conn, "maintenance")
+                })
+            })
+        };
+        // Read only once the writer has made its first attempt: a reader
+        // holding the mutex before that would make it stop as `MutexHeld`.
+        while !attempted.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut slowest_lock = Duration::ZERO;
+        while !writer.is_finished() {
+            let asked = std::time::Instant::now();
+            let conn = shared.lock().unwrap();
+            slowest_lock = slowest_lock.max(asked.elapsed());
+            conn.query_row("SELECT COUNT(*) FROM harness_state", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+            drop(conn);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let outcome = writer.join().unwrap();
+
+        assert!(
+            matches!(outcome, Err(MaintenanceWriteError::Busy(_))),
+            "expected the write to give up busy, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= budget,
+            "gave up after {:?}, before its {budget:?} budget",
+            started.elapsed()
+        );
+        // The writer's single attempts return at once, so a reader only ever
+        // waits for one of them, never for the budget.
+        assert!(
+            slowest_lock < budget / 4,
+            "a reader waited {slowest_lock:?} for the connection mutex"
+        );
+        foreign.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn maintenance_write_commits_once_the_foreign_write_lock_is_released() {
+        let dir = tempdir().unwrap();
+        let (shared, foreign) = shared_and_foreign(dir.path());
+        foreign.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = {
+            let shared = std::sync::Arc::clone(&shared);
+            std::thread::spawn(move || {
+                maintenance_write(&shared, Duration::from_secs(30), |conn| {
+                    write_state(conn, "maintenance")
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        foreign.execute_batch("COMMIT").unwrap();
+
+        writer
+            .join()
+            .unwrap()
+            .expect("write after the lock was released");
+        let value: String = foreign
+            .query_row(
+                "SELECT value FROM harness_state WHERE key = 'k'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "maintenance");
+    }
+
+    #[test]
+    fn maintenance_write_stops_at_once_when_the_mutex_is_held() {
+        let dir = tempdir().unwrap();
+        let (shared, _foreign) = shared_and_foreign(dir.path());
+        let _held = shared.lock().unwrap();
+        let mut ran = false;
+        let outcome = maintenance_write(&shared, Duration::from_secs(30), |_| {
+            ran = true;
+            Ok(())
+        });
+        assert!(matches!(outcome, Err(MaintenanceWriteError::MutexHeld)));
+        assert!(!ran);
+    }
+
+    #[test]
+    fn only_sqlite_contention_is_retryable() {
+        for code in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_LOCKED,
+            rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE,
+        ] {
+            let error = || rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            assert!(OpenError::Sqlite(error()).is_busy());
+            assert!(OpenError::InitializationFailed {
+                step: "PRAGMA journal_mode=WAL",
+                error: error()
+            }
+            .is_busy());
+            assert!(OpenError::MigrationFailed {
+                from: 0,
+                to: 1,
+                error: error()
+            }
+            .is_busy());
+        }
+        for code in [
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_CANTOPEN,
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_READONLY,
+        ] {
+            assert!(!OpenError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None
+            ))
+            .is_busy());
+        }
+        assert!(!OpenError::DowngradeRefused {
+            db_version: 99,
+            supported: 1
+        }
+        .is_busy());
+        assert!(
+            !OpenError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).is_busy()
+        );
+    }
 
     #[test]
     fn open_fresh_db_creates_all_tables() {

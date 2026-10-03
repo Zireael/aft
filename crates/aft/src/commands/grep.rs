@@ -5,7 +5,7 @@ use crate::context::AppContext;
 use crate::grep_executor::{self, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{build_path_filters, GrepMatch, GrepResult, IndexStatus};
+use crate::search_index::{build_path_filters, GrepMatch, GrepResult, IndexStatus, WalkBound};
 
 pub(crate) use crate::grep_executor::ripgrep_glob;
 
@@ -17,13 +17,13 @@ const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
 /// Longest matching line, in characters, the grep tool prints before cutting
 /// it and appending `GREP_LINE_TRUNCATED_MARKER`.
-const GREP_MAX_LINE_CHARS: usize = 500;
+pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
 /// Byte budget for the match rows of one grep reply (file headers included).
 /// Rows past the budget are left for the next page instead of being printed.
-const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 /// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
 /// knows the printed text is not the whole line.
-const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
+pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 /// Text note for a grep or glob whose search path holds no searchable file.
 pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
     "(No searchable files exist under the searched path, so nothing was searched.)";
@@ -124,13 +124,23 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         path_exclusion: None,
     };
-    let (result, phases) =
-        grep_executor::execute_profiled_with_filters(ctx, &compiled, &scope, &params, &filters);
+    // A parent folder session answers from its child repositories' indexes.
+    let (result, phases, parent_gaps) =
+        match crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters) {
+            Some(answer) => answer,
+            None => {
+                let (result, phases) = grep_executor::execute_profiled_with_filters(
+                    ctx, &compiled, &scope, &params, &filters,
+                );
+                (result, phases, Vec::new())
+            }
+        };
     let search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
     let scope_probe_started = std::time::Instant::now();
-    let scope_has_files = phases
+    let scope_presence = phases
         .indexed_scope_has_files
-        .unwrap_or_else(|| grep_executor::scope_has_files(&project_root, &scope));
+        .or_else(|| grep_executor::scope_has_files(&scope, &filters));
+    let scope_has_files = scope_presence != Some(false);
     let scope_probe = scope_probe_started.elapsed();
     let format_started = std::time::Instant::now();
     let page_matches: Vec<&GrepMatch> =
@@ -154,7 +164,8 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let mut body = serde_json::json!({
         "text": text,
-        "complete": !result.walk_truncated
+        "complete": scope_presence.is_some() && !result.walk_truncated
+            && !result.scan_deadline_reached
             && result.skipped_foreign_mounts == 0
             && result.missing_on_disk == 0,
         "no_files_matched_scope": !scope_has_files,
@@ -167,16 +178,43 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         "next_offset": next_offset,
         "total_matches": result.total_matches,
         "files_searched": result.files_searched,
+        "files_read_directly": result.files_read_directly,
         "files_with_matches": result.files_with_matches,
         "index_status": result.index_status.as_str(),
         "truncated": result.truncated,
         "search_ms": (search_ms * 1000.0).round() / 1000.0,
     });
+    if let Some(bound) = result.walk_bound {
+        body["walk_stopped_by"] = serde_json::Value::String(
+            match bound {
+                WalkBound::TimeBudget => "time_budget",
+                WalkBound::FileLimit(_) => "file_limit",
+                WalkBound::Cancelled => "cancelled",
+            }
+            .to_string(),
+        );
+    }
     if result.walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
+        let note = walk_coverage_note(&result).unwrap_or_else(|| {
+            "(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)".to_string()
+        });
+        body["text"] = serde_json::Value::String(format!("{}\n\n{}", text, note));
+    }
+    if result.scan_deadline_reached {
+        // The scan ran out of time with candidate files still unread, so a
+        // missing match here is not evidence of absence.
+        body["scan_deadline_reached"] = serde_json::Value::Bool(true);
         body["text"] = serde_json::Value::String(format!(
-            "{}\n\n(Fallback directory walk stopped early: file-count or time budget reached; results may be incomplete.)",
-            text
+            "{}\n\n(Search stopped at its {}-second time budget before every candidate file was searched; matches may be missing. Narrow with path or include.)",
+            body["text"].as_str().unwrap_or_default(),
+            crate::grep_executor::FALLBACK_WALK_BUDGET.as_secs()
+        ));
+    }
+    if scope_presence.is_none() {
+        body["text"] = serde_json::Value::String(format!(
+            "{}\n\n(Scope probe reached its work bound; whether eligible files exist is unknown.)",
+            body["text"].as_str().unwrap_or_default()
         ));
     }
     if !scope_has_files {
@@ -215,6 +253,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
+    crate::views::parent::attach_gaps(&mut body, parent_gaps);
 
     if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
         body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();
@@ -223,11 +262,12 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     let service_ms = total_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
     match result.index_status {
         crate::search_index::IndexStatus::Ready => {
-            let status = if result.truncated || result.walk_truncated {
-                "partial"
-            } else {
-                "ok"
-            };
+            let status =
+                if result.truncated || result.walk_truncated || result.scan_deadline_reached {
+                    "partial"
+                } else {
+                    "ok"
+                };
             ctx.note_index_query(
                 crate::logging::IndexPlane::Search,
                 "grep",
@@ -350,6 +390,90 @@ fn grep_footer(result: &GrepResult) -> String {
     }
 }
 
+/// The footer the grep tool prints. An index answer gets the plain footer.
+/// Any other answer came from reading files directly (a fallback walk or a
+/// named file), so its index label also says how much of the scope that read
+/// covered: a zero next to "[index: building]" alone could mean either "no
+/// match anywhere" or "the walk never got there", and the reader cannot tell
+/// which without re-checking.
+fn grep_tool_footer(result: &GrepResult) -> String {
+    if result.index_status == IndexStatus::Ready {
+        return grep_footer(result);
+    }
+    let cap_note = if result.truncated { " (capped)" } else { "" };
+    format!(
+        "Found {} match across {} file{} [index: {}; {}]",
+        result.total_matches,
+        result.files_with_matches,
+        cap_note,
+        index_status_label(result.index_status),
+        direct_read_coverage(result)
+    )
+}
+
+/// How much of the scope a direct (non-index) read covered, for the footer.
+fn direct_read_coverage(result: &GrepResult) -> String {
+    let files = result.files_read_directly;
+    if let Some(bound) = result.walk_bound {
+        return format!(
+            "incomplete: checked {files} files before {}",
+            walk_bound_phrase(bound)
+        );
+    }
+    if result.scan_deadline_reached {
+        return format!(
+            "incomplete: stopped at the {}-second time budget",
+            crate::grep_executor::FALLBACK_WALK_BUDGET.as_secs()
+        );
+    }
+    if result.truncated || result.engine_capped {
+        // The search stopped collecting once it had enough matches, so some
+        // files were never read; the "(capped)" count already says the total
+        // is a floor.
+        return format!("stopped at the match limit after searching {files} files directly");
+    }
+    format!("searched all {files} files directly")
+}
+
+fn walk_bound_phrase(bound: WalkBound) -> String {
+    match bound {
+        WalkBound::TimeBudget => "the walk's time budget ran out".to_string(),
+        WalkBound::FileLimit(limit) => format!("the walk's {limit}-file limit"),
+        WalkBound::Cancelled => "the request was cancelled".to_string(),
+    }
+}
+
+/// A note spelling out what an incomplete fallback walk left unsearched and
+/// how to get an exhaustive answer, or `None` when the walk reached every
+/// file (or no walk ran).
+pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
+    let bound = result.walk_bound?;
+    let files = result.files_read_directly;
+    let index = match result.index_status {
+        IndexStatus::Ready => "index ready",
+        IndexStatus::Building => "index building",
+        IndexStatus::Fallback => "index not used",
+        IndexStatus::Disabled => "index disabled",
+    };
+    let exhaustive = if result.index_status == IndexStatus::Building {
+        "For an exhaustive search, narrow with path or include so the walk reaches every file, or retry once the index is ready (an index search reads every indexed file)."
+    } else {
+        "For an exhaustive search, narrow with path or include so the walk reaches every file."
+    };
+    let checked = match bound {
+        WalkBound::FileLimit(limit) => format!(
+            "checked {files} of more than {limit} files ({index}); the fallback walk stops at {limit} files, so files past that limit were not searched and matches may be missing."
+        ),
+        WalkBound::TimeBudget => format!(
+            "checked {files} files ({index}); the fallback walk ran out of its time budget before reaching every file, so files it did not reach were not searched and matches may be missing."
+        ),
+        WalkBound::Cancelled => format!(
+            "checked {files} files ({index}); the request was cancelled before the fallback walk reached every file, so matches may be missing."
+        ),
+    };
+    Some(format!("({checked} {exhaustive})"))
+}
+
 /// One rendered page of grep output: the match rows that fit the byte budget,
 /// grouped under their file path.
 #[derive(Debug)]
@@ -433,7 +557,7 @@ pub(crate) fn grep_page_text(
     offset: usize,
     single_file_scope: bool,
 ) -> String {
-    let footer = grep_footer(result);
+    let footer = grep_tool_footer(result);
     let mut text = if page.rows_text.is_empty() {
         footer
     } else {
@@ -488,7 +612,7 @@ pub(crate) fn grep_next_offset(
 
 /// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
 /// Returns the printable text and whether it was cut.
-fn truncate_grep_line(text: &str) -> (String, bool) {
+pub(crate) fn truncate_grep_line(text: &str) -> (String, bool) {
     match text.char_indices().nth(GREP_MAX_LINE_CHARS) {
         None => (text.to_string(), false),
         Some((byte_index, _)) => (
@@ -626,6 +750,9 @@ mod tests {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         }
     }
 

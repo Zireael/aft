@@ -1,0 +1,1161 @@
+{
+  "exact": {
+    "rows_unchanged": 16,
+    "metrics": {
+      "all_passed": true,
+      "pair_recall_at_10": 1.0,
+      "sentence_rank1": 1.0
+    },
+    "ranked_rows_sha256": "8ba56d35282dd15f2f2cc15730e3b20e96a751f8ccdda7fe6db8b755b309ac32",
+    "rows": [
+      {
+        "exact_marker": true,
+        "expected_file": "crates/searcher/src/sink.rs",
+        "family": "sentence",
+        "id": "ripgrep-sentence-sink-match",
+        "passed": true,
+        "query": "This method is called whenever a match is found.",
+        "rank": 1,
+        "repo": "ripgrep",
+        "result_files": [
+          "crates/searcher/src/sink.rs",
+          "crates/core/search.rs",
+          "crates/searcher/src/line_buffer.rs",
+          "crates/searcher/src/searcher/mmap.rs",
+          "crates/regex/src/matcher.rs"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/ignore/src/types.rs",
+        "family": "sentence",
+        "id": "ripgrep-sentence-file-types",
+        "passed": true,
+        "query": "All of the file type definitions, sorted lexicographically by name.",
+        "rank": 1,
+        "repo": "ripgrep",
+        "result_files": [
+          "crates/ignore/src/types.rs",
+          "crates/core/flags/lowargs.rs",
+          "crates/printer/src/hyperlink/mod.rs",
+          "crates/ignore/src/default_types.rs",
+          "crates/core/flags/hiargs.rs"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/searcher/src/sink.rs",
+        "family": "pair",
+        "id": "ripgrep-pair-sink-match",
+        "passed": true,
+        "query": "whenever match found",
+        "rank": 1,
+        "repo": "ripgrep",
+        "result_files": [
+          "crates/searcher/src/sink.rs",
+          "crates/core/search.rs",
+          "crates/regex/src/config.rs",
+          "crates/searcher/src/searcher/mmap.rs",
+          "crates/core/flags/parse.rs",
+          "crates/searcher/src/line_buffer.rs",
+          "crates/core/haystack.rs",
+          "crates/regex/src/matcher.rs",
+          "crates/core/flags/lowargs.rs",
+          "crates/regex/src/strip.rs"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/ignore/src/types.rs",
+        "family": "pair",
+        "id": "ripgrep-pair-file-types",
+        "passed": true,
+        "query": "definitions lexicographically name",
+        "rank": 1,
+        "repo": "ripgrep",
+        "result_files": [
+          "crates/ignore/src/types.rs",
+          "crates/core/flags/lowargs.rs",
+          "crates/printer/src/hyperlink/mod.rs",
+          "crates/core/flags/hiargs.rs",
+          "crates/ignore/src/default_types.rs",
+          "crates/globset/src/lib.rs",
+          "crates/core/flags/defs.rs",
+          "crates/core/flags/doc/template.rg.1",
+          "CHANGELOG.md",
+          "crates/printer/src/standard.rs"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "src/flask/sansio/app.py",
+        "family": "sentence",
+        "id": "flask-sentence-blueprint-order",
+        "passed": true,
+        "query": "Iterates over all blueprints by the order they were registered.",
+        "rank": 1,
+        "repo": "flask",
+        "result_files": [
+          "src/flask/sansio/app.py",
+          "docs/lifecycle.rst",
+          "docs/tutorial/blog.rst",
+          "docs/appcontext.rst",
+          "docs/cli.rst"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "src/flask/sessions.py",
+        "family": "sentence",
+        "id": "flask-sentence-permanent-key",
+        "passed": true,
+        "query": "This reflects the ``'_permanent'`` key in the dict.",
+        "rank": 1,
+        "repo": "flask",
+        "result_files": [
+          "src/flask/sessions.py",
+          "docs/config.rst",
+          "docs/patterns/fileuploads.rst",
+          "CHANGES.rst",
+          "src/flask/sansio/app.py"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "src/flask/sansio/app.py",
+        "family": "pair",
+        "id": "flask-pair-blueprint-order",
+        "passed": true,
+        "query": "blueprints order registered",
+        "rank": 1,
+        "repo": "flask",
+        "result_files": [
+          "src/flask/sansio/app.py",
+          "docs/lifecycle.rst",
+          "docs/patterns/appfactories.rst",
+          "examples/tutorial/flaskr/auth.py",
+          "docs/tutorial/blog.rst",
+          "src/flask/sansio/blueprints.py",
+          "examples/tutorial/flaskr/__init__.py",
+          "docs/appcontext.rst",
+          "docs/cli.rst",
+          "docs/api.rst"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "src/flask/sessions.py",
+        "family": "pair",
+        "id": "flask-pair-permanent-key",
+        "passed": true,
+        "query": "permanent key dict",
+        "rank": 1,
+        "repo": "flask",
+        "result_files": [
+          "src/flask/sessions.py",
+          "docs/patterns/fileuploads.rst",
+          "docs/api.rst",
+          "docs/config.rst",
+          "src/flask/sansio/app.py",
+          "src/flask/app.py",
+          "CHANGES.rst",
+          "docs/web-security.rst",
+          "docs/tutorial/database.rst",
+          "src/flask/sansio/scaffold.py"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "lib/route.js",
+        "family": "sentence",
+        "id": "fastify-sentence-shallow-copy",
+        "passed": true,
+        "query": "Since we are mutating/assigning only top level props, it is fine to have a shallow copy using the spread operator",
+        "rank": 1,
+        "repo": "fastify",
+        "result_files": [
+          "lib/route.js",
+          "fastify.js",
+          "docs/Reference/Plugins.md",
+          "docs/Guides/Prototype-Poisoning.md",
+          "docs/Reference/Hooks.md"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "lib/reply.js",
+        "family": "sentence",
+        "id": "fastify-sentence-reply-hijacked",
+        "passed": true,
+        "query": "We are checking whether reply was hijacked or the response has ended.",
+        "rank": 1,
+        "repo": "fastify",
+        "result_files": [
+          "lib/reply.js",
+          "lib/wrap-thenable.js",
+          "docs/Reference/Reply.md",
+          "docs/Reference/Server.md",
+          "lib/symbols.js"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "lib/route.js",
+        "family": "pair",
+        "id": "fastify-pair-shallow-copy",
+        "passed": true,
+        "query": "mutating shallow spread",
+        "rank": 1,
+        "repo": "fastify",
+        "result_files": [
+          "lib/route.js",
+          "docs/Reference/Reply.md",
+          "fastify.js",
+          "docs/Reference/Decorators.md",
+          "docs/Reference/Hooks.md",
+          "docs/Reference/Plugins.md",
+          "docs/Reference/Request.md",
+          "test/types/type-provider.test-d.ts",
+          "docs/Guides/Recommendations.md",
+          "docs/Guides/Prototype-Poisoning.md"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "lib/reply.js",
+        "family": "pair",
+        "id": "fastify-pair-reply-hijacked",
+        "passed": true,
+        "query": "reply hijacked ended",
+        "rank": 1,
+        "repo": "fastify",
+        "result_files": [
+          "lib/reply.js",
+          "lib/wrap-thenable.js",
+          "lib/symbols.js",
+          "docs/Reference/Reply.md",
+          "docs/Reference/Lifecycle.md",
+          "docs/Reference/Server.md",
+          "test/types/reply.test-d.ts",
+          "docs/Guides/Migration-Guide-V5.md",
+          "lib/content-type-parser.js",
+          "types/reply.d.ts"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/turborepo-lib/src/run/task_filter.rs",
+        "family": "sentence",
+        "id": "turborepo-sentence-include-selector",
+        "passed": true,
+        "query": "Each include selector contributes a set of tasks (unioned together).",
+        "rank": 1,
+        "repo": "turborepo",
+        "result_files": [
+          "crates/turborepo-lib/src/run/task_filter.rs",
+          "CONTRIBUTING.md",
+          "apps/docs/content/blog/turbo-1-2-0.mdx",
+          "crates/turborepo/ARCHITECTURE.md",
+          "apps/docs/content/blog/turbo-2-4.mdx"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/turborepo-lib/src/run/builder.rs",
+        "family": "sentence",
+        "id": "turborepo-sentence-watch-entrypoint",
+        "passed": true,
+        "query": "In watch mode, we can have a changed package that we want to serve as an entrypoint.",
+        "rank": 1,
+        "repo": "turborepo",
+        "result_files": [
+          "crates/turborepo-lib/src/run/builder.rs",
+          "apps/docs/content/docs/guides/tools/typescript.mdx",
+          "packages/turbo-vsc/ARCHITECTURE.md",
+          "apps/docs/content/docs/reference/system-environment-variables.mdx",
+          "apps/docs/content/blog/turbo-2-6.mdx"
+        ],
+        "top_k": 5
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/turborepo-lib/src/run/task_filter.rs",
+        "family": "pair",
+        "id": "turborepo-pair-include-selector",
+        "passed": true,
+        "query": "contributes unioned",
+        "rank": 1,
+        "repo": "turborepo",
+        "result_files": [
+          "crates/turborepo-lib/src/run/task_filter.rs",
+          "CODE_OF_CONDUCT.md",
+          "apps/docs/content/blog/turbo-1-9-0.mdx",
+          "apps/docs/content/blog/turbo-1-8-0.mdx",
+          "apps/docs/content/blog/turbo-2-3.mdx",
+          "crates/turborepo-task-hash/src/lib.rs",
+          "apps/docs/content/blog/turbo-1-13-0.mdx",
+          "apps/docs/content/blog/turbo-1-4-0.mdx",
+          "apps/docs/content/blog/turbo-1-11-0.mdx",
+          "crates/turborepo-vt100/CHANGELOG.md"
+        ],
+        "top_k": 10
+      },
+      {
+        "exact_marker": true,
+        "expected_file": "crates/turborepo-lib/src/run/builder.rs",
+        "family": "pair",
+        "id": "turborepo-pair-watch-entrypoint",
+        "passed": true,
+        "query": "changed package entrypoint",
+        "rank": 1,
+        "repo": "turborepo",
+        "result_files": [
+          "crates/turborepo-lib/src/run/builder.rs",
+          "skills/turborepo/references/best-practices/packages.md",
+          "apps/docs/content/docs/crafting-your-repository/running-tasks.mdx",
+          "apps/docs/content/docs/guides/publishing-libraries.mdx",
+          "apps/docs/content/docs/crafting-your-repository/creating-an-internal-package.mdx",
+          "apps/docs/content/docs/guides/tools/typescript.mdx",
+          "crates/turborepo-lib/src/lib.rs",
+          "crates/turborepo-engine/src/lib.rs",
+          "apps/docs/content/docs/core-concepts/internal-packages.mdx",
+          "crates/turborepo-lib/src/run/watch.rs"
+        ],
+        "top_k": 10
+      }
+    ]
+  },
+  "concept": {
+    "rows_unchanged": 26,
+    "metrics": {
+      "hit_at_1": 0.5384615384615384,
+      "hit_at_5": 0.7692307692307693,
+      "mrr_at_10": 0.6394230769230769
+    },
+    "ranked_rows_sha256": "026d6df7e964e8e7336b7aac66d6ff6a723c9453a921c55d5bb77571fff939d4",
+    "rows": [
+      {
+        "answer_file": "crates/aft/src/commands/add_import.rs",
+        "answer_rank": 3,
+        "expected_top_files": [
+          "crates/aft/tests/fixtures/imports_ts.ts",
+          "crates/aft/src/commands/add_import.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 0.3333333333333333,
+        "query": "useState",
+        "ranked_paths": [
+          ".gsd/milestones/M002/slices/S01/S01-UAT.md",
+          "crates/aft/src/imports/mod.rs",
+          "crates/aft/src/commands/add_import.rs",
+          ".alfonso/release-notes/v0.23.0.md",
+          ".gsd/DECISIONS.md",
+          "crates/aft/src/commands/semantic_search/mod.rs",
+          "crates/aft/src/query_shape.rs",
+          "docs/tools.md",
+          "packages/opencode-plugin/src/tools/imports.ts",
+          "packages/pi-plugin/src/tools/imports.ts"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "packages/opencode-plugin/src/tools/safety.ts",
+        "answer_rank": 4,
+        "expected_top_files": [
+          "packages/opencode-plugin/src/tools/safety.ts"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 0.25,
+        "query": "aft_safety_history",
+        "ranked_paths": [
+          "scripts/capture-subc-parity.ts",
+          "crates/aft/src/subc_translate.rs",
+          "crates/aft/src/subc/manifest.rs",
+          "packages/opencode-plugin/src/tools/safety.ts",
+          "crates/aft/src/main.rs",
+          "crates/aft/src/bash_background/registry.rs",
+          "crates/aft/src/context.rs",
+          ".alfonso/release-notes/v0.51.1.md",
+          "crates/aft/src/commands/configure.rs",
+          ".gsd/milestones/M004/M004-SUMMARY.md"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/lsp/manager.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/context.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "LSPManager",
+        "ranked_paths": [
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/context.rs",
+          "benchmarks/codegraph-replication/results/aft-codegraph-2026-05-26T09-41-23-339Z.md",
+          "benchmarks/codegraph-replication/results/aft-grep-codegraph-2026-05-26T09-41-35-269Z.md",
+          "benchmarks/codegraph-replication/results/list-files-codegraph-2026-05-26T09-42-18-550Z.md",
+          "benchmarks/codegraph-replication/results/ripgrep-codegraph-2026-05-26T09-41-56-635Z.md",
+          "crates/aft/src/lsp/child_registry.rs",
+          "crates/aft/src/lsp/diagnostics.rs",
+          "crates/aft/src/main.rs",
+          "crates/aft/src/runtime_drain.rs"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/commands/grep.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/commands/grep.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "handle_grep",
+        "ranked_paths": [
+          "crates/aft/src/commands/grep.rs",
+          "crates/aft/src/commands/configure.rs",
+          "crates/aft/src/bash_rewrite/catalog.rs",
+          "crates/aft/src/bash_rewrite/rules.rs",
+          "crates/aft/src/commands/semantic_search/mod.rs",
+          "crates/aft/src/commands/zoom.rs",
+          "crates/aft/src/list_surfaces.rs",
+          "benchmarks/search-bench-v2.py",
+          "crates/aft/src/main.rs",
+          "docs/benchmarks.md"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "packages/aft-bridge/src/bridge.ts",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "packages/aft-bridge/src/bridge.ts"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "BinaryBridge",
+        "ranked_paths": [
+          "packages/aft-bridge/src/bridge.ts",
+          ".gsd/milestones/M004/slices/S03/S03-RESEARCH.md",
+          ".gsd/milestones/M001/slices/S06/S06-SUMMARY.md",
+          "benchmarks/codegraph-vs-aft-retrieval/src/drivers.ts",
+          ".gsd/milestones/M001/M001-SUMMARY.md",
+          ".gsd/milestones/M001/slices/S06/tasks/T01-PLAN.md",
+          ".gsd/milestones/M001/slices/S06/tasks/T01-SUMMARY.md",
+          "packages/aft-bridge/src/subc-transport.ts",
+          ".gsd/milestones/M001/slices/S06/S06-PLAN.md",
+          ".gsd/milestones/M004/slices/S03/tasks/T02-PLAN.md"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/commands/configure.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/commands/configure.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "validate_storage_dir",
+        "ranked_paths": [
+          "crates/aft/src/commands/configure.rs",
+          ".alfonso/release-notes/v0.26.0.md",
+          "crates/aft/src/commands/bash_status.rs",
+          "crates/aft/src/symbol_cache_disk.rs",
+          "crates/aft/src/commands/state.rs",
+          "crates/aft/src/subc/standing.rs",
+          "crates/aft/src/commands/bash_kill.rs",
+          "benchmarks/grep-glob-vs-rg.py",
+          "crates/aft/src/cli/index.rs",
+          "crates/aft/src/readonly_artifacts.rs"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/semantic_index.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/semantic_index.rs",
+          "crates/aft/tests/integration/semantic_disk_test.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "SemanticIndexFingerprint",
+        "ranked_paths": [
+          "crates/aft/src/semantic_index.rs",
+          "crates/aft/src/commands/configure.rs",
+          "crates/aft/src/commands/semantic_search/mod.rs",
+          "crates/aft/src/readonly_artifacts.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/migration/mod.rs",
+          "benchmarks/codegraph-vs-aft-retrieval/results/sample-aft-opencode-aft.json",
+          "crates/aft/examples/export_chunks.rs",
+          ".alfonso/release-notes/v0.53.0.md",
+          ".alfonso/release-notes/v0.49.0.md"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "packages/pi-plugin/src/tools/semantic.ts",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "packages/pi-plugin/src/tools/semantic.ts"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "renderSemanticResult",
+        "ranked_paths": [
+          "packages/pi-plugin/src/tools/semantic.ts",
+          ".alfonso/release-notes/v0.26.0.md",
+          "crates/aft/examples/export_chunks.rs",
+          ".gsd/milestones/M001/slices/S01/tasks/T02-SUMMARY.md",
+          ".alfonso/release-notes/v0.47.0.md",
+          ".gsd/milestones/M001/slices/S02/tasks/T02-SUMMARY.md",
+          ".alfonso/release-notes/v0.52.0.md",
+          ".alfonso/release-notes/v0.41.0.md",
+          ".alfonso/release-notes/v0.54.0.md",
+          ".alfonso/release-notes/v0.37.0.md"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/compress/trust.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/compress/trust.rs",
+          "crates/aft/src/commands/trust_filter_project.rs"
+        ],
+        "fixture_group": "identifier",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "trust_project",
+        "ranked_paths": [
+          "crates/aft/src/compress/trust.rs",
+          "crates/aft/src/commands/trust_filter_project.rs",
+          "crates/aft/src/commands/untrust_filter_project.rs",
+          "crates/aft/src/commands/mod.rs",
+          "packages/aft-bridge/src/protocol.ts",
+          "crates/aft/src/commands/state.rs",
+          ".config/nextest.toml",
+          "crates/aft/src/subc_config.rs",
+          "crates/aft/src/inspect/oxc_engine/resolver.rs",
+          "crates/aft/src/commands/list_filters.rs"
+        ],
+        "router_shape": "identifier"
+      },
+      {
+        "answer_file": "crates/aft/src/lsp/manager.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/lsp/client.rs"
+        ],
+        "fixture_group": "mixed",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "LSPManager initialization timeout",
+        "ranked_paths": [
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/lsp/client.rs",
+          "packages/pi-plugin/src/config.ts",
+          "crates/aft/src/config.rs",
+          ".alfonso/release-notes/v0.47.0.md",
+          ".gsd/milestones/M001/slices/S06/S06-RESEARCH.md",
+          "packages/opencode-plugin/src/hooks/auto-update-checker/index.ts",
+          "crates/aft/src/runtime_drain.rs",
+          "crates/aft/src/main.rs"
+        ],
+        "router_shape": "short"
+      },
+      {
+        "answer_file": "packages/pi-plugin/src/tools/semantic.ts",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/commands/semantic_search/mod.rs",
+          "packages/pi-plugin/src/tools/semantic.ts"
+        ],
+        "fixture_group": "mixed",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "semantic_search unavailable renderer",
+        "ranked_paths": [
+          "packages/pi-plugin/src/tools/semantic.ts",
+          "crates/aft/src/readonly_artifacts.rs",
+          ".github/ISSUE_TEMPLATE/bug_report.yml",
+          "benchmarks/inspect-field-audit/README.md",
+          ".alfonso/release-notes/v0.32.0.md",
+          "crates/aft/src/cli/warmup.rs",
+          ".cortexkit/alfonso/reports/breaker-state-machine-audit.md",
+          "crates/aft/src/list_surfaces.rs",
+          "packages/pi-plugin/src/tool-registration.ts",
+          "packages/opencode-plugin/src/tool-registration.ts"
+        ],
+        "router_shape": "short"
+      },
+      {
+        "answer_file": "packages/pi-plugin/src/config.ts",
+        "answer_rank": 8,
+        "expected_top_files": [
+          "crates/aft/src/commands/configure.rs",
+          "packages/pi-plugin/src/config.ts",
+          "crates/aft/src/config.rs"
+        ],
+        "fixture_group": "mixed",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.125,
+        "query": "bash long running reminder config",
+        "ranked_paths": [
+          "packages/opencode-plugin/src/tools/bash_watch.ts",
+          "packages/pi-plugin/src/bg-notifications.ts",
+          "crates/aft/src/commands/bash_orchestrate.rs",
+          "packages/pi-plugin/src/workflow-hints.ts",
+          "packages/opencode-plugin/src/wakes/runtime-consumer.ts",
+          "crates/aft/src/protocol.rs",
+          "packages/opencode-plugin/src/workflow-hints.ts",
+          "packages/pi-plugin/src/config.ts",
+          "crates/aft/src/bash_background/registry.rs",
+          "crates/aft/src/config_resolve.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "packages/opencode-plugin/src/tools/permissions.ts",
+        "answer_rank": 2,
+        "expected_top_files": [
+          "packages/opencode-plugin/src/tools/permissions.ts",
+          "crates/aft/src/bash_permissions/scan.rs"
+        ],
+        "fixture_group": "mixed",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.5,
+        "query": "workspace permission prompt flow",
+        "ranked_paths": [
+          ".github/workflows/cost-gate.yml",
+          "packages/opencode-plugin/src/tools/permissions.ts",
+          "packages/pi-plugin/src/tools/bash.ts",
+          ".github/workflows/release.yml",
+          "crates/aft/src/lsp/registry.rs",
+          "packages/opencode-plugin/src/tools/bash.ts",
+          "crates/aft/src/checkpoint.rs",
+          ".github/workflows/bump-opencode.yml",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/lsp/manager.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/semantic_index.rs",
+        "answer_rank": 4,
+        "expected_top_files": [
+          "crates/aft/src/commands/configure.rs",
+          "crates/aft/src/semantic_index.rs"
+        ],
+        "fixture_group": "natural-language",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.25,
+        "query": "how does semantic indexing persist across configure runs",
+        "ranked_paths": [
+          "crates/aft/src/runtime_drain.rs",
+          "crates/aft/src/config.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/semantic_index.rs",
+          "crates/aft/src/commands/configure.rs",
+          "crates/aft/src/main.rs",
+          "crates/aft/src/config_resolve.rs",
+          "packages/pi-plugin/src/config.ts",
+          "packages/pi-plugin/src/index.ts",
+          "crates/aft/src/commands/semantic_search/mod.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/bash_background/persistence.rs",
+        "answer_rank": 6,
+        "expected_top_files": [
+          "crates/aft/src/commands/configure.rs",
+          "crates/aft/src/bash_background/persistence.rs"
+        ],
+        "fixture_group": "natural-language",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.16666666666666666,
+        "query": "where are background bash tasks restored after restart",
+        "ranked_paths": [
+          "benchmarks/codegraph-replication/results/aft-grep-codegraph-2026-05-26T09-41-35-269Z.json",
+          "benchmarks/codegraph-replication/results/ripgrep-codegraph-2026-05-26T09-41-56-635Z.json",
+          "crates/aft/src/bash_background/watches.rs",
+          "crates/aft/src/bash_background/process.rs",
+          "packages/aft-bridge/src/error-contract.ts",
+          "crates/aft/src/bash_background/persistence.rs",
+          "crates/aft/src/commands/bash_orchestrate.rs",
+          "crates/aft/src/bash_background/registry.rs",
+          "crates/aft/src/bash_background/mod.rs",
+          "crates/aft/src/commands/bash_status.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/commands/configure.rs",
+        "answer_rank": 6,
+        "expected_top_files": [
+          "crates/aft/src/commands/configure.rs",
+          "packages/aft-bridge/src/bridge.ts"
+        ],
+        "fixture_group": "natural-language",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.16666666666666666,
+        "query": "how are configure warnings delivered asynchronously",
+        "ranked_paths": [
+          "packages/pi-plugin/src/index.ts",
+          "packages/opencode-plugin/src/notifications.ts",
+          "crates/aft/src/runtime_drain.rs",
+          "crates/aft/src/protocol.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/commands/configure.rs",
+          "packages/pi-plugin/src/config.ts",
+          "crates/aft/src/lsp/diagnostics.rs",
+          "crates/aft/src/main.rs",
+          "packages/aft-bridge/src/bridge.ts"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/lsp/manager.rs",
+        "answer_rank": 3,
+        "expected_top_files": [
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/context.rs"
+        ],
+        "fixture_group": "natural-language",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.3333333333333333,
+        "query": "where does lsp diagnostic polling wait for server responses",
+        "ranked_paths": [
+          "crates/aft/src/lsp/client.rs",
+          "crates/aft/src/inspect/diagnostics_category.rs",
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/lsp/diagnostics.rs",
+          "crates/aft/src/commands/inspect.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/commands/lsp_diagnostics.rs",
+          "crates/aft/src/edit.rs",
+          "crates/aft/src/config.rs",
+          "crates/aft/src/alert_state.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/imports/mod.rs",
+        "answer_rank": 2,
+        "expected_top_files": [
+          "crates/aft/src/commands/organize_imports.rs",
+          "crates/aft/src/imports/mod.rs"
+        ],
+        "fixture_group": "natural-language",
+        "hit_at_1": 0.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.5,
+        "query": "how are imports organized after edits",
+        "ranked_paths": [
+          "crates/aft/src/commands/add_import.rs",
+          "crates/aft/src/imports/mod.rs",
+          "crates/aft/src/commands/organize_imports.rs",
+          "packages/pi-plugin/src/tools/imports.ts",
+          "crates/aft/src/commands/remove_import.rs",
+          "packages/opencode-plugin/src/tools/imports.ts",
+          "crates/aft/src/imports/c.rs",
+          "crates/aft/src/imports/perl.rs",
+          "crates/aft/src/main.rs",
+          ".gsd/milestones/M002/M002-ROADMAP.md"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": "crates/aft/src/commands/grep.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/commands/grep.rs"
+        ],
+        "fixture_group": "path",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "path_lookup"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "crates/aft/src/commands/grep.rs",
+        "ranked_paths": [
+          "crates/aft/src/commands/grep.rs",
+          "ARCHITECTURE.md",
+          "STRUCTURE.md",
+          "docs/audits/agent-text-habit-audit-2026-07.md",
+          ".gsd/milestones/M002/slices/S02/tasks/T02-PLAN.md",
+          "packages/aft-bridge/scripts/s5-wire-probe.ts",
+          ".gsd/milestones/M003/M003-RESEARCH.md",
+          "crates/aft/src/list_surfaces.rs",
+          ".gsd/milestones/M001/M001-ROADMAP.md",
+          "crates/aft/src/compress/cargo.rs"
+        ],
+        "router_shape": "path"
+      },
+      {
+        "answer_file": "packages/opencode-plugin/src/tools/bash.ts",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "packages/opencode-plugin/src/tools/bash.ts"
+        ],
+        "fixture_group": "path",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "path_lookup"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "packages/opencode-plugin/src/tools/bash.ts",
+        "ranked_paths": [
+          "packages/opencode-plugin/src/tools/bash.ts",
+          "docs/audits/agent-text-habit-audit-2026-07.md",
+          "crates/aft/src/commands/bash_orchestrate.rs",
+          "ARCHITECTURE.md",
+          "STRUCTURE.md",
+          "crates/aft/src/bash_background/persistence.rs",
+          ".gsd/milestones/M001/slices/S06/tasks/T02-PLAN.md",
+          "packages/opencode-plugin/src/shared/bash-hints.ts",
+          "packages/opencode-plugin/test/matrix/delta-audit-beta-19234.md",
+          ".github/workflows/_unit-suite.yml"
+        ],
+        "router_shape": "path"
+      },
+      {
+        "answer_file": "packages/aft-bridge/src/bridge.ts",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "packages/aft-bridge/src/bridge.ts"
+        ],
+        "fixture_group": "path",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "path_lookup"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "packages/aft-bridge/src/bridge.ts",
+        "ranked_paths": [
+          "packages/aft-bridge/src/bridge.ts",
+          "ARCHITECTURE.md",
+          "STRUCTURE.md",
+          "benchmarks/codegraph-replication/README.md",
+          "benchmarks/codegraph-replication/results/aft-codegraph-2026-05-26T09-41-23-339Z.json",
+          "benchmarks/codegraph-vs-aft-retrieval/results/sample-aft-opencode-aft.json",
+          "benchmarks/codegraph-replication/results/ripgrep-codegraph-2026-05-26T09-41-56-635Z.json",
+          "benchmarks/codegraph-replication/results/aft-grep-codegraph-2026-05-26T09-41-35-269Z.json",
+          "benchmarks/codegraph-replication/results/list-files-codegraph-2026-05-26T09-42-18-550Z.json",
+          "benchmarks/codegraph-vs-aft-retrieval/results/sample-codegraph-opencode-aft.json"
+        ],
+        "router_shape": "path"
+      },
+      {
+        "answer_file": "crates/aft/src/compress/pnpm.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/compress/pnpm.rs"
+        ],
+        "fixture_group": "error-code",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "ERR_PNPM_",
+        "ranked_paths": [
+          "crates/aft/src/compress/pnpm.rs",
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/compress/mod.rs",
+          "crates/aft/src/callgraph_store/mod.rs",
+          "crates/aft/src/callgraph.rs",
+          "crates/aft/src/format.rs",
+          "crates/aft/src/compress/mypy.rs",
+          "crates/aft/src/compress/next.rs",
+          "crates/aft/src/compress/eslint.rs",
+          ".alfonso/research/test-compressor-candidates.md"
+        ],
+        "router_shape": "short"
+      },
+      {
+        "answer_file": "crates/aft/src/bash_background/process.rs",
+        "answer_rank": 1,
+        "expected_top_files": [
+          "crates/aft/src/bash_background/process.rs"
+        ],
+        "fixture_group": "error-code",
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 1.0,
+        "query": "process group already terminated",
+        "ranked_paths": [
+          "crates/aft/src/bash_background/process.rs",
+          "crates/aft/src/commands/bash_kill.rs",
+          "crates/aft/src/lsp/client.rs",
+          "crates/aft/src/format.rs",
+          "crates/aft/src/fs_lock.rs",
+          "crates/aft/src/effective_path.rs",
+          "scripts/telemetry/oss-matrix.py",
+          "crates/aft/src/bash_background/registry.rs",
+          "crates/aft/src/lsp/manager.rs",
+          "crates/aft/src/artifact_owner.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": null,
+        "answer_rank": 0,
+        "expected_top_files": [
+          "packages/opencode-plugin/src/index.ts"
+        ],
+        "fixture_group": "generic-file",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.0,
+        "query": "AFT plugin entry point",
+        "ranked_paths": [
+          ".gsd/milestones/M001/M001-SUMMARY.md",
+          ".gsd/milestones/M001/slices/S06/S06-SUMMARY.md",
+          ".gsd/milestones/M001/slices/S06/tasks/T01-PLAN.md",
+          ".gsd/milestones/M001/slices/S06/tasks/T01-SUMMARY.md",
+          ".gsd/milestones/M001/slices/S07/S07-RESEARCH.md",
+          ".gsd/milestones/M001/M001-CONTEXT.md",
+          ".gsd/milestones/M002/M002-CONTEXT.md",
+          ".gsd/milestones/M002/M002-SUMMARY.md",
+          ".gsd/milestones/M003/M003-CONTEXT.md",
+          ".gsd/milestones/M003/slices/S04/S04-PLAN.md"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": null,
+        "answer_rank": 0,
+        "expected_top_files": [
+          "crates/aft/src/commands/mod.rs"
+        ],
+        "fixture_group": "generic-file",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.0,
+        "query": "command module exports list",
+        "ranked_paths": [
+          ".gsd/milestones/M001/slices/S03/S03-RESEARCH.md",
+          "benchmarks/codegraph-replication/src/util.ts",
+          "crates/aft/src/inspect/frameworks.rs",
+          "crates/aft/src/commands/ast_scope.rs",
+          "crates/aft/src/commands/bash.rs",
+          "crates/aft/src/inspect/entry_points.rs",
+          "crates/aft/src/inspect/scanners/unused_exports.rs",
+          "crates/aft/src/commands/move_symbol.rs",
+          "crates/aft/src/parser.rs",
+          "crates/aft/src/inspect/oxc_engine/types.rs"
+        ],
+        "router_shape": "natural_language"
+      },
+      {
+        "answer_file": null,
+        "answer_rank": 0,
+        "expected_top_files": [
+          "crates/aft/src/lib.rs"
+        ],
+        "fixture_group": "generic-file",
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "mrr_at_10": 0.0,
+        "query": "crate public API modules",
+        "ranked_paths": [
+          ".alfonso/release-notes/v0.45.0.md",
+          "crates/aft/src/inspect/entry_points.rs",
+          "crates/aft/src/config.rs",
+          "crates/aft/src/imports/mod.rs",
+          "crates/aft/src/fleet_status.rs",
+          "crates/aft/src/context.rs",
+          "crates/aft/src/parser.rs",
+          "crates/aft/src/inspect/scanners/dead_code.rs",
+          "crates/aft/src/views/mod.rs",
+          "crates/aft/src/inspect/frameworks.rs"
+        ],
+        "router_shape": "natural_language"
+      }
+    ]
+  }
+}

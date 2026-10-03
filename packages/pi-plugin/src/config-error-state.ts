@@ -22,6 +22,8 @@ import {
   type AftConfig,
   type ConfigLoadError,
   getConfigLoadErrors,
+  getConfigLoadSources,
+  getConfigLoadTexts,
   loadAftConfig,
   migrateAftConfigLocations,
 } from "./config.js";
@@ -33,7 +35,14 @@ import type { PluginContext } from "./types.js";
 export const CONFIG_ERROR_STATUS_KEY = "aft";
 
 export type PiBootstrapConfig =
-  | { ok: true; config: AftConfig }
+  | {
+      ok: true;
+      config: AftConfig;
+      /** The config files this load read; a live config reload starts from them. */
+      sources?: readonly string[];
+      /** The text of each file this load read, keyed by path. */
+      sourceTexts?: Readonly<Record<string, string>>;
+    }
   | {
       ok: false;
       /** The error, its fix, and the note that a restart is needed. */
@@ -46,6 +55,10 @@ export type PiBootstrapConfig =
 export interface PiBootstrapDependencies {
   loadConfig(directory: string): AftConfig;
   configLoadErrors(): readonly ConfigLoadError[];
+  /** The config files the most recent `loadConfig` call read. */
+  configLoadSources?(): readonly string[];
+  /** The text of each file the most recent `loadConfig` call read. */
+  configLoadTexts?(): ReadonlyMap<string, string>;
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
   migrateConfigLocations(directory: string): string[];
   subcConnectionFileError(subcConnectionFile: string | undefined): Promise<string | null>;
@@ -54,6 +67,8 @@ export interface PiBootstrapDependencies {
 const defaultDependencies: PiBootstrapDependencies = {
   loadConfig: loadAftConfig,
   configLoadErrors: getConfigLoadErrors,
+  configLoadSources: getConfigLoadSources,
+  configLoadTexts: getConfigLoadTexts,
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   subcConnectionFileError,
@@ -93,6 +108,8 @@ export async function resolvePiBootstrapConfig(
   dependencies: PiBootstrapDependencies = defaultDependencies,
 ): Promise<PiBootstrapConfig> {
   let config: AftConfig;
+  let sources: readonly string[] = [];
+  let sourceTexts: Record<string, string> = {};
   try {
     dependencies.loadConfig(directory);
     const firstFailure = parseFailure(dependencies);
@@ -101,11 +118,15 @@ export async function resolvePiBootstrapConfig(
     config = dependencies.loadConfig(directory);
     const failure = parseFailure(dependencies);
     if (failure) return configErrorState(failure, notify);
+    sources = [...(dependencies.configLoadSources?.() ?? [])];
+    sourceTexts = Object.fromEntries(dependencies.configLoadTexts?.() ?? []);
   } catch (err) {
     return configErrorState(err instanceof Error ? err.message : String(err), notify);
   }
   const missing = await dependencies.subcConnectionFileError(config.subc?.connection_file);
-  return missing === null ? { ok: true, config } : configErrorState(missing, notify, config);
+  return missing === null
+    ? { ok: true, config, sources, sourceTexts }
+    : configErrorState(missing, notify, config);
 }
 
 /**

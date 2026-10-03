@@ -191,7 +191,7 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
     }
 }
 
-fn thread_census() -> ThreadCensus {
+pub(crate) fn thread_census() -> ThreadCensus {
     let (count, names) = os_thread_names();
     let total = count as u64;
     let Some(names) = names else {
@@ -271,37 +271,49 @@ fn os_thread_names() -> (usize, Option<Vec<Option<String>>>) {
         ) -> libc::c_int;
     }
 
-    let mut buffer = vec![
-        // SAFETY: proc_pidinfo fills this plain C structure before it is read.
-        unsafe { std::mem::zeroed::<ProcThreadInfo>() };
-        MAX_THREADS
-    ];
-    let buffer_size = match libc::c_int::try_from(std::mem::size_of_val(buffer.as_slice())) {
-        Ok(size) => size,
-        Err(_) => return (0, Some(Vec::new())),
-    };
-    // SAFETY: `buffer` is valid writable storage for the exact byte count passed.
+    // LISTTHREADS returns thread IDs, not proc_threadinfo records. Query each
+    // ID separately so the census cannot silently divide an ID buffer by the
+    // larger record size and report zero runtime threads.
+    let mut ids = vec![0u64; MAX_THREADS];
+    let buffer_size = std::mem::size_of_val(ids.as_slice()) as libc::c_int;
+    // SAFETY: ids is writable storage of the passed byte length.
     let bytes = unsafe {
         proc_pidinfo(
             std::process::id() as libc::c_int,
             PROC_PIDLISTTHREADS,
             0,
-            buffer.as_mut_ptr().cast(),
+            ids.as_mut_ptr().cast(),
             buffer_size,
         )
     };
     if bytes <= 0 {
-        return (0, Some(Vec::new()));
+        return (0, None);
     }
-    let count = (bytes as usize / std::mem::size_of::<ProcThreadInfo>()).min(buffer.len());
+    let count = (bytes as usize / std::mem::size_of::<u64>()).min(ids.len());
     if count > THREAD_CLASSIFICATION_CAP {
         return (count, None);
     }
-    let names = buffer
+    let names = ids
         .into_iter()
         .take(count)
-        .map(|info| {
-            // SAFETY: the kernel writes a NUL-terminated thread name into this field.
+        .map(|id| {
+            // SAFETY: this plain C record is initialized before the kernel fills it.
+            let mut info: ProcThreadInfo = unsafe { std::mem::zeroed() };
+            // SAFETY: info is writable storage of the exact record size.
+            let received = unsafe {
+                proc_pidinfo(
+                    std::process::id() as libc::c_int,
+                    5,
+                    id,
+                    (&mut info as *mut ProcThreadInfo).cast(),
+                    std::mem::size_of::<ProcThreadInfo>() as libc::c_int,
+                )
+            };
+            if received != std::mem::size_of::<ProcThreadInfo>() as libc::c_int {
+                return None;
+            }
+            info.name[63] = 0;
+            // SAFETY: the final byte is explicitly terminated even if the kernel truncated it.
             let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
             (!name.is_empty()).then(|| name.into_owned())
         })

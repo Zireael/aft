@@ -541,9 +541,20 @@ fn semantic_compaction_starts_after_sixty_four_segments() {
 }
 
 #[cfg(unix)]
-const SEGMENT_TEAR_CHILD_TEST: &str = "semantic_disk_test::semantic_segment_sigkill_child";
+const SEGMENT_TEAR_CHILD_TEST: &str = concat!(module_path!(), "::semantic_segment_sigkill_child");
 #[cfg(unix)]
-const COMPACTION_SWAP_CHILD_TEST: &str = "semantic_disk_test::semantic_compaction_swap_child";
+const COMPACTION_SWAP_CHILD_TEST: &str =
+    concat!(module_path!(), "::semantic_compaction_swap_child");
+
+#[cfg(unix)]
+fn child_test_name(qualified_name: &'static str) -> &'static str {
+    // libtest names omit the crate name but retain all enclosing modules. The
+    // same disk tests run in both the integration and semantic aggregate targets.
+    qualified_name
+        .split_once("::")
+        .expect("crate-qualified test name")
+        .1
+}
 
 #[cfg(unix)]
 fn wait_for_test_seam(child: &mut std::process::Child, ready: &Path) {
@@ -591,7 +602,7 @@ fn semantic_segment_sigkill_preserves_previous_state_and_retry_recovers() {
     let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
         .args([
             "--exact",
-            SEGMENT_TEAR_CHILD_TEST,
+            child_test_name(SEGMENT_TEAR_CHILD_TEST),
             "--ignored",
             "--nocapture",
         ])
@@ -691,7 +702,7 @@ fn semantic_reader_open_during_compaction_sees_complete_generation() {
     let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
         .args([
             "--exact",
-            COMPACTION_SWAP_CHILD_TEST,
+            child_test_name(COMPACTION_SWAP_CHILD_TEST),
             "--ignored",
             "--nocapture",
         ])
@@ -739,7 +750,7 @@ fn semantic_append_waits_for_paused_compaction_and_lands() {
     let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
         .args([
             "--exact",
-            COMPACTION_SWAP_CHILD_TEST,
+            child_test_name(COMPACTION_SWAP_CHILD_TEST),
             "--ignored",
             "--nocapture",
         ])

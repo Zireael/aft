@@ -21,10 +21,14 @@
  * identity is sticky (parentID never changes after session creation), so
  * the cache never needs invalidation.
  *
- * Errors are not cached. If the SDK is briefly unavailable on the first
- * call, we retry on the next bash invocation rather than permanently
- * misclassifying. This is cheap because the cache is hit on every
- * subsequent call within the same session.
+ * Every bridge call asks for the role (AFT words its replies by it), so the
+ * lookup must stay cheap and bounded:
+ * - concurrent first calls for one session share a single lookup;
+ * - a lookup that has not answered within LOOKUP_TIMEOUT_MS is abandoned and
+ *   that call proceeds as primary, so a slow host can't delay a read;
+ * - a failed or abandoned lookup is cached as "primary" for
+ *   FAILED_LOOKUP_RETRY_MS, then retried, so a struggling host is not asked on
+ *   every call but the real answer is still picked up later.
  *
  * Mirrors the pattern in `session-directory.ts`.
  */
@@ -48,20 +52,33 @@ interface OpenCodeClientShape {
 
 interface CacheEntry {
   isSubagent: boolean;
-  recordedAt: number;
+  /**
+   * When a provisional "primary" answer (recorded after a failed or timed-out
+   * lookup) stops counting and the host is asked again. Absent for a real
+   * answer, which never changes: a session's parent is fixed at creation.
+   */
+  retryAfter?: number;
 }
 
 const CACHE_MAX_ENTRIES = 200;
+/** Longest a caller waits for the host's session lookup. */
+export const LOOKUP_TIMEOUT_MS = 1_000;
+/** How long a failed or timed-out lookup is answered as "primary" before retrying. */
+export const FAILED_LOOKUP_RETRY_MS = 30_000;
 const cache = new Map<string, CacheEntry>();
+/** One lookup per session at a time; concurrent first calls await it. */
+const inflight = new Map<string, Promise<boolean>>();
+let now: () => number = () => Date.now();
 
 /**
  * Returns `true` when the given session has a non-empty `parentID`
  * (subagent). Returns `false` for primary sessions, when the SDK is
- * unavailable, or when any error occurs — the false default keeps
- * primary sessions working exactly as before.
+ * unavailable, or when the lookup fails or takes longer than
+ * LOOKUP_TIMEOUT_MS; the false default keeps primary sessions working
+ * exactly as before.
  *
- * First call per session: one SDK round-trip. All subsequent calls:
- * O(1) cache lookup.
+ * A known answer is an O(1) cache hit. Otherwise at most one host lookup
+ * per session is in flight, and it is bounded by LOOKUP_TIMEOUT_MS.
  */
 export async function resolveIsSubagent(
   client: unknown,
@@ -74,7 +91,7 @@ export async function resolveIsSubagent(
   }
 
   const cached = cache.get(sessionId);
-  if (cached) {
+  if (cached && (cached.retryAfter === undefined || now() < cached.retryAfter)) {
     // Refresh LRU position. Don't log the hit — it's pure noise; the
     // downstream call sites already log their effective gate decisions.
     cache.delete(sessionId);
@@ -82,6 +99,48 @@ export async function resolveIsSubagent(
     return cached.isSubagent;
   }
 
+  const pending = inflight.get(sessionId);
+  if (pending) return pending;
+  const lookup = boundedLookup(client, sessionId).finally(() => {
+    inflight.delete(sessionId);
+  });
+  inflight.set(sessionId, lookup);
+  return lookup;
+}
+
+/**
+ * Runs the host lookup, giving up after LOOKUP_TIMEOUT_MS. A real answer is
+ * cached for good; a failure or timeout is cached as "primary" until
+ * FAILED_LOOKUP_RETRY_MS has passed. The abandoned host call is left to
+ * settle on its own; its late answer is ignored.
+ */
+async function boundedLookup(client: unknown, sessionId: string): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), LOOKUP_TIMEOUT_MS);
+  });
+  let answer: boolean | "failed" | "timeout";
+  try {
+    answer = await Promise.race([lookupSession(client, sessionId), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (typeof answer === "boolean") {
+    setCache(sessionId, answer);
+    return answer;
+  }
+  if (answer === "timeout") {
+    sessionWarn(
+      sessionId,
+      `[subagent-detect] session lookup did not answer within ${LOOKUP_TIMEOUT_MS}ms → primary for now`,
+    );
+  }
+  setCache(sessionId, false, now() + FAILED_LOOKUP_RETRY_MS);
+  return false;
+}
+
+/** The host's answer, or "failed" when the lookup threw. Never rejects. */
+async function lookupSession(client: unknown, sessionId: string): Promise<boolean | "failed"> {
   if (isV2PluginContext(client)) return resolveV2(client, sessionId);
 
   const c = client as OpenCodeClientShape;
@@ -93,7 +152,6 @@ export async function resolveIsSubagent(
       sessionId,
       `[subagent-detect] client.session.get unavailable (client=${typeof client}, session=${typeof sessionApi}, get=${typeof sessionApi?.get}) → caching as primary`,
     );
-    setCache(sessionId, false);
     return false;
   }
 
@@ -102,8 +160,6 @@ export async function resolveIsSubagent(
     `[subagent-detect] cache miss, calling client.session.get(id=${sessionId})`,
   );
 
-  let isSubagent = false;
-  let parentIdRaw: unknown;
   try {
     // Call as a method so the SDK's `this._client` reference resolves
     // correctly. Extracting `sessionApi.get` into a local would lose
@@ -119,25 +175,21 @@ export async function resolveIsSubagent(
     // `Session` depending on `ThrowOnError`. Handle both shapes.
     const session: SessionInfo | undefined =
       (result as { data?: SessionInfo } | undefined)?.data ?? (result as SessionInfo | undefined);
-    parentIdRaw = session?.parentID;
-    isSubagent =
+    const parentIdRaw = session?.parentID;
+    const isSubagent =
       session !== undefined && typeof session.parentID === "string" && session.parentID.length > 0;
     sessionLog(
       sessionId,
       `[subagent-detect] SDK returned session=${session !== undefined ? "present" : "undefined"}, parentID=${JSON.stringify(parentIdRaw)} → isSubagent=${isSubagent}`,
     );
+    return isSubagent;
   } catch (err) {
-    // Don't poison the cache on transient errors — but do log once.
-    // Return false so primary-session behavior is preserved.
     sessionWarn(
       sessionId,
       `[subagent-detect] SDK lookup failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return false;
+    return "failed";
   }
-
-  setCache(sessionId, isSubagent);
-  return isSubagent;
 }
 
 /**
@@ -166,33 +218,35 @@ function isV2PluginContext(client: unknown): client is V2PluginContextShape {
   );
 }
 
-async function resolveV2(context: V2PluginContextShape, sessionId: string): Promise<boolean> {
+async function resolveV2(
+  context: V2PluginContextShape,
+  sessionId: string,
+): Promise<boolean | "failed"> {
   let session: SessionInfo | undefined;
   try {
     session = await Effect.runPromise(
       context.session.get({ sessionID: sessionId }) as Effect.Effect<SessionInfo | undefined>,
     );
   } catch (err) {
-    // Same policy as the V1 path: a failed lookup is not cached, and the call
-    // is treated as primary for now so the next tool call can retry.
+    // Same policy as the V1 path: a failed lookup counts as primary only
+    // until FAILED_LOOKUP_RETRY_MS has passed.
     sessionWarn(
       sessionId,
       `[subagent-detect] OpenCode 2 session lookup failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return false;
+    return "failed";
   }
   const isSubagent = typeof session?.parentID === "string" && session.parentID.length > 0;
   sessionLog(
     sessionId,
     `[subagent-detect] OpenCode 2 session parentID=${JSON.stringify(session?.parentID)} → isSubagent=${isSubagent}`,
   );
-  setCache(sessionId, isSubagent);
   return isSubagent;
 }
 
-function setCache(sessionId: string, isSubagent: boolean): void {
+function setCache(sessionId: string, isSubagent: boolean, retryAfter?: number): void {
   if (cache.has(sessionId)) cache.delete(sessionId);
-  cache.set(sessionId, { isSubagent, recordedAt: Date.now() });
+  cache.set(sessionId, retryAfter === undefined ? { isSubagent } : { isSubagent, retryAfter });
   if (cache.size > CACHE_MAX_ENTRIES) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
@@ -202,4 +256,11 @@ function setCache(sessionId: string, isSubagent: boolean): void {
 /** Test-only cache reset. Not exported from the public surface. */
 export function _resetSubagentCacheForTest(): void {
   cache.clear();
+  inflight.clear();
+  now = () => Date.now();
+}
+
+/** Test-only clock override for the failed-lookup retry window. */
+export function _setSubagentClockForTest(clock: () => number): void {
+  now = clock;
 }

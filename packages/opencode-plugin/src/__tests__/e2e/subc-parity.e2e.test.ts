@@ -123,7 +123,7 @@ maybeDescribe(describeName, () => {
         const tag = read.hashline_tag as string;
         expect(tag).toBeString();
 
-        const config = { edit_mode: "hashline" } as const;
+        const config = { edit_mode: "hashline", disabled_tools: [] } as const;
         const pool = { getBridge: () => harness.bridge } as unknown as BridgePool;
         const tools = buildOpenCodeToolMap(
           {
@@ -167,7 +167,7 @@ maybeDescribe(describeName, () => {
     try {
       for (const transport of ["ndjson", "subc"] as const) {
         for (const testCase of cases) {
-          const pluginConfig = { edit_mode: testCase.pluginMode } as const;
+          const pluginConfig = { edit_mode: testCase.pluginMode, disabled_tools: [] } as const;
           const surface = buildOpenCodeToolMap(
             {
               pool: {} as PluginContext["pool"],
@@ -284,10 +284,15 @@ maybeDescribe(describeName, () => {
       ];
 
       for (const call of calls) {
-        // Transient index/store building states are honest output, not parity
-        // gaps — poll BOTH sides to the converged state before comparing. A
+        // Transient index/store states are honest output, not parity gaps —
+        // poll BOTH sides to the converged state before comparing. A
         // side that never converges still fails the assertion verbatim.
-        const converged = (text: string) => !text.includes("building/retrying");
+        // An index that listed a file since deleted is also a transient state:
+        // the watcher's next drain removes it.
+        const converged = (text: string) =>
+          !text.includes("building/retrying") &&
+          !text.includes("[index: building") &&
+          !text.includes("were not on disk in this checkout");
         const ndjsonText = await toolTextUntil(ndjson, call.name, call.args, converged);
         const subcText = await toolTextUntil(subc, call.name, call.args, converged);
         expect(normalizeRoot(subcText, subc.tempDir), call.name).toBe(
@@ -301,6 +306,15 @@ maybeDescribe(describeName, () => {
 });
 
 async function seedParityFixture(harness: E2EHarness): Promise<void> {
+  // The NDJSON harness points its child's AFT_CACHE_DIR at `.aft-cache` inside
+  // the project, and both harnesses write `.aft-user/aft.jsonc` there. AFT's
+  // project walk includes hidden directories, so without this the NDJSON
+  // side indexed its own state: lock files and `*.tmp.*` files that come and
+  // go while it runs. A grep after one vanished reported "1 indexed file(s)
+  // were not on disk" on the NDJSON side only, because the subc daemon keeps
+  // its cache outside the project. Excluding both directories keeps each
+  // side's index to the fixture files.
+  await writeFile(harness.path(".aftignore"), ".aft-cache/\n.aft-user/\n", "utf8");
   await writeFile(
     harness.path("sample.ts"),
     [
@@ -362,7 +376,17 @@ function normalizeRoot(text: string, root: string): string {
   const escapedRoot = root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const slashRoot = root.split(sep).join("/");
   const escapedSlashRoot = slashRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return text
-    .replace(new RegExp(escapedRoot, "g"), "<ROOT>")
-    .replace(new RegExp(escapedSlashRoot, "g"), "<ROOT>");
+  return (
+    text
+      .replace(new RegExp(escapedRoot, "g"), "<ROOT>")
+      .replace(new RegExp(escapedSlashRoot, "g"), "<ROOT>")
+      // The trailing status bar is dropped before comparing. Whether it is
+      // appended at all depends on whether it changed since that session last
+      // saw it, and its `~` marker on whether a background refresh finished,
+      // so it reflects timing and session history, not the transport. Status
+      // bar rendering has its own tests.
+      .replace(/\n*\[AFT [^\]\n]*\]\s*$/, "")
+      // Trailing blank lines went with the bar on one side and not the other.
+      .trimEnd()
+  );
 }

@@ -304,3 +304,47 @@ fn status_db_unavailable_returns_zero_compression() {
     assert_eq!(status["compression"]["project"]["events"], 0);
     assert_eq!(status["compression"]["session"]["events"], 0);
 }
+
+/// Another thread can hold the shared connection for as long as its statement
+/// waits on a different process's lock. `status` must still answer promptly,
+/// from the totals it computed last, and say they may be stale.
+#[test]
+fn status_answers_from_cached_compression_totals_while_the_connection_is_held() {
+    let project = tempdir().expect("project dir");
+    let (ctx, conn) = context_with_db(project.path(), Harness::Opencode);
+    insert_event(
+        &conn,
+        Harness::Opencode,
+        project.path(),
+        "session-a",
+        "task-1",
+        100,
+        70,
+    );
+    let warm = ctx.build_status_snapshot_for_session("session-a");
+    assert_eq!(warm["compression"]["project"]["events"], 1);
+    assert!(warm["compression"].get("stale").is_none(), "{warm:?}");
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let conn = Arc::clone(&conn);
+        std::thread::spawn(move || {
+            let _held = conn.lock().expect("DB lock");
+            held_tx.send(()).expect("signal held");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        })
+    };
+    held_rx.recv().expect("holder took the connection");
+    let started = std::time::Instant::now();
+    let status = ctx.build_status_snapshot_for_session("session-a");
+    let elapsed = started.elapsed();
+    holder.join().expect("holder thread");
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "status waited {elapsed:?} for the held connection"
+    );
+    assert_eq!(status["compression"]["stale"], true);
+    assert_eq!(status["compression"]["project"]["events"], 1);
+    assert_eq!(status["compression"]["session"]["savings_tokens"], 30);
+}

@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-#[cfg(test)]
+#[cfg(any(test, windows))]
 use std::path::PathBuf;
 use std::path::{Component, Path};
 #[cfg(test)]
@@ -14,7 +14,7 @@ const GENERATED_CONTENT_LINES: usize = 5;
 static FILE_PROBES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
-    if path_has_generated_shape(path) {
+    if relative_shape_is_generated(project_root, path) {
         return true;
     }
 
@@ -23,15 +23,39 @@ pub(crate) fn is_generated_file(project_root: &Path, path: &Path) -> bool {
     } else {
         project_root.join(path)
     };
-    if path_has_generated_shape(&absolute) {
-        return true;
-    }
-
     first_lines_have_generated_marker(&absolute)
 }
 
-pub(crate) fn is_generated_file_from_source(path: &Path, source: &str) -> bool {
-    path_has_generated_shape(path) || source_has_generated_marker(source)
+pub(crate) fn is_generated_file_from_source(
+    project_root: &Path,
+    path: &Path,
+    source: &str,
+) -> bool {
+    relative_shape_is_generated(project_root, path) || source_has_generated_marker(source)
+}
+
+/// Only the part of `path` below `project_root` decides a generated shape;
+/// folders above the project (a checkout under `~/gen/`) must not. On Windows
+/// the root and the path can arrive in different spellings (`\\?\C:\...` from
+/// canonicalization versus `C:\...`), so a failed prefix match is retried on
+/// normalized copies before the path is treated as outside the root.
+pub(crate) fn relative_shape_is_generated(project_root: &Path, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return path_has_generated_shape(path);
+    }
+    if let Ok(relative) = path.strip_prefix(project_root) {
+        return path_has_generated_shape(relative);
+    }
+    #[cfg(windows)]
+    {
+        let root = crate::windows_path::normalize_windows_path(project_root);
+        let path = crate::windows_path::normalize_windows_path(path);
+        let lowercase = |value: &Path| PathBuf::from(value.to_string_lossy().to_lowercase());
+        if let Ok(relative) = lowercase(&path).strip_prefix(lowercase(&root)) {
+            return path_has_generated_shape(relative);
+        }
+    }
+    false
 }
 
 pub(crate) fn is_generated_file_with_cached_hint(
@@ -173,6 +197,56 @@ mod tests {
         ));
         assert!(!source_has_generated_marker(
             "export const handwritten = true;\n// 2\n// 3\n// 4\n// 5\n// DO NOT EDIT"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[cfg(windows)]
+    #[test]
+    fn root_and_path_in_different_windows_spellings() {
+        use std::path::Path;
+        // Canonicalized roots carry the verbatim prefix; scanner paths may not.
+        let root = Path::new(r"\\?\C:\work\gen\proj");
+        assert!(super::relative_shape_is_generated(
+            root,
+            Path::new(r"C:\work\gen\proj\gen\schema_pb.ts")
+        ));
+        assert!(!super::relative_shape_is_generated(
+            root,
+            Path::new(r"c:\Work\Gen\Proj\src\main.ts")
+        ));
+        assert!(!super::relative_shape_is_generated(
+            Path::new(r"C:\work\gen\proj"),
+            Path::new(r"\\?\C:\work\gen\proj\src\main.ts")
+        ));
+    }
+    #[test]
+    fn generated_parent_is_not_project_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gen/myapp");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        let file = root.join("src/main.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        assert!(!super::is_generated_file_from_source(
+            &root,
+            &file,
+            "fn main() {}"
+        ));
+        assert!(super::is_generated_file_from_source(
+            &root,
+            &root.join("src/generated/types.rs"),
+            ""
+        ));
+        assert!(!super::is_generated_file(&root, &file));
+        assert!(!super::is_generated_file(
+            &root,
+            std::path::Path::new("src/main.rs")
+        ));
+        assert!(super::is_generated_file(
+            &root,
+            &root.join("src/generated/types.rs")
         ));
     }
 }

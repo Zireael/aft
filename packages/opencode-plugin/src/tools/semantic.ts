@@ -111,6 +111,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
     // aft_callgraph) already describe themselves.
     description: [
       "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').",
+      "When you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.",
       "Use `offset` to continue a ranked result list from a zero-based position.",
       "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
     ].join("\n\n"),
@@ -118,8 +119,17 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       query: arg(
         z
           .string()
+          .optional()
           .describe(
-            "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
+            "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+          ),
+      ),
+      pattern: arg(
+        z
+          .string()
+          .optional()
+          .describe(
+            "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
           ),
       ),
       topK: arg(optionalInt(1, 50).describe("Number of results (default: 10, max: 50)")),
@@ -144,24 +154,43 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       ),
     },
     execute: async (args, context): Promise<string> => {
-      if (
-        isEmptyParam(args.query) ||
-        typeof args.query !== "string" ||
-        args.query.trim().length === 0
-      ) {
-        throw new Error("semantic_search: invalid params: `query` must be a non-empty string");
+      const hasQuery = typeof args.query === "string" && args.query.trim().length > 0;
+      // A blank pattern counts as absent; a real one is sent as written,
+      // because whitespace inside a regex is part of what it matches.
+      if (!isEmptyParam(args.pattern) && typeof args.pattern !== "string") {
+        throw new Error("semantic_search: invalid params: `pattern` must be a string");
       }
-      const query = args.query;
+      const pattern =
+        typeof args.pattern === "string" && args.pattern.trim().length > 0
+          ? args.pattern
+          : undefined;
+      if (!hasQuery && pattern === undefined) {
+        if (!isEmptyParam(args.query) && typeof args.query !== "string") {
+          throw new Error("semantic_search: invalid params: `query` must be a non-empty string");
+        }
+        throw new Error(
+          args.pattern === undefined || args.pattern === null
+            ? "semantic_search: invalid params: `query` must be a non-empty string"
+            : "semantic_search: invalid params: at least one of `query` or `pattern` must be a non-empty string",
+        );
+      }
+      const query = hasQuery ? (args.query as string) : "";
+      const permissionSubject = hasQuery ? query : (pattern as string);
+      // The continuity key of a query-only search is unchanged; a pattern
+      // makes a different search, so it gets its own key.
+      const continuitySubject = pattern === undefined ? query : `${query}\u0000pattern:${pattern}`;
       const pathArg =
         typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
       const sessionProjectRoot = projectRootFor(context);
 
       // Auto routing may use either the indexed or grep-backed lane, so ask for
       // the aft_search permission before executing every search.
-      const denied = await askSearchPermission(context, query);
+      const denied = await askSearchPermission(context, permissionSubject);
       if (denied) return permissionDeniedResponse(denied);
 
-      const rawArgs: Record<string, unknown> = { query };
+      const rawArgs: Record<string, unknown> = {};
+      if (hasQuery) rawArgs.query = query;
+      if (pattern !== undefined) rawArgs.pattern = pattern;
       const topK = coerceOptionalInt(args.topK, "topK", 1, 50);
       const offset = coerceOptionalInt(args.offset, "offset", 0, 100000);
       const includeTests = !isEmptyParam(args.includeTests)
@@ -176,7 +205,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         if (externalDenied) {
           if (
             externalDenied.kind === "rule_denied" &&
-            hasMeaningfulProjectSearchFallback(query, pathArg, externalDenied.root)
+            hasMeaningfulProjectSearchFallback(permissionSubject, pathArg, externalDenied.root)
           ) {
             const fallbackResponse = await callToolCall(ctx, context, "search", rawArgs, {
               abortSignal: context.abort,
@@ -201,7 +230,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
               responseWithNotice,
               continuity,
               context.sessionID ?? "unknown-session",
-              continuityKey(sessionProjectRoot, query, includeTests, topK),
+              continuityKey(sessionProjectRoot, continuitySubject, includeTests, topK),
             );
           }
           return permissionDeniedResponse(externalDenied.message);
@@ -230,7 +259,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
         response,
         continuity,
         context.sessionID ?? "unknown-session",
-        continuityKey(selectedRoot, query, includeTests, topK),
+        continuityKey(selectedRoot, continuitySubject, includeTests, topK),
       );
     },
   };

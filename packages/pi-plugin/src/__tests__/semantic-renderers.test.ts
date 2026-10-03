@@ -204,6 +204,76 @@ describe("semantic renderer", () => {
     expect(output).toContain("mode=regex");
     expect(output).toContain("src/auth.ts");
     expect(output).toContain("line 12:5 export function login() {}");
+    expect(output).not.toContain("[exact]");
+  });
+
+  test("renderSemanticResult marks identifier sweep lines and shows the sweep coverage", () => {
+    const coverage =
+      "exact pass: complete; checked all 15 files under /repo (no AFT index for this project was usable, so files were read from disk)";
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "external_unindexed",
+          interpreted_as: "literal",
+          query_kind: "Identifier",
+          exact_sweep: { complete: true, coverage },
+          results: [
+            {
+              kind: "GrepLine",
+              source: "exact",
+              exact: true,
+              file: "/repo/src/store/pool.ts",
+              line: 2,
+              column: 3,
+              line_text: "requireCredentialStamps?: boolean",
+              match_text: "requireCredentialStamps",
+            },
+            {
+              kind: "GrepLine",
+              source: "variants",
+              exact: false,
+              file: "/repo/src/legacy.py",
+              line: 1,
+              column: 5,
+              line_text: "def require_credential_stamps(row):",
+              match_text: "require_credential_stamps",
+            },
+          ],
+        }),
+        { query: "requireCredentialStamps", topK: 5 },
+        mockTheme,
+        makeContext({ query: "requireCredentialStamps", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("line 2:3 [exact] requireCredentialStamps?: boolean");
+    expect(output).toContain(
+      "line 1:5 [variant: require_credential_stamps] def require_credential_stamps(row):",
+    );
+    expect(output).toContain(coverage);
+  });
+
+  test("renderSemanticResult shows the sweep coverage when nothing matched", () => {
+    const coverage =
+      "exact pass: bounded (40 files, time limit); checked 40 files; use grep for an exhaustive check";
+    const output = renderToString(
+      renderSemanticResult(
+        makeResult("", {
+          status: "ready",
+          semantic_status: "external_unindexed",
+          interpreted_as: "literal",
+          exact_sweep: { complete: false, coverage },
+          results: [],
+        }),
+        { query: "missingIdentifier", topK: 5 },
+        mockTheme,
+        makeContext({ query: "missingIdentifier", topK: 5 }),
+      ),
+    );
+
+    expect(output).toContain("No matches found.");
+    expect(output).toContain(coverage);
   });
 
   test("renderSemanticResult handles non-ready, error, and empty payloads", () => {

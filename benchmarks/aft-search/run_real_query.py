@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
+import bench_rerank
 from embedding_fixture_server import Server
 from evidence_tree import evidence_tree_sha256
 from ndjson_stream import NdjsonStream
@@ -25,16 +26,20 @@ from run import strip_verbatim_prefix
 from search_quality_lib import (
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
+    METRICS,
+    PAGE_INVARIANCE_FAILED_FIELD,
     InputFault,
     aggregate_real_query,
     canonical_json,
     choose_stop,
     collapse_paths,
+    excused_page_invariance,
     invariance_requests,
     mean_metrics,
     profile_requests,
     row_metrics,
     sha256_file,
+    split_rows_not_applicable,
     validate_profile_score,
     validate_scored_population,
 )
@@ -108,6 +113,7 @@ class NdjsonClient:
         env["FASTEMBED_CACHE_DIR"] = str(storage_dir / "model-cache")
         if model_env:
             env.update(model_env)
+        bench_rerank.apply_to_env(env)
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = "http://127.0.0.1:9"
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
         env.setdefault("RUST_LOG", "warn")
@@ -127,6 +133,7 @@ class NdjsonClient:
             raise AftProtocolError("aft_protocol:pipes_unavailable")
         self._stream = NdjsonStream(self.proc.stdout)
         self._next_id = 0
+        self.allow_building = False
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -139,6 +146,9 @@ class NdjsonClient:
         self._stderr.close()
 
     def call(self, command: str, params: Optional[Mapping[str, Any]] = None, timeout: float = 120.0) -> JsonObject:
+        # Only extend how long the client waits; do not change the engine's
+        # query-work limits or ranking parameters.
+        timeout = max(timeout, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
         self._next_id += 1
         request_id = str(self._next_id)
         request: JsonObject = {"id": request_id, "command": command}
@@ -176,12 +186,12 @@ class NdjsonClient:
         }
         if endpoint:
             semantic["base_url"] = endpoint
-        doc = {
+        doc = bench_rerank.apply_to_config({
             "search_index": True,
             "semantic_search": True,
             "callgraph_store": False,
             "semantic": semantic,
-        }
+        })
         response = self.call(
             "configure",
             {
@@ -207,17 +217,23 @@ class NdjsonClient:
             if semantic_status == "failed":
                 raise AftProtocolError(f"semantic_index_failed:{semantic}:{self.stderr_text()}")
             if semantic_status == "ready" and lexical_status == "ready":
+                settled = bench_rerank.settle(lambda: self.call("status", timeout=30.0))
+                if settled is not None:
+                    print(f"semantic_settled:{json.dumps(settled, sort_keys=True)}", flush=True)
                 return
             time.sleep(0.1)
         raise AftProtocolError(f"index_ready_timeout:{last}:{self.stderr_text()}")
 
     def search(self, arguments: Mapping[str, Any]) -> JsonObject:
+        started = time.perf_counter()
         response = self.call(
             "tool_call",
             {"session_id": "aft-search-real-query", "name": "search", "arguments": dict(arguments)},
         )
-        if response.get("success") is not True or response.get("status") != "ready":
-            raise AftProtocolError(f"aft_search_failed:{response}")
+        bench_rerank.observe("search", arguments, response, (time.perf_counter() - started) * 1000.0)
+        allowed_statuses = {"ready", "building"} if self.allow_building else {"ready"}
+        if response.get("success") is not True or response.get("status") not in allowed_statuses:
+            raise AftProtocolError(f"aft_search_failed:success={response.get('success')}:status={response.get('status')}:code={response.get('code')}")
         if not isinstance(response.get("results"), list):
             raise AftProtocolError("aft_search_failed:results_not_array")
         return response
@@ -335,12 +351,33 @@ def _response_exhausted(response: Mapping[str, Any], result_count: int, top_k: i
     return response.get("more_available") is False and result_count < top_k
 
 
-def _request(arguments: Mapping[str, int], row: Mapping[str, Any]) -> JsonObject:
+def probe_pattern_capability(client: Any) -> JsonObject:
+    """Use an invalid regex to distinguish parsing from silently ignored input."""
+    response = client.call("tool_call", {"session_id": "aft-search-capability", "name": "search", "arguments": {
+        "query": PROBE_TEXT, "pattern": "[", "topK": 1, "includeTests": False,
+    }})
+    error = response.get("error", {})
+    code = response.get("code", response.get("error_code"))
+    if isinstance(error, Mapping):
+        code = error.get("code", code)
+    if response.get("success") is False and code == "invalid_pattern":
+        return {"pattern_declared": True, "pattern_probe": "invalid_pattern"}
+    if response.get("success") is True:
+        return {"pattern_declared": False, "pattern_probe": "ignored_pattern"}
+    raise InputFault(f"pattern_capability_probe_failed:{response}")
+
+
+def _request(arguments: Mapping[str, int], row: Mapping[str, Any], split: bool = False) -> JsonObject:
     request: JsonObject = {
         "query": row["query"],
         "topK": arguments["topK"],
         "includeTests": row["include_tests"],
     }
+    if "pattern" in row:
+        if split:
+            request["pattern"] = row["pattern"]
+        elif str(row["pattern"]).strip():
+            request["query"] = row["query"] + " " + row["pattern"]
     if "offset" in arguments:
         request["offset"] = arguments["offset"]
     return request
@@ -356,18 +393,18 @@ def _run_requests(client: Any, requests: Sequence[JsonObject], project_root: Pat
     return responses, results
 
 
-def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tuple[list[list[JsonObject]], list[str]]:
+def _invariance(client: Any, row: Mapping[str, Any], project_root: Path, split: bool = False) -> tuple[list[list[JsonObject]], list[str], bool]:
+    """Run the invariance plans; return what was sent, the first plan's paths,
+    and whether all plans collapsed to the same paths."""
     plans = invariance_requests()
     sent: list[list[JsonObject]] = []
     collapsed: list[list[str]] = []
     for plan in plans:
-        requests = [_request(item, row) for item in plan]
+        requests = [_request(item, row, split) for item in plan]
         _, results = _run_requests(client, requests, project_root)
         sent.append(requests)
         collapsed.append(collapse_paths(results[:INVARIANCE_DEPTH]))
-    if not collapsed[0] == collapsed[1] == collapsed[2]:
-        raise InputFault(f"page_invariance_failed:{row['episode_id']}")
-    return sent, collapsed[0]
+    return sent, collapsed[0], collapsed[0] == collapsed[1] == collapsed[2]
 
 
 def score_manifest_rows(
@@ -376,6 +413,7 @@ def score_manifest_rows(
     capability: JsonObject,
     client: Any,
     project_root: Path,
+    building_client: Any = None,
 ) -> list[JsonObject]:
     included = [row for row in manifest.get("rows", []) if "excluded_reason" not in row]
     if not included:
@@ -384,8 +422,12 @@ def score_manifest_rows(
     scored: list[JsonObject] = []
     probe_pages: Optional[list[list[JsonObject]]] = None
     for row in included:
-        requests = [_request(item, row) for item in plans]
-        responses, results = _run_requests(client, requests, project_root)
+        row_client = building_client if row.get("semantic_state") == "building" else client
+        if row_client is None:
+            raise InputFault(f"building_fixture_client_missing:{row['episode_id']}")
+        split = capability.get("pattern_declared") is True
+        requests = [_request(item, row, split) for item in plans]
+        responses, results = _run_requests(row_client, requests, project_root)
         if profile == "paged" and probe_pages is None:
             probe_pages = results_by_request(responses, project_root)
         final_count = len(responses[-1].get("results", []))
@@ -401,14 +443,56 @@ def score_manifest_rows(
             page_zero_results, max_paths=len(page_zero_results)
         )
         invariance_sent: list[list[JsonObject]] = []
+        invariance_failure: Optional[str] = None
         if profile == "paged":
-            invariance_sent, invariant_paths = _invariance(client, row, project_root)
-            if invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
-                raise InputFault(f"page_invariance_failed:{row['episode_id']}:scoring")
-        metrics = row_metrics(ranked_paths, str(row["opened_file"]))
+            invariance_sent, invariant_paths, invariant = _invariance(row_client, row, project_root, split)
+            if not invariant:
+                invariance_failure = f"page_invariance_failed:{row['episode_id']}"
+            elif invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
+                invariance_failure = f"page_invariance_failed:{row['episode_id']}:scoring"
+            # A row whose manifest entry carries reference_not_page_invariant
+            # is recorded as a miss instead of raising, so a reference can be
+            # taken on an engine with the defect. validate_candidate_page_invariance
+            # in search_quality_lib still refuses that row when this score is
+            # evaluated as a candidate.
+            if invariance_failure and not excused_page_invariance(row):
+                raise InputFault(invariance_failure)
+        if invariance_failure is None:
+            metrics = row_metrics(ranked_paths, str(row["opened_file"]))
+        else:
+            # A ranking that changes with page size has no one order to
+            # record, and replays of it differ, so the miss keeps no paths.
+            metrics = {metric: 0.0 for metric in METRICS}
+            ranked_paths, retrieval_depth, page_zero_ranked_paths = [], 0, []
+        paired: JsonObject = {}
+        if "pattern" in row:
+            prose_row = {key: value for key, value in row.items() if key != "pattern"}
+            prose_requests = [_request(item, prose_row) for item in plans]
+            _, prose_results = _run_requests(row_client, prose_requests, project_root)
+            prose_paths = collapse_paths(prose_results)[:10]
+            prose_metrics = row_metrics(prose_paths, str(row["opened_file"]))
+            if split and row["split_kind"] == "R5" and results != prose_results:
+                raise InputFault(f"empty_pattern_not_identical:{row['episode_id']}")
+            paired = {
+                "input_form": "split" if split else "joined",
+                "answer_kind": row["answer_kind"],
+                "split_kind": row["split_kind"],
+                **({"pattern_summary": _relative_pattern_summary(responses[0].get("pattern_summary"), project_root), "summary_text": str(responses[0].get("text", "")).splitlines()[:8]} if split else {}),
+                # Diagnostics only, present when the engine runs with
+                # AFT_SEARCH_SPLIT_TRACE set: what placed each leading result.
+                **({"split_trace": responses[0]["split_trace"]} if split and responses[0].get("split_trace") else {}),
+                "prose_only": {"requests": prose_requests, "ranked_paths": prose_paths, "metrics": prose_metrics},
+                "paired_mrr_delta": metrics["mrr_at_10"] - prose_metrics["mrr_at_10"],
+                **({"semantic_state": "building", "envelope_complete": responses[0].get("complete")} if row.get("semantic_state") == "building" else {}),
+            }
+            if profile == "paged":
+                _, _, prose_invariant = _invariance(row_client, prose_row, project_root)
+                if not prose_invariant:
+                    raise InputFault(f"prose_page_invariance_failed:{row['episode_id']}")
         scored.append(
             {
                 "episode_id": row["episode_id"],
+                **paired,
                 "request": requests[0],
                 "requests": requests,
                 "request_count": len(requests) + sum(len(plan) for plan in invariance_sent),
@@ -428,6 +512,7 @@ def score_manifest_rows(
                 "mechanism": row["mechanism"],
                 "census_stratum": row["census_stratum"],
                 **({"invariance_requests": invariance_sent} if invariance_sent else {}),
+                **({PAGE_INVARIANCE_FAILED_FIELD: invariance_failure} if invariance_failure else {}),
             }
         )
     if profile == "paged":
@@ -494,7 +579,7 @@ def assemble_score(
     exact_family, exact_groups = _family_from_exact(exact_report)
     concept_family, concept_groups = _family_from_concept(concept_report)
     real = aggregate_real_query(rows)
-    return {
+    score: JsonObject = {
         "schema": "aft-search-score-v1",
         "evidence_sha": EVIDENCE_SHA,
         "model_id": model_id,
@@ -510,13 +595,21 @@ def assemble_score(
             "concept_recall": concept_family,
             "real_query": real["family"],
         },
-        "fixture_groups": {"exact_recall": exact_groups, "concept_recall": concept_groups},
+        "fixture_groups": {"exact_recall": exact_groups, "concept_recall": concept_groups,
+            **({"real_query": {"split": mean_metrics([row["metrics"] for row in rows if "input_form" in row])}} if any("input_form" in row for row in rows) else {})},
+        "paired_deltas": {row["episode_id"]: row["paired_mrr_delta"] for row in rows if "input_form" in row},
         "shapes": real["shapes"],
         "mechanisms": real["mechanisms"],
         "census_weighted_mrr_report_only": real["census_weighted_mrr_report_only"],
         "fixture_results": {"harness-goldens": True, "profile-grammar": True, "paging": profile != "paged" or capability.get("probe_pages_differ") is True},
         "rows": [dict(row) for row in rows],
     }
+    # Say which split rows the gate will not judge on this engine, and why,
+    # in the score itself rather than leaving the skip implicit.
+    not_applicable = split_rows_not_applicable(score)
+    if not_applicable:
+        score["split_rows_not_applicable"] = not_applicable
+    return score
 
 
 def load_manifest_and_tree(
@@ -553,6 +646,21 @@ def load_inputs(
     pack = read_pack(pack_path)
     if pack.get("pinned_sha") != EVIDENCE_SHA:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
+    supplement = manifest.get("split_query_pack")
+    if supplement:
+        supplemental_path = ROOT / supplement["path"]
+        if sha256_file(supplemental_path) != supplement["sha256"]:
+            raise InputFault("corpus_vector_model_mismatch:split_query_pack")
+        extra = read_pack(supplemental_path)
+        for field in ("pinned_sha", "model_id", "embed_template_version", "dimension"):
+            if extra.get(field) != pack.get(field):
+                raise InputFault(f"corpus_vector_model_mismatch:split_query_pack:{field}")
+        vectors = dict(pack["vectors"])
+        for key, vector in extra["vectors"].items():
+            if key in vectors and vectors[key] != vector:
+                raise InputFault("corpus_vector_model_mismatch:split_query_pack:overlap")
+            vectors[key] = vector
+        pack["vectors"] = vectors
     return manifest, tree, pack_path, pack
 
 
@@ -570,6 +678,27 @@ def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
 # Where the answer-key ignore list is copied inside the evidence tree, which is
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
+
+
+def _relative_pattern_summary(summary: Any, project_root: Path) -> Any:
+    """Rewrite the engine's absolute definition paths relative to the tree.
+
+    The evidence tree is copied into a fresh temporary directory on every run,
+    and that directory's name differs between runs and between platforms
+    (`/tmp/...` on Linux, `/private/var/folders/...` on macOS). The pattern
+    summary is part of each recorded row, so absolute paths there made two runs
+    of an identical engine compare unequal.
+    """
+    roots = {str(project_root), str(project_root.resolve())}
+    if isinstance(summary, dict):
+        return {key: _relative_pattern_summary(value, project_root) for key, value in summary.items()}
+    if isinstance(summary, list):
+        return [_relative_pattern_summary(value, project_root) for value in summary]
+    if isinstance(summary, str):
+        for root in roots:
+            if summary.startswith(root + os.sep):
+                return summary[len(root) + 1 :].replace(os.sep, "/")
+    return summary
 
 
 def copy_answer_key_ignore(root: Path) -> Optional[Path]:
@@ -614,17 +743,21 @@ def copy_evidence_root_ignore(root: Path) -> Path:
 
 
 @contextmanager
-def fixture_endpoint(pack: Mapping[str, Any], log_path: Path) -> Iterator[str]:
+def fixture_endpoint(pack: Mapping[str, Any], log_path: Path, corpus_release: Optional[threading.Event] = None) -> Iterator[str]:
     vectors = pack.get("vectors")
     template = pack.get("embed_template_version")
     if not isinstance(vectors, Mapping) or not isinstance(template, str) or not vectors:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
-    server = Server(("127.0.0.1", 0), vectors, template, log_path)
+    server = Server(("127.0.0.1", 0), vectors, template, log_path, corpus_release=corpus_release, unheld_corpus_texts={PROBE_TEXT})
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_port}"
+        if server.refused:
+            raise InputFault(f"vector_missing:{server.refused[0]}")
     finally:
+        if corpus_release is not None:
+            corpus_release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -633,6 +766,7 @@ def fixture_endpoint(pack: Mapping[str, Any], log_path: Path) -> Iterator[str]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--manifest", default=str(HERE / "real-query-manifest.json"))
+    result.add_argument("--tuning-only", action="store_true", help="Report-only replay of the separate tuning manifest; never gate or record it.")
     result.add_argument("--profile", choices=("single_page", "paged"), default="single_page")
     result.add_argument("--binary", default=DEFAULT_BINARY)
     result.add_argument("--schema", default=str(DEFAULT_SCHEMA))
@@ -669,6 +803,8 @@ def run(args: argparse.Namespace) -> int:
     binary = Path(args.binary).resolve()
     ensure_binary(binary)
     manifest, provisioned_tree, _pack_path, pack = load_inputs(manifest_path)
+    if bool(manifest.get("tuning_only")) != bool(args.tuning_only):
+        raise InputFault("tuning_manifest_requires_tuning_only_flag")
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
@@ -691,7 +827,34 @@ def run(args: argparse.Namespace) -> int:
             try:
                 client.configure(endpoint, configured_model, args.ready_timeout)
                 client.wait_ready(args.ready_timeout)
-                rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
+                bench_rerank.report_warm_up("real_query", bench_rerank.warm_up(
+                    lambda query: client.search({"query": query, "topK": 50, "includeTests": False}),
+                    bench_rerank.burn_in_queries(),
+                    args.ready_timeout,
+                ))
+                capability.update(probe_pattern_capability(client))
+                if any(row.get("semantic_state") == "building" for row in manifest["rows"]):
+                    with fixture_endpoint(pack, runtime / "building-embeddings.log", threading.Event()) as building_endpoint:
+                        building = NdjsonClient(binary, project_root, runtime / "building-storage", runtime / "building.stderr")
+                        building.allow_building = True
+                        try:
+                            building.configure(building_endpoint, FIXTURE_PROVIDER_MODEL, args.ready_timeout)
+                            deadline = time.monotonic() + args.ready_timeout
+                            while time.monotonic() < deadline:
+                                status = building.call("status")
+                                semantic_status = status.get("semantic_index", {}).get("status")
+                                if semantic_status in {"ready", "failed", "unavailable"}:
+                                    raise InputFault(f"semantic_building_fixture_not_building:{semantic_status}")
+                                if status.get("search_index", {}).get("status") == "ready" and (semantic_status == "building" or (semantic_status == "loading" and status.get("semantic_index", {}).get("stage") == "embedding_symbols")):
+                                    break
+                                time.sleep(0.1)
+                            else:
+                                raise InputFault(f"semantic_building_fixture_timeout:lexical={status.get('search_index', {}).get('status')}:semantic={status.get('semantic_index', {}).get('status')}:stage={status.get('semantic_index', {}).get('stage')}")
+                            rows = score_manifest_rows(manifest, args.profile, capability, client, project_root, building)
+                        finally:
+                            building.close()
+                else:
+                    rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
             finally:
                 client.close()
     score = assemble_score(
@@ -706,12 +869,23 @@ def run(args: argparse.Namespace) -> int:
         binary,
         Path(args.reference).resolve(),
     )
-    validate_scored_population(manifest, score)
+    if args.tuning_only:
+        score["tuning_only"] = True
+    else:
+        validate_scored_population(manifest, score)
     validate_profile_score(score)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(canonical_json(score))
+    for row in rows:
+        if "input_form" in row:
+            print(f"split_pair:{row['episode_id']} form={row['input_form']} mrr_delta={row['paired_mrr_delta']:+.6f}")
+            if row["input_form"] == "split":
+                print(f"split_summary:{row['episode_id']} {row.get('pattern_summary')} {row.get('summary_text')}")
     print(f"real_query_rows:{len(rows)}")
+    if "split_rows_not_applicable" in score:
+        skipped = score["split_rows_not_applicable"]
+        print(f"split_rows_not_applicable:{','.join(skipped['rows'])}:{skipped['reason']}")
     print(f"real_query_score:{output}")
     print(f"real_query_score_sha256:{sha256_file(output)}")
     return 0

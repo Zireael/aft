@@ -804,6 +804,26 @@ pub(super) fn build_error_frame(
         .map_err(SubcError::FrameBuild)
 }
 
+/// [`build_error_frame`] with a machine-readable `detail` object, for errors
+/// a caller must act on programmatically (such as which request field was
+/// refused).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_error_frame_with_detail(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    flags: Flags,
+    code: &str,
+    message: &str,
+    detail: Value,
+) -> Result<Frame, SubcError> {
+    let body = serde_json::to_vec(&ErrorBody::new(code, message).with_detail(detail))
+        .map_err(SubcError::Json)?;
+    Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
+        .map_err(SubcError::FrameBuild)
+}
+
 pub(super) fn build_goodbye_frame(
     ver: u8,
     channel: u16,
@@ -948,9 +968,8 @@ impl SubcError {
     /// decided the way a clean end of the connection decides it.
     pub(super) fn is_connection_closed(&self) -> bool {
         match self {
-            Self::WriterClosed | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => {
-                true
-            }
+            Self::WriterClosed
+            | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => true,
             Self::FrameIo(subc_transport::FrameIoError::Io(error)) => matches!(
                 error.kind(),
                 std::io::ErrorKind::BrokenPipe

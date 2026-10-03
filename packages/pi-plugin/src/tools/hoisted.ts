@@ -24,6 +24,9 @@ import {
   decodeFileUrl,
   formatEditSummary,
   formatReadFooter as formatSharedReadFooter,
+  isFindReplaceOnlyEdit,
+  relativePathEscapesRoot,
+  shortenHomePath as shortenPath,
   toolErrorFromResponse,
 } from "@cortexkit/aft-bridge";
 import {
@@ -34,7 +37,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { resolveGithubConfig } from "../config.js";
+import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
+import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -116,7 +120,7 @@ export function whenGhReadEnabled(enabled: boolean, description: string): string
 }
 
 const READ_DESCRIPTION =
-  "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
+  "Read file contents with line numbers or sorted directory entries. Use startLine/endLine or 1-based offset/limit for either. Directory limit defaults to and is capped at 1000; enumeration stops at 10,000 entries and partial listings carry a shown/total trailer. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
 
 function readDescription(ghReadEnabled: boolean): string {
   const githubDescription = whenGhReadEnabled(ghReadEnabled, ISSUE_AND_PR_READ_DESCRIPTION);
@@ -149,7 +153,7 @@ type SearchPathArgSplit = { paths: string[]; missing: string[] };
 
 function containsPath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 /**
@@ -282,15 +286,27 @@ export async function assertExternalDirectoryPermission(
 // to be converted while explicitly provided canonical fields remain authoritative.
 const ReadParams = Type.Object({
   path: Type.String({
-    description: "Path to the file to read (absolute or relative to project root)",
+    description: "Path to the file or directory to read (absolute or relative to project root)",
   }),
-  startLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line to start reading from"),
-  endLine: optionalInt(1, Number.MAX_SAFE_INTEGER, "1-based line to stop reading at (inclusive)"),
-  limit: optionalInt(1, Number.MAX_SAFE_INTEGER, "Maximum number of lines to return"),
+  startLine: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based line or directory entry to start reading from",
+  ),
+  endLine: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "1-based line or directory entry to stop reading at (inclusive)",
+  ),
+  limit: optionalInt(
+    1,
+    Number.MAX_SAFE_INTEGER,
+    "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+  ),
   offset: optionalInt(
     1,
     Number.MAX_SAFE_INTEGER,
-    "1-based line number to start reading from (use with limit)",
+    "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
   ),
 });
 
@@ -298,7 +314,9 @@ const WriteParams = Type.Object({
   path: Type.String({
     description: "Path to the file to write (absolute or relative to project root)",
   }),
-  content: Type.String({ description: "Full file contents to write" }),
+  content: Type.String({
+    description: "Full file contents to write; for issue://N / pr://N, the comment body to post",
+  }),
 });
 
 const BatchEditParams = Type.Object({
@@ -348,7 +366,7 @@ const EditParams = Type.Object({
   appendContent: Type.Optional(
     Type.String({
       description:
-        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). When set, other edit modes are ignored.",
+        "Append text to the end of the file (creates the file if missing, parent dirs auto-created). Mixing with other edit modes is rejected.",
     }),
   ),
   edits: Type.Optional(
@@ -360,7 +378,7 @@ const EditParams = Type.Object({
   ),
 });
 
-const HASHLINE_EDIT_DESCRIPTION = [
+const HASHLINE_EDIT_GRAMMAR = [
   "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string. Server-owned preview control is outside this schema.",
   "",
   "Quick reference:",
@@ -369,8 +387,18 @@ const HASHLINE_EDIT_DESCRIPTION = [
   "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), `<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). A plain `N` PUT replaces; use `<N` or `>N` to insert.",
   "- PUT text: `PUT <address>:` followed by one or more `+` body rows (`+` alone is blank). A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.",
   "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. `*** Begin Patch`/`*** End Patch` is an optional envelope.",
-  "- Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
 ].join("\n");
+
+/**
+ * The hashline `edit` description: the patch grammar plus the rule naming
+ * which calls mint tags. That rule names the bash rewrite path and the AFT
+ * navigation tools only when this configuration registers them.
+ */
+function hashlineEditDescription(config: PluginContext["config"]): string {
+  const bashRewrites = toolEnabled(config, "bash") && resolveBashConfig(config).rewrite;
+  const tagSources = hashlineTagSourceSentence(bashRewrites, (name) => toolEnabled(config, name));
+  return `${HASHLINE_EDIT_GRAMMAR}\n- ${tagSources}`;
+}
 
 const HashlineEditParams = Type.Object(
   {
@@ -564,7 +592,7 @@ export function registerHoistedTools(
         name: readName,
         label: readName,
         description: readDescription(resolveGithubConfig(ctx.config).read),
-        promptSnippet: "Read file contents (supports offset/limit for large files)",
+        promptSnippet: "Read files or directories (supports offset/limit for either)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,
         async execute(
@@ -654,7 +682,7 @@ export function registerHoistedTools(
       withPathAliasPreparation({
         name: writeName,
         label: writeName,
-        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool.${githubWriteDescription}`,
+        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubWriteDescription}`,
         promptSnippet: "Create or overwrite files (uses path; auto-formats)",
         promptGuidelines: [`Use ${writeName} only for new files or complete rewrites.`],
         parameters: WriteParams,
@@ -723,7 +751,7 @@ export function registerHoistedTools(
     pi.registerTool<typeof HashlineEditParams, FileMutationDetails>({
       name: editName,
       label: editName,
-      description: HASHLINE_EDIT_DESCRIPTION,
+      description: hashlineEditDescription(ctx.config),
       promptSnippet: `Apply a tagged hashline patch through the ${editName} tool`,
       promptGuidelines: [
         "Read a file to obtain its current hashline tag before editing it.",
@@ -813,21 +841,7 @@ export function registerHoistedTools(
           }
           if (isGithubResourcePath(filePathArg)) {
             const edits = params.edits;
-            const onlyFindReplace =
-              Array.isArray(edits) &&
-              edits.length > 0 &&
-              params.appendContent === undefined &&
-              params.symbol === undefined &&
-              params.content === undefined &&
-              edits.every(
-                (entry) =>
-                  typeof entry.oldString === "string" &&
-                  (entry.newString === undefined || typeof entry.newString === "string") &&
-                  entry.startLine === undefined &&
-                  entry.endLine === undefined &&
-                  entry.content === undefined,
-              );
-            if (!onlyFindReplace) {
+            if (!isFindReplaceOnlyEdit(argsRecord)) {
               throw new Error(
                 "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
               );
@@ -1200,12 +1214,6 @@ export function renderMutationResult(
     expanded: options.expanded,
     context,
   });
-}
-
-function shortenPath(path: string): string {
-  const home = homedir();
-  if (path.startsWith(home)) return `~${path.slice(home.length)}`;
-  return path;
 }
 
 /** Resolve a path argument to an absolute path if it exists, decoding file:

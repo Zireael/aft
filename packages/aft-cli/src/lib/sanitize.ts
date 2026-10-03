@@ -158,7 +158,7 @@ export function sanitizeContent(content: string): string {
   sanitized = sanitized.replace(/([A-Za-z]:\\Users\\)[^\\"'\s]+/g, "$1<USER>");
   sanitized = sanitized.replace(/([A-Za-z]:\/Users\/)[^/\s"']+/g, "$1<USER>");
   if (username) {
-    sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
+    sanitized = redactUsername(sanitized, username);
   }
   return sanitized;
 }
@@ -180,4 +180,13 @@ export function sanitizeValue(value: unknown): unknown {
     );
   }
   return value;
+}
+
+/** Redact a username only as a whole word or path segment, never inside identifiers. */
+export function redactUsername(content: string, username: string): string {
+  if (!username) return content;
+  return content.replace(
+    new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRegex(username)}(?![\\p{L}\\p{N}_])`, "gu"),
+    "<USER>",
+  );
 }

@@ -148,8 +148,8 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
         description:
           "Delete one or more files (or directories). " +
           (backupsDisabled
-            ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. "
-            : "Each file is backed up before deletion — use `aft_safety undo` to recover any of them. For directories, every file inside is individually backed up before removal. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would copy more than 2,000 files or 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. ") +
+            ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. A directory tree containing a mount point of another filesystem is still refused. "
+            : "Each file is backed up before deletion — use `aft_safety undo` to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. ") +
           "Directory deletion requires recursive: true. " +
           "Returns { success, complete, deleted, skipped_files }: partial success is allowed; files that fail are reported in skipped_files.",
         parameters: DeleteParams,
@@ -168,13 +168,14 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
             throw new Error("delete: `files` must be a non-empty array of paths");
           }
           const files = await Promise.all(inputs.map((file) => resolvePathArg(extCtx.cwd, file)));
+          // One value for every file of this call, even if a live config
+          // reload replaces `ctx.config` while the checks run.
+          const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
           const checked = new Set<string>();
           for (const file of files) {
             if (checked.has(file)) continue;
             checked.add(file);
-            await assertExternalDirectoryPermission(extCtx, file, {
-              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-            });
+            await assertExternalDirectoryPermission(extCtx, file, { restrictToProjectRoot });
           }
 
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -240,10 +241,9 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           const filePath = await resolvePathArg(extCtx.cwd, params.path as string);
           const destination = await resolvePathArg(extCtx.cwd, params.destination);
           const checked = new Set([filePath, destination]);
+          const restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false;
           for (const file of checked) {
-            await assertExternalDirectoryPermission(extCtx, file, {
-              restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-            });
+            await assertExternalDirectoryPermission(extCtx, file, { restrictToProjectRoot });
           }
 
           const bridge = bridgeFor(ctx, extCtx.cwd);

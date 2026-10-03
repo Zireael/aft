@@ -1,3 +1,3 @@
-import React, * as NS from 'react';
+import React, * as NS from "react";
 
 export const x = React;

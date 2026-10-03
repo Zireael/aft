@@ -12,6 +12,21 @@
 //! The ticket is the only authority. A session or agent field in the body is
 //! never used to pick the speaker, and a missing or unknown ticket is refused
 //! before anything leaves the daemon.
+//!
+//! A bot write goes out on one of two paths:
+//!
+//! - **stamp**: the session's tool route was bound under a daemon scope that
+//!   lets providers act as the session's agent (see [`delegating_agent`]). The
+//!   daemon then opens its plexus route under that same scope and sends the
+//!   write without an assertion; plexus reads the agent from the scope stamp on
+//!   that route and re-checks the scope before each write it sends.
+//! - **assertion**: everything else. The daemon mints a signed assertion from
+//!   prefrontal and sends it with the write on an unscoped route.
+//!
+//! The stamp path needs a transport that can open a scoped route
+//! ([`RelayTransport::opens_scoped_routes`]). The production transport can:
+//! it opens the route with the subc client's scoped open, and never falls back
+//! to an unscoped route when that open is refused.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -43,6 +58,14 @@ pub fn is_relay_operation(operation: &str) -> bool {
 /// in a tool-call result whose first text block holds the reply as JSON.
 /// Return the facade reply in both cases.
 pub fn facade_reply(value: &Value) -> Value {
+    // Direct facade fields are authoritative: a tool-call result may also
+    // carry text containing only the inner result, not the whole reply.
+    if ["result", "error", "repo_binding_generation"]
+        .iter()
+        .any(|field| value.get(field).is_some())
+    {
+        return value.clone();
+    }
     let wrapped = value
         .get("content")
         .and_then(Value::as_array)
@@ -68,10 +91,76 @@ pub fn facade_refusal_code(reply: &Value) -> Option<&str> {
 pub enum TransportError {
     /// The target answered with a subc Error frame carrying this code.
     Refused { code: String, message: String },
+    /// The target refused with this code for a reason expected to clear, so
+    /// the same request may be tried again shortly.
+    RefusedRetryable { code: String, message: String },
     /// Nothing was sent: no connection, no route, or the module is absent.
     Unavailable(String),
     /// The request was sent but no reply arrived; it may have executed.
     OutcomeUnknown(String),
+}
+
+/// The daemon scope stamped on a route at bind.
+pub type ScopeStamp = subc_protocol::scope::ScopeStamp;
+/// The scope a route open asks to be admitted under.
+pub type ScopeSelector = subc_protocol::scope::ScopeSelector;
+
+/// The agent a stamp lets a provider act as, if any.
+///
+/// This is exactly the rule plexus applies to a bot write that carries no
+/// assertion: the scope must delegate, its owner must be one the daemon trusts
+/// to set agent identity (`owner_authorized`), and it must name an agent. Any
+/// other stamp grants plexus no one to act as, so a write without an assertion
+/// would be refused (`assertion_absent`).
+pub fn delegating_agent(stamp: &ScopeStamp) -> Option<&str> {
+    if stamp.attributes.delegates && stamp.owner_authorized {
+        stamp.attributes.agent_id.as_deref()
+    } else {
+        None
+    }
+}
+
+/// The selector that opens a route under the scope a stamp names, pinned to
+/// the stamp's epoch so a newer session under the same ref is not picked up.
+fn scope_selector(stamp: &ScopeStamp) -> ScopeSelector {
+    ScopeSelector {
+        owner: stamp.owner.clone(),
+        scope_ref: stamp.scope_ref.clone(),
+        scope_epoch: Some(stamp.scope_epoch),
+    }
+}
+
+/// The scope stamps of AFT's bound tool routes, keyed by the session each
+/// route was bound for. The subc frame loop copies them when a relay request
+/// arrives, because the relay runs on its own task and cannot read the loop's
+/// route table.
+#[derive(Clone, Debug, Default)]
+pub struct RouteScopes {
+    routes: Vec<(String, Option<ScopeStamp>)>,
+}
+
+impl RouteScopes {
+    /// Record one bound tool route and the stamp the daemon put on it.
+    pub fn push(&mut self, session: &str, stamp: Option<ScopeStamp>) {
+        self.routes.push((session.to_string(), stamp));
+    }
+
+    /// The stamp of the session's tool route, when there is exactly one answer.
+    ///
+    /// A ticket names a session, not a route, and a session can have more than
+    /// one route bound at a time. When those routes carry different stamps, or
+    /// one of them carries none, the relay cannot tell which route launched the
+    /// command, so this returns `None` and the write uses the assertion path,
+    /// which is what an unstamped session gets.
+    pub fn for_session(&self, session: &str) -> Option<&ScopeStamp> {
+        let mut stamps = self
+            .routes
+            .iter()
+            .filter(|(bound, _)| bound == session)
+            .map(|(_, stamp)| stamp.as_ref());
+        let first = stamps.next()??;
+        stamps.all(|other| other == Some(first)).then_some(first)
+    }
 }
 
 /// The two outbound calls the relay makes. Production uses the daemon's own
@@ -85,12 +174,19 @@ pub trait RelayTransport: Send + Sync {
         body: Value,
     ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
+    /// With `scope`, the route to plexus must be opened under that scope, so
+    /// plexus sees its stamp; without one the route is unscoped.
     fn plexus(
         &self,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
+    /// Whether [`RelayTransport::plexus`] can open its route under a scope.
+    /// The stamp path is only taken when this is true: a write without an
+    /// assertion on an unscoped route would be refused by plexus.
+    fn opens_scoped_routes(&self) -> bool;
 }
 
 #[derive(Clone, Debug)]
@@ -185,11 +281,18 @@ pub struct RelayCall<'a> {
     pub first_party: bool,
     /// Current Unix time in seconds, for the token cache.
     pub now: u64,
+    /// Scope stamps of the daemon's bound tool routes when the request arrived.
+    pub route_scopes: &'a RouteScopes,
 }
 
+/// Which path a bot write took, for the relay log line.
+const PATH_STAMP: &str = "stamp";
+const PATH_ASSERTION: &str = "assertion";
+
 /// Run one relay operation. `log` receives exactly one line per call carrying
-/// the redeemed session, task id, nonce, action, repository and outcome; the
-/// ticket and the assertion never appear in it.
+/// the redeemed session, task id, nonce, action, repository, the path the
+/// write took (`stamp` or `assertion`, `-` when refused before one was chosen)
+/// and the outcome; the ticket, the assertion and the scope never appear in it.
 pub async fn relay<T: RelayTransport>(
     transport: &T,
     cache: &TokenCache,
@@ -216,6 +319,7 @@ pub async fn relay<T: RelayTransport>(
 
     let mut session = "-".to_string();
     let mut task = "-".to_string();
+    let mut path = "-";
     let reply = 'reply: {
         if !call.first_party {
             break 'reply RelayReply::refused(
@@ -250,20 +354,28 @@ pub async fn relay<T: RelayTransport>(
         };
         match call.operation {
             BINDINGS_READ_OPERATION => {
+                path = PATH_ASSERTION;
                 bindings_read(transport, cache, &redeemed, params, call.now).await
             }
-            _ => bot_request(transport, cache, &redeemed, params, call.now).await,
+            _ => {
+                let stamp = call.route_scopes.for_session(&redeemed.session_id);
+                let (reply, taken) =
+                    bot_request(transport, cache, &redeemed, stamp, params, call.now).await;
+                path = taken;
+                reply
+            }
         }
     };
 
     log(&format!(
-        "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} outcome={}",
+        "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} path={} outcome={}",
         call.operation,
         session,
         task,
         if nonce.is_empty() { "-" } else { nonce },
         action,
         repository,
+        path,
         reply.outcome_label(),
     ));
     reply
@@ -356,12 +468,9 @@ async fn bindings_read<T: RelayTransport>(
         Ok(connection_id) => connection_id,
         Err(message) => return RelayReply::refused("assertion_handle_malformed", "mint", message),
     };
-    let body = json!({
-        "name": "github",
-        "arguments": {"op": "bindings.read", "connection_id": connection_id},
-    });
+    let body = github_call(json!({"op": "bindings.read", "connection_id": connection_id}));
     match transport
-        .plexus(&redeemed.project_root, &redeemed.session_id, body)
+        .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
         .await
     {
         Ok(reply) => RelayReply::relayed(reply),
@@ -369,22 +478,30 @@ async fn bindings_read<T: RelayTransport>(
     }
 }
 
+/// Relay one bot write, returning plexus's reply and the path it took.
 async fn bot_request<T: RelayTransport>(
     transport: &T,
     cache: &TokenCache,
     redeemed: &crate::gh_shim_ticket::Redeemed,
+    stamp: Option<&ScopeStamp>,
     params: &Value,
     now: u64,
-) -> RelayReply {
+) -> (RelayReply, &'static str) {
     let Some(nonce) = params
         .get("request_nonce")
         .and_then(Value::as_str)
         .filter(|nonce| !nonce.is_empty())
     else {
-        return RelayReply::refused("request_malformed", "request", "request_nonce is required");
+        return (
+            RelayReply::refused("request_malformed", "request", "request_nonce is required"),
+            "-",
+        );
     };
     let Some(request) = params.get("request").filter(|request| request.is_object()) else {
-        return RelayReply::refused("request_malformed", "request", "request must be an object");
+        return (
+            RelayReply::refused("request_malformed", "request", "request must be an object"),
+            "-",
+        );
     };
     // The agent is the one the shim's signed manifest binds to the target
     // repository. It names whose bot to mint for; the session comes from the
@@ -395,28 +512,71 @@ async fn bot_request<T: RelayTransport>(
         .and_then(Value::as_str)
         .filter(|agent| !agent.is_empty())
     else {
-        return RelayReply::refused(
-            "request_malformed",
-            "request",
-            "request.metadata.agent_id is required",
+        return (
+            RelayReply::refused(
+                "request_malformed",
+                "request",
+                "request.metadata.agent_id is required",
+            ),
+            "-",
         );
     };
     let session = redeemed.session_id.as_str();
-    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
-        Ok(token) => token,
-        Err(refusal) => return refusal,
-    };
-    let body = json!({
-        "name": "github",
-        "arguments": {
+
+    // The stamp path: the session's scope lets plexus act as its agent, and
+    // the route to plexus can be opened under that scope so plexus sees it.
+    if let Some((stamp_agent, stamp)) = stamp
+        .filter(|_| transport.opens_scoped_routes())
+        .and_then(|stamp| delegating_agent(stamp).map(|agent| (agent, stamp)))
+    {
+        // Plexus takes the agent from the stamp, so a request naming another
+        // agent would speak as the wrong bot. Plexus refuses the same mismatch
+        // under this code when a stamp and an assertion disagree.
+        if stamp_agent != agent_id {
+            return (
+                RelayReply::refused(
+                    "agent_identity_conflict",
+                    "scope",
+                    format!(
+                        "the session's scope acts as agent {stamp_agent}, but the request names agent {agent_id}"
+                    ),
+                ),
+                PATH_STAMP,
+            );
+        }
+        let selector = scope_selector(stamp);
+        let body = github_call(json!({
             "op": "bot_request",
-            "assertion": token,
             "request_nonce": nonce,
             "request": request,
-        },
-    });
-    match transport
-        .plexus(&redeemed.project_root, session, body)
+        }));
+        // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
+        // `delegation_withdrawn`, `agent_identity_conflict`, with their
+        // `legs_sent`), goes back to the shim as plexus sent it. The write is
+        // never retried on the assertion path: plexus refused because of the
+        // scope, and an assertion would get the write past that decision.
+        let reply = match transport
+            .plexus(&redeemed.project_root, session, Some(&selector), body)
+            .await
+        {
+            Ok(reply) => RelayReply::relayed(reply),
+            Err(error) => transport_refusal("plexus", error),
+        };
+        return (reply, PATH_STAMP);
+    }
+
+    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
+        Ok(token) => token,
+        Err(refusal) => return (refusal, PATH_ASSERTION),
+    };
+    let body = github_call(json!({
+        "op": "bot_request",
+        "assertion": token,
+        "request_nonce": nonce,
+        "request": request,
+    }));
+    let reply = match transport
+        .plexus(&redeemed.project_root, session, None, body)
         .await
     {
         Ok(reply) => {
@@ -430,12 +590,36 @@ async fn bot_request<T: RelayTransport>(
             RelayReply::relayed(reply)
         }
         Err(error) => transport_refusal("plexus", error),
-    }
+    };
+    (reply, PATH_ASSERTION)
+}
+
+/// The body of AFT's call to plexus's `github` tool. AFT is the caller here:
+/// it is not relaying a tool call some other principal made, and the agent a
+/// write speaks for reaches plexus through the scope stamp or the minted
+/// assertion. So the request carries no `origin`, which keeps the body the
+/// plain `{name, arguments}` shape plexus already reads.
+fn github_call(arguments: Value) -> Value {
+    serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
+        name: "github".into(),
+        arguments,
+        tool_call_id: None,
+        progress_token: None,
+        call_key: None,
+        schema_pin: None,
+        origin: None,
+    })
+    .expect("a tool call serializes to JSON")
 }
 
 fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
     match error {
         TransportError::Refused { code, message } => RelayReply::refused(&code, stage, message),
+        TransportError::RefusedRetryable { code, message } => {
+            let mut reply = RelayReply::refused(&code, stage, message);
+            reply.data["retryable"] = Value::Bool(true);
+            reply
+        }
         TransportError::Unavailable(message) => {
             RelayReply::refused("relay_unavailable", stage, message)
         }
@@ -460,11 +644,238 @@ impl GhRelay {
     }
 }
 
+/// Route-open refusals of a scoped route that end the call at once. The subc
+/// client returns these four without retrying. Each goes back to the shim
+/// under its own code, the way plexus's own scope refusals do, and the write
+/// is never retried on the assertion path: the daemon refused because of the
+/// scope, and an assertion would get the write past that decision.
+///
+/// This is also how a scope the daemon closed stays closed. The daemon's
+/// `route.closed` notice does not say which route it closed, so the relay
+/// keeps no record of ended scopes. Each relay call opens its route afresh and
+/// never reopens it within the call; the next call's open under a removed
+/// scope is refused by the daemon (`scope_not_live`, `scope_ended`), and that
+/// refusal is relayed as it is.
+const TERMINAL_SCOPE_OPEN_REFUSALS: [&str; 4] = [
+    subc_protocol::error_codes::SCOPE_NOT_LIVE,
+    subc_protocol::error_codes::SCOPE_ENDED,
+    subc_protocol::error_codes::SCOPE_EPOCH_REQUIRED,
+    subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+];
+
+/// Route-open refusals of a scoped route that the subc client retries inside
+/// the call's deadline: the scope's owner has not synced since the daemon
+/// started, or the scope changed while the open was in flight. When they
+/// outlast the deadline the shim gets the code, marked retryable, rather than
+/// a generic `relay_unavailable`.
+const RETRYABLE_SCOPE_OPEN_REFUSALS: [&str; 2] = [
+    subc_protocol::error_codes::SCOPE_NOT_SYNCED,
+    subc_protocol::error_codes::SCOPE_CHANGED,
+];
+
+/// The typed refusal for a failed route open, when the daemon refused it for
+/// one of the scope reasons above.
+fn scope_open_refusal(error: &subc_client_rs::CallError) -> Option<TransportError> {
+    let body = error.route_open_refusal()?;
+    let code = body.code.as_str();
+    if TERMINAL_SCOPE_OPEN_REFUSALS.contains(&code) {
+        Some(TransportError::Refused {
+            code: body.code.clone(),
+            message: body.message.clone(),
+        })
+    } else if RETRYABLE_SCOPE_OPEN_REFUSALS.contains(&code) {
+        Some(TransportError::RefusedRetryable {
+            code: body.code.clone(),
+            message: body.message.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+/// The relay calls currently using each route, so a route shared by
+/// overlapping calls is closed only when the last of them finishes.
+///
+/// The subc client caches a route per target, bind identity and scope, and
+/// hands the same route to every open with that key. Two overlapping relay
+/// calls for one session therefore share a route, and closing it when the
+/// first call finishes would fail the other's request in flight. The client
+/// has no uncached scoped open, so the count lives here.
+#[derive(Default)]
+struct RouteLeases {
+    /// Per route key: how many calls hold it, and every handle they were given.
+    /// A route that died mid-call is replaced by a fresh one under the same
+    /// key, so one key can have handed out more than one handle.
+    holders: tokio::sync::Mutex<HashMap<String, (usize, Vec<subc_client_rs::RouteHandle>)>>,
+}
+
+impl RouteLeases {
+    /// Count a call as holding the route under `key`, before it opens it.
+    async fn acquire(&self, key: &str) {
+        self.holders
+            .lock()
+            .await
+            .entry(key.to_string())
+            .or_default()
+            .0 += 1;
+    }
+
+    /// Record the handle the client gave a holder of `key`.
+    async fn opened(&self, key: &str, route: subc_client_rs::RouteHandle) {
+        if let Some((_, handles)) = self.holders.lock().await.get_mut(key) {
+            if !handles.contains(&route) {
+                handles.push(route);
+            }
+        }
+    }
+
+    /// Stop counting a call as holding `key`. The last holder closes every
+    /// handle given out under it, through the handle: the client's close by
+    /// route key only finds unscoped routes. The close runs under the lock, so
+    /// a call acquiring the key meanwhile opens after the route has left the
+    /// client's cache and gets a fresh one.
+    async fn release(&self, key: &str, consumer: &subc_client_rs::SubcConsumer) {
+        let mut holders = self.holders.lock().await;
+        let Some((count, _)) = holders.get_mut(key) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        let Some((_, handles)) = holders.remove(key) else {
+            return;
+        };
+        for route in handles {
+            let _ = consumer
+                .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
+                .await;
+        }
+    }
+}
+
+/// A failed outbound call, and whether the connection should be reopened
+/// before the next one.
+struct CallFailure {
+    error: TransportError,
+    reconnect: bool,
+}
+
+/// Open a route to `target` (or share the one another call holds), send `body`
+/// on it, and release it again.
+///
+/// With `scope`, the route is opened under that scope with the subc client's
+/// scoped open. A refused scoped open is returned as it is and never retried
+/// as an unscoped open: that would send the write without the stamp that
+/// stands in for its assertion.
+async fn route_request(
+    consumer: &subc_client_rs::SubcConsumer,
+    leases: &RouteLeases,
+    target: subc_protocol::RouteTarget,
+    identity: subc_protocol::BindIdentity,
+    scope: Option<&ScopeSelector>,
+    options: subc_client_rs::CallOptions,
+    body: &Value,
+) -> Result<Value, CallFailure> {
+    let bytes = serde_json::to_vec(body).map_err(|error| CallFailure {
+        error: TransportError::Unavailable(error.to_string()),
+        reconnect: false,
+    })?;
+    let key = serde_json::to_string(&(&target, &identity, scope)).map_err(|error| CallFailure {
+        error: TransportError::Unavailable(error.to_string()),
+        reconnect: false,
+    })?;
+    leases.acquire(&key).await;
+    let outcome = open_and_send(
+        consumer, leases, &key, target, identity, scope, options, bytes,
+    )
+    .await;
+    leases.release(&key, consumer).await;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_and_send(
+    consumer: &subc_client_rs::SubcConsumer,
+    leases: &RouteLeases,
+    key: &str,
+    target: subc_protocol::RouteTarget,
+    identity: subc_protocol::BindIdentity,
+    scope: Option<&ScopeSelector>,
+    options: subc_client_rs::CallOptions,
+    bytes: Vec<u8>,
+) -> Result<Value, CallFailure> {
+    use subc_client_rs::{CallError, CallOptions};
+    let opened = match scope {
+        Some(scope) => {
+            consumer
+                .open_route_scoped(target, identity, scope.clone(), options)
+                .await
+        }
+        None => consumer.open_route(target, identity, options).await,
+    };
+    let route = match opened {
+        Ok(route) => route,
+        Err(error) => {
+            if let Some(refusal) = scope.and_then(|_| scope_open_refusal(&error)) {
+                return Err(CallFailure {
+                    error: refusal,
+                    reconnect: false,
+                });
+            }
+            return Err(match error {
+                CallError::Module(body) => CallFailure {
+                    error: TransportError::Refused {
+                        code: body.code,
+                        message: body.message,
+                    },
+                    reconnect: false,
+                },
+                // A broken connection is reopened on the next relay.
+                error => CallFailure {
+                    error: TransportError::Unavailable(error.to_string()),
+                    reconnect: true,
+                },
+            });
+        }
+    };
+    leases.opened(key, route).await;
+    match consumer
+        .request(&route, bytes, CallOptions::default())
+        .await
+    {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| CallFailure {
+            error: TransportError::OutcomeUnknown("the reply was not JSON".to_string()),
+            reconnect: false,
+        }),
+        Err(CallError::Module(body)) => Err(CallFailure {
+            error: TransportError::Refused {
+                code: body.code,
+                message: body.message,
+            },
+            reconnect: false,
+        }),
+        Err(CallError::NotSent(error)) => Err(CallFailure {
+            error: TransportError::Unavailable(error.to_string()),
+            reconnect: true,
+        }),
+        Err(error) => Err(CallFailure {
+            error: TransportError::OutcomeUnknown(error.to_string()),
+            reconnect: true,
+        }),
+    }
+}
+
 /// Outbound calls over the daemon's own authenticated subc connection. The
 /// connection is opened lazily on first use and reopened after a failure.
 pub struct SubcRelayTransport {
     connection_file: PathBuf,
     consumer: tokio::sync::Mutex<Option<Arc<subc_client_rs::SubcConsumer>>>,
+    leases: RouteLeases,
+    /// Replaces the subc client's route-open deadline (30 s, with retries for
+    /// up to 90 s) when set. Production leaves it unset; tests shorten it so a
+    /// retried refusal runs out quickly.
+    route_open_deadline: Option<Duration>,
 }
 
 impl SubcRelayTransport {
@@ -472,26 +883,42 @@ impl SubcRelayTransport {
         Self {
             connection_file,
             consumer: tokio::sync::Mutex::new(None),
+            leases: RouteLeases::default(),
+            route_open_deadline: None,
         }
     }
 
+    /// A transport already holding `consumer`, for tests that serve it from a
+    /// fake daemon without a module identity.
+    #[cfg(test)]
+    fn with_consumer(
+        consumer: subc_client_rs::SubcConsumer,
+        route_open_deadline: Option<Duration>,
+    ) -> Self {
+        let mut transport = Self::new(PathBuf::from("/nonexistent/aft-gh-relay-test"));
+        transport.route_open_deadline = route_open_deadline;
+        *transport
+            .consumer
+            .try_lock()
+            .expect("a new transport's consumer slot is free") = Some(Arc::new(consumer));
+        transport
+    }
+
     fn identity_available() -> bool {
-        ["SUBC_MODULE_ID", "SUBC_LAUNCH_NONCE"].iter().all(|key| {
-            std::env::var(key)
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
-        })
+        crate::launch_nonce::consumer_identity().is_some()
     }
 
     async fn consumer(&self) -> Result<Arc<subc_client_rs::SubcConsumer>, TransportError> {
+        let mut slot = self.consumer.lock().await;
+        if let Some(consumer) = slot.as_ref() {
+            return Ok(Arc::clone(consumer));
+        }
+        // The identity is fixed for the life of the process, so checking it
+        // before each new connection is the same as checking it on every call.
         if !Self::identity_available() {
             return Err(TransportError::Unavailable(
                 "the daemon has no subc module identity to relay with".to_string(),
             ));
-        }
-        let mut slot = self.consumer.lock().await;
-        if let Some(consumer) = slot.as_ref() {
-            return Ok(Arc::clone(consumer));
         }
         let options = subc_client_rs::ConsumerOptions {
             call_timeout: RELAY_CALL_TIMEOUT,
@@ -510,9 +937,9 @@ impl SubcRelayTransport {
         target: subc_protocol::RouteTarget,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> Result<Value, TransportError> {
-        use subc_client_rs::{CallError, CallOptions, CloseRouteOptions};
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new(
             if project_root.is_empty() {
@@ -524,45 +951,31 @@ impl SubcRelayTransport {
             "aft-gh-relay",
             session.to_string(),
         );
-        let route = match consumer
-            .open_route(target, identity, CallOptions::default())
-            .await
-        {
-            Ok(route) => route,
-            Err(CallError::Module(body)) => {
-                return Err(TransportError::Refused {
-                    code: body.code,
-                    message: body.message,
-                })
-            }
-            Err(error) => {
-                // A broken connection is reopened on the next relay.
-                *self.consumer.lock().await = None;
-                return Err(TransportError::Unavailable(error.to_string()));
-            }
+        let mut options = subc_client_rs::CallOptions {
+            consumer_identity: crate::launch_nonce::consumer_identity(),
+            ..subc_client_rs::CallOptions::default()
         };
-        let bytes = serde_json::to_vec(&body)
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
-        let response = consumer
-            .request(&route, bytes, CallOptions::default())
-            .await;
-        let _ = consumer
-            .close_handle(&route, CloseRouteOptions::default())
-            .await;
-        match response {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|_| TransportError::OutcomeUnknown("the reply was not JSON".to_string())),
-            Err(CallError::Module(body)) => Err(TransportError::Refused {
-                code: body.code,
-                message: body.message,
-            }),
-            Err(CallError::NotSent(error)) => {
-                *self.consumer.lock().await = None;
-                Err(TransportError::Unavailable(error.to_string()))
-            }
-            Err(error) => {
-                *self.consumer.lock().await = None;
-                Err(TransportError::OutcomeUnknown(error.to_string()))
+        if let Some(deadline) = self.route_open_deadline {
+            options.timeout = deadline;
+            options.route_retry_deadline = deadline;
+        }
+        match route_request(
+            &consumer,
+            &self.leases,
+            target,
+            identity,
+            scope,
+            options,
+            &body,
+        )
+        .await
+        {
+            Ok(reply) => Ok(reply),
+            Err(failure) => {
+                if failure.reconnect {
+                    *self.consumer.lock().await = None;
+                }
+                Err(failure.error)
             }
         }
     }
@@ -581,6 +994,7 @@ impl RelayTransport for SubcRelayTransport {
             },
             project_root,
             session,
+            None,
             body,
         )
         .await
@@ -590,6 +1004,7 @@ impl RelayTransport for SubcRelayTransport {
         &self,
         project_root: &str,
         session: &str,
+        scope: Option<&ScopeSelector>,
         body: Value,
     ) -> Result<Value, TransportError> {
         self.call(
@@ -598,9 +1013,17 @@ impl RelayTransport for SubcRelayTransport {
             },
             project_root,
             session,
+            scope,
             body,
         )
         .await
+    }
+
+    /// True: the subc client opens a route to plexus under the session's scope
+    /// (`SubcConsumer::open_route_scoped`, since subc-client-rs 0.23.2), so a
+    /// session whose scope delegates to its agent takes the stamp path.
+    fn opens_scoped_routes(&self) -> bool {
+        true
     }
 }
 

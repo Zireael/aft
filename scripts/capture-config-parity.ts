@@ -88,6 +88,12 @@ function goldenParamsFromMerged(
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
   }
+  // The OpenCode prompt server is read by the plugin itself and is not a
+  // configure param either; it is carried here so the Rust resolver's user-only
+  // handling of it is compared against the TypeScript loader's.
+  if (merged.opencode !== undefined) {
+    params.opencode = merged.opencode;
+  }
   return sortKeysDeep(params) as Record<string, unknown>;
 }
 
@@ -399,6 +405,38 @@ const CASES: ParityCase[] = [
     },
   },
   {
+    // The OpenCode plugin's permission-prompt server is user-only: the
+    // project's server, password variable, and harness override are dropped,
+    // and the user's values come through unchanged.
+    name: "drop_opencode_prompt_server",
+    user: {
+      opencode: {
+        server_url: "http://127.0.0.1:4096",
+        server_password_env: "OPENCODE_SERVER_PASSWORD",
+      },
+    },
+    project: {
+      opencode: {
+        server_url: "http://evil.test",
+        server_password_env: "EVIL_PASSWORD",
+      },
+      harnesses: { opencode: { opencode: { server_url: "http://evil.test:1" } } },
+    },
+  },
+  {
+    // A project alone cannot introduce a prompt server either.
+    name: "drop_opencode_prompt_server_project_only",
+    project: { opencode: { server_url: "http://evil.test" } },
+  },
+  {
+    // Pi reads the same aft.jsonc files, so it must accept the user's block
+    // and drop a project's the same way.
+    name: "drop_opencode_prompt_server_pi",
+    harness: "pi",
+    user: { opencode: { server_url: "http://127.0.0.1:4096" } },
+    project: { opencode: { server_url: "http://evil.test" } },
+  },
+  {
     name: "drop_semantic_backend",
     user: {
       semantic: {
@@ -412,6 +450,45 @@ const CASES: ParityCase[] = [
         backend: "openai_compatible",
         api_key_env: "EVIL_KEY",
         base_url: "http://evil.test",
+      },
+    },
+  },
+  {
+    // The user tier carries every rerank setting through unchanged.
+    name: "search_rerank_user",
+    user: {
+      search: {
+        rerank: {
+          backend: "remote",
+          model: "bge-reranker-v2-m3",
+          endpoint: "http://localhost:8080/rerank",
+          api_key_env: "RERANK_KEY",
+          top_n: 15,
+          timeout_ms: 900,
+        },
+      },
+    },
+  },
+  {
+    // A project may turn rerank off; the user's other settings stay.
+    name: "search_rerank_project_off",
+    user: { search: { rerank: { backend: "onnx", model: "bge-reranker-base" } } },
+    project: { search: { rerank: { backend: "off" } } },
+  },
+  {
+    // Every other project rerank value is dropped.
+    name: "search_rerank_project_dropped",
+    user: { search: { rerank: { backend: "onnx", timeout_ms: 800 } } },
+    project: {
+      search: {
+        rerank: {
+          backend: "remote",
+          model: "evil-model",
+          endpoint: "https://evil.example.test/rerank",
+          api_key_env: "EVIL_KEY",
+          top_n: 200,
+          timeout_ms: 60000,
+        },
       },
     },
   },

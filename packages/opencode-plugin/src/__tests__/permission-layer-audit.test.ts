@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
+import { type BridgePool, execFileSync, type ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
@@ -416,6 +416,50 @@ describe("permission audit regressions", () => {
     expect(grepAskCalls[0]?.always).toEqual(["*"]);
     expect(grepAskCalls[0]?.metadata).toEqual(expect.objectContaining({ pattern: "TODO" }));
     expect(grepCalls).toEqual([]);
+  });
+
+  test("aft_search with a path inside the project's own repository spawns no git probe", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    execFileSync("git", ["init", "-q", project]);
+    await mkdir(path.join(project, "src"), { recursive: true });
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = createSdkContext(project, recordingAsk(askCalls));
+
+    const probesBefore = _permissionsInternalsForTest.gitRootProbeCount();
+    for (const target of [path.join(project, "src"), path.join(project, "src", "missing.ts")]) {
+      await tools.aft_search.execute({ query: "TODO", hint: "literal", path: target }, sdkCtx);
+    }
+
+    expect(_permissionsInternalsForTest.gitRootProbeCount() - probesBefore).toBe(0);
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(0);
+    expect(calls).toHaveLength(2);
+  });
+
+  test("aft_search still probes git when the project is not a repository top level", async () => {
+    // The project sits inside the AFT checkout without its own repository, so
+    // a path in it belongs to the enclosing repository, whose root is outside
+    // the project: only git can tell, and the external-root ask must fire.
+    const { project } = await makeProjectAndExternalDirs();
+    await mkdir(path.join(project, "src"), { recursive: true });
+    const askCalls: AskCall[] = [];
+    const { tools } = createHarness(semanticTools, () => ({ success: true, text: "ok" }));
+    const sdkCtx = createSdkContext(
+      project,
+      recordingAsk(askCalls),
+      // A distinct session: the ask's decision is cached per session and root,
+      // and the AFT checkout root is the external root other tests ask about.
+      "permission-audit-git-probe-session",
+    );
+
+    const probesBefore = _permissionsInternalsForTest.gitRootProbeCount();
+    await tools.aft_search.execute(
+      { query: "TODO", hint: "literal", path: path.join(project, "src") },
+      sdkCtx,
+    );
+
+    expect(_permissionsInternalsForTest.gitRootProbeCount() - probesBefore).toBe(1);
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(1);
   });
 
   test("aft_search external-root permission asks once per root and caches denial", async () => {
@@ -934,6 +978,82 @@ describe("permission audit regressions", () => {
     expect(typeof a).toBe("string");
     expect(typeof b).toBe("string");
     expect(promptCalls).toHaveLength(1);
+  });
+
+  test("restrict_to_project_root denies an ordinary external read the server does not own", async () => {
+    // During a live config change this plugin may already restrict while the
+    // server does not yet, so the read exemption must be a positive
+    // ownership answer, not a hand-off to the server.
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(
+      (ctx) =>
+        hoistedTools({
+          ...ctx,
+          config: { ...ctx.config, restrict_to_project_root: true } as PluginContext["config"],
+        }),
+      (command) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: false }
+          : { success: true, text: "secret contents" },
+    );
+
+    const raw = await tools.read.execute(
+      { filePath: path.join(external, "secret.txt") },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(String(raw)).toContain("restrict_to_project_root");
+    expect(calls.map((call) => call.command)).not.toContain("read");
+  });
+
+  test("restrict_to_project_root still lets a session's own bash artifact be read", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const artifact = path.join(external, "bash-tasks", "bgb-1", "stdout");
+    const { calls, tools } = createHarness(
+      (ctx) =>
+        hoistedTools({
+          ...ctx,
+          config: { ...ctx.config, restrict_to_project_root: true } as PluginContext["config"],
+        }),
+      (command, params) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: params.path === artifact }
+          : { success: true, text: "task output" },
+    );
+
+    await tools.read.execute({ filePath: artifact }, createSdkContext(project, recordingAsk([])));
+
+    expect(calls.map((call) => call.command)).toContain("read");
+  });
+
+  test("restrict_to_project_root denies a worktree path outside the session directory", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const worktree = path.dirname(project);
+    const context = {
+      ...createSdkContext(project, recordingAsk(askCalls), "restrict-worktree-sess"),
+      worktree,
+      directory: project,
+    } as ToolContext;
+    const ctx = createPluginContext({ getBridge: () => ({}) } as unknown as BridgePool);
+    ctx.config = { restrict_to_project_root: true } as PluginContext["config"];
+    // The session's own directory is the project; the OpenCode worktree
+    // around it is wider.
+    _resetSessionDirectoryCacheForTest();
+    const { getSessionDirectory } = await import("../shared/session-directory.js");
+    await getSessionDirectory(
+      { session: { get: async () => ({ data: { directory: project } }) } },
+      context.sessionID,
+      project,
+    );
+
+    const sibling = path.join(worktree, "sibling", "other.txt");
+    const denial = await assertExternalDirectoryPermission(ctx, context, sibling);
+    _resetSessionDirectoryCacheForTest();
+
+    expect(typeof denial).toBe("string");
+    expect(denial).toContain("restrict_to_project_root");
   });
 
   test("restrict_to_project_root allows in-root paths untouched", async () => {
@@ -1512,4 +1632,13 @@ describe("session-owned bash artifact reads", () => {
     expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
     expect(calls.map((call) => call.command)).not.toContain("bash_artifact_owned");
   });
+});
+
+test("containsPath accepts dot-dot-prefixed child names", async () => {
+  expect(
+    (await import("../tools/permissions.js"))._permissionsInternalsForTest.containsPath(
+      "/project",
+      "/project/..cache/file.ts",
+    ),
+  ).toBe(true);
 });

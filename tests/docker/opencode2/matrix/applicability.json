@@ -364,7 +364,7 @@
         "T3": "applicable",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
-        "T6": "n/a:no-list-surface",
+        "T6": "applicable",
         "T7": "applicable"
       },
       "verdict_exclusions": {

@@ -405,6 +405,7 @@ impl FakeRelayDaemon {
                                                 subc_ops: Vec::new(),
                                                 subc_capabilities: Vec::new(),
                                                 storage: None,
+                                                machine_id: None,
                                             }).unwrap(),
                                         ).unwrap(),
                                         FrameType::Request => {
@@ -637,7 +638,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
-            request_timeout: Duration::from_secs(5),
+            relay_budget: Duration::from_secs(5),
         },
     );
     (status, upstream_reached)
@@ -763,6 +764,72 @@ fn assertion_refusals_retry_once_for_a_fresh_mint() {
 }
 
 #[test]
+fn unknown_result_status_is_outcome_undetermined_and_never_resent() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-future", "call-future", "/p");
+    let reply = json!({"op": BOT_REQUEST_OPERATION, "status": "ok", "data": {
+        "result": {"status": "some_future_state"},
+    }});
+    let harness = harness(ticket_gated(vec![reply]));
+    let manifest = v12_manifest();
+    let args = comment_args("hi");
+    let Classification::Governed {
+        tuple, canonical, ..
+    } = classify(&args, &manifest, "macos")
+    else {
+        panic!("not governed");
+    };
+    let request =
+        super::super::canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .unwrap();
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let outcome = route(
+        &harness.paths,
+        &rung,
+        &binding,
+        request,
+        TEST_NOW,
+        &manifest,
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: live.value().map(str::to_string),
+            transient_delays: [Duration::from_millis(1); 2],
+            relay_budget: Duration::from_secs(5),
+        },
+    );
+    assert_eq!(harness.daemon.bot_requests().len(), 1, "never resent");
+    let RouteOutcome::OutcomeUndetermined(text) = &outcome else {
+        panic!("expected OutcomeUndetermined, got {outcome:?}");
+    };
+    assert!(text.contains("some_future_state"));
+    assert!(text.contains("the bot write may have executed; check before retrying"));
+    assert!(text.contains("gh api repos/<owner>/<repo>/issues/<n>/comments"));
+    assert_eq!(
+        super::super::governed_outcome_status(&harness.paths, &binding, TEST_NOW, outcome),
+        OUTCOME_UNKNOWN_EXIT_STATUS
+    );
+}
+
+#[test]
+fn completed_reply_with_inner_result_content_decodes_as_completed() {
+    let mut reply = completed(None);
+    reply["content"] = json!([{"type": "text", "text": reply["result"].to_string()}]);
+    assert_eq!(rendered(reply), "completed\n");
+}
+
+#[test]
 fn outcome_unknown_is_never_resent_and_exits_87() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-outcome", "call-o", "/p");
     let harness = harness(ticket_gated(vec![plexus_refused("outcome_unknown")]));
@@ -780,6 +847,11 @@ fn terminal_setup_and_unknown_codes_are_not_retried() {
         "module_grant_absent",
         "agent_repository_conflict{claimed_agent: a, bound_agent: b}",
         "quota_exhausted_v2",
+        "scope_not_synced",
+        "scope_ended",
+        "delegation_withdrawn",
+        "scope_unverifiable",
+        "agent_identity_conflict",
     ] {
         let harness = harness(ticket_gated(vec![plexus_refused(code)]));
         let (status, upstream) = dispatch_comment(&harness, live.value(), "hi");
@@ -854,17 +926,14 @@ fn a_changed_binding_generation_triggers_a_new_check() {
 }
 
 #[test]
-fn production_request_budget_is_thirty_seconds() {
-    assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(30));
+fn production_relay_budget_is_thirty_seconds() {
+    assert_eq!(RELAY_BUDGET, Duration::from_secs(30));
     if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
-        assert_eq!(
-            RelayContext::from_process().request_timeout,
-            REQUEST_TIMEOUT
-        );
+        assert_eq!(RelayContext::from_process().relay_budget, RELAY_BUDGET);
     }
 }
 
-/// A write that gets no reply within the per-attempt budget is an unknown
+/// A write that gets no reply within the relay budget is an unknown
 /// outcome, reported with the budget that actually applied, and never resent.
 #[test]
 fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
@@ -906,7 +975,7 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
             connection_file: Some(harness.connection_file.clone()),
             ticket: live.value().map(str::to_string),
             transient_delays: [Duration::from_millis(1); 2],
-            request_timeout: Duration::from_millis(400),
+            relay_budget: Duration::from_millis(400),
         },
     );
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
@@ -915,4 +984,278 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
     assert_eq!(probe.stage, "request");
     assert_eq!(probe.elapsed_ms, 400);
     assert!(super::super::outcome_unknown_text(probe.elapsed_ms).contains("within 400 ms"));
+}
+
+/// Run a governed comment through dispatch with explicit relay timing and
+/// report the exit status and how long the whole invocation took.
+fn dispatch_timed(
+    harness: &Harness,
+    ticket: Option<&str>,
+    transient_delays: [Duration; 2],
+    relay_budget: Duration,
+) -> (i32, Duration) {
+    let manifest = v12_manifest();
+    let args = comment_args("hi");
+    let classification = classify(&args, &manifest, "macos");
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let started = std::time::Instant::now();
+    let status = dispatch_r3_with_relay(
+        &args,
+        classification,
+        &manifest,
+        &harness.paths,
+        &rung,
+        &binding,
+        TEST_NOW,
+        |_| panic!("reached upstream gh"),
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: ticket.map(str::to_string),
+            transient_delays,
+            relay_budget,
+        },
+    );
+    (status, started.elapsed())
+}
+
+/// Transient refusals whose retries would outlast the relay budget stop at
+/// the budget instead of sleeping past it. Each refusal proves nothing was
+/// written, so the command exits with the named refusal (86).
+#[test]
+fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget", "call-b", "/p");
+    // Every write attempt takes 400 ms and is refused as transient, and each
+    // retry sleeps 700 ms. After the second attempt ends (about 1.5 s) the
+    // next sleep would end past the 2 s budget, so the shim stops there;
+    // all three attempts would need 2.6 s.
+    let handler: Handler = Arc::new(|body: &Value| {
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return bindings_ok();
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        plexus_refused("store_failure")
+    });
+    let harness = harness(handler);
+    let budget = Duration::from_secs(2);
+    let (status, elapsed) = dispatch_timed(
+        &harness,
+        live.value(),
+        [Duration::from_millis(700); 2],
+        budget,
+    );
+    assert_eq!(status, REFUSAL_EXIT_STATUS);
+    assert!(
+        elapsed < budget,
+        "took {elapsed:?} against a {budget:?} budget"
+    );
+    let sent = nonces(&harness);
+    assert_eq!(sent.len(), 2, "the second retry would pass the budget");
+    assert_eq!(sent[0], sent[1], "a retry reuses the request nonce");
+    let seam = super::super::seam_state(&harness.paths);
+    assert_eq!(seam.last_seam_refusal.unwrap().code, "store_failure");
+}
+
+/// A retried attempt only gets what is left of the relay budget, so a silent
+/// reply to it is reported as an unknown outcome (87) at the budget, not a
+/// fresh full budget after the retry sleep.
+#[test]
+fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget-silent", "call-bs", "/p");
+    let attempts = Arc::new(Mutex::new(0_usize));
+    let handler_attempts = Arc::clone(&attempts);
+    let handler: Handler = Arc::new(move |body: &Value| {
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return bindings_ok();
+        }
+        let mut attempts = handler_attempts.lock().unwrap();
+        *attempts += 1;
+        if *attempts == 1 {
+            plexus_refused("nonce_in_flight")
+        } else {
+            Value::Null
+        }
+    });
+    let harness = harness(handler);
+    let budget = Duration::from_millis(1_000);
+    ATTEMPT_DEADLINES.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let (status, _elapsed) = dispatch_timed(
+        &harness,
+        live.value(),
+        [Duration::from_millis(400); 2],
+        budget,
+    );
+    assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
+    // Setup and scheduling do not consume the exchange budget. Observe the
+    // actual CallOptions passed to the consumer: resetting the timeout for the
+    // retry would give it a different deadline even if this thread ran late.
+    let deadlines = ATTEMPT_DEADLINES.with(|slot| slot.borrow_mut().take().unwrap());
+    assert_eq!(deadlines.len(), 2);
+    assert_eq!(deadlines[0], deadlines[1], "retry received a fresh budget");
+    assert_eq!(
+        nonces(&harness).len(),
+        2,
+        "the silent retry is never resent"
+    );
+    let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
+    assert_eq!(probe.elapsed_ms, 1_000);
+}
+
+fn v16_manifest() -> Manifest {
+    serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v16-manifest.json")).unwrap()
+}
+
+/// Run a governed `gh pr create` through dispatch against the v16 fixture and
+/// report the exit status and whether upstream `gh` was reached.
+fn dispatch_pr_create(harness: &Harness, ticket: Option<&str>) -> (i32, bool) {
+    let manifest = v16_manifest();
+    let args: Vec<OsString> = [
+        "pr",
+        "create",
+        "-R",
+        "cortexkit/aft",
+        "--base",
+        "main",
+        "--head",
+        "no-such-branch",
+        "--title",
+        "T",
+        "--body",
+        "B",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    let classification = classify(&args, &manifest, "macos");
+    assert!(matches!(classification, Classification::Governed { .. }));
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let mut upstream_reached = false;
+    let status = dispatch_r3_with_relay(
+        &args,
+        classification,
+        &manifest,
+        &harness.paths,
+        &rung,
+        &binding,
+        TEST_NOW,
+        |_| {
+            upstream_reached = true;
+            0
+        },
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: ticket.map(str::to_string),
+            transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
+            relay_budget: Duration::from_secs(5),
+        },
+    );
+    (status, upstream_reached)
+}
+
+/// Plexus's reply for a created pull request is `{number, url, state, draft}`.
+/// `gh pr create` prints the URL, and the shim does the same.
+#[test]
+fn a_created_pull_request_prints_its_url() {
+    let result = json!({
+        "number": 7,
+        "url": "https://github.com/cortexkit/aft/pull/7",
+        "state": "open",
+        "draft": false,
+    });
+    assert_eq!(
+        rendered(completed(Some(result))),
+        "https://github.com/cortexkit/aft/pull/7\n"
+    );
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-pr-create", "call-pc", "/p");
+    let harness = harness(ticket_gated(vec![json!({
+        "op": BOT_REQUEST_OPERATION, "status": "ok", "data": {
+            "repo_binding_generation": 1,
+            "result": {"status": "completed", "result": {
+                "number": 7, "url": "https://github.com/cortexkit/aft/pull/7", "state": "open", "draft": false,
+            }},
+        },
+    })]));
+    let (status, upstream) = dispatch_pr_create(&harness, live.value());
+    assert_eq!(status, 0);
+    assert!(!upstream);
+    let sent = harness.daemon.bot_requests();
+    assert_eq!(sent.len(), 1);
+    let request = &sent[0]["params"]["request"];
+    assert_eq!(request["action"], "pr create");
+    assert_eq!(request["target"], json!({}));
+    assert_eq!(
+        request["body"],
+        json!({"title": "T", "body": "B", "base": "main", "head": "no-such-branch", "draft": false})
+    );
+    assert_eq!(request["repository"], "cortexkit/aft");
+}
+
+/// The shim cannot know which branches exist, so a head GitHub does not have
+/// is GitHub's refusal to report. It comes back as a named seam refusal with
+/// plexus's code verbatim, including GitHub's status and message, and is
+/// neither retried nor handed to upstream `gh`.
+#[test]
+fn a_github_head_refusal_is_relayed_verbatim_and_never_retried() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-pr-head", "call-ph", "/p");
+    // GitHub answers an unknown head with 422 "Validation Failed" and an
+    // error naming the `head` field as invalid. Plexus spells a vendor
+    // refusal as `vendor_rejected{...}`; both the status-only spelling it
+    // uses today and one carrying GitHub's message must pass through intact.
+    for code in [
+        "vendor_rejected{status: 422}",
+        r#"vendor_rejected{status: 422, message: "Validation Failed", errors: [{"resource": "PullRequest", "field": "head", "code": "invalid"}]}"#,
+    ] {
+        let harness = harness(ticket_gated(vec![plexus_refused(code)]));
+        let (status, upstream) = dispatch_pr_create(&harness, live.value());
+        assert_eq!(status, REFUSAL_EXIT_STATUS, "{code}");
+        assert!(!upstream, "{code} fell through to upstream gh");
+        assert_eq!(nonces(&harness).len(), 1, "{code} was retried");
+        let seam = super::super::seam_state(&harness.paths);
+        assert_eq!(seam.last_seam_refusal.unwrap().code, code);
+        // The caller-facing text is the named seam refusal carrying the code,
+        // not a paraphrase of it.
+        let text = plexus_refusal_text(code, classify_code(code));
+        assert_eq!(text, format!("plexus refused the bot write: {code}"));
+        assert_eq!(RefusalCode::SeamRefusal.as_str(), "gh_shim_seam_refusal");
+    }
+    // Plexus's own `pr_head_cross_repository` refusal takes the same path.
+    let harness = harness(ticket_gated(vec![plexus_refused(
+        "pr_head_cross_repository",
+    )]));
+    let (status, upstream) = dispatch_pr_create(&harness, live.value());
+    assert_eq!(status, REFUSAL_EXIT_STATUS);
+    assert!(!upstream);
+    assert_eq!(nonces(&harness).len(), 1);
+    assert_eq!(
+        super::super::seam_state(&harness.paths)
+            .last_seam_refusal
+            .unwrap()
+            .code,
+        "pr_head_cross_repository"
+    );
 }

@@ -24,7 +24,7 @@ fn edit_symbol_with_lsp_hints_disambiguates() {
     //   - line 7 (0-indexed): method inside DataHandler (lines 7-9)
     // Send edit_symbol with lsp_hints pointing to the standalone function (line 3 is within range).
     let resp = aft.send(&format!(
-        r#"{{"id":"lsp-1","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toLowerCase();\n}}","lsp_hints":{{"symbols":[{{"name":"process","file":{},"line":2}}]}}}}"#,
+        r#"{{"id":"lsp-1","command":"edit_symbol","file":{},"symbol":"process","operation":"replace","content":"export function process(data: string): string {{\n  return data.toUpperCase();\n}}","lsp_hints":{{"symbols":[{{"name":"process","file":{},"line":2}}]}}}}"#,
         crate::helpers::json_string(&target.display()),
         crate::helpers::json_string(&target.display())
     ));

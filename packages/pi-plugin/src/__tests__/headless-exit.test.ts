@@ -9,7 +9,10 @@
  * process (see fixtures/headless-exit-harness.ts), shut the session down while
  * an LSP auto-install is still running, and watch what the process does next.
  * A second suite sends SIGTERM to a host that has another SIGTERM listener
- * which never exits, and checks the plugin still ends the process.
+ * which never exits, and checks the plugin still ends the process. A last
+ * suite loads the extension with no session at all, the way `omp plugin
+ * install` and `omp plugin upgrade` validate it (issue #389), and checks the
+ * process still ends on its own.
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
@@ -45,7 +48,9 @@ const tempDirs: string[] = [];
 let runPromise: Promise<HarnessRun> | undefined;
 
 /** Build a throwaway HOME/XDG/project sandbox and start the harness in it. */
-function spawnHarness(mode: "session-shutdown" | "sigterm" | "subagent") {
+function spawnHarness(
+  mode: "session-shutdown" | "sigterm" | "subagent" | "plugin-validate" | "session-warmup",
+) {
   const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
   tempDirs.push(tempDir);
   const binDir = join(tempDir, "bin");
@@ -173,6 +178,8 @@ interface SigtermRun {
 /** Longest the process may live after SIGTERM: the plugin's bound plus slack. */
 const SIGTERM_EXIT_BOUND_MS = 8_000;
 let sigtermNpmPid: number | null = null;
+let validateNpmPid: number | null = null;
+let warmupNpmPid: number | null = null;
 
 function runSigtermHarness(): Promise<SigtermRun> {
   return new Promise<SigtermRun>((resolveRun, rejectRun) => {
@@ -237,7 +244,7 @@ function runSigtermHarness(): Promise<SigtermRun> {
 afterAll(async () => {
   const run = await runPromise?.catch(() => undefined);
   // Never leave the stand-in npm behind if a regression orphaned it.
-  for (const pid of [run?.npmPid, sigtermNpmPid]) {
+  for (const pid of [run?.npmPid, sigtermNpmPid, validateNpmPid, warmupNpmPid]) {
     if (pid && isAlive(pid)) process.kill(pid, "SIGKILL");
   }
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
@@ -387,3 +394,123 @@ describe.skipIf(process.platform === "win32")(
     }, 60_000);
   },
 );
+
+interface ValidateRun {
+  events: Array<{ name: string; detail: string }>;
+  exitCode: number | null;
+  exitedAfterValidateMs: number | null;
+  killedAsHung: boolean;
+  npmPid: number | null;
+  stderr: string;
+}
+
+/**
+ * Load the extension the way `omp plugin install` / `omp plugin upgrade`
+ * validates it (GitHub issue #389): the factory runs, no session event ever
+ * fires, and the command's main() returns. Times how long the process lives
+ * after the factory returned.
+ */
+function runValidateHarness(
+  mode: "plugin-validate" | "session-warmup" = "plugin-validate",
+): Promise<ValidateRun> {
+  return new Promise<ValidateRun>((resolveRun, rejectRun) => {
+    const { child, npmMarker } = spawnHarness(mode);
+    const run: ValidateRun = {
+      events: [],
+      exitCode: null,
+      exitedAfterValidateMs: null,
+      killedAsHung: false,
+      npmPid: null,
+      stderr: "",
+    };
+    let validatedAt: number | null = null;
+    let hangTimer: ReturnType<typeof setTimeout> | undefined;
+    let stdoutBuf = "";
+    child.stdout.on("data", (chunk) => {
+      stdoutBuf += String(chunk);
+      let newline = stdoutBuf.indexOf("\n");
+      while (newline >= 0) {
+        const line = stdoutBuf.slice(0, newline);
+        stdoutBuf = stdoutBuf.slice(newline + 1);
+        newline = stdoutBuf.indexOf("\n");
+        const match = /^EVENT (\S+) ?(.*)$/.exec(line);
+        if (!match) continue;
+        run.events.push({ name: match[1] ?? "", detail: match[2] ?? "" });
+        if (match[1] === "validate-done") {
+          validatedAt = Date.now();
+          hangTimer = setTimeout(() => {
+            run.killedAsHung = true;
+            child.kill("SIGKILL");
+          }, HANG_KILL_MS);
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      run.stderr = (run.stderr + String(chunk)).slice(-4_000);
+    });
+    const overallTimer = setTimeout(() => {
+      run.killedAsHung = true;
+      child.kill("SIGKILL");
+    }, 45_000);
+    child.on("error", rejectRun);
+    child.on("exit", (code) => {
+      clearTimeout(overallTimer);
+      clearTimeout(hangTimer);
+      run.exitCode = code;
+      if (validatedAt !== null && !run.killedAsHung) {
+        run.exitedAfterValidateMs = Date.now() - validatedAt;
+      }
+      run.npmPid = readNpmPid(npmMarker);
+      if (mode === "plugin-validate") validateNpmPid = run.npmPid;
+      else warmupNpmPid = run.npmPid;
+      resolveRun(run);
+    });
+  });
+}
+
+let validateRunPromise: Promise<ValidateRun> | undefined;
+const validateRun = () => {
+  validateRunPromise ??= runValidateHarness();
+  return validateRunPromise;
+};
+
+describe.skipIf(process.platform === "win32")(
+  "loading the extension with no session (omp plugin install / upgrade)",
+  () => {
+    test("the process exits on its own within the bound once the factory returned", async () => {
+      const run = await validateRun();
+      if (run.killedAsHung || run.exitCode !== 0) console.error(`harness stderr:\n${run.stderr}`);
+      expect(run.events.map((event) => event.name)).toContain("validate-done");
+      expect(run.killedAsHung).toBe(false);
+      expect(run.exitCode).toBe(0);
+      expect(run.exitedAfterValidateMs ?? Number.POSITIVE_INFINITY).toBeLessThan(EXIT_BOUND_MS);
+    }, 60_000);
+
+    test("no bridge, ONNX Runtime preparation or LSP install starts without a session", async () => {
+      const run = await validateRun();
+      const names = run.events.map((event) => event.name);
+      expect(names).not.toContain("bridge-spawn");
+      expect(names).not.toContain("onnx-prepare");
+      expect(run.npmPid).toBeNull();
+    }, 60_000);
+  },
+);
+
+describe.skipIf(process.platform === "win32")("a real session still warms its bridge", () => {
+  test("session_start spawns the warmup bridge before any tool call", async () => {
+    const run = await runValidateHarness("session-warmup");
+    if (run.killedAsHung || run.exitCode !== 0) console.error(`harness stderr:\n${run.stderr}`);
+    const names = run.events.map((event) => event.name);
+    const sessionStarted = names.indexOf("session-start-fired");
+    const warmupSpawn = run.events.findIndex(
+      (event) => event.name === "bridge-spawn" && event.detail.endsWith("command=status"),
+    );
+    // Nothing spawns while the factory runs; the warmup follows session_start.
+    expect(names.indexOf("bridge-spawn")).toBe(warmupSpawn);
+    expect(sessionStarted).toBeGreaterThan(names.indexOf("plugin-ready"));
+    expect(warmupSpawn).toBeGreaterThan(sessionStarted);
+    expect(names).not.toContain("bridge-tool-call");
+    expect(run.killedAsHung).toBe(false);
+    expect(run.exitCode).toBe(0);
+  }, 60_000);
+});

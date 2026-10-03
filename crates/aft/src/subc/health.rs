@@ -24,7 +24,7 @@ pub(super) enum UnboundRetention {
     ArtifactEvictionFailed,
 }
 
-const UNBOUND_RETENTION_KINDS: usize = 13;
+const UNBOUND_RETENTION_KINDS: usize = 14;
 
 const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "bash_waits",
@@ -40,6 +40,7 @@ const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
     "pending_reconciliation",
     "search_delta_unpersisted",
     "artifact_eviction_failed",
+    "lock_contended",
 ];
 
 impl UnboundRetention {
@@ -58,6 +59,7 @@ impl UnboundRetention {
             Self::Artifact(ArtifactEvictionBlocker::PendingReconciliation) => 10,
             Self::Artifact(ArtifactEvictionBlocker::SearchDeltaUnpersisted) => 11,
             Self::ArtifactEvictionFailed => 12,
+            Self::Artifact(ArtifactEvictionBlocker::LockContended) => 13,
         }
     }
 
@@ -1096,6 +1098,58 @@ fn pending_bind_breadcrumb(
     )
 }
 
+/// Refusal code for a route bind whose deadline passed while it waited
+/// behind a reader on its root. Retryable like `actor_not_ready`: the reader
+/// ends eventually, and a later bind can then be admitted.
+pub(super) const BIND_BLOCKED_BY_READER: &str = "bind_blocked_by_reader";
+
+/// The code and message an overdue route bind is refused with. A bind still
+/// queued while readers run on its root waited for them (a bind that needs
+/// exclusive use of the root cannot start beside readers), so the refusal
+/// names the oldest of them: its job, its tool and how long it has run.
+/// Every other cause keeps the generic `actor_not_ready`.
+pub(super) fn route_bind_deadline_refusal(
+    age: Duration,
+    deadline: Duration,
+    relay: Duration,
+    snapshot: &BindBlockerSnapshot,
+) -> (&'static str, String) {
+    let age_ms = duration_millis_u64(age);
+    let deadline_ms = duration_millis_u64(deadline);
+    let blocking_reader = (snapshot.configure_state == "queued")
+        .then(|| {
+            snapshot
+                .in_flight_readers
+                .iter()
+                .max_by_key(|reader| reader.started_age_ms)
+        })
+        .flatten();
+    match blocking_reader {
+        Some(reader) => {
+            let others = snapshot.in_flight_readers.len() - 1;
+            let others = if others == 0 {
+                String::new()
+            } else {
+                format!(" and {others} other reader(s)")
+            };
+            (
+                BIND_BLOCKED_BY_READER,
+                format!(
+                    "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the bind waited behind a reader on this root that has not finished (job={} tool={} age_ms={}){others}; retry once it finishes or is cancelled",
+                    reader.request_id, reader.command, reader.started_age_ms,
+                ),
+            )
+        }
+        None => (
+            "actor_not_ready",
+            format!(
+                "route bind deadline exceeded after {age_ms}ms (deadline {deadline_ms}ms): the root's configure did not finish, so AFT refuses the bind before the daemon's {}ms bind relay times out",
+                relay.as_millis()
+            ),
+        ),
+    }
+}
+
 const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
 // SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
@@ -1201,6 +1255,8 @@ impl HealthDiagnosticRollup {
             "bash_task_retention": {
                 "eligible_but_unpruned_rows": Value::Null,
                 "last_sweep_skip_reason": Value::Null,
+                "sweeps_skipped_total": crate::db::compression_events::retention_sweep_skip_counts().0,
+                "consecutive_skips": crate::db::compression_events::retention_sweep_skip_counts().1,
                 "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
             },
             "mutating_lanes": { "scheduler_busy": true },
@@ -1438,13 +1494,36 @@ impl HealthRollupWorker {
         let _ = self.wake_tx.try_send(true);
     }
 
-    pub(super) fn shutdown(mut self) {
-        let _ = self.wake_tx.send(false);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+    /// Stop the worker. The wait is capped: the worker may be in the middle of
+    /// a rollup, which probes every root and language server, and this runs
+    /// on the exit path, where each unbounded wait eats into the time the
+    /// daemon allows a draining module to exit. Dropping the sender ends the
+    /// worker at its next wait even if the stop message does not fit in the
+    /// one-slot channel, so a worker that outlives the cap still stops.
+    pub(super) fn shutdown(self) {
+        let Self { wake_tx, join } = self;
+        let _ = wake_tx.try_send(false);
+        drop(wake_tx);
+        let Some(join) = join else {
+            return;
+        };
+        let deadline = Instant::now() + HEALTH_ROLLUP_SHUTDOWN_WAIT;
+        while !join.is_finished() {
+            if Instant::now() >= deadline {
+                log::info!(
+                    "subc attach: health rollup still running after {} ms; not waiting for it",
+                    HEALTH_ROLLUP_SHUTDOWN_WAIT.as_millis()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let _ = join.join();
     }
 }
+
+/// Cap on waiting for the health rollup worker to stop at connection end.
+const HEALTH_ROLLUP_SHUTDOWN_WAIT: Duration = Duration::from_millis(200);
 
 /// Tag for `allocator_slack_bytes` in the health rollup: the figure is
 /// allocator address space (mapped minus in-use), not resident memory. It kept
@@ -1595,9 +1674,13 @@ fn bash_task_retention_metrics(shared_app: &App) -> Value {
         ),
         None => (None, None),
     };
+    let (sweeps_skipped_total, consecutive_skips) =
+        crate::db::compression_events::retention_sweep_skip_counts();
     json!({
         "eligible_but_unpruned_rows": eligible_but_unpruned_rows,
         "last_sweep_skip_reason": last_sweep_skip_reason,
+        "sweeps_skipped_total": sweeps_skipped_total,
+        "consecutive_skips": consecutive_skips,
         "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
     })
 }
@@ -2008,6 +2091,10 @@ pub(super) fn build_health_report(
     metrics.insert(
         "write_ledger_top_10m".to_string(),
         json!(crate::write_ledger::recent_top_writers()),
+    );
+    metrics.insert(
+        "write_ledger_folds_deferred_total".to_string(),
+        json!(crate::db::write_ledger::folds_deferred_total()),
     );
     budget_health_metrics(&mut metrics);
 
@@ -2819,6 +2906,50 @@ mod tests {
             metrics["roots"][0]["callgraph_store"]["status"], "disabled",
             "a disabled store must never report building: {metrics:#}"
         );
+    }
+
+    #[test]
+    fn overdue_bind_refusal_blames_the_oldest_reader_only_while_the_bind_is_queued() {
+        let reader = |request_id: &str, command: &str, started_age_ms: u64| {
+            crate::executor::BindBlockerReaderSnapshot {
+                request_id: request_id.to_string(),
+                command: command.to_string(),
+                lane: Lane::PureRead,
+                started_age_ms,
+                execution_started: true,
+                started_before_oldest_writer: true,
+            }
+        };
+        let snapshot = |configure_state: &'static str| BindBlockerSnapshot {
+            configure_state,
+            configure_phase_timings: None,
+            blockers: Vec::new(),
+            oldest_queued_writer_age_ms: Some(10_600),
+            in_flight_readers: vec![
+                reader("subc-1-790", "read", 900),
+                reader("subc-1-789", "grep", 840_000),
+            ],
+            reader_admissions_while_promoted_writer_waited: 0,
+        };
+        let age = Duration::from_millis(10_600);
+        let deadline = Duration::from_millis(10_500);
+        let relay = Duration::from_secs(12);
+
+        let (code, message) =
+            route_bind_deadline_refusal(age, deadline, relay, &snapshot("queued"));
+        assert_eq!(code, BIND_BLOCKED_BY_READER);
+        assert!(
+            message.contains("job=subc-1-789 tool=grep age_ms=840000")
+                && message.contains("and 1 other reader(s)"),
+            "{message}"
+        );
+
+        // A bind whose configure is still running when the deadline passes was
+        // not held back by readers, so it keeps the generic code.
+        let (code, message) =
+            route_bind_deadline_refusal(age, deadline, relay, &snapshot("running"));
+        assert_eq!(code, "actor_not_ready");
+        assert!(message.contains("configure did not finish"), "{message}");
     }
 
     #[test]

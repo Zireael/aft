@@ -200,10 +200,25 @@ pub fn find_run_occurrences(text: &str, run: &str, run_idx: usize) -> Vec<Occurr
         return Vec::new();
     }
 
-    let matcher = regex::RegexBuilder::new(&regex::escape(run))
+    let matcher = compile_run_matcher(run);
+    find_occurrences_with_matcher(text, &matcher, run.len(), run_idx)
+}
+
+fn compile_run_matcher(run: &str) -> Regex {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.regex_compilations += 1);
+    regex::RegexBuilder::new(&regex::escape(run))
         .case_insensitive(true)
         .build()
-        .expect("escaped retained run must compile");
+        .expect("escaped retained run must compile")
+}
+
+fn find_occurrences_with_matcher(
+    text: &str,
+    matcher: &Regex,
+    run_len: usize,
+    run_idx: usize,
+) -> Vec<Occurrence> {
     let mut occurrences = Vec::new();
     let mut search_start = 0;
 
@@ -215,7 +230,7 @@ pub fn find_run_occurrences(text: &str, run: &str, run_idx: usize) -> Vec<Occurr
             run_idx,
             start: found.start(),
             end: found.end(),
-            len: run.len(),
+            len: run_len,
         });
         if occurrences.len() == MAX_RUN_OCCURRENCES {
             break;
@@ -277,6 +292,43 @@ pub fn find_canonical_alignment_with_test_order(
     canonical_alignment_from_enumerated(&run_occurrences, &windows)
 }
 
+// Matchers belong to one request, not to candidate files or a global cache.
+struct CompiledRuns {
+    matchers: Vec<Option<(usize, Regex)>>,
+}
+
+impl CompiledRuns {
+    fn new(runs: &[String]) -> Self {
+        Self {
+            matchers: runs
+                .iter()
+                .map(|run| (!run.is_empty()).then(|| (run.len(), compile_run_matcher(run))))
+                .collect(),
+        }
+    }
+
+    fn alignment(&self, text: &str) -> Option<Alignment> {
+        if text.is_empty() || self.matchers.is_empty() {
+            return None;
+        }
+        let occurrences = self
+            .matchers
+            .iter()
+            .enumerate()
+            .map(|(index, compiled)| {
+                compiled
+                    .as_ref()
+                    .map(|(len, matcher)| {
+                        find_occurrences_with_matcher(text, matcher, *len, index + 1)
+                    })
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let windows = occupied_anchor_windows(&anchor_windows(text), &occurrences);
+        canonical_alignment_from_enumerated(&occurrences, &windows)
+    }
+}
+
 fn collect_run_occurrences(text: &str, retained_runs: &[String]) -> Vec<Vec<Occurrence>> {
     retained_runs
         .iter()
@@ -306,6 +358,22 @@ fn anchor_windows(text: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Empty windows cannot produce an alignment. Each occurrence can belong to at
+/// most three consecutive-line windows, so evaluate their union rather than
+/// allocating filtered occurrence vectors for every source line.
+fn occupied_anchor_windows(
+    windows: &[(usize, usize)],
+    occurrences: &[Vec<Occurrence>],
+) -> Vec<(usize, usize)> {
+    let mut occupied = BTreeSet::new();
+    for occurrence in occurrences.iter().flatten() {
+        let first = windows.partition_point(|(_, end)| *end < occurrence.end);
+        let last = windows.partition_point(|(start, _)| *start <= occurrence.start);
+        occupied.extend(first..last);
+    }
+    occupied.into_iter().map(|index| windows[index]).collect()
+}
+
 fn canonical_alignment_from_enumerated(
     run_occurrences: &[Vec<Occurrence>],
     windows: &[(usize, usize)],
@@ -313,6 +381,8 @@ fn canonical_alignment_from_enumerated(
     let mut best_overall = None;
 
     for &(window_start, window_end) in windows {
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| counts.anchor_windows_evaluated += 1);
         let window_runs = run_occurrences
             .iter()
             .map(|occurrences| {
@@ -498,23 +568,47 @@ pub fn verify_file_for_anchored(
     retained_runs: &[String],
     denominator: usize,
 ) -> Option<CandidateResult> {
-    let content = fs::read_to_string(file_path).ok()?;
-    let canonical = find_canonical_alignment(&content, retained_runs)?;
+    verify_file_with_alignment(file_path, denominator, |content| {
+        find_canonical_alignment(content, retained_runs)
+    })
+    .ok()
+    .flatten()
+}
+
+fn verify_file_with_alignment(
+    file_path: &Path,
+    denominator: usize,
+    align: impl FnOnce(&str) -> Option<Alignment>,
+) -> Result<Option<CandidateResult>, ()> {
+    let crate::search_index::SearchCorpusEligibility::Eligible(file) =
+        crate::search_index::read_search_corpus_file(
+            file_path,
+            crate::search_index::DEFAULT_MAX_FILE_SIZE,
+        )
+    else {
+        return Err(());
+    };
+    let Ok(content) = std::str::from_utf8(&file.bytes) else {
+        return Err(());
+    };
+    let Some(canonical) = align(content) else {
+        return Ok(None);
+    };
     if !evaluate_threshold(
         canonical.matched_total,
         canonical.runs_matched(),
         denominator,
     ) {
-        return None;
+        return Ok(None);
     }
 
     let descriptor =
         EvidenceDescriptor::for_anchored(canonical.matched_total, canonical.gap_chars, true, false);
-    Some(CandidateResult::new_exact(
+    Ok(Some(CandidateResult::new_exact(
         file_path.to_path_buf(),
         None,
         descriptor,
-    ))
+    )))
 }
 
 /// Anchored lane implementation of SearchLane.
@@ -543,9 +637,20 @@ impl AnchoredLane {
         query: &str,
         include_tests: bool,
     ) -> Vec<CandidateResult> {
+        self.execute_with_admission_report(index, search_root, query, include_tests)
+            .0
+    }
+
+    pub(crate) fn execute_with_admission_report(
+        &self,
+        index: &SearchIndex,
+        search_root: &Path,
+        query: &str,
+        include_tests: bool,
+    ) -> (Vec<CandidateResult>, usize, usize) {
         let split = split_query(query);
         if split.retained_runs.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0, 0);
         }
 
         let candidate_files = discover_anchored_candidate_files(
@@ -554,15 +659,29 @@ impl AnchoredLane {
             &split.retained_runs,
             include_tests,
         );
+        let examined = candidate_files.len();
+        if candidate_files.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        let compiled = CompiledRuns::new(&split.retained_runs);
+        let mut excluded = 0;
         let mut results = candidate_files
             .into_iter()
             .filter_map(|path| {
-                verify_file_for_anchored(&path, &split.retained_runs, split.denominator)
+                match verify_file_with_alignment(&path, split.denominator, |content| {
+                    compiled.alignment(content)
+                }) {
+                    Ok(candidate) => candidate,
+                    Err(()) => {
+                        excluded += 1;
+                        None
+                    }
+                }
             })
             .collect::<Vec<_>>();
 
         sort_anchored_canonical(&mut results);
-        results
+        (results, examined, excluded)
     }
 }
 
@@ -580,6 +699,125 @@ impl SearchLane for AnchoredLane {
                 input.query,
                 input.include_tests,
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    use super::*;
+
+    #[test]
+    fn anchored_regex_compilations_scale_with_runs_not_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let query = "AlphaSymbol {} BetaSymbol";
+        let split = split_query(query);
+        assert_eq!(split.retained_runs.len(), 2);
+        let mut index = SearchIndex::new();
+        let mut paths = Vec::new();
+        for ordinal in 0..20 {
+            let path = temp.path().join(format!("file_{ordinal}.rs"));
+            let content = "AlphaSymbol BetaSymbol\n";
+            fs::write(&path, content).unwrap();
+            index.index_file(&path, content.as_bytes());
+            paths.push(path);
+            if ordinal == 0 || ordinal == 19 {
+                crate::search_hot_path_measurements::reset();
+                let actual =
+                    AnchoredLane::new().execute_ready_mode(&index, temp.path(), query, true);
+                assert_eq!(
+                    crate::search_hot_path_measurements::counts().regex_compilations,
+                    split.retained_runs.len()
+                );
+                assert_eq!(actual.len(), paths.len());
+                let mut reference = paths
+                    .iter()
+                    .filter_map(|path| {
+                        verify_file_for_anchored(path, &split.retained_runs, split.denominator)
+                    })
+                    .collect::<Vec<_>>();
+                sort_anchored_canonical(&mut reference);
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&reference).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn occupied_window_selection_matches_full_scan_across_dense_and_sparse_lines() {
+        let runs = vec![
+            "AlphaSymbol".to_string(),
+            "BetaSymbol".to_string(),
+            "GammaSymbol".to_string(),
+        ];
+        let compiled = CompiledRuns::new(&runs);
+        for seed in 0u64..100 {
+            let mut state = seed + 1;
+            let mut text = String::new();
+            for _ in 0..80 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push_str(
+                    [
+                        "AlphaSymbol\n",
+                        "BetaSymbol\r\n",
+                        "GammaSymbol\n",
+                        "unrelated\n",
+                        "AlphaSymbol BetaSymbol GammaSymbol\n",
+                        "\n",
+                    ][(state >> 32) as usize % 6],
+                );
+            }
+            assert_eq!(
+                compiled.alignment(&text),
+                find_canonical_alignment(&text, &runs),
+                "seed={seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_sparse_hits_only_evaluate_occupied_windows() {
+        let text = format!(
+            "{}AlphaSymbol BetaSymbol\n{}",
+            "unrelated\n".repeat(10_000),
+            "unrelated\n".repeat(10_000)
+        );
+        let runs = vec!["AlphaSymbol".to_string(), "BetaSymbol".to_string()];
+        let expected = find_canonical_alignment(&text, &runs).unwrap();
+        let compiled = CompiledRuns::new(&runs);
+        crate::search_hot_path_measurements::reset();
+        let actual = compiled.alignment(&text).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().anchor_windows_evaluated,
+            3
+        );
+    }
+
+    #[test]
+    fn compiled_runs_preserve_unicode_overlap_and_empty_run_alignment() {
+        for text in [
+            "",
+            "ababa ABAba",
+            "Kelvin kelvin\nİstanbul Istanbul",
+            "alpha\r\nbeta\ngamma",
+            "abcdef ",
+        ] {
+            for runs in [
+                vec![],
+                vec!["".to_string()],
+                vec!["aba".to_string(), "ba".to_string()],
+                vec!["kelvin".to_string(), "Istanbul".to_string()],
+                vec!["alpha".to_string(), "".to_string(), "gamma".to_string()],
+            ] {
+                assert_eq!(
+                    CompiledRuns::new(&runs).alignment(text),
+                    find_canonical_alignment(text, &runs),
+                    "text={text:?}, runs={runs:?}"
+                );
+            }
         }
     }
 }

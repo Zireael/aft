@@ -51,6 +51,10 @@ describe("Effect-owned cancellation", () => {
     const controller = new AbortController();
     const daemonLog: string[] = [];
     const seenSignals: Array<AbortSignal | undefined> = [];
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
     const bridge = {
       send: async (_command: string, _params: unknown, options: { abortSignal?: AbortSignal }) => {
         seenSignals.push(options.abortSignal);
@@ -63,6 +67,7 @@ describe("Effect-owned cancellation", () => {
             },
             { once: true },
           );
+          markStarted?.();
         });
       },
       toolCall: async (
@@ -83,7 +88,9 @@ describe("Effect-owned cancellation", () => {
     } as never;
     const runtime = { directory: process.cwd(), effectAbort: controller.signal };
     const search = callBridge(ctx, runtime, "search", { query: "slow query" });
-    await Promise.resolve();
+    // Host lookups yield before send installs its listener; wait for the request,
+    // not an arbitrary microtask, so this exercises cancellation in flight.
+    await started;
     controller.abort();
 
     await expect(search).rejects.toThrow("request_cancelled");

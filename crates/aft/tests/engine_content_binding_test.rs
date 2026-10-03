@@ -22,6 +22,15 @@ fn empty_verified_set() -> VerifiedExactSet {
     }
 }
 
+/// The memo key `ExactLane::search` uses when it has no ready index, as in
+/// every lane call in this file. A fallback walk is memoized under its own
+/// generation, apart from ready-index results, so its entries are never served
+/// once the full index becomes ready.
+fn fallback_lane_key(root: &std::path::Path, token: &GenerationToken, query: &str) -> MemoKey {
+    let fallback = GenerationToken::new_with_str(&format!("fallback:{}", token.as_str()));
+    MemoKey::new(root, fallback, query, false)
+}
+
 fn create_temp_corpus() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let src = dir.path().join("src");
@@ -77,7 +86,7 @@ fn test_at_most_one_verification_per_k_epoch_three_clean_requests() {
     assert_eq!(r1.results, r3.results);
 
     // Direct re-verification of live entry at epoch 0 must be rejected
-    let key = MemoKey::new(dir.path(), token, query, false);
+    let key = fallback_lane_key(dir.path(), &token, query);
     let re_ver = memo_store.get_or_verify(&key, 0, 10, || {
         panic!("re-verification of live memo entry must not execute verifier");
     });
@@ -227,7 +236,7 @@ fn test_three_request_invalidation_fixture_normative() {
         r2.void_disclosure.as_deref(),
         Some("content changed - page stability void")
     );
-    let key1 = MemoKey::new(dir.path(), gen1.clone(), query, false);
+    let key1 = fallback_lane_key(dir.path(), &gen1, query);
     assert!(
         memo_store.is_key_poisoned(&key1),
         "key K must be marked poisoned"
@@ -275,7 +284,7 @@ fn test_three_request_invalidation_fixture_normative() {
 
     // Generation change: gen2
     let gen2 = GenerationToken::new(101);
-    let key2 = MemoKey::new(dir.path(), gen2.clone(), query, false);
+    let key2 = fallback_lane_key(dir.path(), &gen2, query);
 
     // Next request builds at epoch 0 with stability_void: false and no disclosure
     let r_gen2 = lane

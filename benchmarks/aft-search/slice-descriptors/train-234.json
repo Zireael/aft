@@ -1,0 +1,17 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "inspect-partial-results",
+    "bash-watch-bounds",
+    "producer-bounds",
+    "exit-shutdown",
+    "route-bind-db-defer",
+    "semantic-worker-census"
+  ],
+  "note": "Fence files touched: the anchored and exact lanes (bounded verification and fallback discovery, disclosure only when a limit is hit), semantic_search/mod.rs, lib.rs (module registration) and search_index.rs (census of worker memory). None changes candidate admission, scoring, fusion or truncation, so ranked rows should be byte-equal to the reference; the anchored lane parity was checked by the worker against the benchmark."
+}

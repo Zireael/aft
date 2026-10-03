@@ -11,6 +11,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::cache_freshness::{self, FileFreshness};
 use crate::inspect::cache::Tier1FileMemo;
+use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 use crate::parser::{detect_language, grammar_for, LangId};
 
@@ -49,23 +50,61 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
 
 fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) -> InspectResult {
     let started = Instant::now();
+    let cancellation = crate::executor::current_job_cancellation();
+    let cancelled = || {
+        !job.project_root.is_dir()
+            || cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+    };
+    if cancelled() {
+        return InspectResult::failed(
+            job,
+            "TODO scan cancelled: root unbound or missing",
+            started.elapsed(),
+        );
+    }
     memo.reserve_for_scan(job.scope_files.len());
     let per_file: Vec<FileScan> = job
         .scope_files
         .par_iter()
-        .map(|path| memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
+        .filter_map(|path| {
+            let _cancel = cancellation
+                .clone()
+                .map(crate::executor::install_job_cancellation);
+            if cancelled() {
+                return None;
+            }
+            Some(memo.get_or_insert_with(path, |path| scan_file(path, &job.project_root)))
+        })
         .collect();
+    if cancelled() {
+        return InspectResult::failed(
+            job,
+            "TODO scan cancelled: root unbound or missing",
+            started.elapsed(),
+        );
+    }
     if job.is_full_project_scope() {
         memo.prune_to_scope(&job.project_root, &job.scope_files);
     }
 
     let mut scanned_files = Vec::new();
     let mut all_items = Vec::new();
+    let mut excluded = ExcludedTestTally::default();
     for scan in per_file {
         if let Some(path) = scan.scanned_file {
             scanned_files.push(path);
         }
-        all_items.extend(scan.items);
+        // Markers in test trees (generated fixtures, mutation notes in test
+        // comments) are not product work items; tally them separately.
+        for item in scan.items {
+            if is_test_tree_file(&item.file) {
+                excluded.record(&item.file);
+            } else {
+                all_items.push(item);
+            }
+        }
     }
 
     let mut by_kind = BTreeMap::new();
@@ -94,12 +133,13 @@ fn run_todos_scan_with_memo(job: &InspectJob, memo: &Tier1FileMemo<FileScan>) ->
         })
         .collect::<Vec<_>>();
 
-    let aggregate = serde_json::json!({
+    let mut aggregate = serde_json::json!({
         "count": total_count,
         "by_kind": by_kind,
         "items": items,
         "drill_down_capped": drill_down_capped,
     });
+    excluded.write_into(&mut aggregate);
     let success = InspectScanSuccess {
         scanned_files,
         contributions: Vec::new(),
@@ -157,7 +197,28 @@ fn scan_parser_comments(path: &Path, language: LangId, source: &str, file: &str)
     items
 }
 
+#[cfg(all(test, debug_assertions))]
+type ParseDelay = (
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<()>,
+);
+
+#[cfg(all(test, debug_assertions))]
+static PARSE_DELAYS: OnceLock<Mutex<HashMap<PathBuf, ParseDelay>>> = OnceLock::new();
+
 fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
+    #[cfg(all(test, debug_assertions))]
+    {
+        let delay = PARSE_DELAYS
+            .get()
+            .and_then(|delays| delays.lock().unwrap().remove(path));
+        if let Some((entered, release)) = delay {
+            entered.send(()).expect("TODO file reached parser");
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release delayed TODO parser");
+        }
+    }
     TODOS_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(language) {
@@ -168,17 +229,37 @@ fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
             entry.insert(parser);
         }
 
-        parsers
+        let parser = parsers
             .get_mut(&language)
-            .expect("parser inserted for language")
-            .parse(source, None)
-            .or_else(|| {
-                log::debug!(
-                    "tree-sitter returned no TODO scan tree for {}",
-                    path.display()
-                );
-                None
-            })
+            .expect("parser inserted for language");
+        if crate::executor::current_job_cancelled() || !path.is_file() {
+            parser.reset();
+            return None;
+        }
+        // Progress callbacks interrupt large generated files without reparsing
+        // them. Throttle filesystem checks so ordinary parsing stays CPU-bound.
+        let mut last_check = Instant::now();
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if last_check.elapsed() >= std::time::Duration::from_millis(100) {
+                last_check = Instant::now();
+                if crate::executor::current_job_cancelled() || !path.is_file() {
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        };
+        let bytes = source.as_bytes();
+        let tree = parser.parse_with_options(
+            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        );
+        if tree.is_none() {
+            // A cancelled parser keeps resumable state; the next file must not
+            // accidentally resume the abandoned source buffer.
+            parser.reset();
+        }
+        tree
     })
 }
 
@@ -698,6 +779,129 @@ mod tests {
     }
 
     #[test]
+    fn quiesced_root_aborts_real_executor_todos_scan_mid_parse() {
+        executor_todos_abandonment(false, false);
+    }
+
+    #[test]
+    fn deleted_root_aborts_real_executor_todos_scan_mid_parse() {
+        executor_todos_abandonment(true, false);
+    }
+
+    #[test]
+    fn quiesced_root_rebound_within_grace_completes_real_executor_todos_scan() {
+        executor_todos_abandonment(false, true);
+    }
+
+    fn executor_todos_abandonment(delete_root: bool, rebind: bool) {
+        use crate::context::AppContext;
+        use crate::executor::{Executor, Lane};
+        use crate::parser::TreeSitterProvider;
+        use crate::path_identity::ProjectRootId;
+        use crate::protocol::Response;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("TODO project root");
+        let storage = tempfile::tempdir().expect("isolated TODO storage");
+        let root = ProjectRootId::from_path(directory.path()).expect("canonical TODO root");
+        let path = root.as_path().join("lib.rs");
+        fs::write(&path, "// TODO: retain this marker\npub fn target() {}\n")
+            .expect("write TODO fixture");
+        let job = todos_job(root.as_path(), vec![path.clone()]);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_unbound_build_abandon_grace_for_test(if rebind {
+            Duration::from_secs(600)
+        } else {
+            Duration::ZERO
+        });
+        ctx.mark_subc_bound();
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        PARSE_DELAYS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(path, (entered_tx, release_rx));
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let running = executor.submit_maintenance_async(
+            root.clone(),
+            Lane::HeavyInit,
+            "delayed-todos-scan".to_owned(),
+            Box::new(move |_| {
+                // Run the real scanner and its Rayon file work, not a closure
+                // that merely asserts the executor token was cancelled.
+                let result = run_todos_scan(&job);
+                result_tx.send(result).unwrap();
+                Response::success(
+                    "delayed-todos-scan",
+                    serde_json::json!({ "scan_exited": true }),
+                )
+            }),
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("real TODO scan read a file and reached its parser");
+        if delete_root {
+            directory.close().expect("delete TODO root mid-scan");
+        } else {
+            ctx.mark_subc_unbound();
+            executor.cancel_queued_root_maintenance(&root);
+            if rebind {
+                ctx.mark_subc_bound();
+            }
+        }
+        release_tx.send(()).expect("release TODO parser delay");
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("TODO scan terminates after abandonment");
+        if rebind {
+            assert!(
+                result.outcome.is_ok(),
+                "short unbind must preserve running TODO scan: {:?}",
+                result.outcome
+            );
+        } else {
+            assert!(
+                matches!(result.outcome, Err(ref error) if error.contains("cancelled")),
+                "abandoned TODO scan must not report a fresh aggregate: {:?}",
+                result.outcome
+            );
+        }
+        let response = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), running)
+                    .await
+                    .expect("executor releases TODO scan slot")
+                    .expect("TODO executor completion")
+            });
+        assert!(
+            response.success,
+            "TODO scanner panicked: {:?}",
+            response.data
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !executor.actor_is_idle(&root) {
+            assert!(
+                Instant::now() < deadline,
+                "TODO scan retained executor slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     fn full_scope_larger_than_default_capacity_stays_warm() {
         let project = tempfile::tempdir().expect("project");
         let mut files = Vec::with_capacity(OVER_DEFAULT_MEMO_CAPACITY);
@@ -722,5 +926,71 @@ mod tests {
             0,
             "an unchanged full scan must retain every live file above the default memo capacity"
         );
+    }
+
+    fn scan_files(files: &[(&str, &str)]) -> serde_json::Value {
+        let project = tempfile::tempdir().expect("project");
+        let paths = files
+            .iter()
+            .map(|(relative, contents)| {
+                let path = project.path().join(relative);
+                fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+                fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect::<Vec<_>>();
+        let job = todos_job(project.path(), paths);
+        run_todos_scan_with_memo(&job, &Tier1FileMemo::default())
+            .outcome
+            .expect("todos scan succeeds")
+            .aggregate
+    }
+
+    #[test]
+    fn markers_in_test_trees_are_excluded_from_the_product_count() {
+        let aggregate = scan_files(&[
+            (
+                "src/app.ts",
+                "// TODO: product work item\nexport const a = 1;\n",
+            ),
+            (
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "// TODO: fixture item 0\n// TODO: fixture item 1\n",
+            ),
+            (
+                "crates/app/tests/mutation.rs",
+                "fn f() -> bool {\n    true // BUG: deliberate mutant\n}\n",
+            ),
+        ]);
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["TODO"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["BUG"], 0, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 3, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+        let files = aggregate["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["file"].as_str().expect("file"))
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["src/app.ts"]);
+    }
+
+    /// Every marker must open the comment; an upper-case marker word inside
+    /// prose is not a work item. The rule is the same for all five markers.
+    #[test]
+    fn marker_words_inside_prose_do_not_count() {
+        let aggregate = scan_files(&[(
+            "src/lib.rs",
+            "// BUG: leading marker counts\n\
+             // this documents a BUG in prose\n\
+             // the TODO list and the FIXME tag and a HACK and XXX are prose here\n\
+             fn f() {}\n",
+        )]);
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["by_kind"]["BUG"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 0, "{aggregate:#}");
     }
 }

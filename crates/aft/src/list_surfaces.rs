@@ -8,6 +8,7 @@ pub mod grep;
 pub mod impact;
 pub mod inspect;
 pub mod outline;
+pub mod read;
 pub mod search;
 pub mod trace_data;
 pub mod trace_to;
@@ -148,7 +149,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted, execute_fallback_mode, ExternalFallbackBody, external_fallback_response",
             },
             ReasonEntry {
                 reason: Reason::Depth,
@@ -158,12 +159,17 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Bounding,
-                predicate_name: "engine_capped",
+                // The regex route sets engine_capped in rank_collection when its
+                // file-count or time bound left candidate files unexamined.
+                predicate_name: "engine_capped, rank_collection",
             },
+            // from_matches is the regex route's per-result line allowance: a
+            // file lists its first matching lines and reports the rest in
+            // more_in_file and a "+N more in this file" line.
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, run_engine_ranking, view_semantic_search, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
             },
         ],
     },
@@ -225,6 +231,25 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         ],
     },
     SurfaceEntry {
+        command: "read",
+        mode: "directory",
+        list_id: "payload.entries",
+        unit: Unit::Items,
+        narrow: &["path", "offset", "limit"],
+        reasons: &[
+            ReasonEntry {
+                reason: Reason::Walk,
+                kind: ReasonKind::Bounding,
+                predicate_name: "handle_directory",
+            },
+            ReasonEntry {
+                reason: Reason::Cap,
+                kind: ReasonKind::Selecting,
+                predicate_name: "handle_directory",
+            },
+        ],
+    },
+    SurfaceEntry {
         command: "inspect",
         mode: "",
         list_id: "payload.details",
@@ -233,7 +258,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "details_for, generated_details_for, test_only_details_for, topk_limiting",
+            predicate_name: "details_for, generated_details_for, test_only_details_for, uncovered_files_details_for, topk_limiting",
         }],
     },
     SurfaceEntry {
@@ -245,7 +270,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
         reasons: &[ReasonEntry {
             reason: Reason::Cap,
             kind: ReasonKind::Selecting,
-            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping",
+            predicate_name: "cap_lines, compress_json, finish, middle_truncate, append_hunk, cap_git_lines, compress_add, compress_blame, compress_diff, flush_status_entries, looks_like_golangci_json, finish_folded, first_error_lines, truncate_line, parse_tree, compress_tsc, frozen_compress_tsc, compressor_line_dropping, render_cut, cap_lines_head_tail, cap_text_head_tail, apply_plain_cap_streaming",
         }],
     },
 ];
@@ -261,6 +286,33 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    // The views-on semantic gap note names its first few missing files in the
+    // response text; every missing file is listed in the JSON `semantic_gap`
+    // field, and the text says how many more there are.
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "disclose",
+        location_or_primitive: "semantic gap note take",
+        reason: "summary line naming the first few files a views-on semantic answer is missing, with its own '(+N more)' count; the full list is in the semantic_gap JSON field",
+    },
+    // The unanalyzed-macro note on `callers` is one summary line, not a list
+    // the agent pages through: it states how many mentions exist (or that the
+    // count is a lower bound) and says how many of them it spells out.
+    ExclusionEntry {
+        file: "commands/callgraph_store_adapter.rs",
+        enclosing_item: "unanalyzed_macro_note",
+        location_or_primitive: "macro note site truncate",
+        reason: "summary line under the callers list that carries its own count and 'shown N of M' wording; the callers list itself keeps its envelope",
+    },
+    // The borrowed-graph coverage note on callgraph answers is one summary
+    // line: it names the first few files the borrowed graph does not reflect
+    // and says how many more there are.
+    ExclusionEntry {
+        file: "commands/callgraph_borrowed.rs",
+        enclosing_item: "sample",
+        location_or_primitive: "coverage note file sample take",
+        reason: "summary line naming the first few files a borrowed callgraph does not reflect, with its own 'and N more' count; the counts are in the borrowed_coverage JSON field and the answer's own list keeps its envelope",
+    },
     // The lexical lane's depth tiers are engine-internal cuts over a candidate
     // pool (D_k = 200..3200); the agent never sees this list. The only cut an
     // agent sees is the search surface's topK, which carries the envelope.
@@ -304,6 +356,44 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "engine-internal interval cut when building L over frozen blocks; the served page's envelope and paging trailer are the search surface's",
     },
     ExclusionEntry {
+        file: "commands/semantic_search/rerank/mod.rs",
+        enclosing_item: "rerank_head",
+        location_or_primitive: "page take",
+        reason: "re-cuts the served page from the reranked canonical list with the same offset and topK as the block builder; the search surface computes the envelope and paging trailer from that page afterwards",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/mod.rs",
+        enclosing_item: "rerank_positions",
+        location_or_primitive: "rerank candidate take",
+        reason: "selects which first-block entries a reranker may reorder (at most the configured rerank top_n); nothing is dropped from the list, so the served page and its paging trailer are unchanged in length",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/pool_export.rs",
+        enclosing_item: "entries",
+        location_or_primitive: "benchmark pool export take",
+        reason: "benchmark-only export, written only when AFT_RERANK_POOL_EXPORT is set, of a fixed number of first-block candidates to a file; it is never part of a tool response",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/rerank/tests.rs",
+        enclosing_item: "onnx_cost_profile_when_available",
+        location_or_primitive: "test candidate text truncate",
+        reason: "test-only cost profile that trims each candidate's text to a byte budget before timing the local reranker; no tool response is produced",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/exact_lane.rs",
+        enclosing_item: "copied_worktree_exact_fallback_reproduction",
+        location_or_primitive: "test walk-list truncate",
+        reason: "ignored manual reproduction test that replays the former 1,000-file fallback walk cap to compare it with the current walk; no tool response is produced",
+    },
+    // Checkpoint and restore results name their first files and then say how
+    // many more there are; the checkpoint itself always covers every file.
+    ExclusionEntry {
+        file: "subc_format.rs",
+        enclosing_item: "checkpoint_path_lines",
+        location_or_primitive: "checkpoint path lines take",
+        reason: "summary of a checkpoint or restore result naming its first few files with its own '… and N more' count; the operation covers every file and no paging applies",
+    },
+    ExclusionEntry {
         file: "commands/bash_status.rs",
         enclosing_item: "handle",
         location_or_primitive: "bash_status / bash live-tail",
@@ -322,10 +412,16 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "error message preview of offending non-regular file paths is diagnostic formatting, not a returned list payload",
     },
     ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "inspect_outline_file_content",
+        location_or_primitive: "bounded line-count byte reader",
+        reason: "caps bytes inspected for a file's line-count statistic; the file remains in the outline with an unknown line count, so no agent-visible list items are removed",
+    },
+    ExclusionEntry {
         file: "commands/read.rs",
-        enclosing_item: "handle_directory",
-        location_or_primitive: "commands::read::MAX_DIRECTORY_ENTRIES",
-        reason: "raw directory entry read mode limits directory listing entries to MAX_DIRECTORY_ENTRIES",
+        enclosing_item: "handle_streaming_range_read",
+        location_or_primitive: "bounded streamed line window",
+        reason: "limits bytes retained while reading a selected text line; truncated content and scan gaps are disclosed by the read response, not a cut to a list of files or result records",
     },
     ExclusionEntry {
         file: "commands/lsp_diagnostics.rs",
@@ -380,6 +476,65 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "handle_trace_to_symbol",
         location_or_primitive: "commands::trace_to_symbol::handle_trace_to_symbol",
         reason: "trace_to_symbol reply is a single shortest path (path: Option<Vec<...>>) with no list semantics, so it carries no truncation envelope",
+    },
+    ExclusionEntry {
+        file: "commands/configure.rs",
+        enclosing_item: "schedule_artifact_loads",
+        location_or_primitive: "commands::configure::schedule_artifact_loads warm_permit.take()",
+        reason: "Option::take releasing a warm-reload permit before a cold-build acquire; no list is cut",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/lexical_lane.rs",
+        enclosing_item: "reference_selected_pool",
+        location_or_primitive: "commands::semantic_search::lexical_lane::reference_selected_pool",
+        reason: "test-only reference implementation choosing the three rarest trigram postings to compare against the optimized pool; not an agent-visible list",
+    },
+    ExclusionEntry {
+        file: "commands/zoom.rs",
+        enclosing_item: "indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file",
+        location_or_primitive: "commands::zoom indexed offset work-count test",
+        reason: "test fixture selecting sample offsets for a work-count assertion; not an agent-visible list",
+    },
+    // Split-query search (aft_search with both query and pattern). The
+    // results list is the search surface's, cut and enveloped by the engine;
+    // these items only describe the pattern input.
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "summary_line",
+        location_or_primitive: "commands::semantic_search::split_query::SUMMARY_DEFINITION_SITES",
+        reason: "the one-line pattern summary names at most three definition sites as a preview; the reply's pattern_summary.definition_files carries the full count, and no result is removed",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "from_bounded_scan, bounded_scan_groups_lines_by_file_and_keeps_the_bound",
+        location_or_primitive: "commands::semantic_search::split_query bounded scan truncation flags",
+        reason: "reads (or, in the test, sets) the bounded grep scan's truncation flags to mark the pattern examination capped; nothing is cut here, and the split reply discloses the bound through its budget envelope",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/split_query.rs",
+        enclosing_item: "selective_definitions, admission_definers, expand_group",
+        location_or_primitive: "commands::semantic_search::split_query::MAX_PLACED_DEFINITIONS, MAX_GROUP_EXPANSION",
+        reason: "bounds the definitions scored for relevance or carried into the ranking and the alternatives a group expands into; these are ranking inputs, no list is shown to the agent, and the results list is cut and enveloped by the engine",
+    },
+    // Identifier search in another project (external path): the sweep's
+    // results page is the search surface's, registered under its cap reason.
+    ExclusionEntry {
+        file: "commands/semantic_search/external_exact.rs",
+        enclosing_item: "files_with_hits",
+        location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
+        reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "count",
+        location_or_primitive: "commands::semantic_search external grep coverage line walk_truncated",
+        reason: "reads the bounded scan's truncation flag to word the coverage line; nothing is cut here, and the same flag marks the reply incomplete in external_fallback_response",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/nearest_names.rs",
+        enclosing_item: "nearest_names",
+        location_or_primitive: "commands::semantic_search::nearest_names NEAREST_NAME_FILE_LIMIT, NEAREST_NAME_LIMIT",
+        reason: "a not-found answer suggests a few nearest names: the scan reads a bounded number of files and keeps the most similar names; these are suggestions for a name that occurs nowhere, not a cut of matching results",
     },
 ];
 

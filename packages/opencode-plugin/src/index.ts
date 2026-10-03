@@ -33,14 +33,15 @@ import {
 } from "./bridge-bootstrap.js";
 import {
   ConfigRejectedError,
+  createUnchangedConfigLoader,
   getConfigLoadErrors,
   loadAftConfig,
-  resolveBashConfig,
   resolveBridgePoolTransportOptions,
   resolvedIndexes,
   resolveOpenCodeRegistrationRoot,
 } from "./config.js";
 import { buildConfigErrorToolMap } from "./config-error-surface.js";
+import { startOpenCodeLiveConfigReload } from "./config-live-reload.js";
 import {
   drainPendingConfigParseWarnings,
   enqueueConfigParseWarnings,
@@ -61,6 +62,7 @@ import {
 import { resolvePluginVersion } from "./plugin-version.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
+import { rememberReadModel } from "./shared/read-vision.js";
 import {
   drainNotifications,
   isTuiConnected,
@@ -78,10 +80,9 @@ import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
-import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
-import { appendHintsToSystem, buildHintsFromConfig } from "./workflow-hints.js";
+import { appendHintsToSystem, buildHintsForRegisteredTools } from "./workflow-hints.js";
 
 type BashPatternMatchPayload = {
   session_id: string;
@@ -304,9 +305,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Reloads keep the last configuration that loaded successfully when the
   // current file is rejected.
   const lastGoodConfig = new Map<string, typeof aftConfig>([[registrationRoot, aftConfig]]);
+  // chat.message loads the config on every message; skip the full reload while
+  // neither config file has changed.
+  const loadAftConfigIfChanged = createUnchangedConfigLoader(loadAftConfig);
   const loadAftConfigOrLastGood = (projectRoot: string): typeof aftConfig => {
     try {
-      const loaded = loadAftConfig(projectRoot);
+      const loaded = loadAftConfigIfChanged(projectRoot);
       lastGoodConfig.set(projectRoot, loaded);
       return loaded;
     } catch (err) {
@@ -452,6 +456,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     storageDir: configOverrides.storage_dir as string,
     isProjectEnabled,
   };
+  // Keep the live keys of `ctx.config` current when either config file
+  // changes. Tool handlers read `ctx.config` per call; the tool set, schemas
+  // and descriptions stay as loaded and follow the next restart.
+  const liveConfigReload = startOpenCodeLiveConfigReload({
+    directory: registrationRoot,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
+    getConfig: () => ctx.config,
+    setConfig: (config) => {
+      ctx.config = config;
+    },
+    notify: (message) => deliverConfigMigrationWarnings(registrationRoot, [message]),
+  });
 
   type StatusSubscribableBridge = {
     subscribeStatus(listener: (snapshot: Record<string, unknown>) => void): () => void;
@@ -515,6 +532,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   let clearInspectTier2Idle = () => {};
   const shutdownCleanup = registerShutdownCleanup(async (reason) => {
     autoUpdateAbort.abort();
+    liveConfigReload.stop();
     clearInspectTier2Idle();
     for (const unsubscribe of statusUnsubscribes) {
       try {
@@ -756,20 +774,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // AFT workflows. Computed from the final tool surface so we never
   // advertise tools the agent doesn't have. User-only — see config.ts
   // for the security rationale.
-  // We pass the complement of registered tools (i.e. names that AREN'T in
-  // allTools) so buildHintsFromConfig drops sections for tools the agent
-  // can't actually call.
-  const HINTS_TOOL_NAMES = [
-    "aft_outline",
-    "aft_zoom",
-    "aft_search",
-    "aft_callgraph",
-    "aft_inspect",
-    "grep",
-    "read",
-    "bash",
-    "bash_status",
-  ];
   const registeredTools = new Set(Object.keys(allTools));
   // The registration flag describes the hashline edit arm, not merely the
   // presence of the default edit tool. A config/schema mismatch must downgrade
@@ -797,36 +801,20 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // not rewrite (for example, greps with unsupported flags or pipes).
   (ctx as PluginContext & { aftSearchRegistered?: boolean }).aftSearchRegistered =
     aftSearchRegistered;
-  // The bash tool description embeds a code-search prohibition that steers to
-  // aft_search when registered (else the grep tool). Registration is only
-  // known once the full tool map exists, so select the variant here — the
-  // factory default assumes aft_search is absent. The compression and
-  // background/PTY sentences are config-gated too: only advertised when the
-  // feature is actually on for this project.
-  for (const name of ["bash"]) {
-    const def = allTools[name];
-    if (def) {
-      const bashCfg = resolveBashConfig(aftConfig);
-      def.description = bashToolDescription(
-        aftSearchRegistered,
-        bashCfg.compress,
-        bashCfg.background,
-        bashCfg.detach_on_user_message,
-      );
-    }
-  }
-  const hintsAbsentTools = new Set<string>();
-  for (const name of HINTS_TOOL_NAMES) {
-    if (!registeredTools.has(name)) hintsAbsentTools.add(name);
-  }
-  const hintsBlock = buildHintsFromConfig(aftConfig, hintsAbsentTools, hashlineEditRegistered);
+  // The bash tool description already names only registered tools and enabled
+  // features: `buildAftToolDefinitions` rewrote it for the final surface.
+  const hintsBlock = buildHintsForRegisteredTools(
+    aftConfig,
+    registeredTools,
+    hashlineEditRegistered,
+  );
   if (hintsBlock) {
     log(`Workflow hints injected (${hintsBlock.length} chars)`);
   }
 
   const inspectTier2Idle = createInspectTier2IdleScheduler({
     isEnabled: () => registeredTools.has("aft_inspect"),
-    idleMinutes: () => aftConfig.inspect?.tier2_idle_minutes,
+    idleMinutes: () => ctx.config.inspect?.tier2_idle_minutes,
     warn,
     run: async (sessionID: string): Promise<void> => {
       const sessionDir =
@@ -897,10 +885,19 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           storageDir: configOverrides.storage_dir as string,
           pluginVersion: PLUGIN_VERSION,
           serverUrl: input.serverUrl?.toString(),
-          delivery: aftConfig.configure_warnings_delivery ?? "toast",
+          delivery: ctx.config.configure_warnings_delivery ?? "toast",
         });
       }
       await flushConfigureWarningsOnIdle(sessionID);
+    },
+    "chat.params": async (params: {
+      sessionID: string;
+      model: { providerID: string; id: string };
+    }) => {
+      rememberReadModel(input.client, params.sessionID, {
+        providerID: params.model.providerID,
+        modelID: params.model.id,
+      });
     },
     "chat.message": async (
       messageInput: {

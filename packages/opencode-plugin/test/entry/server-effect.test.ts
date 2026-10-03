@@ -28,6 +28,12 @@ function testDependencies(events: string[]) {
       events.push(`config:${directory}`);
       return {};
     },
+    // The real config loader retains errors, sources and notices in module globals.
+    // Return empty metadata for this fake load rather than reuse an earlier test's load.
+    configLoadErrors: () => [],
+    configLoadSources: () => [],
+    configLoadTexts: () => new Map(),
+    deliverLoadNotices: () => {},
     migrateConfigLocations: () => [],
     ensureStorageMigrated: async () => {},
     ensureOnnxRuntime: async () => null,
@@ -127,6 +133,9 @@ function hostContext(
 describe("V2 server effect", () => {
   test("each start line names the entry and the Location, and pairs with a stop line", async () => {
     const log = spyOn(logger, "log");
+    // Another suite may have replaced log with a mock that already has calls.
+    // Count only runtime messages from the two Locations created in this test.
+    log.mockClear();
     try {
       const events: string[] = [];
       const effect = makeServerEffect(testDependencies(events));
@@ -351,5 +360,75 @@ describe("V2 server effect", () => {
     await Effect.runPromise(Effect.scoped(effect({ location: { directory: 1 } })));
 
     expect(events).toEqual([]);
+  });
+
+  // OpenCode 2 has no chat.message hook, so without this registration a new
+  // message could not detach a waiting bash there.
+  test("registers a session prompt hook that detaches through the Location's pool and live config", async () => {
+    const events: string[] = [];
+    const detached: string[] = [];
+    const hooks: Array<{ name: string; callback: (event: unknown) => Effect.Effect<void> }> = [];
+    let setConfig: ((next: Record<string, unknown>) => void) | undefined;
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        if (command === "bash_wait_detach") detached.push(String(params.session_id));
+        return { success: true, detached: true };
+      },
+    };
+    const dependencies = {
+      ...testDependencies(events),
+      loadConfig: () => ({ bash: { detach_on_user_message: false } }),
+      acquireBridge: async (directory: string) => ({
+        directory,
+        setConfigureOverride: () => {},
+        getActiveBridgeForRoot: (root: string) => {
+          events.push(`active-root:${root}`);
+          return bridge;
+        },
+        activeBridges: () => [bridge],
+      }),
+      startLiveConfigReload: (options: { setConfig(next: Record<string, unknown>): void }) => {
+        setConfig = options.setConfig;
+        return { stop: () => {} };
+      },
+    };
+    const host = hostContext("/work/a", events, [], "/canonical/a");
+    const context = {
+      ...host.context,
+      location: host.context.location,
+      session: {
+        hook: (name: string, callback: (event: unknown) => Effect.Effect<void>) =>
+          Effect.sync(() => {
+            hooks.push({ name, callback });
+            return { dispose: Effect.void };
+          }),
+      },
+    };
+
+    await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(context)));
+
+    expect(hooks.map((hook) => hook.name)).toEqual(["prompt"]);
+    const prompt = hooks[0]?.callback;
+    if (!prompt) return;
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The config the Location booted with keeps plain messages from detaching.
+    await Effect.runPromise(prompt({ sessionID: "s1", prompt: { text: "still there?" } }));
+    await settle();
+    expect(detached).toEqual([]);
+
+    // A live reload that turns the setting on applies to the next message.
+    setConfig?.({ bash: { detach_on_user_message: true } });
+    const event = { sessionID: "s1", prompt: { text: "still there? &detach" } };
+    await Effect.runPromise(prompt(event));
+    await settle();
+    expect(detached).toEqual(["s1"]);
+    expect(event.prompt.text).toBe("still there? ");
+    // The first bridge asked is the one the Location's tools run on, keyed by
+    // the Location's own directory rather than the canonical main checkout the
+    // pool was acquired for, so a Location in a linked worktree detaches its
+    // own wait first.
+    expect(events).toContain("active-root:/work/a");
+    expect(events).not.toContain("active-root:/canonical/a");
   });
 });

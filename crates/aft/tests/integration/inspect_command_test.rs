@@ -10,6 +10,7 @@ use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
     handle_inspect_tier2_run, handle_inspect_tool_call, handle_inspect_warm_for_test,
 };
+use aft::commands::tool_call::handle_with_dispatch;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
 use aft::inspect::{
@@ -30,25 +31,7 @@ fn fixture_project() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn fake_server_path() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            option_env!("CARGO_BIN_EXE_fake-lsp-server")
-                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
-                .map(PathBuf::from)
-        })
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
-        .or_else(|| {
-            let mut path = std::env::current_exe().ok()?;
-            path.pop();
-            path.pop();
-            path.push("fake-lsp-server");
-            Some(path)
-        })
-        .filter(|path| path.exists())
-        .expect("fake-lsp-server binary path not set")
+    crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
 fn write_file(root: &Path, relative_path: &str, contents: &str) -> PathBuf {
@@ -686,6 +669,84 @@ fn inspect_command_dead_code_uses_callgraph_snapshot_and_details() {
 }
 
 #[test]
+fn borrow_only_dead_code_is_a_named_gap_never_a_zero() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/index.ts",
+        "import { used } from './lib';\nused();\n",
+    );
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function used() { return 1; }\nexport function unused() { return 2; }\n",
+    );
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    // A borrow-only root (a worktree) keeps its own inspect store but may only
+    // read, never build, the shared call graph; no main-checkout store exists.
+    ctx.set_cache_writer_capabilities(false, true);
+    // An earlier count (from before the root became borrow-only) must not
+    // survive as if it were current.
+    ctx.update_status_bar_tier2(Some(7), None, None, None, false);
+    assert_eq!(ctx.status_bar_count_values().dead_code, Some(7));
+
+    let response = inspect(
+        &ctx,
+        json!({
+            "id": "inspect-borrow-only",
+            "command": "inspect",
+            "sections": ["dead_code", "unused_exports", "duplicates"],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    let dead_code = &response["summary"]["dead_code"];
+    assert_eq!(dead_code["unavailable"], true, "{response:#}");
+    assert_eq!(dead_code["complete"], false, "{response:#}");
+    assert!(
+        dead_code.get("count").is_none() && dead_code.get("by_language").is_none(),
+        "an unavailable analysis must carry no count: {response:#}"
+    );
+    assert_eq!(
+        dead_code["gaps"][0]["reason"],
+        "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout",
+        "{response:#}"
+    );
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("dead code: unavailable in this worktree (call graph is borrow-only)"),
+        "the named gap must be rendered: {text}"
+    );
+    assert!(
+        !text.lines().any(|line| line.starts_with("Dead code: ")),
+        "no dead-code count may be rendered: {text}"
+    );
+    assert_eq!(
+        ctx.status_bar_count_values().dead_code,
+        None,
+        "the status bar must show dead code as unknown, not the earlier count"
+    );
+    // The background refresh path reads counts from the inspect store; it must
+    // not bring the old number back either.
+    aft::runtime_drain::drain_inspect_events(&ctx);
+    ctx.update_status_bar_tier2(None, None, None, None, false);
+    // A `None` count renders as `D?` in the agent bar (see
+    // response_finalize::agent_bar_marks_missing_categories_instead_of_zeroing_them).
+    assert_eq!(ctx.status_bar_count_values().dead_code, None);
+
+    // These analyses need no call graph and are computed locally even in a
+    // borrow-only root, so they do report real numbers.
+    assert_eq!(
+        response["summary"]["unused_exports"]["count"], 1,
+        "{response:#}"
+    );
+    assert!(
+        response["summary"]["duplicates"]["count"].is_u64(),
+        "{response:#}"
+    );
+}
+
+#[test]
 fn inspect_command_tier2_cold_direct_computes_before_deadline() {
     let (_temp_dir, root) = fixture_project();
     write_file(
@@ -1129,6 +1190,142 @@ fn inspect_blocking_reuse_attaches_to_in_flight_background_category() {
         1,
         "blocking inspect must not start a competing same-category reuse scan"
     );
+}
+
+#[test]
+fn scoped_inspect_does_not_wait_for_blocked_tier2() {
+    let _env_lock = env_serial_lock();
+    let (temp, owner) = fixture_project();
+    write_file(&owner, "src/foo.ts", duplicate_fixture_source());
+    let git = |root: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git fixture");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&owner, &["init"]);
+    git(&owner, &["add", "src/foo.ts"]);
+    git(
+        &owner,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &owner,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+
+    let gate_ready = temp.path().join("tier2-ready");
+    let gate_release = temp.path().join("tier2-release");
+    let _gate_root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &linked.to_string_lossy());
+    let _gate_ready = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_READY",
+        &gate_ready.to_string_lossy(),
+    );
+    let _gate_release = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+        &gate_release.to_string_lossy(),
+    );
+    let owner_ctx = configured_context(&owner);
+    let linked_ctx = configured_context(&linked);
+    let manager = linked_ctx.inspect_manager();
+    let snapshot = InspectSnapshot::new(
+        linked.clone(),
+        linked_ctx.inspect_dir(),
+        linked_ctx.config(),
+        linked_ctx.symbol_cache(),
+    );
+    let tier2_root = linked.clone();
+    let tier2_worker = thread::spawn(move || {
+        manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::Duplicates,
+            JobScope::for_project(tier2_root),
+        )
+    });
+    wait_for_path_event(&gate_ready, "Tier-2 gate");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::scope(|threads| {
+        threads.spawn(|| {
+            for ctx in [&linked_ctx, &owner_ctx] {
+                ctx.lsp()
+                    .override_binary(ServerKind::TypeScript, fake_server_path());
+                ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+                for sections in [json!("diagnostics"), Value::Null] {
+                    let response = handle_inspect_tool_call(
+                        &request(json!({
+                            "id": "scoped-blocked-tier2", "command": "inspect",
+                            "scope": "src/foo.ts", "sections": sections,
+                        })),
+                        ctx,
+                    );
+                    tx.send(serde_json::to_value(response).unwrap()).unwrap();
+                }
+            }
+        });
+        // Release even on failure so the regression cannot strand a worker.
+        let mut responses = Vec::new();
+        for _ in 0..4 {
+            let response = rx.recv_timeout(Duration::from_secs(15));
+            let timed_out = response.is_err();
+            responses.push(response);
+            if timed_out {
+                break;
+            }
+        }
+        fs::write(&gate_release, b"release").expect("release Tier-2");
+        tier2_worker.join().expect("Tier-2 worker finished");
+        for response in responses {
+            let response = response.expect("scoped inspect waited for blocked Tier-2");
+            assert_eq!(response["success"], true, "{response:#}");
+            assert!(
+                response["summary"]["diagnostics"].is_object(),
+                "{response:#}"
+            );
+            assert_eq!(
+                response["summary"]["duplicates"]["complete"], false,
+                "{response:#}"
+            );
+            assert!(
+                response["summary"]["duplicates"].get("count").is_none(),
+                "{response:#}"
+            );
+            let phases = response["wait_stamp"]["phases"]
+                .as_array()
+                .expect("completed phase log");
+            assert!(
+                phases
+                    .iter()
+                    .any(|phase| phase["id"] == "stat_verification"),
+                "{response:#}"
+            );
+            assert!(
+                phases
+                    .iter()
+                    .all(|phase| phase["id"] != "tier2_rescan" && phase["id"] != "callgraph_ready"),
+                "{response:#}"
+            );
+            let text = response["text"].as_str().unwrap();
+            assert!(
+                text.contains("Incomplete duplicates: Tier-2 unavailable"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("Duplicates: 0") && !text.contains("Dead code: 0"),
+                "{text}"
+            );
+        }
+    });
 }
 
 #[test]
@@ -3065,9 +3262,11 @@ fn inspect_command_diagnostics_clean_zero_after_empty_publish() {
         .is_empty());
 }
 
-/// Scope must not change collection work: a scoped request may not spawn
-/// servers, open documents, or pull diagnostics beyond what the warm path
-/// already did. Assertions target the producer/LSP call surface (server
+/// On the nonblocking inspect path, scope must not change collection work: a
+/// scoped request may not spawn servers, open documents, or pull diagnostics
+/// beyond what the warm path already did. (A blocking scoped inspect does
+/// open the scoped files; see the `scoped_blocking_inspect_*` tests.)
+/// Assertions target the producer/LSP call surface (server
 /// roster, open-document store, diagnostic reports), not timing.
 #[test]
 fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
@@ -3119,6 +3318,100 @@ fn scoped_diagnostics_perform_no_lsp_work_beyond_the_warm_path() {
     assert_eq!(gap["file"], "src/main.rs");
 }
 
+/// A string file scope selects only the owning TypeScript workspace, even
+/// when other packages and languages have source files in the same project.
+#[test]
+fn scoped_typescript_file_inspect_starts_only_its_workspace() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", "{\"name\":\"root\"}\n");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"root\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn root() {}\n");
+    write_file(&root, "scripts/other.sh", "echo other\n");
+    write_file(&root, "scripts/second.sh", "echo second\n");
+    write_file(
+        &root,
+        "packages/dashboard/src-tauri/Cargo.toml",
+        "[package]\nname = \"dashboard\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(
+        &root,
+        "packages/dashboard/src-tauri/src/lib.rs",
+        "pub fn dashboard() {}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/package.json",
+        "{\"name\":\"plugin\"}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/tsconfig.json",
+        "{\"references\":[{\"path\":\"./scripts\"}]}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/scripts/tsconfig.json",
+        "{\"compilerOptions\":{}}\n",
+    );
+    write_file(
+        &root,
+        "packages/plugin/scripts/sentinel.ts",
+        "export const sentinel = 1;\n",
+    );
+    for package in [
+        "cli",
+        "pi-plugin",
+        "e2e-tests",
+        "docs",
+        "retina-local-fs",
+        "dashboard",
+    ] {
+        write_file(&root, &format!("packages/{package}/package.json"), "{}\n");
+        write_file(
+            &root,
+            &format!("packages/{package}/src/index.ts"),
+            "export const other = 2;\n",
+        );
+    }
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Bash, fake_server_path());
+
+    let response = serde_json::to_value(handle_with_dispatch(
+        &request(json!({
+            "id": "inspect-scoped-ts-monorepo",
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "args": {
+                "scope": "packages/plugin/scripts/sentinel.ts",
+                "sections": "diagnostics"
+            }
+        })),
+        &ctx,
+        &|_, _| panic!("inspect tool calls use the inspect dispatcher"),
+    ))
+    .expect("inspect response serializes");
+    let active = ctx.lsp().active_server_keys();
+    assert_eq!(response["scope_files"], 1, "scope was lost: {response:#}");
+    assert_eq!(active.len(), 1, "response: {response:#}");
+    assert_eq!(active[0].kind, ServerKind::TypeScript);
+    // No package installs its own TypeScript, so every package sees the same
+    // (none) and one server at the outermost TypeScript root serves them all;
+    // the scope still starts only that one server, not one per package.
+    assert_eq!(
+        active[0].root,
+        crate::helpers::canonicalize_like_product(&root)
+    );
+}
+
 /// Producer discovery may see nested Cargo workspaces, but a scoped blocking
 /// inspect starts rust-analyzer only for the workspace that owns the scope.
 #[test]
@@ -3135,12 +3428,15 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
         "[package]\nname = \"scoped-owner\"\nversion = \"0.1.0\"\n",
     );
     write_file(&root, "crates/aft/src/lib.rs", "pub fn owned() {}\n");
+    // A nested standalone workspace outside `spikes/` and fixture directories,
+    // which the whole-project walk skips; this one must still get its own
+    // server when the request is unscoped.
     write_file(
         &root,
-        "spikes/foreign/Cargo.toml",
+        "tools/foreign/Cargo.toml",
         "[workspace]\n[package]\nname = \"foreign\"\nversion = \"0.1.0\"\n",
     );
-    write_file(&root, "spikes/foreign/src/lib.rs", "pub fn foreign() {}\n");
+    write_file(&root, "tools/foreign/src/lib.rs", "pub fn foreign() {}\n");
     let ctx = configured_context(&root);
     configure_fake_rust_lsp(&ctx);
 
@@ -3173,8 +3469,642 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
     let active = ctx.lsp().active_server_keys();
     assert_eq!(active.len(), 2, "response: {unscoped:#}");
     assert!(active.iter().any(|key| {
-        key.root == crate::helpers::canonicalize_like_product(&root.join("spikes/foreign"))
+        key.root == crate::helpers::canonicalize_like_product(&root.join("tools/foreign"))
     }));
+}
+
+/// A Rust Cargo project whose `package.json` exists only to install a tool
+/// (Cloudflare's `wrangler` here). The manifest is a TypeScript root marker but
+/// not a TypeScript source file.
+fn wrangler_rust_fixture() -> (tempfile::TempDir, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"wrangler-worker\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn worker() {}\n");
+    write_file(
+        &root,
+        "package.json",
+        "{\n  \"private\": true,\n  \"devDependencies\": { \"wrangler\": \"4.0.0\" }\n}\n",
+    );
+    (temp_dir, root)
+}
+
+/// Both the Rust and the TypeScript producers run the fake LSP child, so a
+/// TypeScript start is observable as a live server key rather than depending
+/// on whether `typescript-language-server` happens to be installed.
+fn configure_fake_rust_and_typescript_lsp(ctx: &AppContext) {
+    configure_fake_rust_lsp(ctx);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+}
+
+fn active_server_kinds(ctx: &AppContext) -> Vec<ServerKind> {
+    ctx.lsp()
+        .active_server_keys()
+        .into_iter()
+        .map(|key| key.kind)
+        .collect()
+}
+
+/// A context whose Tier-2 aggregates are already built, so an unscoped inspect
+/// returns a fresh payload with a diagnostics summary instead of refusing
+/// while the callgraph is still building.
+fn tier2_ready_context(root: &Path) -> AppContext {
+    let ctx = configured_context_with_callgraph_store(root, true);
+    ensure_callgraph_store_ready(&ctx);
+    tier2_run(
+        &ctx,
+        &[
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ],
+    );
+    ctx
+}
+
+fn not_applicable_producers(response: &Value) -> Vec<String> {
+    response["summary"]["diagnostics"]["not_applicable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["producer"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn failed_producers(response: &Value) -> Vec<String> {
+    response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["kind"] == "failed_producer")
+        .filter_map(|gap| gap["producer"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Standalone OpenCode and Pi call inspect through `tool_call` with the
+/// registered name `aft_inspect`. The agent-visible text must be the rendered
+/// inspect text, as for `read` and `grep`, not the response serialized as JSON.
+#[test]
+fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "src/main.rs", "fn main() {}\n// TODO: tidy\n");
+    let ctx = configured_context(&root);
+
+    let response = serde_json::to_value(handle_with_dispatch(
+        &request(json!({
+            "id": "tool-call-inspect-text",
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "arguments": {"scope": "src", "sections": "todos"}
+        })),
+        &ctx,
+        &|_, _| panic!("inspect tool calls use the inspect dispatcher"),
+    ))
+    .expect("inspect response serializes");
+
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "text is serialized JSON: {text}"
+    );
+    // `src/main.rs` has no Cargo.toml, so Rust diagnostics are unknown and the
+    // rendered text opens with the partial header that names rust.
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some("PARTIAL: diagnostics unknown for rust (see below)"),
+        "{text}"
+    );
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with("scope: 1 root")),
+        "{text}"
+    );
+    assert!(text.contains("TODOs: 1"), "{text}");
+}
+
+/// A scoped inspect selects producers from the files inside the scope only.
+/// A JavaScript file elsewhere in the project (a checked-in `.mjs` test stub)
+/// must not start TypeScript for a scope that contains only Rust.
+#[test]
+fn scoped_rust_inspect_does_not_start_typescript_for_js_outside_the_scope() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    write_file(
+        &root,
+        "tests/usage-stub/index.mjs",
+        "export default { fetch() { return new Response(\"ok\"); } };\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-rust-with-outside-js",
+            "command": "inspect",
+            "scope": "src/lib.rs",
+        }),
+    );
+
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "a Rust-only scope must start only rust-analyzer: {response:#}"
+    );
+    assert!(
+        !failed_producers(&response).contains(&"typescript".to_string()),
+        "response: {response:#}"
+    );
+}
+
+fn diagnostic_messages_for(response: &Value, file: &str) -> Vec<String> {
+    response["details"]["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["file"] == file)
+        .filter_map(|item| item["message"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// `(file, cause reason)` of every scoped file inspect could not certify.
+fn uncovered_files(response: &Value) -> Vec<(String, String)> {
+    response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["kind"] == "uncovered_file")
+        .map(|gap| {
+            (
+                gap["file"].as_str().unwrap_or_default().to_string(),
+                gap["cause"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn single_crate_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    );
+    let lib = write_file(&root, "src/lib.rs", "pub fn f() {}\n");
+    (temp_dir, root, lib)
+}
+
+fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value {
+    inspect_tool_call(
+        ctx,
+        json!({
+            "id": id,
+            "command": "inspect",
+            "scope": scope,
+            "sections": "diagnostics",
+            "topK": 20,
+        }),
+    )
+}
+
+/// Language servers publish diagnostics only for files they were told about.
+/// The fake here behaves like rust-analyzer without pull support: it publishes
+/// for a file only after `didOpen`. A blocking scoped inspect opens the scoped
+/// file, reports what the server published, and closes the file again.
+#[test]
+fn scoped_blocking_inspect_opens_scoped_files_for_a_push_only_server() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-push");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-push", "src");
+
+    assert!(
+        diagnostic_messages_for(&response, "src/lib.rs")
+            .iter()
+            .any(|message| message.contains("test diagnostic error")),
+        "the opened file's diagnostics must be reported: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"],
+        json!({"files": 1, "examined": 1, "authoritative": 1, "not_examined": 0, "file_cap": 1000}),
+        "response: {response:#}"
+    );
+    assert!(
+        !ctx.lsp().document_is_open_for_test(&lib),
+        "inspect must close the documents it opened"
+    );
+
+    // The fake answers the close with an empty publish, as TypeScript does.
+    // That reply describes the closed document, not the file, and must not
+    // replace the diagnostics inspect collected.
+    wait_for_close_reply(&ctx);
+    assert_eq!(
+        ctx.lsp().get_diagnostics_for_file(&lib).len(),
+        2,
+        "the close reply erased the collected diagnostics"
+    );
+}
+
+/// Drain events until the fake reports the `didClose` and then sends the
+/// publish that follows it.
+fn wait_for_close_reply(ctx: &AppContext) {
+    let hang_deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_close = false;
+    loop {
+        assert!(
+            Instant::now() < hang_deadline,
+            "fake never answered didClose"
+        );
+        for event in ctx.lsp().drain_events().events {
+            if let LspEvent::Notification { method, .. } = event {
+                if method == "custom/documentClosed" {
+                    saw_close = true;
+                } else if saw_close && method == "textDocument/publishDiagnostics" {
+                    return;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The empty publish that clears a closed document is ignored however late
+/// it arrives; there is no time window after which it would be stored.
+#[test]
+fn scoped_blocking_inspect_ignores_a_late_clearing_publish_after_its_close() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-close-late");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CLOSE_DELAY_MS", "2500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-close-late", "src");
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+
+    wait_for_close_reply(&ctx);
+    assert_eq!(
+        ctx.lsp().get_diagnostics_for_file(&lib).len(),
+        2,
+        "a late clearing publish erased the collected diagnostics"
+    );
+}
+
+/// Only an empty publish after inspect's close is ignored. A publish with
+/// diagnostics that arrives right after the close is real news about the file
+/// and is stored.
+#[test]
+fn scoped_blocking_inspect_stores_a_non_empty_publish_after_its_close() {
+    let (_temp_dir, root, lib) = single_crate_fixture("sweep-close-news");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CLOSE_PUBLISHES", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-close-news", "src");
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+
+    wait_for_close_reply(&ctx);
+    let stored = ctx
+        .lsp()
+        .get_diagnostics_for_file(&lib)
+        .into_iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored,
+        vec!["test diagnostic after change".to_string()],
+        "the publish after the close was not stored"
+    );
+}
+
+/// A server that answers `textDocument/diagnostic` is asked directly. The
+/// fake pushes nothing useful here (an empty list on open), so only the pull
+/// can produce its diagnostic.
+#[test]
+fn scoped_blocking_inspect_pulls_diagnostics_from_a_pull_server() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull", "src/lib.rs");
+
+    assert_eq!(
+        diagnostic_messages_for(&response, "src/lib.rs"),
+        vec!["test pull diagnostic".to_string()],
+        "response: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+}
+
+/// rust-analyzer publishes compiler errors only when its `cargo check` run
+/// finishes. The fake's check ends 1.5s after the file is opened and adds one
+/// compiler error; inspect must wait for it instead of answering with the
+/// analyzer's own diagnostics alone.
+#[test]
+fn scoped_blocking_inspect_waits_for_rust_analyzer_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-flycheck");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck", "src");
+
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "flycheck diagnostic"),
+        "cargo check result missing: {response:#}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "test diagnostic error"),
+        "response: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+}
+
+/// rust-analyzer that answers pulls returns its own analysis through the pull
+/// and pushes `cargo check` results separately, for the same file. Both
+/// reach one store entry, so the later one would hide the other; inspect
+/// must report the pulled diagnostic and the compiler error together.
+#[test]
+fn scoped_blocking_inspect_keeps_cargo_check_results_beside_pulled_diagnostics() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull-flycheck");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "1500");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-flycheck", "src");
+
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    for expected in ["test pull diagnostic", "flycheck diagnostic"] {
+        assert!(
+            messages.iter().any(|message| message == expected),
+            "{expected} missing: {response:#}"
+        );
+    }
+}
+
+/// Pulls are sent several files at a time and then waited for in turn; each
+/// wait must end at the request budget, not restart its own timeout. With a
+/// server that never answers within the budget, a scope of many files still
+/// returns close to the configured diagnostics deadline.
+#[test]
+fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-pull-budget");
+    for index in 0..40 {
+        write_file(&root, &format!("src/m{index:02}.rs"), "pub fn g() {}\n");
+    }
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_DELAY_MS", "60000");
+
+    let started = std::time::Instant::now();
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-pull-budget", "src");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(25),
+        "a 10s inspect took {elapsed:?}: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "unanswered pulls are gaps: {response:#}"
+    );
+}
+
+/// A scope with more files than one inspect opens reports how many it
+/// examined, and names the rest with that cause instead of opening them.
+#[test]
+fn scoped_blocking_inspect_caps_the_files_it_opens() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cap");
+    for index in 0..1000 {
+        write_file(&root, &format!("src/m{index:04}.rs"), "pub fn g() {}\n");
+    }
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-cap", "src");
+
+    assert_eq!(
+        response["summary"]["diagnostics"]["coverage"],
+        json!({"files": 1001, "examined": 1000, "authoritative": 1000, "not_examined": 1, "file_cap": 1000}),
+        "response: {response:#}"
+    );
+    let uncovered = uncovered_files(&response);
+    assert_eq!(uncovered.len(), 1, "response: {response:#}");
+    assert!(
+        uncovered[0].1.starts_with("not examined:"),
+        "response: {response:#}"
+    );
+    let text = response["text"].as_str().expect("rendered text");
+    // The coverage line counts files with authoritative diagnostics: the 1000
+    // opened and answered, but not the one file past the cap, which is the
+    // single uncovered file asserted above.
+    assert!(
+        text.contains("authoritative results for 1000 of 1001 scoped files (1 not examined"),
+        "{text}"
+    );
+}
+
+/// When `cargo check` is still running at the end of the budget, the Rust
+/// files are named as incomplete with that cause instead of being certified
+/// from reports that lack the compiler's errors.
+#[test]
+fn scoped_blocking_inspect_names_an_unfinished_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-flycheck-slow");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-sweep-flycheck-slow", "src");
+
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let uncovered = uncovered_files(&response);
+    assert_eq!(uncovered.len(), 1, "response: {response:#}");
+    assert_eq!(uncovered[0].0, "src/lib.rs");
+    assert!(
+        uncovered[0].1.starts_with("still checking:"),
+        "response: {response:#}"
+    );
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(
+        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry;"),
+        "{text}"
+    );
+}
+
+/// A TypeScript server started for an earlier request keeps its runtime note
+/// (which SDK it runs). An inspect scoped to Rust files must not repeat it.
+/// The fake is installed as the project's `typescript-language-server` so the
+/// real SDK resolution runs and records a note, which a binary override skips.
+#[cfg(unix)]
+#[test]
+fn scoped_rust_inspect_omits_the_note_of_a_typescript_server_started_earlier() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("notes-scope");
+    write_file(&root, "package.json", "{\"name\":\"notes-scope\"}\n");
+    write_file(&root, "web/index.ts", "export const x = 1;\n");
+    let bin_dir = root.join("node_modules/.bin");
+    fs::create_dir_all(&bin_dir).expect("node_modules/.bin");
+    std::os::unix::fs::symlink(
+        fake_server_path(),
+        bin_dir.join("typescript-language-server"),
+    )
+    .expect("link fake typescript-language-server");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+
+    let typescript = scoped_diagnostics_inspect(&ctx, "inspect-notes-ts", "web/index.ts");
+    assert!(
+        typescript.to_string().contains("TypeScript: "),
+        "precondition: the TypeScript scope reports its runtime note: {typescript:#}"
+    );
+
+    let rust = scoped_diagnostics_inspect(&ctx, "inspect-notes-rust", "src/lib.rs");
+    assert!(
+        active_server_kinds(&ctx).contains(&ServerKind::TypeScript),
+        "precondition: the TypeScript server is still running"
+    );
+    assert!(
+        !rust.to_string().contains("TypeScript"),
+        "a Rust-only scope must not carry a TypeScript note: {rust:#}"
+    );
+}
+
+/// With no file TypeScript handles anywhere in the project, `package.json`
+/// alone never starts it: a scoped Rust inspect starts only rust-analyzer, and
+/// an unscoped inspect names TypeScript as not applicable instead of starting
+/// it, failing it, or saying nothing.
+#[test]
+fn package_json_without_typescript_files_never_starts_typescript() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    // Each inspect gets its own context so the live-server roster after it
+    // reflects that call alone.
+    let ctx = tier2_ready_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let unscoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-wrangler",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "response: {unscoped:#}"
+    );
+    assert_eq!(
+        not_applicable_producers(&unscoped),
+        vec!["typescript".to_string()],
+        "response: {unscoped:#}"
+    );
+    assert!(
+        failed_producers(&unscoped).is_empty(),
+        "not applicable is not a failure: {unscoped:#}"
+    );
+    let text = unscoped["text"].as_str().expect("inspect text");
+    assert!(
+        text.contains("diagnostics: producer typescript not applicable (package.json found"),
+        "text: {text}"
+    );
+
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let scoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-rust-wrangler",
+            "command": "inspect",
+            "scope": "src/lib.rs",
+        }),
+    );
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::Rust],
+        "response: {scoped:#}"
+    );
+}
+
+/// Positive control for the two tests above: once the project has a
+/// TypeScript file, TypeScript is selected exactly as before, both for an
+/// unscoped inspect and for a scope naming that file.
+#[test]
+fn a_typescript_file_still_starts_typescript() {
+    let (_temp_dir, root) = wrangler_rust_fixture();
+    write_file(&root, "worker/index.ts", "export const answer = 42;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+
+    let scoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-scoped-typescript",
+            "command": "inspect",
+            "scope": "worker/index.ts",
+        }),
+    );
+    assert_eq!(
+        active_server_kinds(&ctx),
+        vec![ServerKind::TypeScript],
+        "response: {scoped:#}"
+    );
+
+    let ctx = tier2_ready_context(&root);
+    configure_fake_rust_and_typescript_lsp(&ctx);
+    let unscoped = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-typescript",
+            "command": "inspect",
+        }),
+    );
+    assert_eq!(unscoped["success"], true, "response: {unscoped:#}");
+    let mut kinds = active_server_kinds(&ctx);
+    kinds.sort_by(|left, right| left.id_str().cmp(right.id_str()));
+    assert_eq!(
+        kinds,
+        vec![ServerKind::Rust, ServerKind::TypeScript],
+        "response: {unscoped:#}"
+    );
+    assert!(
+        not_applicable_producers(&unscoped).is_empty(),
+        "response: {unscoped:#}"
+    );
 }
 
 /// A scoped call over a warm root returns only scope-matching findings, and
@@ -3206,8 +4136,8 @@ fn scoped_diagnostics_filter_warm_findings_to_the_scope() {
     );
     assert_eq!(scoped["success"], true, "inspect failed: {scoped:#}");
     assert!(
-        scoped.get("complete").is_none(),
-        "covered scope must be complete: {scoped:#}"
+        scoped["summary"]["diagnostics"].get("complete").is_none(),
+        "covered diagnostics must be complete even with Tier-2 gaps: {scoped:#}"
     );
     assert_eq!(scoped["summary"]["diagnostics"]["errors"], 1);
     assert_eq!(scoped["summary"]["diagnostics"]["warnings"], 1);
@@ -3287,7 +4217,7 @@ fn scoped_diagnostics_name_uncovered_files_instead_of_rendering_clean_empty() {
         summary.get("complete").and_then(Value::as_bool),
         Some(false)
     );
-    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
+    assert_eq!(summary.get("errors"), Some(&Value::Null));
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -3326,8 +4256,10 @@ fn scoped_diagnostics_name_uncovered_files_instead_of_rendering_clean_empty() {
 
     assert_eq!(mutated["success"], true, "inspect failed: {mutated:#}");
     assert!(
-        mutated.get("complete").is_none(),
-        "forced coverage must remove the gap: {mutated:#}"
+        mutated["gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.iter().all(|gap| gap["kind"] != "uncovered_file")),
+        "forced coverage must remove the diagnostics gap: {mutated:#}"
     );
     assert!(
         mutated["summary"]["diagnostics"].get("complete").is_none(),
@@ -3373,8 +4305,10 @@ fn scoped_diagnostics_render_clean_empty_for_covered_file_without_findings() {
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
     assert!(
-        response.get("complete").is_none(),
-        "covered clean scope must not be marked incomplete: {response:#}"
+        response["gaps"]
+            .as_array()
+            .is_none_or(|gaps| gaps.iter().all(|gap| gap["kind"] != "uncovered_file")),
+        "covered clean scope must not carry a diagnostics gap: {response:#}"
     );
     assert!(
         response["summary"]["diagnostics"].get("complete").is_none(),
@@ -3470,9 +4404,7 @@ fn blocking_inspect_waits_for_a_warming_producer_to_settle() {
     );
 }
 
-/// A producer that never settles is cut off by the shared request deadline.
-/// The terminal reserve keeps the PHASE-FAILED response inside the configured
-/// budget and attributes it to the unfinished quiescence phase.
+/// A producer that never settles leaves a named gap without hiding other categories.
 #[test]
 fn blocking_inspect_returns_before_the_configured_request_deadline() {
     let (_temp_dir, root) = fixture_project();
@@ -3498,10 +4430,15 @@ fn blocking_inspect_returns_before_the_configured_request_deadline() {
     ))
     .expect("inspect response serializes");
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["inspect_terminal"], "phase_failed");
-    assert_eq!(response["failure_reason"], "inspect_request_timeout");
-    assert_eq!(response["failed_phase"], "lsp_quiescence");
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["complete"], false);
+    assert!(response["text"]
+        .as_str()
+        .unwrap()
+        .contains("still indexing after"));
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "the terminal reserve must return well before the 10s request budget: {:?}",
@@ -3509,10 +4446,9 @@ fn blocking_inspect_returns_before_the_configured_request_deadline() {
     );
 }
 
-/// The deadline error text carries the configured millisecond budget end to
-/// end: user config, clamped deadline, blocking wait, terminal failure detail.
+/// A larger configured budget still bounds indexing and reports how to retry.
 #[test]
-fn blocking_inspect_deadline_error_names_the_configured_budget() {
+fn blocking_inspect_indexing_gap_names_elapsed_wait_and_retry() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -3533,22 +4469,22 @@ fn blocking_inspect_deadline_error_names_the_configured_budget() {
     ))
     .expect("inspect response serializes");
 
-    assert_eq!(response["success"], false, "response: {response:#}");
-    assert_eq!(response["failure_reason"], "inspect_request_timeout");
-    let detail = response["failure_detail"]
-        .as_str()
-        .unwrap_or_else(|| panic!("failure_detail missing: {response:#}"));
-    assert!(
-        detail.contains("12000ms"),
-        "the configured budget must reach the error text: {detail}"
-    );
+    assert_eq!(response["success"], true, "response: {response:#}");
+    let gap = response["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gap| gap["producer"] == "rust")
+        .unwrap();
+    let reason = gap["reason"].as_str().unwrap();
+    assert!(reason.contains("still indexing after"), "{reason}");
+    assert!(reason.contains("retry aft_inspect"), "{reason}");
 }
 
-/// A producer that declares quiescence without publishing any report is
-/// complete. The wait already treated that producer as settled; the freshness
-/// gate must use the same predicate rather than requiring a published report.
+/// This fake neither begins a compiler check nor publishes diagnostics.
+/// Quiescence alone is not evidence of a completed clean Rust check.
 #[test]
-fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
+fn blocking_inspect_names_a_quiescent_rust_producer_before_any_check_begins() {
     let (_temp_dir, root) = fixture_project();
     write_file(
         &root,
@@ -3578,13 +4514,22 @@ fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
     .expect("inspect response serializes");
 
     assert_eq!(response["success"], true, "response: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
+    // The request completed, but Rust diagnostics are unknown, so the terminal
+    // is partial (a completed result that names the unknown producer) rather
+    // than fresh.
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert!(
+        response["partial_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("rust")),
+        "{response:#}"
+    );
     let phases = response["wait_stamp"]["phases"]
         .as_array()
         .unwrap_or_else(|| panic!("wait_stamp.phases missing: {response:#}"));
     assert!(
         phases.iter().any(|phase| phase["id"] == "lsp_quiescence"),
-        "quiescence must complete before the fresh terminal: {response:#}"
+        "quiescence must complete before the completed terminal: {response:#}"
     );
     assert!(
         phases
@@ -3599,12 +4544,11 @@ fn blocking_inspect_is_fresh_when_producers_quiesce_without_reports() {
     let summary = response["summary"]["diagnostics"]
         .as_object()
         .expect("diagnostics summary");
-    assert_eq!(summary.get("errors").and_then(Value::as_u64), Some(0));
-    assert_eq!(summary.get("warnings").and_then(Value::as_u64), Some(0));
-    assert!(
-        !summary.contains_key("status"),
-        "settled empty diagnostics must be complete, not pending: {response:#}"
-    );
+    assert!(summary["errors"].is_null(), "{response:#}");
+    assert!(summary["warnings"].is_null(), "{response:#}");
+    assert_eq!(summary["complete"], false, "{response:#}");
+    assert_eq!(summary["gaps"][0]["producer"], "rust", "{response:#}");
+    assert!(summary["by_producer"]["rust"]["errors"].is_null());
 }
 
 #[test]
@@ -3752,7 +4696,7 @@ fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
     assert_eq!(response["summary"]["diagnostics"]["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -3789,7 +4733,7 @@ fn inspect_command_diagnostics_unsupported_file_is_not_returned_as_a_zero_result
     // never a confident zero result.
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -3864,7 +4808,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     // named coverage gap, never a confident zero result.
     assert_eq!(response["success"], true, "response: {response:#}");
     assert_eq!(response["complete"], false);
-    assert_eq!(response["summary"]["diagnostics"]["errors"], 0);
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
     let gap = response["gaps"]
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["kind"] == "uncovered_file"))
@@ -3910,6 +4854,176 @@ fn inspect_command_diagnostics_details_honor_top_k() {
 }
 
 #[test]
+fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"inspect-exit\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn rust_value() -> u8 { 1 }\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+
+    let mut lsp = ctx.lsp();
+    lsp.override_binary(ServerKind::Rust, fake_server_path());
+    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_CODE", "3");
+    // Many stderr lines: the inspect reason must quote the first one and
+    // stay short instead of inlining the whole tail.
+    let mut stderr = vec!["error: rust-analyzer could not load the workspace".to_string()];
+    stderr.extend((0..40).map(|index| format!("stderr filler line {index:02}")));
+    lsp.set_extra_env("AFT_FAKE_LSP_INIT_EXIT_STDERR", &stderr.join("|"));
+    drop(lsp);
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-producer-exit",
+            "command": "inspect",
+            "scope": "src/lib.rs",
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(!text.contains("0 errors"), "{text}");
+    assert!(text.contains("rust"), "{text}");
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    assert!(response["summary"]["diagnostics"]["warnings"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
+
+    let rust_gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
+        .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
+    let reason = rust_gap["reason"].as_str().expect("gap reason");
+    assert!(
+        reason.contains("server crashed during initialize (exit 3 after "),
+        "reason must name the exit code: {reason}"
+    );
+    assert!(
+        reason.contains("error: rust-analyzer could not load the workspace"),
+        "reason must quote the first stderr line: {reason}"
+    );
+    assert!(
+        !reason.contains("stderr filler line 39"),
+        "reason must not inline the whole stderr tail: {reason}"
+    );
+    assert!(
+        !reason.contains('\n') && reason.len() <= 600,
+        "reason must stay a bounded single line ({} bytes): {reason:?}",
+        reason.len()
+    );
+}
+
+#[test]
+fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
+    // A fresh worktree of a JavaScript project: package.json but no
+    // node_modules, so the TypeScript server binary cannot be resolved.
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "web/package.json", "{\"name\":\"rollup-web\"}\n");
+    // Keep package.json itself out of the scoped candidates: it is a JSON
+    // file with a producer of its own and would add a second cause.
+    write_file(&root, ".aftignore", "package.json\n");
+    for index in 0..7 {
+        write_file(
+            &root,
+            &format!("web/src/file_{index}.ts"),
+            &format!("export const value{index} = {index};\n"),
+        );
+    }
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    {
+        let mut lsp = ctx.lsp();
+        lsp.override_binary(
+            ServerKind::TypeScript,
+            PathBuf::from("/definitely/missing/typescript-language-server"),
+        );
+        // Keep the other JavaScript-family servers out of the picture so the
+        // test does not depend on what is installed on this machine.
+        lsp.override_binary(
+            ServerKind::Biome,
+            PathBuf::from("/definitely/missing/biome"),
+        );
+    }
+
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-uncovered-rollup",
+            "command": "inspect",
+            "scope": "web",
+            "topK": 3,
+        })),
+        &ctx,
+    ))
+    .expect("inspect response serializes");
+
+    assert_eq!(response["success"], true, "inspect failed: {response:#}");
+    assert_eq!(response["complete"], false);
+    let text = response["text"].as_str().expect("rendered text");
+    let group_lines = text
+        .lines()
+        .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+        .collect::<Vec<_>>();
+    assert_eq!(group_lines.len(), 1, "one line per cause: {text}");
+    assert!(
+        group_lines[0].starts_with(
+            "Incomplete diagnostics: no authoritative diagnostics for 7 files (typescript in web: "
+        ),
+        "{text}"
+    );
+    // The remedy is printed once, on the TypeScript producer's failure line;
+    // the group line names that producer instead of repeating the reason.
+    let remedy = "no node_modules in web: the project's dependencies are not installed; \
+                  run your package manager's install";
+    assert_eq!(
+        text.matches(remedy).count(),
+        1,
+        "the cause must name the install remedy exactly once: {text}"
+    );
+    assert!(
+        text.lines().any(|line| line
+            .starts_with("Incomplete diagnostics: producer typescript @ web failed (")
+            && line.contains(remedy)),
+        "the producer line must carry the install remedy: {text}"
+    );
+    assert!(
+        group_lines[0].ends_with("(typescript in web: producer typescript failed, reason above)"),
+        "{text}"
+    );
+    let listed = text
+        .lines()
+        .filter(|line| line.starts_with("  web/src/file_") && line.ends_with(".ts"))
+        .count();
+    assert_eq!(listed, 3, "at most topK paths: {text}");
+    assert!(
+        text.contains("shown 3 of 7 items (cap) · narrow: topK, scope, sections"),
+        "{text}"
+    );
+
+    // Every file keeps its structured gap row for machine consumers.
+    let uncovered = response["gaps"]
+        .as_array()
+        .expect("gaps")
+        .iter()
+        .filter(|gap| gap["kind"] == "uncovered_file")
+        .collect::<Vec<_>>();
+    assert_eq!(uncovered.len(), 7, "{response:#}");
+    assert!(uncovered
+        .iter()
+        .all(|gap| gap["cause"]["producer"] == "typescript" && gap["cause"]["root"] == "web"));
+}
+
+#[test]
 fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     let (_temp_dir, root) = fixture_project();
     write_file(
@@ -3943,9 +5057,9 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     lsp.set_extra_env("AFT_FAKE_LSP_INIT_CRASH_ROOT_URI", &rust_root_uri);
     drop(lsp);
 
-    // The blocking tool call reads the warm working set instead of pulling
-    // per-file, so the TypeScript findings must be warmed through the normal
-    // edit path before the inspection runs.
+    // A blocking scoped inspect reads the live report of a document that is
+    // already open instead of asking the server again, so the TypeScript
+    // findings warmed through the normal edit path are the ones it reports.
     let app_ts = root.join("web/src/app.ts");
     open_with_lsp(
         &ctx,
@@ -3953,20 +5067,30 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         "export function tsValue(): number { return 1; }\n",
     );
 
+    let before_failure = ctx.status_bar_count_values();
+    assert!(before_failure.errors.is_some_and(|errors| errors > 0));
+
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-producer-gap",
             "command": "inspect",
+            "scope": ["src/lib.rs", "web/src/app.ts"],
         })),
         &ctx,
     ))
     .expect("inspect response serializes");
 
     assert_eq!(response["success"], true, "inspect failed: {response:#}");
-    assert_eq!(response["inspect_terminal"], "fresh");
+    // The Rust producer failed, so the completed result is partial and its
+    // reason names rust.
+    assert_eq!(response["inspect_terminal"], "partial");
+    assert_eq!(
+        response["partial_reason"], "diagnostics unknown for rust",
+        "{response:#}"
+    );
     assert_eq!(response["complete"], false);
     assert!(
-        response["summary"]["diagnostics"]["errors"]
+        response["summary"]["diagnostics"]["by_producer"]["typescript"]["errors"]
             .as_u64()
             .is_some_and(|errors| errors > 0),
         "the working TypeScript producer's diagnostics should survive: {response:#}"
@@ -3975,6 +5099,15 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         .as_array()
         .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
         .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(!text.contains("diagnostics: 0 errors"), "{text}");
+    assert!(text.contains("from typescript"), "{text}");
+    assert!(text.contains("test diagnostic error"), "{text}");
+    assert!(text.contains("rust"), "{text}");
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    let counts = ctx.status_bar_count_values();
+    assert_eq!((counts.errors, counts.warnings), (None, None));
     assert_eq!(rust_gap["kind"], "failed_producer");
     assert_eq!(rust_gap["categories"], json!(["diagnostics"]));
     assert!(
@@ -3983,4 +5116,885 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
             .is_some_and(|reason| !reason.is_empty()),
         "failed producer reason missing: {response:#}"
     );
+}
+
+#[test]
+fn scoped_rust_inspect_preserves_stale_cargo_lock() {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        eprintln!("SKIP scoped_rust_inspect_preserves_stale_cargo_lock: rust-analyzer is not installed (or rustup component unavailable)");
+        return;
+    }
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlocal-dep = { path = \"dep\" }\n");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub fn value() -> u8 { local_dep::value() }\n",
+    );
+    let manifest = write_file(
+        &root,
+        "dep/Cargo.toml",
+        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "dep/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    let before = fs::read(root.join("Cargo.lock")).unwrap();
+    fs::write(
+        manifest,
+        "[package]\nname = \"local-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-stale-lock",
+            "command": "inspect",
+            "scope": "src",
+            "sections": ["diagnostics"],
+        })),
+        &ctx,
+    ))
+    .unwrap();
+    assert_eq!(
+        fs::read(root.join("Cargo.lock")).unwrap(),
+        before,
+        "Rust-scoped inspect rewrote the stale Cargo.lock"
+    );
+    assert_eq!(ctx.lsp().active_server_keys().len(), 1, "{response:#}");
+    assert_eq!(response["complete"], false, "{response:#}");
+    let gap = response["gaps"]
+        .as_array()
+        .and_then(|gaps| {
+            gaps.iter()
+                .find(|gap| gap["kind"] == "failed_producer" && gap["producer"] == "rust")
+        })
+        .unwrap_or_else(|| panic!("missing rust-analyzer failure: {response:#}"));
+    assert!(
+        gap["reason"].as_str().unwrap().contains("--locked"),
+        "metadata failure must explain why diagnostics are unavailable: {response:#}"
+    );
+}
+
+/// A rust-analyzer run with `--locked` over a stale Cargo.lock reports a
+/// failed workspace load and keeps it: it re-reads the lockfile only when the
+/// client reports a change or asks for a reload. After the lockfile is fixed
+/// outside AFT (as `cargo update` in a shell does), the next scoped inspect
+/// must make the server reload and report the new load, not the old failure.
+/// The fake server reads Cargo.lock only when it loads the workspace, which is
+/// exactly the behavior that made the failure stick.
+#[test]
+fn scoped_rust_inspect_recovers_after_a_stale_cargo_lock_is_fixed() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"lock-recovery\"\nversion = \"0.1.0\"\n",
+    );
+    write_file(&root, "Cargo.lock", "# stale lockfile\n");
+    write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "cargo_lock");
+
+    let stale = scoped_diagnostics_inspect(&ctx, "inspect-lock-stale", "src/main.rs");
+    assert_eq!(failed_producers(&stale), vec!["rust"], "{stale:#}");
+    let text = stale["text"].as_str().expect("rendered text");
+    assert_eq!(
+        text.matches("--locked was passed").count(),
+        1,
+        "the producer failure must be printed once: {text}"
+    );
+
+    // Modification times must land after the server's load for the change to
+    // count; a short pause keeps coarse file-system clocks from tying.
+    thread::sleep(Duration::from_millis(50));
+    fs::write(root.join("Cargo.lock"), "# fixed lockfile\n").unwrap();
+
+    let fixed = scoped_diagnostics_inspect(&ctx, "inspect-lock-fixed", "src/main.rs");
+    assert!(
+        failed_producers(&fixed).is_empty(),
+        "the fixed lockfile must not keep reporting the old failure: {fixed:#}"
+    );
+    assert!(uncovered_files(&fixed).is_empty(), "{fixed:#}");
+    assert_eq!(fixed["summary"]["diagnostics"]["errors"], 1, "{fixed:#}");
+    assert!(
+        diagnostic_messages_for(&fixed, "src/main.rs")
+            .iter()
+            .any(|message| message.contains("test diagnostic error")),
+        "{fixed:#}"
+    );
+}
+
+/// The same sequence against a real rust-analyzer: a scoped inspect over a
+/// workspace whose Cargo.lock is stale for `--locked` fails, and after
+/// `cargo update` fixes the lockfile the next scoped inspect reports the new
+/// load instead of the old `cargo metadata` error.
+#[test]
+fn scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer() {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        eprintln!("SKIP scoped_rust_inspect_recovers_after_cargo_update_with_real_rust_analyzer: rust-analyzer is not installed (or rustup component unavailable)");
+        return;
+    }
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"lock-reader\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlocal-dep = { path = \"dep\" }\n");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub fn value() -> u8 { local_dep::value() }\n",
+    );
+    let manifest = write_file(
+        &root,
+        "dep/Cargo.toml",
+        "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "dep/src/lib.rs", "pub fn value() -> u8 { 1 }\n");
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    // A sibling crate moves its version: the lockfile is now stale.
+    fs::write(
+        manifest,
+        "[package]\nname = \"local-dep\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let ctx = configured_context(&root);
+
+    let stale = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-stale", "src/lib.rs");
+    assert!(
+        failed_producers(&stale).contains(&"rust".to_string()),
+        "{stale:#}"
+    );
+    // rust-analyzer re-fetches its workspace once on its own shortly after
+    // startup; fix the lockfile only after that, so recovery cannot come
+    // from that startup fetch.
+    thread::sleep(Duration::from_secs(3));
+    let updated = std::process::Command::new("cargo")
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("run cargo update");
+    assert!(updated.status.success(), "{updated:?}");
+
+    let fixed = scoped_diagnostics_inspect(&ctx, "inspect-real-lock-fixed", "src/lib.rs");
+    assert!(
+        failed_producers(&fixed).is_empty(),
+        "the fixed lockfile must not keep reporting the old failure: {fixed:#}"
+    );
+    assert!(
+        !fixed["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--locked was passed"),
+        "{fixed:#}"
+    );
+}
+
+/// A crate whose `src/user.rs` builds `S { a, b }` from `src/s.rs`. Returns
+/// the root and the path of `src/s.rs`.
+fn field_removal_crate() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let (temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub mod s;\npub mod user;\n");
+    let s = write_file(
+        &root,
+        "src/s.rs",
+        "pub struct S {\n    pub a: u8,\n    pub b: u8,\n}\n",
+    );
+    write_file(
+        &root,
+        "src/user.rs",
+        "use crate::s::S;\n\npub fn make() -> S {\n    S { a: 1, b: 2 }\n}\n",
+    );
+    // AFT runs rust-analyzer with `--locked`, which needs a lockfile.
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&root)
+        .output()
+        .expect("cargo is required for Rust integration tests");
+    assert!(generated.status.success(), "{generated:?}");
+    (temp_dir, root, s)
+}
+
+/// `(source, message)` of every diagnostic inspect reported for `file`.
+fn diagnostic_sources_for(response: &Value, file: &str) -> Vec<(String, String)> {
+    response["details"]["diagnostics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["file"] == file)
+        .map(|item| {
+            (
+                item["source"].as_str().unwrap_or_default().to_string(),
+                item["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// After `b` was removed from `S`, `src/user.rs` no longer compiles. A
+/// scoped inspect of it must say so, from the compiler (`cargo check`,
+/// source `rustc`) and from rust-analyzer's own analysis, or name the
+/// unfinished check. A clean answer is the stale result this guards against.
+fn assert_removed_field_reported(response: &Value) {
+    let text = response["text"].as_str().expect("rendered text");
+    let still_checking = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(response["complete"], false, "{response:#}");
+        assert!(
+            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            "{text}"
+        );
+        return;
+    }
+    let reported = diagnostic_sources_for(response, "src/user.rs");
+    assert!(
+        reported
+            .iter()
+            .any(|(source, message)| source == "rustc" && message.contains("no field named `b`")),
+        "cargo check's error for the removed field is missing: {text}\n{response:#}"
+    );
+    assert!(
+        reported
+            .iter()
+            .any(|(source, message)| source == "rust-analyzer" && message.contains("no such field")),
+        "rust-analyzer's own error for the removed field is missing: {text}\n{response:#}"
+    );
+    assert!(!text.contains("diagnostics: 0 errors"), "{text}");
+}
+
+/// An agent edits a use site (which leaves it open in rust-analyzer), then
+/// removes a struct field with an AFT edit. rust-analyzer re-runs `cargo
+/// check` only when told of a save, and analyzes an open document only when
+/// asked for its diagnostics. Unless AFT sends the save and asks again, the
+/// next inspect certifies the use site from diagnostics made before the
+/// removal.
+#[test]
+fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, s) = field_removal_crate();
+    let ctx = configured_context(&root);
+    let warm = scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src");
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+
+    let user_edit = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "field-removal-edit-user",
+            "command": "edit_match",
+            "file": root.join("src/user.rs").display().to_string(),
+            "match": "use crate::s::S;\n",
+            "replacement": "use crate::s::S;\n// builds S\n",
+        })),
+        &ctx,
+    );
+    assert!(user_edit.success, "{user_edit:?}");
+    let before = scoped_diagnostics_inspect(&ctx, "field-removal-before", "src/user.rs");
+    assert_eq!(
+        before["summary"]["diagnostics"]["errors"], 0,
+        "control: the use site compiles before the removal: {before:#}"
+    );
+
+    let removal = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "field-removal-edit",
+            "command": "edit_match",
+            "file": s.display().to_string(),
+            "match": "    pub b: u8,\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(removal.success, "{removal:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "field-removal-after", "src/user.rs");
+    assert_removed_field_reported(&after);
+}
+
+/// The same removal made by another program (a plain file write the project
+/// watcher reports): rust-analyzer hears of it only as a watched-file change,
+/// which does not start `cargo check`, so AFT sends rust-analyzer a save
+/// notification for the changed file to start one.
+#[test]
+fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, s) = field_removal_crate();
+    let ctx = configured_context(&root);
+    let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+    // Only the use site is examined first, so AFT has no diagnostics for
+    // `src/s.rs`. Its change then reaches rust-analyzer only through the
+    // watcher path, not through the resync AFT does for files it has
+    // diagnostics for.
+    let warm = scoped_diagnostics_inspect(&ctx, "outside-removal-warm", "src/user.rs");
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+
+    fs::write(&s, "pub struct S {\n    pub a: u8,\n}\n").unwrap();
+    // Feed the event the project file watcher would report for the write.
+    watcher_tx
+        .send(aft::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            s.clone()
+        ]))
+        .expect("send watcher event");
+    aft::runtime_drain::drain_watcher_events(&ctx);
+
+    let after = scoped_diagnostics_inspect(&ctx, "outside-removal-after", "src/user.rs");
+    assert_removed_field_reported(&after);
+}
+
+/// The opposite direction: a compiler error present when rust-analyzer
+/// starts (its first `cargo check` reports it) is then fixed with an AFT
+/// edit. `use of moved value` comes only from the compiler, never from
+/// rust-analyzer's own analysis, so only a new check can clear it. Until
+/// one ran, inspect certified the fixed file with the old error.
+#[test]
+fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _s) = field_removal_crate();
+    let broken = "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v, v)\n}\n";
+    let fixed = "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v.clone(), v)\n}\n";
+    let moves = write_file(&root, "src/moves.rs", broken);
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub mod moves;\npub mod s;\npub mod user;\n",
+    );
+    let ctx = configured_context(&root);
+    let moved_value = |response: &Value| {
+        diagnostic_sources_for(response, "src/moves.rs")
+            .iter()
+            .any(|(_, message)| message.contains("moved value"))
+    };
+    let before = scoped_diagnostics_inspect(&ctx, "fixed-error-before", "src");
+    assert!(
+        moved_value(&before),
+        "control: the first check reports the error: {before:#}"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "fixed-error-edit",
+            "command": "edit_match",
+            "file": moves.display().to_string(),
+            "match": broken,
+            "replacement": fixed,
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+    let after = scoped_diagnostics_inspect(&ctx, "fixed-error-after", "src/moves.rs");
+    let text = after["text"].as_str().expect("rendered text");
+    let still_checking = after["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(after["complete"], false, "{after:#}");
+        return;
+    }
+    assert!(
+        !moved_value(&after),
+        "the fixed error is still reported: {text}\n{after:#}"
+    );
+    assert!(
+        text.contains("diagnostics: 0 errors"),
+        "the fixed file must be reported clean: {text}"
+    );
+}
+
+/// Whether a scoped inspect reported rust-analyzer's `cargo check` as still
+/// running instead of certifying the files. Then the answer must be marked
+/// incomplete and say that diagnostics are unknown.
+fn reported_check_still_running(response: &Value) -> bool {
+    let still_checking = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|gap| gap["kind"] == "checking_producer");
+    if still_checking {
+        assert_eq!(response["complete"], false, "{response:#}");
+        let text = response["text"].as_str().expect("rendered text");
+        assert!(
+            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            "{text}"
+        );
+    }
+    still_checking
+}
+
+/// rust-analyzer starts its first `cargo check` just after it reports
+/// quiescence, but a server short of CPU (several of them sharing a CI
+/// runner) can announce that check seconds later. A relay in front of the
+/// real server holds the first check's announcement, and every diagnostics
+/// report, back for three seconds while requests are still answered. The
+/// compiler error (`use of moved value` comes only from the compiler) must be
+/// reported, or the check named as still running; certifying the file from
+/// rust-analyzer's own analysis alone is the stale answer this guards against.
+#[test]
+fn scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _s) = field_removal_crate();
+    write_file(
+        &root,
+        "src/moves.rs",
+        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) {\n    (v, v)\n}\n",
+    );
+    write_file(
+        &root,
+        "src/lib.rs",
+        "pub mod moves;\npub mod s;\npub mod user;\n",
+    );
+    let ctx = configured_context(&root);
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "3000");
+
+    let response = scoped_diagnostics_inspect(&ctx, "late-first-check", "src");
+    if reported_check_still_running(&response) {
+        return;
+    }
+    assert!(
+        diagnostic_sources_for(&response, "src/moves.rs")
+            .iter()
+            .any(|(_, message)| message.contains("moved value")),
+        "the compiler error of the late check is missing: {response:#}"
+    );
+}
+
+/// The same late start against the fake, which emulates rust-analyzer's
+/// check on save: it begins its first check three seconds after reporting
+/// quiescence, longer than inspect used to wait for one, and the check finds
+/// a compiler error. The inspect must wait for it and report the error.
+///
+/// These fake-check tests give inspect a 40 s budget: the scoped sweep gets
+/// about half of it, which must outlast the waits they exercise (up to the
+/// ten seconds rust-analyzer gets to begin its first check).
+#[test]
+fn scoped_rust_inspect_waits_for_a_first_cargo_check_that_begins_late() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("late-first-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
+
+    let response = scoped_diagnostics_inspect(&ctx, "late-first-check", "src/lib.rs");
+
+    assert!(
+        !reported_check_still_running(&response),
+        "the check begins well within the budget: {response:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&response, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the compiler error of the late check is missing: {response:#}"
+    );
+}
+
+/// A save whose check never begins (the fake drops checks asked for by a
+/// save) leaves the published compiler results describing the file before
+/// the edit. Once inspect stops waiting for that check it must say the
+/// diagnostics are unknown, not certify the old results.
+#[test]
+fn scoped_rust_inspect_never_certifies_a_save_that_started_no_check() {
+    let (_temp_dir, root, lib) = single_crate_fixture("save-without-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
+
+    let before = scoped_diagnostics_inspect(&ctx, "save-without-check-before", "src/lib.rs");
+    assert!(!reported_check_still_running(&before), "{before:#}");
+    assert!(
+        diagnostic_messages_for(&before, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "control: the first check reports the error: {before:#}"
+    );
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "save-without-check-fix",
+            "command": "edit_match",
+            "file": lib.display().to_string(),
+            "match": "// fake_compile_error\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+
+    let after = scoped_diagnostics_inspect(&ctx, "save-without-check-after", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&after),
+        "no check ran after the save, so the result must be unknown: {after:#}"
+    );
+}
+
+/// rust-analyzer's events wait in AFT's queue until a request drains them. A
+/// check that began before an edit's save, for the files before the edit, can
+/// therefore be drained only after the save was sent; it must not count as
+/// the save's check. Here the fake's first check runs (and finds the error)
+/// while nothing drains its events, the error is then fixed by an edit whose
+/// save starts no check, and inspect must report the result as unknown
+/// instead of certifying the old check.
+#[test]
+fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_save() {
+    let (_temp_dir, root, lib) = single_crate_fixture("check-before-save");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1000");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
+
+    // Start the server without waiting for its first check, then give that
+    // check time to run while nothing drains the server's events.
+    let config = ctx.config().clone();
+    let started = ctx.lsp().ensure_server_for_file(&lib, &config);
+    assert!(!started.is_empty(), "the fake rust server must start");
+    thread::sleep(Duration::from_secs(3));
+
+    let fix = aft::commands::edit_match::handle_edit_match(
+        &request(json!({
+            "id": "check-before-save-fix",
+            "command": "edit_match",
+            "file": lib.display().to_string(),
+            "match": "// fake_compile_error\n",
+            "replacement": "",
+        })),
+        &ctx,
+    );
+    assert!(fix.success, "{fix:?}");
+
+    let after = scoped_diagnostics_inspect(&ctx, "check-before-save-after", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&after),
+        "only a check announced before the save ran, so the result must be unknown: {after:#}"
+    );
+}
+
+/// rust-analyzer owes a check of the whole workspace once it is quiescent.
+/// When that check never begins (the fake drops it), inspect stops waiting
+/// at a deadline and reports the diagnostics as unknown instead of hanging
+/// or certifying them. The next inspect asks for the check again
+/// (`rust-analyzer/runFlycheck`), which the fake runs, and reports its
+/// compiler error.
+#[test]
+fn scoped_rust_inspect_reports_an_unstarted_first_check_as_unknown_then_asks_again() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("first-check-dropped");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context_with_diagnostics_timeout(&root, 40_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "0");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "load");
+
+    let first = scoped_diagnostics_inspect(&ctx, "first-check-dropped", "src/lib.rs");
+    assert!(
+        reported_check_still_running(&first),
+        "no check has run, so the result must be unknown: {first:#}"
+    );
+
+    let retried = scoped_diagnostics_inspect(&ctx, "first-check-retried", "src/lib.rs");
+    assert!(!reported_check_still_running(&retried), "{retried:#}");
+    assert!(
+        diagnostic_messages_for(&retried, "src/lib.rs")
+            .iter()
+            .any(|message| message == "fake compile error"),
+        "the check asked for again reports the error: {retried:#}"
+    );
+}
+
+/// An unscoped inspect makes a whole-project claim, so it too must wait for
+/// rust-analyzer's `cargo check`. The fake's check never finishes: the
+/// answer names the running check instead of certifying the published
+/// reports, and does not call the producer failed.
+#[test]
+fn unscoped_inspect_names_an_unfinished_cargo_check() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-flycheck-slow");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
+    // Hold begin after the already-flushed quiescent status to expose the
+    // idle Current observation without relying on machine contention.
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_FLYCHECK_BEGIN_DELAY_MS", "500");
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-unscoped-flycheck-slow",
+            "command": "inspect",
+            "sections": "diagnostics",
+        }),
+    );
+
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    let gaps: Vec<&Value> = response["gaps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|gap| gap["producer"] == "rust")
+        .collect();
+    assert_eq!(gaps.len(), 1, "response: {response:#}");
+    assert_eq!(gaps[0]["kind"], "checking_producer", "{response:#}");
+    assert!(
+        response["summary"]["diagnostics"]["errors"].is_null(),
+        "{response:#}"
+    );
+    let text = response["text"].as_str().expect("rendered text");
+    assert!(
+        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry)"),
+        "{text}"
+    );
+    assert!(!text.contains("producer rust failed"), "{text}");
+    assert!(!text.contains("unknown producer"), "{text}");
+    assert!(response["summary"]["diagnostics"]["by_producer"]
+        .as_object()
+        .expect("producer counts")
+        .contains_key("rust"));
+}
+
+/// With no opened files, a clean compiler check may publish no reports.
+/// Its matching check-begin and check-end events still certify zero crate errors.
+#[test]
+fn unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "unscoped_rust_inspect_certifies_a_clean_check_without_reports_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-real-clean");
+    generate_fixture_lockfile(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "unscoped-real-clean", "command": "inspect", "sections": "diagnostics"
+        }),
+    );
+    eprintln!("real Rust clean unscoped: {response:#}");
+    assert!(
+        !ctx.lsp().has_any_diagnostic_reports(),
+        "the clean zero-report authority path must execute"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["by_producer"]["rust"]["errors"], 0,
+        "{response:#}"
+    );
+    assert_ne!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    assert_ne!(response["complete"], false, "{response:#}");
+}
+
+/// Unscoped inspect must collect a compiler error without relying on didOpen
+/// diagnostics for the broken source file.
+#[test]
+fn unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let (_temp_dir, root, lib) = single_crate_fixture("unscoped-real-error");
+    fs::write(
+        &lib,
+        "pub fn twice(v: Vec<u8>) -> (Vec<u8>, Vec<u8>) { (v, v) }\n",
+    )
+    .unwrap();
+    generate_fixture_lockfile(&root);
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    tier2_run(
+        &ctx,
+        &["dead_code", "unused_exports", "duplicates", "cycles"],
+    );
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "unscoped-real-error", "command": "inspect", "sections": "diagnostics"
+        }),
+    );
+    eprintln!("real Rust compile error unscoped: {response:#}");
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert!(
+        diagnostic_sources_for(&response, "src/lib.rs")
+            .iter()
+            .any(|(source, message)| source == "rustc" && message.contains("moved value")),
+        "{response:#}"
+    );
+}
+
+fn generate_fixture_lockfile(root: &Path) {
+    let generated = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root)
+        .output()
+        .expect("cargo is required for real Rust fixtures");
+    assert!(generated.status.success(), "{generated:?}");
+}
+
+#[test]
+fn rust_analyzer_warning_keeps_diagnostics_and_reports_note() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-warning\"\n");
+    let file = write_file(&root, "src/main.rs", "fn main() {}\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "warning");
+    open_with_lsp(&ctx, &file, "fn main() {}\n");
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-analyzer-warning",
+            "command": "inspect",
+            "scope": "src/main.rs",
+            "sections": ["diagnostics"],
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    // Scoped inspects report Tier-2 categories as not computed, so only the
+    // diagnostics category is expected to be complete here.
+    assert!(
+        response["summary"]["diagnostics"].get("complete").is_none(),
+        "a rust-analyzer warning must not make diagnostics incomplete: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["summary"]["diagnostics"]["warnings"], 1,
+        "{response:#}"
+    );
+    assert_eq!(
+        response["details"]["diagnostics"].as_array().unwrap().len(),
+        2,
+        "{response:#}"
+    );
+    let note = "rust-analyzer warning: proc-macro server failed to start";
+    assert_eq!(
+        response["summary"]["diagnostics"]["notes"],
+        json!([note]),
+        "{response:#}"
+    );
+    assert!(
+        response["text"].as_str().unwrap().contains(note),
+        "{response:#}"
+    );
+}
+
+#[test]
+fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"partial-diag\"\n");
+    let file = write_file(&root, "src/main.rs", "// TODO: finish\nfn main() {}\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    open_with_server_status_mode(&ctx, &file, "1");
+    wait_for_lsp_report_state(&ctx, &file, true);
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({
+            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs"
+        })),
+        &ctx,
+    ))
+    .unwrap();
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], false);
+    // The TODO scan shares the remaining budget. On a slow runner (Windows CI)
+    // it can run out too, which must surface as a named gap rather than a
+    // silent zero; either outcome is honest.
+    let todos = &response["summary"]["todos"];
+    let todos_counted = todos["count"].as_u64().is_some_and(|n| n > 0);
+    let todos_gap_named = todos["gaps"]
+        .as_array()
+        .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "analysis_incomplete"));
+    assert!(todos_counted || todos_gap_named, "{response:#}");
+    let details = response["details"]["diagnostics"].as_array().unwrap();
+    assert!(
+        details.iter().any(|item| item["complete"] == false
+            && item["message"]
+                .as_str()
+                .unwrap()
+                .contains("analyzer warming")),
+        "{response:#}"
+    );
+    assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    assert_eq!(ctx.status_bar_count_values().errors, None);
 }

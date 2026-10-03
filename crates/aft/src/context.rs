@@ -46,6 +46,107 @@ pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
+/// `view_disk_limits_next_ms` while views are disabled: never due.
+const VIEW_DISK_LIMITS_OFF: u64 = u64::MAX;
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+thread_local! {
+    /// Config snapshots pinned by the requests running on this thread, keyed
+    /// by the address of the `AppContext` they belong to.
+    static CONFIG_PINS: std::cell::RefCell<Vec<(usize, Arc<Config>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    static CHECKOUT_QUERY_OUTCOMES: std::cell::RefCell<Vec<(usize, Option<crate::views::contracts::WaitOutcome>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Set while this thread runs a closure under the configuration write
+    /// lock (`update_config`). Reading the configuration there would wait on
+    /// that same lock forever, so the read path panics instead.
+    static CONFIG_WRITE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the configuration write lock as held by this thread until dropped,
+/// including when the closure panics.
+struct ConfigWriteLockHeld {
+    previous: bool,
+}
+
+impl ConfigWriteLockHeld {
+    fn enter() -> Self {
+        Self {
+            previous: CONFIG_WRITE_LOCK_HELD.with(|held| held.replace(true)),
+        }
+    }
+}
+
+impl Drop for ConfigWriteLockHeld {
+    fn drop(&mut self) {
+        CONFIG_WRITE_LOCK_HELD.with(|held| held.set(self.previous));
+    }
+}
+
+fn assert_config_write_lock_not_held() {
+    if CONFIG_WRITE_LOCK_HELD.with(std::cell::Cell::get) {
+        panic!(
+            "config read inside update_config closure would deadlock: the closure \
+             receives the configuration as `&mut Config` and must not call \
+             `ctx.config()`, publish the configuration, or call anything that does"
+        );
+    }
+}
+
+fn pinned_config_for(key: usize) -> Option<Arc<Config>> {
+    CONFIG_PINS.with(|pins| {
+        pins.borrow()
+            .iter()
+            .find(|(pinned_key, _)| *pinned_key == key)
+            .map(|(_, config)| Arc::clone(config))
+    })
+}
+
+fn replace_pinned_config(key: usize, config: &Arc<Config>) {
+    CONFIG_PINS.with(|pins| {
+        if let Some(slot) = pins
+            .borrow_mut()
+            .iter_mut()
+            .find(|(pinned_key, _)| *pinned_key == key)
+        {
+            slot.1 = Arc::clone(config);
+        }
+    });
+}
+
+/// Releases a request's config pin; see [`AppContext::pin_config`].
+pub struct ConfigPinGuard {
+    key: Option<usize>,
+    // The pin lives in a thread-local, so the guard must drop on this thread.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ConfigPinGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+                outcomes
+                    .borrow_mut()
+                    .retain(|(pinned_key, _)| *pinned_key != key)
+            });
+            CONFIG_PINS.with(|pins| {
+                pins.borrow_mut()
+                    .retain(|(pinned_key, _)| *pinned_key != key)
+            });
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -191,7 +292,7 @@ pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120
 /// Serializes the daemon's bound/unbound transition with admission of deferred
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SubcLifecycleAdmission {
     unbound: Arc<parking_lot::Mutex<bool>>,
     /// When the current unbound period started; `None` while bound. Written
@@ -243,6 +344,26 @@ impl SubcLifecycleAdmission {
         self.unbound_since
             .lock()
             .is_some_and(|since| since.elapsed() >= grace)
+    }
+
+    /// Serialize cancellation with rebind: a root rebound before this decision
+    /// cannot have its still-running work cancelled by a stale grace check.
+    pub(crate) fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
+        // A checkpoint may be inside a lifecycle admission closure that already
+        // owns this lock. Defer that checkpoint instead of recursively locking;
+        // the next batch/parser poll makes the synchronized decision.
+        let Some(unbound) = self.unbound.try_lock() else {
+            return;
+        };
+        let grace = Duration::from_millis(self.abandon_grace_ms.load(Ordering::SeqCst));
+        if *unbound
+            && self
+                .unbound_since
+                .lock()
+                .is_some_and(|since| since.elapsed() >= grace)
+        {
+            cancel();
+        }
     }
 
     #[cfg(test)]
@@ -1177,6 +1298,10 @@ pub(crate) enum ArtifactEvictionBlocker {
     /// The resident search index holds edits that were never written to
     /// `cache.bin`.
     SearchDeltaUnpersisted,
+    /// A lock the check reads was held by another thread, so the answer is
+    /// not available without waiting. Only the non-blocking check used on the
+    /// subc frame loop reports this; the reaper retries on its next sweep.
+    LockContended,
 }
 
 impl ArtifactEvictionBlocker {
@@ -1426,6 +1551,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) home_match: bool,
     pub(crate) format_tool_cache_clear_needed: bool,
     pub(crate) run_bash_replay: bool,
+    pub(crate) configure_database_runtime: bool,
     pub(crate) refresh_project_runtime: bool,
     pub(crate) sync_bash_compress_flag: bool,
     pub(crate) reset_filter_registry: bool,
@@ -2305,8 +2431,11 @@ impl App {
                 Some((cache_root, context))
             })
             .find_map(|(cache_root, context)| {
-                if context.cached_artifact_cache_key(&cache_root).as_deref()
-                    != Some(artifact_cache_key)
+                // Only the artifact writer may donate a snapshot. Another
+                // checkout's RAM delta describes that checkout, not this one.
+                if context.shared_artifacts_read_only()
+                    || context.cached_artifact_cache_key(&cache_root).as_deref()
+                        != Some(artifact_cache_key)
                     || !matches!(
                         &*context
                             .semantic_index_status()
@@ -2334,6 +2463,14 @@ impl App {
         &self,
         path: &Path,
     ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
+        self.open_db_with_mode(path, crate::db::OpenMode::Deferred)
+    }
+
+    pub(crate) fn open_db_with_mode(
+        &self,
+        path: &Path,
+        mode: crate::db::OpenMode,
+    ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
         let mut slot = self.db.lock();
         if let Some((existing_path, conn)) = slot.as_ref() {
@@ -2342,7 +2479,7 @@ impl App {
             }
         }
 
-        let conn = Arc::new(Mutex::new(crate::db::open(path)?));
+        let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         *slot = Some((key, Arc::clone(&conn)));
         Ok(conn)
     }
@@ -2372,6 +2509,15 @@ impl App {
         self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
     }
 
+    /// [`Self::db`] without waiting for the handle slot: the outer `None`
+    /// means another thread holds it right now. The subc frame loop's
+    /// maintenance sweep uses this and skips its database chores for the tick.
+    pub fn try_db(&self) -> Option<Option<Arc<Mutex<TrackedConnection>>>> {
+        self.db
+            .try_lock()
+            .map(|slot| slot.as_ref().map(|(_, conn)| Arc::clone(conn)))
+    }
+
     /// The resident handle only when it was opened for `path`. Callers that must
     /// not open a second connection to a file this process already holds use
     /// this to tell "holding it" from "holding some other database".
@@ -2388,6 +2534,7 @@ impl App {
         self.active_watchers.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     pub(crate) fn watcher_stopped(&self) {
         self.active_watchers
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -2406,6 +2553,7 @@ impl App {
         self.active_actor_roots.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
     pub(crate) fn actor_root_unregistered(&self) {
         self.active_actor_roots
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
@@ -2472,9 +2620,35 @@ struct BorrowedIndexCacheKey {
     artifact: crate::readonly_artifacts::BorrowedArtifactGeneration,
 }
 
+type BorrowedSearchResult = crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>;
+
+#[derive(Debug, Default)]
+struct BorrowedSearchFlight {
+    result: Option<BorrowedSearchResult>,
+    previous: Option<BorrowedSearchResult>,
+}
+
+impl BorrowedSearchFlight {
+    fn serving(&self) -> BorrowedSearchResult {
+        match &self.result {
+            Some(
+                result @ (crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)),
+            ) => result.clone(),
+            _ => self
+                .previous
+                .clone()
+                .or_else(|| self.result.clone())
+                .unwrap_or(crate::readonly_artifacts::ReadOnlyArtifact::Degraded(
+                    crate::readonly_artifacts::BORROWED_SEARCH_LOAD_DEGRADATION,
+                )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum BorrowedIndexCacheValue {
-    Search(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>),
+    SearchLoading(Arc<parking_lot::Mutex<BorrowedSearchFlight>>),
     Semantic(crate::readonly_artifacts::ReadOnlyArtifact<Arc<SemanticIndex>>),
 }
 
@@ -2482,6 +2656,10 @@ enum BorrowedIndexCacheValue {
 struct BorrowedIndexCache {
     entries: VecDeque<(BorrowedIndexCacheKey, BorrowedIndexCacheValue)>,
     resolved_roots: VecDeque<(PathBuf, GitEntrySignature)>,
+    /// Copies of borrowed search indexes recently compared with their
+    /// project's files on disk. Each lives only as long as its project's
+    /// entries here: replacing or dropping them drops the copy too.
+    checked_overlays: crate::commands::semantic_search::external_disk_check::CheckedOverlays,
 }
 
 impl BorrowedIndexCache {
@@ -2490,13 +2668,13 @@ impl BorrowedIndexCache {
         key: &BorrowedIndexCacheKey,
     ) -> Option<crate::readonly_artifacts::ReadOnlyArtifact<Arc<SearchIndex>>> {
         let position = self.entries.iter().position(|(candidate, value)| {
-            candidate == key && matches!(value, BorrowedIndexCacheValue::Search(_))
+            candidate == key && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
         })?;
         let entry = self.entries.remove(position)?;
-        let BorrowedIndexCacheValue::Search(index) = &entry.1 else {
+        let BorrowedIndexCacheValue::SearchLoading(slot) = &entry.1 else {
             return None;
         };
-        let index = (*index).clone();
+        let index = slot.lock().serving();
         self.entries.push_back(entry);
         Some(index)
     }
@@ -2522,10 +2700,20 @@ impl BorrowedIndexCache {
             candidate.canonical_root != key.canonical_root
                 || candidate.artifact.path != key.artifact.path
         });
+        // A new search or semantic generation for this project makes its
+        // checked copy describe indexes no longer served.
+        self.checked_overlays.forget_root(&key.canonical_root);
         self.entries.push_back((key, value));
         while self.entries.len() > BORROWED_INDEX_CACHE_CAPACITY {
             self.entries.pop_front();
         }
+        let entries = &self.entries;
+        self.checked_overlays.retain_roots(|root| {
+            entries.iter().any(|(candidate, value)| {
+                candidate.canonical_root == root
+                    && matches!(value, BorrowedIndexCacheValue::SearchLoading(_))
+            })
+        });
     }
 
     fn resolved_root(&mut self, requested_root: &Path) -> Option<PathBuf> {
@@ -2555,6 +2743,7 @@ impl BorrowedIndexCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.resolved_roots.clear();
+        self.checked_overlays.clear();
     }
 }
 
@@ -2604,7 +2793,15 @@ pub struct AppContext {
     provider: Box<dyn LanguageProvider>,
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
+    /// Lets configure select the checkpoint store's durable namespace without
+    /// taking `checkpoint`, which a command can hold while it waits on the
+    /// cross-process checkpoint file lock.
+    checkpoint_namespace_request: crate::checkpoint::CheckpointNamespaceRequest,
     config: RwLock<Arc<Config>>,
+    /// State for applying config file edits while the root stays bound: the
+    /// config file texts the last configure applied, the pending-reload flag
+    /// and the root's own config file watches.
+    config_live: crate::config_live::ConfigLiveState,
     /// Last tool/request activity for this root. Standalone idle LSP reclaim
     /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.
     last_request_at: parking_lot::Mutex<Instant>,
@@ -2623,6 +2820,9 @@ pub struct AppContext {
     /// Standalone NDJSON requests may borrow a finite CLI snapshot after the
     /// writer has exited; daemon-bound routes keep their live freshness owner.
     daemonless_query_mode: AtomicBool,
+    /// The search reranker backend, rebuilt off the search path whenever the
+    /// published config or the daemon mode changes.
+    rerank_slot: crate::commands::semantic_search::rerank::slot::BackendSlot,
     callgraph_writer: AtomicBool,
     inspect_writer: AtomicBool,
     artifact_owner_status: parking_lot::Mutex<Option<ArtifactOwnerStatus>>,
@@ -2644,6 +2844,19 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    deleted_view_root_retired: AtomicBool,
+    #[cfg(test)]
+    view_publication_attempts: AtomicUsize,
+    checkout_driver: crate::views::first_load::InstalledDriver,
+    /// The views-on semantic lane of this root (see `views::semantic_runtime`).
+    checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
+    /// Wall-clock milliseconds at which the completion drain should next
+    /// check this root's view disk limits; [`VIEW_DISK_LIMITS_OFF`] while
+    /// views are disabled. An atomic so the scheduler's work probe can read
+    /// it without a lock; only the drain and configuration publication
+    /// write it.
+    view_disk_limits_next_ms: AtomicU64,
+    checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
@@ -2698,7 +2911,7 @@ pub struct AppContext {
     semantic_pending_install: Arc<PendingInstallSlot>,
     semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
-    semantic_index_status: RwLock<SemanticIndexStatus>,
+    semantic_index_status: Arc<RwLock<SemanticIndexStatus>>,
     /// Present only while a cold semantic build is running. Its counters are
     /// read by status and health without taking the worker's batch-loop locks.
     semantic_build_progress: RwLock<Option<SemanticBuildProgress>>,
@@ -2726,6 +2939,7 @@ pub struct AppContext {
     semantic_refresh_epoch: AtomicU64,
     semantic_refresh_build_epoch: AtomicU64,
     semantic_refresh_worker: parking_lot::Mutex<Option<SemanticRefreshWorkerSlot>>,
+    semantic_worker_bytes: Arc<AtomicU64>,
     semantic_refresh_retry_attempts: parking_lot::Mutex<BTreeMap<PathBuf, usize>>,
     semantic_refresh_circuit: Arc<SemanticRefreshCircuit>,
     semantic_embedding_model: parking_lot::Mutex<Option<crate::semantic_index::EmbeddingModel>>,
@@ -2736,7 +2950,14 @@ pub struct AppContext {
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
-    lsp_manager: parking_lot::Mutex<LspManager>,
+    lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// Watcher changes waiting for the LSP manager lock. `Some` while the one
+    /// helper thread that forwards them exists; drains that find the lock
+    /// busy merge into it instead of starting threads of their own (see
+    /// [`Self::lsp_forward_or_queue_watcher_changes`]).
+    lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
+    /// How many of those helper threads were started, for tests.
+    lsp_watcher_forward_helpers_spawned: AtomicUsize,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
     /// teardown. Already-admitted workers use it to decide whether their disk
@@ -2757,6 +2978,17 @@ pub struct AppContext {
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
+    // 0: never configured, 1: opening, 2: ready, 3: failed,
+    // 4: busy not yet reported, 5: busy reported (next call may retry). Dispatch must not
+    // run persistence-dependent tools while the root's database is opening.
+    database_runtime_state: AtomicU8,
+    database_runtime_changed: tokio::sync::Notify,
+    database_runtime_error: parking_lot::Mutex<Option<String>>,
+    /// The pending aft.db open request, the configure epoch it belongs to, and
+    /// whether an open is running. See `crate::database_open`.
+    database_open: parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
+    /// Signalled whenever an open for this root stops running.
+    database_open_idle: parking_lot::Condvar,
     /// Configure-tail work that stepped aside mid-drain so a queued
     /// interactive writer (usually a route bind) could take the actor. The
     /// next tail drain resumes it before anything newly enqueued.
@@ -2972,6 +3204,105 @@ impl Drop for CallgraphBuildWaitMsGuard {
     }
 }
 
+/// `try_read` that uses a poisoned lock's data, as the blocking paths in this
+/// module do, and returns `None` only when another thread holds the lock.
+fn try_read_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    match lock.try_read() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The `try_write` counterpart of [`try_read_unpoisoned`].
+fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGuard<'_, T>> {
+    match lock.try_write() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The locks the subc idle reaper reads for one candidate root (the eviction
+/// gate, the pending reconciliation sets and the resident handles it drops).
+/// Tests hold each in turn to prove the reaper does not wait for it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdleReapLock {
+    SemanticIndexStatus,
+    SearchIndexReceiver,
+    CallgraphStoreReceiver,
+    SemanticIndexReceiver,
+    InspectInFlight,
+    BashWatchdogTasks,
+    PendingSearchPaths,
+    PendingCallgraphPaths,
+    PendingTier2Paths,
+    PendingSemanticPaths,
+    PendingCorpusRefresh,
+    SearchIndex,
+    CallgraphStore,
+    SemanticIndex,
+    BorrowedIndexCache,
+}
+
+#[cfg(test)]
+impl IdleReapLock {
+    pub(crate) const ALL: [Self; 15] = [
+        Self::SemanticIndexStatus,
+        Self::SearchIndexReceiver,
+        Self::CallgraphStoreReceiver,
+        Self::SemanticIndexReceiver,
+        Self::InspectInFlight,
+        Self::BashWatchdogTasks,
+        Self::PendingSearchPaths,
+        Self::PendingCallgraphPaths,
+        Self::PendingTier2Paths,
+        Self::PendingSemanticPaths,
+        Self::PendingCorpusRefresh,
+        Self::SearchIndex,
+        Self::CallgraphStore,
+        Self::SemanticIndex,
+        Self::BorrowedIndexCache,
+    ];
+}
+
+/// The locks behind the subc maintenance probes (see
+/// [`AppContext::watcher_drain_has_work`] and its siblings), one per field a
+/// probe reads. Tests hold each in turn to prove no probe waits for it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceProbeLock {
+    WatcherReceiver,
+    WatcherDrainSlice,
+    Tier2RefreshScheduler,
+    LspManager,
+    ConfigureMaintenanceJobs,
+    ParkedConfigureTail,
+    SearchIndexReceiver,
+    CallgraphStoreReceiver,
+    SemanticIndexReceiver,
+    SemanticRefreshEvents,
+    SemanticRefreshWorker,
+}
+
+#[cfg(test)]
+impl MaintenanceProbeLock {
+    pub(crate) const ALL: [Self; 11] = [
+        Self::WatcherReceiver,
+        Self::WatcherDrainSlice,
+        Self::Tier2RefreshScheduler,
+        Self::LspManager,
+        Self::ConfigureMaintenanceJobs,
+        Self::ParkedConfigureTail,
+        Self::SearchIndexReceiver,
+        Self::CallgraphStoreReceiver,
+        Self::SemanticIndexReceiver,
+        Self::SemanticRefreshEvents,
+        Self::SemanticRefreshWorker,
+    ];
+}
+
 /// Serialize test overrides of the query-op inline wait. Configure-tail tests
 /// share this with query-op tests so they cannot clobber each other's env.
 #[cfg(test)]
@@ -3117,6 +3448,12 @@ impl AppContext {
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
         let heavy_root_work_allowed = Arc::new(AtomicBool::new(true));
         let semantic_cold_seed_active = Arc::new(AtomicBool::new(false));
+        let subc_lifecycle = SubcLifecycleAdmission::default();
+        let inspect_manager = Arc::new(InspectManager::with_root_work_gates(
+            Arc::clone(&heavy_root_work_allowed),
+            Arc::clone(&semantic_cold_seed_active),
+        ));
+        inspect_manager.set_root_lifecycle(subc_lifecycle.clone());
         let symbol_cache = provider
             .as_any()
             .downcast_ref::<TreeSitterProvider>()
@@ -3130,12 +3467,21 @@ impl AppContext {
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
         let bash_background = BgTaskRegistry::new(Arc::clone(&progress_sender));
         let compression_aggregates = bash_background.compression_aggregate_cache();
+        let view_disk_limits_next_ms = AtomicU64::new(if config.views.enabled {
+            0
+        } else {
+            VIEW_DISK_LIMITS_OFF
+        });
+        let checkpoint_store = CheckpointStore::new();
+        let checkpoint_namespace_request = checkpoint_store.namespace_request();
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
             backup: parking_lot::Mutex::new(BackupStore::new()),
-            checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
+            checkpoint: parking_lot::Mutex::new(checkpoint_store),
+            checkpoint_namespace_request,
             config: RwLock::new(Arc::new(config)),
+            config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             #[cfg(test)]
@@ -3147,6 +3493,7 @@ impl AppContext {
             git_common_dir: parking_lot::Mutex::new(None),
             shared_artifacts_read_only: AtomicBool::new(false),
             daemonless_query_mode: AtomicBool::new(false),
+            rerank_slot: Default::default(),
             callgraph_writer: AtomicBool::new(true),
             inspect_writer: AtomicBool::new(true),
             artifact_owner_status: parking_lot::Mutex::new(None),
@@ -3156,6 +3503,13 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            deleted_view_root_retired: AtomicBool::new(false),
+            #[cfg(test)]
+            view_publication_attempts: AtomicUsize::new(0),
+            checkout_driver: crate::views::first_load::InstalledDriver::default(),
+            checkout_semantic: Arc::default(),
+            view_disk_limits_next_ms,
+            checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
@@ -3183,10 +3537,7 @@ impl AppContext {
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
-            inspect_manager: Arc::new(InspectManager::with_root_work_gates(
-                Arc::clone(&heavy_root_work_allowed),
-                Arc::clone(&semantic_cold_seed_active),
-            )),
+            inspect_manager,
             tier2_refresh_scheduler: parking_lot::Mutex::new(Tier2RefreshScheduler::new()),
             pending_tier2_paths: parking_lot::Mutex::new(BTreeSet::new()),
             semantic_index: RwLock::new(None),
@@ -3197,7 +3548,7 @@ impl AppContext {
             semantic_pending_install: Arc::default(),
             semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
-            semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            semantic_index_status: Arc::new(RwLock::new(SemanticIndexStatus::Disabled)),
             semantic_build_progress: RwLock::new(None),
             semantic_build_epoch: Arc::new(AtomicU64::new(0)),
             artifact_reload_lock: parking_lot::Mutex::new(()),
@@ -3212,6 +3563,7 @@ impl AppContext {
             semantic_refresh_epoch: AtomicU64::new(0),
             semantic_refresh_build_epoch: AtomicU64::new(0),
             semantic_refresh_worker: parking_lot::Mutex::new(None),
+            semantic_worker_bytes: Arc::default(),
             semantic_refresh_retry_attempts: parking_lot::Mutex::new(BTreeMap::new()),
             semantic_refresh_circuit: Arc::new(SemanticRefreshCircuit::default()),
             semantic_embedding_model: parking_lot::Mutex::new(None),
@@ -3222,10 +3574,12 @@ impl AppContext {
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
-            lsp_manager: parking_lot::Mutex::new(lsp_manager),
+            lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
+            lsp_watcher_forward_slot: Default::default(),
+            lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
-            subc_lifecycle: SubcLifecycleAdmission::default(),
+            subc_lifecycle,
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
@@ -3233,6 +3587,11 @@ impl AppContext {
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
+            database_runtime_state: AtomicU8::new(0),
+            database_runtime_changed: tokio::sync::Notify::new(),
+            database_runtime_error: parking_lot::Mutex::new(None),
+            database_open: parking_lot::Mutex::new(Default::default()),
+            database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
@@ -3289,6 +3648,17 @@ impl AppContext {
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
         let lsp = self.lsp_manager.lock();
         let diagnostics_generation = lsp.diagnostics_generation();
+        let root = self
+            .canonical_cache_root_opt()
+            .map(|root| crate::inspect::job::normalize_path(&root));
+        let failed = lsp.has_failed_diagnostic_producers(root.as_deref());
+        let mask_failed = |mut counts: StatusBarCountValues| {
+            if failed {
+                counts.errors = None;
+                counts.warnings = None;
+            }
+            counts
+        };
 
         {
             let cached = self
@@ -3300,10 +3670,12 @@ impl AppContext {
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return cached
-                    .counts
-                    .clone()
-                    .expect("a valid status-count cache carries truthful values");
+                return mask_failed(
+                    cached
+                        .counts
+                        .clone()
+                        .expect("a valid status-count cache carries truthful values"),
+                );
             }
         }
 
@@ -3357,7 +3729,7 @@ impl AppContext {
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
-        counts
+        mask_failed(counts)
     }
 
     /// Provides legacy numeric status-bar fields to callers that still require
@@ -3378,18 +3750,11 @@ impl AppContext {
             Ok(guard) => Arc::clone(&*guard),
             Err(_) => return RootHealthSummary::busy(),
         };
-        let search_index = match self.search_index.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        let search_index_rx = match self.search_index_rx.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        let semantic_status = match self.semantic_index_status.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
+        // Answers from other subsystems are taken before any of this
+        // context's guards below. The guards are held until the summary is
+        // built, and the frame loop's maintenance probes read the same
+        // fields: a call into another subsystem made while holding them
+        // would pin those fields for as long as that subsystem is slow.
         let semantic_build_progress = match self.semantic_build_progress.try_read() {
             Ok(guard) => guard.clone(),
             Err(_) => return RootHealthSummary::busy(),
@@ -3397,22 +3762,6 @@ impl AppContext {
         let semantic_backend = match self.try_semantic_backend_health_snapshot() {
             Some(snapshot) => snapshot,
             None => return RootHealthSummary::busy(),
-        };
-        let callgraph_store = match self.callgraph_store.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
-        };
-        // The receiver contents no longer feed the status below (a disabled
-        // store must not report "building" from a lingering receiver), but a
-        // contended lock still means the snapshot would race a build state
-        // transition, so keep the probe for its busy signal.
-        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
-            Some(guard) => guard,
-            None => return RootHealthSummary::busy(),
-        };
-        let tier2 = match self.status_bar_tier2.try_read() {
-            Ok(guard) => guard,
-            Err(_) => return RootHealthSummary::busy(),
         };
         // Read the inspect builder registry (the same map used to refuse inspect
         // work while a rebuild is registered). Published status-bar counts are
@@ -3428,6 +3777,41 @@ impl AppContext {
         };
         let suspended_domains = match self.health_build_suspensions.try_read() {
             Ok(snapshot) => snapshot.clone(),
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        // Opens the view status store on disk, so it also stays ahead of the
+        // guards.
+        let views = if config.views.enabled {
+            self.view_health_snapshot()
+        } else {
+            None
+        };
+        let search_index = match self.search_index.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let search_index_rx = match self.search_index_rx.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let semantic_status = match self.semantic_index_status.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        let callgraph_store = match self.callgraph_store.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return RootHealthSummary::busy(),
+        };
+        // The receiver contents no longer feed the status below (a disabled
+        // store must not report "building" from a lingering receiver), but a
+        // contended lock still means the snapshot would race a build state
+        // transition, so keep the probe for its busy signal.
+        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
+            Some(guard) => guard,
+            None => return RootHealthSummary::busy(),
+        };
+        let tier2 = match self.status_bar_tier2.try_read() {
+            Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
 
@@ -3605,11 +3989,7 @@ impl AppContext {
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
-            views: if config.views.enabled {
-                self.view_health_snapshot()
-            } else {
-                None
-            },
+            views,
             tier2_status: Some(tier2_status),
             tier2_completion_generation: Some(successful_tier2_completions),
             tier2_stale_since_ms,
@@ -3697,6 +4077,15 @@ impl AppContext {
         todos: Option<usize>,
         stale: bool,
     ) {
+        // A `None` count keeps the last known value, which is right while a
+        // category is merely pending. In a borrow-only root, though, dead code
+        // is known to be unavailable: keeping an earlier number would show an
+        // old count as current, so the bar shows it as unknown (`?`) instead.
+        let dead_code_unavailable = self
+            .config()
+            .project_root
+            .as_deref()
+            .is_some_and(|root| self.inspect_manager.dead_code_borrow_only_unavailable(root));
         let mut tier2 = self
             .status_bar_tier2
             .write()
@@ -3708,7 +4097,9 @@ impl AppContext {
             tier2.todos,
             tier2.stale,
         );
-        if let Some(dead_code) = dead_code {
+        if dead_code_unavailable {
+            tier2.dead_code = None;
+        } else if let Some(dead_code) = dead_code {
             tier2.dead_code = Some(dead_code);
         }
         if let Some(unused_exports) = unused_exports {
@@ -4080,6 +4471,10 @@ impl AppContext {
 
     pub(crate) fn mark_subc_bound(&self) {
         self.subc_lifecycle.mark_bound();
+        self.inspect_manager.resume_root_work();
+        // A views-on semantic lane pauses its fills while the root is unbound
+        // past the grace window; resume them now rather than at the next edit.
+        self.checkout_semantic.wake();
     }
 
     pub(crate) fn mark_subc_unbound(&self) {
@@ -4107,6 +4502,13 @@ impl AppContext {
         expected_generation: u64,
         action: impl FnOnce() -> R,
     ) -> Option<R> {
+        if self
+            .canonical_cache_root_opt()
+            .or_else(|| self.config().project_root.clone())
+            .is_some_and(|root| !root.is_dir())
+        {
+            return None;
+        }
         self.subc_lifecycle.run_if_current(
             self.configure_generation.as_ref(),
             expected_generation,
@@ -4197,23 +4599,25 @@ impl AppContext {
     /// dispatch cycle per kind per tick. Every probe is lock-free or try-lock
     /// (a contended source reports "maybe work" and the kind is enqueued —
     /// fail-open keeps the skip an optimization, never a correctness gate).
+    ///
+    /// These probes run on the subc frame loop, which also answers health
+    /// checks and routes every request. A blocking `lock()` here parks the
+    /// whole module for as long as any other thread holds the source, so
+    /// never add one: use `try_lock` and treat contention as pending work.
     pub fn watcher_drain_has_work(&self) -> bool {
         let receiver_pending = self
             .watcher_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty());
+            .try_lock()
+            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
         receiver_pending
-            || self
-                .watcher_drain_slice
-                .lock()
-                .as_ref()
-                .is_some_and(|state| {
+            || self.watcher_drain_slice.try_lock().is_none_or(|slot| {
+                slot.as_ref().is_some_and(|state| {
                     state.has_pending_work()
                         || state
                             .ignore_refresh_due
                             .is_some_and(|due| Instant::now() >= due)
                 })
+            })
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {
@@ -4239,58 +4643,248 @@ impl AppContext {
         if search_pending {
             return true;
         }
+        // A contended receiver slot counts as pending. The health rollup and
+        // callgraph access paths hold `callgraph_store_rx` while they do other
+        // work, and waiting for them here once stalled the frame loop.
         if self
             .callgraph_store_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty())
+            .try_lock()
+            .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()))
         {
             return true;
         }
-        if self
-            .semantic_index_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|receiver| {
+        if self.semantic_index_rx.try_lock().is_none_or(|slot| {
+            slot.as_ref().is_some_and(|receiver| {
                 !receiver.is_empty()
                     || self.semantic_index_rx_terminal_epoch.load(Ordering::SeqCst)
                         == self.semantic_index_rx_epoch()
             })
-        {
+        }) {
             return true;
         }
-        if self
-            .semantic_refresh_event_rx
-            .lock()
-            .as_ref()
-            .is_some_and(|rx| !rx.is_empty())
-        {
+        match self.semantic_refresh_event_rx.try_lock() {
+            None => return true,
+            Some(slot) => {
+                if slot.as_ref().is_some_and(|rx| !rx.is_empty())
+                    || (self.semantic_refresh_probe_ready() && slot.is_some())
+                {
+                    return true;
+                }
+            }
+        }
+        if self.semantic_refresh_worker.try_lock().is_none_or(|slot| {
+            slot.as_ref()
+                .is_some_and(|worker_slot| match worker_slot.try_lock() {
+                    Ok(handle) => handle
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished),
+                    Err(std::sync::TryLockError::WouldBlock) => true,
+                    Err(std::sync::TryLockError::Poisoned(_)) => true,
+                })
+        }) {
             return true;
         }
-        if self.semantic_refresh_probe_ready() && self.semantic_refresh_event_rx.lock().is_some() {
-            return true;
-        }
-        if self
-            .semantic_refresh_worker
-            .lock()
-            .as_ref()
-            .is_some_and(|worker_slot| match worker_slot.try_lock() {
-                Ok(handle) => handle
-                    .as_ref()
-                    .is_some_and(std::thread::JoinHandle::is_finished),
-                Err(std::sync::TryLockError::WouldBlock) => true,
-                Err(std::sync::TryLockError::Poisoned(_)) => true,
-            })
-        {
+        if self.view_disk_limits_due() {
             return true;
         }
         self.inspect_manager().has_pending_completions() || self.has_new_reuse_completions()
     }
 
+    /// The family registry behind this project root's per-checkout view,
+    /// when views are enabled and the root's checkout semantic runtime is
+    /// loaded. `None` with views off, so the disk-limit checks below never
+    /// run for users who did not enable views. Takes locks; the drain calls
+    /// it, never the work probe.
+    pub(crate) fn checkout_view_registry(&self) -> Option<crate::views::registry::FamilyRegistry> {
+        if !self.config().views.enabled {
+            return None;
+        }
+        match self.checkout_semantic.runtime()?.access() {
+            crate::views::contracts::ViewAccess::Owner(owner) => Some(owner.registry().clone()),
+            _ => None,
+        }
+    }
+
+    /// True when this root's view disk limits are due a check, which the
+    /// completion drain then starts (`runtime_drain::drain_view_disk_limits`).
+    /// Lock-free and free of I/O: one atomic load and a clock read, because
+    /// the module loop calls this probe for every root on every tick.
+    pub fn view_disk_limits_due(&self) -> bool {
+        let next = self.view_disk_limits_next_ms.load(Ordering::Acquire);
+        next != VIEW_DISK_LIMITS_OFF && now_epoch_ms() >= next
+    }
+
+    /// Sets when the drain should look at the view disk limits again.
+    #[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
+    pub(crate) fn schedule_view_disk_limits(&self, after: Duration) {
+        let next = now_epoch_ms().saturating_add(after.as_millis() as u64);
+        // Never re-arms a root whose views were turned off meanwhile.
+        let _ = self.view_disk_limits_next_ms.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| (current != VIEW_DISK_LIMITS_OFF).then_some(next),
+        );
+    }
+
+    /// Follows a configuration publication: views turned on make a check due
+    /// now unless one is already scheduled; views off disarm it entirely.
+    fn arm_view_disk_limits(&self, views_enabled: bool) {
+        if views_enabled {
+            let _ = self.view_disk_limits_next_ms.compare_exchange(
+                VIEW_DISK_LIMITS_OFF,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        } else {
+            self.view_disk_limits_next_ms
+                .store(VIEW_DISK_LIMITS_OFF, Ordering::Release);
+        }
+    }
+
     pub fn configure_tail_has_work(&self) -> bool {
-        !self.configure_maintenance_jobs.lock().is_empty()
-            || self.parked_configure_tail.lock().is_some()
+        self.configure_maintenance_jobs
+            .try_lock()
+            .is_none_or(|jobs| !jobs.is_empty())
+            || self
+                .parked_configure_tail
+                .try_lock()
+                .is_none_or(|tail| tail.is_some())
             || !self.configure_warnings_rx.is_empty()
+    }
+
+    /// Hold the lock behind one maintenance probe for the duration of
+    /// `while_held`, so a test can prove the probe does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_maintenance_probe_lock_for_test(
+        &self,
+        lock: MaintenanceProbeLock,
+        while_held: impl FnOnce(),
+    ) {
+        match lock {
+            MaintenanceProbeLock::WatcherReceiver => {
+                let _held = self.watcher_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::WatcherDrainSlice => {
+                let _held = self.watcher_drain_slice.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::Tier2RefreshScheduler => {
+                let _held = self.tier2_refresh_scheduler.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::LspManager => {
+                let _held = self.lsp_manager.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::ConfigureMaintenanceJobs => {
+                let _held = self.configure_maintenance_jobs.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::ParkedConfigureTail => {
+                let _held = self.parked_configure_tail.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SearchIndexReceiver => {
+                let _held = self
+                    .search_index_rx
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while_held();
+            }
+            MaintenanceProbeLock::CallgraphStoreReceiver => {
+                let _held = self.callgraph_store_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticIndexReceiver => {
+                let _held = self.semantic_index_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticRefreshEvents => {
+                let _held = self.semantic_refresh_event_rx.lock();
+                while_held();
+            }
+            MaintenanceProbeLock::SemanticRefreshWorker => {
+                let _held = self.semantic_refresh_worker.lock();
+                while_held();
+            }
+        }
+    }
+
+    /// Hold one lock the idle reaper reads for the duration of `while_held`.
+    #[cfg(test)]
+    pub(crate) fn hold_idle_reap_lock_for_test(
+        &self,
+        lock: IdleReapLock,
+        while_held: impl FnOnce(),
+    ) {
+        fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+            lock.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        match lock {
+            IdleReapLock::SemanticIndexStatus => {
+                let _held = write(&self.semantic_index_status);
+                while_held();
+            }
+            IdleReapLock::SearchIndexReceiver => {
+                let _held = write(&self.search_index_rx);
+                while_held();
+            }
+            IdleReapLock::CallgraphStoreReceiver => {
+                let _held = self.callgraph_store_rx.lock();
+                while_held();
+            }
+            IdleReapLock::SemanticIndexReceiver => {
+                let _held = self.semantic_index_rx.lock();
+                while_held();
+            }
+            IdleReapLock::InspectInFlight => {
+                self.inspect_manager
+                    .hold_in_flight_lock_for_test(while_held);
+            }
+            IdleReapLock::BashWatchdogTasks => {
+                self.bash_background
+                    .hold_watchdog_tasks_lock_for_test(while_held);
+            }
+            IdleReapLock::PendingSearchPaths => {
+                let _held = self.pending_search_index_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingCallgraphPaths => {
+                let _held = self.pending_callgraph_store_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingTier2Paths => {
+                let _held = self.pending_tier2_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingSemanticPaths => {
+                let _held = self.pending_semantic_index_paths.lock();
+                while_held();
+            }
+            IdleReapLock::PendingCorpusRefresh => {
+                let _held = self.pending_semantic_corpus_refresh.lock();
+                while_held();
+            }
+            IdleReapLock::SearchIndex => {
+                let _held = write(&self.search_index);
+                while_held();
+            }
+            IdleReapLock::CallgraphStore => {
+                let _held = write(&self.callgraph_store);
+                while_held();
+            }
+            IdleReapLock::SemanticIndex => {
+                let _held = write(&self.semantic_index);
+                while_held();
+            }
+            IdleReapLock::BorrowedIndexCache => {
+                let _held = self.borrowed_index_cache.lock();
+                while_held();
+            }
+        }
     }
 
     pub(crate) fn park_configure_tail(
@@ -4515,31 +5109,73 @@ impl AppContext {
             canonical_root: canonical_root.clone(),
             artifact,
         };
+        let slot = Arc::new(parking_lot::Mutex::new(BorrowedSearchFlight::default()));
         {
             let mut cache = self.borrowed_index_cache.lock();
             if let Some(index) = cache.search(&key) {
                 return index;
             }
+            slot.lock().previous = cache.entries.iter().find_map(|(candidate, value)| {
+                if candidate.canonical_root == key.canonical_root
+                    && candidate.artifact.path == key.artifact.path
+                {
+                    if let BorrowedIndexCacheValue::SearchLoading(previous) = value {
+                        let serving = previous.lock().serving();
+                        if matches!(
+                            serving,
+                            crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                                | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
+                        ) {
+                            return Some(serving);
+                        }
+                    }
+                }
+                None
+            });
+            // Publish the flight before spawning: concurrent requests share one
+            // parse, and eviction drops its only long-lived strong reference.
+            cache.insert(
+                key,
+                BorrowedIndexCacheValue::SearchLoading(Arc::clone(&slot)),
+            );
         }
-
-        // Artifact parsing can touch many records. Keep this process-local cache
-        // mutex free so another read-only request is not blocked behind the load.
-        let opened = crate::readonly_artifacts::open_search_index_read_only_with_key(
-            &canonical_root,
-            storage_dir,
-            &project_key,
-        )
-        .map(Arc::new);
-        if !matches!(
-            opened,
-            crate::readonly_artifacts::ReadOnlyArtifact::Absent
-                | crate::readonly_artifacts::ReadOnlyArtifact::Cancelled
-        ) {
-            self.borrowed_index_cache
-                .lock()
-                .insert(key, BorrowedIndexCacheValue::Search(opened.clone()));
+        let weak = Arc::downgrade(&slot);
+        let (max_records, wait_budget) =
+            crate::readonly_artifacts::borrowed_search_background_limits();
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(&project_key, storage_dir);
+        std::thread::spawn(move || {
+            let opened = crate::readonly_artifacts::open_search_index_background_with_limit(
+                &canonical_root,
+                cache_dir,
+                max_records,
+                &|| weak.strong_count() > 0,
+            )
+            .map(Arc::new);
+            if let Some(slot) = weak.upgrade() {
+                let mut flight = slot.lock();
+                if matches!(
+                    opened,
+                    crate::readonly_artifacts::ReadOnlyArtifact::Fresh(_)
+                        | crate::readonly_artifacts::ReadOnlyArtifact::Stale(_)
+                ) {
+                    flight.previous = None;
+                }
+                flight.result = Some(opened);
+            }
+        });
+        let started = Instant::now();
+        loop {
+            {
+                let flight = slot.lock();
+                if flight.result.is_some() {
+                    return flight.serving();
+                }
+            }
+            if started.elapsed() >= wait_budget || crate::executor::current_job_cancelled() {
+                return slot.lock().serving();
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        opened
     }
 
     pub(crate) fn open_borrowed_semantic_index(
@@ -4590,6 +5226,17 @@ impl AppContext {
     #[cfg(test)]
     pub(crate) fn borrowed_index_cache_len_for_test(&self) -> usize {
         self.borrowed_index_cache.lock().entries.len()
+    }
+
+    /// Run `use_overlays` on the recently checked copies of borrowed search
+    /// indexes, under the borrowed-index cache lock.
+    pub(crate) fn with_checked_overlays<R>(
+        &self,
+        use_overlays: impl FnOnce(
+            &mut crate::commands::semantic_search::external_disk_check::CheckedOverlays,
+        ) -> R,
+    ) -> R {
+        use_overlays(&mut self.borrowed_index_cache.lock().checked_overlays)
     }
 
     pub fn configure_generation(&self) -> u64 {
@@ -4733,6 +5380,27 @@ impl AppContext {
         &self.checkpoint
     }
 
+    /// Select the checkpoint store's durable namespace without waiting on
+    /// anything: no store mutex, no file lock, no I/O. The store applies it at
+    /// the start of its next operation; moving checkpoints saved before
+    /// configure happens then or in deferred maintenance.
+    pub fn request_checkpoint_namespace(
+        &self,
+        storage_dir: PathBuf,
+        harness: crate::harness::Harness,
+    ) {
+        self.checkpoint_namespace_request
+            .request(storage_dir, harness);
+    }
+
+    /// Swap in a test-built checkpoint store that answers this context's
+    /// namespace requests.
+    #[cfg(test)]
+    pub(crate) fn replace_checkpoint_store_for_test(&self, mut store: CheckpointStore) {
+        store.use_namespace_request(self.checkpoint_namespace_request.clone());
+        *self.checkpoint.lock() = store;
+    }
+
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
@@ -4745,6 +5413,218 @@ impl AppContext {
 
     pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
+    }
+
+    /// Mark persistence as initializing for a configure that just committed,
+    /// and stage its database open in the same step, so a root reported as
+    /// initializing always has an open staged or running (never an
+    /// initializing state nobody will finish). A new open epoch keeps any open
+    /// still running for an older configure from publishing over this one;
+    /// taking the open mutex orders this against `publish_database_open`.
+    ///
+    /// A rebind that keeps the root and storage directory of a database that
+    /// is already open and ready changes nothing: re-marking it as
+    /// initializing would refuse bash and edits on a working root until the
+    /// rebind's open ran again. A failed or busy database is always retried.
+    pub(crate) fn begin_database_runtime(
+        &self,
+        canonical_cache_root: PathBuf,
+        storage_root: PathBuf,
+        session_id: String,
+    ) {
+        let mut slot = self.database_open.lock();
+        let target = (canonical_cache_root, storage_root);
+        if self.database_runtime_state.load(Ordering::Acquire) == 2
+            && !slot.running
+            && slot.pending.is_none()
+            && slot.ready_for.as_ref() == Some(&target)
+            && self.app.db_for_path(&target.1.join("aft.db")).is_some()
+        {
+            return;
+        }
+        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.committed_at = Instant::now();
+        let (canonical_cache_root, storage_root) = target;
+        slot.pending = Some(crate::database_open::DatabaseOpenRequest {
+            epoch: slot.epoch,
+            canonical_cache_root,
+            storage_root,
+            session_id,
+            committed_at: slot.committed_at,
+            dispatched_at: None,
+        });
+        self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// Mark persistence as initializing with nothing staged, for tests of the
+    /// readiness wait itself that must control when the state changes.
+    #[cfg(test)]
+    pub(crate) fn mark_database_runtime_initializing_for_test(&self) {
+        let mut slot = self.database_open.lock();
+        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.pending = None;
+        self.database_runtime_state.store(1, Ordering::Release);
+    }
+
+    /// Record that the staged open was handed to the database-open thread
+    /// (after a bind reply, or by a tool that found the root initializing).
+    /// False when nothing is staged.
+    pub(crate) fn mark_database_open_dispatched(&self) -> bool {
+        let mut slot = self.database_open.lock();
+        match slot.pending.as_mut() {
+            Some(request) => {
+                request.dispatched_at.get_or_insert_with(Instant::now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn database_open_epoch(&self) -> u64 {
+        self.database_open.lock().epoch
+    }
+
+    pub(crate) fn database_open_slot(
+        &self,
+    ) -> (
+        &parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
+        &parking_lot::Condvar,
+    ) {
+        (&self.database_open, &self.database_open_idle)
+    }
+
+    /// Run `publish` (install or clear the database pools and publish the
+    /// readiness outcome) only if no configure committed since the open for
+    /// `epoch` began. The open runs outside the actor's write gate, so without
+    /// this an open for an older configure could finish after a newer
+    /// configure marked persistence as initializing and report its database
+    /// as ready. Returns whether `publish` ran.
+    pub(crate) fn publish_database_open(
+        &self,
+        epoch: u64,
+        publish: impl FnOnce(&mut crate::database_open::DatabaseOpenSlot),
+    ) -> bool {
+        let mut slot = self.database_open.lock();
+        if slot.epoch != epoch {
+            return false;
+        }
+        publish(&mut slot);
+        drop(slot);
+        true
+    }
+
+    pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {
+        let success = result.is_ok();
+        *self.database_runtime_error.lock() = result.err();
+        self.database_runtime_state
+            .store(if success { 2 } else { 3 }, Ordering::Release);
+        self.database_runtime_changed.notify_waiters();
+    }
+
+    pub(crate) fn finish_database_runtime_error(&self, error: String, busy: bool) {
+        *self.database_runtime_error.lock() = Some(error);
+        self.database_runtime_state
+            .store(if busy { 4 } else { 3 }, Ordering::Release);
+        self.database_runtime_changed.notify_waiters();
+    }
+
+    pub fn claim_database_runtime_retry(&self, command: &str) -> bool {
+        crate::persistence_gate::requires_database(command)
+            && self
+                .database_runtime_state
+                .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub fn retry_database_runtime(&self) {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            let error = "Cannot retry project persistence: configured database root is missing";
+            log::warn!("{error}");
+            self.finish_database_runtime_error(error.into(), false);
+            return;
+        };
+        let storage = crate::bash_background::storage_dir(self.config().storage_dir.as_deref());
+        crate::commands::configure::configure_database_runtime_with_mode(
+            self,
+            &root,
+            &storage,
+            crate::db::OpenMode::SingleAttempt,
+        );
+    }
+
+    pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
+        crate::persistence_gate::requires_database(command)
+            && self.database_runtime_state.load(Ordering::Acquire) == 1
+    }
+
+    /// Wait outside executor admission. Register before checking state so an
+    /// open completing between the check and await cannot lose its notification.
+    pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
+        loop {
+            let changed = self.database_runtime_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.database_runtime_pending(command) {
+                return;
+            }
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn database_runtime_failed(&self) -> bool {
+        matches!(
+            self.database_runtime_state.load(Ordering::Acquire),
+            3 | 4 | 5
+        )
+    }
+
+    /// Persistence-dependent commands must not silently use a JSON fallback.
+    /// Read-only commands and unconfigured library contexts remain available.
+    pub fn database_runtime_refusal(
+        &self,
+        request_id: &str,
+        command: &str,
+    ) -> Option<crate::protocol::Response> {
+        if !crate::persistence_gate::requires_database(command) {
+            return None;
+        }
+        let failure;
+        let (code, message, retryable) = match self.database_runtime_state.load(Ordering::Acquire) {
+            1 => (
+                "database_initializing",
+                "Project persistence is still initializing after route bind; retry the tool shortly. No tool operation was performed.",
+                true,
+            ),
+            4 | 5 => {
+                // Report exhaustion once before permitting another bounded attempt.
+                // Otherwise the waiter that exhausted the budget would reopen again.
+                let _ = self.database_runtime_state.compare_exchange(4, 5, Ordering::AcqRel, Ordering::Acquire);
+                failure = format!(
+                    "Project persistence is busy after bounded initialization retries: {}. Retry the tool shortly; no rebind is needed. No tool operation was performed.",
+                    self.database_runtime_error.lock().as_deref().unwrap_or("database busy")
+                );
+                ("database_unavailable", failure.as_str(), true)
+            },
+            3 => {
+                failure = format!(
+                    "Project persistence could not be opened: {}. Read-only tools still work. Resolve the database error and rebind to retry. No tool operation was performed.",
+                    self.database_runtime_error.lock().as_deref().unwrap_or("unknown database error")
+                );
+                ("database_unavailable", failure.as_str(), false)
+            },
+            _ => return None,
+        };
+        Some(crate::protocol::Response::error_with_data(
+            request_id,
+            code,
+            message,
+            serde_json::json!({ "retryable": retryable }),
+        ))
     }
 
     pub(crate) fn compression_aggregate_cache(
@@ -4773,6 +5653,18 @@ impl AppContext {
 
     /// Access an owned configuration snapshot.
     pub fn config(&self) -> Arc<Config> {
+        assert_config_write_lock_not_held();
+        if let Some(pinned) = pinned_config_for(self.config_pin_key()) {
+            return pinned;
+        }
+        self.config_unpinned()
+    }
+
+    /// The published configuration, ignoring any snapshot the calling request
+    /// pinned. Read-modify-write callers use this so they never republish an
+    /// older snapshot over a newer one.
+    pub fn config_unpinned(&self) -> Arc<Config> {
+        assert_config_write_lock_not_held();
         let guard = match self.config.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -4782,31 +5674,114 @@ impl AppContext {
 
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
-        let next = Arc::new(config);
-        let next_watcher_counters = next
-            .project_root
-            .as_deref()
-            .map(watcher_counters_for_root)
-            .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
-        let project_root_changed = {
+        // Configure publishes this way, and it runs inside a pinned request:
+        // it must see its own publication for the rest of that request.
+        self.publish_config(|_| Some(config), true);
+    }
+
+    /// Publish `config` only if the published snapshot is still `expected`.
+    /// A live config reload builds its snapshot from the one it read, so it
+    /// must not overwrite a configure that published in between.
+    pub fn publish_config_if_current(&self, expected: &Arc<Config>, config: Config) -> bool {
+        self.publish_config(
+            |current| Arc::ptr_eq(expected, current).then_some(config),
+            false,
+        )
+    }
+
+    /// Build the next snapshot from the current one and publish it, both
+    /// under the configuration write lock, so no other publication can land
+    /// between the read and the write. `replace_pin` makes the calling
+    /// thread's own request pin follow the publication (configure only).
+    fn publish_config(
+        &self,
+        build: impl FnOnce(&Arc<Config>) -> Option<Config>,
+        replace_pin: bool,
+    ) -> bool {
+        // A publication from inside an `update_config` closure would wait on
+        // the write lock this thread already holds.
+        assert_config_write_lock_not_held();
+        let (next, project_root_changed) = {
             let mut guard = self
                 .config
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let built = {
+                let _held = ConfigWriteLockHeld::enter();
+                build(&guard)
+            };
+            let Some(next) = built else {
+                return false;
+            };
+            let next = Arc::new(next);
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.
             let changed = guard.project_root.as_ref().map(|root| root.as_os_str())
                 != next.project_root.as_ref().map(|root| root.as_os_str());
-            *guard = next;
-            changed
+            *guard = Arc::clone(&next);
+            (next, changed)
         };
+        if replace_pin {
+            replace_pinned_config(self.config_pin_key(), &next);
+        }
+        self.reconcile_rerank_backend(&next);
+        self.arm_view_disk_limits(next.views.enabled);
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
             *self
                 .watcher_counters
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = next_watcher_counters;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next
+                .project_root
+                .as_deref()
+                .map(watcher_counters_for_root)
+                .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
         }
+        true
+    }
+
+    /// Pin the published configuration for the rest of the calling request.
+    ///
+    /// Until the guard drops, `config()` on this thread returns the snapshot
+    /// that was published when the request was admitted, so a live config
+    /// reload switches over between requests and never in the middle of one.
+    /// A nested pin for the same context keeps the outer snapshot.
+    pub fn pin_config(&self) -> ConfigPinGuard {
+        self.pin_config_to(self.config())
+    }
+
+    /// Pin `snapshot` for the rest of the calling scope on this thread.
+    ///
+    /// Work a request hands to another thread (deferred LSP navigation,
+    /// inspect, offloaded validation) captures `ctx.config()` while the
+    /// request is being admitted and installs it here on the worker, so the
+    /// worker keeps the request's admitted snapshot even if a live config
+    /// reload publishes before the worker starts.
+    pub fn pin_config_to(&self, snapshot: Arc<Config>) -> ConfigPinGuard {
+        let key = self.config_pin_key();
+        let pushed = CONFIG_PINS.with(|pins| {
+            let mut pins = pins.borrow_mut();
+            if pins.iter().any(|(pinned_key, _)| *pinned_key == key) {
+                return false;
+            }
+            pins.push((key, snapshot));
+            true
+        });
+        if pushed {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| outcomes.borrow_mut().push((key, None)));
+        }
+        ConfigPinGuard {
+            key: pushed.then_some(key),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    fn config_pin_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    pub fn config_live(&self) -> &crate::config_live::ConfigLiveState {
+        &self.config_live
     }
 
     #[cfg(test)]
@@ -4821,10 +5796,21 @@ impl AppContext {
     }
 
     /// Clone-mutate-publish the current configuration without returning a guard.
+    ///
+    /// The update runs on the snapshot that is published at that moment,
+    /// under the configuration write lock, so it can never overwrite a newer
+    /// publication (a live config reload) with values it read earlier. It
+    /// must not read the configuration itself. A request pin on the calling
+    /// thread keeps its admitted snapshot.
     pub fn update_config(&self, update: impl FnOnce(&mut Config)) {
-        let mut next = self.config().as_ref().clone();
-        update(&mut next);
-        self.set_config(next);
+        self.publish_config(
+            |current| {
+                let mut next = current.as_ref().clone();
+                update(&mut next);
+                Some(next)
+            },
+            false,
+        );
     }
 
     pub fn force_restrict_guard(&self, req_id: &str) -> ForceRestrictGuard<'_> {
@@ -5055,6 +6041,25 @@ impl AppContext {
     #[doc(hidden)]
     pub fn set_daemonless_query_mode(&self, enabled: bool) {
         self.daemonless_query_mode.store(enabled, Ordering::SeqCst);
+        self.reconcile_rerank_backend(&self.config_unpinned());
+    }
+
+    /// The search reranker's backend slot.
+    pub(crate) fn rerank_slot(
+        &self,
+    ) -> &crate::commands::semantic_search::rerank::slot::BackendSlot {
+        &self.rerank_slot
+    }
+
+    /// Start building the reranker backend for `config` in the background when
+    /// it differs from the one built or being built. Never blocks on the build.
+    fn reconcile_rerank_backend(&self, config: &Config) {
+        self.rerank_slot.reconcile(
+            crate::commands::semantic_search::rerank::slot::BuildInputs::from_config(
+                config,
+                !self.daemonless_query_mode(),
+            ),
+        );
     }
 
     pub(crate) fn daemonless_query_mode(&self) -> bool {
@@ -5095,7 +6100,12 @@ impl AppContext {
     }
 
     pub fn heavy_root_work_allowed(&self) -> bool {
-        self.heavy_root_work_allowed.load(Ordering::SeqCst) && !self.subc_lifecycle.is_unbound()
+        self.heavy_root_work_allowed.load(Ordering::SeqCst)
+            && !self.subc_lifecycle.is_unbound()
+            && self
+                .canonical_cache_root_opt()
+                .or_else(|| self.config().project_root.clone())
+                .is_none_or(|root| root.is_dir())
     }
 
     fn try_heavy_root_work_allowed(&self) -> Option<bool> {
@@ -5155,6 +6165,8 @@ impl AppContext {
         snapshot: ViewRuntimeSnapshot,
         pin: Option<crate::pins::QueryPin>,
     ) {
+        self.deleted_view_root_retired
+            .store(false, Ordering::Release);
         *self
             .view_runtime
             .write()
@@ -5164,7 +6176,40 @@ impl AppContext {
         });
     }
 
+    /// A deleted checkout has no publication consumer. Retire once rather than
+    /// letting watcher quiet-window retries spawn git indefinitely.
+    pub(crate) fn retire_deleted_view_root(&self) -> bool {
+        let missing = self
+            .canonical_cache_root_opt()
+            .is_some_and(|root| !root.is_dir());
+        if !missing && !self.deleted_view_root_retired.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.deleted_view_root_retired.swap(true, Ordering::AcqRel) {
+            crate::executor::view_publication::cancel_for_context(self);
+            self.clear_view_runtime();
+            log::info!(
+                "content-addressed view publication retired deleted root={}",
+                self.canonical_cache_root_opt()
+                    .unwrap_or_default()
+                    .display()
+            );
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_publication_attempts_for_test(&self) -> usize {
+        self.view_publication_attempts.load(Ordering::Acquire)
+    }
+
     pub(crate) fn clear_view_runtime(&self) {
+        self.checkout_driver.clear();
+        self.checkout_semantic.clear();
+        *self
+            .checkout_query_runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         *self
             .view_runtime
             .write()
@@ -5211,6 +6256,9 @@ impl AppContext {
     }
 
     pub(crate) fn refresh_view_head_for_watcher(&self, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+        if self.retire_deleted_view_root() {
+            return BTreeSet::new();
+        }
         let Some(root) = self.canonical_cache_root_opt() else {
             return BTreeSet::new();
         };
@@ -5288,8 +6336,14 @@ impl AppContext {
         allow_blob_put: bool,
         phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
     ) -> Result<PreparedViewUpdate, String> {
+        #[cfg(test)]
+        self.view_publication_attempts
+            .fetch_add(1, Ordering::AcqRel);
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
+        if self.retire_deleted_view_root() {
+            return Err("view publication root was deleted".to_owned());
+        }
         let snapshot = self
             .view_runtime_snapshot()
             .ok_or_else(|| "view runtime is not configured".to_string())?;
@@ -5302,7 +6356,11 @@ impl AppContext {
         let head_metadata =
             crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
                 .map_err(|error| error.to_string())?;
-        let semantic_search = self.config().indexes.semantic;
+        // With a per-checkout semantic view, the content-addressed view this
+        // function publishes (used for views-on callgraph reads) carries no
+        // semantic plane: its vectors came from the legacy semantic index,
+        // which such a root no longer builds.
+        let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
         let semantic_keys = if semantic_search && allow_blob_put {
             let index = self
                 .semantic_index
@@ -5339,6 +6397,8 @@ impl AppContext {
                 semantic_keys,
                 require_semantic: semantic_search,
                 allow_blob_put,
+                // Nothing reads a view's call graph while the index is off.
+                callgraph: self.config().indexes.callgraph,
             },
             phase,
         )
@@ -5844,8 +6904,111 @@ impl AppContext {
         *guard = None;
     }
 
+    /// True only after explicit per-checkout activation, never from defaults.
+    pub fn checkout_query_runtime_active(&self) -> bool {
+        self.checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Binds watcher invalidation and synchronous write intent to the same driver.
+    /// Called explicitly alongside query activation, never by legacy configure.
+    pub fn install_checkout_driver(&self, driver: Arc<crate::views::first_load::CheckoutDriver>) {
+        self.checkout_driver.install(driver);
+    }
+
+    /// The shared handle a worker thread uses to install this root's driver
+    /// with the same wiring as `install_checkout_driver`.
+    pub(crate) fn installed_checkout_driver(&self) -> crate::views::first_load::InstalledDriver {
+        self.checkout_driver.clone()
+    }
+
+    /// This root's views-on semantic lane.
+    pub fn checkout_semantic(&self) -> &Arc<crate::views::semantic_runtime::CheckoutSemanticSlot> {
+        &self.checkout_semantic
+    }
+
+    /// The loaded views-on semantic view, when this root serves semantic
+    /// search from one.
+    pub fn checkout_semantic_runtime(
+        &self,
+    ) -> Option<Arc<crate::views::semantic_runtime::CheckoutSemantic>> {
+        self.checkout_semantic.runtime()
+    }
+
+    pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
+        if let Some(driver) = self.checkout_driver.get() {
+            driver.record_absolute_change(path);
+        }
+        // The driver only records the change; the semantic view resolves it
+        // on its worker after the quiet window.
+        self.checkout_semantic.wake();
+    }
+
+    /// Activates a supplied, already loaded checkout runtime for this root.
+    /// Nothing calls this from legacy configure; defaults remain unchanged.
+    pub fn install_checkout_query_runtime(
+        &self,
+        runtime: Arc<crate::views::query_wait::CheckoutQueryRuntime>,
+    ) {
+        *self
+            .checkout_query_runtime
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(runtime);
+    }
+
+    /// The one final post-wait outcome pinned by this request, including gaps.
+    pub fn checkout_query_outcome(&self) -> Option<crate::views::contracts::WaitOutcome> {
+        CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+            outcomes
+                .borrow()
+                .iter()
+                .find(|(key, _)| *key == self.config_pin_key())
+                .and_then(|(_, outcome)| outcome.clone())
+        })
+    }
+
+    fn wait_checkout_query(
+        &self,
+        runtime: &crate::views::query_wait::CheckoutQueryRuntime,
+        wait: Duration,
+    ) -> crate::views::contracts::WaitOutcome {
+        if !wait.is_zero() {
+            if let Some(outcome) = self.checkout_query_outcome() {
+                return outcome;
+            }
+        }
+        let outcome = runtime.waiter.wait_for(
+            &runtime.access,
+            crate::blob_store::v2::FamilyPlane::Callgraph,
+            wait,
+        );
+        if !wait.is_zero() {
+            CHECKOUT_QUERY_OUTCOMES.with(|outcomes| {
+                if let Some((_, slot)) = outcomes
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|(key, _)| *key == self.config_pin_key())
+                {
+                    *slot = Some(outcome.clone());
+                }
+            });
+        }
+        outcome
+    }
+
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(callgraph_build_wait_window())
+        let active = self
+            .checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        self.callgraph_store_for_ops_with_wait(if active {
+            crate::views::contracts::CALLGRAPH_QUERY_WAIT
+        } else {
+            callgraph_build_wait_window()
+        })
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
@@ -5869,6 +7032,22 @@ impl AppContext {
         // A disabled index never starts: refuse before any open or cold build.
         if !self.config().indexes.callgraph {
             return CallgraphStoreAccess::Off;
+        }
+        let checkout = self
+            .checkout_query_runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(runtime) = checkout {
+            let outcome = self.wait_checkout_query(&runtime, wait);
+            let snapshot = match &outcome {
+                crate::views::contracts::WaitOutcome::Installed(snapshot)
+                | crate::views::contracts::WaitOutcome::TimedOut { snapshot, .. } => snapshot,
+            };
+            return match runtime.callgraph.reader(&runtime.access, snapshot) {
+                Ok(reader) => CallgraphStoreAccess::Ready(Arc::clone(&reader.store)),
+                Err(_) => CallgraphStoreAccess::Building,
+            };
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
             if let Some(view) = self.pinned_view_runtime() {
@@ -5953,6 +7132,25 @@ impl AppContext {
             return CallgraphStoreAccess::Unavailable;
         };
         let callgraph_dir = self.callgraph_store_dir();
+
+        // A published generation written by a newer build (or a reader floor
+        // above this build) is refused by name; no cold build is started to
+        // replace it.
+        if let Some(refusal) = crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::CallgraphStore,
+            &callgraph_dir,
+        )
+        .or_else(|| {
+            crate::callgraph_store::check_published_format(
+                &callgraph_dir,
+                &self.memoized_artifact_cache_key(&project_root),
+            )
+            .err()
+        }) {
+            return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                refusal.to_string(),
+            ));
+        }
 
         if !build_in_flight {
             match CallGraphStore::cold_build_suspension(&callgraph_dir, &project_root) {
@@ -6043,6 +7241,13 @@ impl AppContext {
         }
 
         if !wait.is_zero() {
+            // This holds the `callgraph_store_rx` slot for the whole wait
+            // window, and the subc frame loop's maintenance probes and the
+            // health rollup read that slot, so they would wait with it. A
+            // non-zero wait comes only from `AFT_CALLGRAPH_BUILD_WAIT_MS`,
+            // which tests set so small builds answer `Ready` inline. Never
+            // reach this with a non-zero wait from the frame loop; its
+            // warmers pass zero.
             let (received, receiver_generation, receiver_epoch) = {
                 let rx_ref = self.callgraph_store_rx.lock();
                 let Some(rx) = rx_ref.as_ref() else {
@@ -6905,23 +8110,6 @@ impl AppContext {
         *self.pending_semantic_corpus_refresh.lock() = false;
     }
 
-    /// Take the retained pending reconciliation state for a transactional
-    /// teardown. The caller commits the disposal by dropping the returned
-    /// state after eviction succeeds, or restores it with
-    /// [`Self::restore_pending_reconciliation_state`] when eviction is blocked
-    /// by a secondary blocker (running bash, in-flight builds): the paths are
-    /// the only repair record for consumed watcher events, and the root may
-    /// rebind before the next reap attempt.
-    pub(crate) fn take_pending_reconciliation_state(&self) -> PendingReconciliationState {
-        PendingReconciliationState {
-            search: std::mem::take(&mut *self.pending_search_index_paths.lock()),
-            callgraph: std::mem::take(&mut *self.pending_callgraph_store_paths.lock()),
-            tier2: std::mem::take(&mut *self.pending_tier2_paths.lock()),
-            semantic: std::mem::take(&mut *self.pending_semantic_index_paths.lock()),
-            corpus_refresh: std::mem::take(&mut *self.pending_semantic_corpus_refresh.lock()),
-        }
-    }
-
     pub(crate) fn restore_pending_reconciliation_state(&self, state: PendingReconciliationState) {
         self.pending_search_index_paths.lock().extend(state.search);
         self.pending_callgraph_store_paths
@@ -7194,6 +8382,17 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = limiter;
     }
 
+    /// Takes one slot of this context's maintenance-build limiter, so an
+    /// integration test can hold queued background work (such as a legacy
+    /// import) at its admission point and observe what queries report
+    /// meanwhile. `None` when every slot is taken.
+    #[doc(hidden)]
+    pub fn take_cold_build_slot_for_test(
+        &self,
+    ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
+        self.cold_build_limiter().try_acquire()
+    }
+
     pub fn add_pending_tier2_paths<I>(&self, paths: I)
     where
         I: IntoIterator<Item = PathBuf>,
@@ -7344,9 +8543,13 @@ impl AppContext {
         if self.try_callgraph_cold_build_active() != Some(false) {
             return false;
         }
+        // The scheduler itself is only held for short bookkeeping, so its
+        // contention says nothing about whether a refresh is due. Fail open
+        // like the other maintenance probes: the watcher drain re-reads the
+        // scheduler under its own lock and does nothing if no refresh is due.
         self.tier2_refresh_scheduler
             .try_lock()
-            .is_some_and(|scheduler| scheduler.dispatch_due(Instant::now()))
+            .is_none_or(|scheduler| scheduler.dispatch_due(Instant::now()))
     }
 
     pub fn note_tier2_refresh_started(&self) {
@@ -7648,7 +8851,13 @@ impl AppContext {
     }
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
-        &self.semantic_index_status
+        self.semantic_index_status.as_ref()
+    }
+
+    /// Shared handle on the semantic status, for a worker thread that keeps
+    /// it in step with the views-on semantic lane.
+    pub(crate) fn semantic_index_status_handle(&self) -> Arc<RwLock<SemanticIndexStatus>> {
+        Arc::clone(&self.semantic_index_status)
     }
 
     pub(crate) fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
@@ -7734,6 +8943,10 @@ impl AppContext {
     pub fn set_semantic_cold_seed_active_for_test(&self, active: bool) {
         self.semantic_cold_seed_active
             .store(active, Ordering::SeqCst);
+    }
+
+    pub(crate) fn semantic_worker_bytes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.semantic_worker_bytes)
     }
 
     pub fn install_semantic_refresh_worker(
@@ -8473,6 +9686,173 @@ impl AppContext {
         true
     }
 
+    /// [`Self::artifact_eviction_blocker`] for the subc frame loop: every lock
+    /// it reads is try-locked, and a contended one answers
+    /// [`ArtifactEvictionBlocker::LockContended`] instead of waiting. The idle
+    /// reaper takes the pending reconciliation sets before it asks, so it
+    /// passes `include_pending = false` for that check.
+    pub(crate) fn try_artifact_eviction_blocker(
+        &self,
+        include_pending: bool,
+    ) -> Option<ArtifactEvictionBlocker> {
+        use ArtifactEvictionBlocker as Blocker;
+        if self.standing_artifact_exempt.load(Ordering::Acquire) {
+            return Some(Blocker::StandingRoot);
+        }
+        let semantic_refresh_in_flight = match try_read_unpoisoned(&self.semantic_index_status) {
+            Some(status) => match &*status {
+                SemanticIndexStatus::Building { .. } => true,
+                SemanticIndexStatus::Ready { refreshing, .. } => !refreshing.is_empty(),
+                SemanticIndexStatus::Disabled | SemanticIndexStatus::Failed(_) => false,
+            },
+            None => return Some(Blocker::LockContended),
+        };
+        match crate::runtime_drain::try_any_build_in_flight(self) {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::BuildInFlight),
+            Some(false) => {}
+        }
+        if semantic_refresh_in_flight {
+            return Some(Blocker::SemanticRefresh);
+        }
+        match self.inspect_manager.try_tier2_any_in_flight() {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::InspectTier2),
+            Some(false) => {}
+        }
+        match self.bash_background.try_has_running_tasks() {
+            None => return Some(Blocker::LockContended),
+            Some(true) => return Some(Blocker::BashRunning),
+            Some(false) => {}
+        }
+        if include_pending {
+            match self.try_pending_reconciliation_present() {
+                None => return Some(Blocker::LockContended),
+                Some(true) => return Some(Blocker::PendingReconciliation),
+                Some(false) => {}
+            }
+        }
+        if self.shared_artifacts_read_only() {
+            return None;
+        }
+        match try_read_unpoisoned(&self.search_index) {
+            Some(index) => index
+                .as_ref()
+                .is_some_and(SearchIndex::has_pending_disk_changes)
+                .then_some(Blocker::SearchDeltaUnpersisted),
+            None => Some(Blocker::LockContended),
+        }
+    }
+
+    fn try_pending_reconciliation_present(&self) -> Option<bool> {
+        Some(
+            !self.pending_callgraph_store_paths.try_lock()?.is_empty()
+                || !self.pending_search_index_paths.try_lock()?.is_empty()
+                || !self.pending_tier2_paths.try_lock()?.is_empty()
+                || !self.pending_semantic_index_paths.try_lock()?.is_empty()
+                || *self.pending_semantic_corpus_refresh.try_lock()?,
+        )
+    }
+
+    /// Take the retained pending reconciliation state for a transactional
+    /// teardown, without waiting: `None`, with nothing taken, when any of the
+    /// pending sets is locked. The caller commits the disposal by dropping the
+    /// returned state after eviction succeeds, or restores it with
+    /// [`Self::restore_pending_reconciliation_state_without_waiting`] when
+    /// eviction is blocked by a secondary blocker (running bash, in-flight
+    /// builds): the paths are the only repair record for consumed watcher
+    /// events, and the root may rebind before the next reap attempt.
+    pub(crate) fn try_take_pending_reconciliation_state(
+        &self,
+    ) -> Option<PendingReconciliationState> {
+        let mut search = self.pending_search_index_paths.try_lock()?;
+        let mut callgraph = self.pending_callgraph_store_paths.try_lock()?;
+        let mut tier2 = self.pending_tier2_paths.try_lock()?;
+        let mut semantic = self.pending_semantic_index_paths.try_lock()?;
+        let mut corpus_refresh = self.pending_semantic_corpus_refresh.try_lock()?;
+        Some(PendingReconciliationState {
+            search: std::mem::take(&mut *search),
+            callgraph: std::mem::take(&mut *callgraph),
+            tier2: std::mem::take(&mut *tier2),
+            semantic: std::mem::take(&mut *semantic),
+            corpus_refresh: std::mem::take(&mut *corpus_refresh),
+        })
+    }
+
+    /// Put taken pending sets back without waiting on the caller's thread.
+    /// The sets are the only record of watcher events already consumed, so
+    /// they are never dropped: when a set is locked, a short-lived thread
+    /// restores them instead.
+    pub(crate) fn restore_pending_reconciliation_state_without_waiting(
+        self: &Arc<Self>,
+        state: PendingReconciliationState,
+    ) {
+        let guards = (|| {
+            Some((
+                self.pending_search_index_paths.try_lock()?,
+                self.pending_callgraph_store_paths.try_lock()?,
+                self.pending_tier2_paths.try_lock()?,
+                self.pending_semantic_index_paths.try_lock()?,
+                self.pending_semantic_corpus_refresh.try_lock()?,
+            ))
+        })();
+        match guards {
+            Some((mut search, mut callgraph, mut tier2, mut semantic, mut corpus_refresh)) => {
+                search.extend(state.search);
+                callgraph.extend(state.callgraph);
+                tier2.extend(state.tier2);
+                semantic.extend(state.semantic);
+                if state.corpus_refresh {
+                    *corpus_refresh = true;
+                }
+            }
+            None => {
+                let ctx = Arc::clone(self);
+                std::thread::spawn(move || ctx.restore_pending_reconciliation_state(state));
+            }
+        }
+    }
+
+    /// [`Self::evict_idle_artifacts`] for the subc frame loop: the eviction
+    /// gate and the resident-handle write locks are all try-locked, and
+    /// nothing is evicted unless every one of them was free. Returns false
+    /// when eviction is unsafe or a lock was contended; the reaper retries on
+    /// its next sweep.
+    pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
+        if self.try_artifact_eviction_blocker(true).is_some() {
+            return false;
+        }
+        let Some(mut callgraph_store) = try_write_unpoisoned(&self.callgraph_store) else {
+            return false;
+        };
+        let Some(mut search_index) = try_write_unpoisoned(&self.search_index) else {
+            return false;
+        };
+        let Some(mut semantic_index) = try_write_unpoisoned(&self.semantic_index) else {
+            return false;
+        };
+        let Some(mut borrowed_index_cache) = self.borrowed_index_cache.try_lock() else {
+            return false;
+        };
+        callgraph_store.take();
+        search_index.take();
+        semantic_index.take();
+        borrowed_index_cache.clear();
+        drop((
+            callgraph_store,
+            search_index,
+            semantic_index,
+            borrowed_index_cache,
+        ));
+        // Intentional idle eviction starts a new reload lifecycle; a cooldown
+        // from an earlier failed load must not suppress the first reopen.
+        self.note_search_index_load_succeeded();
+        self.inspect_manager.evict_idle_caches();
+        self.reset_symbol_cache();
+        self.clear_tsconfig_membership_cache();
+        true
+    }
+
     /// Test seam for the serialized real-watcher integration suite. Production
     /// callers cannot trigger it without the explicit test-only environment flag.
     #[doc(hidden)]
@@ -8515,6 +9895,7 @@ impl AppContext {
     /// The executor invokes this only after proving the actor has no queued or
     /// running jobs, and always from a detached teardown thread.
     pub(crate) fn teardown_deleted_root(&self) {
+        self.inspect_manager.cancel_root_work();
         self.bash_background.detach();
         self.bash_background.clear_db_pool();
         self.backup.lock().clear_db_pool();
@@ -8526,6 +9907,49 @@ impl AppContext {
         self.lsp_manager.lock()
     }
 
+    /// The LSP manager if no other thread holds it right now. For callers on
+    /// the subc frame loop, which must not wait behind a server start or a
+    /// diagnostics request.
+    pub fn try_lsp(&self) -> Option<parking_lot::MutexGuard<'_, LspManager>> {
+        self.lsp_manager.try_lock()
+    }
+
+    /// Start one inspect producer, holding the LSP manager lock only to
+    /// reserve the server and to publish it; the spawn and `initialize`
+    /// handshake run unlocked (see
+    /// [`crate::lsp::manager::start_applicable_server_unlocked`]).
+    pub fn lsp_start_applicable_server_until(
+        &self,
+        snapshot: &crate::lsp::manager::ApplicableServerSnapshot,
+        server: &crate::lsp::roots::ServerKey,
+        config: &Config,
+        deadline: Instant,
+    ) -> crate::lsp::manager::ApplicableServerStartOutcomes {
+        crate::lsp::manager::start_applicable_server_unlocked(
+            &self.lsp_manager,
+            snapshot,
+            server,
+            config,
+            deadline,
+        )
+    }
+
+    /// Make a running rust-analyzer reload its workspace when its Cargo
+    /// manifests, lockfile, toolchain file, or Cargo config changed since it
+    /// last loaded them (see
+    /// [`crate::lsp::manager::reload_rust_workspace_if_manifests_changed`]).
+    pub fn lsp_reload_rust_workspace_if_manifests_changed(
+        &self,
+        server: &crate::lsp::roots::ServerKey,
+        scope_roots: &[PathBuf],
+    ) -> bool {
+        crate::lsp::manager::reload_rust_workspace_if_manifests_changed(
+            &self.lsp_manager,
+            server,
+            scope_roots,
+        )
+    }
+
     /// Notify LSP servers that a file was written.
     /// Call this after write_format_validate in command handlers.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
@@ -8535,6 +9959,104 @@ impl AppContext {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
             }
         }
+    }
+
+    /// Forward paths the project file watcher saw change to the language
+    /// servers that registered for them (see
+    /// [`LspManager::forward_watcher_file_events`]), and have rust-analyzer
+    /// reload its workspace when a Cargo manifest among them changed.
+    ///
+    /// The watcher reports paths without the kind of change, so a path that
+    /// exists is reported as changed and a missing one as deleted, as AFT's
+    /// own config-file notifications do. rust-analyzer decides between
+    /// created and modified from its own file set, whatever the event says.
+    pub fn lsp_forward_watcher_file_events(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        self.lsp_forward_or_queue_watcher_changes(paths, false);
+    }
+
+    /// After the file watcher lost events (an overflow that needs a rescan),
+    /// ask every running rust-analyzer to reload its workspace if a Cargo
+    /// manifest changed since its last load. Other servers get no per-file
+    /// events: the lost paths are unknown, and a flood of guesses would cost
+    /// them more than a missed notification for files AFT resyncs when it
+    /// next opens or edits them.
+    pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
+        self.lsp_forward_or_queue_watcher_changes(&[], true);
+    }
+
+    /// Deliver watcher changes to the LSP manager without making the drain
+    /// wait for its lock.
+    ///
+    /// An uncontended lock forwards them here. A contended one queues them in
+    /// a single per-context slot served by one helper thread that waits for
+    /// the lock: while that helper exists, later drains merge into its slot
+    /// (deduplicated and capped, see [`crate::lsp::manager::WatcherForwardBacklog`])
+    /// and start nothing. Dropping the changes instead would leave servers
+    /// on the old files (and rust-analyzer on the old workspace) until some
+    /// later change; a thread per contended drain would pile up without
+    /// bound while the lock stays held, for example during a server start.
+    fn lsp_forward_or_queue_watcher_changes(&self, paths: &[PathBuf], reload_all_rust: bool) {
+        use crate::lsp::manager::WatcherForwardBacklog;
+        let markers = self.custom_lsp_root_markers();
+        {
+            // A queued backlog goes first, so newer changes join it rather
+            // than overtake it on the fast path.
+            let mut slot = self.lsp_watcher_forward_slot.lock();
+            if let Some(backlog) = slot.as_mut() {
+                backlog.merge(paths, reload_all_rust, markers);
+                return;
+            }
+        }
+        if let Some(mut lsp) = self.lsp_manager.try_lock() {
+            let mut backlog = WatcherForwardBacklog::default();
+            backlog.merge(paths, reload_all_rust, markers);
+            let reloads = backlog.apply(&mut lsp);
+            drop(lsp);
+            crate::lsp::manager::spawn_watcher_rust_workspace_reloads(&self.lsp_manager, reloads);
+            return;
+        }
+        let mut slot = self.lsp_watcher_forward_slot.lock();
+        if let Some(backlog) = slot.as_mut() {
+            backlog.merge(paths, reload_all_rust, markers);
+            return;
+        }
+        let mut backlog = WatcherForwardBacklog::default();
+        backlog.merge(paths, reload_all_rust, markers);
+        *slot = Some(backlog);
+        drop(slot);
+        let manager = Arc::clone(&self.lsp_manager);
+        let forward_slot = Arc::clone(&self.lsp_watcher_forward_slot);
+        match std::thread::Builder::new()
+            .name("aft-lsp-watched-files".into())
+            .spawn(move || crate::lsp::manager::run_watcher_forward_helper(&manager, &forward_slot))
+        {
+            Ok(_) => {
+                self.lsp_watcher_forward_helpers_spawned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                // Free the slot so a later drain can try again.
+                self.lsp_watcher_forward_slot.lock().take();
+                crate::slog_warn!("could not reach LSP servers after a watcher change: {error}");
+            }
+        }
+    }
+
+    /// How many helper threads have waited for the LSP manager lock on behalf
+    /// of contended watcher drains.
+    #[doc(hidden)]
+    pub fn lsp_watcher_forward_helpers_spawned_for_test(&self) -> usize {
+        self.lsp_watcher_forward_helpers_spawned
+            .load(Ordering::Relaxed)
+    }
+
+    /// Whether watcher changes are still queued for the LSP manager.
+    #[doc(hidden)]
+    pub fn lsp_watcher_forward_pending_for_test(&self) -> bool {
+        self.lsp_watcher_forward_slot.lock().is_some()
     }
 
     /// Drop cached LSP diagnostics for a deleted/renamed-away file so its
@@ -8651,14 +10173,24 @@ impl AppContext {
         // Some LSP 3.17 servers disable publishDiagnostics as soon as the client
         // advertises pull support. Pull before parking so edits work for those
         // servers while push-only servers still use the event-driven wait below.
+        // The manager lock is released while servers work on the pull; the
+        // wait registered below re-checks the store, so a publish another
+        // drain consumed in the meantime is not missed.
         let diagnostics_deadline = Instant::now() + timeout;
-        if let Err(err) = lsp.pull_file_diagnostics_with_timeout(file_path, &config, timeout) {
+        drop(lsp);
+        if let Err(err) = crate::lsp::manager::pull_file_diagnostics_unlocked(
+            || self.lsp_manager.lock(),
+            file_path,
+            &config,
+            Some(timeout),
+        ) {
             crate::slog_warn!(
                 "post-edit LSP diagnostic pull failed for {}: {}",
                 file_path.display(),
                 err
             );
         }
+        let mut lsp = self.lsp_manager.lock();
         let remaining = diagnostics_deadline.saturating_duration_since(Instant::now());
 
         // Register the wake receiver while the manager is still locked. Events
@@ -8801,6 +10333,9 @@ impl AppContext {
     }
 
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {
+        // An agent write to package.json or a lockfile can change which
+        // TypeScript server a file gets, even with the file watcher off.
+        crate::lsp::typescript_project::invalidate_typescript_selection([file_path]);
         let custom_markers = self.custom_lsp_root_markers();
         if !is_config_file_path_with_custom(file_path, &custom_markers) {
             return;
@@ -9156,7 +10691,7 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
-        let semantic = match self.semantic_index.try_read() {
+        let mut semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
                 .map(SemanticIndex::estimated_memory)
@@ -9168,6 +10703,23 @@ impl AppContext {
                 .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
+        let worker_bytes = self.semantic_worker_bytes.load(Ordering::Relaxed);
+        if let Some(serving_bytes) = semantic.estimated_bytes {
+            semantic
+                .counts
+                .insert("serving_index_bytes".into(), serving_bytes);
+            semantic.estimated_bytes = Some(serving_bytes.saturating_add(worker_bytes));
+        } else {
+            // A busy serving index must not hide the independently observed worker.
+            semantic.estimated_bytes = Some(worker_bytes);
+            semantic.bytes_status = "partial";
+            semantic
+                .not_estimated
+                .push("serving_semantic_index_busy".into());
+        }
+        semantic
+            .counts
+            .insert("worker_index_bytes".into(), worker_bytes);
         let trigram = match self.search_index.try_read() {
             Ok(index) => index
                 .as_ref()
@@ -9570,6 +11122,42 @@ mod subc_lifecycle_admission_tests {
         let snapshot = ctx.try_health_snapshot(Path::new("borrow-only-root"));
 
         assert_eq!(snapshot.tier2.expect("tier2 health").status, "disabled");
+    }
+
+    #[test]
+    fn revision_borrower_is_not_a_resident_semantic_donor() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = App::default_shared();
+        let donor_root = temp.path().join("other_branch");
+        let target = temp.path().join("late_branch");
+        std::fs::create_dir_all(&donor_root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let donor = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+        donor.set_canonical_cache_root(donor_root.clone());
+        donor
+            .artifact_cache_keys
+            .lock()
+            .insert(donor_root.clone(), "family".into());
+        donor.set_cache_writer_capabilities(false, true);
+        let config = crate::config::SemanticBackendConfig::default();
+        let mut index = SemanticIndex::new(donor_root.clone(), 3);
+        index.set_fingerprint(
+            crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&config, 3),
+        );
+        *donor.semantic_index().write().unwrap() = Some(index);
+        *donor.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        app.register_memory_context(donor_root, &donor);
+        assert!(
+            app.adopt_resident_semantic_index("family", &target, &config)
+                .is_none(),
+            "another borrower must never donate branch-local state"
+        );
+        donor.set_cache_writer_capabilities(true, true);
+        assert!(
+            app.adopt_resident_semantic_index("family", &target, &config)
+                .is_some(),
+            "the same matching snapshot is eligible only when owned by the writer"
+        );
     }
 
     #[test]
@@ -10796,7 +12384,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn inline_ready_without_published_pointer_settles_and_preserves_pending_paths() {
-        let _env_guard = callgraph_build_wait_ms(2_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -10816,10 +12403,48 @@ mod callgraph_store_for_ops_tests {
         let pointer = ctx
             .callgraph_store_dir()
             .join(format!("{project_key}.current"));
-        let _remove_pointer_guard = install_callgraph_pointer_removal_arm(pointer);
-
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let delayed_start = std::env::var("AFT_TEST_INLINE_READY_BUILD_DELAY_MS")
+            .ok()
+            .map(|value| {
+                let delay = Duration::from_millis(value.parse().expect("build delay milliseconds"));
+                let (reached, release) =
+                    install_callgraph_build_start_gate(ctx.callgraph_project_root().unwrap());
+                (delay, reached, release)
+            });
         assert!(matches!(
-            ctx.callgraph_store_for_ops(),
+            ctx.schedule_callgraph_store_warm(),
+            CallgraphStoreAccess::Building
+        ));
+        if let Some((delay, reached, release)) = delayed_start {
+            reached
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker did not reach delayed build start");
+            std::thread::sleep(delay);
+            release.send(()).expect("release delayed build");
+        }
+        let events = ctx
+            .callgraph_store_rx()
+            .lock()
+            .take()
+            .expect("build receiver");
+        let ready = events
+            .recv_timeout(Duration::from_secs(60))
+            .expect("callgraph build did not publish its completion");
+        assert!(matches!(&ready, CallGraphStoreBuildEvent::Ready { .. }));
+
+        // A query receiving Ready must clear its build receiver even if reopening
+        // the published store fails, without discarding pending watcher paths. Wait
+        // for the build event first so extraction and disk I/O cannot use up the
+        // query's wait window. Remove the pointer before the query so it cannot
+        // return a disk reader without consuming Ready; the event retains the
+        // built store's writer lease until the query drops it.
+        std::fs::remove_file(pointer).expect("remove published pointer");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ready).expect("queue Ready event");
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60)),
             CallgraphStoreAccess::Building
         ));
         assert!(
@@ -11031,6 +12656,124 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             response.data["message"],
             "callers: callgraph store is building in the background; retry shortly"
+        );
+    }
+
+    impl ViewsCallgraphFixture {
+        /// Publish the current HEAD as a generation without call graph data,
+        /// as a session with the call graph off does, and pin it as this
+        /// context's view, as configure does when it loads that generation.
+        fn publish_without_callgraph(&self) -> String {
+            let view = self.ctx.view_runtime_snapshot().expect("view runtime");
+            let head = crate::alias::head_tree_entries(&self.root).expect("HEAD entries");
+            let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+            let report = crate::views::assembly::publish_checkout(
+                &crate::views::assembly::AssemblyRequest {
+                    storage: view.storage.clone(),
+                    project_root: self.root.clone(),
+                    family: view.family.clone(),
+                    scope: view.scope.clone(),
+                    desired_head: desired_head.clone(),
+                    changed_paths: Default::default(),
+                    semantic_keys: Default::default(),
+                    require_semantic: false,
+                    allow_blob_put: true,
+                    callgraph: false,
+                },
+            )
+            .expect("keyless view publication");
+            assert!(report.published, "keyless generation must publish");
+            let manifest = report.manifest.expect("published manifest");
+            assert!(crate::views::assembly::manifest_lacks_callgraph(&manifest));
+            let generation = report.generation.expect("published generation");
+            let pin =
+                crate::pins::QueryPin::acquire(&view.view_dir, &generation).expect("query pin");
+            self.ctx.install_view_runtime(
+                ViewRuntimeSnapshot {
+                    generation: Some(generation.clone()),
+                    manifest: Some(manifest),
+                    head_fingerprint: desired_head,
+                    pending_paths: BTreeSet::new(),
+                    ..view
+                },
+                Some(pin),
+            );
+            generation
+        }
+
+        /// Hold the derived database of the pinned generation busy the way a
+        /// writer does mid-maintenance: an exclusive lock that a zero-wait
+        /// reader cannot get past. Waits for the publication's own deferred
+        /// checkpoint first so only this connection holds the file. The lock
+        /// lasts as long as the returned connection.
+        fn hold_pinned_derived_busy(&self) -> rusqlite::Connection {
+            let view = self.ctx.pinned_view_runtime().expect("pinned view runtime");
+            crate::views::wait_for_derived_checkpoint_for_test(&view.view_dir);
+            let generation = view.generation.expect("pinned generation");
+            let path = crate::views::resolve_derived_path(&view.view_dir, &generation)
+                .expect("derived path");
+            assert!(
+                path.is_file(),
+                "derived database {} missing",
+                path.display()
+            );
+            let holder = rusqlite::Connection::open(&path).expect("derived writer");
+            holder
+                .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+                .expect("exclusive derived lock");
+            holder
+        }
+    }
+
+    /// Whether a generation carries a call graph is a property of its
+    /// manifest alone. A generation published with the call graph off must
+    /// answer "disabled" even while its derived database is busy; answering
+    /// "building, retry" would send the agent into a retry loop for a graph
+    /// that will never be built from this generation.
+    #[test]
+    fn views_keyless_generation_answers_disabled_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish_without_callgraph();
+        let _busy = fixture.hold_pinned_derived_busy();
+
+        let response = fixture.callers();
+
+        assert!(!response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["code"], "callgraph_unavailable",
+            "{:#}",
+            response.data
+        );
+        assert!(
+            response.data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(crate::views::read::CALLGRAPH_DISABLED)),
+            "{:#}",
+            response.data
+        );
+    }
+
+    /// The counterpart: a generation that does carry a call graph, read while
+    /// its derived database is busy, is temporarily unreadable and says so as
+    /// a retryable `callgraph_building`. This also proves the busy hold above
+    /// really blocks a reader that opens the store.
+    #[test]
+    fn views_keyed_generation_answers_building_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish();
+        let _busy = fixture.hold_pinned_derived_busy();
+
+        let response = fixture.callers();
+
+        assert!(!response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["code"], "callgraph_building",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["message"],
+            "callers: persisted callgraph store is busy; retry shortly"
         );
     }
 
@@ -12672,6 +14415,31 @@ mod harness_path_tests {
 mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn database_retry_without_configured_root_refuses_without_panicking() {
+        let ctx = AppContext::from_app(App::default_shared(), Config::default());
+        assert!(ctx.canonical_cache_root_opt().is_none());
+        ctx.finish_database_runtime_error("database busy".into(), true);
+        assert!(ctx
+            .database_runtime_refusal("first", "db_set_host_state")
+            .is_some());
+        assert!(ctx.claim_database_runtime_retry("db_set_host_state"));
+        ctx.retry_database_runtime();
+        let response = serde_json::to_value(
+            ctx.database_runtime_refusal("retry", "db_set_host_state")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["code"], "database_unavailable");
+        assert_eq!(response["retryable"], false);
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("configured database root is missing"));
+        assert!(!ctx.claim_database_runtime_retry("db_set_host_state"));
+        assert!(ctx.database_runtime_refusal("read", "read").is_none());
+    }
 
     #[test]
     fn app_contexts_share_one_database_connection() {

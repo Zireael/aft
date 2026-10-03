@@ -7,6 +7,7 @@ use tree_sitter::{Node, Parser};
 use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
+    MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
@@ -34,6 +35,15 @@ pub const HUB_SUMMARY_LIMIT: usize = 15;
 // layered call graph from unfolding millions of path prefixes synchronously.
 const TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
 const TRACE_TO_RETAINED_PATH_LIMIT: usize = HUB_SUMMARY_LIMIT * 4;
+/// Maximum number of macro-template and macro-invocation entries added to one
+/// `callers` answer; further ones are not listed.
+const MACRO_VIA_ENTRY_LIMIT: usize = 50;
+/// Maximum number of unanalyzed macro mentions counted exactly in one
+/// `callers` answer; beyond it the note reports the count as a lower bound.
+const MACRO_MENTION_COUNT_LIMIT: usize = 100;
+/// Maximum number of mention locations written out in the unanalyzed-macro
+/// note; further locations are counted but not shown.
+const MACRO_MENTION_SHOWN: usize = 5;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -76,6 +86,22 @@ pub struct StoreCallersResult {
     pub truncated: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callers_list_envelope: Option<ListEnvelope>,
+    /// Present when the target's name appears inside Rust macro token trees
+    /// that could not be parsed, so the caller list may be incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub macro_note: Option<StoreMacroNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreMacroNote {
+    pub message: String,
+    /// Unanalyzed mention locations found (extraction keeps one per name and
+    /// file), capped at `MACRO_MENTION_COUNT_LIMIT`.
+    pub mentions: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub mentions_is_lower_bound: bool,
+    /// `file:line` of the first mentions.
+    pub sites: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +118,10 @@ pub struct StoreCallerEntry {
     pub approximate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
+    /// The macro (`name!`) whose template makes the call. Set on the sites
+    /// that invoke that macro: the call runs there once the macro expands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +137,8 @@ pub struct StoreCallTreeNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_by: Option<String>,
     pub children: Vec<StoreCallTreeNode>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub work_gap: Option<crate::callgraph::CallTreeWorkGap>,
     pub depth_limited: bool,
     pub truncated: usize,
     #[serde(skip_serializing_if = "is_zero")]
@@ -548,14 +580,10 @@ pub fn callers_result(
         None
     };
 
-    let callers_list_envelope = build_callgraph_envelope(
-        Unit::Items,
-        shown,
-        post_filter_count,
-        truncated.max(usize::from(depth_limited)),
-    );
     let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
+    let mut listed = HashSet::new();
     for site in visible_sites {
+        listed.insert((site.caller.file.clone(), site.line));
         groups
             .entry(site.caller.file.clone())
             .or_default()
@@ -564,8 +592,32 @@ pub fn callers_result(
                 line: site.line,
                 approximate: edge_approximate(&site),
                 resolved_by: edge_resolved_by(&site),
+                via: None,
             });
     }
+
+    let is_rust = target.representative.lang == crate::parser::LangId::Rust;
+    let via_entries = if is_rust {
+        macro_via_entries(store, &target, include_tests, &listed)?
+    } else {
+        Vec::new()
+    };
+    let via_count = via_entries.len();
+    for (file, entry) in via_entries {
+        groups.entry(file).or_default().push(entry);
+    }
+    let macro_note = if is_rust {
+        unanalyzed_macro_note(store, &target.representative.name, include_tests)?
+    } else {
+        None
+    };
+
+    let callers_list_envelope = build_callgraph_envelope(
+        Unit::Items,
+        shown + via_count,
+        post_filter_count + via_count,
+        truncated.max(usize::from(depth_limited)),
+    );
 
     Ok(StoreCallersResult {
         symbol: target.representative.symbol,
@@ -574,14 +626,137 @@ pub fn callers_result(
             .into_iter()
             .map(|(file, callers)| StoreCallerGroup { file, callers })
             .collect(),
-        total_callers,
+        total_callers: total_callers + via_count,
         hidden_test_callers: if include_tests { 0 } else { hidden_tests },
         hub_summary,
         scanned_files: store.indexed_file_count()?,
         depth_limited,
         truncated,
         callers_list_envelope,
+        macro_note,
     })
+}
+
+/// Callers reached through `macro_rules!` templates that call the target
+/// outside any item the template defines. Each such template contributes its
+/// own call site (listed under the macro name, `name!`) and every invocation
+/// of the macro (listed under the invoking symbol, annotated `via name!`).
+///
+/// Templates, invocations and the target are all matched by name only, so
+/// every entry is marked name-resolved. When several symbols share the
+/// target's name no entries are produced, because nothing tells which of them
+/// a template calls. Only macros defined in the project have template refs,
+/// and the entry count is capped at `MACRO_VIA_ENTRY_LIMIT` by the queries.
+fn macro_via_entries(
+    store: &impl CallGraphRead,
+    target: &ResolvedStoreSymbol,
+    include_tests: bool,
+    listed: &HashSet<(String, u32)>,
+) -> StoreAdapterResult<Vec<(String, StoreCallerEntry)>> {
+    let name = &target.representative.name;
+    let template_calls =
+        store.ref_sites_named(MACRO_BODY_CALL_REF_KIND, name, MACRO_VIA_ENTRY_LIMIT)?;
+    if template_calls.is_empty() {
+        return Ok(Vec::new());
+    }
+    let namesakes = store
+        .nodes_matching(name)?
+        .into_iter()
+        .filter(|node| node.name == *name && !target.nodes.contains(node))
+        .count();
+    if namesakes > 0 {
+        return Ok(Vec::new());
+    }
+
+    let name_match = |symbol: String, line: u32, via: Option<String>| StoreCallerEntry {
+        symbol,
+        line,
+        approximate: Some(true),
+        resolved_by: Some("name_match".to_string()),
+        via,
+    };
+    let mut entries = Vec::new();
+    let mut macros = BTreeSet::new();
+    for site in template_calls {
+        let Some(macro_name) = site.local_name else {
+            continue;
+        };
+        if include_tests || !is_test_file(&site.file) {
+            entries.push((site.file, name_match(macro_name.clone(), site.line, None)));
+        }
+        macros.insert(macro_name);
+    }
+    for macro_name in macros {
+        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
+        if remaining == 0 {
+            break;
+        }
+        for site in store.ref_sites_named("call", &macro_name, remaining)? {
+            if (!include_tests && is_test_file(&site.file))
+                || listed.contains(&(site.file.clone(), site.line))
+            {
+                continue;
+            }
+            let symbol = site
+                .caller_symbol
+                .unwrap_or_else(|| "<top-level>".to_string());
+            entries.push((
+                site.file,
+                name_match(symbol, site.line, Some(macro_name.clone())),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+/// A note naming where the target's name occurs inside Rust macro token trees
+/// that could not be parsed as Rust. Calls there are invisible to the call
+/// graph, so without the note an empty or short caller list would read as
+/// complete when it may not be.
+fn unanalyzed_macro_note(
+    store: &impl CallGraphRead,
+    name: &str,
+    include_tests: bool,
+) -> StoreAdapterResult<Option<StoreMacroNote>> {
+    // One more than the limit tells an exact count from a lower bound.
+    let rows =
+        store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
+    let mut seen = BTreeSet::new();
+    let mut sites = Vec::new();
+    for row in rows {
+        if !include_tests && is_test_file(&row.file) {
+            continue;
+        }
+        if seen.insert((row.file.clone(), row.line)) {
+            sites.push(format!("{}:{}", row.file, row.line));
+        }
+    }
+    if sites.is_empty() {
+        return Ok(None);
+    }
+    let mentions_is_lower_bound = sites.len() > MACRO_MENTION_COUNT_LIMIT;
+    sites.truncate(MACRO_MENTION_COUNT_LIMIT);
+    let mentions = sites.len();
+    sites.truncate(MACRO_MENTION_SHOWN);
+    let count = if mentions_is_lower_bound {
+        format!("{mentions}+")
+    } else {
+        mentions.to_string()
+    };
+    let noun = if mentions == 1 { "mention" } else { "mentions" };
+    let listed = if mentions > sites.len() {
+        format!("{}, … (shown {} of {count})", sites.join(", "), sites.len())
+    } else {
+        sites.join(", ")
+    };
+    Ok(Some(StoreMacroNote {
+        message: format!(
+            "{count} {noun} of `{name}` inside macros could not be analyzed (one location per file): {listed}"
+        ),
+        mentions,
+        mentions_is_lower_bound,
+        sites,
+    }))
 }
 
 pub fn call_tree_result(
@@ -594,15 +769,24 @@ pub fn call_tree_result(
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
     let mut adjacency_cache = HashMap::new();
+    let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
     let mut tree = call_tree_inner(
         store,
         &target,
-        depth,
+        depth.min(100),
         0,
         &mut visited,
         &mut adjacency_cache,
         true,
+        &mut remaining,
     )?;
+    if remaining == 0 && tree.truncated > 0 {
+        tree.work_gap = Some(crate::callgraph::CallTreeWorkGap {
+            complete: false,
+            nodes_examined: crate::callgraph::CALL_TREE_NODE_BUDGET,
+            gap: crate::callgraph::CALL_TREE_WORK_GAP.into(),
+        });
+    }
     let hidden_test_callers = if include_tests {
         0
     } else {
@@ -619,6 +803,15 @@ pub fn call_tree_result(
         total_children,
         tree.truncated.max(usize::from(tree.depth_limited)),
     );
+    if tree.work_gap.is_some() {
+        tree.tree_list_envelope = Some(ListEnvelope::new(
+            shown,
+            crate::list_envelope::Total::AtLeast(total_children),
+            Unit::Items,
+            vec![crate::list_envelope::Reason::Cap],
+            &["symbol", "depth"],
+        ));
+    }
     Ok(tree)
 }
 
@@ -722,17 +915,22 @@ pub fn impact_result(
         .unwrap_or_default();
 
     let mut callers = Vec::new();
+    // Each caller file is read once, however many of its call sites are shown.
+    let mut source_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
     for site in visible_sites {
+        let lines = source_lines
+            .entry(site.caller.file.clone())
+            .or_insert_with(|| read_source_lines(&store.project_root().join(&site.caller.file)));
         callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
             line: site.line,
             signature: site.caller.signature.clone(),
             is_entry_point: site.caller.is_entry_point,
-            call_expression: read_source_line(
-                &store.project_root().join(&site.caller.file),
-                site.line,
-            ),
+            call_expression: lines
+                .as_ref()
+                .and_then(|lines| lines.get(site.line.saturating_sub(1) as usize))
+                .cloned(),
             parameters: site
                 .caller
                 .signature
@@ -833,12 +1031,28 @@ fn trace_to_result_with_budget(
             continue;
         };
         let caller_key = (current.node.file.clone(), current.node.symbol.clone());
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            callers_by_symbol.entry(caller_key.clone())
-        {
-            let callers =
-                dedup_call_sites(store.direct_callers_of(Path::new(&caller_key.0), &caller_key.1)?);
-            entry.insert(callers);
+        if !callers_by_symbol.contains_key(&caller_key) {
+            // Fetch this node's callers together with those of every other
+            // queued path end that will still be expanded, in one batched
+            // query, instead of one query per node.
+            let mut wanted = BTreeSet::from([caller_key.clone()]);
+            for (queued, queued_depth) in &queue {
+                if *queued_depth >= effective_max {
+                    continue;
+                }
+                if let Some(end) = queued.last() {
+                    let key = (end.node.file.clone(), end.node.symbol.clone());
+                    if !callers_by_symbol.contains_key(&key) {
+                        wanted.insert(key);
+                    }
+                }
+            }
+            let wanted = wanted.into_iter().collect::<Vec<_>>();
+            let mut fetched = store.direct_callers_for_symbols(&wanted)?;
+            for key in wanted {
+                let callers = dedup_call_sites(fetched.remove(&key).unwrap_or_default());
+                callers_by_symbol.insert(key, callers);
+            }
         }
         let callers = callers_by_symbol
             .get(&caller_key)
@@ -1862,6 +2076,15 @@ mod outbound_serialization_failure_tests {
 }
 
 pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStoreError) -> Response {
+    // A published WAL generation can still be busy during writer maintenance.
+    // Contention is temporary, not evidence that the persisted graph is broken.
+    if error.is_transient_lock_contention() {
+        return Response::error(
+            req_id,
+            "callgraph_building",
+            format!("{operation}: persisted callgraph store is busy; retry shortly"),
+        );
+    }
     match error {
         CallGraphStoreError::Aft(error) => Response::error(req_id, error.code(), error.to_string()),
         CallGraphStoreError::Unavailable(message) => Response::error(
@@ -1888,6 +2111,25 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
 #[cfg(test)]
 mod serialization_tests {
     use super::*;
+
+    #[test]
+    fn sqlite_contention_is_retryable_but_other_store_errors_are_not() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("database is locked".into()),
+            ));
+            let response = store_error_response("request", "trace_to", error);
+            assert!(!response.success);
+            assert_eq!(response.data["code"], "callgraph_building");
+        }
+        let response = store_error_response(
+            "request",
+            "trace_to",
+            CallGraphStoreError::Sqlite(rusqlite::Error::InvalidQuery),
+        );
+        assert_eq!(response.data["code"], "callgraph_store_error");
+    }
 
     struct RefusesSerialization;
 
@@ -2109,7 +2351,7 @@ fn resolve_exact_symbol(
     fallback: Option<StoreNode>,
 ) -> StoreAdapterResult<Option<ResolvedStoreSymbol>> {
     let nodes = store
-        .nodes_for(Path::new(file), symbol)?
+        .nodes_for_stored(file, symbol)?
         .into_iter()
         .filter(|node| node.symbol == symbol)
         .collect::<Vec<_>>();
@@ -2272,7 +2514,9 @@ fn call_tree_inner(
     visited: &mut HashSet<(String, String)>,
     adjacency_cache: &mut HashMap<(String, String), Vec<ForwardCall>>,
     memoize_adjacency: bool,
+    remaining: &mut usize,
 ) -> StoreAdapterResult<StoreCallTreeNode> {
+    *remaining -= 1;
     let node = &current.representative;
     let visit_key = (node.file.clone(), node.symbol.clone());
     if visited.contains(&visit_key) {
@@ -2289,6 +2533,7 @@ fn call_tree_inner(
             truncated: 0,
             hidden_test_callers: 0,
             tree_list_envelope: None,
+            work_gap: None,
         });
     }
     visited.insert(visit_key.clone());
@@ -2312,6 +2557,10 @@ fn call_tree_inner(
 
     if current_depth < max_depth {
         for call in calls {
+            if *remaining == 0 {
+                truncated += 1;
+                break;
+            }
             match call {
                 ForwardCall::Resolved(site) => {
                     let resolved = resolve_exact_symbol(
@@ -2329,6 +2578,7 @@ fn call_tree_inner(
                             visited,
                             adjacency_cache,
                             memoize_adjacency,
+                            remaining,
                         )?;
                         child.approximate = edge_approximate(&site);
                         child.resolved_by = edge_resolved_by(&site);
@@ -2336,6 +2586,7 @@ fn call_tree_inner(
                         truncated += child.truncated;
                         children.push(child);
                     } else {
+                        *remaining -= 1;
                         children.push(StoreCallTreeNode {
                             name: site.target_symbol.clone(),
                             file: site.target_file.clone(),
@@ -2349,23 +2600,28 @@ fn call_tree_inner(
                             truncated: 0,
                             hidden_test_callers: 0,
                             tree_list_envelope: None,
+                            work_gap: None,
                         });
                     }
                 }
-                ForwardCall::Unresolved(call) => children.push(StoreCallTreeNode {
-                    name: call.symbol,
-                    file: call.caller.file,
-                    line: call.line,
-                    signature: None,
-                    resolved: false,
-                    approximate: None,
-                    resolved_by: None,
-                    children: Vec::new(),
-                    depth_limited: false,
-                    truncated: 0,
-                    hidden_test_callers: 0,
-                    tree_list_envelope: None,
-                }),
+                ForwardCall::Unresolved(call) => {
+                    *remaining -= 1;
+                    children.push(StoreCallTreeNode {
+                        name: call.symbol,
+                        file: call.caller.file,
+                        line: call.line,
+                        signature: None,
+                        resolved: false,
+                        approximate: None,
+                        resolved_by: None,
+                        children: Vec::new(),
+                        depth_limited: false,
+                        truncated: 0,
+                        hidden_test_callers: 0,
+                        tree_list_envelope: None,
+                        work_gap: None,
+                    });
+                }
             }
         }
     } else if !calls.is_empty() {
@@ -2387,6 +2643,7 @@ fn call_tree_inner(
         truncated,
         hidden_test_callers: 0,
         tree_list_envelope: None,
+        work_gap: None,
     })
 }
 
@@ -2498,12 +2755,10 @@ fn unqualified_name(symbol: &str) -> &str {
     symbol.rsplit("::").next().unwrap_or(symbol)
 }
 
-fn read_source_line(path: &Path, line: u32) -> Option<String> {
+/// The file's lines, trimmed.
+fn read_source_lines(path: &Path) -> Option<Vec<String>> {
     let source = std::fs::read_to_string(path).ok()?;
-    source
-        .lines()
-        .nth(line.saturating_sub(1) as usize)
-        .map(|line| line.trim().to_string())
+    Some(source.lines().map(|line| line.trim().to_string()).collect())
 }
 
 fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
@@ -2917,6 +3172,7 @@ mod trace_to_tests {
         };
         let mut visited = HashSet::new();
         let mut unused_cache = HashMap::new();
+        let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
         let mut uncached = call_tree_inner(
             &store,
             &resolved_root,
@@ -2925,6 +3181,7 @@ mod trace_to_tests {
             &mut visited,
             &mut unused_cache,
             false,
+            &mut remaining,
         )
         .expect("uncached call tree");
         let uncached_queries = store.total_forward_queries();
@@ -3060,12 +3317,15 @@ mod trace_to_tests {
         assert_eq!(result.total_paths, 8);
         assert!(!result.total_paths_is_lower_bound);
         assert_eq!(expansions, 15);
-        assert_eq!(store.total_caller_queries(), 7);
-        assert!(store
-            .caller_queries
-            .borrow()
-            .values()
-            .all(|queries| *queries == 1));
+        // Callers are fetched in frontier batches; summed over the batches,
+        // each of the 7 distinct symbols is requested exactly once.
+        assert_eq!(store.total_caller_queries(), 0);
+        assert_eq!(store.caller_frontier_target_count(), 7);
+        assert!(
+            store.total_caller_frontier_queries() < 7,
+            "callers must be fetched in batches, not once per symbol: {} queries",
+            store.total_caller_frontier_queries()
+        );
     }
 
     #[test]

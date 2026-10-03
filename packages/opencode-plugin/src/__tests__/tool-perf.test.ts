@@ -18,7 +18,9 @@ mock.module("../logger.js", () => ({
   bridgeLogger: { log: () => {}, warn: () => {}, error: () => {} },
 }));
 
-const { instrumentToolMap, markBridgeStart, markBridgeEnd } = await import("../tool-perf.js");
+const { instrumentToolMap, markBridgeStart, markBridgeEnd, measurePreStage } = await import(
+  "../tool-perf.js"
+);
 
 function makeTool(execute: ToolDefinition["execute"]): ToolDefinition {
   return { description: "t", args: {}, execute } as ToolDefinition;
@@ -72,6 +74,25 @@ describe("tool-perf instrumentation", () => {
     expect(line?.message).toMatch(/bridge=\d+ms/);
     expect(line?.message).toMatch(/post=\d+ms/);
     expect(line?.message).not.toContain("(no bridge call)");
+  });
+
+  test("reports directory permission and capability stages", async () => {
+    const tools = instrumentToolMap({
+      read: makeTool(async () => {
+        for (const stage of ["directory", "permission", "capability"] as const) {
+          await measurePreStage(stage, () => new Promise((resolve) => setTimeout(resolve, 10)));
+        }
+        markBridgeStart();
+        markBridgeEnd();
+        return "ok";
+      }),
+    });
+    await tools.read!.execute!({} as never, { sessionID: "stages" } as never);
+    const message = lastLine()?.message ?? "";
+    for (const stage of ["directory", "permission", "capability"]) {
+      const match = message.match(new RegExp(`${stage}=(\\d+)ms`));
+      expect(Number(match?.[1])).toBeGreaterThan(0);
+    }
   });
 
   test("emits a perf line even when the tool throws", async () => {

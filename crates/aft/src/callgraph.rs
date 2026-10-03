@@ -71,10 +71,32 @@ struct RustCrateTargets {
     target_roots: Vec<PathBuf>,
 }
 
+/// Interior-mutable memo storage. A lock rather than a `RefCell` lets one memo
+/// be shared by the cold build's parse pool; each access holds it only for a
+/// single lookup or insert, never across the work that computes a value.
+#[derive(Default)]
+struct MemoCell<T>(std::sync::Mutex<T>);
+
+impl<T> MemoCell<T> {
+    fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    fn borrow(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn borrow_mut(&self) -> std::sync::MutexGuard<'_, T> {
+        self.borrow()
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RustCrateRootMemo {
-    caller_roots: std::rc::Rc<RefCell<HashMap<PathBuf, Option<PathBuf>>>>,
-    crate_targets: std::rc::Rc<RefCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
+    caller_roots: Arc<MemoCell<HashMap<PathBuf, Option<PathBuf>>>>,
+    crate_targets: Arc<MemoCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
 }
 
 struct BoundedMemo<K, V> {
@@ -120,38 +142,38 @@ impl<K: Eq + std::hash::Hash, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
-    module_paths: RefCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
-    json_values: RefCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
-    workspace_packages: RefCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
-    rust_declared_modules: RefCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
+    module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
+    json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
+    workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
+    rust_declared_modules: MemoCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
     rust_crate_roots: RustCrateRootMemo,
     #[cfg(test)]
     collect_metrics: bool,
     #[cfg(test)]
-    module_computations: RefCell<HashMap<ModuleResolutionKey, usize>>,
+    module_computations: MemoCell<HashMap<ModuleResolutionKey, usize>>,
     #[cfg(test)]
-    json_probes: RefCell<HashMap<PathBuf, usize>>,
+    json_probes: MemoCell<HashMap<PathBuf, usize>>,
     #[cfg(test)]
-    rust_declaration_parses: RefCell<HashMap<String, usize>>,
+    rust_declaration_parses: MemoCell<HashMap<String, usize>>,
 }
 
 impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
-            module_paths: RefCell::new(BoundedMemo::new(
+            module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
             )),
-            json_values: RefCell::new(BoundedMemo::new(
+            json_values: MemoCell::new(BoundedMemo::new(
                 JSON_VALUE_MEMO_MAX_ENTRIES,
                 JSON_VALUE_MEMO_MAX_RETAINED_BYTES,
             )),
-            workspace_packages: RefCell::new(BoundedMemo::new(
+            workspace_packages: MemoCell::new(BoundedMemo::new(
                 WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES,
                 WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES,
             )),
-            rust_declared_modules: RefCell::new(BoundedMemo::new(
+            rust_declared_modules: MemoCell::new(BoundedMemo::new(
                 RUST_DECLARED_MODULE_MEMO_MAX_ENTRIES,
                 RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES,
             )),
@@ -159,11 +181,11 @@ impl Default for ModuleResolutionMemo {
             #[cfg(test)]
             collect_metrics: false,
             #[cfg(test)]
-            module_computations: RefCell::new(HashMap::new()),
+            module_computations: MemoCell::new(HashMap::new()),
             #[cfg(test)]
-            json_probes: RefCell::new(HashMap::new()),
+            json_probes: MemoCell::new(HashMap::new()),
             #[cfg(test)]
-            rust_declaration_parses: RefCell::new(HashMap::new()),
+            rust_declaration_parses: MemoCell::new(HashMap::new()),
         }
     }
 }
@@ -506,6 +528,16 @@ pub struct FileCallData {
     /// Rust function items referenced as values, grouped by containing symbol.
     /// These do not participate in callgraph navigation.
     pub value_refs_by_symbol: HashMap<String, Vec<CallSite>>,
+    /// Calls written in a `macro_rules!` template outside any item defined in
+    /// that template, keyed by macro name with its `!` (e.g. `check!`). They
+    /// run wherever the macro is invoked, so `callers` reports the macro's
+    /// invocation sites for them instead of a caller in this file.
+    pub macro_body_calls_by_macro: HashMap<String, Vec<CallSite>>,
+    /// Identifiers inside Rust macro token trees that could not be parsed as
+    /// Rust, grouped by containing symbol. `callers` counts these as mentions
+    /// it could not analyze, so a target named only there is not reported as
+    /// having no callers without comment.
+    pub macro_mentions_by_symbol: HashMap<String, Vec<CallSite>>,
     /// Names of exported symbols in this file.
     pub exported_symbols: Vec<String>,
     /// Per-symbol metadata (kind, exported, signature).
@@ -602,8 +634,20 @@ pub struct CallTreeNode {
     pub children: Vec<CallTreeNode>,
     /// Whether traversal below this node stopped at the requested depth.
     pub depth_limited: bool,
-    /// Number of child call edges omitted because of the depth limit.
+    /// Number of omitted edges, a lower bound when the work budget is exhausted.
     pub truncated: usize,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub work_gap: Option<CallTreeWorkGap>,
+}
+
+pub const CALL_TREE_NODE_BUDGET: usize = 1000;
+pub const CALL_TREE_WORK_GAP: &str = "Call tree cut short: examined 1000 call nodes (work budget); additional nodes not examined · narrow: symbol, depth";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallTreeWorkGap {
+    pub complete: bool,
+    pub nodes_examined: usize,
+    pub gap: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1338,79 @@ fn collect_calls_by_symbol(
     )
 }
 
+/// Separate calls written directly in a `macro_rules!` template from ordinary
+/// calls. A call inside an item that the template itself defines (a method in
+/// a macro that stamps out a whole `impl` body) stays an ordinary call of that
+/// item. Any other call in a template belongs to the macro, keyed `name!`,
+/// because attributing it to the code around the definition would name a
+/// caller that never runs it.
+fn split_macro_body_calls(
+    source: &str,
+    symbols: &[Symbol],
+    raw_calls: Vec<crate::calls::CallTuple>,
+    bodies: &[crate::calls::RustMacroBody],
+) -> (Vec<crate::calls::CallTuple>, HashMap<String, Vec<CallSite>>) {
+    let mut body_calls: HashMap<String, Vec<CallSite>> = HashMap::new();
+    if bodies.is_empty() {
+        return (raw_calls, body_calls);
+    }
+    let line_index = SourceLineIndex::new(source);
+    let symbol_ranges = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                line_index.byte_offset(symbol.range.start_line, symbol.range.start_col),
+                line_index.byte_offset(symbol.range.end_line, symbol.range.end_col),
+            )
+        })
+        .collect::<Vec<_>>();
+    // For each template, the items it defines itself.
+    let body_symbols = bodies
+        .iter()
+        .map(|body| {
+            symbol_ranges
+                .iter()
+                .copied()
+                .filter(|(start, end)| body.byte_start <= *start && *end <= body.byte_end)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut ordinary = Vec::with_capacity(raw_calls.len());
+    for call in raw_calls {
+        let (_, _, _, call_start, call_end) = call;
+        // Templates can nest; the innermost one holding the call owns it.
+        let innermost = bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| body.byte_start <= call_start && call_end <= body.byte_end)
+            .min_by_key(|(_, body)| body.byte_end - body.byte_start);
+        let Some((body_index, body)) = innermost else {
+            ordinary.push(call);
+            continue;
+        };
+        let inside_defined_item = body_symbols[body_index]
+            .iter()
+            .any(|(start, end)| *start <= call_start && call_end <= *end);
+        if inside_defined_item {
+            ordinary.push(call);
+            continue;
+        }
+        let (full, short, line, byte_start, byte_end) = call;
+        body_calls
+            .entry(format!("{}!", body.name))
+            .or_default()
+            .push(CallSite {
+                callee_name: short,
+                full_callee: full,
+                line,
+                byte_start,
+                byte_end,
+            });
+    }
+    (ordinary, body_calls)
+}
+
 fn collect_rust_value_refs_by_symbol(
     source: &str,
     root: Node<'_>,
@@ -1397,7 +1514,20 @@ pub(crate) fn build_file_data_from_source_with_lang(
     let symbols = crate::parser::extract_symbols_from_tree(&source, &tree, lang)?;
 
     let root = tree.root_node();
-    let mut calls_by_symbol = collect_calls_by_symbol(&source, root, lang, &symbols);
+    let mut macro_body_calls_by_macro = HashMap::new();
+    let mut macro_mentions_by_symbol = HashMap::new();
+    let mut calls_by_symbol = if lang == LangId::Rust {
+        let (raw_calls, macro_facts) =
+            crate::calls::extract_rust_calls_with_macro_facts(&source, root, 0, source.len());
+        let (raw_calls, body_calls) =
+            split_macro_body_calls(&source, &symbols, raw_calls, &macro_facts.bodies);
+        macro_body_calls_by_macro = body_calls;
+        macro_mentions_by_symbol =
+            attribute_sites_to_symbols(&source, &symbols, macro_facts.unparsed_mentions);
+        attribute_sites_to_symbols(&source, &symbols, raw_calls)
+    } else {
+        collect_calls_by_symbol(&source, root, lang, &symbols)
+    };
     let value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols)
     } else {
@@ -1507,6 +1637,8 @@ pub(crate) fn build_file_data_from_source_with_lang(
     Ok(FileCallData {
         calls_by_symbol,
         value_refs_by_symbol,
+        macro_body_calls_by_macro,
+        macro_mentions_by_symbol,
         exported_symbols,
         symbol_metadata,
         default_export_symbol: default_export.map(|export| export.symbol),
@@ -3518,6 +3650,19 @@ fn find_alias_original(raw_import: &str, local_name: &str) -> Option<String> {
 // Worktree file discovery
 // ---------------------------------------------------------------------------
 
+/// Directories the callgraph walk always skips, whatever .gitignore says.
+const WALK_EXCLUDED_DIR_NAMES: [&str; 9] = [
+    "node_modules",
+    "target",
+    "venv",
+    ".venv",
+    ".git",
+    "__pycache__",
+    ".tox",
+    "dist",
+    "build",
+];
+
 /// Walk project files respecting .gitignore, excluding common non-source dirs.
 ///
 /// Returns an iterator of file paths for supported source file types.
@@ -3537,11 +3682,7 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules" | "target" | "venv" | ".venv" | ".git" | "__pycache__"
-                        | ".tox" | "dist" | "build"
-                );
+                return !WALK_EXCLUDED_DIR_NAMES.contains(&name.as_ref());
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         })
@@ -3552,6 +3693,37 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .filter(|entry| detect_language(entry.path()).is_some())
         .map(|entry| entry.into_path())
+}
+
+/// Whether [`walk_project_files`] can yield the file at this root-relative
+/// path (`/` or `\` separators), judged from the path alone: a supported
+/// source type, no hidden component, no always-excluded directory and no OS
+/// metadata file name. Ignore files are not consulted; callers pass paths
+/// that an ignore-respecting walk has already produced.
+pub fn walk_could_include(relative: &str) -> bool {
+    let components: Vec<&str> = relative
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .collect();
+    let Some((file_name, directories)) = components.split_last() else {
+        return false;
+    };
+    if components
+        .iter()
+        .any(|component| component.starts_with('.'))
+    {
+        return false;
+    }
+    if directories
+        .iter()
+        .any(|directory| WALK_EXCLUDED_DIR_NAMES.contains(directory))
+    {
+        return false;
+    }
+    if crate::os_metadata::is_os_metadata_file_name(std::ffi::OsStr::new(file_name)) {
+        return false;
+    }
+    detect_language(Path::new(file_name)).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -3875,6 +4047,8 @@ def right():
         let file_data = FileCallData {
             calls_by_symbol: HashMap::new(),
             value_refs_by_symbol: HashMap::new(),
+            macro_body_calls_by_macro: HashMap::new(),
+            macro_mentions_by_symbol: HashMap::new(),
             exported_symbols: vec!["total_disk_bytes".to_string()],
             symbol_metadata,
             default_export_symbol: None,

@@ -275,9 +275,43 @@ pub(crate) fn spawn_reader(
                 coordinator.task_id
             );
         }
+        #[cfg(test)]
+        wait_on_pty_reader_gate_for_test(&coordinator.task_id);
         reader_done.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     });
+}
+
+/// Test gates that hold a PTY reader after it reached end-of-file and before
+/// it reports itself done (and so before the watchdog wake), keyed by task id
+/// so parallel tests do not collide.
+#[cfg(test)]
+static PTY_READER_GATES: std::sync::OnceLock<
+    Mutex<HashMap<String, crossbeam_channel::Receiver<()>>>,
+> = std::sync::OnceLock::new();
+
+/// Hold the reader of `task_id` at end-of-file until the returned sender is
+/// used (or dropped).
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn install_pty_reader_gate_for_test(task_id: &str) -> crossbeam_channel::Sender<()> {
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    PTY_READER_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(task_id.to_string(), release_rx);
+    release_tx
+}
+
+#[cfg(test)]
+fn wait_on_pty_reader_gate_for_test(task_id: &str) {
+    let gate = PTY_READER_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(release) = gate {
+        let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+    }
 }
 
 /// Detects the DSR cursor-position query `\x1b[6n` (4 bytes) in a byte stream

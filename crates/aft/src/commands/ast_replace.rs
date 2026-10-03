@@ -260,14 +260,17 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             let replacement_count = edits.len();
             // Apply edits in reverse byte-offset order to preserve positions.
             edits.sort_by(|a, b| b.position.cmp(&a.position));
-            let mut new_bytes = original.as_bytes().to_vec();
-            for edit in &edits {
-                let start = edit.position;
-                let end = start + edit.deleted_length;
-                if start <= new_bytes.len() && end <= new_bytes.len() {
-                    new_bytes.splice(start..end, edit.inserted_text.iter().copied());
-                }
-            }
+            let spans: Vec<(usize, usize, &[u8])> = edits
+                .iter()
+                .map(|edit| {
+                    (
+                        edit.position,
+                        edit.deleted_length,
+                        edit.inserted_text.as_slice(),
+                    )
+                })
+                .collect();
+            let new_bytes = apply_descending_edits(original.as_bytes(), &spans);
             let new_content = String::from_utf8(new_bytes).unwrap_or_else(|_| original.clone());
 
             Ok(Some(FileChange {
@@ -390,6 +393,9 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if !dry_run {
+        let _view_intent = crate::views::intent::record_paths(
+            changes_to_apply.iter().map(|(_, path, _)| path.as_path()),
+        );
         for (change, validated_path, _) in &changes_to_apply {
             if let Err(e) = std::fs::OpenOptions::new()
                 .write(true)
@@ -707,5 +713,117 @@ mod tests {
         let pattern = extract_meta_var_names("test($NAME, () => { $$$BODY })");
         let rewrite = extract_meta_var_names("test($NAME, async () => { $$$BODY })");
         assert!(rewrite.difference(&pattern).next().is_none());
+    }
+}
+
+/// Applies `(position, deleted_length, inserted)` edits sorted by descending
+/// position, with the result of splicing them into `original` one by one in
+/// that order.
+///
+/// Splicing one by one shifts the whole tail of the file per edit, so a file
+/// with many matches cost edits x file size in copying. When the edits are in
+/// bounds and do not overlap (the normal case) the result is built in one
+/// forward pass instead; walking the list backwards gives ascending positions,
+/// and edits at the same position come out in the same order the splices
+/// would leave them. Anything else keeps the splice loop so its exact result
+/// is preserved.
+fn apply_descending_edits(original: &[u8], edits: &[(usize, usize, &[u8])]) -> Vec<u8> {
+    let mut cursor = 0usize;
+    let forward_safe = edits.iter().rev().all(|&(start, deleted, _)| {
+        let Some(end) = start.checked_add(deleted) else {
+            return false;
+        };
+        let ok = start >= cursor && end <= original.len();
+        cursor = end;
+        ok
+    });
+    if forward_safe {
+        let inserted: usize = edits.iter().map(|(_, _, text)| text.len()).sum();
+        let mut out = Vec::with_capacity(original.len() + inserted);
+        let mut cursor = 0usize;
+        for &(start, deleted, text) in edits.iter().rev() {
+            out.extend_from_slice(&original[cursor..start]);
+            out.extend_from_slice(text);
+            cursor = start + deleted;
+        }
+        out.extend_from_slice(&original[cursor..]);
+        #[cfg(test)]
+        BYTES_MOVED.with(|moved| moved.set(moved.get() + out.len()));
+        return out;
+    }
+    let mut new_bytes = original.to_vec();
+    for &(start, deleted, text) in edits {
+        let end = start + deleted;
+        if start <= new_bytes.len() && end <= new_bytes.len() {
+            #[cfg(test)]
+            BYTES_MOVED.with(|moved| moved.set(moved.get() + (new_bytes.len() - end) + text.len()));
+            new_bytes.splice(start..end, text.iter().copied());
+        }
+    }
+    new_bytes
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes `apply_descending_edits` wrote or shifted on this thread.
+    static BYTES_MOVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod apply_edits_tests {
+    use super::*;
+
+    /// The reference: splice each edit in the given (descending) order.
+    fn splice_reference(original: &[u8], edits: &[(usize, usize, &[u8])]) -> Vec<u8> {
+        let mut new_bytes = original.to_vec();
+        for &(start, deleted, text) in edits {
+            let end = start + deleted;
+            if start <= new_bytes.len() && end <= new_bytes.len() {
+                new_bytes.splice(start..end, text.iter().copied());
+            }
+        }
+        new_bytes
+    }
+
+    #[test]
+    fn forward_build_matches_splicing_including_ties_and_overlaps() {
+        let original = b"abcdefghijklmnopqrstuvwxyz";
+        let cases: Vec<Vec<(usize, usize, &[u8])>> = vec![
+            vec![],
+            vec![(20, 2, b"XX"), (10, 0, b"I"), (0, 3, b"")],
+            // Two insertions at one position, and a replacement ending there.
+            vec![(5, 0, b"second"), (5, 0, b"first"), (2, 3, b"R")],
+            // Edit reaching the end of the input.
+            vec![(24, 2, b"END"), (0, 0, b"START")],
+            // Overlapping edits fall back to splicing.
+            vec![(8, 6, b"o2"), (5, 6, b"o1")],
+            // Out-of-bounds edits are skipped like before.
+            vec![(40, 1, b"zz"), (3, 1, b"d")],
+        ];
+        for edits in cases {
+            assert_eq!(
+                apply_descending_edits(original, &edits),
+                splice_reference(original, &edits),
+                "{edits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn many_edits_cost_one_pass_over_the_file() {
+        let original = "x = foo(1);\n".repeat(2000).into_bytes();
+        let mut edits: Vec<(usize, usize, &[u8])> = (0..2000)
+            .map(|line| (line * 12 + 4, 3, b"bar".as_slice()))
+            .collect();
+        edits.reverse();
+        let before = BYTES_MOVED.with(|moved| moved.get());
+        let result = apply_descending_edits(&original, &edits);
+        let moved = BYTES_MOVED.with(|moved| moved.get()) - before;
+        assert_eq!(result, "x = bar(1);\n".repeat(2000).into_bytes());
+        assert!(
+            moved <= 2 * original.len(),
+            "{moved} bytes moved to rewrite a {} byte file",
+            original.len()
+        );
     }
 }

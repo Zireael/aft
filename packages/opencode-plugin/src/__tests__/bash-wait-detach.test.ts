@@ -292,3 +292,9 @@ describe("chat.message interrupts waits by one decision", () => {
     expect(isSyncWatchAborted(sessionID)).toBe(false);
   });
 });
+
+test("detach preserves indentation and TSV away from the token", () => {
+  const text = "&detach please\n    print('x')\na\t\tb\n| a  | b |";
+  const output = { parts: [{ type: "text", text }] };
+  expect(stripUserMessageDetachKeyword(output)).toBe(" please\n    print('x')\na\t\tb\n| a  | b |");
+});

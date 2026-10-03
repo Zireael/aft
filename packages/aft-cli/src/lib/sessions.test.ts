@@ -5,6 +5,28 @@ import { join } from "node:path";
 import { listPiSessionsFromDir, mapOpenCodeSessionRows, parsePiSessionJsonl } from "./sessions";
 
 describe("mapOpenCodeSessionRows", () => {
+  test("maps OpenCode directory and creation time for session log scoping", () => {
+    expect(
+      mapOpenCodeSessionRows([
+        {
+          id: "ses_target",
+          title: "target",
+          time_updated: 200,
+          time_created: 100,
+          directory: "/projects/target",
+        },
+      ]),
+    ).toEqual([
+      {
+        id: "ses_target",
+        title: "target",
+        lastActivity: 200,
+        startedAt: 100,
+        projectRoot: "/projects/target",
+      },
+    ]);
+  });
+
   test("maps rows to RecentSession entries in newest-first order capped at five", () => {
     const rows = [
       { id: "ses_1", title: "one", time_updated: 100 },
@@ -46,6 +68,27 @@ describe("parsePiSessionJsonl", () => {
     expect(parsePiSessionJsonl(jsonl)).toEqual({
       id: "019e6307-0749-4000-9000-111111111111",
       title: "Explain this bug please",
+    });
+  });
+
+  test("reads session project root and start time from the Pi header", () => {
+    expect(
+      parsePiSessionJsonl(
+        [
+          JSON.stringify({
+            type: "session",
+            id: "pi-id",
+            cwd: "/projects/target",
+            timestamp: "2026-01-01T10:00:00.000Z",
+          }),
+          JSON.stringify({ type: "message", message: { role: "user", content: "hello" } }),
+        ].join("\n"),
+      ),
+    ).toEqual({
+      id: "pi-id",
+      title: "hello",
+      projectRoot: "/projects/target",
+      startedAt: Date.parse("2026-01-01T10:00:00.000Z"),
     });
   });
 

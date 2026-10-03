@@ -31,10 +31,12 @@ import {
   decodeFileUrl,
   isBashTransportDeadError,
   timeoutForCommand,
+  WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
+import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { markBridgeEnd, markBridgeStart } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 
@@ -97,6 +99,16 @@ export interface ToolRuntime {
   directory: string;
   /** Opaque OpenCode session identifier. Missing in CLI tests / some hosts. */
   sessionID?: string;
+  /**
+   * True when `directory` is the directory the host placed this session in, so
+   * it, not `worktree`, is the root to use while no session directory is
+   * cached. OpenCode 2 sets this: its `directory` is the session's Location
+   * directory, while its `worktree` is the project's main checkout, which is
+   * the wrong root for a session in a linked git worktree (issue #387).
+   * OpenCode 1 leaves it unset because its `directory` can be the launch cwd
+   * of a resumed session rather than the session's project.
+   */
+  directoryIsSessionRoot?: boolean;
   /** Effect-owned cancellation is explicit so V1 ToolContext signals remain unchanged. */
   effectAbort?: AbortSignal;
 }
@@ -130,6 +142,12 @@ function canonicalizeDirectory(dir: string): string {
  * stored directory wins. This is the workaround for OpenCode's bug where
  * `ctx.directory` is set to `process.cwd()` rather than the resumed
  * session's actual project directory.
+ *
+ * With no cached directory, an OpenCode 2 runtime (`directoryIsSessionRoot`)
+ * resolves to its `directory`, never to `worktree`: there `worktree` is the
+ * main checkout, which for a session in a linked git worktree is the one
+ * wrong answer (issue #387). `worktree` keeps that meaning for the permission
+ * checks that treat the main checkout as part of the project.
  */
 export function projectRootFor(runtime: ToolRuntime): string {
   // Workaround: if OpenCode handed us a session ID and the session has a
@@ -140,7 +158,9 @@ export function projectRootFor(runtime: ToolRuntime): string {
     return canonicalizeDirectory(cached);
   }
 
-  const raw = runtime.worktree ?? runtime.directory;
+  const raw = runtime.directoryIsSessionRoot
+    ? runtime.directory
+    : (runtime.worktree ?? runtime.directory);
   return canonicalizeDirectory(raw);
 }
 
@@ -237,6 +257,16 @@ export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectT
  * is absent (see `RawRequest::session()`), so hosts that don't expose a
  * session identifier still work — they just share undo/checkpoint state.
  */
+/**
+ * Whether this tool call comes from a delegated worker (subagent) session.
+ * AFT words its replies by role (see WORKER_SESSION_FIELD), so every request
+ * carries it. The lookup is cached per session after the first call.
+ */
+async function isWorkerRuntime(ctx: PluginContext, runtime: ToolRuntime): Promise<boolean> {
+  if (!runtime.sessionID) return false;
+  return resolveIsSubagent(ctx.client, runtime.sessionID, runtime.directory);
+}
+
 export async function callBridge(
   ctx: PluginContext,
   runtime: ToolRuntime,
@@ -248,13 +278,22 @@ export async function callBridge(
   // OpenCode sets `runtime.directory = process.cwd()` even for resumed
   // sessions, so we can't trust it as the workspace root. Subsequent
   // calls in the same session hit the cache and skip the lookup.
-  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
-    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
-  }
+  // Both host lookups are bounded; run them together so their timeout budgets
+  // do not add up before a tool can reach the bridge.
+  const [workerSession] = await Promise.all([
+    isWorkerRuntime(ctx, runtime),
+    runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined
+      ? getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory)
+      : Promise.resolve(),
+  ]);
 
   const merged: Record<string, unknown> = { ...params };
   if (runtime.sessionID) {
     merged.session_id = runtime.sessionID;
+  }
+  // The caller's role travels with every request, beside the session.
+  if (workerSession) {
+    merged[WORKER_SESSION_FIELD] = true;
   }
   const timeoutMs = timeoutForCommand(command);
   const sendOptions = {
@@ -299,15 +338,22 @@ export async function callToolCall(
   rawArgs: Record<string, unknown> = {},
   options?: ToolCallOptions,
 ): Promise<ToolCallResult> {
-  if (runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined) {
-    await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
-  }
+  // Run the worker-role and session-directory lookups together so their
+  // timeout budgets do not add up before the tool call proceeds.
+  const [workerSession] = await Promise.all([
+    isWorkerRuntime(ctx, runtime),
+    runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined
+      ? getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory)
+      : Promise.resolve(),
+  ]);
 
   const timeoutMs = timeoutForCommand(name);
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
     ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
+    // The caller's role travels in the tool_call envelope, beside the session.
+    ...(workerSession ? { workerSession: true } : {}),
     ...options,
   };
   markBridgeStart();

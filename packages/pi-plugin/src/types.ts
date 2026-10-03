@@ -17,4 +17,10 @@ export interface PluginContext {
   hashlineEffective?: boolean;
   /** Absolute path to AFT's data storage dir (e.g. ~/.local/share/cortexkit/aft). */
   storageDir: string;
+  /**
+   * Starts the work the extension defers until a session needs AFT (LSP
+   * discovery and installs, ONNX Runtime preparation, the warmup bridge).
+   * Idempotent; a no-op once the host has shut the session down.
+   */
+  startSessionWork?: () => void;
 }

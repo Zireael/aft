@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -71,6 +71,65 @@ pub struct ZoomResponse {
     pub annotations: Annotations,
 }
 
+fn zoom_line_starts(source: &str) -> Vec<usize> {
+    #[cfg(test)]
+    ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(count.get() + source.len()));
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < source.len() {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn zoom_line_col_to_byte(source: &str, starts: &[usize], line: u32, col: u32) -> usize {
+    #[cfg(test)]
+    ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.set(count.get() + 1));
+    let Some(&start) = starts.get(line as usize) else {
+        return source.len();
+    };
+    let next = starts
+        .get(line as usize + 1)
+        .copied()
+        .unwrap_or(source.len());
+    let segment = &source[start..next];
+    let text = segment
+        .strip_suffix("\r\n")
+        .or_else(|| segment.strip_suffix('\n'))
+        .unwrap_or(segment);
+    #[cfg(test)]
+    ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(count.get() + text.len()));
+    start + (col as usize).min(text.len())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ZOOM_BODY_JOIN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_INDEXED_OFFSET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_COORD_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Files a multi-target zoom already resolved and read, keyed by the target's
+/// `file` string, plus the per-file call enrichment. Several targets in one
+/// file then share one read and one enrichment instead of each repeating it.
+#[derive(Default)]
+struct ZoomTargetMemo {
+    files: HashMap<String, (PathBuf, String)>,
+    enrichments: HashMap<PathBuf, ZoomEnrichment>,
+}
+
+struct ZoomEnrichment {
+    symbols: Vec<Symbol>,
+    source: String,
+    tree: tree_sitter::Tree,
+    calls: Vec<RawCall>,
+    line_starts: Vec<usize>,
+}
+
 struct RawCall {
     name: String,
     line: u32,
@@ -122,6 +181,8 @@ fn resolve_zoom_file(
         ));
     }
 
+    #[cfg(test)]
+    ZOOM_FILE_READS.with(|count| count.set(count.get() + 1));
     let source = std::fs::read_to_string(&path).map_err(|error| {
         Response::error(
             &req.id,
@@ -142,26 +203,33 @@ fn zoom_one_target_response(
     symbol: &str,
     context_lines: usize,
     include_callgraph: bool,
+    memo: &mut ZoomTargetMemo,
 ) -> Response {
     if is_github_read_target(file) {
         return handle_github_zoom(req, ctx, file, symbol);
     }
-    let (path, source) = match resolve_zoom_file(req, ctx, file) {
-        Ok(file) => file,
-        Err(resp) => return resp,
-    };
+    if !memo.files.contains_key(file) {
+        match resolve_zoom_file(req, ctx, file) {
+            Ok(resolved) => {
+                memo.files.insert(file.to_string(), resolved);
+            }
+            Err(resp) => return resp,
+        }
+    }
+    let (path, source) = &memo.files[file];
     let lines: Vec<&str> = source.lines().collect();
 
     zoom_one_symbol(
         req,
         ctx,
-        &path,
+        path,
         file,
-        &source,
+        source,
         &lines,
         symbol,
         context_lines,
         include_callgraph,
+        &mut memo.enrichments,
     )
 }
 
@@ -174,6 +242,50 @@ fn serialize_zoom_target_response(req: &RawRequest, response: Response) -> serde
         ))
         .expect("serializing Response::error should not fail")
     })
+}
+
+/// Why one `targets` entry cannot be zoomed: the refusal text plus the label
+/// and symbol name its per-target error line is rendered under.
+struct InvalidZoomTarget {
+    label: String,
+    name: String,
+    message: String,
+}
+
+fn zoom_target_fields(
+    target: &serde_json::Value,
+    index: usize,
+) -> Result<(&str, &str, &str), InvalidZoomTarget> {
+    let obj = target.as_object();
+    let field = |key: &str| {
+        obj.and_then(|obj| obj.get(key))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+    };
+    let label = obj
+        .and_then(|obj| obj.get("target_label").or_else(|| obj.get("targetLabel")))
+        .and_then(|value| value.as_str())
+        .filter(|label| !label.trim().is_empty());
+    let file = field("file");
+    let symbol = field("symbol");
+    let invalid = |message: String| InvalidZoomTarget {
+        label: label.or(file).unwrap_or("(no path)").to_string(),
+        name: symbol.unwrap_or("").to_string(),
+        message,
+    };
+    let Some(file) = file else {
+        return Err(invalid(deterministic_zoom_refusal(
+            format!("zoom: targets[{index}].file must be a non-empty string"),
+            "Provide a file path for every target.",
+        )));
+    };
+    let Some(symbol) = symbol else {
+        return Err(invalid(deterministic_zoom_refusal(
+            format!("zoom: targets[{index}].symbol must be a non-empty string"),
+            "Provide a symbol name for every target.",
+        )));
+    };
+    Ok((file, symbol, label.unwrap_or(file)))
 }
 
 fn handle_zoom_targets(
@@ -194,50 +306,47 @@ fn handle_zoom_targets(
         );
     }
 
+    // An unusable entry (no file or no symbol) becomes its own error line so
+    // the rest of the batch still answers. The whole call is refused only
+    // when no entry is usable, because then there is nothing to return.
     let mut entries = Vec::with_capacity(targets.len());
+    let mut first_refusal: Option<String> = None;
+    let mut any_usable = false;
+    let mut memo = ZoomTargetMemo::default();
     for (index, target) in targets.iter().enumerate() {
-        let obj = target.as_object();
-        let Some(file) = obj
-            .and_then(|obj| obj.get("file"))
-            .and_then(|value| value.as_str())
-            .filter(|file| !file.is_empty())
-        else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                deterministic_zoom_refusal(
-                    format!("zoom: targets[{index}].file must be a non-empty string"),
-                    "Provide a file path for every target.",
-                ),
-            );
-        };
-        let Some(symbol) = obj
-            .and_then(|obj| obj.get("symbol"))
-            .and_then(|value| value.as_str())
-            .filter(|symbol| !symbol.is_empty())
-        else {
-            return Response::error(
-                &req.id,
-                "invalid_request",
-                deterministic_zoom_refusal(
-                    format!("zoom: targets[{index}].symbol must be a non-empty string"),
-                    "Provide a symbol name for every target.",
-                ),
-            );
-        };
-        let target_label = obj
-            .and_then(|obj| obj.get("target_label").or_else(|| obj.get("targetLabel")))
-            .and_then(|value| value.as_str())
-            .filter(|label| !label.is_empty())
-            .unwrap_or(file);
-
-        let response =
-            zoom_one_target_response(req, ctx, file, symbol, context_lines, include_callgraph);
-        entries.push(serde_json::json!({
-            "targetLabel": target_label,
-            "name": symbol,
-            "response": serialize_zoom_target_response(req, response),
-        }));
+        match zoom_target_fields(target, index) {
+            Ok((file, symbol, target_label)) => {
+                any_usable = true;
+                let response = zoom_one_target_response(
+                    req,
+                    ctx,
+                    file,
+                    symbol,
+                    context_lines,
+                    include_callgraph,
+                    &mut memo,
+                );
+                entries.push(serde_json::json!({
+                    "targetLabel": target_label,
+                    "name": symbol,
+                    "response": serialize_zoom_target_response(req, response),
+                }));
+            }
+            Err(invalid) => {
+                let response = Response::error(&req.id, "invalid_request", invalid.message.clone());
+                first_refusal.get_or_insert(invalid.message);
+                entries.push(serde_json::json!({
+                    "targetLabel": invalid.label,
+                    "name": invalid.name,
+                    "response": serialize_zoom_target_response(req, response),
+                }));
+            }
+        }
+    }
+    if !any_usable {
+        if let Some(message) = first_refusal {
+            return Response::error(&req.id, "invalid_request", message);
+        }
     }
 
     Response::success(
@@ -246,6 +355,36 @@ fn handle_zoom_targets(
             "targets": entries,
         }),
     )
+}
+
+/// Expand a top-level `file` (or `url`) plus `symbol`/`symbols` that arrived
+/// next to `targets` into batch entries, one per symbol, split exactly as the
+/// single-file mode splits them. Some models fill every declared parameter on
+/// every call, so a real same-file request routinely arrives beside a
+/// placeholder `targets` entry; answering both beats refusing both. A file
+/// with no symbol still becomes one entry, which reports the missing symbol
+/// on its own line.
+fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value> {
+    let label = req
+        .params
+        .get("target_label")
+        .and_then(|value| value.as_str())
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(file);
+    let names = if is_github_read_target(file) {
+        github_zoom_selector(req)
+            .map(|selector| vec![selector])
+            .unwrap_or_default()
+    } else {
+        parse_zoom_symbol_names(&req.params, detect_language(Path::new(file))).unwrap_or_default()
+    };
+    if names.is_empty() {
+        return vec![serde_json::json!({ "file": file, "symbol": "", "target_label": label })];
+    }
+    names
+        .into_iter()
+        .map(|name| serde_json::json!({ "file": file, "symbol": name, "target_label": label }))
+        .collect()
 }
 
 /// Handle a `zoom` request.
@@ -277,7 +416,18 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                 ),
             );
         };
-        return handle_zoom_targets(req, ctx, targets, context_lines, include_callgraph);
+        let mut merged = Vec::with_capacity(targets.len() + 1);
+        if let Some(file) = req
+            .params
+            .get("file")
+            .or_else(|| req.params.get("url"))
+            .and_then(|v| v.as_str())
+            .filter(|file| !file.trim().is_empty())
+        {
+            merged.extend(same_file_zoom_targets(req, file));
+        }
+        merged.extend(targets.iter().cloned());
+        return handle_zoom_targets(req, ctx, &merged, context_lines, include_callgraph);
     }
 
     let file = match req
@@ -471,6 +621,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             &symbol_names[0],
             context_lines,
             include_callgraph,
+            &mut HashMap::new(),
         );
     }
 
@@ -768,6 +919,7 @@ fn zoom_batch_symbols(
 ) -> Response {
     let mut entries = Vec::with_capacity(symbol_names.len());
     let mut all_ok = true;
+    let mut enrichments = HashMap::new();
 
     for name in symbol_names {
         let resp = zoom_one_symbol(
@@ -780,6 +932,7 @@ fn zoom_batch_symbols(
             name,
             context_lines,
             include_callgraph,
+            &mut enrichments,
         );
         let json = match serde_json::to_value(&resp) {
             Ok(v) => v,
@@ -819,6 +972,7 @@ fn zoom_one_symbol(
     symbol_name: &str,
     context_lines: usize,
     include_callgraph: bool,
+    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
 ) -> Response {
     // Keep raw heading labels for outline display. Zoom resolves heading names in tiers:
     // exact raw text, normalized text, case-insensitive normalized text, then anchor slugs.
@@ -910,13 +1064,6 @@ fn zoom_one_symbol(
         .map(|source| source.lines().collect::<Vec<_>>());
     let effective_lines = resolved_lines.as_deref().unwrap_or(lines);
 
-    // Extract symbol body (0-based line indices)
-    let content = if end < effective_lines.len() {
-        effective_lines[start..=end].join("\n")
-    } else {
-        effective_lines[start..].join("\n")
-    };
-
     let resolved_lang = detect_language(resolved_file_path);
     let container_outline = if might_have_container_members(target) {
         match build_container_outline(ctx, resolved_file_path, target) {
@@ -960,6 +1107,23 @@ fn zoom_one_symbol(
         };
     }
 
+    // Only join the body when the response actually displays it.
+    #[cfg(test)]
+    ZOOM_BODY_JOIN_BYTES.with(|bytes| {
+        bytes.set(
+            bytes.get()
+                + effective_lines[start..=end.min(effective_lines.len() - 1)]
+                    .iter()
+                    .map(|line| line.len())
+                    .sum::<usize>(),
+        )
+    });
+    let content = if end < effective_lines.len() {
+        effective_lines[start..=end].join("\n")
+    } else {
+        effective_lines[start..].join("\n")
+    };
+
     // Context before
     let ctx_start = start.saturating_sub(context_lines);
     let context_before: Vec<String> = if ctx_start < start {
@@ -992,46 +1156,60 @@ fn zoom_one_symbol(
         None
     };
     let (calls_out, called_by) = if include_callgraph {
-        // Get all symbols in the resolved file for call matching
-        let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
-            Ok(s) => s,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
-
-        let known_names: Vec<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
-
-        // Parse AST for call extraction (use resolved file for cross-file re-exports)
-        let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
-        let (tree, lang) = match parser.parse(resolved_file_path) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
-
-        // calls_out: calls within the target symbol's byte range
-        let resolved_source = if resolved_file_path != path {
-            std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
-        } else {
-            source.to_string()
-        };
-        let signature_byte_start = line_col_to_byte(
-            &resolved_source,
+        if !enrichments.contains_key(resolved_file_path) {
+            #[cfg(test)]
+            ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
+            let symbols = match ctx.provider().list_symbols(resolved_file_path) {
+                Ok(symbols) => symbols,
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
+            let mut parser = FileParser::with_symbol_cache(ctx.symbol_cache());
+            let (tree, lang) = match parser.parse(resolved_file_path) {
+                Ok((tree, lang)) => (tree.clone(), lang),
+                Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+            };
+            let resolved_source = if resolved_file_path != path {
+                std::fs::read_to_string(resolved_file_path).unwrap_or_else(|_| source.to_string())
+            } else {
+                source.to_string()
+            };
+            let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+            let line_starts = zoom_line_starts(&resolved_source);
+            enrichments.insert(
+                resolved_file_path.to_path_buf(),
+                ZoomEnrichment {
+                    symbols,
+                    source: resolved_source,
+                    tree,
+                    calls,
+                    line_starts,
+                },
+            );
+        }
+        let enrichment = &enrichments[resolved_file_path];
+        let all_symbols = &enrichment.symbols;
+        let resolved_source = &enrichment.source;
+        let line_starts = &enrichment.line_starts;
+        let all_file_calls = &enrichment.calls;
+        let known_names: HashSet<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
+        let signature_byte_start = zoom_line_col_to_byte(
+            resolved_source,
+            line_starts,
             target.range.start_line,
             target.range.start_col,
         );
-        let signature_byte_end = line_col_to_byte(
-            &resolved_source,
+        let signature_byte_end = zoom_line_col_to_byte(
+            resolved_source,
+            line_starts,
             target.range.end_line,
             target.range.end_col,
         );
-        let (target_byte_start, target_byte_end) =
-            symbol_body_byte_range(tree.root_node(), signature_byte_start, signature_byte_end)
-                .unwrap_or((signature_byte_start, signature_byte_end));
-
-        let all_file_calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
+        let (target_byte_start, target_byte_end) = symbol_body_byte_range(
+            enrichment.tree.root_node(),
+            signature_byte_start,
+            signature_byte_end,
+        )
+        .unwrap_or((signature_byte_start, signature_byte_end));
 
         let raw_calls = all_file_calls.iter().filter(|call| {
             call.start_byte >= target_byte_start && call.end_byte <= target_byte_end
@@ -1049,21 +1227,36 @@ fn zoom_one_symbol(
                 .collect(),
         );
 
-        // called_by: bucket the single file-wide call extraction by enclosing symbol range
+        // Preserve file-call order for each name when attributing nested symbols.
+        let matching_calls: Vec<&RawCall> = all_file_calls
+            .iter()
+            .filter(|call| {
+                #[cfg(test)]
+                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+                call.name == target.name
+            })
+            .collect();
         let mut called_by: Vec<CallRef> = Vec::new();
-        for sym in &all_symbols {
+        for sym in all_symbols {
             if sym.name == target.name && sym.range.start_line == target.range.start_line {
                 continue; // skip self
             }
-            let sym_byte_start =
-                line_col_to_byte(&resolved_source, sym.range.start_line, sym.range.start_col);
-            let sym_byte_end =
-                line_col_to_byte(&resolved_source, sym.range.end_line, sym.range.end_col);
-            for call in &all_file_calls {
-                if call.name == target.name
-                    && call.start_byte >= sym_byte_start
-                    && call.end_byte <= sym_byte_end
-                {
+            let sym_byte_start = zoom_line_col_to_byte(
+                &resolved_source,
+                &line_starts,
+                sym.range.start_line,
+                sym.range.start_col,
+            );
+            let sym_byte_end = zoom_line_col_to_byte(
+                &resolved_source,
+                &line_starts,
+                sym.range.end_line,
+                sym.range.end_col,
+            );
+            for call in &matching_calls {
+                #[cfg(test)]
+                ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(count.get() + 1));
+                if call.start_byte >= sym_byte_start && call.end_byte <= sym_byte_end {
                     called_by.push(CallRef {
                         name: sym.name.clone(),
                         line: call.line,
@@ -2234,6 +2427,21 @@ mod tests {
     }
 
     #[test]
+    fn indexed_coordinates_match_edit_offsets_for_large_mixed_line_endings() {
+        let source = format!("{}\r\n多字\rsolo\nend\n", "é".repeat(20_000));
+        let starts = zoom_line_starts(&source);
+        for line in 0..8 {
+            for col in [0, 1, 2, 20, 40_000, u32::MAX] {
+                assert_eq!(
+                    zoom_line_col_to_byte(&source, &starts, line, col),
+                    line_col_to_byte(&source, line, col),
+                    "line {line}, col {col}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parse_zoom_symbol_names_splits_whitespace_for_code() {
         let params = serde_json::json!({ "symbol": "InspectCategory active is_active" });
         let names = parse_zoom_symbol_names(&params, Some(LangId::Rust)).expect("parse");
@@ -2506,6 +2714,142 @@ function helper(value: number): number {
             names.contains(&"helper"),
             "call inside the function body should be included: {names:?}"
         );
+    }
+
+    #[test]
+    fn indexed_offsets_avoid_repeated_prefix_scans_at_end_of_large_file() {
+        let source = format!("{}last é\r\n", "line\n".repeat(20_000));
+        ZOOM_COORD_BYTES_SCANNED.with(|count| count.set(0));
+        let starts = zoom_line_starts(&source);
+        let mut old_prefix_bytes = 0;
+        for _ in 0..80 {
+            let scanned = source
+                .split_inclusive('\n')
+                .take(20_001)
+                .map(str::len)
+                .sum::<usize>();
+            old_prefix_bytes += scanned;
+            assert_eq!(
+                zoom_line_col_to_byte(&source, &starts, 20_000, 5),
+                line_col_to_byte(&source, 20_000, 5)
+            );
+        }
+        let indexed_bytes = ZOOM_COORD_BYTES_SCANNED.with(|count| count.get());
+        assert!(old_prefix_bytes > indexed_bytes * 70);
+        eprintln!("coordinate prefix bytes: baseline {old_prefix_bytes}, indexed {indexed_bytes}");
+    }
+
+    #[test]
+    fn batch_callgraph_reuses_file_enrichment_and_matches_individual_zoom() {
+        let ctx = make_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.ts");
+        let source = format!(
+            "{}{}",
+            "// filler\n".repeat(20_000),
+            (0..80)
+                .map(|i| format!("function f{i}() {{ f0(); }}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(&path, &source).unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let names = (1..40).map(|i| format!("f{i}")).collect::<Vec<_>>();
+        let req = make_zoom_request_cg("many", path.to_str().unwrap(), "f1");
+        ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.set(0));
+        ZOOM_CALL_NAME_COMPARISONS.with(|count| count.set(0));
+        ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
+        let mut enrichments = HashMap::new();
+        let mut shared_responses = Vec::new();
+        for name in &names {
+            let shared = zoom_one_symbol(
+                &req,
+                &ctx,
+                &path,
+                path.to_str().unwrap(),
+                &source,
+                &lines,
+                name,
+                0,
+                true,
+                &mut enrichments,
+            );
+            shared_responses.push(serde_json::to_value(shared).unwrap());
+        }
+        assert_eq!(enrichments.len(), 1);
+        assert_eq!(ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()), 1);
+        let actual_comparisons = ZOOM_CALL_NAME_COMPARISONS.with(|count| count.get());
+        let enriched = &enrichments[&path];
+        let baseline_comparisons = enriched.symbols.len() * enriched.calls.len() * names.len();
+        assert!(baseline_comparisons > actual_comparisons * 20);
+        eprintln!("zoom incoming call comparisons: baseline {baseline_comparisons}, indexed {actual_comparisons}");
+        eprintln!(
+            "batch parses/extractions: baseline {}, shared {}",
+            names.len(),
+            enrichments.len()
+        );
+        for (name, shared) in names.iter().zip(shared_responses) {
+            let standalone = zoom_one_symbol(
+                &req,
+                &ctx,
+                &path,
+                path.to_str().unwrap(),
+                &source,
+                &lines,
+                name,
+                0,
+                true,
+                &mut HashMap::new(),
+            );
+            assert_eq!(shared, serde_json::to_value(standalone).unwrap());
+        }
+        assert_eq!(
+            ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()),
+            names.len() + 1
+        );
+        assert!(ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.get()) > names.len());
+    }
+
+    /// Several targets in one file share one read and one call enrichment,
+    /// and answer exactly as separate zooms would.
+    #[test]
+    fn multi_target_zoom_reads_and_enriches_each_file_once() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        let file = path.to_str().unwrap();
+        let names = ["helper", "compute", "orchestrate"];
+        let targets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::json!({ "file": file, "symbol": name }))
+            .collect();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "targets",
+            "command": "zoom",
+            "targets": targets,
+            "callgraph": true,
+        }))
+        .unwrap();
+        ZOOM_FILE_READS.with(|count| count.set(0));
+        ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
+        let batch = serde_json::to_value(handle_zoom(&request, &ctx)).unwrap();
+        assert_eq!(ZOOM_FILE_READS.with(|count| count.get()), 1);
+        assert_eq!(ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()), 1);
+
+        let entries = batch["targets"].as_array().expect("targets");
+        assert_eq!(entries.len(), names.len());
+        for (entry, name) in entries.iter().zip(names) {
+            let alone = zoom_one_target_response(
+                &request,
+                &ctx,
+                file,
+                name,
+                3,
+                true,
+                &mut ZoomTargetMemo::default(),
+            );
+            let single = serialize_zoom_target_response(&request, alone);
+            assert_eq!(entry["response"], single, "{name}");
+            assert_eq!(single["success"], true, "{name}: {single}");
+        }
     }
 
     #[test]
@@ -2896,9 +3240,29 @@ function helper(value: number): number {
             None,
         );
 
+        ZOOM_BODY_JOIN_BYTES.with(|bytes| bytes.set(0));
         let response = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
         let content = response["content"].as_str().unwrap();
         assert!(response["success"].as_bool().unwrap());
+        let joined = ZOOM_BODY_JOIN_BYTES.with(|bytes| bytes.get());
+        assert_eq!(joined, 0, "member menus must not build the discarded body");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let lines = source.lines().collect::<Vec<_>>();
+        let symbol = ctx
+            .provider()
+            .list_symbols(&path)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.name == "LargeContainer")
+            .unwrap();
+        let baseline_joined_bytes = lines
+            [symbol.range.start_line as usize..=symbol.range.end_line as usize]
+            .join("\n")
+            .len();
+        eprintln!(
+            "container discarded body bytes: baseline {}, deferred {}",
+            baseline_joined_bytes, joined
+        );
         assert!(
             content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
             "expected member menu, got: {content}"

@@ -112,10 +112,18 @@ function surfaceSearchText(
 
 const SearchParams = Type.Object(
   {
-    query: Type.String({
-      description:
-        "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
-    }),
+    query: Type.Optional(
+      Type.String({
+        description:
+          "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+      }),
+    ),
+    pattern: Type.Optional(
+      Type.String({
+        description:
+          "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+      }),
+    ),
     topK: Type.Optional(
       Type.Integer({
         minimum: 1,
@@ -174,7 +182,7 @@ export function buildSemanticSections(
     : responseText;
   const sections = [
     ...(hasGenerationDisclosure ? [theme.fg("warning", GENERATION_CHANGED_DISCLOSURE)] : []),
-    `${theme.fg(semanticStatus === "ready" ? "success" : "warning", `semantic: ${semanticStatus}`)} ${theme.fg("muted", `mode=${interpretedAs}${queryKind ? ` kind=${queryKind}` : ""} query=${JSON.stringify(args.query)} topK=${args.topK ?? 10}`)}`,
+    `${theme.fg(semanticStatus === "ready" ? "success" : "warning", `semantic: ${semanticStatus}`)} ${theme.fg("muted", `mode=${interpretedAs}${queryKind ? ` kind=${queryKind}` : ""}${args.query !== undefined ? ` query=${JSON.stringify(args.query)}` : ""}${args.pattern !== undefined ? ` pattern=${JSON.stringify(args.pattern)}` : ""} topK=${args.topK ?? 10}`)}`,
   ];
 
   const warnings = Array.isArray(response.warnings)
@@ -187,6 +195,11 @@ export function buildSemanticSections(
   const honestyNote = semanticHonestyNote(response, theme);
   if (honestyNote) sections.push(honestyNote);
 
+  // An identifier searched in another project is answered by an exact sweep
+  // whose coverage (complete, or stopped at its time limit) the agent text
+  // ends with; the human view shows the same sentence.
+  const sweepCoverage = asString(asRecord(response.exact_sweep)?.coverage);
+
   const results = asRecords(response.results);
   if (status !== "ready" && results.length === 0) {
     sections.push(backendText ?? theme.fg("muted", "Semantic index is not ready."));
@@ -195,6 +208,7 @@ export function buildSemanticSections(
 
   if (results.length === 0) {
     sections.push(theme.fg("muted", "No matches found."));
+    if (sweepCoverage) sections.push(theme.fg("muted", sweepCoverage));
     return sections;
   }
 
@@ -208,7 +222,16 @@ export function buildSemanticSections(
         const lineText = asString(result.line_text) ?? "";
         const location =
           line !== undefined ? `${line}${column !== undefined ? `:${column}` : ""}` : "?";
-        lines.push(`  ↳ ${theme.fg("muted", `line ${location}`)} ${lineText}`);
+        // Sweep lines say whether they hold the identifier itself or only a
+        // spelling variant of it; plain regex and literal lines carry no
+        // `exact` field and get no marker.
+        const marker =
+          result.exact === true
+            ? ` ${theme.fg("muted", "[exact]")}`
+            : result.exact === false
+              ? ` ${theme.fg("muted", `[variant: ${asString(result.match_text) ?? "?"}]`)}`
+              : "";
+        lines.push(`  ↳ ${theme.fg("muted", `line ${location}`)}${marker} ${lineText}`);
         return;
       }
 
@@ -250,6 +273,7 @@ export function buildSemanticSections(
     });
     sections.push(lines.join("\n"));
   }
+  if (sweepCoverage) sections.push(theme.fg("muted", sweepCoverage));
 
   return sections;
 }
@@ -260,7 +284,12 @@ export function renderSemanticCall(
   theme: Theme,
   context: RenderContextLike,
 ) {
-  return renderToolCall("search", theme.fg("toolOutput", args.query), theme, context);
+  return renderToolCall(
+    "search",
+    theme.fg("toolOutput", args.query ?? (args.pattern ? `pattern ${args.pattern}` : "")),
+    theme,
+    context,
+  );
 }
 
 /** Exported for renderer unit tests. */
@@ -293,6 +322,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       // the exact bash-grep reflex the system prompt works to suppress.
       description: [
         "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').",
+        "When you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.",
         "Use `offset` to continue a ranked result list from a zero-based position.",
         "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       ].join("\n\n"),
@@ -304,16 +334,32 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         _onUpdate,
         extCtx,
       ) {
-        if (
-          isEmptyParam(params.query) ||
-          typeof params.query !== "string" ||
-          params.query.trim().length === 0
-        ) {
-          throw new Error("semantic_search: invalid params: `query` must be a non-empty string");
+        const rawPattern: unknown = params.pattern;
+        const hasQuery = typeof params.query === "string" && params.query.trim().length > 0;
+        // A blank pattern counts as absent; a real one is sent as written,
+        // because whitespace inside a regex is part of what it matches.
+        if (!isEmptyParam(rawPattern) && typeof rawPattern !== "string") {
+          throw new Error("semantic_search: invalid params: `pattern` must be a string");
         }
+        const pattern =
+          typeof rawPattern === "string" && rawPattern.trim().length > 0 ? rawPattern : undefined;
+        if (!hasQuery && pattern === undefined) {
+          throw new Error(
+            rawPattern === undefined || rawPattern === null
+              ? "semantic_search: invalid params: `query` must be a non-empty string"
+              : "semantic_search: invalid params: at least one of `query` or `pattern` must be a non-empty string",
+          );
+        }
+        const query = hasQuery ? (params.query as string) : "";
+        // The continuity key of a query-only search is unchanged; a pattern
+        // makes a different search, so it gets its own key.
+        const continuitySubject =
+          pattern === undefined ? query : `${query}\u0000pattern:${pattern}`;
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
-        const req: Record<string, unknown> = { query: params.query };
+        const req: Record<string, unknown> = {};
+        if (hasQuery) req.query = query;
+        if (pattern !== undefined) req.pattern = pattern;
         const includeTests = !isEmptyParam(params.includeTests)
           ? coerceBoolean(params.includeTests)
           : undefined;
@@ -337,7 +383,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
           resolveSessionId(extCtx) ?? "unknown-session",
           continuityKey(
             selectedProjectRoot(extCtx.cwd, params.path),
-            params.query,
+            continuitySubject,
             includeTests,
             params.topK,
           ),

@@ -4,7 +4,8 @@
 #[allow(unused_imports)]
 pub use crate::test_helpers::{
     canonicalize_like_product, cargo_manifest_dir, disable_in_process_file_watcher, fixture_path,
-    thread_scratch_dir, user_config, user_config_tier, warm_executable, AftProcess, ReleaseOnDrop,
+    real_rust_analyzer_available, thread_scratch_dir, user_config, user_config_tier,
+    warm_executable, AftProcess, ReleaseOnDrop,
 };
 
 pub fn json_string(value: &impl std::fmt::Display) -> String {
@@ -67,5 +68,45 @@ pub fn inspect_reasking_tier1_deadline(
             return value;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Keeps every CPU busy until dropped, to reproduce the loaded CI runners on
+/// which timer wake-ups and thread scheduling run late. Deadline tests run
+/// their timed section while one of these is alive.
+#[allow(dead_code)]
+pub struct CpuHog {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl CpuHog {
+    /// Starts two spinning threads per available CPU, so the hog competes
+    /// with, rather than yields to, the work being timed.
+    pub fn start() -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cpus = std::thread::available_parallelism().map_or(4, usize::from);
+        let threads = (0..cpus * 2)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut value = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        value = std::hint::black_box(value.wrapping_mul(31).wrapping_add(7));
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for CpuHog {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
 }

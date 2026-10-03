@@ -105,7 +105,7 @@ fn validate_content_type(value: &str) -> io::Result<()> {
         };
         if name.trim().eq_ignore_ascii_case("charset") {
             let charset = raw_value.trim().trim_matches('"');
-            if !charset.eq_ignore_ascii_case("utf-8") {
+            if !charset.eq_ignore_ascii_case("utf-8") && !charset.eq_ignore_ascii_case("utf8") {
                 return Err(invalid_data(format!(
                     "unsupported Content-Type charset: {charset}"
                 )));
@@ -145,4 +145,18 @@ pub fn write_response(
     let json = serde_json::to_string(response)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     write_message(writer, &json)
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn content_type_accepts_utf8_alias() {
+        for charset in ["utf8", "UTF8", "utf-8", "UTF-8", "\"utf8\""] {
+            super::validate_content_type(&format!("application/vscode-jsonrpc; charset={charset}"))
+                .unwrap();
+        }
+        assert!(
+            super::validate_content_type("application/vscode-jsonrpc; charset=latin1").is_err()
+        );
+    }
 }

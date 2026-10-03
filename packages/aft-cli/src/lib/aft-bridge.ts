@@ -37,6 +37,49 @@ function isResponseForRequest(parsed: unknown, expectedIds: Set<string>): boolea
   return expectedIds.has(id);
 }
 
+/**
+ * Split an NDJSON byte stream into trimmed lines.
+ *
+ * Only each new chunk is searched for a newline; the partial line carried
+ * between chunks is kept as a list and joined once its newline arrives. The
+ * previous `stdout += chunk; stdout.indexOf("\n")` loop rescanned (and, after
+ * slicing, recopied) the whole pending line on every chunk, which is quadratic
+ * in the size of one large response.
+ *
+ * `scannedChars` counts the characters searched for newlines so tests can pin
+ * the linear cost.
+ */
+export function createNdjsonLineSplitter(onLine: (line: string) => boolean | undefined): {
+  push(chunk: string): void;
+  readonly scannedChars: number;
+} {
+  let pending: string[] = [];
+  let scannedChars = 0;
+  return {
+    push(chunk: string): void {
+      scannedChars += chunk.length;
+      let start = 0;
+      let newline = chunk.indexOf("\n");
+      while (newline !== -1) {
+        let line = chunk.slice(start, newline);
+        if (pending.length > 0) {
+          pending.push(line);
+          line = pending.join("");
+          pending = [];
+        }
+        start = newline + 1;
+        // A true return means the consumer is done; stop splitting.
+        if (onLine(line.trim()) === true) return;
+        newline = chunk.indexOf("\n", start);
+      }
+      if (start < chunk.length) pending.push(start === 0 ? chunk : chunk.slice(start));
+    },
+    get scannedChars() {
+      return scannedChars;
+    },
+  };
+}
+
 export async function sendAftRequest(
   binaryPath: string,
   request: AftRequest,
@@ -71,8 +114,9 @@ export async function sendAftRequests(
       stdio: ["pipe", "pipe", "pipe"],
     });
     const responses: AftResponse[] = [];
+    // Only the first few noise lines are ever shown; the rest are counted.
     const noiseLines: string[] = [];
-    let stdout = "";
+    let noiseLineCount = 0;
     let stderr = "";
     let settled = false;
 
@@ -84,13 +128,17 @@ export async function sendAftRequests(
     };
 
     const expectedIds = new Set(requests.map((req) => req.id));
+    const recordNoise = (line: string): void => {
+      noiseLineCount += 1;
+      if (noiseLines.length < MAX_NOISE_LINES_IN_ERROR) noiseLines.push(line);
+    };
     const handleLine = (line: string): void => {
       if (!line) return;
       // Fast-path the protocol: aft writes `{"id":...}` per response.
       // Any other content is binary log noise, panic output, or a
       // wrapper script banner. We swallow it instead of crashing.
       if (!line.startsWith("{")) {
-        noiseLines.push(line);
+        recordNoise(line);
         return;
       }
       let parsed: unknown;
@@ -98,7 +146,7 @@ export async function sendAftRequests(
         parsed = JSON.parse(line);
       } catch {
         // Looked like JSON but wasn't — also noise.
-        noiseLines.push(line);
+        recordNoise(line);
         return;
       }
       // Skip push frames (configure_warnings, progress, bash_completed, etc.)
@@ -119,17 +167,14 @@ export async function sendAftRequests(
       }
     };
 
+    const stdoutLines = createNdjsonLineSplitter((line) => {
+      handleLine(line);
+      return settled;
+    });
     child.stdout.setEncoding("utf-8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      while (true) {
-        const newline = stdout.indexOf("\n");
-        if (newline === -1) break;
-        const line = stdout.slice(0, newline).trim();
-        stdout = stdout.slice(newline + 1);
-        handleLine(line);
-        if (settled) break;
-      }
+      if (settled) return;
+      stdoutLines.push(chunk);
     });
 
     child.stderr.setEncoding("utf-8");
@@ -150,7 +195,11 @@ export async function sendAftRequests(
     // every line has been processed by handleLine.
     child.on("close", (code) => {
       if (settled) return;
-      finish(() => reject(buildBridgeError({ binaryPath, code, stderr, noiseLines, responses })));
+      finish(() =>
+        reject(
+          buildBridgeError({ binaryPath, code, stderr, noiseLines, noiseLineCount, responses }),
+        ),
+      );
     });
 
     // A binary that crashes at startup can close its stdin before (or
@@ -177,6 +226,8 @@ interface BridgeErrorContext {
   code: number | null;
   stderr: string;
   noiseLines: string[];
+  /** Every noise line seen; `noiseLines` keeps only the first few. */
+  noiseLineCount: number;
   responses: AftResponse[];
 }
 
@@ -190,17 +241,15 @@ function buildBridgeError(ctx: BridgeErrorContext): Error {
     parts.push(`Got ${ctx.responses.length} valid response(s) before exit.`);
   }
 
-  if (ctx.noiseLines.length > 0) {
+  if (ctx.noiseLineCount > 0) {
     parts.push(
-      `\nThe binary printed ${ctx.noiseLines.length} non-JSON line(s) to stdout — this usually means ` +
+      `\nThe binary printed ${ctx.noiseLineCount} non-JSON line(s) to stdout — this usually means ` +
         "the resolved binary isn't an AFT release binary (wrapper script, panic output, or unrelated tool):",
     );
     const sample = ctx.noiseLines.slice(0, MAX_NOISE_LINES_IN_ERROR).map((line) => `  | ${line}`);
     parts.push(sample.join("\n"));
-    if (ctx.noiseLines.length > MAX_NOISE_LINES_IN_ERROR) {
-      parts.push(
-        `  | (… ${ctx.noiseLines.length - MAX_NOISE_LINES_IN_ERROR} more line(s) omitted)`,
-      );
+    if (ctx.noiseLineCount > MAX_NOISE_LINES_IN_ERROR) {
+      parts.push(`  | (… ${ctx.noiseLineCount - MAX_NOISE_LINES_IN_ERROR} more line(s) omitted)`);
     }
     parts.push(
       `\nTry: ${CLI} doctor (full diagnostics) or check ~/.cache/aft/bin/ for the right binary.`,

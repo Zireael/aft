@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve, sep } from "node:path";
-import { spawnSync } from "@cortexkit/aft-bridge";
+import { shortenHomePath, spawnSync } from "@cortexkit/aft-bridge";
 
 /**
  * Turn filesystem errors into one readable line for the setup and doctor UI.
@@ -96,8 +96,7 @@ export function errorPath(error: unknown): string | null {
 
 /** Show paths under the home directory as `~/…`, which is how users type them. */
 export function tildePath(path: string, home: string = homedir()): string {
-  if (path === home) return "~";
-  return path.startsWith(home + sep) ? `~${path.slice(home.length)}` : path;
+  return shortenHomePath(path, home);
 }
 
 /** Quote a path for a POSIX shell only when it needs it; keep `~/` expandable. */

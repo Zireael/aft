@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "fuzzy-edit-boundary",
+    "bash-task-route-owner",
+    "pi-hints-mc-children"
+  ],
+  "note": "Fuzzy edit keeps skipped boundary whitespace; bash tasks persist under the command route harness; Pi skips workflow hints in Magic Context helper children. No ranking-fence file touched."
+}

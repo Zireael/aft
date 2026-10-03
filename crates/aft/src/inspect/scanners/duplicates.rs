@@ -14,6 +14,7 @@ use tree_sitter::{Node, Parser, Tree};
 use super::duplicates_classifier::{is_anonymizable, node_cost, AnonymizeAs};
 use crate::cache_freshness;
 use crate::inspect::entry_points::TOP_PREVIEW_ITEMS;
+use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{
     FileContribution, InspectCategory, InspectJob, InspectResult, InspectScanSuccess,
 };
@@ -80,7 +81,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct DuplicateGroup {
     files: Vec<String>,
     cost: u32,
@@ -90,6 +91,33 @@ struct DuplicateGroup {
     sample_end_line: u32,
     #[serde(skip_serializing_if = "is_false")]
     generated: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROLLUP_CLONED_STRING_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Clone for DuplicateGroup {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ROLLUP_CLONED_STRING_BYTES.with(|bytes| {
+            bytes.set(
+                bytes.get()
+                    + self.sample_file.len()
+                    + self.files.iter().map(String::len).sum::<usize>(),
+            )
+        });
+        Self {
+            files: self.files.clone(),
+            cost: self.cost,
+            duplicated_lines: self.duplicated_lines,
+            sample_file: self.sample_file.clone(),
+            sample_start_line: self.sample_start_line,
+            sample_end_line: self.sample_end_line,
+            generated: self.generated,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +215,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
-            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
+            generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
         });
     };
@@ -200,7 +228,7 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
             freshness,
             line_count: 0,
             expected_duplicate: false,
-            generated: crate::inspect::generated::is_generated_file(Path::new(""), path),
+            generated: crate::inspect::generated::is_generated_file(&job.project_root, path),
             fragments: Vec::new(),
         });
     }
@@ -209,7 +237,8 @@ fn scan_file(job: &InspectJob, path: &Path) -> Result<FileScan, String> {
         .map_err(|error| format!("read failed for {}: {error}", path.display()))?;
     let line_count = source_line_count(&source);
     let expected_duplicate = source.contains(EXPECTED_DUPLICATE_MARKER);
-    let generated = crate::inspect::generated::is_generated_file_from_source(path, &source);
+    let generated =
+        crate::inspect::generated::is_generated_file_from_source(&job.project_root, path, &source);
     let tree = parse_source(path, lang, &source)?;
     let mut fragments = Vec::new();
     let mut hash_scratch = Vec::new();
@@ -728,6 +757,7 @@ fn aggregate_duplicate_occurrences(
 
     let expected_mirrors = compile_expected_mirrors(expected_mirrors);
     let mut suppression = SuppressionStats::default();
+    let mut excluded = ExcludedTestTally::default();
     let mut groups = by_hash
         .iter()
         .filter(|(hash, occurrences)| {
@@ -754,6 +784,14 @@ fn aggregate_duplicate_occurrences(
                 suppression.marker_groups += 1;
                 return None;
             }
+            // A clone that lives only in test trees (generated fixtures, test
+            // helpers copied between suites) is not a product refactoring
+            // target. Groups that touch any product file stay in the count.
+            let files = group_files(&group);
+            if files.iter().all(|file| is_test_tree_file(file)) {
+                excluded.record_in_files(files.iter().map(String::as_str));
+                return None;
+            }
             Some(group)
         })
         .collect::<Vec<_>>();
@@ -770,26 +808,25 @@ fn aggregate_duplicate_occurrences(
     let headline_groups = groups
         .iter()
         .filter(|group| !group.generated)
-        .cloned()
         .collect::<Vec<_>>();
     let generated_groups = groups
         .iter()
         .filter(|group| group.generated)
-        .cloned()
         .collect::<Vec<_>>();
     let count = headline_groups.len();
     let generated_count = generated_groups.len();
     let duplicate_stats = duplicate_line_stats(&headline_groups);
-    let all_duplicate_stats = duplicate_line_stats(&groups);
+    let all_duplicate_stats = duplicate_line_stats(&groups.iter().collect::<Vec<_>>());
     let generated_duplicate_stats = duplicate_line_stats(&generated_groups);
     let duplicated_percent =
         duplicate_percent(duplicate_stats.duplicated_lines, total_analyzed_lines);
     let drill_down_capped = drill_down_limit.is_some_and(|limit| groups_count > limit);
     let generated_drill_down_capped = drill_down_limit.is_some_and(|limit| generated_count > limit);
-    let generated_items = match drill_down_limit {
-        Some(limit) => generated_groups.into_iter().take(limit).collect::<Vec<_>>(),
-        None => generated_groups,
-    };
+    let generated_items = generated_groups
+        .iter()
+        .take(drill_down_limit.unwrap_or(usize::MAX))
+        .map(|group| (*group).clone())
+        .collect::<Vec<_>>();
     let items = match drill_down_limit {
         Some(limit) => groups.into_iter().take(limit).collect::<Vec<_>>(),
         None => groups,
@@ -809,7 +846,7 @@ fn aggregate_duplicate_occurrences(
         .map(duplicate_top_item)
         .collect::<Vec<_>>();
 
-    json!({
+    let mut aggregate = json!({
         "count": count,
         "generated_count": generated_count,
         "total_count": groups_count,
@@ -834,7 +871,9 @@ fn aggregate_duplicate_occurrences(
         "generated_drill_down_capped": generated_drill_down_capped,
         "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
-    })
+    });
+    excluded.write_into(&mut aggregate);
+    aggregate
 }
 
 /// Hashes of duplicate fragments that are "maximal" — i.e. have at least one
@@ -942,7 +981,7 @@ struct DuplicateLineStats {
     file_count: usize,
 }
 
-fn duplicate_line_stats(groups: &[DuplicateGroup]) -> DuplicateLineStats {
+fn duplicate_line_stats(groups: &[&DuplicateGroup]) -> DuplicateLineStats {
     let mut by_file = BTreeMap::<String, Vec<(u32, u32)>>::new();
     for group in groups {
         for occurrence in &group.files {
@@ -1313,6 +1352,60 @@ mod tests {
     }
 
     #[test]
+    fn capped_duplicate_rollup_avoids_cloning_discarded_groups() {
+        let mut by_hash = BTreeMap::new();
+        for i in 0..1_000 {
+            let start = i * 20 + 1;
+            by_hash.insert(
+                format!("hash-{i}"),
+                ["src/a.ts", "src/b.ts"]
+                    .into_iter()
+                    .map(|file| FragmentOccurrence {
+                        file: Rc::from(file),
+                        start_line: start,
+                        end_line: start + 11,
+                        cost: 100,
+                        generated: false,
+                    })
+                    .collect(),
+            );
+        }
+        let aggregate = |hashes, limit| {
+            aggregate_duplicate_occurrences(hashes, 2, 40_000, BTreeSet::new(), vec![], limit, &[])
+        };
+        let full = aggregate(by_hash.clone(), None);
+        ROLLUP_CLONED_STRING_BYTES.with(|bytes| bytes.set(0));
+        let capped = aggregate(by_hash, Some(2));
+        assert_eq!(full["total_groups"], capped["total_groups"]);
+        assert_eq!(full["duplicated_lines"], capped["duplicated_lines"]);
+        assert_eq!(
+            &full["items"].as_array().unwrap()[..2],
+            &capped["items"].as_array().unwrap()[..2]
+        );
+        let baseline_cloned_bytes: usize = full["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| {
+                group["sample_file"].as_str().unwrap().len()
+                    + group["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|file| file.as_str().unwrap().len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let capped_cloned_bytes = ROLLUP_CLONED_STRING_BYTES.with(|bytes| bytes.get());
+        assert_eq!(
+            capped_cloned_bytes, 0,
+            "headline items must be moved without cloning"
+        );
+        assert!(baseline_cloned_bytes > 20_000);
+        eprintln!("rollup headline cloned string bytes: baseline {baseline_cloned_bytes}, capped {capped_cloned_bytes}");
+    }
+
+    #[test]
     fn generated_duplicate_groups_sort_below_headline_and_keep_totals() {
         let aggregate = aggregate_duplicate_contributions_with_limit(
             &[
@@ -1335,6 +1428,44 @@ mod tests {
         assert_eq!(items[1]["generated"], true, "{items:#?}");
         assert_eq!(aggregate["top"][0]["files"][0], "src/a.ts:1-10");
         assert_eq!(aggregate["generated_top"][0]["files"][0], "gen/a.ts:1-12");
+    }
+
+    #[test]
+    fn duplicate_groups_only_in_test_trees_are_excluded_from_the_count() {
+        let aggregate = aggregate_duplicate_contributions_with_limit(
+            &[
+                contribution("src/a.ts", &[(1, 10, 10, "hand")]),
+                contribution("src/b.ts", &[(1, 10, 10, "hand")]),
+                contribution(
+                    "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                    &[(1, 141, 700, "bulk")],
+                ),
+                contribution(
+                    "tests/docker/scenarios/grep/fixture/bulk/bulk.ts",
+                    &[(1, 141, 700, "bulk")],
+                ),
+                // A clone between a product file and a test keeps counting:
+                // the product side is still a refactoring target.
+                contribution("src/c.ts", &[(1, 12, 20, "mixed")]),
+                contribution("src/c.test.ts", &[(1, 12, 20, "mixed")]),
+            ],
+            Vec::new(),
+            None,
+            &[],
+        );
+
+        assert_eq!(aggregate["count"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["total_groups"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 2, "{aggregate:#}");
+        let items = aggregate["items"].as_array().expect("items");
+        assert!(
+            items.iter().all(|group| !group["sample_file"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fixture")),
+            "{items:#?}"
+        );
     }
 
     #[test]

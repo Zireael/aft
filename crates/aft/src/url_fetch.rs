@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +13,7 @@ use htmd::{
     element_handler::{HandlerResult, Handlers},
     Element, HtmlToMarkdown,
 };
+use markup5ever_rcdom::{Node, NodeData};
 use reqwest::blocking::{Client, Response as HttpResponse};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::redirect::Policy;
@@ -758,11 +760,25 @@ fn convert_html_body_to_markdown(body: &[u8], url: &str) -> Result<Vec<u8>, UrlF
     Ok(markdown.into_bytes())
 }
 
+/// Page chrome dropped from the converted Markdown. The `<pre>` text walker
+/// skips the same tags so a copy button inside a code block stays out of it.
+const SKIPPED_HTML_TAGS: [&str; 8] = [
+    "head", "script", "style", "nav", "footer", "aside", "noscript", "button",
+];
+
 fn html_to_markdown_converter() -> HtmlToMarkdown {
     HtmlToMarkdown::builder()
-        .skip_tags(vec![
-            "head", "script", "style", "nav", "footer", "aside", "noscript", "button",
-        ])
+        .skip_tags(SKIPPED_HTML_TAGS.to_vec())
+        .add_handler(
+            vec!["pre"],
+            |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
+                if node_has_descendant_tag(element.node, "code") {
+                    Some(fenced_code_block(&element).into())
+                } else {
+                    handlers.fallback(element)
+                }
+            },
+        )
         .add_handler(
             vec!["a"],
             |handlers: &dyn Handlers, element: Element| -> Option<HandlerResult> {
@@ -802,6 +818,219 @@ fn html_to_markdown_converter() -> HtmlToMarkdown {
             },
         )
         .build()
+}
+
+/// Render a `<pre>` that holds code as one fenced block built from the raw
+/// text of the whole `<pre>`, not just its `<code>` child.
+///
+/// htmd fences only the `<code>` element and renders whatever follows it in
+/// the `<pre>` as ordinary text. Real pages close `</code>` early: the Chrome
+/// DevTools docs end `<code>` in the middle of a JSON string, and the HTML
+/// parser then leaves the rest of the block as `<pre>` children after the
+/// `<code>`. A browser still shows that as one block, so the Markdown must too.
+/// Walking the text ourselves also keeps htmd's text handling (escaping,
+/// collapsing blank lines) away from code that has to be copied verbatim.
+fn fenced_code_block(element: &Element<'_>) -> String {
+    let mut text = PreformattedText::default();
+    text.collect(element.node);
+    // A break still pending after the last line ends the block, so it is
+    // dropped rather than written.
+    let mut code = text.output;
+    // The line break before `</code>` or `</pre>` ends the last line; it is
+    // not an extra blank line inside the block.
+    if code.ends_with('\n') {
+        code.pop();
+    }
+    let fence = code_fence_for(&code);
+    let language = find_descendant_element(element.node, "code")
+        .and_then(|code| node_class_attr(&code))
+        .as_deref()
+        .and_then(language_from_class)
+        .or_else(|| element_attr_value(element, "class").and_then(language_from_class));
+
+    let mut block = String::from("\n\n");
+    block.push_str(&fence);
+    if let Some(language) = language {
+        block.push_str(&language);
+    }
+    block.push('\n');
+    block.push_str(&code);
+    block.push('\n');
+    block.push_str(&fence);
+    block.push_str("\n\n");
+    block
+}
+
+/// How an element inside a `<pre>` ends the text line it holds.
+///
+/// Many highlighters emit one element per source line with no newline text
+/// between them: Prism `span.token-line` (Docusaurus), Shiki `span.line`,
+/// `<li>` per line, table rows (highlight.js line-numbers plugin), or plain
+/// per-line `<div>`s. A browser still shows separate lines, so the copied
+/// text must break after each one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreLineBreak {
+    /// Inline element: adds no break.
+    None,
+    /// One source line, so it always ends a line, even when empty (an empty
+    /// row or `span.line` is a blank line of code).
+    Line,
+    /// Generic block (`<div>`, `<p>`): ends a line only when it holds text,
+    /// so an empty line-number `<div>` beside the code does not add a blank
+    /// line.
+    Block,
+}
+
+fn pre_line_break(tag: &str, class: Option<&str>) -> PreLineBreak {
+    let has_class =
+        |token: &str| class.is_some_and(|value| value.split_ascii_whitespace().any(|c| c == token));
+    match tag {
+        "tr" | "li" => PreLineBreak::Line,
+        "span" if has_class("token-line") || has_class("line") => PreLineBreak::Line,
+        "div" | "p" => PreLineBreak::Block,
+        _ => PreLineBreak::None,
+    }
+}
+
+/// The raw text of a `<pre>`, collected exactly as written: no escaping and
+/// no whitespace changes.
+///
+/// A per-line element (see [`PreLineBreak`]) ends its line with a *pending*
+/// break rather than a written one. Some highlighters already put a newline
+/// between their line elements (Shiki's default output does) and some do
+/// not; the pending break is written only when more of the block follows
+/// and is absorbed when that next text already starts with a newline, so
+/// both layouts give one line per element.
+#[derive(Default)]
+struct PreformattedText {
+    output: String,
+    pending_break: bool,
+}
+
+impl PreformattedText {
+    fn flush_pending_break(&mut self) {
+        if self.pending_break {
+            self.output.push('\n');
+            self.pending_break = false;
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.pending_break && text.starts_with('\n') {
+            self.pending_break = false;
+        }
+        self.flush_pending_break();
+        self.output.push_str(text);
+    }
+
+    fn collect(&mut self, node: &Node) {
+        for child in node.children.borrow().iter() {
+            match &child.data {
+                NodeData::Text { contents } => self.push_text(&contents.borrow()),
+                NodeData::Element { name, attrs, .. } => {
+                    let tag = name.local.as_ref();
+                    if SKIPPED_HTML_TAGS.contains(&tag) {
+                        continue;
+                    }
+                    if tag == "br" {
+                        // A `<br>` right after a finished line starts an
+                        // empty line, as it does in a browser.
+                        self.flush_pending_break();
+                        self.output.push('\n');
+                        continue;
+                    }
+                    let line_break = {
+                        let attrs = attrs.borrow();
+                        let class = attrs
+                            .iter()
+                            .find(|attr| attr.name.local.as_ref() == "class")
+                            .map(|attr| attr.value.as_ref());
+                        pre_line_break(tag, class)
+                    };
+                    if line_break == PreLineBreak::None {
+                        self.collect(child);
+                        continue;
+                    }
+                    // A new line element starts on its own line, so the
+                    // previous one's break is written before measuring this
+                    // one's text.
+                    self.flush_pending_break();
+                    let line_start = self.output.len();
+                    self.collect(child);
+                    let line = &self.output[line_start..];
+                    let line_ended = self.pending_break || line.ends_with('\n');
+                    let ends_line = match line_break {
+                        PreLineBreak::None => false,
+                        PreLineBreak::Line => !line_ended,
+                        PreLineBreak::Block => !line.is_empty() && !line_ended,
+                    };
+                    if ends_line {
+                        self.pending_break = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A backtick fence one longer than the longest backtick run in `code`
+/// (at least three), so a run inside the code can never close the block.
+fn code_fence_for(code: &str) -> String {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in code.chars() {
+        if ch == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// The `xyz` of a `language-xyz` class token, the convention both Prism and
+/// highlight.js use to name a code block's language.
+fn language_from_class(class: &str) -> Option<String> {
+    class
+        .split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("language-"))
+        .filter(|language| !language.is_empty())
+        .map(str::to_string)
+}
+
+fn node_has_descendant_tag(node: &Node, tag: &str) -> bool {
+    find_descendant_element(node, tag).is_some()
+}
+
+/// The first element named `tag` below `node`, depth first.
+fn find_descendant_element(node: &Node, tag: &str) -> Option<Rc<Node>> {
+    for child in node.children.borrow().iter() {
+        if let NodeData::Element { name, .. } = &child.data {
+            if name.local.as_ref() == tag {
+                return Some(Rc::clone(child));
+            }
+            if let Some(found) = find_descendant_element(child, tag) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn node_class_attr(node: &Node) -> Option<String> {
+    match &node.data {
+        NodeData::Element { attrs, .. } => attrs
+            .borrow()
+            .iter()
+            .find(|attr| attr.name.local.as_ref() == "class")
+            .map(|attr| attr.value.to_string()),
+        _ => None,
+    }
 }
 
 fn is_permalink_anchor(element: &Element<'_>) -> bool {
@@ -1135,5 +1364,176 @@ mod tests {
         let md = html_to_markdown_converter().convert(html).unwrap();
         assert!(md.contains("## The Retain Pipeline"), "{md:?}");
         assert!(!md.contains('\u{200b}'), "{md:?}");
+    }
+
+    const CHROME_AUTO_CONNECT_HTML: &str =
+        include_str!("../tests/fixtures/url_html/chrome_auto_connect.html");
+
+    /// The fenced blocks of `markdown` as (opening fence line, body). Body
+    /// lines lose only the indentation the opening fence has (a list item's
+    /// indent), so the code's own indentation is compared as written.
+    fn fenced_blocks(markdown: &str) -> Vec<(String, String)> {
+        let mut blocks = Vec::new();
+        let mut open: Option<(String, usize, Vec<String>)> = None;
+        for line in markdown.lines() {
+            let trimmed = line.trim_start();
+            match open.take() {
+                None => {
+                    if trimmed.starts_with("```") {
+                        let indent = line.len() - trimmed.len();
+                        open = Some((trimmed.to_string(), indent, Vec::new()));
+                    }
+                }
+                Some((fence_line, indent, mut body)) => {
+                    let fence: String = fence_line.chars().take_while(|c| *c == '`').collect();
+                    if trimmed == fence {
+                        blocks.push((fence_line, body.join("\n")));
+                    } else {
+                        let unindented = line
+                            .strip_prefix(&" ".repeat(indent))
+                            .unwrap_or(line.trim_start());
+                        body.push(unindented.to_string());
+                        open = Some((fence_line, indent, body));
+                    }
+                }
+            }
+        }
+        assert!(open.is_none(), "unclosed fence in {markdown}");
+        blocks
+    }
+
+    #[test]
+    fn html_to_markdown_pre_closed_code_early_stays_one_fenced_block() {
+        // The live page closes </code> inside the "chrome-devtools-mcp@latest"
+        // string; everything after it must still land inside the same fence.
+        let md = html_to_markdown_converter()
+            .convert(CHROME_AUTO_CONNECT_HTML)
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        let (fence_line, body) = &blocks[0];
+        assert_eq!(fence_line, "```", "{md}");
+        assert_eq!(
+            body,
+            concat!(
+                "{\n",
+                "  \"mcpServers\": {\n",
+                "    \"chrome-devtools\": {\n",
+                "      \"command\": \"npx\",\n",
+                "      \"args\": [\"chrome-devtools-mcp@latest\", \"--autoConnect\"]\n",
+                "    }\n",
+                "  }\n",
+                "}",
+            ),
+            "{md}"
+        );
+        assert!(
+            md.contains(r#""args": ["chrome-devtools-mcp@latest", "--autoConnect"]"#),
+            "{md}"
+        );
+        assert!(!md.contains("```ome"), "{md}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_keeps_code_verbatim() {
+        let html = "<pre><code class=\"language-md\">line *one*\n\n\n\n  # not a heading &lt;b&gt;\n</code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(
+            md.trim(),
+            "```md\nline *one*\n\n\n\n  # not a heading <b>\n```",
+            "{md:?}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_code_containing_triple_backticks_gets_longer_fence() {
+        let html = "<pre><code>Example:\n```rust\nfn main() {}\n```\n</code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(
+            md.trim(),
+            "````\nExample:\n```rust\nfn main() {}\n```\n````",
+            "{md:?}"
+        );
+
+        let html = "<pre><code>a ````` run</code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(md.trim(), "``````\na ````` run\n``````", "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_without_code_keeps_htmd_rendering() {
+        let html = "<pre>plain preformatted</pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert!(!md.contains("```"), "{md:?}");
+        assert!(md.contains("plain preformatted"), "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_per_line_divs_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!(
+                "../tests/fixtures/url_html/per_line_divs.html"
+            ))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        // The template literal's single backticks leave the fence at three.
+        assert_eq!(blocks[0].0, "```js", "{md}");
+        assert_eq!(
+            blocks[0].1, "function greet(name) {\n  return `Hello, ${name}`;\n\n}",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_table_rows_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!("../tests/fixtures/url_html/table_rows.html"))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        assert_eq!(blocks[0].0, "```python", "{md}");
+        assert_eq!(
+            blocks[0].1, "def add(a, b):\n    return a + b\n\nprint(add(1, 2))",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_shiki_line_spans_keep_their_lines() {
+        let md = html_to_markdown_converter()
+            .convert(include_str!("../tests/fixtures/url_html/shiki_lines.html"))
+            .unwrap();
+        let blocks = fenced_blocks(&md);
+        assert_eq!(blocks.len(), 1, "{md}");
+        assert_eq!(blocks[0].0, "```", "{md}");
+        assert_eq!(
+            blocks[0].1,
+            "const total = items.reduce((sum, item) => sum + item.price, 0);\n\nconsole.log(total);",
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn html_to_markdown_pre_list_item_lines_keep_their_lines() {
+        let html = "<pre><code><ol><li>first</li><li></li><li>  third</li></ol></code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(md.trim(), "```\nfirst\n\n  third\n```", "{md:?}");
+    }
+
+    #[test]
+    fn html_to_markdown_pre_newline_text_between_lines_is_not_doubled() {
+        // Lines that already end in newline text must not gain a second break.
+        let html = "<pre><code><span class=\"line\">a</span>\n<span class=\"line\">b</span>\n<div>c\n</div></code></pre>";
+        let md = html_to_markdown_converter().convert(html).unwrap();
+        assert_eq!(md.trim(), "```\na\nb\nc\n```", "{md:?}");
+    }
+
+    #[test]
+    fn code_fence_for_outgrows_longest_backtick_run() {
+        assert_eq!(code_fence_for("no ticks"), "```");
+        assert_eq!(code_fence_for("`inline` ``double``"), "```");
+        assert_eq!(code_fence_for("```"), "````");
+        assert_eq!(code_fence_for("``` and ````"), "`````");
     }
 }

@@ -9,13 +9,21 @@
  * backup tracking, formatting, and inline diagnostics.
  */
 
+import { stat } from "node:fs/promises";
 import * as path from "node:path";
-import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceStringArray,
+  isFindReplaceOnlyEdit,
+  toolErrorFromResponse,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { resolveGithubConfig } from "../config.js";
+import { resolveBashConfig, resolveGithubConfig, toolEnabled } from "../config.js";
+import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import { prepareToolMap } from "../normalize-schemas.js";
-import { resolvePromptContext } from "../shared/last-assistant-model.js";
+import { currentSessionVisionCapability } from "../shared/read-vision.js";
+import { measurePreStage } from "../tool-perf.js";
 import type { PluginContext } from "../types.js";
 import {
   callToolCall,
@@ -65,71 +73,6 @@ export function whenGhReadEnabled(enabled: boolean, description: string): string
   return enabled ? description : "";
 }
 
-type OpenCodeModelCatalogEntry = {
-  attachment?: unknown;
-  modalities?: { input?: unknown };
-};
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function visionCapabilityForOpenCodeModel(model: unknown): boolean | undefined {
-  const entry = model as OpenCodeModelCatalogEntry | undefined;
-  if (Array.isArray(entry?.modalities?.input)) {
-    return entry.modalities.input.includes("image");
-  }
-  return typeof entry?.attachment === "boolean" ? entry.attachment : undefined;
-}
-
-function modelFromOpenCodeProvider(provider: Record<string, unknown>, modelID: string): unknown {
-  const models = provider.models;
-  if (Array.isArray(models)) {
-    return models.find((model) => asRecord(model)?.id === modelID);
-  }
-  return asRecord(models)?.[modelID];
-}
-
-/**
- * Resolve the current session model for this call instead of retaining a bind-time
- * capability. A missing model catalog entry deliberately remains unspecified so
- * the server's safe text-only default applies.
- */
-async function currentSessionVisionCapability(
-  client: unknown,
-  sessionID: string | undefined,
-): Promise<boolean | undefined> {
-  if (!sessionID) return undefined;
-  const promptContext = await resolvePromptContext(client, sessionID);
-  const currentModel = promptContext?.model;
-  if (!currentModel) return undefined;
-
-  const providerApi = (client as { provider?: { list?: () => Promise<unknown> } }).provider;
-  if (typeof providerApi?.list !== "function") return undefined;
-
-  let listed: unknown;
-  try {
-    listed = await providerApi.list();
-  } catch {
-    return undefined;
-  }
-  const result = asRecord(listed);
-  const catalog = asRecord(result?.data) ?? result;
-  const providers = Array.isArray(catalog?.all)
-    ? catalog.all
-    : Array.isArray(catalog?.providers)
-      ? catalog.providers
-      : [];
-  const provider = providers.map(asRecord).find((entry) => entry?.id === currentModel.providerID);
-  if (!provider) return undefined;
-
-  return visionCapabilityForOpenCodeModel(
-    modelFromOpenCodeProvider(provider, currentModel.modelID),
-  );
-}
-
 /**
  * Keep OpenCode's persisted tool input compatible with its file-tool display.
  * The bridge payload remains separately constructed from the canonical path.
@@ -144,6 +87,13 @@ function persistFilePathAlias(args: Record<string, unknown>, context: ToolContex
 /** Test-only export. Production code uses buildUnifiedDiff directly. */
 export const _buildUnifiedDiffForTest = (fp: string, before: string, after: string): string =>
   buildUnifiedDiff(fp, before, after);
+
+/** Test-only export of the line diff behind buildUnifiedDiff. */
+export const _diffLinesForTest = (a: readonly string[], b: readonly string[]) => diffLines(a, b);
+
+/** LCS table cells allocated by diffLines in this process; tests pin the cost. */
+let diffTableCells = 0;
+export const _diffTableCellsForTest = (): number => diffTableCells;
 
 /**
  * Build a unified diff string from before/after content using a proper
@@ -163,9 +113,10 @@ function buildUnifiedDiff(fp: string, before: string, after: string): string {
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
 
-  // LCS is O(n*m) in lines; a 5000x5000 matrix uses ~100 MB and ~250 ms,
-  // which we accept for normal source files. Above that we skip diff
-  // generation rather than block the plugin event loop on a single edit.
+  // LCS is O(n*m) in the lines between the common prefix and suffix; a
+  // whole-file rewrite at 5000x5000 still needs a ~50 MB table and ~250 ms.
+  // Above that we skip diff generation rather than block the plugin event
+  // loop on a single edit.
   // Byte-size gating misses the real cost (a 100 KB minified bundle is one
   // line; a 30 KB markdown file with 1500 lines is the expensive case).
   const LINE_CAP = 5000;
@@ -202,27 +153,52 @@ type DiffOp =
 
 /**
  * LCS-based line diff. Builds a length table then walks back to produce ops.
- * O(n*m) time and space — fine for the 100KB SIZE_CAP guard above.
+ *
+ * Lines shared at the start and end of both files are matched before the
+ * table is built, so its size is (changed region)² rather than (file)²: a
+ * one-line edit in a 3000-line file needs a 2×2 table instead of 3001×3001.
+ * The ops are exactly those of the full-table walk. The walk starts at the
+ * end and takes every equal pair first, which is the common suffix. Inside
+ * the common prefix the full table is known without computing it: the LCS of
+ * the first i lines of `a` and the first j lines of `b` is min(i, j) whenever
+ * min(i, j) is within the prefix, and prefix length plus the trimmed table
+ * otherwise. The walk reads those values, so its tie-breaks match.
  */
 function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
   const n = a.length;
   const m = b.length;
 
-  // dp[i][j] = LCS length of a[0..i] and b[0..j]
-  // Use a flat Uint32Array for memory efficiency on large files.
-  const dp = new Uint32Array((n + 1) * (m + 1));
-  const w = m + 1;
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        dp[i * w + j] = dp[(i - 1) * w + (j - 1)] + 1;
+  let prefix = 0;
+  const maxPrefix = Math.min(n, m);
+  while (prefix < maxPrefix && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  const maxSuffix = maxPrefix - prefix;
+  while (suffix < maxSuffix && a[n - 1 - suffix] === b[m - 1 - suffix]) suffix++;
+
+  // inner[i][j] = LCS length of a[prefix..prefix+i] and b[prefix..prefix+j]
+  // within the trimmed middle. Values never exceed min(innerN, innerM), so a
+  // 16-bit table suffices below 65535 lines and halves the memory.
+  const innerN = n - prefix - suffix;
+  const innerM = m - prefix - suffix;
+  const w = innerM + 1;
+  const cells = (innerN + 1) * w;
+  diffTableCells += cells;
+  const inner = Math.min(innerN, innerM) < 0xffff ? new Uint16Array(cells) : new Uint32Array(cells);
+  for (let i = 1; i <= innerN; i++) {
+    const ai = a[prefix + i - 1];
+    for (let j = 1; j <= innerM; j++) {
+      if (ai === b[prefix + j - 1]) {
+        inner[i * w + j] = inner[(i - 1) * w + (j - 1)] + 1;
       } else {
-        const up = dp[(i - 1) * w + j];
-        const left = dp[i * w + (j - 1)];
-        dp[i * w + j] = up >= left ? up : left;
+        const up = inner[(i - 1) * w + j];
+        const left = inner[i * w + (j - 1)];
+        inner[i * w + j] = up >= left ? up : left;
       }
     }
   }
+  // LCS length of a[0..i] and b[0..j] in the full (untrimmed) table.
+  const lcs = (i: number, j: number): number =>
+    i <= prefix || j <= prefix ? Math.min(i, j) : prefix + inner[(i - prefix) * w + (j - prefix)];
 
   // Walk back to produce ops in reverse, then reverse at the end.
   const ops: DiffOp[] = [];
@@ -233,7 +209,7 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
       ops.push({ tag: "eq", beforeIdx: i - 1, afterIdx: j - 1, line: a[i - 1] });
       i--;
       j--;
-    } else if (dp[(i - 1) * w + j] >= dp[i * w + (j - 1)]) {
+    } else if (lcs(i - 1, j) >= lcs(i, j - 1)) {
       ops.push({ tag: "del", beforeIdx: i - 1, line: a[i - 1] });
       i--;
     } else {
@@ -365,7 +341,7 @@ const z = tool.schema;
 
 const READ_DESCRIPTION = `Read file contents or list directory entries.
 
-Use either startLine/endLine OR offset/limit to read a section of a file.
+Use either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.
 
 Behavior:
 - Returns line-numbered content (e.g., "1: const x = 1")
@@ -373,7 +349,7 @@ Behavior:
 - Output capped at 50KB
 - Binary files are auto-detected and return a size-only message
 - Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media
-- Directories return sorted entries with trailing / for subdirectories
+- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.
 
 Examples:
   Read full file: { "path": "src/app.ts" }
@@ -407,21 +383,23 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           .string()
           .describe("Path to file or directory (absolute or relative to project root)"),
         startLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line to start reading from",
+          "1-based line or directory entry to start reading from",
         ),
         endLine: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line to stop reading at (inclusive)",
+          "1-based line or directory entry to stop reading at (inclusive)",
         ),
         limit: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "Max lines to return (default: 2000)",
+          "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
         ),
         offset: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "1-based line number to start reading from (use with limit). Ignored if startLine is provided",
+          "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
         ),
       },
       execute: async (args, context): Promise<ToolResult> => {
         const file = args.path as string;
-        const projectRoot = await resolveProjectRoot(ctx, context);
+        const projectRoot = await measurePreStage("directory", () =>
+          resolveProjectRoot(ctx, context),
+        );
 
         // Resolve relative paths from the same session/project root used by the bridge.
         const filePath = resolvePathFromProjectRoot(projectRoot, file);
@@ -431,27 +409,31 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
         // restriction, reads continue to Rust so its session task registry can
         // distinguish exact bash artifacts from ordinary external paths.
         {
-          const denial = await assertExternalDirectoryPermission(ctx, context, filePath, {
-            serverValidatedRead: true,
-          });
+          const denial = await measurePreStage("permission", () =>
+            assertExternalDirectoryPermission(ctx, context, filePath, {
+              serverValidatedRead: true,
+            }),
+          );
           if (denial) return permissionDeniedResponse(denial);
         }
 
         // Permission check
         try {
-          await runAsk(
-            context.ask({
-              permission: "read",
-              // OpenCode states a read permission against the path relative to
-              // the project directory when the file is inside it, and only
-              // falls back to the absolute path for files outside. Sending the
-              // absolute path for a file in the project root instead made every
-              // project-relative read rule unmatchable, so such a read could
-              // never be the one the user had already permitted.
-              patterns: [permissionPath(context, filePath)],
-              always: ["*"],
-              metadata: {},
-            }),
+          await measurePreStage("permission", () =>
+            runAsk(
+              context.ask({
+                permission: "read",
+                // OpenCode states a read permission against the path relative to
+                // the project directory when the file is inside it, and only
+                // falls back to the absolute path for files outside. Sending the
+                // absolute path for a file in the project root instead made every
+                // project-relative read rule unmatchable, so such a read could
+                // never be the one the user had already permitted.
+                patterns: [permissionPath(context, filePath)],
+                always: ["*"],
+                metadata: {},
+              }),
+            ),
           );
         } catch (error) {
           const failure = classifyPermissionError(error);
@@ -460,36 +442,40 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           );
         }
 
-        const rawStartLine = coerceOptionalInt(
+        const startLine = coerceOptionalInt(
           args.startLine,
           "startLine",
           1,
           Number.MAX_SAFE_INTEGER,
         );
-        const rawEndLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
-        const rawLimit = coerceOptionalInt(args.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
-        const rawOffset = coerceOptionalInt(args.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
+        const endLine = coerceOptionalInt(args.endLine, "endLine", 1, Number.MAX_SAFE_INTEGER);
+        const limit = coerceOptionalInt(args.limit, "limit", 1, Number.MAX_SAFE_INTEGER);
+        const offset = coerceOptionalInt(args.offset, "offset", 1, Number.MAX_SAFE_INTEGER);
 
-        // Normalize offset/limit to startLine/endLine (backward compat with opencode's read)
-        let startLine = rawStartLine;
-        let endLine = rawEndLine;
-        if (startLine === undefined && rawOffset !== undefined) {
-          startLine = rawOffset;
-          if (rawLimit !== undefined) {
-            endLine = rawOffset + rawLimit - 1;
-          }
-        }
-
+        // Forward the four range fields as given (empty placeholders already
+        // dropped). The server resolves how they combine, and refuses an
+        // inverted range by name, in one place shared with the Pi plugin and
+        // direct daemon callers, so every host reads the same lines.
         const rawArgs: Record<string, unknown> = { filePath: file };
         if (startLine !== undefined) rawArgs.startLine = startLine;
         if (endLine !== undefined) rawArgs.endLine = endLine;
-        // Only send limit if we did NOT convert offset to startLine/endLine.
-        if (rawLimit !== undefined && rawOffset === undefined) rawArgs.limit = rawLimit;
+        if (offset !== undefined) rawArgs.offset = offset;
+        if (limit !== undefined) rawArgs.limit = limit;
 
-        const visionCapability = await currentSessionVisionCapability(
-          ctx.client,
-          context.sessionID,
-        );
+        // GitHub resources can embed images. For local media extensions, exclude
+        // directories before negotiating capability; all other reads dispatch directly.
+        const mediaCandidate =
+          isGithubResourcePath(file) ||
+          (/\.(png|jpe?g|gif|webp|pdf)$/i.test(filePath) &&
+            (await stat(filePath).then(
+              (info) => info.isFile(),
+              () => false,
+            )));
+        const visionCapability = mediaCandidate
+          ? await measurePreStage("capability", () =>
+              currentSessionVisionCapability(ctx.client, context.sessionID),
+            )
+          : undefined;
         if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
 
         const response = await callToolCall(ctx, context, "read", rawArgs);
@@ -565,7 +551,7 @@ function getWriteDescription(ctx: PluginContext, editToolName: string): string {
   const githubText = resolveGithubConfig(ctx.config).write
     ? ' When enabled, `write("issue://N", content)` or `write("pr://N", content)` publishes a new comment.'
     : "";
-  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.${githubText}`;
+  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubText}`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -576,7 +562,11 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       filePath: z
         .string()
         .describe("Path to the file to write (absolute or relative to project root)"),
-      content: z.string().describe("The full content to write to the file"),
+      content: z
+        .string()
+        .describe(
+          "The full content to write to the file; for issue://N / pr://N, the comment body to post",
+        ),
     },
     execute: async (args, context): Promise<ToolResult> => {
       const argsRecord = args as Record<string, unknown>;
@@ -737,7 +727,7 @@ ${backupBehavior}
 - Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.`;
 }
 
-const HASHLINE_EDIT_DESCRIPTION = [
+const HASHLINE_EDIT_GRAMMAR = [
   "Apply a hashline patch. Arguments are exactly `{patch}` where `patch` is a non-empty string. Server-owned preview control is outside this schema.",
   "",
   "Quick reference:",
@@ -746,12 +736,22 @@ const HASHLINE_EDIT_DESCRIPTION = [
   "- Addresses: `0` (BOF), `N` (one line), `N.=M` (range; `N..=M`/`N..M` also work), `<N`/`>N` (gap before/after), `N*`/`<N*`/`>N*` (block), and `$`/`$-K` (EOF-relative). A plain `N` PUT replaces; use `<N` or `>N` to insert.",
   "- PUT text: `PUT <address>:` followed by one or more `+` body rows (`+` alone is blank). A final patch newline is allowed. PUT without `:` copies `@name` (or the anonymous register) and takes no body; names use `@` plus ASCII letters, digits, `_`, or `-`.",
   "- CUT: `CUT <address> [@name]`. REM: bare `REM` only, removing the whole file. MV: `MV <destination>` (one whitespace-free path, optional matching quotes), once and after any line operations. `*** Begin Patch`/`*** End Patch` is an optional envelope.",
-  "- Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.",
 ].join("\n");
+
+/**
+ * The hashline `edit` description: the patch grammar plus the rule naming
+ * which calls mint tags. That rule names the bash rewrite path and the AFT
+ * navigation tools only when this configuration registers them.
+ */
+function hashlineEditDescription(config: PluginContext["config"]): string {
+  const bashRewrites = toolEnabled(config, "bash") && resolveBashConfig(config).rewrite;
+  const tagSources = hashlineTagSourceSentence(bashRewrites, (name) => toolEnabled(config, name));
+  return `${HASHLINE_EDIT_GRAMMAR}\n- ${tagSources}`;
+}
 
 function createHashlineEditTool(ctx: PluginContext): ToolDefinition {
   return {
-    description: HASHLINE_EDIT_DESCRIPTION,
+    description: hashlineEditDescription(ctx.config),
     args: {
       patch: z
         .string()
@@ -882,24 +882,7 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       if (!file) throw new Error("'path' parameter is required");
       if (isGithubResourcePath(file)) {
         const edits = argsRecord.edits;
-        const onlyFindReplace =
-          Array.isArray(edits) &&
-          edits.length > 0 &&
-          argsRecord.appendContent === undefined &&
-          argsRecord.symbol === undefined &&
-          argsRecord.content === undefined &&
-          edits.every(
-            (entry) =>
-              entry !== null &&
-              typeof entry === "object" &&
-              typeof (entry as Record<string, unknown>).oldString === "string" &&
-              ((entry as Record<string, unknown>).newString === undefined ||
-                typeof (entry as Record<string, unknown>).newString === "string") &&
-              (entry as Record<string, unknown>).startLine === undefined &&
-              (entry as Record<string, unknown>).endLine === undefined &&
-              (entry as Record<string, unknown>).content === undefined,
-          );
-        if (!onlyFindReplace) {
+        if (!isFindReplaceOnlyEdit(argsRecord)) {
           throw new Error(
             "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
           );
@@ -1156,8 +1139,8 @@ function createApplyPatchTool(ctx: PluginContext): ToolDefinition {
 function deleteDescription(ctx: PluginContext): string {
   const backupText =
     ctx.config.backup?.enabled === false
-      ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. "
-      : "Each file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would copy more than 2,000 files or 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. ";
+      ? "Backup capture is disabled by user config, so this tool does not create undo snapshots. A directory tree containing a mount point of another filesystem is still refused. "
+      : "Each file is backed up before deletion — use aft_safety undo to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. ";
   return (
     "Delete one or more files (or directories).\n\n" +
     backupText +
@@ -1324,16 +1307,27 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 
 /**
  * Returns AFT's host-slot tools keyed by the host's built-in names, plus the
- * move/delete tools and the bash companions.
+ * move/delete tools and, while `bash.background` is on, the bash companions.
  *
- * Every entry is always returned; `buildAftToolDefinitions` removes only the
- * names listed in the resolved `disabled_tools`. The bash companions
- * (`bash_status`, `bash_write`, `bash_watch`, `bash_kill`) are independent
- * registrations: disabling `bash` does not remove them, and when the bash
- * runtime gate (`bash.enabled`) is off every bash operation reports
- * `bash_disabled` instead of disappearing.
+ * `buildAftToolDefinitions` then removes the names listed in the resolved
+ * `disabled_tools`. The bash companions (`bash_status`, `bash_write`,
+ * `bash_watch`, `bash_kill`) are independent of `bash` itself: disabling
+ * `bash` does not remove them, and when the bash runtime gate (`bash.enabled`)
+ * is off every bash operation reports `bash_disabled` instead of disappearing.
+ * They exist only to inspect, wait on, feed and stop background tasks, so with
+ * `bash.background` off, when no background task can exist, they are not
+ * registered at all.
  */
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
+  const backgroundCompanions: Record<string, ToolDefinition> = resolveBashConfig(ctx.config)
+    .background
+    ? {
+        bash_status: createBashStatusTool(ctx),
+        bash_write: createBashWriteTool(ctx),
+        bash_watch: createBashWatchTool(ctx),
+        bash_kill: createBashKillTool(ctx),
+      }
+    : {};
   const tools: Record<string, ToolDefinition> = {
     read: createReadTool(ctx),
     write: createWriteTool(ctx, "edit"),
@@ -1342,10 +1336,7 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
     bash: createBashTool(ctx),
-    bash_status: createBashStatusTool(ctx),
-    bash_write: createBashWriteTool(ctx),
-    bash_watch: createBashWatchTool(ctx),
-    bash_kill: createBashKillTool(ctx),
+    ...backgroundCompanions,
   };
 
   return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });

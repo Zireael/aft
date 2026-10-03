@@ -195,6 +195,47 @@ fn edit_match_omits_syntax_valid_when_language_unsupported() {
 // after the last matched line in its byte range; applying the replacement
 // verbatim used to merge the last replaced line with the following line.
 #[test]
+fn edit_match_table_fuzzy_preserves_padding_but_exact_removes_requested_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("table.md");
+    fs::write(&file, "  | For  a task | b |  \n  | For  a task | b |  \n").unwrap();
+    let mut aft = AftProcess::spawn();
+    let req = json!({
+        "id": "fuzzy-table", "command": "edit_match", "file": file,
+        "match": "| For a task | b |", "replacement": "| Changed | b |",
+        "replace_all": true
+    });
+    let resp = aft.send(&req.to_string());
+    assert_eq!(resp["success"], true, "{resp:?}");
+    assert_eq!(resp["fuzzy_match"]["pass"], 5);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "  | Changed | b |  \n  | Changed | b |  \n"
+    );
+    fs::write(&file, "  | For  a task | b |  \n").unwrap();
+    let fuzzy_removal = aft.send(
+        &json!({
+            "id": "fuzzy-remove-pipe", "command": "edit_match", "file": file,
+            "match": "| For a task | b |", "replacement": "Changed | b |"
+        })
+        .to_string(),
+    );
+    assert_eq!(fuzzy_removal["success"], true, "{fuzzy_removal:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "  Changed | b |  \n");
+    fs::write(&file, "| For a task | b |\n").unwrap();
+    let exact = aft.send(
+        &json!({
+            "id": "exact-table", "command": "edit_match", "file": file,
+            "match": "| For a task", "replacement": "Changed"
+        })
+        .to_string(),
+    );
+    assert_eq!(exact["success"], true, "{exact:?}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "Changed | b |\n");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn edit_match_fuzzy_preserves_trailing_newline() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("greet.js");

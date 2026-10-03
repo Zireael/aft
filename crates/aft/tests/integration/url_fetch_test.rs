@@ -554,6 +554,115 @@ fn html_url_rustdoc_headings_are_clean_without_chrome() {
 }
 
 #[test]
+fn html_url_split_code_block_outline_and_zoom_agree() {
+    // Trimmed copy of the Chrome DevTools auto-connect page, whose <pre> closes
+    // </code> in the middle of a JSON string.
+    const FIXTURE: &str = include_str!("../fixtures/url_html/chrome_auto_connect.html");
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(2, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            FIXTURE.as_bytes(),
+        );
+    });
+    let url = server.url("/docs/devtools/agents/use-cases/auto-connect");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+
+    let outline = aft.send(
+        &json!({
+            "id": "split-outline",
+            "command": "outline",
+            "file": &url,
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(outline["success"], true, "outline failed: {outline:?}");
+    let text = outline["text"].as_str().expect("outline text");
+    let heading_line = text
+        .lines()
+        .find(|line| line.contains("## Set up auto-connect"))
+        .unwrap_or_else(|| panic!("outline should list the section heading: {text}"));
+    let (outline_start, outline_end) = heading_line
+        .split_whitespace()
+        .last()
+        .and_then(|range| range.split_once(':'))
+        .map(|(start, end)| (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap()))
+        .unwrap_or_else(|| panic!("heading line should end with a line range: {heading_line}"));
+
+    let zoom = aft.send(
+        &json!({
+            "id": "split-zoom",
+            "command": "zoom",
+            "file": &url,
+            "symbol": "Set up auto-connect",
+            "allow_private": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(zoom["success"], true, "zoom failed: {zoom:?}");
+    let content = zoom["content"].as_str().expect("zoom content");
+    assert_eq!(
+        (
+            zoom["range"]["start_line"].as_u64(),
+            zoom["range"]["end_line"].as_u64()
+        ),
+        (Some(outline_start), Some(outline_end)),
+        "zoom range should match the outline range {outline_start}:{outline_end}: {zoom:?}"
+    );
+
+    // Both commands read the same cached Markdown, so the outline's range
+    // must select exactly the text zoom returned.
+    let markdown =
+        fs::read_to_string(cache_content_path_for_url(storage.path(), &url, ".md")).unwrap();
+    let lines: Vec<&str> = markdown.lines().collect();
+    let sliced = lines[(outline_start as usize - 1)..outline_end as usize].join("\n");
+    assert_eq!(
+        content, sliced,
+        "zoom content vs outline range in:\n{markdown}"
+    );
+
+    // The whole JSON sits inside one fence that closes after its last line.
+    let args_line = r#""args": ["chrome-devtools-mcp@latest", "--autoConnect"]"#;
+    let fence_lines: Vec<usize> = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("```"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(fence_lines.len(), 2, "one fenced block expected: {content}");
+    let body: Vec<&str> = content
+        .lines()
+        .skip(fence_lines[0] + 1)
+        .take(fence_lines[1] - fence_lines[0] - 1)
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        body,
+        vec![
+            "{",
+            r#""mcpServers": {"#,
+            r#""chrome-devtools": {"#,
+            r#""command": "npx","#,
+            args_line,
+            "}",
+            "}",
+            "}",
+        ],
+        "fenced JSON should be intact: {content}"
+    );
+    assert!(
+        text.contains("## Use cases for auto-connect"),
+        "the next section must still be a heading: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn markdown_url_cache_content_is_unchanged() {
     let storage = TempDir::new().unwrap();
     let body = b"# Native Markdown\n\n```rs\nfn main() {}\n```\n";

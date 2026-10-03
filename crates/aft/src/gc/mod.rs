@@ -14,6 +14,8 @@ use crate::blob_store::BlobPlane;
 use crate::pins::{self, PinMetadata, PIN_TTL_MS};
 use crate::root_cache;
 
+pub mod family;
+
 /// Payloads newer than this stay available even when a store is over budget.
 pub const BLOB_AGE_FLOOR_MS: u64 = 15 * 60 * 1_000;
 

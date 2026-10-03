@@ -30,6 +30,70 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
+/// Who started a background task and the key they gave the call, recorded on
+/// the task so a consumer can find the task its own call started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCallKey {
+    /// The principal of the route the call arrived on (`direct`,
+    /// `reserved:<module>`, `unverified`, or `absent`), or `first-party` for
+    /// a call with no subc route (standalone mode).
+    pub requester: String,
+    /// The consumer's `call_key`, or the task id when it sent none.
+    pub key: String,
+    /// True when the consumer sent no key and the task id AFT minted stands
+    /// in for it, so a reader can tell a fallback from a key the consumer chose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub minted: bool,
+}
+
+thread_local! {
+    /// The `call_key` of the tool call whose dispatch is running on this
+    /// thread. Installed around the dispatch like the authenticated principal
+    /// (see [`with_call_key`]), because the bash handler that creates the task
+    /// only sees the tool's own arguments, which the agent controls.
+    static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `run` with `call_key` as the current call's key, restoring the
+/// previous one afterwards, even if `run` panics.
+pub(crate) fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                CURRENT_CALL_KEY.with(|slot| *slot.borrow_mut() = previous);
+            }
+        }
+    }
+    let previous = CURRENT_CALL_KEY.with(|slot| slot.replace(call_key));
+    let _restore = Restore(Some(previous));
+    run()
+}
+
+/// The requester and key to record on a task being created now: the
+/// consumer's key when the call carried one, otherwise the task id.
+pub(crate) fn call_key_for_new_task(task_id: &str) -> TaskCallKey {
+    let requester = match current_authenticated_principal() {
+        crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty => "first-party".to_string(),
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+            principal_id.unwrap_or_else(|| "absent".to_string())
+        }
+    };
+    match CURRENT_CALL_KEY.with(|slot| slot.borrow().clone()) {
+        Some(key) => TaskCallKey {
+            requester,
+            key,
+            minted: false,
+        },
+        None => TaskCallKey {
+            requester,
+            key: task_id.to_string(),
+            minted: true,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BashShell {
@@ -143,6 +207,40 @@ impl BgTaskStatus {
     }
 }
 
+/// When a background bash task is killed for running too long (its hard kill).
+///
+/// Every spawn names one explicitly, so no caller can drop the default by
+/// passing an empty timeout by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardKill {
+    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes).
+    Default,
+    /// Never killed for running too long. Only a delegated worker's
+    /// `wait: true` call without a timeout uses this: the worker blocks until
+    /// the command finishes and cannot be woken later, so an implicit kill
+    /// would only cut a long build short.
+    Never,
+    /// Killed once it has run this long (the caller's explicit `timeout`).
+    After(Duration),
+}
+
+impl HardKill {
+    /// The hard kill for an optional caller timeout in milliseconds, falling
+    /// back to [`HardKill::Default`].
+    pub fn from_timeout_ms(timeout_ms: Option<u64>) -> Self {
+        timeout_ms.map_or(Self::Default, |ms| Self::After(Duration::from_millis(ms)))
+    }
+
+    /// How long the task may run, or `None` when it is never killed for it.
+    pub fn limit(self) -> Option<Duration> {
+        match self {
+            Self::Default => Some(registry::DEFAULT_BG_TIMEOUT),
+            Self::Never => None,
+            Self::After(limit) => Some(limit),
+        }
+    }
+}
+
 /// Spawn a bash command in the background. Returns a task_id immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -153,7 +251,7 @@ pub fn spawn(
     shell_path: PathBuf,
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
-    timeout_ms: Option<u64>,
+    hard_kill: HardKill,
     ctx: &AppContext,
     require_background_flag: bool,
     notify_on_completion: bool,
@@ -179,7 +277,6 @@ pub fn spawn(
     });
     let storage_dir = task_storage_dir(ctx);
     let max_running = ctx.config().max_background_bash_tasks;
-    let timeout = timeout_ms.map(Duration::from_millis);
     let project_root = ctx
         .config()
         .project_root
@@ -329,7 +426,7 @@ pub fn spawn(
             session_id.to_string(),
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -347,7 +444,7 @@ pub fn spawn(
             session_id.to_string(),
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -409,11 +506,22 @@ pub fn spawn(
     }
 }
 
+// A root context is shared by routes from different harnesses. Determine a
+// command's owner from its route binding, not the last harness to configure the root.
+pub(crate) fn route_harness() -> Option<crate::harness::Harness> {
+    match current_authenticated_principal() {
+        crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { harness, .. } => {
+            harness.parse().ok()
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
     let config = ctx.config();
     let root = storage_dir(config.storage_dir.as_deref());
-    config
-        .harness
+    route_harness()
+        .or_else(|| config.harness.clone())
         .as_ref()
         .map(|harness| root.join(harness.storage_segment()))
         .unwrap_or(root)

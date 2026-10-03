@@ -144,10 +144,14 @@ fn scope_warnings(
         .collect();
 
     for include_glob in globs.iter().filter(|glob| !glob.starts_with('!')) {
-        if !matched_relative_paths
-            .iter()
-            .any(|path| glob_matches(include_glob, path))
-        {
+        // Compile each glob once and test every path against it; compiling it
+        // again per path made this check cost a glob build per walked file.
+        let matcher = glob_matcher(include_glob);
+        if !matcher.is_some_and(|matcher| {
+            matched_relative_paths
+                .iter()
+                .any(|path| matcher.matched(path, false).is_whitelist())
+        }) {
             warnings.push(format!("{} → no files", include_glob));
         }
     }
@@ -176,16 +180,12 @@ fn relative_path_for_globs(project_root: &Path, roots: &[SearchRoot], file: &Pat
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-fn glob_matches(glob: &str, relative_path: &str) -> bool {
+fn glob_matcher(glob: &str) -> Option<ignore::overrides::Override> {
+    #[cfg(test)]
+    work_counters::GLOB_BUILDS.with(|count| count.set(count.get() + 1));
     let mut builder = ignore::overrides::OverrideBuilder::new("");
-    if builder.add(glob).is_err() {
-        return false;
-    }
-
-    builder
-        .build()
-        .map(|overrides| overrides.matched(relative_path, false).is_whitelist())
-        .unwrap_or(false)
+    builder.add(glob).ok()?;
+    builder.build().ok()
 }
 
 fn walk_roots(
@@ -194,12 +194,34 @@ fn walk_roots(
     lang: &AstGrepLang,
     globs: &[String],
 ) -> Vec<PathBuf> {
+    // One walk never yields a path twice (symlinks are not followed), so
+    // canonicalizing every file to dedupe is only needed when several roots
+    // can overlap. Canonicalizing is a filesystem call per file.
+    if let [root] = roots {
+        return walk_root(project_root, root, lang, globs);
+    }
     let mut seen = HashSet::new();
     roots
         .iter()
         .flat_map(|root| walk_root(project_root, root, lang, globs))
-        .filter(|file| seen.insert(canonical_key(file)))
+        .filter(|file| {
+            #[cfg(test)]
+            work_counters::FILE_CANONICALIZATIONS.with(|count| count.set(count.get() + 1));
+            seen.insert(canonical_key(file))
+        })
         .collect()
+}
+
+/// Per-thread counts of the filesystem and glob work a scope walk does, so
+/// tests can pin it without timing anything.
+#[cfg(test)]
+mod work_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static GLOB_BUILDS: Cell<usize> = const { Cell::new(0) };
+        pub(super) static FILE_CANONICALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    }
 }
 
 fn walk_root(
@@ -277,4 +299,79 @@ fn build_overrides(root: &Path, globs: &[String]) -> Option<ignore::overrides::O
     }
 
     override_builder.build().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::parser::TreeSitterProvider;
+
+    /// Scope collection must compile each include glob once (not once per
+    /// walked file) and must not canonicalize every file of a single-root walk.
+    #[test]
+    fn single_root_scope_compiles_globs_once_and_skips_per_file_canonicalize() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for index in 0..50 {
+            std::fs::write(root.join(format!("src/f{index:02}.ts")), "const x = 1;\n").unwrap();
+        }
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        let lang = AstGrepLang::from_str("typescript").unwrap();
+        let globs = vec!["src/**".to_string(), "missing/**".to_string()];
+
+        let globs_before = work_counters::GLOB_BUILDS.with(|count| count.get());
+        let canon_before = work_counters::FILE_CANONICALIZATIONS.with(|count| count.get());
+        let scope = match collect_ast_files("scope", "ast_search", &ctx, &root, &lang, &[], &globs)
+        {
+            Ok(scope) => scope,
+            Err(_) => panic!("scope collection failed"),
+        };
+        let glob_builds = work_counters::GLOB_BUILDS.with(|count| count.get()) - globs_before;
+        let canonicalizations =
+            work_counters::FILE_CANONICALIZATIONS.with(|count| count.get()) - canon_before;
+
+        assert_eq!(scope.files.len(), 50);
+        assert_eq!(
+            scope.scope_warnings,
+            vec!["missing/** → no files".to_string()]
+        );
+        assert_eq!(glob_builds, 2, "one glob build per include glob");
+        assert_eq!(
+            canonicalizations, 0,
+            "a single root needs no per-file dedupe"
+        );
+    }
+
+    /// Overlapping roots still dedupe files that both walks reach.
+    #[test]
+    fn overlapping_roots_still_dedupe_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("src/inner")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "const a = 1;\n").unwrap();
+        std::fs::write(root.join("src/inner/b.ts"), "const b = 1;\n").unwrap();
+        let lang = AstGrepLang::from_str("typescript").unwrap();
+        let roots = vec![
+            SearchRoot {
+                path: root.join("src"),
+                label: Some("src".into()),
+            },
+            SearchRoot {
+                path: root.join("src/inner"),
+                label: Some("src/inner".into()),
+            },
+        ];
+        let mut files = walk_roots(&root, &roots, &lang, &[]);
+        files.sort();
+        assert_eq!(
+            files,
+            vec![root.join("src/a.ts"), root.join("src/inner/b.ts")]
+        );
+    }
 }

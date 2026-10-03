@@ -73,6 +73,16 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "too_many_watches",
             format!("Too many active watches on task {} (max 8)", params.task_id),
         ),
+        Err("task_not_found") => {
+            let unadopted = ctx.config().project_root.as_deref().and_then(|root| {
+                ctx.bash_background()
+                    .unadopted_task_message(&params.task_id, req.session(), root)
+            });
+            match unadopted {
+                Some(message) => Response::error(&req.id, "task_not_adopted", message),
+                None => Response::error(&req.id, "invalid_request", "task_not_found"),
+            }
+        }
         Err(error) => Response::error(&req.id, "invalid_request", error),
     }
 }

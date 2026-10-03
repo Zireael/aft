@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(not(windows))]
 use std::ffi::OsString;
 use std::fs;
@@ -64,8 +64,9 @@ use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 /// Default timeout for background bash tasks: 30 minutes.
-/// Agents can override per-call via the `timeout` parameter (in ms).
-const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Agents can override per-call via the `timeout` parameter (in ms); see
+/// [`super::HardKill`].
+pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -73,6 +74,139 @@ const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
+
+/// How long a reader that must answer with a settled status (`bash_status`,
+/// a second kill) waits for a kill already in flight on the same task: the
+/// SIGTERM grace period plus a margin for the SIGKILL, the reap and the
+/// terminal write. A kill still in flight after that (a signal stuck in the
+/// kernel) is reported as in flight rather than waited out.
+const KILL_IN_FLIGHT_WAIT: Duration =
+    Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
+
+/// What a kill does after it releases the task's state lock. See
+/// [`BgTaskRegistry::kill_with_status_reason`].
+enum KillSignalPlan {
+    /// Nothing to signal; the locked step already settled the task.
+    Nothing,
+    /// Another kill is signaling this task; wait for its outcome.
+    AwaitOtherKill,
+    /// The task is already terminal but members of its process group were
+    /// still alive when it ended.
+    TerminalSurvivors { pgid: i32, live_count: usize },
+    /// Signal a piped task's process group and reap its direct child.
+    Piped {
+        pgid: Option<i32>,
+        child_pid: Option<u32>,
+        child: Option<Child>,
+    },
+    /// The task had already exited; close its retired PTY runtime, if any.
+    RetirePty(Option<PtyRuntime>),
+    /// Signal a PTY task's process group, then close its pseudoterminal so
+    /// the PTY reader reaches end-of-file.
+    Pty {
+        pid: Option<u32>,
+        master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    },
+}
+
+/// Signal a piped task: SIGTERM to its process group, a grace period that
+/// ends early once the direct child exits, then SIGKILL (Unix); `taskkill`
+/// on the process tree (Windows).
+fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option<&mut Child>) {
+    #[cfg(unix)]
+    {
+        let _ = child_pid;
+        if let Some(pgid) = pgid {
+            terminate_pgid(pgid, child);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = pgid;
+        if let Some(child) = child {
+            super::process::terminate_process(child);
+        } else if let Some(pid) = child_pid {
+            terminate_pid(pid);
+        }
+    }
+}
+
+/// Signal a PTY task's process group (Unix) or process tree (Windows).
+/// Close a killed PTY's pseudoterminal so its reader reaches end-of-file and
+/// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
+/// once the pseudoconsole is closed, and closing it can wait for conhost to
+/// flush; it runs on its own thread so no caller (or lock) waits on that.
+fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
+    let Some(master) = master else {
+        return;
+    };
+    #[cfg(windows)]
+    {
+        let spawned = std::thread::Builder::new()
+            .name("aft-pty-close".to_owned())
+            .spawn(move || drop(master));
+        if let Err(error) = spawned {
+            crate::slog_warn!("[pty-kill] could not close the pseudoconsole off-thread: {error}");
+        }
+    }
+    #[cfg(not(windows))]
+    drop(master);
+}
+
+fn terminate_pty_group(pid: u32) {
+    #[cfg(unix)]
+    terminate_pgid(pid as i32, None);
+    #[cfg(windows)]
+    terminate_pid(pid);
+}
+
+/// Test gates that park a piped-task kill after it has published `Killing`
+/// and released the state lock, before it signals, so a test can act while
+/// the kill is in flight. Keyed by task id so parallel tests do not collide.
+#[cfg(test)]
+struct KillSignalGate {
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn install_kill_signal_gate_for_test(
+    task_id: &str,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    KILL_SIGNAL_GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(
+            task_id.to_string(),
+            KillSignalGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_kill_signal_gate_for_test(task_id: &str) {
+    let gate = KILL_SIGNAL_GATES
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(task_id));
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(30));
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
@@ -318,6 +452,8 @@ pub enum WatchdogPassCause {
 
 pub(crate) struct RegistryInner {
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
+    pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -348,7 +484,21 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    /// Harness of the most recent configure of this root. Routes from several
+    /// harnesses share the root, so this is only a fallback for a task,
+    /// session or request that cannot name its own harness (a spawn with no
+    /// route, metadata written before tasks recorded their harness).
     pub(crate) db_harness: RwLock<Option<String>>,
+    /// Harness each session's tasks were started under, recorded when a task
+    /// is registered. Row lookups for a session use it instead of
+    /// `db_harness`, which only names the harness that configured the root
+    /// most recently.
+    session_harnesses: Mutex<HashMap<String, String>>,
+    /// Every harness that configured this root or started a task on it.
+    /// Root-wide aft.db scans (pending wake keys, orphaned-watch retirement)
+    /// cover all of them, because routes from several harnesses share the
+    /// root. Bounded by the handful of harness kinds.
+    seen_harnesses: Mutex<BTreeSet<String>>,
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
@@ -358,6 +508,7 @@ pub(crate) struct RegistryInner {
     /// this record instead of racing the 500 ms ticker on the wall clock.
     pub(crate) completion_pass_cause: Mutex<HashMap<String, WatchdogPassCause>>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
+    persisted_watch_cursors: Mutex<HashMap<String, (u64, u64, u64)>>,
     /// Session identities with an installed route for this root in subc mode.
     /// The loop-owned route table refreshes this snapshot before replay and on
     /// bind/unbind transitions; standalone replay relies on its binding-session
@@ -377,6 +528,15 @@ pub(crate) struct BgTask {
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// Notified, with `state` locked, when a kill clears
+    /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
+    /// status wait on it instead of holding `state` across the kill.
+    kill_settled: std::sync::Condvar,
+    /// Harness namespace the task's aft.db row is keyed under: the harness of
+    /// the route that started it (or of the row it was replayed from). The
+    /// root context is shared by routes from several harnesses, so this can
+    /// differ from the registry's current `db_harness`.
+    db_harness: Option<String>,
     /// Orders this task's aft.db row writes, which happen after `state` is
     /// released; see [`DbWriteOrder`]. Shared by every `BgTask` for the same
     /// session and task id in the process.
@@ -583,6 +743,12 @@ pub(crate) struct BgTaskState {
     /// Prevent duplicate completion delivery while the post-exit process-group
     /// sample is waiting for its grace period.
     pub(crate) descendant_sampling_started: bool,
+    /// True while a kill has released this lock to signal and reap the
+    /// process group. That kill owns the terminal transition until it clears
+    /// the flag: the watchdog must not declare the task dead without an exit
+    /// marker, and a second kill waits for the first rather than signaling
+    /// again.
+    pub(crate) kill_in_flight: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
     /// PTY-only: set for timeout kill intent before signaling the child.
@@ -611,6 +777,7 @@ impl BgTaskRegistry {
         Self {
             inner: Arc::new(RegistryInner {
                 tasks: Mutex::new(HashMap::new()),
+                watchdog_tasks: Mutex::new(HashMap::new()),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -627,12 +794,15 @@ impl BgTaskRegistry {
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
+                session_harnesses: Mutex::new(HashMap::new()),
+                seen_harnesses: Mutex::new(BTreeSet::new()),
                 compression_aggregates: Arc::new(CompressionAggregateCache::default()),
                 wake_tx,
                 wake_rx,
                 terminal_transition: tokio::sync::Notify::new(),
                 completion_pass_cause: Mutex::new(HashMap::new()),
                 watch_registry: Mutex::new(WatchRegistry::default()),
+                persisted_watch_cursors: Mutex::new(HashMap::new()),
                 live_delivery_sessions: Mutex::new(HashSet::new()),
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
@@ -735,8 +905,12 @@ impl BgTaskRegistry {
     }
 
     pub fn set_harness(&self, harness: Harness) {
+        let segment = harness.storage_segment();
+        if let Ok(mut seen) = self.inner.seen_harnesses.lock() {
+            seen.insert(segment.clone());
+        }
         if let Ok(mut slot) = self.inner.db_harness.write() {
-            *slot = Some(harness.storage_segment());
+            *slot = Some(segment);
         }
     }
 
@@ -745,6 +919,17 @@ impl BgTaskRegistry {
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
+        // Tasks started while no handle was installed have no row yet; the
+        // in-memory task is authoritative, so write their rows now.
+        let running = self
+            .inner
+            .tasks
+            .lock()
+            .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for task in running.into_iter().filter(|task| !task.is_terminal()) {
+            self.ensure_task_row(&task);
+        }
     }
 
     pub fn clear_db_pool(&self) {
@@ -1068,6 +1253,12 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        // When a watchdog pass is publishing this terminal state, record that
+        // pass before the completion becomes visible below, so a reader that
+        // sees the completion also sees which pass observed it.
+        if let Some(pass) = super::watchdog::current_pass() {
+            self.record_completion_pass_cause(&task.task_id, pass);
+        }
         let should_sample = {
             let mut state = task
                 .state
@@ -1238,14 +1429,23 @@ impl BgTaskRegistry {
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
+            // A registry without a harness belongs to an unconfigured library
+            // context, which never has a database. A configured one without a
+            // handle is missing a row it should have; a later watch
+            // registration or erased-row check writes it once the handle is
+            // installed.
+            if self.fallback_db_harness().is_some() {
+                crate::slog_warn!(
+                    "dual-write bash_task to DB skipped for {}: aft.db is not attached to this registry",
+                    metadata.task_id
+                );
+            }
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata
+            .harness
+            .clone()
+            .or_else(|| self.fallback_db_harness());
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "dual-write bash_task to DB skipped for {}: harness not configured",
@@ -1288,12 +1488,10 @@ impl BgTaskRegistry {
         let Some(pool) = pool else {
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata
+            .harness
+            .clone()
+            .or_else(|| self.fallback_db_harness());
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "GC bash_task DB delete skipped for {}: harness not configured",
@@ -1340,33 +1538,15 @@ impl BgTaskRegistry {
     }
 
     fn db_has_live_process_for_task(&self, task_id: &str) -> bool {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
-            return false;
-        };
-        let Ok(conn) = pool.lock() else {
-            return false;
-        };
-        #[cfg(test)]
-        self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
-        crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
-            .map(|rows| {
-                rows.into_iter().any(|row| {
-                    let started_at = u64::try_from(row.started_at).unwrap_or_default();
-                    row.pid
-                        .and_then(|pid| u32::try_from(pid).ok())
-                        .into_iter()
-                        .chain(row.pgid.and_then(|pid| u32::try_from(pid).ok()))
-                        .any(|pid| is_recorded_process_alive(pid, started_at))
-                })
-            })
-            .unwrap_or(false)
+        self.db_live_process_task_ids(std::slice::from_ref(&task_id.to_string()))
+            .contains(task_id)
     }
 
-    /// Which of `task_ids` have an aft.db row whose recorded process is still
-    /// alive, from one query. The liveness probes run after the aft.db mutex
-    /// is released.
+    /// Which of `task_ids` have an aft.db row, under any harness, whose
+    /// recorded process is still alive, from one query. The liveness probes
+    /// run after the aft.db mutex is released.
     fn db_live_process_task_ids(&self, task_ids: &[String]) -> HashSet<String> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|slot| slot.clone()) else {
             return HashSet::new();
         };
         let rows = {
@@ -1374,11 +1554,11 @@ impl BgTaskRegistry {
                 return HashSet::new();
             };
             #[cfg(test)]
-            self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
-            // Same fallback as the per-task lookup: a failed query reads as
-            // no live row.
-            crate::db::bash_tasks::list_bash_task_process_ids(&conn, &harness, task_ids)
-                .unwrap_or_default()
+            self.inner
+                .gc_db_liveness_queries
+                .fetch_add(1, Ordering::SeqCst);
+            // A failed query reads as no live row.
+            crate::db::bash_tasks::list_bash_task_process_ids(&conn, task_ids).unwrap_or_default()
         };
         rows.into_iter()
             .filter(|row| {
@@ -1393,27 +1573,186 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+    /// The harness of the most recent configure of this root. Only a fallback
+    /// for a task, session or request that cannot name its own harness.
+    fn fallback_db_harness(&self) -> Option<String> {
+        self.inner
+            .db_harness
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    fn remember_session_harness(&self, task: &BgTask) {
+        let Some(harness) = task.db_harness.as_ref() else {
+            return;
+        };
+        if let Ok(mut seen) = self.inner.seen_harnesses.lock() {
+            seen.insert(harness.clone());
+        }
+        if let Ok(mut harnesses) = self.inner.session_harnesses.lock() {
+            harnesses
+                .entry(task.session_id.clone())
+                .or_insert_with(|| harness.clone());
+        }
+    }
+
+    /// Drops the recorded harness of every session the registry no longer
+    /// holds a task for, so the map stays bounded by the live task set.
+    fn prune_session_harnesses(&self) {
+        let live_sessions = self
+            .inner
+            .tasks
+            .lock()
+            .map(|tasks| {
+                tasks
+                    .values()
+                    .map(|task| task.session_id.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Ok(mut harnesses) = self.inner.session_harnesses.lock() {
+            harnesses.retain(|session_id, _| live_sessions.contains(session_id));
+        }
+    }
+
+    /// The shared aft.db handle and every harness seen on this root, for
+    /// root-wide scans that must cover rows of all of them.
+    fn db_seen_harnesses_and_pool(&self) -> Option<(Vec<String>, Arc<Mutex<TrackedConnection>>)> {
         let pool = self
             .inner
             .db_pool
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self
+        let harnesses = self
             .inner
-            .db_harness
+            .seen_harnesses
+            .lock()
+            .map(|seen| seen.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        (!harnesses.is_empty()).then_some((harnesses, pool))
+    }
+
+    /// The harness namespace a session's aft.db rows are keyed under.
+    ///
+    /// One project root is shared by routes from several harnesses, and each
+    /// configure replaces `db_harness` with its own. A session's task rows are
+    /// written under the harness of the route that started them, so this
+    /// prefers the harness recorded for the session's tasks, then the calling
+    /// route's harness, and only then the harness that configured the root
+    /// last.
+    fn db_harness_for_session(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .session_harnesses
+            .lock()
+            .ok()
+            .and_then(|harnesses| harnesses.get(session_id).cloned())
+            .or_else(|| super::route_harness().map(|harness| harness.storage_segment()))
+            .or_else(|| self.fallback_db_harness())
+    }
+
+    fn db_harness_for_task(&self, task: &BgTask) -> Option<String> {
+        task.db_harness
+            .clone()
+            .or_else(|| self.db_harness_for_session(&task.session_id))
+    }
+
+    fn db_harness_and_pool_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        let pool = self
+            .inner
+            .db_pool
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        Some((harness, pool))
+        Some((self.db_harness_for_session(session_id)?, pool))
+    }
+
+    fn db_harness_and_pool_for_task(
+        &self,
+        task: &BgTask,
+    ) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
+        let pool = self
+            .inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())?;
+        Some((self.db_harness_for_task(task)?, pool))
+    }
+
+    /// Writes the task's row from its in-memory metadata when aft.db has no
+    /// row for it, and reports whether the row exists afterwards.
+    ///
+    /// The registry's in-memory task is authoritative while it runs; its row
+    /// can be missing because the spawn-time write happened before this
+    /// registry had an aft.db handle, failed, or was deleted underneath it.
+    /// Watch rows reference the task row, so a watch is only durable once
+    /// the row exists.
+    fn ensure_task_row(&self, task: &BgTask) -> bool {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(task) else {
+            return false;
+        };
+        // Fenced so a snapshot queued before this check is written first and
+        // none captured later can be overtaken by the one written here.
+        with_task_db_fence(&task.session_id, &task.task_id, || {
+            let metadata = match task.state.lock() {
+                Ok(state) => state.metadata.clone(),
+                Err(_) => return false,
+            };
+            let row = match metadata.to_bash_task_row(&harness, &task.paths) {
+                Ok(row) => row,
+                Err(error) => {
+                    crate::slog_warn!("bash_task row rewrite failed for {}: {error}", task.task_id);
+                    return false;
+                }
+            };
+            let Ok(conn) = pool.lock() else {
+                crate::slog_warn!(
+                    "bash_task row rewrite failed for {}: db mutex poisoned",
+                    task.task_id
+                );
+                return false;
+            };
+            match crate::db::bash_tasks::get_bash_task(
+                &conn,
+                &harness,
+                &task.session_id,
+                &task.task_id,
+            ) {
+                Ok(Some(_)) => true,
+                Ok(None) => match crate::db::bash_tasks::upsert_bash_task(&conn, &row) {
+                    Ok(()) => {
+                        crate::slog_warn!(
+                            "bash_task row for {} was missing under harness {harness}; rewrote it from the live task",
+                            task.task_id
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "bash_task row rewrite failed for {}: {error}",
+                            task.task_id
+                        );
+                        false
+                    }
+                },
+                Err(error) => {
+                    crate::slog_warn!("bash_task row check failed for {}: {error}", task.task_id);
+                    false
+                }
+            }
+        })
     }
 
     pub fn pending_pattern_matches_for_session(
         &self,
         session_id: &str,
     ) -> Vec<BashPatternMatchFrame> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
         let rows = {
@@ -1476,7 +1815,7 @@ impl BgTaskRegistry {
         task_id: &str,
         storage_dir: &Path,
     ) -> Option<BgTaskSnapshot> {
-        let (harness, pool) = self.db_harness_and_pool()?;
+        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
         let conn = pool.lock().ok()?;
         let row =
             crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id).ok()??;
@@ -1492,6 +1831,12 @@ impl BgTaskRegistry {
 
     pub fn has_erased_watch_reference(&self, task_id: &str) -> bool {
         self.evaluate_erased_watch_targets();
+        // A task this registry still runs is not erased whatever its row
+        // state: its output is still captured and its watches still scan, so
+        // reporting it as a terminal storage failure would be false.
+        if self.task(task_id).is_some_and(|task| !task.is_terminal()) {
+            return false;
+        }
         self.inner
             .watch_registry
             .lock()
@@ -1499,8 +1844,14 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
+    /// Tombstones watches whose task row is gone and whose task has ended.
+    ///
+    /// A missing row only means a terminal storage failure when no process
+    /// is left either. For a task the registry still runs, the row is written
+    /// again from the in-memory task (with the watch rows the task-row delete
+    /// cascaded away) and its watches stay armed.
     pub(crate) fn evaluate_erased_watch_targets(&self) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|slot| slot.clone()) else {
             return;
         };
         // The task deletion cascade removes durable watch rows, so only watches
@@ -1515,28 +1866,34 @@ impl BgTaskRegistry {
             return;
         }
 
+        // Liveness and harness are read before the aft.db mutex is taken, so
+        // no task state lock is ever acquired while that mutex is held.
         let candidates = watched_task_ids
             .into_iter()
             .filter_map(|task_id| {
                 let task = self.task(&task_id)?;
-                self.originating_session_has_live_route(&task.session_id)
-                    .then(|| (task.session_id.clone(), task_id))
+                if !self.originating_session_has_live_route(&task.session_id) {
+                    return None;
+                }
+                let harness = self.db_harness_for_task(&task)?;
+                let running = !task.is_terminal();
+                Some((task, harness, running))
             })
             .collect::<Vec<_>>();
+        let mut running_without_row = Vec::new();
         let erased_tasks = {
             let Ok(conn) = pool.lock() else {
                 return;
             };
             let mut erased_tasks = Vec::new();
-            for (session_id, task_id) in candidates {
-                match crate::db::bash_tasks::get_bash_task(&conn, &harness, &session_id, &task_id) {
+            for (task, harness, running) in candidates {
+                let (session_id, task_id) = (&task.session_id, &task.task_id);
+                match crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id) {
+                    Ok(None) if running => running_without_row.push(task),
                     Ok(None) => {
                         if let Err(error) =
                             crate::db::bash_watches::delete_bash_pattern_watches_for_task(
-                                &conn,
-                                &harness,
-                                &session_id,
-                                &task_id,
+                                &conn, &harness, session_id, task_id,
                             )
                         {
                             crate::slog_warn!(
@@ -1544,7 +1901,7 @@ impl BgTaskRegistry {
                                 task_id
                             );
                         }
-                        erased_tasks.push((session_id, task_id));
+                        erased_tasks.push((session_id.clone(), task_id.clone()));
                     }
                     Ok(Some(_)) => {}
                     Err(error) => {
@@ -1558,6 +1915,9 @@ impl BgTaskRegistry {
             erased_tasks
         };
 
+        for task in running_without_row {
+            self.restore_running_task_rows(&task);
+        }
         for (session_id, task_id) in erased_tasks {
             let watch_ids = self
                 .inner
@@ -1568,6 +1928,33 @@ impl BgTaskRegistry {
             for watch_id in watch_ids {
                 self.emit_bash_watch_erased(&session_id, &task_id, &watch_id);
             }
+        }
+    }
+
+    /// Rewrites a running task's missing row and the rows of the watches
+    /// still armed on it in this process.
+    fn restore_running_task_rows(&self, task: &BgTask) {
+        if !self.ensure_task_row(task) {
+            return;
+        }
+        let specs = self
+            .inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.watch_specs(&task.task_id))
+            .unwrap_or_default();
+        let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
+        for spec in specs {
+            self.persist_watch_registration(
+                &task.session_id,
+                &task.task_id,
+                &spec.watch_id,
+                &spec.pattern,
+                spec.once,
+                stdout_offset,
+                stderr_offset,
+                pty_offset,
+            );
         }
     }
 
@@ -1582,7 +1969,7 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1614,7 +2001,7 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watch(&self, session_id: &str, task_id: &str, watch_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1628,7 +2015,7 @@ impl BgTaskRegistry {
     }
 
     fn delete_persisted_watches_for_task(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1650,7 +2037,7 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1694,12 +2081,21 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
             return;
         };
+        let offsets = (stdout_offset, stderr_offset, pty_offset);
+        if self
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .is_ok_and(|last| last.get(task_id) == Some(&offsets))
+        {
+            return;
+        }
         if let Err(error) = crate::db::bash_watches::update_watch_offsets_for_task(
             &conn,
             &harness,
@@ -1710,6 +2106,8 @@ impl BgTaskRegistry {
             pty_offset as i64,
         ) {
             crate::slog_warn!("persist bash_pattern_watch cursors failed for {task_id}: {error}");
+        } else if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+            last.insert(task_id.to_string(), offsets);
         }
     }
 
@@ -1730,7 +2128,7 @@ impl BgTaskRegistry {
     /// Ack path for pattern watches: once-watches (and any terminal-task watches)
     /// are dropped after delivery is confirmed; sticky watches clear pending only.
     fn ack_persisted_watches_for_task(&self, session_id: &str, task_id: &str, task_terminal: bool) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -1810,7 +2208,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -1825,7 +2223,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -1845,7 +2243,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -1870,8 +2268,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
         } else {
@@ -1916,6 +2313,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
         // bash/zsh PIPESTATUS and a dedicated inherited fd, neither of which
         // exists on the Windows spawn path.
@@ -1992,6 +2390,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -1999,6 +2398,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -2006,6 +2406,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -2013,10 +2414,16 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -2030,7 +2437,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2048,7 +2455,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2069,7 +2476,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2091,8 +2498,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         #[cfg(unix)]
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
@@ -2136,6 +2542,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -2186,6 +2593,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -2193,6 +2601,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
@@ -2200,6 +2609,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -2207,10 +2617,16 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -2225,7 +2641,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2240,7 +2656,7 @@ impl BgTaskRegistry {
             session_id,
             workdir,
             env,
-            timeout,
+            hard_kill,
             storage_dir,
             max_running,
             notify_on_completion,
@@ -2260,7 +2676,7 @@ impl BgTaskRegistry {
         session_id: String,
         workdir: PathBuf,
         env: HashMap<String, String>,
-        timeout: Option<Duration>,
+        hard_kill: super::HardKill,
         storage_dir: PathBuf,
         max_running: usize,
         notify_on_completion: bool,
@@ -2280,8 +2696,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout = timeout.or(Some(DEFAULT_BG_TIMEOUT));
-        let timeout_ms = timeout.map(|timeout| timeout.as_millis() as u64);
+        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
@@ -2297,6 +2712,7 @@ impl BgTaskRegistry {
             notify_on_completion,
             compressed,
         );
+        metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -2337,6 +2753,7 @@ impl BgTaskRegistry {
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -2344,6 +2761,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -2351,6 +2769,7 @@ impl BgTaskRegistry {
                 detached: false,
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -2358,10 +2777,16 @@ impl BgTaskRegistry {
         });
 
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
+            .insert(task_id.clone(), Arc::clone(&task));
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
             .insert(task_id.clone(), task);
 
         Ok(task_id)
@@ -2489,8 +2914,10 @@ impl BgTaskRegistry {
     /// it, and a request within [`PERSISTED_GC_COALESCE_WINDOW`] of a finished
     /// sweep is covered by that one.
     fn request_persisted_gc(&self, storage_dir: &Path) {
-        let harness = self.inner.db_harness.read().ok().and_then(|slot| slot.clone());
-        let key = (canonicalized_path(storage_dir), harness);
+        // Keyed by storage root alone: the sweep reads each persisted task's
+        // own harness and checks recorded processes under every harness, so
+        // the harness that configured this root has no bearing on it.
+        let key = canonicalized_path(storage_dir);
         {
             let mut slots = persisted_gc_slots()
                 .lock()
@@ -2511,7 +2938,7 @@ impl BgTaskRegistry {
 
         /// Ends the sweep's slot on every exit path, a panicking sweep
         /// included, so a later request can start a new one.
-        struct FinishSlot(Option<(PathBuf, Option<String>)>);
+        struct FinishSlot(Option<PathBuf>);
         impl FinishSlot {
             fn finish(&mut self) {
                 let Some(key) = self.0.take() else {
@@ -2575,20 +3002,29 @@ impl BgTaskRegistry {
     }
 
     fn retire_orphaned_watch_tombstones(&self, binding_session_id: &str) -> Result<(), String> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        // Every harness seen on this root: an orphan written by one harness's
+        // route must be retired even after another harness configured it.
+        let Some((harnesses, pool)) = self.db_seen_harnesses_and_pool() else {
             return Ok(());
         };
         let retired = {
             let conn = pool
                 .lock()
                 .map_err(|_| "background task database lock poisoned".to_string())?;
-            let rows = crate::db::bash_watches::list_bash_pattern_watches(&conn, &harness)
-                .map_err(|error| format!("failed to inspect persisted bash watches: {error}"))?;
+            let mut rows = Vec::new();
+            for harness in &harnesses {
+                rows.extend(
+                    crate::db::bash_watches::list_bash_pattern_watches(&conn, harness).map_err(
+                        |error| format!("failed to inspect persisted bash watches: {error}"),
+                    )?,
+                );
+            }
             let mut retired = Vec::new();
             for row in rows {
+                let harness = &row.harness;
                 let task_exists = match crate::db::bash_tasks::get_bash_task(
                     &conn,
-                    &harness,
+                    harness,
                     &row.session_id,
                     &row.task_id,
                 ) {
@@ -2609,7 +3045,7 @@ impl BgTaskRegistry {
                 }
                 let deleted = crate::db::bash_watches::delete_bash_pattern_watch(
                     &conn,
-                    &harness,
+                    harness,
                     &row.session_id,
                     &row.task_id,
                     &row.watch_id,
@@ -2646,9 +3082,11 @@ impl BgTaskRegistry {
         originating_session_id: &str,
         task_id: &str,
     ) {
-        if let Some((harness, pool)) = self.db_harness_and_pool() {
+        if let Some((harness, pool)) = self.db_harness_and_pool_for_session(originating_session_id)
+        {
             // Fenced so a queued row snapshot cannot re-insert the row.
-            with_task_db_fence(originating_session_id, task_id, || match pool.lock() {
+            with_task_db_fence(originating_session_id, task_id, || {
+                match pool.lock() {
                 Ok(conn) => {
                     if let Err(error) = crate::db::bash_tasks::delete_bash_task(
                         &conn,
@@ -2664,6 +3102,7 @@ impl BgTaskRegistry {
                 Err(_) => crate::slog_warn!(
                     "failed to delete already-reaped orphaned background completion row: task_id={task_id} error=database_lock_poisoned"
                 ),
+            }
             });
         }
         let _ = self.remove_pending_completion(task_id);
@@ -2850,7 +3289,11 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "ignoring persisted background task with invalid id {:?}: reason={}",
                         metadata.task_id,
-                        if old_id { "process_alive" } else { "unrecognized_id" }
+                        if old_id {
+                            "process_alive"
+                        } else {
+                            "unrecognized_id"
+                        }
                     );
                     continue;
                 }
@@ -2881,13 +3324,23 @@ impl BgTaskRegistry {
                     );
                     continue;
                 }
-                if let Some((harness, pool)) = self.db_harness_and_pool() {
-                    let result = with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
-                        pool.lock().map_err(|_| "database_lock_poisoned".to_string())
-                            .and_then(|conn| crate::db::bash_tasks::delete_bash_task(
-                                &conn, &harness, &metadata.session_id, &metadata.task_id,
-                            ).map_err(|error| error.to_string()))
-                    });
+                if let Some((harness, pool)) =
+                    self.db_harness_and_pool_for_session(&metadata.session_id)
+                {
+                    let result =
+                        with_task_db_fence(&metadata.session_id, &metadata.task_id, || {
+                            pool.lock()
+                                .map_err(|_| "database_lock_poisoned".to_string())
+                                .and_then(|conn| {
+                                    crate::db::bash_tasks::delete_bash_task(
+                                        &conn,
+                                        &harness,
+                                        &metadata.session_id,
+                                        &metadata.task_id,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                })
+                        });
                     match result {
                         Ok(removed) if removed > 0 => crate::slog_warn!(
                             "retired old-id background task {}: reason=invalid_legacy_id",
@@ -3039,13 +3492,16 @@ impl BgTaskRegistry {
                         )?;
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else if metadata.status == BgTaskStatus::Killing {
-                        let _ = write_kill_marker_if_absent(&paths);
+                        let recovered = "recovered from inconsistent killing state on replay";
+                        let reason = match write_kill_marker_if_absent(&paths) {
+                            Ok(()) => recovered.to_string(),
+                            Err(error) => kill_marker_failure_reason(
+                                Some(recovered),
+                                &format!("failed to write kill marker: {error}"),
+                            ),
+                        };
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata.mark_terminal(
-                            BgTaskStatus::Killed,
-                            None,
-                            Some("recovered from inconsistent killing state on replay".to_string()),
-                        );
+                        metadata.mark_terminal(BgTaskStatus::Killed, None, Some(reason));
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -3103,12 +3559,7 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())?;
+        let harness = self.db_harness_for_session(session_id)?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
@@ -3253,6 +3704,15 @@ impl BgTaskRegistry {
             .transpose()
             .map_err(|_| "artifact_refused")?;
 
+        let stdout_len = stdout
+            .as_ref()
+            .and_then(|file| file.len().ok())
+            .unwrap_or(0);
+        let stderr_len = stderr
+            .as_ref()
+            .and_then(|file| file.len().ok())
+            .unwrap_or(0);
+        let pty_len = pty.as_ref().and_then(|file| file.len().ok()).unwrap_or(0);
         let mut terminal_matches = Vec::new();
         let scanned_terminal = terminal_at_registration;
         let watch_id = {
@@ -3269,48 +3729,58 @@ impl BgTaskRegistry {
                     if terminal_at_registration {
                         registry.set_file_cursor(&stdout_key, 0);
                         registry.set_file_cursor(&stderr_key, 0);
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &stdout_key,
-                            &task_id,
-                            stdout.as_mut().expect("pipe stdout opened"),
-                        ));
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &stderr_key,
-                            &task_id,
-                            stderr.as_mut().expect("pipe stderr opened"),
-                        ));
                     } else {
-                        registry.prime_file_cursor(
-                            &stdout_key,
-                            stdout.as_ref().expect("pipe stdout opened"),
-                        );
-                        registry.prime_file_cursor(
-                            &stderr_key,
-                            stderr.as_ref().expect("pipe stderr opened"),
-                        );
+                        if registry.file_cursor(&stdout_key).is_none() {
+                            registry.set_file_cursor(&stdout_key, stdout_len);
+                        }
+                        if registry.file_cursor(&stderr_key).is_none() {
+                            registry.set_file_cursor(&stderr_key, stderr_len);
+                        }
                     }
                 }
                 BgMode::Pty => {
                     let pty_key = format!("{task_id}:pty");
                     if terminal_at_registration {
                         registry.set_file_cursor(&pty_key, 0);
-                        terminal_matches.extend(registry.scan_file_new_bytes(
-                            &pty_key,
-                            &task_id,
-                            pty.as_mut().expect("PTY artifact opened"),
-                        ));
-                    } else {
-                        registry.prime_file_cursor(
-                            &pty_key,
-                            pty.as_ref().expect("PTY artifact opened"),
-                        );
+                    } else if registry.file_cursor(&pty_key).is_none() {
+                        registry.set_file_cursor(&pty_key, pty_len);
                     }
                 }
             }
             watch_id
         };
+        if terminal_at_registration {
+            match mode {
+                BgMode::Pipes => {
+                    terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:stdout"),
+                        stdout.as_mut().unwrap(),
+                        true,
+                    ));
+                    terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:stderr"),
+                        stderr.as_mut().unwrap(),
+                        true,
+                    ));
+                }
+                BgMode::Pty => terminal_matches.extend(self.scan_watch_file(
+                    &task_id,
+                    &format!("{task_id}:pty"),
+                    pty.as_mut().unwrap(),
+                    true,
+                )),
+            }
+        }
 
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
+        // The watch row references the task row. A running task's row can be
+        // missing (spawned before this registry had its aft.db handle, or a
+        // failed write), so write it first rather than lose the watch row.
+        if !terminal_at_registration {
+            self.ensure_task_row(&task);
+        }
         self.persist_watch_registration(
             &task.session_id,
             &task_id,
@@ -3321,44 +3791,53 @@ impl BgTaskRegistry {
             stderr_offset,
             pty_offset,
         );
+        let single_watch = self.active_watch_count(&task_id) == 1;
+        if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+            if single_watch {
+                last.insert(task_id.clone(), (stdout_offset, stderr_offset, pty_offset));
+            } else {
+                last.remove(&task_id);
+            }
+        }
 
         if task.is_terminal() {
             if !scanned_terminal {
-                terminal_matches = {
+                {
                     let mut registry = self
                         .inner
                         .watch_registry
                         .lock()
                         .map_err(|_| "watch_registry_poisoned")?;
-                    match &mode {
+                    match mode {
                         BgMode::Pipes => {
-                            let stdout_key = format!("{task_id}:stdout");
-                            let stderr_key = format!("{task_id}:stderr");
-                            registry.set_file_cursor(&stdout_key, 0);
-                            registry.set_file_cursor(&stderr_key, 0);
-                            let mut matches = registry.scan_file_new_bytes(
-                                &stdout_key,
-                                &task_id,
-                                stdout.as_mut().expect("pipe stdout opened"),
-                            );
-                            matches.extend(registry.scan_file_new_bytes(
-                                &stderr_key,
-                                &task_id,
-                                stderr.as_mut().expect("pipe stderr opened"),
-                            ));
-                            matches
+                            registry.set_file_cursor(&format!("{task_id}:stdout"), 0);
+                            registry.set_file_cursor(&format!("{task_id}:stderr"), 0);
                         }
-                        BgMode::Pty => {
-                            let pty_key = format!("{task_id}:pty");
-                            registry.set_file_cursor(&pty_key, 0);
-                            registry.scan_file_new_bytes(
-                                &pty_key,
-                                &task_id,
-                                pty.as_mut().expect("PTY artifact opened"),
-                            )
-                        }
+                        BgMode::Pty => registry.set_file_cursor(&format!("{task_id}:pty"), 0),
                     }
-                };
+                }
+                match mode {
+                    BgMode::Pipes => {
+                        terminal_matches.extend(self.scan_watch_file(
+                            &task_id,
+                            &format!("{task_id}:stdout"),
+                            stdout.as_mut().unwrap(),
+                            true,
+                        ));
+                        terminal_matches.extend(self.scan_watch_file(
+                            &task_id,
+                            &format!("{task_id}:stderr"),
+                            stderr.as_mut().unwrap(),
+                            true,
+                        ));
+                    }
+                    BgMode::Pty => terminal_matches.extend(self.scan_watch_file(
+                        &task_id,
+                        &format!("{task_id}:pty"),
+                        pty.as_mut().unwrap(),
+                        true,
+                    )),
+                }
             }
 
             let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task_id);
@@ -3441,7 +3920,52 @@ impl BgTaskRegistry {
         }
     }
 
+    fn scan_watch_file(
+        &self,
+        task_id: &str,
+        cursor_key: &str,
+        file: &mut super::persistence::ValidatedArtifact,
+        drain: bool,
+    ) -> Vec<PatternMatch> {
+        const CHUNK: u64 = 64 * 1024;
+        let mut matches = Vec::new();
+        loop {
+            let cursor = match self.inner.watch_registry.lock() {
+                Ok(registry) if registry.active_count(task_id) > 0 => {
+                    registry.file_cursor(cursor_key)
+                }
+                _ => break,
+            };
+            let start = cursor.unwrap_or_else(|| file.len().unwrap_or(0));
+            let Ok(bytes) = file.read_range(start, CHUNK) else {
+                break;
+            };
+            if bytes.is_empty() {
+                break;
+            }
+            let len = bytes.len();
+            let Ok(mut registry) = self.inner.watch_registry.lock() else {
+                break;
+            };
+            if registry.active_count(task_id) == 0 {
+                break;
+            }
+            if registry.file_cursor(cursor_key) != cursor {
+                continue;
+            }
+            matches.extend(registry.scan_chunk(cursor_key, task_id, &bytes, start));
+            drop(registry);
+            if !drain || len < CHUNK as usize {
+                break;
+            }
+        }
+        matches
+    }
+
     pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
+        if self.active_watch_count(&task.task_id) == 0 {
+            return;
+        }
         let mode = match task.state.lock() {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return,
@@ -3461,33 +3985,34 @@ impl BgTaskRegistry {
             .transpose()
             .ok()
             .flatten();
+        let drain = !task.is_running();
         let mut matches = Vec::new();
-        if let Ok(mut registry) = self.inner.watch_registry.lock() {
-            match mode {
-                BgMode::Pipes => {
-                    let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
-                        return;
-                    };
-                    let stdout_key = format!("{}:stdout", task.task_id);
-                    let stderr_key = format!("{}:stderr", task.task_id);
-                    matches.extend(registry.scan_file_new_bytes(
-                        &stdout_key,
-                        &task.task_id,
-                        stdout,
-                    ));
-                    matches.extend(registry.scan_file_new_bytes(
-                        &stderr_key,
-                        &task.task_id,
-                        stderr,
-                    ));
-                }
-                BgMode::Pty => {
-                    let Some(pty) = pty.as_mut() else {
-                        return;
-                    };
-                    let pty_key = format!("{}:pty", task.task_id);
-                    matches.extend(registry.scan_file_new_bytes(&pty_key, &task.task_id, pty));
-                }
+        match mode {
+            BgMode::Pipes => {
+                let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
+                    return;
+                };
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:stdout", task.task_id),
+                    stdout,
+                    drain,
+                ));
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:stderr", task.task_id),
+                    stderr,
+                    drain,
+                ));
+            }
+            BgMode::Pty => {
+                let Some(pty) = pty.as_mut() else { return };
+                matches.extend(self.scan_watch_file(
+                    &task.task_id,
+                    &format!("{}:pty", task.task_id),
+                    pty,
+                    drain,
+                ));
             }
         }
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
@@ -3536,6 +4061,32 @@ impl BgTaskRegistry {
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
+    /// Explain failed adoption without importing a task from another namespace.
+    pub(crate) fn unadopted_task_message(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: &Path,
+    ) -> Option<String> {
+        validate_task_id(task_id).ok()?;
+        let pool = self.inner.db_pool.read().ok()?.clone()?;
+        let conn = pool.lock().ok()?;
+        let project_key = crate::path_identity::project_scope_key(project_root);
+        conn.query_row(
+            "SELECT harness, stdout_path, stderr_path FROM bash_tasks WHERE task_id = ?1 AND session_id = ?2 AND project_key = ?3 ORDER BY started_at DESC LIMIT 1",
+            rusqlite::params![task_id, session_id, project_key],
+            |row| {
+                let harness: String = row.get(0)?;
+                let stdout: Option<String> = row.get(1)?;
+                let stderr: Option<String> = row.get(2)?;
+                Ok(format!("background task could not be adopted: {task_id} (persisted namespace: {harness}). Output: {}. Stderr: {}. The task has not been adopted or signaled; inspect these files before rerunning the command.", stdout.as_deref().unwrap_or("unavailable"), stderr.as_deref().unwrap_or("unavailable")))
+            },
+        ).ok()
+    }
+
+    /// A snapshot of the task as it is now, including `killing` while a kill
+    /// is signaling it. Never waits for a kill, so pending-response polls and
+    /// other loop-driven readers can call it.
     pub fn status(
         &self,
         task_id: &str,
@@ -3543,6 +4094,50 @@ impl BgTaskRegistry {
         project_root: Option<&Path>,
         storage_dir: Option<&Path>,
         preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            storage_dir,
+            preview_bytes,
+            Duration::ZERO,
+        )
+    }
+
+    /// The status `bash_status` answers with. A kill in flight publishes
+    /// `killing` while it signals and reaps without the state lock; callers
+    /// of `bash_status` never saw that state before kills released the lock,
+    /// and treat any non-running status as final. So this waits (without the
+    /// state lock, bounded by [`KILL_IN_FLIGHT_WAIT`]) for an in-flight kill
+    /// to publish its outcome, and only reports `killing` if the kill is
+    /// still in flight when the bound expires.
+    pub fn status_settled(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: Option<&Path>,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            storage_dir,
+            preview_bytes,
+            KILL_IN_FLIGHT_WAIT,
+        )
+    }
+
+    fn status_with_kill_wait(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: Option<&Path>,
+        preview_bytes: usize,
+        kill_wait: Duration,
     ) -> Option<BgTaskSnapshot> {
         validate_task_id(task_id).ok()?;
         let terminal_db_fallback_allowed = storage_dir
@@ -3573,9 +4168,15 @@ impl BgTaskRegistry {
                 storage_dir?,
                 preview_bytes,
                 terminal_db_fallback_allowed,
+                kill_wait,
             );
         };
         let _ = self.poll_task(&task);
+        // After a wait, poll again: a PTY's exit marker may have landed while
+        // the kill settled, and this reader can publish it itself.
+        if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
+            let _ = self.poll_task(&task);
+        }
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
@@ -3725,12 +4326,12 @@ impl BgTaskRegistry {
             .read()
             .ok()
             .and_then(|slot| slot.clone())?;
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone())?;
+        // Task rows are keyed by the harness of the route that started them;
+        // the calling route's harness finds them even when another harness
+        // configured this root more recently.
+        let harness = super::route_harness()
+            .map(|harness| harness.storage_segment())
+            .or_else(|| self.fallback_db_harness())?;
         let conn = match pool.lock() {
             Ok(conn) => conn,
             Err(_) => return Some(Err("db mutex poisoned".to_string())),
@@ -3755,6 +4356,7 @@ impl BgTaskRegistry {
         storage_dir: &Path,
         preview_bytes: usize,
         allow_terminal_db_fallback: bool,
+        kill_wait: Duration,
     ) -> Option<BgTaskSnapshot> {
         let fallback_row = if allow_terminal_db_fallback {
             self.lookup_relaxed_task_from_db(task_id, project_root)
@@ -3766,6 +4368,9 @@ impl BgTaskRegistry {
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
         if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
             let _ = self.poll_task(&task);
+            if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
+                let _ = self.poll_task(&task);
+            }
             return Some(self.snapshot_with_terminal_cache(&task, preview_bytes));
         }
         let row = fallback_row?;
@@ -3948,8 +4553,7 @@ impl BgTaskRegistry {
                     if !(metadata.status.is_terminal() && metadata.completion_delivered) {
                         continue;
                     }
-                    if Self::persisted_task_process_is_alive(&metadata)
-                        || live_in_db(self, task_id)
+                    if Self::persisted_task_process_is_alive(&metadata) || live_in_db(self, task_id)
                     {
                         crate::slog_warn!(
                             "refusing to delete terminal background task bundle {task_id}: recorded process is still alive"
@@ -4148,6 +4752,7 @@ impl BgTaskRegistry {
             } else {
                 Vec::new()
             };
+        self.prune_session_harnesses();
 
         for (task_id, paths) in removable_paths {
             match delete_task_bundle(&paths) {
@@ -4220,19 +4825,21 @@ impl BgTaskRegistry {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harnesses, pool)) = self.db_seen_harnesses_and_pool() else {
             return keys;
         };
         let Ok(conn) = pool.lock() else {
             return keys;
         };
-        if let Ok(rows) = crate::db::bash_watches::list_bash_pattern_watches(&conn, &harness) {
-            keys.extend(rows.into_iter().filter(|row| row.pending_match).map(|row| {
-                format!(
-                    "match\0{}\0{}\0{}",
-                    row.session_id, row.task_id, row.watch_id
-                )
-            }));
+        for harness in &harnesses {
+            if let Ok(rows) = crate::db::bash_watches::list_bash_pattern_watches(&conn, harness) {
+                keys.extend(rows.into_iter().filter(|row| row.pending_match).map(|row| {
+                    format!(
+                        "match\0{}\0{}\0{}",
+                        row.session_id, row.task_id, row.watch_id
+                    )
+                }));
+            }
         }
         keys
     }
@@ -4249,20 +4856,31 @@ impl BgTaskRegistry {
                     .count()
             })
             .unwrap_or(1);
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        // A session's watches live under its own harness; the root-wide count
+        // covers every harness seen on this root.
+        let db = match session_id {
+            Some(session_id) => self
+                .db_harness_and_pool_for_session(session_id)
+                .map(|(harness, pool)| (vec![harness], pool)),
+            None => self.db_seen_harnesses_and_pool(),
+        };
+        let Some((harnesses, pool)) = db else {
             return completion_count;
         };
         let Ok(conn) = pool.lock() else {
             return completion_count.saturating_add(1);
         };
-        let pending_matches = match session_id {
-            Some(session_id) => {
-                crate::db::bash_watches::count_pending_bash_pattern_watches_for_session(
-                    &conn, &harness, session_id,
-                )
-            }
-            None => crate::db::bash_watches::count_pending_bash_pattern_watches(&conn, &harness),
-        };
+        let pending_matches = harnesses.iter().try_fold(0usize, |total, harness| {
+            let count = match session_id {
+                Some(session_id) => {
+                    crate::db::bash_watches::count_pending_bash_pattern_watches_for_session(
+                        &conn, harness, session_id,
+                    )
+                }
+                None => crate::db::bash_watches::count_pending_bash_pattern_watches(&conn, harness),
+            }?;
+            Ok::<_, rusqlite::Error>(total.saturating_add(count))
+        });
         completion_count.saturating_add(pending_matches.unwrap_or(1))
     }
 
@@ -4275,7 +4893,7 @@ impl BgTaskRegistry {
         session_id: &str,
         older_than: Duration,
     ) -> Vec<(String, String, u64)> {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return Vec::new();
         };
         let Ok(conn) = pool.lock() else {
@@ -4323,17 +4941,28 @@ impl BgTaskRegistry {
         let mut delivered = Vec::new();
         for task_id in task_ids {
             if self.has_erased_watch_reference(task_id) {
-                if let Some((harness, pool)) = self.db_harness_and_pool() {
+                // The task's own harness when the registry still holds it;
+                // otherwise every harness seen on this root.
+                let db = match self.task(task_id) {
+                    Some(task) => self
+                        .db_harness_and_pool_for_task(&task)
+                        .map(|(harness, pool)| (vec![harness], pool)),
+                    None => self.db_seen_harnesses_and_pool(),
+                };
+                if let Some((harnesses, pool)) = db {
                     if let Ok(conn) = pool.lock() {
-                        if let Ok(rows) =
-                            crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
-                                &conn, &harness, task_id,
-                            )
-                        {
+                        for harness in &harnesses {
+                            let Ok(rows) =
+                                crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
+                                    &conn, harness, task_id,
+                                )
+                            else {
+                                continue;
+                            };
                             for row in rows {
                                 let _ = crate::db::bash_watches::delete_bash_pattern_watch(
                                     &conn,
-                                    &harness,
+                                    harness,
                                     &row.session_id,
                                     task_id,
                                     &row.watch_id,
@@ -4401,7 +5030,7 @@ impl BgTaskRegistry {
     }
 
     fn persisted_task_is_terminal(&self, session_id: &str, task_id: &str) -> Option<bool> {
-        let (harness, pool) = self.db_harness_and_pool()?;
+        let (harness, pool) = self.db_harness_and_pool_for_session(session_id)?;
         let conn = pool.lock().ok()?;
         let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
             .ok()
@@ -4413,7 +5042,7 @@ impl BgTaskRegistry {
     }
 
     fn mark_persisted_completion_delivered(&self, session_id: &str, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
             return;
         };
         // The task may be held by another registry (this path runs when the
@@ -4436,13 +5065,13 @@ impl BgTaskRegistry {
     }
 
     fn sync_memory_watches_from_persistence(&self, task_id: &str) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some(task) = self.task(task_id) else {
             return;
         };
-        let session_id = match self.task(task_id) {
-            Some(task) => task.session_id.clone(),
-            None => return,
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(&task) else {
+            return;
         };
+        let session_id = task.session_id.clone();
         let Ok(conn) = pool.lock() else {
             return;
         };
@@ -4535,6 +5164,7 @@ impl BgTaskRegistry {
             }
             tasks.clear();
         }
+        self.prune_session_harnesses();
     }
 
     pub fn shutdown(&self) {
@@ -4637,6 +5267,12 @@ impl BgTaskRegistry {
         if state.metadata.status.is_terminal() {
             return false;
         }
+        // A kill in flight owns the terminal transition: the process it is
+        // signaling dies without an exit marker by design, and the kill
+        // publishes the outcome once its reap finishes.
+        if state.kill_in_flight {
+            return false;
+        }
         if matches!(read_exit_marker(&task.paths), Ok(Some(_))) {
             return false;
         }
@@ -4664,18 +5300,80 @@ impl BgTaskRegistry {
         false
     }
 
+    /// True for a PTY task whose child has exited (its waiter wrote the exit
+    /// marker) before its completion wake was sent, which happens once the
+    /// PTY reader has drained the output as well. The watchdog uses this to
+    /// leave such a task to that wake instead of finalizing it on a periodic
+    /// tick.
+    ///
+    /// Always false on Windows: a ConPTY reader reaches end-of-file only after
+    /// the pseudoconsole is closed, which finalizing the task does, so there
+    /// the wake cannot come first. Also false for a killed task, whose
+    /// outcome is already decided and must not wait on output.
+    pub(crate) fn pty_exit_awaiting_reader(&self, task: &BgTask) -> bool {
+        if cfg!(windows) {
+            return false;
+        }
+        task.state.lock().is_ok_and(|state| match &state.runtime {
+            TaskRuntime::Pty(Some(pty)) => {
+                state.metadata.status != BgTaskStatus::Killing
+                    && !pty.was_killed.load(Ordering::SeqCst)
+                    && pty.exit_observed.load(Ordering::SeqCst)
+                    && !pty.coordinator.woken.load(Ordering::SeqCst)
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether a watchdog wake is queued and not yet consumed by a pass.
+    pub(crate) fn wake_pending(&self) -> bool {
+        !self.inner.wake_rx.is_empty()
+    }
+
+    /// Record the first watchdog pass that observed `task_id` terminal. A
+    /// periodic pass that runs while a wake is already queued is serving that
+    /// wake's completion signal, so it is recorded as a wake pass.
+    pub(crate) fn record_completion_pass_cause(&self, task_id: &str, cause: WatchdogPassCause) {
+        let cause = if cause == WatchdogPassCause::Tick && self.wake_pending() {
+            WatchdogPassCause::Wake
+        } else {
+            cause
+        };
+        if let Ok(mut causes) = self.inner.completion_pass_cause.lock() {
+            causes.entry(task_id.to_string()).or_insert(cause);
+        }
+    }
+
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
         self.inner
-            .tasks
+            .watchdog_tasks
             .lock()
-            .map(|tasks| {
-                tasks
-                    .values()
-                    .filter(|task| task.is_running())
-                    .cloned()
-                    .collect()
-            })
+            .map(|tasks| tasks.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether any task is still under watch, without waiting: `None` when
+    /// the watch map is locked by another thread right now.
+    pub(crate) fn try_has_running_tasks(&self) -> Option<bool> {
+        match self.inner.watchdog_tasks.try_lock() {
+            Ok(tasks) => Some(!tasks.is_empty()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => Some(false),
+        }
+    }
+
+    /// Hold the watch map lock for the duration of `while_held`, so a test can
+    /// prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_watchdog_tasks_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self.inner.watchdog_tasks.lock();
+        while_held();
+    }
+
+    pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.watchdog_tasks.lock() {
+            tasks.remove(task_id);
+        }
     }
 
     fn insert_rehydrated_task(
@@ -4691,6 +5389,7 @@ impl BgTaskRegistry {
         let mode = metadata.mode.clone();
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
+            db_harness: metadata.harness.clone(),
             task_id: task_id.clone(),
             session_id,
             paths: paths.clone(),
@@ -4698,6 +5397,7 @@ impl BgTaskRegistry {
             started,
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
+            kill_settled: std::sync::Condvar::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: if mode == BgMode::Pty {
@@ -4715,17 +5415,26 @@ impl BgTaskRegistry {
                 // failure based on stale evidence.
                 child_exit_observed: false,
                 descendant_sampling_started: false,
+                kill_in_flight: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
             }),
         });
         self.record_live_delivery_session(&task.session_id);
+        self.remember_session_harness(&task);
         self.inner
             .tasks
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
+        if task.is_running() {
+            self.inner
+                .watchdog_tasks
+                .lock()
+                .map_err(|_| "background watchdog lock poisoned")?
+                .insert(task_id.clone(), Arc::clone(&task));
+        }
         // Re-arm durable pattern watches after the task is addressable again so
         // gap matches (bytes written while the bridge was down) are scanned and
         // pending undelivered matches are re-pushed.
@@ -4734,7 +5443,7 @@ impl BgTaskRegistry {
     }
 
     fn rearm_persisted_watches(&self, task: &Arc<BgTask>) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_task(task) else {
             return;
         };
         let rows = {
@@ -4795,6 +5504,16 @@ impl BgTaskRegistry {
 
             // All rows for a task share stream cursors; take them from the first row.
             let first = &rows[0];
+            if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+                last.insert(
+                    task.task_id.clone(),
+                    (
+                        first.stdout_offset.max(0) as u64,
+                        first.stderr_offset.max(0) as u64,
+                        first.pty_offset.max(0) as u64,
+                    ),
+                );
+            }
             match mode {
                 BgMode::Pipes => {
                     registry.set_file_cursor(&stdout_key, first.stdout_offset.max(0) as u64);
@@ -4847,35 +5566,36 @@ impl BgTaskRegistry {
                 }
             }
 
-            // Gap scan: bytes written after the last persisted cursor while the
-            // previous process was down. Skip when we already have a pending
-            // once-match to re-deliver (avoids double-firing the same hit).
-            let should_gap_scan =
-                rows.iter().any(|row| row.scanning) && !pending_to_emit.iter().any(|m| m.once);
-            if should_gap_scan {
-                match mode {
-                    BgMode::Pipes => {
-                        if let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) {
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &stdout_key,
-                                &task.task_id,
-                                stdout,
-                            ));
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &stderr_key,
-                                &task.task_id,
-                                stderr,
-                            ));
-                        }
+            // Gap bytes are read after releasing the registry lock.
+        }
+        let should_gap_scan =
+            rows.iter().any(|row| row.scanning) && !pending_to_emit.iter().any(|m| m.once);
+        if should_gap_scan {
+            match mode {
+                BgMode::Pipes => {
+                    if let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) {
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:stdout", task.task_id),
+                            stdout,
+                            true,
+                        ));
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:stderr", task.task_id),
+                            stderr,
+                            true,
+                        ));
                     }
-                    BgMode::Pty => {
-                        if let Some(pty) = pty.as_mut() {
-                            gap_matches.extend(registry.scan_file_new_bytes(
-                                &pty_key,
-                                &task.task_id,
-                                pty,
-                            ));
-                        }
+                }
+                BgMode::Pty => {
+                    if let Some(pty) = pty.as_mut() {
+                        gap_matches.extend(self.scan_watch_file(
+                            &task.task_id,
+                            &format!("{}:pty", task.task_id),
+                            pty,
+                            true,
+                        ));
                     }
                 }
             }
@@ -4952,6 +5672,19 @@ impl BgTaskRegistry {
         self.kill_with_status_reason(task_id, session_id, terminal_status, None)
     }
 
+    /// Kill a task in three steps so its state lock is never held while
+    /// signals are delivered or the process group is reaped. Signaling can
+    /// take seconds (a SIGTERM grace period, then `wait()` on the direct
+    /// child), and `killpg` itself has been seen to sit in the kernel for over
+    /// a minute. Everything that reads the task's state (status polls, the
+    /// health rollup, the watchdog) would otherwise wait for all of it.
+    ///
+    /// 1. Under the lock: publish `Killing` and take what signaling needs
+    ///    (the process group, the direct child handle).
+    /// 2. Unlocked: signal, wait out the grace period, reap the child.
+    /// 3. Under the lock again: publish the terminal state, unless another
+    ///    path published one first. A task can exit on its own while the
+    ///    signal is in flight, and the first terminal state stands.
     fn kill_with_status_reason(
         &self,
         task_id: &str,
@@ -4963,17 +5696,15 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         let mut terminalized = false;
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_signaled = false;
-        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_reached = 0;
-        // Declared before the state lock below, so it runs after that lock is
+        // Declared before the state locks below, so it runs after they are
         // released on every exit, including a failed persist that returns
         // early after the task was already marked terminal and would
         // otherwise never reach `post_terminal_transition`.
         let _release_handles = ReleaseIoHandlesOnExit(&task);
 
-        {
+        let plan = {
             let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .state
@@ -4981,7 +5712,6 @@ impl BgTaskRegistry {
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
-                #[cfg(unix)]
                 let live_count = state
                     .metadata
                     .live_descendants
@@ -4989,22 +5719,11 @@ impl BgTaskRegistry {
                     .map(Vec::len)
                     .unwrap_or(0)
                     + state.metadata.live_descendants_omitted;
-                #[cfg(unix)]
-                if live_count > 0 {
-                    if let Some(pgid) = state.metadata.pgid {
-                        kill_signaled = true;
-                        kill_reached = live_count;
-                        terminate_pgid(pgid, None);
-                        let sample = live_process_group_members(pgid);
-                        state.metadata.live_descendants =
-                            sample.as_ref().map(|(members, _)| members.clone());
-                        state.metadata.live_descendants_omitted =
-                            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
-                        self.persist_task_locked(&task, &state.metadata, &mut db)
-                            .map_err(|error| {
-                                format!("failed to persist post-kill descendant sample: {error}")
-                            })?;
+                match state.metadata.pgid {
+                    Some(pgid) if cfg!(unix) && live_count > 0 => {
+                        KillSignalPlan::TerminalSurvivors { pgid, live_count }
                     }
+                    _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
@@ -5020,12 +5739,21 @@ impl BgTaskRegistry {
                     // `wait()`s after signaling, so this is the only kill
                     // path that needed the explicit reap.
                     TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
-                    TaskRuntime::Pty(runtime) => *runtime = None,
+                    TaskRuntime::Pty(_) => {}
                 }
+                // Move the PTY runtime out of the task while holding the lock;
+                // it is closed after the lock is released.
+                let retired_pty = match &mut state.runtime {
+                    TaskRuntime::Pty(runtime) => runtime.take(),
+                    TaskRuntime::Piped(_) => None,
+                };
                 state.detached = true;
                 self.persist_task_locked(&task, &state.metadata, &mut db)
                     .map_err(|e| format!("failed to persist terminal state: {e}"))?;
                 terminalized = true;
+                KillSignalPlan::RetirePty(retired_pty)
+            } else if state.kill_in_flight {
+                KillSignalPlan::AwaitOtherKill
             } else {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
                 if !was_already_killing {
@@ -5038,11 +5766,6 @@ impl BgTaskRegistry {
                     self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
-
-                #[cfg(unix)]
-                let pgid = state.metadata.pgid;
-                #[cfg(windows)]
-                let child_pid = state.metadata.child_pid;
                 if !was_already_killing
                     && state.metadata.mode == BgMode::Pty
                     && terminal_status == BgTaskStatus::TimedOut
@@ -5050,67 +5773,17 @@ impl BgTaskRegistry {
                     state.pending_terminal_override = Some(BgTaskStatus::TimedOut);
                 }
 
-                #[cfg(windows)]
-                let mut pty_forced_terminal_status: Option<BgTaskStatus> = None;
-
-                match &mut state.runtime {
-                    TaskRuntime::Piped(child_slot) => {
-                        #[cfg(unix)]
-                        if let Some(pgid) = pgid {
-                            terminate_pgid(pgid, child_slot.as_mut());
-                        }
-                        #[cfg(windows)]
-                        if let Some(child) = child_slot.as_mut() {
-                            super::process::terminate_process(child);
-                        } else if let Some(pid) = child_pid {
-                            terminate_pid(pid);
-                        }
-                        if let Some(child) = child_slot.as_mut() {
-                            let _ = child.wait();
-                        }
-                        *child_slot = None;
-                        state.detached = true;
-
-                        if let Some(handles) = state.io_handles.as_mut() {
-                            match handles.write(TaskArtifact::Exit, b"killed") {
-                                Ok(()) => {}
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::Interrupted
-                                        && error.to_string().contains(
-                                            super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
-                                        ) =>
-                                {
-                                    // The child's own temp+rename exit write landed
-                                    // between wait() and this write, leaving the
-                                    // retained handle at zero links (Windows). The
-                                    // replacement is the child's real exit marker;
-                                    // re-open by path and keep whichever is there.
-                                    write_kill_marker_if_absent(&task.paths).map_err(|e| {
-                                        format!("failed to write kill marker after replace: {e}")
-                                    })?;
-                                }
-                                Err(error) => {
-                                    return Err(format!(
-                                        "failed to write retained kill marker: {error}"
-                                    ));
-                                }
-                            }
-                        } else {
-                            write_kill_marker_if_absent(&task.paths)
-                                .map_err(|e| format!("failed to write kill marker: {e}"))?;
-                        }
-
-                        let exit_code = terminal_exit_code_for_status(&terminal_status);
-                        state
-                            .metadata
-                            .mark_terminal(terminal_status, exit_code, reason.clone());
-
-                        state.pending_terminal_override = None;
-                        task.mark_terminal_now();
-                        self.persist_task_locked(&task, &state.metadata, &mut db)
-                            .map_err(|e| format!("failed to persist killed state: {e}"))?;
-                        terminalized = true;
-                    }
+                let pgid = state.metadata.pgid;
+                let child_pid = state.metadata.child_pid;
+                let plan = match &mut state.runtime {
+                    // The child handle leaves the slot for the unlocked wait.
+                    // With the slot empty and the task not yet detached, the
+                    // watchdog's reap pass leaves the task alone.
+                    TaskRuntime::Piped(child_slot) => KillSignalPlan::Piped {
+                        pgid,
+                        child_pid,
+                        child: child_slot.take(),
+                    },
                     TaskRuntime::Pty(Some(pty)) => {
                         pty.was_killed.store(true, Ordering::SeqCst);
                         if let Err(error) = pty.killer.kill() {
@@ -5118,54 +5791,116 @@ impl BgTaskRegistry {
                                 "[pty-kill] {task_id} ChildKiller::kill failed: {error}"
                             );
                         }
-                        if let Some(pid) = pty.child_pid {
-                            #[cfg(unix)]
-                            terminate_pgid(pid as i32, None);
-                            #[cfg(windows)]
-                            terminate_pid(pid);
-                        }
-                        drop(pty.master.take());
-
-                        #[cfg(windows)]
-                        {
-                            let default_status = if terminal_status == BgTaskStatus::TimedOut {
-                                BgTaskStatus::TimedOut
-                            } else {
-                                BgTaskStatus::Killed
-                            };
-                            pty_forced_terminal_status = Some(
-                                state
-                                    .pending_terminal_override
-                                    .take()
-                                    .unwrap_or(default_status),
-                            );
+                        KillSignalPlan::Pty {
+                            pid: pty.child_pid,
+                            master: pty.master.take(),
                         }
                     }
-                    TaskRuntime::Pty(None) => {}
+                    TaskRuntime::Pty(None) => KillSignalPlan::Nothing,
+                };
+                if !matches!(plan, KillSignalPlan::Nothing) {
+                    state.kill_in_flight = true;
                 }
+                plan
+            }
+        };
 
-                #[cfg(windows)]
-                if let Some(target_status) = pty_forced_terminal_status {
-                    if !task.paths.exit.exists() {
+        match plan {
+            KillSignalPlan::Nothing => {}
+            KillSignalPlan::RetirePty(runtime) => {
+                if let Some(mut runtime) = runtime {
+                    close_pty_master(runtime.master.take());
+                }
+            }
+            KillSignalPlan::AwaitOtherKill => self.await_kill_in_flight(&task),
+            KillSignalPlan::TerminalSurvivors { pgid, live_count } => {
+                kill_signaled = true;
+                kill_reached = live_count;
+                self.terminate_terminal_survivors(&task, pgid)?;
+            }
+            KillSignalPlan::Piped {
+                pgid,
+                child_pid,
+                mut child,
+            } => {
+                #[cfg(test)]
+                wait_on_kill_signal_gate_for_test(&task.task_id);
+                terminate_piped_task(pgid, child_pid, child.as_mut());
+                if let Some(child) = child.as_mut() {
+                    let _ = child.wait();
+                }
+                drop(child);
+
+                let mut db = DeferredDbWrites::new(self, &task);
+                let mut state = task
+                    .state
+                    .lock()
+                    .map_err(|_| "background task lock poisoned".to_string())?;
+                state.kill_in_flight = false;
+                task.kill_settled.notify_all();
+                // A terminal state published while the signal was in flight
+                // (the task's own exit marker, read by the watchdog) stands.
+                if !state.metadata.status.is_terminal() {
+                    state.detached = true;
+
+                    let marker_written = if let Some(handles) = state.io_handles.as_mut() {
+                        match handles.write(TaskArtifact::Exit, b"killed") {
+                            Ok(()) => Ok(()),
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::Interrupted
+                                    && error.to_string().contains(
+                                        super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
+                                    ) =>
+                            {
+                                // The child's own temp+rename exit write landed
+                                // between wait() and this write, leaving the
+                                // retained handle at zero links (Windows). The
+                                // replacement is the child's real exit marker;
+                                // re-open by path and keep whichever is there.
+                                write_kill_marker_if_absent(&task.paths).map_err(|e| {
+                                    format!("failed to write kill marker after replace: {e}")
+                                })
+                            }
+                            Err(error) => {
+                                Err(format!("failed to write retained kill marker: {error}"))
+                            }
+                        }
+                    } else {
                         write_kill_marker_if_absent(&task.paths)
-                            .map_err(|e| format!("failed to write kill marker: {e}"))?;
-                    }
+                            .map_err(|e| format!("failed to write kill marker: {e}"))
+                    };
+                    // The process group has already been terminated, so a
+                    // failed marker write must not leave the task in
+                    // `killing`: nothing would ever finish it. End it with
+                    // a reason that names the failed write instead.
+                    let terminal_reason = match marker_written {
+                        Ok(()) => reason.clone(),
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "background task {task_id} was terminated but its exit marker could not be written: {error}"
+                            );
+                            Some(kill_marker_failure_reason(reason.as_deref(), &error))
+                        }
+                    };
 
-                    let exit_code = terminal_exit_code_for_status(&target_status);
+                    let exit_code = terminal_exit_code_for_status(&terminal_status);
                     state
                         .metadata
-                        .mark_terminal(target_status, exit_code, reason.clone());
+                        .mark_terminal(terminal_status, exit_code, terminal_reason);
 
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
-                    if let TaskRuntime::Pty(runtime) = &mut state.runtime {
-                        *runtime = None;
-                    }
-                    state.detached = true;
                     self.persist_task_locked(&task, &state.metadata, &mut db)
-                        .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+                        .map_err(|e| format!("failed to persist killed state: {e}"))?;
                     terminalized = true;
                 }
+            }
+            KillSignalPlan::Pty { pid, master } => {
+                if let Some(pid) = pid {
+                    terminate_pty_group(pid);
+                }
+                close_pty_master(master);
+                terminalized = self.finish_pty_kill(&task, terminal_status, reason)?;
             }
         }
 
@@ -5178,6 +5913,96 @@ impl BgTaskRegistry {
         Ok(snapshot)
     }
 
+    /// Signal the surviving members of an already-terminal task's process
+    /// group, then record what is still alive. Runs without the state lock
+    /// held across the signal and its grace period.
+    #[cfg(unix)]
+    fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
+        terminate_pgid(pgid, None);
+        let sample = live_process_group_members(pgid);
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
+        state.metadata.live_descendants_omitted =
+            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+        self.persist_task_locked(task, &state.metadata, &mut db)
+            .map_err(|error| format!("failed to persist post-kill descendant sample: {error}"))
+    }
+
+    /// Process groups are not enumerated or signaled as a group on this
+    /// platform, so a terminal task has no survivors to signal.
+    #[cfg(not(unix))]
+    fn terminate_terminal_survivors(&self, _task: &Arc<BgTask>, _pgid: i32) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Re-take the state lock after a PTY kill's signal and close the master.
+    /// Returns whether this call published the terminal state.
+    fn finish_pty_kill(
+        &self,
+        task: &Arc<BgTask>,
+        terminal_status: BgTaskStatus,
+        reason: Option<String>,
+    ) -> Result<bool, String> {
+        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        state.kill_in_flight = false;
+        task.kill_settled.notify_all();
+
+        // On Unix the PTY waiter writes the exit marker and the watchdog
+        // publishes the terminal state from it. Windows ConPTY gives no such
+        // signal, so the kill publishes it here.
+        #[cfg(windows)]
+        if !state.metadata.status.is_terminal() {
+            let default_status = if terminal_status == BgTaskStatus::TimedOut {
+                BgTaskStatus::TimedOut
+            } else {
+                BgTaskStatus::Killed
+            };
+            let target_status = state
+                .pending_terminal_override
+                .take()
+                .unwrap_or(default_status);
+            if !task.paths.exit.exists() {
+                write_kill_marker_if_absent(&task.paths)
+                    .map_err(|e| format!("failed to write kill marker: {e}"))?;
+            }
+
+            let exit_code = terminal_exit_code_for_status(&target_status);
+            state
+                .metadata
+                .mark_terminal(target_status, exit_code, reason.clone());
+
+            state.pending_terminal_override = None;
+            task.mark_terminal_now();
+            if let TaskRuntime::Pty(runtime) = &mut state.runtime {
+                *runtime = None;
+            }
+            state.detached = true;
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
+            return Ok(true);
+        }
+        #[cfg(not(windows))]
+        let _ = (terminal_status, reason);
+        Ok(false)
+    }
+
+    /// Wait, without holding the task's state lock, for a kill that another
+    /// caller has in flight, so this caller also answers with the outcome.
+    /// Bounded by the longest a kill should take; past that the caller
+    /// answers with whatever state the task is in.
+    fn await_kill_in_flight(&self, task: &Arc<BgTask>) {
+        let _ = task.wait_for_kill_settled(KILL_IN_FLIGHT_WAIT);
+    }
+
     fn finalize_from_marker(
         &self,
         task: &Arc<BgTask>,
@@ -5185,6 +6010,10 @@ impl BgTaskRegistry {
         reason: Option<String>,
     ) -> Result<(), String> {
         let mut pty_reader_done = None;
+        // The PTY runtime leaves the task under the lock and is dropped after
+        // it is released: dropping it closes the pseudoterminal, which on
+        // Windows can wait for conhost, and that must not hold the state lock.
+        let mut retired_pty_runtime = None;
         {
             // The aft.db mirror of the terminal row is written when this
             // scope ends, after the state lock is released: the aft.db mutex
@@ -5220,6 +6049,8 @@ impl BgTaskRegistry {
                 .map_err(|e| format!("failed to persist terminal state: {e}"))?;
             state.metadata = updated;
             task.mark_terminal_now();
+            // A reader waiting out an in-flight kill can answer now.
+            task.kill_settled.notify_all();
             match &mut state.runtime {
                 // Reap the exited direct child instead of dropping it, so it
                 // does not linger as a `<defunct>` zombie (issue #91). The
@@ -5230,10 +6061,14 @@ impl BgTaskRegistry {
                     pty_reader_done = runtime
                         .as_ref()
                         .map(|runtime| Arc::clone(&runtime.reader_done));
-                    *runtime = None;
+                    retired_pty_runtime = runtime.take();
                 }
             }
             state.detached = true;
+        }
+        if let Some(mut runtime) = retired_pty_runtime {
+            close_pty_master(runtime.master.take());
+            drop(runtime);
         }
 
         if let Some(reader_done) = pty_reader_done {
@@ -5460,12 +6295,10 @@ impl BgTaskRegistry {
             );
             return;
         };
-        let harness = self
-            .inner
-            .db_harness
-            .read()
-            .ok()
-            .and_then(|slot| slot.clone());
+        let harness = metadata
+            .harness
+            .clone()
+            .or_else(|| self.fallback_db_harness());
         let Some(harness) = harness else {
             crate::slog_warn!(
                 "compression event insert skipped for {}: harness not configured",
@@ -5632,7 +6465,7 @@ impl BgTaskRegistry {
     }
 
     fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(&frame.session_id) else {
             return;
         };
         let Ok(conn) = pool.lock() else {
@@ -5836,6 +6669,26 @@ impl BgTaskRegistry {
         self.task(task_id).is_none_or(|task| task.is_terminal())
     }
 
+    /// The task a requester started under `call_key`: the `(requester,
+    /// call_key)` pair a consumer uses to recognise its own call. A call that
+    /// came without a key is found under its task id, which stands in for it.
+    pub fn task_id_for_call_key(&self, requester: &str, call_key: &str) -> Option<String> {
+        let tasks: Vec<Arc<BgTask>> = self.inner.tasks.lock().ok()?.values().cloned().collect();
+        tasks.into_iter().find_map(|task| {
+            let state = task.state.lock().ok()?;
+            let recorded = state.metadata.call_key.as_ref()?;
+            (recorded.requester == requester && recorded.key == call_key)
+                .then(|| task.task_id.clone())
+        })
+    }
+
+    /// The requester and call key recorded on a task.
+    pub fn task_call_key(&self, task_id: &str) -> Option<super::TaskCallKey> {
+        let task = self.task(task_id)?;
+        let state = task.state.lock().ok()?;
+        state.metadata.call_key.clone()
+    }
+
     fn task_for_session(&self, task_id: &str, session_id: &str) -> Option<Arc<BgTask>> {
         self.task(task_id)
             .filter(|task| task.session_id == session_id)
@@ -5848,13 +6701,20 @@ impl BgTaskRegistry {
         self.task(task_id)
     }
 
+    /// Health counts without waiting on any registry lock: `None` when the
+    /// task map or completion queue is contended. Per-task state is read with
+    /// a try-lock too, because a kill holds a task's state lock while it
+    /// signals and reaps the process group, which can take seconds. The health
+    /// rollup calls this while it is building a root summary, and waiting here
+    /// once kept that rollup, and the frame loop behind it, stalled for the
+    /// whole kill.
     pub fn try_health_counts(&self) -> Option<BgTaskHealthCounts> {
         let running = self
             .inner
             .tasks
             .try_lock()
             .ok()
-            .map(|tasks| tasks.values().filter(|task| task.is_running()).count())?;
+            .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
         Some(BgTaskHealthCounts {
             running,
@@ -6778,7 +7638,7 @@ struct PersistedGcSlot {
 
 /// Keyed by canonical storage root and aft.db harness: the sweep deletes and
 /// probes rows under its registry's harness.
-type PersistedGcSlots = HashMap<(PathBuf, Option<String>), PersistedGcSlot>;
+type PersistedGcSlots = HashMap<PathBuf, PersistedGcSlot>;
 
 fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
     static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
@@ -7027,12 +7887,26 @@ impl BgTask {
     pub(crate) fn is_running(&self) -> bool {
         self.state
             .lock()
-            .map(|state| {
-                state.metadata.status == BgTaskStatus::Running
-                    || (state.metadata.mode == BgMode::Pty
-                        && state.metadata.status == BgTaskStatus::Killing)
-            })
+            .map(|state| Self::state_is_running(&state))
             .unwrap_or(false)
+    }
+
+    /// [`Self::is_running`] without waiting for the state lock. A contended
+    /// task counts as running: its holder is mid-transition (a kill holds the
+    /// lock while it signals and reaps the process group), and the task has
+    /// not been observed terminal yet.
+    fn try_is_running(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(state) => Self::state_is_running(&state),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        }
+    }
+
+    fn state_is_running(state: &BgTaskState) -> bool {
+        state.metadata.status == BgTaskStatus::Running
+            || (state.metadata.mode == BgMode::Pty
+                && state.metadata.status == BgTaskStatus::Killing)
     }
 
     fn is_terminal(&self) -> bool {
@@ -7040,6 +7914,42 @@ impl BgTask {
             .lock()
             .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false)
+    }
+
+    /// Whether a kill has released the state lock to signal and reap this
+    /// task and has not published its outcome yet.
+    pub(crate) fn kill_in_flight(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.kill_in_flight)
+            .unwrap_or(false)
+    }
+
+    /// Wait, without holding `state`, until a kill on this task has settled
+    /// or the task is terminal, for at most `bound`. Returns at once when no
+    /// kill is under way. A piped kill settles when it publishes its outcome.
+    /// A PTY kill only signals: the PTY's waiter writes the exit marker and
+    /// the watchdog publishes the terminal state from it, so a PTY task
+    /// stays `killing` until then and is waited out the same way.
+    /// Returns whether it waited.
+    fn wait_for_kill_settled(&self, bound: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let unsettled = |state: &mut BgTaskState| {
+            !state.metadata.status.is_terminal()
+                && (state.kill_in_flight
+                    || (state.metadata.mode == BgMode::Pty
+                        && state.metadata.status == BgTaskStatus::Killing))
+        };
+        let mut state = state;
+        if !unsettled(&mut state) {
+            return false;
+        }
+        let _ = self
+            .kill_settled
+            .wait_timeout_while(state, bound, unsettled);
+        true
     }
 
     fn mark_terminal_now(&self) {
@@ -7168,6 +8078,19 @@ fn terminal_metadata_from_marker(
         ),
     }
     metadata
+}
+
+/// Status reason for a task being ended as killed whose exit marker could not
+/// be written. The task still ends: its process group is already gone, and
+/// leaving it in `killing` would mean no completion is ever delivered. The
+/// reason keeps any caller-supplied reason and names the failed write so the
+/// missing marker is visible in `bash_status` and the completion.
+fn kill_marker_failure_reason(reason: Option<&str>, error: &str) -> String {
+    let failure = format!("the exit marker could not be written: {error}");
+    match reason {
+        Some(reason) => format!("{reason}; {failure}"),
+        None => failure,
+    }
 }
 
 fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i32> {
@@ -7979,7 +8902,7 @@ mod tests {
                     session_id.clone(),
                     dir.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     dir.path().to_path_buf(),
                     10,
                     true,
@@ -8557,7 +9480,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -8638,7 +9561,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -8694,7 +9617,7 @@ mod tests {
                 "session".to_string(),
                 root.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -8777,7 +9700,7 @@ mod tests {
                 "session".to_string(),
                 root.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(60)),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -8881,7 +9804,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -8947,7 +9870,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -8981,7 +9904,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9019,7 +9942,7 @@ mod tests {
                     session.to_string(),
                     project.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     storage.path().to_path_buf(),
                     10,
                     false,
@@ -9053,7 +9976,10 @@ mod tests {
         assert_eq!(registry.inner.tasks.lock().unwrap().len(), 3);
         registry.cleanup_finished(Duration::ZERO);
         let tasks = registry.inner.tasks.lock().unwrap();
-        let retained: Vec<&String> = task_ids.iter().filter(|id| tasks.contains_key(*id)).collect();
+        let retained: Vec<&String> = task_ids
+            .iter()
+            .filter(|id| tasks.contains_key(*id))
+            .collect();
         assert!(
             retained.is_empty(),
             "foreground tasks outlived retention: {retained:?}"
@@ -9128,7 +10054,7 @@ mod tests {
                     session.to_string(),
                     project.path().to_path_buf(),
                     HashMap::new(),
-                    Some(Duration::from_secs(30)),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
                     storage.path().to_path_buf(),
                     QUICK_TASKS * 2,
                     false,
@@ -9149,7 +10075,7 @@ mod tests {
                 session.to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 QUICK_TASKS * 2,
                 false,
@@ -9171,13 +10097,7 @@ mod tests {
         task_ids.push(killed);
         task_ids.push(pty);
         for task_id in &task_ids {
-            wait_for_terminal_snapshot(
-                &registry,
-                task_id,
-                session,
-                project.path(),
-                storage.path(),
-            );
+            wait_for_terminal_snapshot(&registry, task_id, session, project.path(), storage.path());
         }
 
         // The watchdog thread may be finishing a transition that a status
@@ -9221,7 +10141,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9397,7 +10317,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9560,7 +10480,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9662,7 +10582,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -9705,7 +10625,10 @@ mod tests {
             .map(|metadata| metadata.status.is_terminal())
             .unwrap_or(false)
         {
-            assert!(Instant::now() < json_by, "finalize never wrote the terminal JSON");
+            assert!(
+                Instant::now() < json_by,
+                "finalize never wrote the terminal JSON"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let state_by = Instant::now() + Duration::from_millis(1_000);
@@ -9748,7 +10671,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -9798,7 +10721,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9863,6 +10786,207 @@ mod tests {
         );
     }
 
+    /// Spawns a long-running piped task in one registry and then drops that
+    /// registry without killing the task, the way a daemon restart does. The
+    /// returned paths and metadata describe the task as it sits on disk: its
+    /// exit file exists (it is created at spawn) and is still empty.
+    #[cfg(unix)]
+    fn spawn_long_running_then_drop_registry(
+        storage: &Path,
+        session: &str,
+    ) -> (String, TaskPaths, PersistedTask) {
+        let original = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let task_id = original
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 60",
+                session.to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(120)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        let task = original.task_for_session(&task_id, session).unwrap();
+        let paths = task.paths.clone();
+        let metadata = task.state.lock().unwrap().metadata.clone();
+        original.detach();
+        assert_eq!(metadata.status, BgTaskStatus::Running);
+        assert_eq!(
+            fs::metadata(&paths.exit).unwrap().len(),
+            0,
+            "precondition: the exit file exists and is empty while the task runs"
+        );
+        (task_id, paths, metadata)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pending_completion(
+        registry: &BgTaskRegistry,
+        session: &str,
+        task_id: &str,
+    ) -> BgCompletion {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(completion) = registry
+                .pending_completions_for_session(session)
+                .into_iter()
+                .find(|completion| completion.task_id == task_id)
+            {
+                return completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no completion was queued for {task_id}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A task restored after a restart has no retained output handles, so its
+    /// kill writes the exit marker by path into the exit file created at spawn,
+    /// which is still empty while the task runs. That write once went through a
+    /// read-only handle and failed with EINVAL, after the process group was
+    /// already terminated, leaving the task in `killing` forever.
+    #[cfg(unix)]
+    #[test]
+    fn kill_of_restored_task_with_empty_exit_file_writes_marker_and_completes() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "restored-kill";
+        let (task_id, paths, _metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        let task = restarted.task_for_session(&task_id, session).unwrap();
+        {
+            let state = task.state.lock().unwrap();
+            assert_eq!(state.metadata.status, BgTaskStatus::Running);
+            assert!(
+                state.io_handles.is_none(),
+                "precondition: a restored task has no retained output handles"
+            );
+        }
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("kill of a restored task must succeed");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(snapshot.info.status_reason, None);
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// A task left in `killing` by a kill whose marker write failed (its
+    /// process group already gone) must end terminal on the next `bash_kill`.
+    #[cfg(unix)]
+    #[test]
+    fn repeat_kill_recovers_task_stuck_in_killing_with_empty_exit_file() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "stuck-killing-repeat";
+        let (task_id, paths, metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+        let pgid = metadata.pgid.expect("piped task records its process group");
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        let task = restarted.task_for_session(&task_id, session).unwrap();
+        // Reproduce the state the failed kill left behind: the process group
+        // is gone, the exit file is still empty, and the status is `killing`.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Killing;
+            write_task(&paths.json, &state.metadata).unwrap();
+        }
+        assert_eq!(fs::metadata(&paths.exit).unwrap().len(), 0);
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("a repeat kill must finish a task stuck in killing");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// A task persisted in `killing` with an empty exit file (the on-disk
+    /// shape a failed kill left behind) is finished by the next restore.
+    #[cfg(unix)]
+    #[test]
+    fn replay_recovers_task_stuck_in_killing_with_empty_exit_file() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "stuck-killing-replay";
+        let (task_id, paths, mut metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+        let pgid = metadata.pgid.expect("piped task records its process group");
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+        metadata.status = BgTaskStatus::Killing;
+        write_task(&paths.json, &metadata).unwrap();
+        assert_eq!(fs::metadata(&paths.exit).unwrap().len(), 0);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+
+        let persisted = read_task(&paths.json).unwrap();
+        assert_eq!(persisted.status, BgTaskStatus::Killed);
+        assert_eq!(
+            persisted.status_reason.as_deref(),
+            Some("recovered from inconsistent killing state on replay")
+        );
+        assert_eq!(fs::read_to_string(&paths.exit).unwrap(), "killed");
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
+    /// When the process group has been terminated but the exit marker cannot
+    /// be written, the kill still ends the task, and the status reason names
+    /// the failed write instead of leaving the task in `killing`.
+    #[cfg(unix)]
+    #[test]
+    fn kill_whose_marker_write_fails_ends_task_with_reason_naming_the_failure() {
+        let storage = tempfile::tempdir().unwrap();
+        let session = "marker-write-fails";
+        let (task_id, paths, _metadata) =
+            spawn_long_running_then_drop_registry(storage.path(), session);
+
+        let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        restarted.replay_session(storage.path(), session).unwrap();
+        // A second hard link raises the exit file's link count above one,
+        // which artifact validation refuses as possible tampering, so the
+        // marker write fails however it is attempted.
+        fs::hard_link(&paths.exit, storage.path().join("exit-alias")).unwrap();
+
+        let snapshot = restarted
+            .kill(&task_id, session)
+            .expect("a kill that terminated the process group must not fail");
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        let reason = snapshot.info.status_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("exit marker") && reason.contains("multiple hard links"),
+            "status reason must name the failed marker write: {reason:?}"
+        );
+        let persisted = read_task(&paths.json).unwrap();
+        assert_eq!(persisted.status, BgTaskStatus::Killed);
+        assert_eq!(persisted.status_reason.as_deref(), Some(reason.as_str()));
+        let completion = wait_for_pending_completion(&restarted, session, &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Killed);
+    }
+
     #[test]
     fn cleanup_finished_keeps_running_tasks() {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
@@ -9874,7 +10998,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 true,
@@ -9887,6 +11011,370 @@ mod tests {
 
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
         let _ = registry.kill(&task_id, "session");
+    }
+
+    /// A kill holds the task's state lock while it signals and reaps the
+    /// process group, which can take seconds. The health rollup reads these
+    /// counts while holding root-level locks that the frame loop also reads,
+    /// so the counts must not wait for a task's state lock.
+    #[test]
+    fn try_health_counts_does_not_wait_for_a_held_task_state_lock() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _state = task.state.lock().expect("task state");
+            held_tx.send(()).expect("held signal");
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("holder took the task state lock");
+
+        // Count on another thread so a count that waits shows up as a missed
+        // deadline rather than hanging the test.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let counting_registry = registry.clone();
+        let counter = std::thread::spawn(move || {
+            let _ = done_tx.send(counting_registry.try_health_counts());
+        });
+        let counts = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release signal");
+        holder.join().expect("holder thread");
+        counter.join().expect("counter thread");
+
+        let counts = counts
+            .expect("try_health_counts waited for a held task state lock")
+            .expect("the task map and completion queue are uncontended");
+        assert_eq!(
+            counts.running, 1,
+            "a task whose state is held has not been observed terminal"
+        );
+        let _ = registry.kill(&task_id, "session");
+    }
+
+    #[cfg(unix)]
+    fn spawn_unsandboxed_for_kill_test(
+        registry: &BgTaskRegistry,
+        dir: &Path,
+        command: &str,
+    ) -> String {
+        registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                command,
+                "session".to_string(),
+                dir.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.to_path_buf()),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn completions_for(registry: &BgTaskRegistry, task_id: &str) -> Vec<BgCompletion> {
+        registry
+            .pending_completions_for_session("session")
+            .into_iter()
+            .filter(|completion| completion.task_id == task_id)
+            .collect()
+    }
+
+    /// A kill must not hold the task's state lock while it signals and waits
+    /// for the process group: status readers see `Killing` while the signal
+    /// is in flight, then exactly one terminal state and one completion.
+    #[cfg(unix)]
+    #[test]
+    fn kill_publishes_killing_and_releases_the_state_lock_while_signaling() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        // The kill is now about to signal and wait. Its state lock must be
+        // free, with the task already published as Killing.
+        let status_while_signaling = task
+            .state
+            .try_lock()
+            .map(|state| state.metadata.status.clone())
+            .ok();
+        release.send(()).expect("release the kill");
+        let snapshot = killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+        assert_eq!(
+            status_while_signaling,
+            Some(BgTaskStatus::Killing),
+            "the state lock must be free and show Killing while the kill signals"
+        );
+
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Killed
+        );
+        wait_for_pending_completion(&registry, "session", &task_id);
+        std::thread::sleep(Duration::from_millis(300));
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1, "exactly one completion");
+        assert_eq!(completions[0].status, BgTaskStatus::Killed);
+    }
+
+    /// `bash_status` answers with a settled status: during a kill held in
+    /// flight by the test gate it waits for the kill's outcome instead of
+    /// answering `killing`, and with no kill in flight it does not wait.
+    #[cfg(unix)]
+    #[test]
+    fn status_settled_waits_out_an_in_flight_kill_and_only_then() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+
+        let idle_started = Instant::now();
+        let idle = registry
+            .status_settled(&task_id, "session", None, None, 0)
+            .expect("status without a kill");
+        assert_eq!(idle.info.status, BgTaskStatus::Running);
+        assert!(
+            idle_started.elapsed() < KILL_IN_FLIGHT_WAIT / 2,
+            "no kill in flight, so no wait: {:?}",
+            idle_started.elapsed()
+        );
+
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let status_registry = registry.clone();
+        let status_task_id = task_id.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = done_tx.send(status_registry.status_settled(
+                &status_task_id,
+                "session",
+                None,
+                None,
+                0,
+            ));
+        });
+        let answered_early = done_rx.recv_timeout(Duration::from_millis(300)).ok();
+        release.send(()).expect("release the kill");
+        let snapshot = match answered_early {
+            Some(snapshot) => snapshot,
+            None => done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("status answered once the kill settled"),
+        }
+        .expect("task status");
+        killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+        reader.join().expect("status thread");
+        assert_eq!(
+            snapshot.info.status,
+            BgTaskStatus::Killed,
+            "a status taken while the kill is in flight answers with its outcome"
+        );
+    }
+
+    /// A PTY task whose child has exited while its reader is still draining
+    /// output is completed by the reader's wake, not by a periodic watchdog
+    /// pass that happens to land first. The reader is held at end-of-file by a
+    /// test gate across at least one periodic pass.
+    #[cfg(unix)]
+    #[test]
+    fn exited_pty_is_completed_by_the_reader_wake_not_a_periodic_pass() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done; printf done'",
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let release_reader = super::super::pty_process::install_pty_reader_gate_for_test(&task_id);
+        fs::write(dir.path().join("ready"), "").unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !registry.pty_exit_awaiting_reader(&task) {
+            assert!(
+                Instant::now() < deadline,
+                "the child never exited with its reader held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Periodic passes run every 500 ms, so at least one sees the exited
+        // task while its reader is held.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            registry.completion_pass_cause(&task_id),
+            None,
+            "a periodic pass completed the task before its reader finished"
+        );
+        assert!(!task.is_terminal());
+
+        release_reader.send(()).expect("release the reader");
+        let completion = wait_for_pending_completion(&registry, "session", &task_id);
+        assert_eq!(completion.status, BgTaskStatus::Completed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while registry.completion_pass_cause(&task_id).is_none() {
+            assert!(Instant::now() < deadline, "no pass recorded the completion");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            registry.completion_pass_cause(&task_id),
+            Some(WatchdogPassCause::Wake)
+        );
+    }
+
+    /// A killed PTY's outcome is decided, so the watchdog never leaves it to
+    /// the reader's wake: on Windows that reader may not reach end-of-file
+    /// until the task is finalized. The reader is held at end-of-file here.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_pty_is_not_left_to_the_reader_wake() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "/bin/sh -c 'while [ ! -f ready ]; do sleep 0.01; done'",
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let release_reader = super::super::pty_process::install_pty_reader_gate_for_test(&task_id);
+        fs::write(dir.path().join("ready"), "").unwrap();
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !registry.pty_exit_awaiting_reader(&task) {
+            assert!(
+                Instant::now() < deadline,
+                "the child never exited with its reader held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Set the flag a kill sets on a PTY before it signals the process
+        // group, as if this exited task had been killed.
+        if let TaskRuntime::Pty(Some(pty)) = &task.state.lock().unwrap().runtime {
+            pty.was_killed.store(true, Ordering::SeqCst);
+        }
+        assert!(
+            !registry.pty_exit_awaiting_reader(&task),
+            "a killed PTY must not wait for its reader's wake"
+        );
+        release_reader.send(()).expect("release the reader");
+    }
+
+    /// A task can finish on its own while a kill is in flight. If its own
+    /// terminal state is published first (the watchdog reads its exit
+    /// marker), the kill must not overwrite it, and only one completion is
+    /// queued.
+    #[cfg(unix)]
+    #[test]
+    fn kill_keeps_a_terminal_state_published_while_its_signal_was_in_flight() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = spawn_unsandboxed_for_kill_test(&registry, dir.path(), LONG_RUNNING_COMMAND);
+        let task = registry.task_for_test(&task_id).expect("registered task");
+        let (reached, release) = install_kill_signal_gate_for_test(&task_id);
+
+        let killer_registry = registry.clone();
+        let killer_task_id = task_id.clone();
+        let killer = std::thread::spawn(move || killer_registry.kill(&killer_task_id, "session"));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("kill reached its signal step");
+
+        // The task's own exit lands while the kill is in flight, and the
+        // watchdog's poll publishes it first.
+        fs::write(&task.paths.exit, "0").expect("write natural exit marker");
+        registry
+            .poll_task(&task)
+            .expect("watchdog poll publishes the natural exit");
+        assert_eq!(
+            task.state.lock().unwrap().metadata.status,
+            BgTaskStatus::Completed
+        );
+
+        release.send(()).expect("release the kill");
+        let snapshot = killer
+            .join()
+            .expect("killer thread")
+            .expect("kill succeeds");
+
+        assert_eq!(
+            snapshot.info.status,
+            BgTaskStatus::Completed,
+            "the first terminal state stands"
+        );
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Completed
+        );
+        wait_for_pending_completion(&registry, "session", &task_id);
+        std::thread::sleep(Duration::from_millis(300));
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1, "exactly one completion");
+        assert_eq!(completions[0].status, BgTaskStatus::Completed);
     }
 
     #[cfg(unix)]
@@ -9937,7 +11425,7 @@ mod tests {
                 "sandbox-rehydrate".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10031,7 +11519,7 @@ mod tests {
                 "session".to_string(),
                 dir.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
                 false,
@@ -10188,6 +11676,442 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn spawn_long_running_task(
+        registry: &BgTaskRegistry,
+        session: &str,
+        storage: &Path,
+        project: &Path,
+    ) -> String {
+        registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 30",
+                session.to_string(),
+                project.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.to_path_buf()),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn task_row_exists(
+        db: &Arc<Mutex<TrackedConnection>>,
+        harness: &str,
+        session: &str,
+        task_id: &str,
+    ) -> bool {
+        let conn = db.lock().unwrap();
+        crate::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
+            .unwrap()
+            .is_some()
+    }
+
+    #[cfg(unix)]
+    fn watch_row_exists(
+        db: &Arc<Mutex<TrackedConnection>>,
+        harness: &str,
+        session: &str,
+        task_id: &str,
+        watch_id: &str,
+    ) -> bool {
+        let conn = db.lock().unwrap();
+        crate::db::bash_watches::get_bash_pattern_watch(&conn, harness, session, task_id, watch_id)
+            .unwrap()
+            .is_some()
+    }
+
+    /// One project root is shared by routes from several harnesses, and each
+    /// configure replaces the registry's harness. A task keeps the harness of
+    /// the route that started it, so its watch rows and its erased-row check
+    /// must use that harness, not whichever harness configured the root last.
+    #[cfg(unix)]
+    #[test]
+    fn watch_rows_and_erased_check_use_the_harness_that_spawned_the_task() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-harness-switch";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        assert!(task_row_exists(&db, "opencode", session, &task_id));
+
+        // A route from a second harness configures the same root.
+        registry.set_harness(Harness::Runner);
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            watch_row_exists(&db, "opencode", session, &task_id, &watch_id),
+            "the watch row must be keyed under the task's own harness"
+        );
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        assert_eq!(registry.active_watch_count(&task_id), 1);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// A task spawned before the registry had its aft.db handle has no row.
+    /// Installing the handle writes rows for running tasks, and arming a
+    /// watch writes a still-missing row first, so the watch row's foreign key
+    /// holds and the task is not reported erased.
+    #[cfg(unix)]
+    #[test]
+    fn watch_on_task_spawned_before_db_attach_writes_the_missing_task_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        registry.set_harness(Harness::Opencode);
+        let session = "ses-late-db";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).expect("open test DB"),
+        ));
+        registry.set_db_pool(Arc::clone(&db));
+        assert!(
+            task_row_exists(&db, "opencode", session, &task_id),
+            "installing the aft.db handle must write rows for running tasks"
+        );
+        {
+            let conn = db.lock().unwrap();
+            crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id).unwrap();
+        }
+
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+
+        assert!(
+            task_row_exists(&db, "opencode", session, &task_id),
+            "arming a watch must write the task's missing row"
+        );
+        assert!(watch_row_exists(
+            &db, "opencode", session, &task_id, &watch_id
+        ));
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// A row deleted under a running, watched task is written again from the
+    /// in-memory task, together with its watch rows; the task stays running
+    /// and its watch stays armed.
+    #[cfg(unix)]
+    #[test]
+    fn erased_row_under_a_running_task_is_rewritten_not_tombstoned() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-erased-live";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        let watch_id = registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            assert_eq!(
+                crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id)
+                    .unwrap(),
+                1
+            );
+        }
+
+        assert!(
+            !registry.has_erased_watch_reference(&task_id),
+            "a running task was reported erased"
+        );
+        assert!(task_row_exists(&db, "opencode", session, &task_id));
+        assert!(watch_row_exists(
+            &db, "opencode", session, &task_id, &watch_id
+        ));
+        assert_eq!(registry.active_watch_count(&task_id), 1);
+        assert!(
+            frames.lock().unwrap().iter().all(|frame| !matches!(
+                frame,
+                PushFrame::BashPatternMatch(frame) if frame.task_id == task_id
+            )),
+            "no watch frame may fire for a running task whose row was rewritten"
+        );
+        let snapshot = registry
+            .status(&task_id, session, None, None, 0)
+            .expect("running task stays addressable");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// With no process left and no row, a watched task is still reported
+    /// erased: that is the one case where the tombstone is true.
+    #[cfg(unix)]
+    #[test]
+    fn erased_row_under_an_ended_task_still_tombstones_its_watch() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-erased-ended";
+        let task_id = spawn_long_running_task(&registry, session, storage.path(), project.path());
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        registry
+            .kill_with_status(&task_id, session, BgTaskStatus::Killed)
+            .unwrap();
+        // Killing a task retires its watches, so arm one on the ended task
+        // directly: the state a watch is left in when its task ends while
+        // the row is gone.
+        registry
+            .inner
+            .watch_registry
+            .lock()
+            .unwrap()
+            .register(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                false,
+            )
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            crate::db::bash_tasks::delete_bash_task(&conn, "opencode", session, &task_id).unwrap();
+        }
+
+        assert!(registry.has_erased_watch_reference(&task_id));
+        assert!(!task_row_exists(&db, "opencode", session, &task_id));
+        registry.detach();
+    }
+
+    #[cfg(unix)]
+    fn mark_watches_pending(db: &Arc<Mutex<TrackedConnection>>, task_id: &str) {
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE bash_pattern_watches
+                 SET pending_match = 1, match_text = 'hit', match_offset = 0
+                 WHERE task_id = ?1",
+                [task_id],
+            )
+            .unwrap();
+    }
+
+    /// Root-wide wake bookkeeping must count pending watch matches of every
+    /// harness that has run tasks on the root, not only of the harness that
+    /// configured it last.
+    #[cfg(unix)]
+    #[test]
+    fn pending_wake_keys_and_counts_cover_every_harness_on_the_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let opencode_task =
+            spawn_long_running_task(&registry, "ses-oc", storage.path(), project.path());
+        let opencode_watch = registry
+            .register_watch(
+                opencode_task.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        registry.set_harness(Harness::Runner);
+        let runner_task =
+            spawn_long_running_task(&registry, "ses-runner", storage.path(), project.path());
+        let runner_watch = registry
+            .register_watch(
+                runner_task.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        assert!(task_row_exists(&db, "runner", "ses-runner", &runner_task));
+        mark_watches_pending(&db, &opencode_task);
+        mark_watches_pending(&db, &runner_task);
+
+        let keys = registry.unacked_wake_keys();
+        for (session, task_id, watch_id) in [
+            ("ses-oc", &opencode_task, &opencode_watch),
+            ("ses-runner", &runner_task, &runner_watch),
+        ] {
+            assert!(
+                keys.contains(&format!("match\0{session}\0{task_id}\0{watch_id}")),
+                "pending match of {session} missing from wake keys: {keys:?}"
+            );
+        }
+        assert_eq!(registry.unacked_wake_count_for_session(None), 2);
+        for (task_id, session) in [(&opencode_task, "ses-oc"), (&runner_task, "ses-runner")] {
+            registry
+                .kill_with_status(task_id, session, BgTaskStatus::Killed)
+                .unwrap();
+        }
+        registry.detach();
+    }
+
+    /// The persisted-task GC and replay refuse to quarantine a layout whose
+    /// task has a live recorded process. That check must find the row under
+    /// whichever harness started the task.
+    #[cfg(unix)]
+    #[test]
+    fn recorded_live_process_lookup_covers_every_harness() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, _db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = spawn_long_running_task(&registry, "ses-oc", storage.path(), project.path());
+        registry.set_harness(Harness::Runner);
+
+        assert!(registry.db_has_live_process_for_task(&task_id));
+        assert!(registry
+            .db_live_process_task_ids(std::slice::from_ref(&task_id))
+            .contains(&task_id));
+        registry
+            .kill_with_status(&task_id, "ses-oc", BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+    }
+
+    /// An orphaned watch row (its task row is gone and its session has no
+    /// route here) is retired whichever harness it was written under.
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_watch_retirement_covers_every_harness() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        // Another root's registry owns the task, so this one holds no copy.
+        let owner = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        owner.set_harness(Harness::Opencode);
+        owner.set_db_pool(Arc::clone(&db));
+        let task_id = spawn_long_running_task(&owner, "ses-owner", storage.path(), project.path());
+        let watch_id = owner
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        owner
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let conn = db.lock().unwrap();
+            conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+            crate::db::bash_tasks::delete_bash_task(&conn, "opencode", "ses-owner", &task_id)
+                .unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        }
+        assert!(watch_row_exists(
+            &db,
+            "opencode",
+            "ses-owner",
+            &task_id,
+            &watch_id
+        ));
+
+        registry.set_harness(Harness::Runner);
+        registry
+            .retire_orphaned_watch_tombstones("ses-binding")
+            .unwrap();
+
+        assert!(
+            !watch_row_exists(&db, "opencode", "ses-owner", &task_id, &watch_id),
+            "the orphaned opencode watch row survived retirement"
+        );
+        owner
+            .kill_with_status(&task_id, "ses-owner", BgTaskStatus::Killed)
+            .unwrap();
+        owner.detach();
+        registry.detach();
+    }
+
+    /// The per-session harness map forgets a session once the registry no
+    /// longer holds any of its tasks.
+    #[cfg(unix)]
+    #[test]
+    fn session_harness_map_forgets_sessions_whose_tasks_are_removed() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        registry.set_harness(Harness::Opencode);
+        let spawn_undelivered = |session: &str| {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    "sleep 30",
+                    session.to_string(),
+                    project.path().to_path_buf(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                    storage.path().to_path_buf(),
+                    10,
+                    false,
+                    false,
+                    Some(project.path().to_path_buf()),
+                )
+                .unwrap()
+        };
+        let finished = spawn_undelivered("ses-finished");
+        let running = spawn_undelivered("ses-running");
+        let sessions = |registry: &BgTaskRegistry| {
+            let mut sessions = registry
+                .inner
+                .session_harnesses
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            sessions.sort();
+            sessions
+        };
+        assert_eq!(sessions(&registry), ["ses-finished", "ses-running"]);
+
+        registry
+            .kill_with_status(&finished, "ses-finished", BgTaskStatus::Killed)
+            .unwrap();
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(
+            registry.task(&finished).is_none(),
+            "finished task was not removed"
+        );
+        assert_eq!(sessions(&registry), ["ses-running"]);
+
+        registry
+            .kill_with_status(&running, "ses-running", BgTaskStatus::Killed)
+            .unwrap();
+        registry.detach();
+        assert!(sessions(&registry).is_empty());
+    }
+
+    #[cfg(unix)]
     fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut pending = vec![root.to_path_buf()];
@@ -10236,7 +12160,7 @@ mod tests {
                 session.to_string(),
                 project.path().to_path_buf(),
                 env,
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10255,13 +12179,7 @@ mod tests {
             "a running task's ticket redeems to its own session"
         );
 
-        wait_for_terminal_snapshot(
-            &registry,
-            &task_id,
-            session,
-            project.path(),
-            storage.path(),
-        );
+        wait_for_terminal_snapshot(&registry, &task_id, session, project.path(), storage.path());
         assert_eq!(
             crate::gh_shim_ticket::redeem(&ticket),
             None,
@@ -10391,6 +12309,59 @@ mod tests {
         );
     }
 
+    /// Task metadata written by a newer build is refused by name. Neither
+    /// replay nor GC moves it to the invalid-task quarantine: it stays under
+    /// its original path, byte for byte.
+    #[test]
+    fn replay_and_gc_leave_future_schema_task_metadata_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let registry = BgTaskRegistry::default();
+        let session_dir = session_tasks_dir(storage, "session");
+        let task_id = "bash-0000000000000401";
+        let control = session_dir.join(task_id).join("control");
+        fs::create_dir_all(&control).unwrap();
+        let metadata_path = control.join("metadata.json");
+        let metadata = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 99,
+            "task_id": task_id,
+            "shape": "written-by-a-newer-build",
+        }))
+        .unwrap();
+        fs::write(&metadata_path, &metadata).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60 * 60);
+        for path in [&metadata_path, &control, &session_dir.join(task_id)] {
+            filetime::set_file_mtime(path, filetime::FileTime::from_system_time(old)).unwrap();
+        }
+
+        let _ = registry.replay_session(storage, "session");
+        let _ = registry.maybe_gc_persisted(storage);
+
+        assert_eq!(
+            fs::read(&metadata_path).unwrap(),
+            metadata,
+            "metadata changed or moved"
+        );
+        let quarantined = fs::read_dir(storage.join("bash-tasks-quarantine"))
+            .map(|sessions| {
+                sessions
+                    .flatten()
+                    .map(|session| fs::read_dir(session.path()).map_or(0, |e| e.count()))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        assert_eq!(quarantined, 0, "a newer task was quarantined as invalid");
+        let refusal = crate::persisted_format::refusal_covering(
+            crate::persisted_format::PersistedStore::BashTask,
+            &metadata_path,
+        )
+        .expect("refusal recorded for the status surface");
+        assert_eq!(refusal.found, 99);
+        assert!(refusal
+            .to_string()
+            .starts_with(crate::persisted_format::CODE));
+    }
+
     #[test]
     fn pending_pattern_match_is_returned_by_drain_contract_until_ack() {
         let storage = tempfile::tempdir().unwrap();
@@ -10483,7 +12454,7 @@ mod tests {
                 "session-a".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10506,7 +12477,7 @@ mod tests {
                 "session-a".to_string(),
                 project.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10666,7 +12637,7 @@ mod tests {
                 "session".to_string(),
                 storage.path().to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
                 10,
                 true,
@@ -10675,13 +12646,21 @@ mod tests {
             )
             .unwrap();
         let row = |db: &Mutex<TrackedConnection>| {
-            crate::db::bash_tasks::get_bash_task(&db.lock().unwrap(), "opencode", "session", &task_id)
-                .unwrap()
-                .expect("bash_tasks row")
+            crate::db::bash_tasks::get_bash_task(
+                &db.lock().unwrap(),
+                "opencode",
+                "session",
+                &task_id,
+            )
+            .unwrap()
+            .expect("bash_tasks row")
         };
         let terminal_by = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
         while row(&db).status != "completed" {
-            assert!(Instant::now() < terminal_by, "task row never reached completed");
+            assert!(
+                Instant::now() < terminal_by,
+                "task row never reached completed"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!row(&db).completion_delivered);
@@ -10810,7 +12789,10 @@ mod tests {
             .iter()
             .any(|registry| registry.persisted_gc_thread().is_none())
         {
-            assert!(Instant::now() < deadline, "a replay's persisted GC never finished");
+            assert!(
+                Instant::now() < deadline,
+                "a replay's persisted GC never finished"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -10855,7 +12837,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -10905,6 +12887,112 @@ mod tests {
     }
 
     #[test]
+    fn noisy_watch_scan_is_bounded_and_other_task_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let spawn = || {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    LONG_RUNNING_COMMAND,
+                    "session".to_string(),
+                    storage.to_path_buf(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    storage.to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(storage.to_path_buf()),
+                )
+                .unwrap()
+        };
+        let noisy = spawn();
+        let other = spawn();
+        registry
+            .register_watch(
+                noisy.clone(),
+                WatchPattern::Substring("CROSS-CHUNK".into()),
+                true,
+            )
+            .unwrap();
+        registry
+            .register_watch(other.clone(), WatchPattern::Substring("READY".into()), true)
+            .unwrap();
+        let noisy_task = registry.task_for_session(&noisy, "session").unwrap();
+        let other_task = registry.task_for_session(&other, "session").unwrap();
+        let mut burst = vec![b'x'; 64 * 1024 - 5];
+        burst.extend_from_slice(b"CROSS-CHUNK");
+        burst.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&noisy_task.paths.stdout)
+            .unwrap()
+            .write_all(&burst)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&other_task.paths.stdout)
+            .unwrap()
+            .write_all(b"READY")
+            .unwrap();
+        registry.scan_task_watch_output(&noisy_task);
+        let first = registry.watch_stream_cursors(&noisy).0;
+        assert_eq!(
+            first,
+            64 * 1024,
+            "one running tick must not consume the whole burst"
+        );
+        registry.scan_task_watch_output(&other_task);
+        registry.scan_task_watch_output(&noisy_task);
+        let hits = pattern_match_frames(&frames);
+        assert!(hits
+            .iter()
+            .any(|hit| hit.task_id == other && hit.match_text == "READY"));
+        assert!(hits
+            .iter()
+            .any(|hit| hit.task_id == noisy && hit.match_text == "CROSS-CHUNK"));
+    }
+
+    #[test]
+    fn idle_watched_task_does_not_write_unchanged_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, db, _) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("NEVER".into()),
+                true,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let before = db.lock().unwrap().total_changes();
+        for _ in 0..8 {
+            registry.scan_task_watch_output(&task);
+        }
+        let after = db.lock().unwrap().total_changes();
+        assert_eq!(after - before, 0, "idle ticks updated watch rows");
+    }
+
+    #[test]
     fn pattern_watch_gap_match_between_teardown_and_rehydrate_delivers_once() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
@@ -10916,7 +13004,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,
@@ -10981,7 +13069,7 @@ mod tests {
                 "session".to_string(),
                 storage.to_path_buf(),
                 HashMap::new(),
-                Some(Duration::from_secs(30)),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.to_path_buf(),
                 10,
                 true,

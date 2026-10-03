@@ -8,6 +8,29 @@
 # the SIGNED bytes, and the card's name carries the same hash so a stale
 # sidecar can never be matched to a fresh card by a glob readback.
 #
+# On macOS the card is signed here, once, with the pinned identifier ck-aft,
+# hardened runtime and scripts/ck-aft.entitlements.plist (only
+# com.apple.security.cs.disable-library-validation; never get-task-allow).
+# The signature is read back from the card and the card is refused unless it
+# matches, and the signed card must actually load ONNX Runtime (the code path
+# the exception exists for) before it is staged. --skip-build cards cut from
+# a release download go through the same signing and checks.
+#
+# Before the card is staged, it must be able to read the live storage root:
+# scripts/lib/storage-floor-check.sh asks the card for its on-disk formats
+# (`aft --formats`) and refuses it when any store is below the root's reader
+# floor (<storage root>/reader-floor.json), when the card cannot report its
+# formats, or when the floor cannot be read. This holds for --skip-build cards
+# too, so a rollback image goes through the same gate. CK_AFT_STORAGE_DIR
+# names the storage root when it is not the default one.
+#
+# Placement never re-signs: re-signing would drop hardened runtime or the
+# entitlement unless repeated exactly, and would change the bytes the sidecar
+# vouches for. Manual placement is a plain copy of the staged card, then a
+# check of the file actually placed:
+#   rm -f "$DEPLOY" && cp "$STAGING/$CARD" "$DEPLOY"
+#   scripts/verify-placed-card.sh "$DEPLOY"
+#
 # Usage: scripts/stage-card.sh [--skip-build] [discriminator ...]
 #   discriminator  a string that must be present in the new card and
 #                  absent from the running daemon image; each one is
@@ -17,6 +40,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=lib/ck-aft-signature.sh
+source "$REPO_ROOT/scripts/lib/ck-aft-signature.sh"
+# shellcheck source=lib/storage-floor-check.sh
+source "$REPO_ROOT/scripts/lib/storage-floor-check.sh"
 
 STAGING="${CK_STAGING_DIR:-$HOME/.local/share/cortexkit/staging}"
 DEPLOY="${CK_DEPLOY_PATH:-$HOME/.local/share/cortexkit/bin/ck-aft}"
@@ -76,6 +103,18 @@ if [ "$SKIP_BUILD" -eq 0 ] && [ "$(stat -f %m "$BIN")" -lt "$BUILD_START" ]; the
   echo "stage-card: $BIN predates this build invocation; refusing to stage a stale binary" >&2
   exit 2
 fi
+# The release profile keeps debug info in the dSYM, so a card must carry no
+# debug map. Entries here mean the toolchain's debug-info pass failed and the
+# build carried on silently (a compiler wrapper that dropped the linker's
+# library path did exactly that across the fleet on 2026-10-02), and the card
+# would embed this machine's build paths.
+if [ "$(uname -s)" = "Darwin" ]; then
+  DEBUG_MAP_ENTRIES="$(nm -a "$BIN" 2>/dev/null | awk '$2 == "-"' | wc -l | tr -d ' ')"
+  if [ "${DEBUG_MAP_ENTRIES:-0}" -ne 0 ]; then
+    echo "stage-card: $BIN carries $DEBUG_MAP_ENTRIES debug-map entries; refusing to stage an unstripped card" >&2
+    exit 2
+  fi
+fi
 
 mkdir -p "$STAGING"
 TMP="$(mktemp "$STAGING/ck-aft.tmp.XXXXXX")"
@@ -84,8 +123,21 @@ chmod 755 "$TMP"
 if [ "$(uname -s)" = "Darwin" ]; then
   # The identifier is pinned to the deploy name so macOS grants keyed on it
   # survive across cards; the default identifier derives from content.
-  codesign --force --sign - --identifier ck-aft "$TMP"
-  codesign --verify --strict "$TMP"
+  echo "==> signing ($CK_AFT_IDENTIFIER, hardened runtime, $(basename "$CK_AFT_ENTITLEMENTS"))"
+  if ! ck_aft_sign "$TMP"; then
+    rm -f "$TMP"
+    echo "stage-card: signing failed: codesign rejected $CK_AFT_ENTITLEMENTS or the binary" >&2
+    exit 2
+  fi
+  if ! ck_aft_check_signature "$TMP" stage-card; then
+    rm -f "$TMP"
+    exit 2
+  fi
+  echo "==> smoke: ONNX Runtime load under the signed card"
+  if ! ck_aft_smoke_onnx "$TMP" stage-card; then
+    rm -f "$TMP"
+    exit 2
+  fi
 
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
@@ -112,6 +164,15 @@ if [ "$(uname -s)" = "Darwin" ]; then
   rm -rf "$DSYM_DEST"
   mv "$DSYM_TMP" "$DSYM_DEST"
   echo "    dSYM: $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
+fi
+# The storage-floor check runs on the signed temporary binary, the exact bytes
+# that would be staged, before the card is moved into staging or recorded in
+# ck-aft.current.
+STORAGE_ROOT="$(ck_aft_default_storage_root)"
+echo "==> storage floor: $STORAGE_ROOT"
+if ! ck_aft_check_storage_floor "$TMP" "$STORAGE_ROOT"; then
+  rm -f "$TMP"
+  exit 2
 fi
 HASH="$(shasum -a 256 "$TMP" | awk '{print $1}')"
 CARD="ck-aft.${HASH:0:16}"

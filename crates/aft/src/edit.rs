@@ -107,7 +107,16 @@ pub fn replace_byte_range(
 /// Returns `Ok(Some(true))` if syntax is valid, `Ok(Some(false))` if there are
 /// parse errors, and `Ok(None)` if the language is unsupported.
 pub fn validate_syntax(path: &Path) -> Result<Option<bool>, AftError> {
-    let mut parser = FileParser::new();
+    validate_syntax_with_parser(&mut FileParser::new(), path)
+}
+
+/// [`validate_syntax`] through a caller-owned parser. The parsed tree stays in
+/// that parser's tree cache, so a caller that extracts symbols from the same
+/// file next reuses it instead of parsing the file a second time.
+pub fn validate_syntax_with_parser(
+    parser: &mut FileParser,
+    path: &Path,
+) -> Result<Option<bool>, AftError> {
     match parser.parse(path) {
         Ok((tree, _lang)) => Ok(Some(!tree.root_node().has_error())),
         Err(AftError::InvalidRequest { .. }) => {
@@ -198,6 +207,20 @@ pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
     )
 }
 
+/// Reject an identity edit before writing or recording undo state.
+pub fn no_change_response(id: &str) -> crate::protocol::Response {
+    crate::protocol::Response::error(
+        id,
+        "no_change",
+        "No change: the replacement is identical to the existing text.",
+    )
+}
+
+/// Supply the unified patch consumed by host diff views, independently of diff counts.
+pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
+    result["metadata"] = serde_json::json!({ "diff": build_unified_diff(file, before, after) });
+}
+
 /// Attach the standard preview diff fields to a command response payload.
 pub fn attach_preview_diff(
     result: &mut serde_json::Value,
@@ -206,6 +229,7 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
+    attach_mutation_diff(result, file, before, after);
     result["preview"] = serde_json::json!(true);
     result["diff"] = compute_diff_for_response(params, before, after);
     result["preview_diff"] = serde_json::json!(build_unified_diff(file, before, after));
@@ -622,6 +646,7 @@ pub fn write_format_validate(
         None
     };
 
+    let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
     std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
         message: format!("failed to write file: {}", e),

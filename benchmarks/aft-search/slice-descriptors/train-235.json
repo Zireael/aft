@@ -1,0 +1,18 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "bash-cap-line-counts",
+    "rust-use-list-module-keys",
+    "filtered-grep-glob-scope",
+    "directory-read-windows",
+    "scoped-inspect-startup",
+    "gh-shim-run-cancel-v15",
+    "live-config-reload"
+  ],
+  "note": "Fence files touched: crates/aft/src/lib.rs, crates/aft/src/search_index.rs, crates/aft/src/subc_tool_schemas.json. search_index.rs corrects filtered grep/glob scope reporting, lib.rs registers live config reload, and subc_tool_schemas.json documents directory windows. No search ranking change is intended; candidate scoring, lane selection and fusion are unchanged."
+}

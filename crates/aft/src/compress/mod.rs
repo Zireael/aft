@@ -27,6 +27,7 @@ pub mod find;
 pub mod generic;
 pub mod git;
 pub mod go;
+pub mod line_cut;
 pub mod listing_fold;
 pub mod ls;
 pub mod mypy;
@@ -531,7 +532,7 @@ fn failure_preserving_result(
     if missing.is_empty() {
         result
     } else {
-        append_missing_failure_lines(result, &missing)
+        append_missing_failure_lines(result, stripped_raw_output, &missing)
     }
 }
 
@@ -543,14 +544,34 @@ fn dropped_failure_or_error_blocks(result: &CompressionResult) -> bool {
 
 fn append_missing_failure_lines(
     mut result: CompressionResult,
+    raw_output: &str,
     missing_failure_lines: &[String],
 ) -> CompressionResult {
     let mut text = result.text.trim_end().to_string();
+    // When the result ends with the command's own final line (a test summary,
+    // a script's verdict), the preserved block goes just before that line so
+    // the output still ends the way the command ended.
+    let raw_last = raw_output
+        .lines()
+        .map(str::trim_end)
+        .rfind(|line| !line.is_empty());
+    let (before, last) = text.rsplit_once('\n').unwrap_or(("", text.as_str()));
+    let final_line = match raw_last {
+        Some(raw_last) if last.trim_end() == raw_last => Some(last.to_string()),
+        _ => None,
+    };
+    if final_line.is_some() {
+        text = before.to_string();
+    }
     if !text.is_empty() {
         text.push('\n');
     }
     text.push_str("[raw failure lines preserved by AFT]\n");
     text.push_str(&missing_failure_lines.join("\n"));
+    if let Some(final_line) = final_line {
+        text.push('\n');
+        text.push_str(&final_line);
+    }
     result.text = text;
     result
 }
@@ -2114,6 +2135,19 @@ Error: second failure
         assert!(preserved
             .text
             .contains("[raw failure lines preserved by AFT]"));
+    }
+
+    #[test]
+    fn preserved_failure_lines_go_before_the_commands_final_line() {
+        let raw = "Error: first failure\nprogress\nError: second failure\nGATE RED: lint\n";
+        let compressed = CompressionResult::new("Error: first failure\nGATE RED: lint");
+
+        let preserved = failure_preserving_result("tool", raw, compressed, Some(1));
+
+        assert_eq!(
+            preserved.text,
+            "Error: first failure\n[raw failure lines preserved by AFT]\nError: second failure\nGATE RED: lint"
+        );
     }
 
     #[test]

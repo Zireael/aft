@@ -8,7 +8,7 @@ exception is capture: `capture_real_query_vectors.py` passes a `recorder` that
 embeds a missing text with the real model and stores the result.
 """
 from __future__ import annotations
-import argparse, hashlib, json, sys
+import argparse, hashlib, json, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, MutableMapping, Mapping, Optional
@@ -27,7 +27,7 @@ Recorder = Callable[[str], list[float]]
 
 
 class Server(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], vectors: Mapping[str, list[float]], template: str, log: Path, *, recorder: Optional[Recorder] = None, query_texts: Optional[set[str]] = None):
+    def __init__(self, address: tuple[str, int], vectors: Mapping[str, list[float]], template: str, log: Path, *, recorder: Optional[Recorder] = None, query_texts: Optional[set[str]] = None, corpus_release: Optional[threading.Event] = None, unheld_corpus_texts: Optional[set[str]] = None):
         if recorder is not None and not isinstance(vectors, MutableMapping):
             raise InputFault("vector_capture_needs_mutable_store")
         super().__init__(address, Handler); self.vectors=vectors; self.template=template; self.log=log; self.recorder=recorder; self.query_texts=query_texts or set()
@@ -35,6 +35,9 @@ class Server(ThreadingHTTPServer):
         # embedding by ranking without its semantic lane, which looks like an
         # ordinary result; a runner reads this list to fail the run instead.
         self.refused: list[str] = []
+        self.corpus_release = corpus_release
+        self.corpus_waiting = threading.Event()
+        self.unheld_corpus_texts = unheld_corpus_texts or set()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None: pass
@@ -58,6 +61,11 @@ class Handler(BaseHTTPRequestHandler):
                     key = qkey if text in server.query_texts else ckey
                     # Server.__init__ only accepts a recorder with a mutable store.
                     server.vectors[key] = server.recorder(text)  # type: ignore[index]
+                # Hold index embeddings so a building-state fixture cannot race
+                # the semantic worker; query embeddings remain available.
+                if key.startswith("corpus:") and server.corpus_release is not None and text not in server.unheld_corpus_texts:
+                    server.corpus_waiting.set()
+                    server.corpus_release.wait()
                 vector=server.vectors[key]
                 if not vector or any(not isinstance(item,(int,float)) for item in vector): raise ValueError("vector")
                 output.append({"object":"embedding","index":index,"embedding":vector}); requests.append(key)
@@ -66,7 +74,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200,{"object":"list","model":payload.get("model","aft-search-fixture-v1"),"data":output})
         except (ValueError,json.JSONDecodeError) as error: self._json(400,{"error":f"invalid_request:{error}"})
     def _json(self,status:int,payload:dict[str,Any])->None:
-        data=json.dumps(payload,separators=(",",":")).encode(); self.send_response(status); self.send_header("content-type","application/json"); self.send_header("content-length",str(len(data))); self.end_headers(); self.wfile.write(data)
+        data=json.dumps(payload,separators=(",",":")).encode(); self.send_response(status); self.send_header("content-type","application/json"); self.send_header("content-length",str(len(data))); self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # The partial-index test terminates the search process before
+            # releasing corpus embeddings, so its closed socket needs no reply.
+            pass
 
 def main()->int:
     parser=argparse.ArgumentParser(); parser.add_argument("--vectors",required=True); parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=0); parser.add_argument("--log",required=True); parser.add_argument("--check-key")

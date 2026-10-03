@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "lsp-forward-once",
+    "gh-shim-undetermined",
+    "database-open-thread"
+  ],
+  "note": "lib.rs only gains the new database_open module declaration; LSP watched-file forwarding, gh shim outcome-undetermined replies and the aft.db open thread change no ranking code, so ranked rows must stay byte-identical."
+}

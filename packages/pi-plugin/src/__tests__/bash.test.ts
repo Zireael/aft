@@ -208,7 +208,10 @@ describe("bash tool adapter", () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const mockBridge = makeMockBridge();
-    const ctx = makeMockContext(mockBridge);
+    // `sandbox` is only offered while the native sandbox is enabled.
+    const ctx = makeMockContext(mockBridge, {
+      sandbox: { enabled: true },
+    } as PluginContext["config"]);
 
     registerBashTool(api, ctx);
 
@@ -228,7 +231,24 @@ describe("bash tool adapter", () => {
     expect(properties?.sandbox).toMatchObject({ const: "host" });
   });
 
-  test("schema omits background and PTY params when bash.background is disabled", () => {
+  test("pty param mentions the worker refusal only when subagent_background is off", () => {
+    const describePty = (config: PluginContext["config"]): string => {
+      const tools = new Map<string, MockToolDef>();
+      registerBashTool(makeMockApi(tools), makeMockContext(makeMockBridge(), config));
+      const properties = (
+        tools.get("bash")!.parameters as {
+          properties?: Record<string, { description?: string }>;
+        }
+      ).properties;
+      return properties?.pty?.description ?? "";
+    };
+    expect(describePty({} as PluginContext["config"])).not.toContain("worker");
+    expect(
+      describePty({ bash: { subagent_background: false } } as PluginContext["config"]),
+    ).toContain("Unavailable in worker sessions because bash.subagent_background is false.");
+  });
+
+  test("schema omits wait, background and PTY params when bash.background is disabled", () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const mockBridge = makeMockBridge();
@@ -242,15 +262,17 @@ describe("bash tool adapter", () => {
     expect(bashTool).toBeDefined();
     const properties = (bashTool!.parameters as { properties?: Record<string, unknown> })
       .properties;
+    // `wait` only changes whether a command may auto-promote to the
+    // background, so it leaves with the other background parameters.
+    // `sandbox` is absent too: this config does not enable the native sandbox.
     expect(Object.keys(properties ?? {})).toEqual([
       "command",
       "timeout",
       "workdir",
       "description",
-      "wait",
-      "sandbox",
       "compressed",
     ]);
+    expect(properties?.wait).toBeUndefined();
     expect(properties?.background).toBeUndefined();
     expect(properties?.pty).toBeUndefined();
     expect(properties?.ptyRows).toBeUndefined();
@@ -735,6 +757,40 @@ describe("bash tool adapter", () => {
     expect(bashParams.timeout).toBe(25);
     expect(bashParams.block_to_completion).toBe(true);
     expect(bashCall[2].transportTimeoutMs).toBe(10_025);
+  });
+
+  test("stale wait, background and pty params are ignored, never rejected, when background is off", async () => {
+    // These params are not in the schema with background off, but a model
+    // replaying an older call can still send them. Paired, they would trip the
+    // wait/background contradiction checks; alone, `wait: true` would make the
+    // call detachable into a background task.
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({
+      status: "completed",
+      exit_code: 0,
+      output: "done",
+    });
+    const ctx = makeMockContext(bridge, { bash: { background: false } } as PluginContext["config"]);
+    registerBashTool(api, ctx);
+
+    for (const stale of [
+      { wait: true, background: true },
+      { wait: true, pty: true },
+      { wait: true },
+    ]) {
+      const result = (await tools
+        .get("bash")!
+        .execute("stale-call", { command: "true", ...stale }, undefined, undefined, {
+          cwd: projectRoot,
+        })) as { content: Array<{ text: string }> };
+      expect(result.content[0].text).toBe("done");
+      const params = (calls.at(-1) as [string, Record<string, unknown>])[1];
+      expect(params.wait).toBe(false);
+      expect(params.background).toBe(false);
+      expect(params.pty).toBe(false);
+      expect(params.block_to_completion).toBe(true);
+    }
   });
 
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
@@ -1729,10 +1785,12 @@ describe("bash tool adapter", () => {
 
 /**
  * Standalone `registerBashTool` registers the four background companions
- * whatever the runtime bash settings are; registration is decided only by
- * `disabled_tools`, and the engine reports runtime gates when called.
+ * exactly when the resolved `bash.background` is on. They only act on
+ * background tasks, so with background off they would be tools with nothing
+ * to act on. The other runtime gates never remove a registration; the engine
+ * reports them when called.
  */
-describe("registerBashTool registers companions independently of runtime bash config", () => {
+describe("registerBashTool registers companions only while bash.background is on", () => {
   function registerWithConfig(config: PluginContext["config"]) {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -1762,26 +1820,34 @@ describe("registerBashTool registers companions independently of runtime bash co
     expectBackgroundControls(tools, true);
   });
 
-  test("bash.background=false → bash registered with independent companions", () => {
+  test("bash.background=false → bash registered without companions", () => {
     const tools = registerWithConfig({ bash: { background: false } } as PluginContext["config"]);
+    expect(tools.get("bash")).toBeDefined();
+    expectBackgroundControls(tools, false);
+  });
+
+  test("bash.enabled=false → bash registered with companions", () => {
+    const tools = registerWithConfig({ bash: { enabled: false } } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
     expectBackgroundControls(tools, true);
   });
 
-  test("legacy rewrite=true only → bash registered with independent companions", () => {
+  // The legacy block is opt-in: a flag it does not set resolves to off, so a
+  // legacy config without `background: true` has no background tasks.
+  test("legacy rewrite=true only → bash registered without companions", () => {
     const tools = registerWithConfig({
       experimental: { bash: { rewrite: true } },
     } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
+    expectBackgroundControls(tools, false);
   });
 
-  test("legacy compress=true only → bash registered with independent companions", () => {
+  test("legacy compress=true only → bash registered without companions", () => {
     const tools = registerWithConfig({
       experimental: { bash: { compress: true } },
     } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, true);
+    expectBackgroundControls(tools, false);
   });
 
   test("legacy background=true → full bash surface registered", () => {

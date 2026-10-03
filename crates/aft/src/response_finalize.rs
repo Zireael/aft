@@ -14,6 +14,7 @@ pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
     intervention: &repeat_breaker::RepeatIntervention,
+    worker_session: bool,
 ) {
     let count = intervention.count;
     let span_seconds = intervention.span.as_secs();
@@ -22,10 +23,16 @@ pub fn append_repeat_breaker_reminder(
     // call returns nothing new, while changing output names common timestamp
     // drift. Both variants point legitimate waiting toward a background watch
     // instead of treating output churn as progress.
-    let instruction = if repeat_breaker::escalation_starts_at(count) {
-        "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
-    } else {
-        "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
+    //
+    // A delegated worker (subagent) is never told to end its turn: a worker
+    // that ends its turn has delivered its result and cannot be woken when the
+    // awaited task finishes. It is told to wait on the task instead.
+    let escalated = repeat_breaker::escalation_starts_at(count);
+    let instruction = match (worker_session, escalated) {
+        (false, true) => "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (false, false) => "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again.",
+        (true, true) => "Stop now: make no further call with these arguments. If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
+        (true, false) => "If you are waiting on a task or CI run, wait with a watch on its background task (for example bash_watch on the task ID you already hold) instead of repeating this call. If you are already watching, let the watch return before calling again.",
     };
     let observation = if intervention.outputs_identical {
         format!(
@@ -88,6 +95,7 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
@@ -114,6 +122,7 @@ pub fn finalize_tool_response(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
@@ -141,6 +150,7 @@ pub fn finalize_response_for_dispatch_root(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
+    attach_checkout_query_gaps(response, ctx);
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
@@ -682,5 +692,131 @@ mod tests {
             format!("[{}]", aft_status_segment(&counts)),
             "[AFT E0 W0 | ~D10 U0 C0 | T0]"
         );
+    }
+}
+
+/// Applies the request's pinned post-wait gaps without reading newer runtime state.
+pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
+    let Some(crate::views::contracts::WaitOutcome::TimedOut { unreflected, .. }) =
+        ctx.checkout_query_outcome()
+    else {
+        return;
+    };
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("complete".into(), Value::Bool(false));
+        let gaps = data
+            .entry("gaps")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(gaps) = gaps.as_array_mut() {
+            for path in unreflected {
+                let gap = serde_json::json!({"kind":"view_pending", "path":path, "reason":"callgraph changes not yet installed"});
+                if !gaps.contains(&gap) {
+                    gaps.push(gap);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod checkout_transport_tests {
+    use super::*;
+    use crate::views::contracts::{QueryWait, ViewAccess, WaitOutcome};
+    use crate::views::manifest_v2::{ManifestHeader, ManifestV2, Producers};
+    use crate::views::snapshot::{LiveDelta, OpenGeneration};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct Timeout {
+        snapshot: crate::views::snapshot::Snapshot,
+    }
+    impl QueryWait for Timeout {
+        fn wait_for(
+            &self,
+            _: &ViewAccess,
+            _: crate::blob_store::v2::FamilyPlane,
+            budget: Duration,
+        ) -> WaitOutcome {
+            assert_eq!(budget, crate::views::contracts::CALLGRAPH_QUERY_WAIT);
+            WaitOutcome::TimedOut {
+                snapshot: self.snapshot.clone(),
+                unreflected: vec!["unreflected.rs".into()],
+            }
+        }
+    }
+    fn context(storage: &std::path::Path) -> AppContext {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.set_heavy_root_work_allowed(true);
+        let owner = crate::views::registry::FamilyRegistry::open(storage, "family")
+            .unwrap()
+            .register_view("local", storage)
+            .unwrap();
+        let manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: "test".into(),
+                semantic: None,
+                callgraph: crate::views::callgraph::PRODUCER.into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        let snapshot =
+            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest, None))).snapshot();
+        ctx.install_checkout_query_runtime(Arc::new(
+            crate::views::query_wait::CheckoutQueryRuntime {
+                access: ViewAccess::Owner(owner),
+                waiter: Arc::new(Timeout { snapshot }),
+                callgraph: Arc::new(crate::views::callgraph::CallgraphPlane::default()),
+            },
+        ));
+        ctx
+    }
+    #[test]
+    fn default_config_keeps_legacy_query_runtime_unmodified() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        assert!(!ctx.checkout_query_runtime_active());
+        let _pin = ctx.pin_config();
+        let _ = ctx.callgraph_store_for_ops();
+        assert!(ctx.checkout_query_outcome().is_none());
+        let mut response = Response::success("legacy", serde_json::json!({"complete":true}));
+        super::attach_checkout_query_gaps(&mut response, &ctx);
+        assert_eq!(response.data, serde_json::json!({"complete":true}));
+    }
+
+    #[test]
+    fn standalone_ndjson_finalization_preserves_pinned_timeout_named_files() {
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(storage.path());
+        let _pin = ctx.pin_config();
+        let _ = ctx.callgraph_store_for_ops();
+        let _ = ctx.callgraph_store_for_ops();
+        let mut response = Response::success("ndjson", serde_json::json!({"complete":true}));
+        finalize_response_with_bg_completions(&mut response, &ctx, "session", "callers", false);
+        let wire = serde_json::to_string(&response).unwrap();
+        assert_eq!(response.data["complete"], false);
+        assert!(wire.contains("unreflected.rs"));
+        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn subc_tool_call_finalization_preserves_pinned_timeout_named_files() {
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(storage.path());
+        let _pin = ctx.pin_config();
+        let _ = ctx.callgraph_store_for_ops();
+        let mut response = Response::success(
+            "tool",
+            serde_json::json!({"complete":true, "text":"callgraph"}),
+        );
+        let mut text = String::from("callgraph");
+        finalize_tool_response(&mut response, &mut text, &ctx, "session", "callers", false);
+        assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["gaps"][0]["path"], "unreflected.rs");
     }
 }

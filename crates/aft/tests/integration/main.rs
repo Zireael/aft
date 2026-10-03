@@ -47,6 +47,9 @@ mod db_read_fallback_test;
 // Stands in shell scripts for Apple's developer-tools launcher.
 #[cfg(unix)]
 mod developer_tools_git_test;
+// Syscall census of store durability; uses dyld interposition, so macOS only.
+#[cfg(target_os = "macos")]
+mod durability_census_test;
 // The durable-restart matrix SIGKILLs a child publisher at each failpoint; the
 // kill primitive and the parked-child protocol are POSIX-only.
 #[cfg(unix)]
@@ -113,6 +116,15 @@ mod outline_zoom_test;
 mod parser_audit_fixes_test;
 mod parser_test;
 mod pascal_test;
+mod per_checkout_6;
+mod per_checkout_7;
+mod per_checkout_9;
+mod per_checkout_callgraph;
+mod per_checkout_first_load;
+mod per_checkout_registry;
+mod per_checkout_semantic;
+mod per_checkout_semantic_runtime;
+mod per_checkout_trigram;
 mod pins_gc_test;
 mod powershell_refusal_test;
 mod preview_diff_test;
@@ -122,9 +134,11 @@ mod publication_cas_test;
 mod quarto_test;
 mod query_shape_test;
 mod r_test;
+mod read_freshness_test;
 mod refresh_watcher_path_status_test;
 mod rename_delete_migration_test;
 mod repeat_breaker_test;
+mod rollback_safety_test;
 mod root_keyed_adversarial_test;
 mod safety_test;
 mod sandbox_native_test;
@@ -132,7 +146,9 @@ mod score_floor_drop_test;
 mod search_index_warm_restart_test;
 mod security_test;
 mod semantic_disk_test;
+mod shared_db_contention_test;
 mod shared_index_scope_test;
+mod stage_card_floor_test;
 mod staging_cleanup_test;
 mod standalone_search_deferred_test;
 mod state_commands_test;
@@ -145,6 +161,8 @@ mod subc_bridge_test;
 #[cfg(unix)]
 mod subc_detach_test;
 mod subc_format_test;
+#[cfg(unix)]
+mod subc_launch_nonce_test;
 mod subc_plumbing_drift_test;
 mod subc_storm_test;
 mod subc_translate_test;
@@ -152,7 +170,12 @@ mod symbol_cache_persist_test;
 mod toml_test;
 mod tool_call_parity_test;
 mod tool_call_preview_test;
+mod tool_disabled_test;
 mod trace_to_symbol_test;
+#[cfg(unix)]
+mod typescript_native_lsp_test;
+mod undo_path_lifecycle_test;
 mod url_fetch_test;
 mod view_assembly_wiring_test;
 mod vue_test;
+mod worker_session_test;

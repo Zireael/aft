@@ -57,6 +57,12 @@ pub struct CheckpointInfo {
     /// Empty on successful round-trips. Populated only on `create()` — the
     /// `list()` / `restore()` paths leave it empty.
     pub skipped: Vec<(PathBuf, String)>,
+    /// Files the operation covered, sorted: the snapshotted paths for
+    /// `create()`, the written paths for a restore. Empty for `list()`.
+    pub paths: Vec<PathBuf>,
+    /// Restore only: the subset of `paths` whose on-disk state already matched
+    /// the checkpoint, so restoring them changed nothing.
+    pub unchanged: Vec<PathBuf>,
 }
 
 /// A stored checkpoint: a snapshot of multiple file contents and metadata.
@@ -188,6 +194,26 @@ impl CheckpointFile {
         }
     }
 
+    /// Whether this on-disk state is what restoring `stored` would produce:
+    /// the same kind, the same bytes or link target, and (where the platform
+    /// records one) the same mode.
+    fn matches(&self, stored: &CheckpointFile) -> bool {
+        let same_mode = stored.mode.is_none() || self.mode == stored.mode;
+        match (&self.kind, &stored.kind) {
+            (
+                CheckpointFileKind::Regular { bytes: current },
+                CheckpointFileKind::Regular { bytes: stored },
+            ) => same_mode && current == stored,
+            (
+                CheckpointFileKind::Symlink {
+                    target: current, ..
+                },
+                CheckpointFileKind::Symlink { target: stored, .. },
+            ) => current == stored,
+            _ => false,
+        }
+    }
+
     fn from_disk(meta: &DiskCheckpointFileMeta, bytes: Vec<u8>) -> Result<Self, String> {
         let kind = match &meta.kind {
             DiskCheckpointFileKind::Regular => CheckpointFileKind::Regular {
@@ -238,6 +264,44 @@ pub struct CheckpointStore {
     storage_dir: Option<PathBuf>,
     storage_harness: Option<String>,
     blob_counter: AtomicU64,
+    /// Namespace selected by configure but not yet applied; see
+    /// [`CheckpointNamespaceRequest`].
+    namespace_request: CheckpointNamespaceRequest,
+    /// `(storage_dir, harness)` whose `unbound` checkpoints still need moving
+    /// into the harness directory. Set when the store leaves the unbound
+    /// namespace, cleared once the move ran under the mutation lock.
+    pending_unbound_migration: Option<(PathBuf, String)>,
+}
+
+/// The durable namespace a configure selected for a [`CheckpointStore`],
+/// handed over without touching the store's own mutex.
+///
+/// Configure runs before the bind reply and must not wait: the store's mutex
+/// can be held by a checkpoint command that is itself waiting up to
+/// `CHECKPOINT_LOCK_TIMEOUT` for the cross-process checkpoint file lock.
+/// Configure therefore only records the request here (a short in-memory
+/// critical section), and the store applies it at the start of its next
+/// operation, before it reads or writes any checkpoint.
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointNamespaceRequest(Arc<Mutex<Option<(PathBuf, String)>>>);
+
+impl CheckpointNamespaceRequest {
+    /// Ask the store to use `<dir>/<harness>/checkpoints`. A later request
+    /// replaces an earlier one that has not been applied yet.
+    pub fn request(&self, dir: PathBuf, harness: crate::harness::Harness) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((dir, harness.storage_segment()));
+    }
+
+    fn take(&self) -> Option<(PathBuf, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// Owns a checkpoint mutation lock and removes its project scope directory after
@@ -269,6 +333,21 @@ impl CheckpointStore {
         store
     }
 
+    /// A store in the state `new()` leaves it before configure (durable
+    /// checkpoints under `<storage>/unbound/checkpoints`), but with `<storage>`
+    /// a test-owned directory instead of the process-wide cache.
+    #[cfg(test)]
+    pub(crate) fn unbound_in_for_test(storage_dir: &Path) -> Self {
+        let lock_path = storage_dir
+            .join("checkpoints")
+            .join("test-project")
+            .join("checkpoint.lock");
+        let mut store = Self::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.storage_dir = Some(storage_dir.to_path_buf());
+        store.storage_harness = Some(UNBOUND_HARNESS_SEGMENT.to_string());
+        store
+    }
+
     /// Point this store's mutation lock at a private path. Tests use this for
     /// isolation instead of mutating the process-global `AFT_CACHE_DIR` env
     /// var, which races parallel lib tests that resolve storage paths.
@@ -279,30 +358,72 @@ impl CheckpointStore {
         self.lock_path = lock_path;
     }
 
-    /// Select the harness-scoped durable namespace. Rebinding a different
-    /// namespace drops only the derived in-memory cache; disk remains authoritative.
+    /// Select the harness-scoped durable namespace and, when leaving the
+    /// unbound namespace, move checkpoints saved before configure into it.
+    /// Rebinding a different namespace drops only the derived in-memory cache;
+    /// disk remains authoritative. This may wait for the checkpoint file lock,
+    /// so it belongs in deferred maintenance, never before a bind reply; use
+    /// [`CheckpointNamespaceRequest`] there instead.
     pub fn set_storage_dir_for_harness(&mut self, dir: PathBuf, harness: crate::harness::Harness) {
-        let harness = harness.storage_segment();
+        self.select_namespace(dir, harness.storage_segment());
+        // Configure may have published a namespace request after the job that
+        // called this was queued; the latest request wins.
+        self.apply_namespace_request();
+        if self.pending_unbound_migration.is_some() {
+            match self.acquire_mutation_lock() {
+                Ok(_lock) => self.run_pending_unbound_migration_locked(),
+                // Left pending: the next operation retries under its own lock.
+                Err(error) => crate::slog_warn!(
+                    "could not migrate unbound durable checkpoints yet: {}",
+                    error
+                ),
+            }
+        }
+    }
+
+    /// Handle through which configure selects this store's namespace without
+    /// taking the store's mutex.
+    pub fn namespace_request(&self) -> CheckpointNamespaceRequest {
+        self.namespace_request.clone()
+    }
+
+    /// Make this store read namespace requests from `request`, the handle the
+    /// `AppContext` that now owns this store gives configure.
+    #[cfg(test)]
+    pub(crate) fn use_namespace_request(&mut self, request: CheckpointNamespaceRequest) {
+        self.namespace_request = request;
+    }
+
+    /// Switch the in-memory target directory. No I/O and no file lock; a move
+    /// of unbound checkpoints is only recorded, for
+    /// `run_pending_unbound_migration_locked`.
+    fn select_namespace(&mut self, dir: PathBuf, harness: String) {
         if self.storage_dir.as_ref() == Some(&dir)
-            && self.storage_harness.as_deref() == Some(&harness)
+            && self.storage_harness.as_deref() == Some(harness.as_str())
         {
             return;
         }
         if self.storage_dir.as_ref() == Some(&dir)
             && self.storage_harness.as_deref() == Some(UNBOUND_HARNESS_SEGMENT)
         {
-            match self.acquire_mutation_lock() {
-                Ok(_lock) => migrate_unbound_checkpoint_namespace(&dir, &harness),
-                Err(error) => crate::slog_warn!(
-                    "could not migrate unbound durable checkpoints into {}: {}",
-                    harness,
-                    error
-                ),
-            }
+            self.pending_unbound_migration = Some((dir.clone(), harness.clone()));
         }
         self.storage_dir = Some(dir);
         self.storage_harness = Some(harness);
         self.checkpoints.clear();
+    }
+
+    fn apply_namespace_request(&mut self) {
+        if let Some((dir, harness)) = self.namespace_request.take() {
+            self.select_namespace(dir, harness);
+        }
+    }
+
+    /// Caller holds the checkpoint mutation lock.
+    fn run_pending_unbound_migration_locked(&mut self) {
+        if let Some((dir, harness)) = self.pending_unbound_migration.take() {
+            migrate_unbound_checkpoint_namespace(&dir, &harness);
+        }
     }
 
     fn with_lock_path(lock_path: PathBuf, lock_timeout: Duration) -> Self {
@@ -313,6 +434,8 @@ impl CheckpointStore {
             storage_dir: None,
             storage_harness: None,
             blob_counter: AtomicU64::new(0),
+            namespace_request: CheckpointNamespaceRequest::default(),
+            pending_unbound_migration: None,
         }
     }
 
@@ -376,7 +499,19 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, backup_store, None)
+        self.create_impl(session, name, files, Some(backup_store), None)
+    }
+
+    /// Checkpoint exactly `files`, with no fallback to the backup store's
+    /// tracked files. Used by undo to preserve content changed outside AFT
+    /// while the backup store is already borrowed for the restore.
+    pub fn create_for_files(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+    ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, None, None)
     }
 
     pub(crate) fn create_from_captures(
@@ -387,7 +522,7 @@ impl CheckpointStore {
         backup_store: &BackupStore,
         captures: &mut HashMap<PathBuf, CapturedRegularFile>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, backup_store, Some(captures))
+        self.create_impl(session, name, files, Some(backup_store), Some(captures))
     }
 
     fn create_impl(
@@ -395,7 +530,7 @@ impl CheckpointStore {
         session: &str,
         name: &str,
         files: Vec<PathBuf>,
-        backup_store: &BackupStore,
+        backup_store: Option<&BackupStore>,
         mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
@@ -403,10 +538,9 @@ impl CheckpointStore {
         self.run_process_maintenance_once_locked()?;
         self.hydrate_session_locked(session)?;
         let explicit_request = !files.is_empty();
-        let file_list = if files.is_empty() {
-            backup_store.tracked_files(session)
-        } else {
-            files
+        let file_list = match backup_store {
+            Some(backup_store) if files.is_empty() => backup_store.tracked_files(session),
+            _ => files,
         };
 
         let mut file_contents = HashMap::new();
@@ -442,22 +576,26 @@ impl CheckpointStore {
             }
         }
 
-        // If the caller explicitly named a single file and it was unreadable,
-        // that's a real error — surface it rather than silently returning an
-        // empty checkpoint. For empty `files` (tracked-file fallback) with no
-        // readable files at all, the empty-file checkpoint is a legitimate
-        // "nothing to snapshot" outcome and we keep it.
-        if explicit_request && file_contents.is_empty() && !skipped.is_empty() {
-            let (path, err) = &skipped[0];
-            return Err(AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), err),
-            });
+        // A caller that named files and got none of them has no checkpoint at
+        // all; report that as an error rather than an empty success. Every
+        // named path either lands in the checkpoint or in `skipped`, so the
+        // first skip carries the reason. For empty `files` (tracked-file
+        // fallback) with no readable files, the empty checkpoint is a
+        // legitimate "nothing to snapshot" outcome and we keep it.
+        if explicit_request && file_contents.is_empty() {
+            let path = match skipped.first() {
+                Some((path, err)) => format!("{}: {}", path.display(), err),
+                None => "none of the requested files could be checkpointed".to_string(),
+            };
+            return Err(AftError::FileNotFound { path });
         }
 
         let created_at = current_timestamp();
         let created_order = current_timestamp_nanos()
             .saturating_add(self.blob_counter.fetch_add(1, Ordering::Relaxed));
         let file_count = file_contents.len();
+        let mut captured_paths = file_contents.keys().cloned().collect::<Vec<_>>();
+        captured_paths.sort();
         let checkpoint = Checkpoint {
             name: name.to_string(),
             file_contents,
@@ -492,6 +630,8 @@ impl CheckpointStore {
             storage_path,
             evicted,
             skipped,
+            paths: captured_paths,
+            unchanged: Vec::new(),
         })
     }
 
@@ -505,7 +645,7 @@ impl CheckpointStore {
         let mut paths = checkpoint.file_contents.keys().cloned().collect::<Vec<_>>();
         paths.sort();
 
-        restore_paths_atomically(checkpoint, &paths)?;
+        let unchanged = restore_paths_atomically(checkpoint, &paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
 
         Ok(CheckpointInfo {
@@ -515,6 +655,8 @@ impl CheckpointStore {
             storage_path,
             evicted: Vec::new(),
             skipped: Vec::new(),
+            paths,
+            unchanged,
         })
     }
 
@@ -539,7 +681,7 @@ impl CheckpointStore {
                     path: path.display().to_string(),
                 })?;
         }
-        restore_paths_atomically(checkpoint, validated_paths)?;
+        let unchanged = restore_paths_atomically(checkpoint, validated_paths)?;
         crate::slog_info!("checkpoint restored: {}", name);
 
         Ok(CheckpointInfo {
@@ -549,6 +691,8 @@ impl CheckpointStore {
             storage_path,
             evicted: Vec::new(),
             skipped: Vec::new(),
+            paths: validated_paths.to_vec(),
+            unchanged,
         })
     }
 
@@ -637,6 +781,8 @@ impl CheckpointStore {
                         storage_path: self.durable_checkpoint_dir(session, &checkpoint.name),
                         evicted: Vec::new(),
                         skipped: Vec::new(),
+                        paths: Vec::new(),
+                        unchanged: Vec::new(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -664,6 +810,8 @@ impl CheckpointStore {
                 return;
             }
         };
+        self.apply_namespace_request();
+        self.run_pending_unbound_migration_locked();
         if let Err(error) = self.cleanup_locked() {
             crate::slog_warn!("checkpoint cleanup failed: {}", error);
         }
@@ -696,6 +844,12 @@ impl CheckpointStore {
     }
 
     fn run_process_maintenance_once_locked(&mut self) -> Result<(), AftError> {
+        // Every operation passes through here right after taking the mutation
+        // lock, so a namespace configure selected, and any move of unbound
+        // checkpoints it implies, takes effect before this operation reads or
+        // writes a checkpoint.
+        self.apply_namespace_request();
+        self.run_pending_unbound_migration_locked();
         let Some(storage_dir) = self.storage_dir.clone() else {
             return Ok(());
         };
@@ -780,6 +934,7 @@ impl CheckpointStore {
             return Ok(());
         }
 
+        recover_replaced_checkpoints(&session_dir);
         let entries = fs::read_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: format!("failed to read durable checkpoint session: {error}"),
@@ -802,7 +957,7 @@ impl CheckpointStore {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !is_safe_checkpoint_name(&name) {
+            if !is_safe_checkpoint_name(&name) || name.ends_with(REPLACED_CHECKPOINT_SUFFIX) {
                 continue;
             }
             let meta_path = checkpoint_dir.join("meta.json");
@@ -1035,6 +1190,30 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
             let target_checkpoint = target_session.join(checkpoint_entry.file_name());
             if !target_checkpoint.exists() {
                 let _ = fs::rename(source_checkpoint, target_checkpoint);
+                continue;
+            }
+            // `<storage>/unbound/checkpoints` (written before configure) and
+            // `<storage>/<harness>/checkpoints` both hold a checkpoint with this
+            // name for this session. Saving under an existing name replaces it,
+            // so the newer one is the checkpoint the session last asked for.
+            // Keeping the harness copy regardless let an older snapshot answer
+            // the next restore.
+            let source_order = durable_checkpoint_created_order(&source_checkpoint);
+            let target_order = durable_checkpoint_created_order(&target_checkpoint);
+            let source_is_newer = match (source_order, target_order) {
+                (Some(source), Some(target)) => source > target,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if !source_is_newer {
+                continue;
+            }
+            if let Err(error) = replace_checkpoint_dir(&source_checkpoint, &target_checkpoint) {
+                crate::slog_warn!(
+                    "failed to replace durable checkpoint {} with the newer unbound one: {}",
+                    target_checkpoint.display(),
+                    error
+                );
             }
         }
         let _ = fs::remove_dir(&source_session);
@@ -1049,7 +1228,112 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
     }
 }
 
+/// Creation order recorded in a durable checkpoint's metadata, or `None` when
+/// the metadata is missing or unreadable.
+fn durable_checkpoint_created_order(checkpoint_dir: &Path) -> Option<u64> {
+    let bytes = fs::read(checkpoint_dir.join("meta.json")).ok()?;
+    serde_json::from_slice::<DiskCheckpointMeta>(&bytes)
+        .ok()
+        .map(|meta| meta.created_order)
+}
+
+/// Suffix of the name a checkpoint directory is moved to while
+/// `replace_checkpoint_dir` swaps a newer copy into its place. Names with it
+/// are not checkpoints: hydration restores or removes them, and
+/// `validate_checkpoint_name` refuses them.
+const REPLACED_CHECKPOINT_SUFFIX: &str = ".aft-replaced";
+
+fn replaced_checkpoint_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(REPLACED_CHECKPOINT_SUFFIX);
+    target.with_file_name(name)
+}
+
+/// Replace the checkpoint directory `target` with `source` so that a failure
+/// or crash at any step leaves one complete copy under `target`'s name, or
+/// under its `.aft-replaced` name for `recover_replaced_checkpoints` to put
+/// back. `target` is moved aside first, `source` moved into place, and only
+/// then is the old copy deleted; if the move into place fails, the old copy is
+/// moved back.
+fn replace_checkpoint_dir(source: &Path, target: &Path) -> io::Result<()> {
+    replace_checkpoint_dir_with(source, target, |from, to| fs::rename(from, to))
+}
+
+fn replace_checkpoint_dir_with(
+    source: &Path,
+    target: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let aside = replaced_checkpoint_path(target);
+    // A `.aft-replaced` copy left by an earlier replacement of this same
+    // checkpoint that finished but could not delete it. `target` exists and is
+    // the newer copy, so this one is superseded.
+    if aside.exists() {
+        fs::remove_dir_all(&aside)?;
+    }
+    rename(target, &aside)?;
+    if let Err(error) = rename(source, target) {
+        if let Err(restore_error) = rename(&aside, target) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; moving the previous checkpoint back from {} also failed: {restore_error}",
+                    aside.display()
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    if let Err(error) = fs::remove_dir_all(&aside) {
+        crate::slog_warn!(
+            "replaced durable checkpoint {} but could not delete the previous copy {}: {}",
+            target.display(),
+            aside.display(),
+            error
+        );
+    }
+    Ok(())
+}
+
+/// Finish any `replace_checkpoint_dir` a crash interrupted in `session_dir`:
+/// a `<name>.aft-replaced` directory goes back to `<name>` when nothing took
+/// its place, and is deleted when the newer copy did.
+fn recover_replaced_checkpoints(session_dir: &Path) {
+    let Ok(entries) = fs::read_dir(session_dir) else {
+        return;
+    };
+    let leftovers = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let original = name.strip_suffix(REPLACED_CHECKPOINT_SUFFIX)?.to_string();
+            Some((entry.path(), session_dir.join(original)))
+        })
+        .collect::<Vec<_>>();
+    for (aside, original) in leftovers {
+        let result = if original.exists() {
+            fs::remove_dir_all(&aside)
+        } else {
+            fs::rename(&aside, &original)
+        };
+        if let Err(error) = result {
+            crate::slog_warn!(
+                "failed to recover interrupted checkpoint replacement {}: {}",
+                aside.display(),
+                error
+            );
+        }
+    }
+}
+
 fn validate_checkpoint_name(name: &str) -> Result<(), AftError> {
+    if name.ends_with(REPLACED_CHECKPOINT_SUFFIX) {
+        return Err(AftError::InvalidRequest {
+            message: format!(
+                "checkpoint names ending in '{REPLACED_CHECKPOINT_SUFFIX}' are reserved"
+            ),
+        });
+    }
     if is_safe_checkpoint_name(name) {
         Ok(())
     } else {
@@ -1308,13 +1592,27 @@ fn normalize_checkpoint_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Result<(), AftError> {
+/// Restore `paths` from `checkpoint`, all or nothing. Returns the paths whose
+/// on-disk state already matched the checkpoint, so callers can tell a restore
+/// that changed files from one that found them already in place.
+fn restore_paths_atomically(
+    checkpoint: &Checkpoint,
+    paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, AftError> {
     let mut pre_restore_snapshot: HashMap<PathBuf, Option<CheckpointFile>> = HashMap::new();
+    let mut unchanged = Vec::new();
     for path in paths {
         let current = CheckpointFile::read_optional(path).map_err(|error| AftError::IoError {
             path: path.display().to_string(),
             message: format!("failed to snapshot pre-restore file metadata: {error}"),
         })?;
+        if let (Some(current), Some(stored)) =
+            (current.as_ref(), checkpoint.file_contents.get(path))
+        {
+            if current.matches(stored) {
+                unchanged.push(path.clone());
+            }
+        }
         pre_restore_snapshot.insert(path.clone(), current);
     }
 
@@ -1369,7 +1667,7 @@ fn restore_paths_atomically(checkpoint: &Checkpoint, paths: &[PathBuf]) -> Resul
         restored_paths.push(path.clone());
     }
 
-    Ok(())
+    Ok(unchanged)
 }
 
 fn restore_snapshot_file(path: &Path, snapshot: Option<&CheckpointFile>) -> Result<(), AftError> {
@@ -1892,6 +2190,209 @@ mod tests {
             }
             other => panic!("expected durable hydration I/O error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn binding_the_harness_keeps_the_newer_of_two_same_name_checkpoints() {
+        let storage = tempfile::tempdir().unwrap();
+        let (older_file, _older_dir) = temp_file("older.txt", "older");
+        let (newer_file, _newer_dir) = temp_file("newer.txt", "newer");
+        let backup_store = BackupStore::new();
+
+        // `<storage>/opencode/checkpoints` already holds `snap` (older.txt).
+        let mut harness_store = fresh_checkpoint_store(storage.path());
+        harness_store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![older_file.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        drop(harness_store);
+
+        // A store that has not been configured yet saves a newer `snap`
+        // (newer.txt) under `<storage>/unbound/checkpoints`.
+        let mut store = CheckpointStore::unbound_in_for_test(storage.path());
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![newer_file.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+        );
+
+        fs::write(&older_file, "older changed").unwrap();
+        fs::write(&newer_file, "newer changed").unwrap();
+        let info = store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        assert_eq!(info.file_count, 1);
+        assert_eq!(fs::read_to_string(&newer_file).unwrap(), "newer");
+        assert_eq!(fs::read_to_string(&older_file).unwrap(), "older changed");
+    }
+
+    #[test]
+    fn binding_the_harness_keeps_a_newer_harness_checkpoint_over_an_older_unbound_one() {
+        let storage = tempfile::tempdir().unwrap();
+        let (older_file, _older_dir) = temp_file("older.txt", "older");
+        let (newer_file, _newer_dir) = temp_file("newer.txt", "newer");
+        let backup_store = BackupStore::new();
+
+        let mut store = CheckpointStore::unbound_in_for_test(storage.path());
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![older_file.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        let mut harness_store = fresh_checkpoint_store(storage.path());
+        harness_store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![newer_file.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        drop(harness_store);
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+        );
+
+        fs::write(&older_file, "older changed").unwrap();
+        fs::write(&newer_file, "newer changed").unwrap();
+        store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        assert_eq!(fs::read_to_string(&newer_file).unwrap(), "newer");
+        assert_eq!(fs::read_to_string(&older_file).unwrap(), "older changed");
+    }
+
+    #[test]
+    fn restore_reports_files_that_already_matched_the_checkpoint() {
+        let (edited, _edited_dir) = temp_file("edited.txt", "original");
+        let (untouched, _untouched_dir) = temp_file("untouched.txt", "same");
+        let backup_store = BackupStore::new();
+        let (mut store, _store_dir) = checkpoint_store();
+        store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![edited.clone(), untouched.clone()],
+                &backup_store,
+            )
+            .unwrap();
+
+        fs::write(&edited, "changed").unwrap();
+        let info = store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        let mut expected_paths = vec![edited.clone(), untouched.clone()];
+        expected_paths.sort();
+        assert_eq!(info.paths, expected_paths);
+        assert_eq!(info.unchanged, vec![untouched.clone()]);
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "original");
+
+        let again = store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        assert_eq!(again.unchanged, expected_paths);
+    }
+
+    fn checkpoint_dir_with_meta(parent: &Path, name: &str, marker: &str) -> PathBuf {
+        let dir = parent.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("meta.json"), marker).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replacing_a_checkpoint_dir_keeps_the_original_when_the_move_into_place_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let source = checkpoint_dir_with_meta(&root.path().join("unbound"), "snap", "newer");
+        let target = checkpoint_dir_with_meta(&root.path().join("harness"), "snap", "older");
+
+        let result = replace_checkpoint_dir_with(&source, &target, |from, to| {
+            if from == source.as_path() {
+                Err(io::Error::other("injected failure moving the newer copy"))
+            } else {
+                fs::rename(from, to)
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("meta.json")).unwrap(),
+            "older"
+        );
+        assert!(!replaced_checkpoint_path(&target).exists());
+        assert_eq!(
+            fs::read_to_string(source.join("meta.json")).unwrap(),
+            "newer"
+        );
+    }
+
+    #[test]
+    fn replacing_a_checkpoint_dir_swaps_in_the_new_copy_and_drops_the_old_one() {
+        let root = tempfile::tempdir().unwrap();
+        let source = checkpoint_dir_with_meta(&root.path().join("unbound"), "snap", "newer");
+        let target = checkpoint_dir_with_meta(&root.path().join("harness"), "snap", "older");
+
+        replace_checkpoint_dir(&source, &target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("meta.json")).unwrap(),
+            "newer"
+        );
+        assert!(!replaced_checkpoint_path(&target).exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn hydration_puts_back_a_checkpoint_a_crash_left_moved_aside() {
+        let (file, _file_dir) = temp_file("aside.txt", "original");
+        let backup_store = BackupStore::new();
+        let (mut store, _store_dir) = checkpoint_store();
+        let info = store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap",
+                vec![file.clone()],
+                &backup_store,
+            )
+            .unwrap();
+        // A crash between moving the old copy aside and moving the new copy
+        // into place leaves only `snap.aft-replaced`.
+        let checkpoint_dir = info.storage_path.unwrap();
+        fs::rename(&checkpoint_dir, replaced_checkpoint_path(&checkpoint_dir)).unwrap();
+
+        fs::write(&file, "changed").unwrap();
+        store.restore(DEFAULT_SESSION_ID, "snap").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+        assert!(!replaced_checkpoint_path(&checkpoint_dir).exists());
+        let names = store
+            .list(DEFAULT_SESSION_ID)
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["snap".to_string()]);
+    }
+
+    #[test]
+    fn checkpoint_names_with_the_reserved_suffix_are_refused() {
+        let (file, _file_dir) = temp_file("reserved.txt", "x");
+        let (mut store, _store_dir) = checkpoint_store();
+        let error = store
+            .create(
+                DEFAULT_SESSION_ID,
+                "snap.aft-replaced",
+                vec![file],
+                &BackupStore::new(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
     }
 
     #[test]

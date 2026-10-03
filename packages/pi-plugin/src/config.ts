@@ -128,6 +128,16 @@ export interface GhShimConfig {
   binary_path?: string;
 }
 
+/**
+ * OpenCode 2 server used for permission prompts. Only the OpenCode plugin reads
+ * it; Pi accepts it because both plugins share the same aft.jsonc files.
+ * USER-tier ONLY: a project could otherwise send prompts to its own server.
+ */
+export interface OpenCodeHostConfig {
+  server_url?: string;
+  server_password_env?: string;
+}
+
 export interface GithubConfig {
   /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
   shim?: boolean;
@@ -177,6 +187,34 @@ export interface SemanticConfig {
   max_batch_size?: number;
   max_input_tokens?: number;
   max_files?: number;
+}
+
+export interface RerankConfig {
+  /**
+   * Reranker for the head of aft_search results: "off" (default), "onnx",
+   * "remote" or "synapse". Only prose questions are reranked. A project
+   * config may only set "off".
+   */
+  backend?: "off" | "onnx" | "remote" | "synapse";
+  /**
+   * For "onnx": bge-reranker-base (default), bge-reranker-v2-m3,
+   * jina-reranker-v1-turbo or gte-reranker-modernbert-base. Required for
+   * "remote" and "synapse". User config only.
+   */
+  model?: string;
+  /** Base URL of the "remote" endpoint (AFT appends /rerank; tei+ for TEI). User config only. */
+  endpoint?: string;
+  /** Environment variable holding the "remote" endpoint's API key. User config only. */
+  api_key_env?: string;
+  /** How many leading results are reranked (default 20, at most 200). User config only. */
+  top_n?: number;
+  /** Reranking budget per search in milliseconds (default 1500). User config only. */
+  timeout_ms?: number;
+}
+
+export interface SearchConfig {
+  /** Optional cross-encoder reranking of aft_search results. Default off. */
+  rerank?: RerankConfig;
 }
 
 export interface LspServerConfig {
@@ -429,8 +467,12 @@ export interface AftConfig {
   lsp?: LspConfig;
   url_fetch_allow_private?: boolean;
   semantic?: SemanticConfig;
+  /** aft_search settings; a project config may only turn reranking off. */
+  search?: SearchConfig;
   bridge?: BridgeConfig;
   subc?: SubcConfig;
+  /** OpenCode 2 server used for permission prompts (user-only; read by the OpenCode plugin). */
+  opencode?: OpenCodeHostConfig;
   github?: GithubConfig;
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
   gh_shim?: GhShimConfig;
@@ -655,7 +697,7 @@ const IndexConfigSchema = z.object({
 });
 
 const SemanticConfigSchema = z.object({
-  backend: z.enum(["fastembed", "openai_compatible", "ollama"]).optional(),
+  backend: z.enum(["fastembed", "openai_compatible", "ollama", "synapse"]).optional(),
   model: z.string().trim().min(1).optional(),
   base_url: z.string().trim().min(1).optional(),
   api_key_env: z.string().trim().min(1).optional(),
@@ -665,6 +707,19 @@ const SemanticConfigSchema = z.object({
   max_batch_size: z.number().int().positive().optional(),
   max_input_tokens: z.number().int().positive().optional(),
   max_files: z.number().int().positive().optional(),
+});
+
+const RerankConfigSchema = z.object({
+  backend: z.enum(["off", "onnx", "remote", "synapse"]).optional(),
+  model: z.string().trim().min(1).optional(),
+  endpoint: z.string().trim().min(1).optional(),
+  api_key_env: z.string().trim().min(1).optional(),
+  top_n: z.number().int().positive().optional(),
+  timeout_ms: z.number().int().positive().optional(),
+});
+
+const SearchConfigSchema = z.object({
+  rerank: RerankConfigSchema.optional(),
 });
 
 const LspExtensionSchema = z
@@ -797,6 +852,11 @@ const GhShimConfigSchema = z.object({
     .trim()
     .refine(isAbsolute, "gh_shim.binary_path must be absolute")
     .optional(),
+});
+
+const OpenCodeHostConfigSchema = z.object({
+  server_url: z.string().optional(),
+  server_password_env: z.string().optional(),
 });
 
 const GithubConfigSchema = z.object({
@@ -937,8 +997,10 @@ const AftConfigFieldsSchema = z.object({
   lsp: LspConfigSchema.optional(),
   url_fetch_allow_private: z.boolean().optional(),
   semantic: SemanticConfigSchema.optional(),
+  search: SearchConfigSchema.optional(),
   bridge: BridgeConfigSchema.optional(),
   subc: SubcConfigSchema.optional(),
+  opencode: OpenCodeHostConfigSchema.optional(),
   github: GithubConfigSchema.optional(),
   gh_shim: GhShimConfigSchema.optional(),
   git: GitConfigSchema.optional(),
@@ -1097,6 +1159,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  const rerank = definedEntries(config.search?.rerank);
+  if (rerank !== undefined) overrides.search = { rerank };
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
@@ -1368,6 +1432,34 @@ export function migrateAftConfigFile(
 export type ConfigLoadError = { path: string; message: string };
 
 let configLoadErrors: ConfigLoadError[] = [];
+let configValidationErrors: ConfigLoadError[] = [];
+let configLoadSources: string[] = [];
+let configLoadTexts = new Map<string, string>();
+
+/**
+ * The config files the last load actually read, in load order. A file that
+ * did not exist when the loader looked is not listed. A live config reload
+ * compares this with the previous accepted load to tell that a file it relied
+ * on has disappeared, rather than probing the filesystem separately.
+ */
+export function getConfigLoadSources(): readonly string[] {
+  return configLoadSources;
+}
+
+/** The text of each file the last load read, keyed by path. */
+export function getConfigLoadTexts(): ReadonlyMap<string, string> {
+  return configLoadTexts;
+}
+
+/**
+ * Settings the last load dropped because their value did not validate. A
+ * normal load keeps the rest of the file and uses defaults for these; a live
+ * config reload treats any of them as an invalid file and keeps the last valid
+ * config instead, so a typo cannot reset a key while the host runs.
+ */
+export function getConfigValidationErrors(): readonly ConfigLoadError[] {
+  return configValidationErrors;
+}
 
 export function getConfigLoadErrors(): readonly ConfigLoadError[] {
   return configLoadErrors;
@@ -1452,6 +1544,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   try {
     if (!existsSync(configPath)) return null;
     const content = readFileSync(configPath, "utf-8");
+    configLoadSources.push(configPath);
+    configLoadTexts.set(configPath, content);
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
       recordConfigParseFailure(configPath, "root must be an object");
@@ -1510,6 +1604,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   } else {
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    configValidationErrors.push({ path: configPath, message: errorMsg });
     parsed = parseConfigPartially(cleanConfig);
   }
   if (tier === "user" && parsed.disabled_tools === undefined) {
@@ -1822,12 +1917,42 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
+  stripped.push(...projectRerankStrippedKeys(override.search?.rerank));
   return stripped;
+}
+
+/** Project rerank keys that are ignored: everything except `backend: "off"`. */
+function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
+  if (rerank === undefined) return [];
+  const stripped: string[] = [];
+  if (rerank.backend !== undefined && rerank.backend !== "off")
+    stripped.push("search.rerank.backend");
+  for (const key of ["model", "endpoint", "api_key_env", "top_n", "timeout_ms"] as const) {
+    if (rerank[key] !== undefined) stripped.push(`search.rerank.${key}`);
+  }
+  return stripped;
+}
+
+/** A project may set `search.rerank.backend: "off"` and nothing else. */
+function mergeProjectSearchConfig(
+  base: SearchConfig | undefined,
+  project: SearchConfig | undefined,
+): SearchConfig | undefined {
+  if (project?.rerank?.backend !== "off") return base;
+  return { ...base, rerank: { ...base?.rerank, backend: "off" } };
+}
+
+/** A copy of `value` without its undefined entries, or undefined when none are left. */
+function definedEntries<T extends object>(value: T | undefined): Partial<T> | undefined {
+  if (value === undefined) return undefined;
+  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
+  return entries.length > 0 ? (Object.fromEntries(entries) as Partial<T>) : undefined;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
@@ -1842,6 +1967,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
@@ -1878,6 +2004,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(pi !== undefined ? { pi } : {}),
     experimental,
     semantic,
+    // Only the project-safe rerank disable is merged.
+    search,
     ...(bridge !== undefined ? { bridge } : {}),
     ...(indexes !== undefined ? { indexes } : {}),
     ...(disabledTools !== undefined ? { disabled_tools: disabledTools } : {}),
@@ -1987,6 +2115,9 @@ export function buildConfigTierConfigureParams(
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
+  configValidationErrors = [];
+  configLoadSources = [];
+  configLoadTexts = new Map();
   configLoadNotices = [];
   semanticInputSupplied = false;
 

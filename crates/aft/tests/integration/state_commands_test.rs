@@ -283,21 +283,21 @@ fn db_set_host_state_concurrent_insert() {
     let thread_a = std::thread::spawn(move || {
         barrier_a.wait();
         let response = set_host_state(&mut aft_a, "alpha", "one");
-        let ok = response["success"] == true;
         assert!(aft_a.shutdown().success());
-        ok
+        response
     });
     let barrier_b = barrier.clone();
     let thread_b = std::thread::spawn(move || {
         barrier_b.wait();
         let response = set_host_state(&mut aft_b, "beta", "two");
-        let ok = response["success"] == true;
         assert!(aft_b.shutdown().success());
-        ok
+        response
     });
 
-    assert!(thread_a.join().unwrap());
-    assert!(thread_b.join().unwrap());
+    let response_a = thread_a.join().unwrap();
+    let response_b = thread_b.join().unwrap();
+    assert_eq!(response_a["success"], true, "alpha: {response_a}");
+    assert_eq!(response_b["success"], true, "beta: {response_b}");
     assert_eq!(
         host_state_value(storage.path(), "alpha"),
         Some("one".into())
@@ -346,5 +346,92 @@ fn db_set_state_legacy_write_failure_does_not_fail_db_write() {
         harness_state_value(storage.path(), "opencode", "last_announced_version"),
         Some("0.27.0".into())
     );
+    assert!(aft.shutdown().success());
+}
+
+// An exclusive rollback-journal lock prevents the deferred opener from switching to WAL.
+// Use SQLite for the lock; touching database files directly can drop POSIX locks.
+fn journal_lock(storage: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).unwrap();
+    conn.execute_batch("CREATE TABLE lock_fixture (id INTEGER); BEGIN EXCLUSIVE;")
+        .unwrap();
+    conn
+}
+
+#[test]
+fn deferred_database_open_retries_journal_lock_until_release() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        lock.execute_batch("ROLLBACK").unwrap();
+    });
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    release.join().unwrap();
+    assert_eq!(response["success"], true, "{response}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn deferred_database_open_busy_exhaustion_retries_without_rebind() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let start = std::time::Instant::now();
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    assert_eq!(response["success"], false, "{response}");
+    assert_eq!(response["retryable"], true, "{response}");
+    assert_eq!(response["code"], "database_unavailable", "{response}");
+    assert!(start.elapsed() >= std::time::Duration::from_secs(9));
+    assert!(start.elapsed() < std::time::Duration::from_secs(15));
+    lock.execute_batch("ROLLBACK").unwrap();
+    let response = set_host_state(&mut aft, "after-lock", "yes");
+    assert_eq!(response["success"], true, "{response}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn standalone_database_retry_does_not_block_read_only_requests() {
+    use std::time::{Duration, Instant};
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let path = project.path().join("readable.txt");
+    fs::write(&path, "available during database contention\n").unwrap();
+    let lock = journal_lock(storage.path());
+    let mut aft = configured_aft(project.path(), storage.path(), "opencode");
+    let exhausted = set_host_state(&mut aft, "initial", "no");
+    assert_eq!(exhausted["retryable"], true, "{exhausted}");
+    assert_eq!(exhausted["code"], "database_unavailable", "{exhausted}");
+
+    // Keep the lock held through both responses. Send the read behind the retry
+    // so a long synchronous retry cannot masquerade as a responsive main loop.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    aft.send_silent(&json!({"id": "retry-held", "command": "db_set_host_state", "params": {"key": "retry", "value": "no"}}).to_string());
+    aft.send_silent(&json!({"id": "read-held", "command": "read", "file": path}).to_string());
+    let mut saw_read = false;
+    let mut saw_retry = false;
+    while !saw_read || !saw_retry {
+        let response = aft
+            .try_read_next_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("read-only request must answer within two seconds while SQLite remains locked");
+        match response["id"].as_str() {
+            Some("read-held") => {
+                assert_eq!(response["success"], true, "{response}");
+                saw_read = true;
+            }
+            Some("retry-held") => {
+                assert_eq!(response["success"], false, "{response}");
+                assert_eq!(response["retryable"], true, "{response}");
+                saw_retry = true;
+            }
+            _ => {}
+        }
+    }
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(set_host_state(&mut aft, "released", "yes")["success"], true);
     assert!(aft.shutdown().success());
 }

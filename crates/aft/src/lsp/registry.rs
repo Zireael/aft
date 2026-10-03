@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock};
 use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
     find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
+    outermost_marker_root,
 };
+use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
 
 /// Resolve an LSP binary name to a full path.
 ///
@@ -54,6 +56,22 @@ pub fn resolve_server_binary(
     workspace_root: Option<&Path>,
     config: &Config,
 ) -> Option<PathBuf> {
+    if server.kind == ServerKind::Oxlint && server.binary == "oxlint" {
+        // Older npm releases ship a standalone server, including versions before
+        // oxlint gained --lsp (1.29). Prefer it when present, even alongside
+        // oxlint, so those projects work without a version/help subprocess probe.
+        for root in [workspace_root, config.project_root.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(found) = probe_dir(
+                &root.join("node_modules").join(".bin"),
+                "oxc_language_server",
+            ) {
+                return Some(found);
+            }
+        }
+    }
     let python_family = matches!(server.kind, ServerKind::Python | ServerKind::Ty);
 
     if python_family {
@@ -132,6 +150,15 @@ fn probe_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
 pub enum ServerKind {
     // --- Built-in (existing, pre-v0.17.0) ---
     TypeScript,
+    /// TypeScript 7 and later's own language server (`tsc --lsp --stdio`),
+    /// carrying the project's `node_modules/typescript` directory. It never
+    /// appears in the static registry: [`servers_for_file`] swaps it in for
+    /// the `typescript` server when the file's installed TypeScript is the
+    /// native compiler. The directory is part of the kind, and so of the
+    /// server key, so packages with different TypeScript installations under
+    /// one root get separate servers and a TypeScript 5 server never serves a
+    /// TypeScript 7 package's files (or the reverse).
+    TypeScriptNative(Arc<Path>),
     Python, // pyright
     Rust,
     Go,
@@ -177,6 +204,7 @@ impl ServerKind {
     pub fn id_str(&self) -> &str {
         match self {
             Self::TypeScript => "typescript",
+            Self::TypeScriptNative(_) => "typescript-native",
             Self::Python => "python",
             Self::Rust => "rust",
             Self::Go => "go",
@@ -249,6 +277,26 @@ pub struct ServerDef {
 }
 
 impl ServerDef {
+    /// The standalone Oxlint server uses stdio without the CLI's --lsp flag.
+    pub fn spawn_args_for_binary(&self, binary: &Path) -> Vec<String> {
+        if self.kind == ServerKind::Oxlint
+            && self.binary == "oxlint"
+            && matches!(
+                binary.file_name().and_then(|name| name.to_str()),
+                Some(
+                    "oxc_language_server"
+                        | "oxc_language_server.cmd"
+                        | "oxc_language_server.exe"
+                        | "oxc_language_server.bat"
+                )
+            )
+        {
+            Vec::new()
+        } else {
+            self.args.clone()
+        }
+    }
+
     /// Return the workspace root this server should use for a file.
     pub fn workspace_root_for_file(&self, file_path: &Path) -> Option<PathBuf> {
         self.workspace_root_for_file_with_project_root(file_path, None)
@@ -275,6 +323,62 @@ impl ServerDef {
             self.kind,
             ServerKind::Rust | ServerKind::Python | ServerKind::Ty
         );
+        let nearest = match self.nearest_marker_root(file_path, project_root, bounded_to_project) {
+            Some(nearest) => nearest,
+            // A Python script with no project file above it (a helper under
+            // `scripts/`, say) is still Python that Pyright can check with its
+            // defaults. Serving it from the project root keeps such files from
+            // being permanently "no workspace root" gaps in a scoped inspect.
+            None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
+                let project_root = crate::inspect::job::canonicalize_normalized(project_root?);
+                crate::inspect::job::canonicalize_normalized(file_path)
+                    .starts_with(&project_root)
+                    .then_some(project_root)?
+            }
+            None => return None,
+        };
+        let Some(project_root) = project_root else {
+            return Some(nearest);
+        };
+        match self.kind {
+            // One TypeScript language server serves every tsconfig project
+            // below its root: tsserver finds the nearest tsconfig of each file
+            // it opens. Packages share a server as long as they see the same
+            // TypeScript version, so a monorepo whose packages each install
+            // the same TypeScript runs one server instead of one per package.
+            ServerKind::TypeScript => {
+                Some(super::typescript_project::shared_typescript_server_root(
+                    &nearest,
+                    project_root,
+                    |dir| self.has_root_marker(dir),
+                ))
+            }
+            // Bash and YAML servers analyze each file on its own; their
+            // workspace root only bounds background indexing. Their markers
+            // (`package.json`, `.git`) mark every JavaScript package, which
+            // started one server per package for the same project.
+            ServerKind::Bash | ServerKind::Yaml => {
+                Some(outermost_marker_root(&nearest, project_root, |dir| {
+                    self.has_root_marker(dir)
+                }))
+            }
+            _ => Some(nearest),
+        }
+    }
+
+    fn has_root_marker(&self, dir: &Path) -> bool {
+        self.root_markers
+            .iter()
+            .chain(self.priority_root_markers.iter())
+            .any(|marker| dir.join(marker).exists())
+    }
+
+    fn nearest_marker_root(
+        &self,
+        file_path: &Path,
+        project_root: Option<&Path>,
+        bounded_to_project: bool,
+    ) -> Option<PathBuf> {
         for marker in &self.priority_root_markers {
             let root = if bounded_to_project {
                 find_workspace_root_within(file_path, &[marker.as_str()], project_root)
@@ -333,13 +437,19 @@ pub fn builtin_servers() -> Vec<ServerDef> {
             ],
             &["pyrightconfig.json", "pyproject.toml"],
         ),
-        builtin_server(
+        builtin_server_with_init(
             ServerKind::Rust,
             "rust-analyzer",
             &["rs"],
             "rust-analyzer",
             &[],
             &["Cargo.toml", "Cargo.lock"],
+            // Lock metadata resolution and build-script discovery/flycheck so a
+            // stale Cargo.lock fails analysis instead of being rewritten by Cargo.
+            serde_json::json!({ "cargo": {
+                "extraArgs": ["--locked"],
+                "metadataExtraArgs": ["--locked"]
+            } }),
         ),
         // gopls requires opt-in for `textDocument/diagnostic` (LSP 3.17 pull)
         // via the `pullDiagnostics` initializationOption. Without this the
@@ -576,13 +686,13 @@ pub fn builtin_servers() -> Vec<ServerDef> {
         ),
         builtin_server(
             ServerKind::Oxlint,
-            "oxc-language-server",
+            "oxlint",
             // Same JS/TS family as TypeScript LS; coexists rather than replaces.
             &[
                 "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts", "vue", "astro", "svelte",
             ],
-            "oxc-language-server",
-            &[],
+            "oxlint",
+            &["--lsp"],
             // Only trigger on actual oxlint config files. We previously also
             // matched `package.json`, but that fired oxc on every JS/TS project
             // whether they used oxlint or not, producing a persistent warning
@@ -708,7 +818,204 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .filter(|server| !is_disabled(server, config))
         .filter(|server| server.matches_extension(extension))
         .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+        // The swap runs after the disabled filter, so `lsp.disabled:
+        // ["typescript"]` still turns TypeScript off for native projects;
+        // the second filter lets `typescript-native` be disabled on its own.
+        .map(|server| select_typescript_server(server, path, config))
+        .filter(|server| !is_disabled(server, config))
+        .filter(|server| !biome_config_excludes(server, path))
         .collect()
+}
+
+/// Biome analyzes only the files its configuration's `files.includes` lists
+/// and publishes nothing for the rest. Treating Biome as a producer for an
+/// excluded file (this repository's biome.json lists only package sources,
+/// so every `.json` under `crates/` is excluded) left that file a permanent
+/// "published no diagnostics" gap in every scoped inspect. A configuration
+/// without `files.includes`, or one that cannot be read, includes every file.
+fn biome_config_excludes(server: &ServerDef, path: &Path) -> bool {
+    if server.kind != ServerKind::Biome {
+        return false;
+    }
+    let Some(root) = server.workspace_root_for_file(path) else {
+        return false;
+    };
+    let Some(config_path) = ["biome.json", "biome.jsonc"]
+        .iter()
+        .map(|name| root.join(name))
+        .find(|candidate| candidate.is_file())
+    else {
+        return false;
+    };
+    let Some(includes) = biome_includes(&config_path) else {
+        return false;
+    };
+    let path = crate::inspect::job::canonicalize_normalized(path);
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return false;
+    };
+    !includes.includes(relative)
+}
+
+/// A Biome `files.includes` list: a file is included when a positive pattern
+/// matches it and no later `!` pattern does.
+struct BiomeIncludes {
+    patterns: Vec<(bool, globset::GlobMatcher)>,
+}
+
+impl BiomeIncludes {
+    fn includes(&self, relative: &Path) -> bool {
+        let mut included = false;
+        for (negated, matcher) in &self.patterns {
+            if matcher.is_match(relative) {
+                included = !negated;
+            }
+        }
+        included
+    }
+}
+
+/// Parsed `files.includes` of one Biome configuration, memoized by path and
+/// modification time so a walk over thousands of files reads it once.
+fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
+    type Memo = parking_lot::Mutex<
+        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<Arc<BiomeIncludes>>)>,
+    >;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let modified = std::fs::metadata(config_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some((at, includes)) = memo.lock().get(config_path) {
+        if *at == modified {
+            return includes.clone();
+        }
+    }
+    let parsed = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|source| {
+            serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&source)).ok()
+        })
+        .and_then(|config| {
+            let patterns = config.pointer("/files/includes")?.as_array()?;
+            let patterns = patterns
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|pattern| {
+                    let negated = pattern.starts_with('!');
+                    let glob = pattern.trim_start_matches('!');
+                    let matcher = globset::GlobBuilder::new(glob)
+                        .literal_separator(true)
+                        .build()
+                        .ok()?
+                        .compile_matcher();
+                    Some((negated, matcher))
+                })
+                .collect::<Vec<_>>();
+            Some(Arc::new(BiomeIncludes { patterns }))
+        });
+    memo.lock()
+        .insert(config_path.to_path_buf(), (modified, parsed.clone()));
+    parsed
+}
+
+const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
+
+/// Serve a TypeScript 7+ file with the native compiler's own language server.
+///
+/// `typescript-language-server` needs the `lib/tsserver.js` that TypeScript 7
+/// no longer ships, so for a file whose nearest installed TypeScript is the
+/// native compiler the `typescript` definition becomes a
+/// [`ServerKind::TypeScriptNative`] one that runs `tsc --lsp --stdio`. The
+/// choice is per file because one project can mix TypeScript versions across
+/// packages. The binary shown here is the platform binary when it resolves;
+/// the manager resolves it again at spawn and reports a named gap, without
+/// spawning anything, when it does not.
+fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> ServerDef {
+    // Only the built-in program is swapped: a user who pointed the
+    // `typescript` server at another binary has chosen their own server.
+    if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
+        return server;
+    }
+    let project_root = config.project_root.as_deref();
+    let markers = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        server.root_markers.hash(&mut hasher);
+        server.priority_root_markers.hash(&mut hasher);
+        hasher.finish()
+    };
+    let Some(native) = native_typescript_for(path, project_root, markers, || {
+        server.workspace_root_for_file_with_project_root(path, project_root)
+    }) else {
+        return server;
+    };
+    let binary = native
+        .binary
+        .map(|binary| binary.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tsc".into());
+    ServerDef {
+        kind: ServerKind::TypeScriptNative(Arc::from(native.project.package_dir.as_path())),
+        name: "TypeScript native language server".into(),
+        extensions: server.extensions,
+        binary,
+        args: NATIVE_SERVER_ARGS.map(String::from).to_vec(),
+        root_markers: server.root_markers,
+        priority_root_markers: server.priority_root_markers,
+        env: server.env,
+        // Options configured for typescript-language-server (a tsserver.path,
+        // its preferences) mean nothing to the native server.
+        initialization_options: None,
+    }
+}
+
+/// Find every enabled server definition for which `path` is a root marker that
+/// signals the server's language is in use (for example `package.json` for the
+/// TypeScript server). A marker only says where a server's workspace would
+/// start; it does not mean the server has any files to analyze.
+pub fn servers_with_root_marker(path: &Path, config: &Config) -> Vec<ServerDef> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+
+    resolved_servers(config)
+        .into_iter()
+        .filter(|server| !is_disabled(server, config))
+        .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+        .filter(|server| {
+            server
+                .root_markers
+                .iter()
+                .chain(server.priority_root_markers.iter())
+                .any(|marker| marker == file_name)
+        })
+        .filter(|server| marker_signals_language(file_name, server))
+        .collect()
+}
+
+/// Several servers borrow generic files as workspace-root fallbacks: Bash and
+/// YAML use `package.json` and `.git`, Vue and Astro use package-manager
+/// lockfiles, Prisma uses `package.json`. Those files say a JavaScript
+/// package lives here, not that shell scripts or Vue components do, so they
+/// signal only servers that handle JavaScript or TypeScript files; `.git`
+/// signals nothing. Every other marker (`Cargo.toml`, `tsconfig.json`,
+/// `astro.config.mjs`, ...) is specific to its server.
+fn marker_signals_language(marker: &str, server: &ServerDef) -> bool {
+    const JS_PACKAGE_FILES: &[&str] = &[
+        "package.json",
+        "package-lock.json",
+        "bun.lock",
+        "bun.lockb",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    ];
+    if marker == ".git" {
+        return false;
+    }
+    if JS_PACKAGE_FILES.contains(&marker) {
+        return server.matches_extension("js") || server.matches_extension("ts");
+    }
+    true
 }
 
 /// Resolve the full server set after applying user overrides.
@@ -819,11 +1126,17 @@ pub fn is_config_file_path(path: &Path) -> bool {
     // creates unnecessary churn without affecting language analysis.
     // Intentional: this list is checked BEFORE builtin_config_file_names so a
     // file that is both a root_marker and a lockfile is excluded.
+    //
+    // Cargo.lock is deliberately absent. AFT starts rust-analyzer with
+    // `--locked`, so when Cargo.toml gains or changes a dependency the old
+    // lockfile no longer matches and `cargo metadata` fails; rust-analyzer
+    // then loads the workspace without its dependencies and re-reads the
+    // lockfile only when told it changed. So a lockfile update is a
+    // project-graph change for Rust, not install churn.
     const LOCKFILE_NAMES: &[&str] = &[
         "package-lock.json",
         "yarn.lock",
         "pnpm-lock.yaml",
-        "Cargo.lock",
         "Gemfile.lock",
         "poetry.lock",
         "go.sum",
@@ -950,7 +1263,7 @@ mod tests {
 
     use super::{
         builtin_servers, is_config_file_path, resolve_lsp_binary, resolve_server_binary,
-        servers_for_file, ServerKind,
+        servers_for_file, ServerDef, ServerKind,
     };
     use crate::config::{Config, UserServerDef};
 
@@ -959,6 +1272,306 @@ mod tests {
             .into_iter()
             .map(|server| server.kind)
             .collect()
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn install_typescript(package_parent: &Path, version: &str) -> PathBuf {
+        let package_dir = package_parent.join("node_modules").join("typescript");
+        write_file(
+            &package_dir.join("package.json"),
+            &format!(r#"{{"name":"typescript","version":"{version}"}}"#),
+        );
+        package_dir
+    }
+
+    fn typescript_server(file: &Path, config: &Config) -> Option<super::ServerDef> {
+        servers_for_file(file, config).into_iter().find(|server| {
+            matches!(
+                server.kind,
+                ServerKind::TypeScript | ServerKind::TypeScriptNative(_)
+            )
+        })
+    }
+
+    /// Packages that each install the same TypeScript share one server at the
+    /// highest root that still sees that version; a package with a different
+    /// version keeps its own server root.
+    #[test]
+    fn typescript_packages_with_the_same_version_share_one_server_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "5.9.3");
+        for package in ["cli", "plugin", "old"] {
+            write_file(
+                &root.join("packages").join(package).join("package.json"),
+                "{}",
+            );
+            write_file(
+                &root.join("packages").join(package).join("tsconfig.json"),
+                "{}",
+            );
+            write_file(
+                &root.join("packages").join(package).join("src/index.ts"),
+                "",
+            );
+        }
+        install_typescript(&root.join("packages/cli"), "5.9.3");
+        install_typescript(&root.join("packages/old"), "5.4.5");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let server_root = |package: &str| {
+            let file = root.join("packages").join(package).join("src/index.ts");
+            let server = typescript_server(&file, &config).unwrap();
+            assert_eq!(server.kind, ServerKind::TypeScript);
+            server
+                .workspace_root_for_file_with_project_root(&file, Some(&root))
+                .unwrap()
+        };
+        assert_eq!(server_root("cli"), root);
+        assert_eq!(server_root("plugin"), root);
+        assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    /// Biome is not a producer for a file its `files.includes` leaves out, so
+    /// such a file is not an eternal "no diagnostics published" gap.
+    #[test]
+    fn biome_is_not_a_producer_for_files_its_config_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(
+            &root.join("biome.json"),
+            r#"{"files":{"includes":["packages/**/*.ts","!packages/gen/**"]}}"#,
+        );
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let has_biome = |relative: &str| {
+            let file = root.join(relative);
+            write_file(&file, "");
+            matching_kinds(file.to_str().unwrap(), &config).contains(&ServerKind::Biome)
+        };
+        assert!(has_biome("packages/app/src/index.ts"));
+        assert!(!has_biome("crates/app/schema.json"));
+        assert!(!has_biome("packages/gen/out.ts"));
+    }
+
+    /// A Python script with no project file above it is served from the
+    /// project root instead of having no server at all.
+    #[test]
+    fn python_script_without_a_project_file_uses_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let script = root.join("scripts/report.py");
+        write_file(&script, "print(1)\n");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let python = servers_for_file(&script, &config)
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        assert_eq!(
+            python.workspace_root_for_file_with_project_root(&script, Some(&root)),
+            Some(root.clone())
+        );
+        assert_eq!(python.workspace_root_for_file(&script), None);
+    }
+
+    /// Bash marks every JavaScript package (`package.json`) as a root; one
+    /// server at the outermost root in the project serves all of them.
+    #[test]
+    fn bash_scripts_in_nested_packages_share_the_outermost_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        write_file(&root.join("packages/cli/package.json"), "{}");
+        let script = root.join("packages/cli/scripts/release.sh");
+        write_file(&script, "echo hi\n");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let bash = servers_for_file(&script, &config)
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Bash)
+            .unwrap();
+        assert_eq!(
+            bash.workspace_root_for_file_with_project_root(&script, Some(&root)),
+            Some(root.clone())
+        );
+        // Without a project root there is nothing to bound the climb, so the
+        // nearest marker stays the root.
+        assert_eq!(
+            bash.workspace_root_for_file(&script),
+            Some(root.join("packages/cli"))
+        );
+    }
+
+    /// One root can hold packages with different TypeScript installations.
+    /// The native kind carries its TypeScript directory, so the two files get
+    /// different server keys even though their workspace root is the same.
+    #[test]
+    fn typescript_7_files_get_the_native_server_keyed_by_their_typescript() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("tsconfig.json"), "{}");
+        let native_dir = install_typescript(&root.join("next"), "7.0.2");
+        install_typescript(&root.join("legacy"), "5.9.3");
+        let native_file = root.join("next").join("index.ts");
+        let legacy_file = root.join("legacy").join("index.ts");
+        write_file(&native_file, "");
+        write_file(&legacy_file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+
+        let native = typescript_server(&native_file, &config).unwrap();
+        assert_eq!(
+            native.kind,
+            ServerKind::TypeScriptNative(Arc::from(native_dir.as_path()))
+        );
+        assert_eq!(native.kind.id_str(), "typescript-native");
+        assert_eq!(native.args, vec!["--lsp", "--stdio"]);
+        assert_eq!(native.initialization_options, None);
+        let legacy = typescript_server(&legacy_file, &config).unwrap();
+        assert_eq!(legacy.kind, ServerKind::TypeScript);
+        assert_eq!(legacy.binary, "typescript-language-server");
+
+        // Same workspace root, different keys.
+        let config_root = config.project_root.as_deref();
+        assert_eq!(
+            native.workspace_root_for_file_with_project_root(&native_file, config_root),
+            legacy.workspace_root_for_file_with_project_root(&legacy_file, config_root),
+        );
+        assert_ne!(native.kind, legacy.kind);
+    }
+
+    /// Choosing the TypeScript server for many files in one directory reads
+    /// the installed package once, not once per file. Bypassing the memo makes
+    /// this 200 reads or more; the bound leaves room for a parallel test that
+    /// clears the memo mid-loop.
+    #[test]
+    fn typescript_server_choice_is_memoized_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let files: Vec<PathBuf> = (0..100)
+            .map(|index| root.join("src").join(format!("file{index}.ts")))
+            .collect();
+        for file in &files {
+            write_file(file, "");
+        }
+        let before = crate::lsp::typescript_project::package_json_reads_on_this_thread();
+        for file in &files {
+            let server = typescript_server(file, &config).unwrap();
+            assert!(matches!(server.kind, ServerKind::TypeScriptNative(_)));
+        }
+        let reads = crate::lsp::typescript_project::package_json_reads_on_this_thread() - before;
+        assert!(
+            reads <= 10,
+            "{reads} package.json reads for 100 files in one directory"
+        );
+    }
+
+    /// After the watcher reports an installation change, the TypeScript
+    /// server choice is recomputed.
+    #[test]
+    fn typescript_server_choice_follows_an_install_after_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        let package_dir = install_typescript(&root, "5.9.3");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        assert_eq!(
+            typescript_server(&file, &config).unwrap().kind,
+            ServerKind::TypeScript
+        );
+        install_typescript(&root, "7.0.2");
+        let changed = package_dir.join("package.json");
+        assert!(crate::lsp::typescript_project::path_affects_typescript_selection(&changed));
+        crate::lsp::typescript_project::invalidate_typescript_selection([changed.as_path()]);
+        assert_eq!(
+            typescript_server(&file, &config).unwrap().kind,
+            ServerKind::TypeScriptNative(Arc::from(package_dir.as_path()))
+        );
+        // Editing a source file cannot change which TypeScript is installed,
+        // so it does not empty the memo.
+        assert!(!crate::lsp::typescript_project::path_affects_typescript_selection(&file));
+        for path in [
+            "/r/bun.lock",
+            "/r/node_modules/.bin/tsc",
+            "/r/node_modules/@typescript/typescript-linux-x64/lib/tsc",
+        ] {
+            assert!(
+                crate::lsp::typescript_project::path_affects_typescript_selection(Path::new(path)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_typescript_also_disables_the_native_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        for disabled in ["typescript", "typescript-native"] {
+            let config = Config {
+                project_root: Some(root.clone()),
+                disabled_lsp: [disabled.to_string()].into_iter().collect(),
+                ..Config::default()
+            };
+            assert!(
+                typescript_server(&file, &config).is_none(),
+                "lsp.disabled [{disabled}] left a TypeScript server"
+            );
+        }
+    }
+
+    /// A user who replaced the `typescript` server's program keeps it; only
+    /// the built-in typescript-language-server is swapped.
+    #[test]
+    fn user_chosen_typescript_program_is_not_swapped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        write_file(&root.join("package.json"), "{}");
+        install_typescript(&root, "7.0.2");
+        let file = root.join("index.ts");
+        write_file(&file, "");
+        let config = Config {
+            project_root: Some(root.clone()),
+            lsp_servers: vec![UserServerDef {
+                id: "typescript".to_string(),
+                binary: "vtsls".to_string(),
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let server = typescript_server(&file, &config).unwrap();
+        assert_eq!(server.kind, ServerKind::TypeScript);
+        assert_eq!(server.binary, "vtsls");
     }
 
     #[test]
@@ -983,6 +1596,7 @@ mod tests {
             "/repo/pyproject.toml",
             "/repo/pyrightconfig.json",
             "/repo/Cargo.toml",
+            "/repo/Cargo.lock",
             "/repo/go.mod",
             "/repo/biome.json",
         ] {
@@ -995,9 +1609,9 @@ mod tests {
         // Lockfiles are excluded even though they appear in root_markers —
         // they change on every package install and triggering LSP re-analysis
         // on each install creates unnecessary churn. See the LOCKFILE_NAMES
-        // list in is_config_file_path().
+        // list in is_config_file_path(). Cargo.lock is the exception checked
+        // above: a stale one breaks rust-analyzer's workspace load.
         for path in [
-            "/repo/Cargo.lock",
             "/repo/go.sum",
             "/repo/bun.lock",
             "/repo/bun.lockb",
@@ -1082,7 +1696,7 @@ mod tests {
 
     #[test]
     fn test_oxlint_root_markers_exclude_package_json() {
-        // Regression guard (v0.17.2): oxc-language-server previously listed
+        // Oxlint previously listed
         // `package.json` as a root marker, which fired oxc on every JS/TS
         // project — including the overwhelming majority that don't use
         // oxlint — producing a persistent "binary missing" warning whenever
@@ -1451,6 +2065,77 @@ mod tests {
         }
     }
 
+    fn oxlint_def() -> ServerDef {
+        builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Oxlint)
+            .unwrap()
+    }
+
+    #[test]
+    fn oxlint_resolves_cli_with_lsp_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxlint"));
+        let server = oxlint_def();
+        assert_eq!(server.binary, "oxlint");
+        assert_eq!(server.args, ["--lsp"]);
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxlint"));
+        assert_eq!(server.spawn_args_for_binary(&binary), ["--lsp"]);
+    }
+
+    #[test]
+    fn oxlint_resolves_standalone_without_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxc_language_server"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
+    }
+
+    #[test]
+    fn oxlint_prefers_standalone_alongside_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxlint"));
+        touch_exe(&local_bin.join("oxc_language_server"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oxlint_standalone_npm_shim_has_no_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_bin = tmp.path().join("node_modules/.bin");
+        touch_exe(&local_bin.join("oxc_language_server.cmd"));
+        let server = oxlint_def();
+        let config = Config {
+            project_root: Some(tmp.path().to_path_buf()),
+            ..Config::default()
+        };
+        let binary = resolve_server_binary(&server, Some(tmp.path()), &config).unwrap();
+        assert_eq!(binary, local_bin.join("oxc_language_server.cmd"));
+        assert!(server.spawn_args_for_binary(&binary).is_empty());
+    }
+
     #[test]
     fn resolve_lsp_binary_prefers_project_node_modules() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1766,15 +2451,17 @@ mod tests {
         };
         touch_exe(&outside_python);
 
+        let project_root = crate::inspect::job::canonicalize_normalized(&project);
         for kind in [ServerKind::Python, ServerKind::Ty] {
             let server = builtin_servers()
                 .into_iter()
                 .find(|server| server.kind == kind)
                 .unwrap();
-            assert!(
-                server
-                    .workspace_root_for_file_with_project_root(&source, Some(&project))
-                    .is_none(),
+            // With no marker inside the project, the script is served from
+            // the project root itself, never from the marker above it.
+            assert_eq!(
+                server.workspace_root_for_file_with_project_root(&source, Some(&project)),
+                Some(project_root.clone()),
                 "{kind:?} must not select a marker above project_root"
             );
         }

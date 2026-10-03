@@ -2096,7 +2096,7 @@ fn starved_bind_promotes_over_pure_reads() {
     assert_eq!(
         actor
             .class_queues(JobClass::Interactive)
-            .next_interactive_lane(Instant::now()),
+            .next_interactive_lane(Instant::now(), None),
         Some(Lane::Mutating),
         "starved bind must preempt queued pure reads"
     );
@@ -2148,7 +2148,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
     assert_eq!(
         actor
             .class_queues(JobClass::Interactive)
-            .next_interactive_lane(Instant::now()),
+            .next_interactive_lane(Instant::now(), None),
         Some(Lane::PureRead),
         "fresh binds queue behind pure reads until the promotion age"
     );
@@ -3906,4 +3906,446 @@ fn reserved_bind_workers_run_only_binds_and_the_bind_jumps_a_queued_edit() {
         "an edit must never start on a reserved bind worker"
     );
     assert_eq!(dirs.len(), pool_size);
+}
+
+/// A same-root read held on its worker and reported to the scheduler as
+/// having run for longer than `READER_STUCK_CENSUS_AGE`, as an indexed grep
+/// stuck on a pathological file is. Released when dropped.
+struct StuckReader {
+    response: Option<tokio::sync::oneshot::Receiver<Response>>,
+    finished: Option<Response>,
+    release: crossbeam_channel::Sender<()>,
+}
+
+impl StuckReader {
+    fn start(executor: &Executor, root: &ProjectRootId, request_id: &str, tool: &str) -> Self {
+        let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        let id = request_id.to_string();
+        let (response, _token) = executor.submit_tool_call_cancellable_async(
+            root.clone(),
+            Lane::PureRead,
+            request_id.to_string(),
+            tool,
+            Box::new(move |_| {
+                started_tx.send(()).expect("signal reader start");
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                ok(id)
+            }),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader starts");
+        {
+            let mut state = executor.inner.state.lock();
+            let running = state
+                .running_jobs
+                .values_mut()
+                .find(|job| job.root_id == *root && job.request_id == request_id)
+                .expect("running reader census entry");
+            running.started_at = Instant::now()
+                .checked_sub(READER_STUCK_CENSUS_AGE + Duration::from_secs(1))
+                .expect("monotonic clock is older than the stuck-reader age");
+        }
+        Self {
+            response: Some(response),
+            finished: None,
+            release: release_tx,
+        }
+    }
+
+    /// True while the reader's job has not answered.
+    fn still_running(&mut self) -> bool {
+        if self.finished.is_some() {
+            return false;
+        }
+        match self.response.as_mut().map(|response| response.try_recv()) {
+            Some(Ok(response)) => {
+                self.finished = Some(response);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn finish(mut self) -> Response {
+        let _ = self.release.send(());
+        if let Some(response) = self.finished.take() {
+            return response;
+        }
+        recv_async(
+            self.response.take().expect("reader response"),
+            "stuck reader",
+        )
+    }
+}
+
+impl Drop for StuckReader {
+    fn drop(&mut self) {
+        // A failed assertion must not leave the reader parked on its worker.
+        let _ = self.release.send(());
+    }
+}
+
+/// The response if it arrives within `within`, without consuming the
+/// receiver otherwise.
+fn try_recv_within(
+    response: &mut tokio::sync::oneshot::Receiver<Response>,
+    within: Duration,
+) -> Option<Response> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(response) = response.try_recv() {
+            return Some(response);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn is_stuck_reader_blocker(blocker: &str) -> bool {
+    blocker.starts_with("waiting_on_readers_stuck(")
+}
+
+/// A rebind of an unchanged root needs only a shared hold, so a read that has
+/// run far longer than the route-bind deadline must not hold it up: the bind
+/// is answered beside the reader, within the bound a bind storm is answered
+/// in, while the reader is still running.
+#[test]
+fn shared_bind_is_answered_beside_a_reader_held_past_the_bind_deadline() {
+    let executor = test_executor(6, 3, 4, 2);
+    let (_dir, root) = test_root("shared-bind-beside-stuck-reader");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let mut reader = StuckReader::start(&executor, &root, "subc-1-789", "grep");
+
+    let (mut bind, _token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-beside-reader", |_| {
+            Response::success(
+                "subc-bind-beside-reader",
+                serde_json::json!({ "shared": current_bind_gate_is_shared() }),
+            )
+        });
+    let answered = try_recv_within(&mut bind, BIND_STORM_ACK_BOUND);
+    let reader_held_at_answer = reader.still_running();
+    let blockers = executor
+        .try_bind_blocker_snapshot(&root, "subc-bind-beside-reader")
+        .map(|snapshot| snapshot.blockers);
+    let reader_response = reader.finish();
+    if answered.is_none() {
+        let _ = recv_async(bind, "bind after the reader released");
+    }
+
+    let answered = answered.unwrap_or_else(|| {
+        panic!(
+            "the bind was not answered within {BIND_STORM_ACK_BOUND:?} beside a stuck reader: \
+             {blockers:?}"
+        )
+    });
+    assert!(answered.success, "{:?}", answered.data);
+    assert_eq!(
+        answered.data["shared"], true,
+        "the bind held the gate shared"
+    );
+    assert!(reader_held_at_answer, "the reader was still running");
+    assert!(reader_response.success);
+}
+
+/// While a shared bind runs beside a stuck reader, the root keeps serving new
+/// reads, including after the bind has waited past the age at which a queued
+/// bind starts holding new reads back.
+#[test]
+fn new_reads_are_admitted_while_a_shared_bind_and_a_stuck_reader_overlap() {
+    let executor = test_executor(6, 3, 4, 2);
+    let (_dir, root) = test_root("reads-beside-shared-bind-and-stuck-reader");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let reader = StuckReader::start(&executor, &root, "subc-1-789", "grep");
+
+    let (release_bind_tx, release_bind_rx) = crossbeam_channel::bounded::<()>(1);
+    let (bind, _token) = submit_repeatable_bind(&executor, &root, "subc-bind-overlap", move |_| {
+        let _ = release_bind_rx.recv_timeout(Duration::from_secs(30));
+        ok("subc-bind-overlap")
+    });
+    thread::sleep(BIND_PROMOTION_AGE + Duration::from_millis(200));
+
+    let (mut read, _read_token) = executor.submit_tool_call_cancellable_async(
+        root.clone(),
+        Lane::PureRead,
+        "subc-1-790".to_string(),
+        "read",
+        Box::new(|_| ok("subc-1-790")),
+    );
+    let read_answered = try_recv_within(&mut read, Duration::from_secs(2));
+    let blockers = executor
+        .try_bind_blocker_snapshot(&root, "subc-bind-overlap")
+        .map(|snapshot| snapshot.blockers);
+    let _ = release_bind_tx.send(());
+    let reader_response = reader.finish();
+    let bind_response = recv_async(bind, "overlapping bind");
+
+    let read_answered = read_answered
+        .unwrap_or_else(|| panic!("a new read was held back on the root: {blockers:?}"));
+    assert!(read_answered.success);
+    assert!(bind_response.success, "{:?}", bind_response.data);
+    assert!(reader_response.success);
+}
+
+/// A bind that must change the root still cannot run beside a reader. It
+/// waits in the queue, off any worker, names the stuck reader (job and tool)
+/// as its blocker, never runs exclusively while the reader holds the root,
+/// and cancelling it removes it and its writer demand at once.
+#[test]
+fn exclusive_bind_beside_a_held_reader_waits_names_its_blocker_and_cancels_cleanly() {
+    let executor = test_executor(6, 3, 4, 2);
+    let (_dir, root) = test_root("exclusive-bind-beside-stuck-reader");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (_epoch, waiting_writers, _detached) = actor_epoch_and_demand(&executor, &root);
+    let reader = StuckReader::start(&executor, &root, "subc-1-791", "grep");
+
+    let runs = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let recorded = Arc::clone(&runs);
+    let (bind, token) =
+        submit_repeatable_bind(&executor, &root, "subc-bind-needs-exclusive", move |_| {
+            recorded.lock().push(current_bind_gate_is_shared());
+            if request_exclusive_rerun() {
+                return Response::error(
+                    "subc-bind-needs-exclusive",
+                    "configure_needs_exclusive",
+                    "rerun",
+                );
+            }
+            ok("subc-bind-needs-exclusive")
+        });
+    let snapshot = wait_for_bind_snapshot(
+        &executor,
+        &root,
+        "subc-bind-needs-exclusive",
+        Duration::from_secs(5),
+        |snapshot| {
+            snapshot.configure_state == "queued"
+                && snapshot
+                    .oldest_queued_writer_age_ms
+                    .is_some_and(|age| age >= duration_millis_u64(BIND_PROMOTION_AGE) + 100)
+                && snapshot
+                    .blockers
+                    .iter()
+                    .any(|blocker| is_stuck_reader_blocker(blocker))
+        },
+    );
+    let (idle_workers, total_workers) = {
+        let state = executor.inner.state.lock();
+        (state.idle_workers, state.config.total_workers())
+    };
+    let runs_while_reader_held = runs.lock().clone();
+    let demand_while_queued = waiting_writers.load(Ordering::Acquire);
+    let cancel = executor.cancel_job(&root, &token);
+    let demand_after_cancel = waiting_writers.load(Ordering::Acquire);
+    let response = recv_async(bind, "cancelled exclusive bind");
+    let reader_response = reader.finish();
+
+    let snapshot = snapshot.expect("the bind waits behind the stuck reader");
+    let blocker = snapshot
+        .blockers
+        .iter()
+        .find(|blocker| is_stuck_reader_blocker(blocker))
+        .expect("stuck-reader blocker");
+    assert!(blocker.contains("job=subc-1-791"), "{blocker}");
+    assert!(blocker.contains("command=grep"), "{blocker}");
+    assert!(
+        runs_while_reader_held.iter().all(|shared| *shared),
+        "the bind ran exclusively beside the reader: {runs_while_reader_held:?}"
+    );
+    assert_eq!(
+        idle_workers,
+        total_workers - 1,
+        "only the reader may hold a worker"
+    );
+    assert_eq!(demand_while_queued, 1, "the queued bind is writer demand");
+    assert_eq!(cancel, JobCancelOutcome::QueuedRemoved);
+    assert_eq!(demand_after_cancel, 0);
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert!(reader_response.success);
+}
+
+/// A bind that needs exclusive use and has waited past its promotion age
+/// would normally stop new reads so the readers ahead of it drain. When every
+/// reader ahead of it is stuck, that only freezes the root: new reads must
+/// still be admitted, and the blocker the bind reports (what the module names
+/// in its refusal when the bind deadline passes) names the stuck job and its
+/// tool.
+#[test]
+fn promoted_bind_does_not_freeze_reads_behind_a_stuck_reader() {
+    let executor = test_executor(6, 3, 4, 2);
+    let (_dir, root) = test_root("promoted-bind-stuck-reader");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let reader = StuckReader::start(&executor, &root, "subc-1-792", "grep");
+
+    let (bind, token) = submit_repeatable_bind(&executor, &root, "subc-bind-promoted", |_| {
+        if request_exclusive_rerun() {
+            return Response::error("subc-bind-promoted", "configure_needs_exclusive", "rerun");
+        }
+        ok("subc-bind-promoted")
+    });
+    let snapshot = wait_for_bind_snapshot(
+        &executor,
+        &root,
+        "subc-bind-promoted",
+        Duration::from_secs(5),
+        |snapshot| {
+            snapshot.configure_state == "queued"
+                && snapshot
+                    .oldest_queued_writer_age_ms
+                    .is_some_and(|age| age >= duration_millis_u64(BIND_PROMOTION_AGE) + 100)
+        },
+    );
+    let (mut read, _read_token) = executor.submit_tool_call_cancellable_async(
+        root.clone(),
+        Lane::PureRead,
+        "subc-1-793".to_string(),
+        "read",
+        Box::new(|_| ok("subc-1-793")),
+    );
+    let read_answered = try_recv_within(&mut read, Duration::from_secs(2));
+    let cancel = executor.cancel_job(&root, &token);
+    let bind_response = recv_async(bind, "cancelled promoted bind");
+    let reader_response = reader.finish();
+    if read_answered.is_none() {
+        let _ = recv_async(read, "read after the bind was cancelled");
+    }
+
+    let snapshot = snapshot.expect("the bind waits past its promotion age");
+    let read_answered = read_answered.unwrap_or_else(|| {
+        panic!(
+            "a waiting bind froze new reads behind a stuck reader: {:?}",
+            snapshot.blockers
+        )
+    });
+    assert!(read_answered.success);
+    let stuck = snapshot
+        .in_flight_readers
+        .iter()
+        .find(|reader| reader.request_id == "subc-1-792")
+        .expect("the stuck reader is reported");
+    assert_eq!(stuck.command, "grep");
+    assert!(stuck.started_before_oldest_writer);
+    assert!(stuck.started_age_ms >= duration_millis_u64(READER_STUCK_CENSUS_AGE));
+    assert_eq!(cancel, JobCancelOutcome::QueuedRemoved);
+    assert_eq!(bind_response.data["code"], "request_cancelled");
+    assert!(reader_response.success);
+}
+
+#[test]
+fn quiesced_root_past_grace_signals_running_maintenance_and_refuses_late_work() {
+    let (_dir, root) = test_root("quiesce-running");
+    let ctx = test_ctx();
+    ctx.set_unbound_build_abandon_grace_for_test(Duration::ZERO);
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), Arc::clone(&ctx));
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "running".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                current_job_cancelled(),
+                "running maintenance must observe quiesce"
+            );
+            ok("running")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ctx.mark_subc_unbound();
+    assert_eq!(executor.cancel_queued_root_maintenance(&root), 0);
+    let late = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "late".into(),
+        Box::new(|_| panic!("unbound root admitted maintenance")),
+    );
+    assert!(!recv_async(late, "late unbound maintenance").success);
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "cancelled running maintenance").success);
+    ctx.mark_subc_bound();
+    let rebound = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "rebound".into(),
+        Box::new(|_| {
+            assert!(!current_job_cancelled());
+            ok("rebound")
+        }),
+    );
+    assert!(recv_async(rebound, "rebound maintenance").success);
+}
+
+#[test]
+fn deleted_root_aborts_running_maintenance_without_a_reaper() {
+    let (dir, root) = test_root("deleted-running");
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), test_ctx());
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "deleted".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                current_job_cancelled(),
+                "deletion must abort at the next checkpoint"
+            );
+            ok("deleted")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    dir.close().unwrap();
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "deleted root maintenance").success);
+    let late = executor.submit_maintenance_async(
+        root,
+        Lane::HeavyInit,
+        "late".into(),
+        Box::new(|_| panic!("missing root admitted maintenance")),
+    );
+    assert!(!recv_async(late, "late deleted maintenance").success);
+}
+
+#[test]
+fn quiesced_root_rebound_within_grace_preserves_running_maintenance() {
+    let (_dir, root) = test_root("short-unbind");
+    let ctx = test_ctx();
+    ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(600));
+    ctx.mark_subc_bound();
+    let executor = test_executor(2, 2, 2, 1);
+    executor.register_actor(root.clone(), Arc::clone(&ctx));
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::HeavyInit,
+        "short-unbind".into(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(
+                !current_job_cancelled(),
+                "short rebind must preserve running maintenance"
+            );
+            ok("short-unbind")
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    ctx.mark_subc_unbound();
+    executor.cancel_queued_root_maintenance(&root);
+    ctx.mark_subc_bound();
+    release_tx.send(()).unwrap();
+    assert!(recv_async(running, "short rebind maintenance").success);
 }

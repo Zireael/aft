@@ -1,5 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { constants } from "node:fs";
+import { appendFileSync, constants } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
@@ -61,6 +61,7 @@ export interface AftModuleRuntime {
 
 export interface SubcRig {
   readonly tempDir: string;
+  readonly logDir: string;
   readonly homeDir: string;
   readonly configHome: string;
   readonly runtimeDir: string;
@@ -139,7 +140,21 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const cacheDir = join(tempDir, "cache");
   const storageDir = join(tempDir, "aft-storage");
   const connectionFile = join(runtimeDir, "subc-connection.json");
-  const stderrPath = join(tempDir, "subc-core.stderr.log");
+  // Logs live outside the disposable fixture, including on startup failure.
+  const logRoot = resolve(process.env.AFT_SUBC_E2E_LOG_DIR || join(tmpdir(), "aft-subc-e2e-logs"));
+  await mkdir(logRoot, { recursive: true });
+  const logDir = await mkdtemp(join(logRoot, "rig-"));
+  const stderrPath = join(logDir, "subc-core.stderr.log");
+  console.info(`[subc e2e] diagnostics: ${logDir}`);
+  const moduleStderrPath = join(logDir, "aft.stderr.log");
+  const moduleWrapper = join(tempDir, "aft-with-stderr.sh");
+  // exec preserves the module PID and protocol descriptors; only stderr is redirected.
+  // Capture panics too, which do not necessarily reach AFT's structured file logger.
+  if (process.platform !== "win32") {
+    await writeFile(moduleWrapper, '#!/bin/sh\nlog=$1\nshift\nexec "$@" 2>>"$log"\n', {
+      mode: 0o700,
+    });
+  }
 
   await mkdir(join(configHome, "cortexkit"), { recursive: true });
   await Promise.all([mkdir(homeDir, { recursive: true }), mkdir(runtimeDir, { recursive: true })]);
@@ -150,8 +165,9 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     JSON.stringify(
       {
         storage_dir: storageDir,
-        search_index: false,
+        search_index: true,
         semantic_search: false,
+        disabled_tools: [],
         experimental_bash_background: true,
         bash_permissions: false,
       },
@@ -171,14 +187,16 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
         storage: { backend: "sqlite", data_home: dataHome },
         modules: {
           aft: {
-            program: prepared.aftBinaryPath,
-            args: [],
+            program: process.platform === "win32" ? prepared.aftBinaryPath : moduleWrapper,
+            args: process.platform === "win32" ? [] : [moduleStderrPath, prepared.aftBinaryPath],
             env: {
               HOME: homeDir,
               XDG_CONFIG_HOME: configHome,
               XDG_DATA_HOME: dataHome,
               AFT_CACHE_DIR: cacheDir,
               AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
+              RUST_BACKTRACE: "1",
+              AFT_TEST_DATABASE_OPEN_DELAY_MS: process.env.AFT_TEST_DATABASE_OPEN_DELAY_MS || "0",
             },
             enabled: true,
           },
@@ -210,6 +228,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   let cleaned = false;
   return {
     tempDir,
+    logDir,
     homeDir,
     configHome,
     runtimeDir,
@@ -306,12 +325,15 @@ async function writeBulkFixtureFiles(
 async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
   // A killed runner (test timeout, SIGKILL, worktree reclaim) runs no exit
   // handler at all, so the daemon it started is still alive and has been
-  // reparented to init. Reap those leftovers before starting another daemon,
+  // reparented to init or a subreaper. Reap leftovers before starting a daemon,
   // otherwise they accumulate one per run.
   await sweepReparentedSubcDaemons();
 
   const subc = await resolveSubcCore();
   if (!subc.path) {
+    if (process.env.CI === "true" || process.env.SUBC_CORE_BIN?.trim()) {
+      throw new Error(`e2e setup failed: ${subc.skipReason}`);
+    }
     return {
       aftBinaryPath: null,
       subcCorePath: null,
@@ -393,7 +415,8 @@ function requireWireV2Core(
     path: null,
     skipReason:
       `wire-v2 e2e requires a subc-core wire version 2 daemon; ${source} reports ` +
-      `wire version ${reportedVersion}. No wire-v2 release asset is pinned yet.`,
+      `wire version ${reportedVersion}. Set SUBC_CORE_WIRE_VERSION=2 for a compatible daemon, ` +
+      `or unset SUBC_CORE_BIN to use scripts/fetch-subc-core.sh's pinned cache.`,
   };
 }
 
@@ -521,12 +544,19 @@ async function spawnReadyDaemon(
     daemon.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
       stderrChunks.push(text);
-      void writeFile(dirs.stderrPath, stderrChunks.join(""), "utf8").catch(() => undefined);
+      // Append synchronously so retries cannot race outstanding writes to this file.
+      appendFileSync(dirs.stderrPath, text);
     });
     daemon.stdout.resume();
     trackDaemon(daemon);
 
     try {
+      if (daemon.pid && process.platform !== "win32") {
+        const recordPath = await recordSubcDaemonOwner(daemon.pid);
+        daemon.once("close", () => {
+          void rm(recordPath, { force: true }).catch(() => undefined);
+        });
+      }
       await waitForAftCatalog(dirs.connectionFile, daemon, stderrChunks, START_TIMEOUT_MS);
       return daemon;
     } catch (err) {
@@ -560,7 +590,9 @@ async function waitForAftCatalog(
     }
     await sleep(200);
   }
-  throw new Error(`timed out waiting for aft in subc catalog: ${lastError}`);
+  throw new Error(
+    `timed out waiting for aft in subc catalog: ${lastError}; stderr:\n${stderrChunks.join("")}`,
+  );
 }
 
 async function catalogHasAft(connectionFile: string): Promise<boolean> {
@@ -698,9 +730,9 @@ async function findAftModuleProcess(
  *     The name `ck-subc` is deliberately NOT part of the test: the production
  *     supervisor and other checkouts' supervisors share that name, and only the
  *     cache path distinguishes a daemon this test rig fetched and started.
- *   - its parent is pid 1, meaning the process that started it has exited and
- *     the kernel reparented it. A process with a live parent belongs to a
- *     running test run and is never touched.
+ *   - its recorded runner is gone (including reuse of the runner pid). The
+ *     parent may be a child subreaper rather than pid 1 on Linux. Only older
+ *     daemons without ownership records use parent pid 1 as a fallback.
  */
 export async function sweepReparentedSubcDaemons(
   options: SweepSubcDaemonOptions = {},
@@ -727,19 +759,86 @@ export async function sweepReparentedSubcDaemons(
   const reaped: ReapedSubcDaemon[] = [];
   for (const row of rows) {
     if (row.pid <= 1 || row.pid === process.pid) continue;
-    if (row.ppid !== 1) continue;
     const executable = commandExecutable(row.command);
     if (!isUnderAnyRoot(executable, roots)) continue;
+    const recordPath = daemonOwnerPath(cacheRoot, row.pid);
+    try {
+      const owner = JSON.parse(await readFile(recordPath, "utf8")) as DaemonOwner;
+      // A stale daemon pid or unreadable identity must never authorize a kill.
+      if (
+        !Number.isInteger(owner.runnerPid) ||
+        owner.runnerPid <= 0 ||
+        typeof owner.runnerStart !== "string" ||
+        !owner.runnerStart ||
+        typeof owner.daemonStart !== "string" ||
+        !owner.daemonStart
+      )
+        continue;
+      if ((await processStart(row.pid)) !== owner.daemonStart) continue;
+      if ((await processStart(owner.runnerPid)) === owner.runnerStart) continue;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        log(`[subc-rig] ignoring unreadable ownership for pid=${row.pid}: ${errorText(err)}`);
+        continue;
+      }
+      if (row.ppid !== 1) continue;
+    }
     log(
       `[subc-rig] reaping orphaned subc daemon pid=${row.pid} uptime=${row.elapsed} exe=${executable}`,
     );
     if (await terminatePid(row.pid, options.graceMs ?? 2_000)) {
       reaped.push({ pid: row.pid, uptime: row.elapsed, executable });
+      await rm(recordPath, { force: true });
     } else {
       log(`[subc-rig] orphaned subc daemon pid=${row.pid} did not die; leaving it to the OS`);
     }
   }
   return reaped;
+}
+
+interface DaemonOwner {
+  runnerPid: number;
+  runnerStart: string;
+  daemonStart: string;
+}
+
+function daemonOwnerPath(cacheRoot: string, pid: number): string {
+  return join(cacheRoot, ".rig-owners", `${pid}.json`);
+}
+
+/** Persist ownership before readiness so a crashed runner can be swept later. */
+export async function recordSubcDaemonOwner(
+  daemonPid: number,
+  cacheRoot = FETCHED_SUBC_CORE_CACHE_ROOT,
+  runnerPid = process.pid,
+): Promise<string> {
+  const runnerStart = await processStart(runnerPid);
+  const daemonStart = await processStart(daemonPid);
+  if (!runnerStart || !daemonStart)
+    throw new Error("Cannot record daemon ownership: process exited");
+  const path = daemonOwnerPath(cacheRoot, daemonPid);
+  await mkdir(join(cacheRoot, ".rig-owners"), { recursive: true });
+  await writeFile(path, JSON.stringify({ runnerPid, runnerStart, daemonStart }), "utf8");
+  return path;
+}
+
+async function processStart(pid: number): Promise<string | null> {
+  if (process.platform === "linux") {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      // Field 22 is start time in clock ticks; the command in parentheses can contain spaces.
+      const ticks = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19];
+      const boot = await readFile("/proc/sys/kernel/random/boot_id", "utf8");
+      return ticks ? `${boot.trim()}:${ticks}` : null;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+  const result = await runProcess("ps", ["-p", String(pid), "-o", "lstart="], PROJECT_ROOT);
+  if (result.code === 1 && !result.output.trim()) return null;
+  if (result.code !== 0) throw new Error(`Cannot read process start: ${result.output}`);
+  return result.output.trim() || null;
 }
 
 async function cacheRootPrefixes(cacheRoot: string): Promise<string[]> {

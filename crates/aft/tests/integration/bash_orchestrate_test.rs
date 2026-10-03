@@ -205,6 +205,62 @@ fn orchestrated_foreground_promotes_after_wait_window() {
     assert!(aft.shutdown().success());
 }
 
+/// A pipeline promoted to the background must report a masked upstream
+/// failure the way a foreground run does. Here `head` exits 0 while the middle
+/// `grep` exits 1 (it matches nothing), so the completion and `bash_status`
+/// must both name `grep`, not only show `head`'s exit code.
+#[test]
+fn promoted_pipeline_reports_the_failed_middle_stage() {
+    let mut aft = spawn_with_wait(SHORT_WAIT_MS);
+    let dir = tempfile::tempdir().unwrap();
+    configure_bash_background(&mut aft, &dir, PROMOTION_WAIT_MS);
+
+    let response = aft.send_with_timeout(
+        &bash_request(
+            "bash-promote-pipeline",
+            json!({
+                "command": "sleep 2 | grep definitely-absent-token | head -1",
+                "foreground_orchestrate": true,
+            }),
+        ),
+        HANG_CATCH,
+    );
+    assert_eq!(response["success"], true, "response: {response:?}");
+    assert_eq!(response["status"], "running", "response: {response:?}");
+    let task_id = response["task_id"].as_str().expect("task_id").to_string();
+    assert!(
+        response["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("promoted to background: {task_id}")),
+        "response: {response:?}"
+    );
+
+    let note = "note: `grep` (segment 2 of 3) exited 1; the pipeline's exit code is `head`'s.";
+    let completion = wait_for_bash_completed_frame(&mut aft, &task_id);
+    let status = aft.send(
+        &json!({
+            "id": "bash-promote-pipeline-status",
+            "method": "bash_status",
+            "params": { "task_id": task_id },
+        })
+        .to_string(),
+    );
+    for observed in [&completion, &status] {
+        assert_eq!(observed["status"], "completed", "{observed:?}");
+        assert_eq!(observed["exit_code"], 0, "{observed:?}");
+        assert!(
+            observed["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(note),
+            "a promoted pipeline must name its failed middle stage: {observed:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn orchestrated_block_to_completion_does_not_promote() {
     let mut aft = spawn_with_wait("300");

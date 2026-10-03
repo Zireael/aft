@@ -1,7 +1,7 @@
 //! Offline measurement harness for one-file incremental callgraph refreshes.
 //!
 //! Run against a copy of a production store:
-//! `AFT_CALLGRAPH_REFRESH_STORE=/path/to/<root-key> AFT_CALLGRAPH_REFRESH_ROOT=/path/to/project cargo test -p agent-file-tools --test callgraph_refresh_bench -- --ignored --nocapture`
+//! `AFT_CALLGRAPH_REFRESH_STORE=/path/to/<root-key> AFT_CALLGRAPH_REFRESH_ROOT=/path/to/project cargo test -p agent-file-tools --test rest callgraph_refresh_bench:: -- --ignored --nocapture`
 //! Set `AFT_CALLGRAPH_REFRESH_FILE` to choose a project-relative file, or
 //! `AFT_CALLGRAPH_REFRESH_PATHS` to a newline-delimited list for a real transition.
 //! In path-list mode the copied store must represent the base and the project

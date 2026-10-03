@@ -8,9 +8,11 @@ import {
   type AutoInstallConfig,
   ensureInstallAnchor,
   pushLspPathsAfterAutoInstall,
+  resolveTargetVersion,
   runAutoInstall,
 } from "../lsp-auto-install";
-import { lspBinaryPath, writeInstalledMeta } from "../lsp-cache";
+import { lspBinaryPath, writeInstalledMeta, writeVersionCheck } from "../lsp-cache";
+import { findNpmServerById } from "../lsp-npm-table";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -72,14 +74,14 @@ function defaultConfig(overrides: Partial<AutoInstallConfig> = {}): AutoInstallC
  * given npm package. Writes the binary AND a valid installed-metadata
  * record so Lane F's TOFU sha256 validation accepts the cache entry.
  */
-function fakeInstalled(npmPackage: string, binary: string): string {
+function fakeInstalled(npmPackage: string, binary: string, version = "1.0.0"): string {
   const path = lspBinaryPath(npmPackage, binary);
   mkdirSync(join(path, ".."), { recursive: true });
   const content = "#!/bin/sh\nexit 0\n";
   writeFileSync(path, content);
   const sha256 = createHash("sha256").update(content).digest("hex");
   // Version is arbitrary but must pass isSafeVersion (semver-ish).
-  writeInstalledMeta(npmPackage, "1.0.0", sha256);
+  writeInstalledMeta(npmPackage, version, sha256);
   return path;
 }
 
@@ -123,6 +125,18 @@ describe("runAutoInstall", () => {
     expect(result.cachedBinDirs[0]).toContain("typescript-language-server");
   });
 
+  test("surfaces the separately cached TypeScript SDK for fresh worktrees", async () => {
+    // The SDK entry only accepts the 5.x line, so the fixture uses a 5.x version.
+    fakeInstalled("typescript", "tsserver", "5.9.3");
+    const result = await runAutoInstall(
+      tempProject,
+      defaultConfig({ autoInstall: false }),
+      fakeFetch(),
+    );
+    expect(result.cachedBinDirs).toHaveLength(1);
+    expect(result.cachedBinDirs[0]).toContain("typescript");
+  });
+
   test("disabled config blocks discovery for that server", async () => {
     // Make project relevant to TypeScript by creating a package.json.
     writeFileSync(join(tempProject, "package.json"), "{}");
@@ -134,6 +148,7 @@ describe("runAutoInstall", () => {
     // Disabled entries appear in skipped with reason "disabled by config".
     const disabledEntries = result.skipped.filter((s) => s.reason.includes("disabled"));
     expect(disabledEntries.map((s) => s.id)).toContain("typescript");
+    expect(disabledEntries.map((s) => s.id)).toContain("typescript-sdk");
     expect(disabledEntries.map((s) => s.id)).toContain("biome");
   });
 
@@ -339,5 +354,101 @@ describe("runAutoInstall", () => {
       const missing = join(tmpdir(), `aft-anchor-missing-${Date.now()}`, "nope");
       expect(() => ensureInstallAnchor(missing)).not.toThrow();
     });
+  });
+});
+
+describe("typescript-sdk version cap", () => {
+  /** Registry response whose releases were published `days` ago. */
+  function registryFetch(releases: Record<string, number>): typeof fetch {
+    return (async () => {
+      const now = Date.now();
+      const time: Record<string, string> = {};
+      for (const [version, days] of Object.entries(releases)) {
+        time[version] = isoDaysAgo(now, days);
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { time };
+        },
+      } as Response;
+    }) as typeof fetch;
+  }
+
+  function sdkSpec() {
+    const spec = findNpmServerById("typescript-sdk");
+    if (!spec) throw new Error("typescript-sdk entry missing");
+    return spec;
+  }
+
+  test("a fresh cached 7.x decision is ignored and the newest 5.x is chosen", async () => {
+    // Before the cap, the version check cache recorded 7.0.2 as the latest
+    // eligible release. Consuming it would keep reinstalling the native
+    // compiler, which has no tsserver.js.
+    writeVersionCheck("typescript", "7.0.2");
+    const { version } = await resolveTargetVersion(
+      sdkSpec(),
+      defaultConfig(),
+      registryFetch({ "5.8.3": 200, "5.9.3": 120, "6.0.2": 60, "7.0.2": 30 }),
+    );
+    // 5.9.3 differs from an installed 7.0.2, so the installer reinstalls.
+    expect(version).toBe("5.9.3");
+  });
+
+  test("a failed probe does not fall back to a cached 7.x decision", async () => {
+    writeVersionCheck("typescript", "7.0.2");
+    const failingFetch = (async () => {
+      throw new Error("network down");
+    }) as typeof fetch;
+    const { version } = await resolveTargetVersion(
+      sdkSpec(),
+      defaultConfig({ graceDays: 0 }),
+      failingFetch,
+    );
+    expect(version).toBeNull();
+  });
+
+  test("a user pin still wins over the cap", async () => {
+    const { version, pinned } = await resolveTargetVersion(
+      sdkSpec(),
+      defaultConfig({ versions: { typescript: "7.0.2" } }),
+      registryFetch({ "5.9.3": 120 }),
+    );
+    expect(version).toBe("7.0.2");
+    expect(pinned).toBe(true);
+  });
+
+  test("a cached 7.x install is neither surfaced nor kept as the existing install", async () => {
+    writeFileSync(join(tempProject, "tsconfig.json"), "{}");
+    fakeInstalled("typescript", "tsserver", "7.0.2");
+    // A 365-day grace window blocks every release, so no npm install runs.
+    const result = runAutoInstall(
+      tempProject,
+      defaultConfig({ graceDays: 365 }),
+      registryFetch({ "5.9.3": 120, "7.0.2": 30 }),
+    );
+    await result.installsComplete;
+    expect(
+      result.cachedBinDirs.some((dir) => dir.includes(join("typescript", "node_modules"))),
+    ).toBe(false);
+    const sdkSkip = result.skipped.find((s) => s.id === "typescript-sdk");
+    expect(sdkSkip?.reason).toContain("7.0.2 is outside the supported 5.x line");
+  });
+
+  test("a cached 5.x install is still kept when no newer release is eligible", async () => {
+    writeFileSync(join(tempProject, "tsconfig.json"), "{}");
+    fakeInstalled("typescript", "tsserver", "5.9.3");
+    const result = runAutoInstall(
+      tempProject,
+      defaultConfig({ graceDays: 365 }),
+      registryFetch({ "5.9.3": 120, "7.0.2": 30 }),
+    );
+    await result.installsComplete;
+    expect(
+      result.cachedBinDirs.some((dir) => dir.includes(join("typescript", "node_modules"))),
+    ).toBe(true);
+    const sdkSkip = result.skipped.find((s) => s.id === "typescript-sdk");
+    expect(sdkSkip?.reason).toBe("kept existing install");
   });
 });

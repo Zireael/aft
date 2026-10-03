@@ -22,6 +22,43 @@ use crate::watcher_filter::{
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[cfg(test)]
+struct HandoffWriteForTest {
+    root: PathBuf,
+    path: PathBuf,
+    written: bool,
+    observed_by_old: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static HANDOFF_WRITE_FOR_TEST: std::sync::Mutex<Option<HandoffWriteForTest>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn write_during_stream_handoff_for_test(root: &Path) {
+    let hook = {
+        let mut guard = HANDOFF_WRITE_FOR_TEST.lock().unwrap();
+        guard
+            .as_mut()
+            .filter(|hook| hook.root == root && !hook.written)
+            .map(|hook| {
+                hook.written = true;
+                (hook.path.clone(), Arc::clone(&hook.observed_by_old))
+            })
+    };
+    if let Some((path, observed_by_old)) = hook {
+        std::fs::write(&path, b"handoff-visible-marker").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !observed_by_old.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            observed_by_old.load(Ordering::Acquire),
+            "old stream did not observe handoff write"
+        );
+    }
+}
+
 pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
@@ -46,7 +83,18 @@ impl ProjectWatcher {
         super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
-        let stream = FsEventsStream::start(&root, &exclusion_paths, backend_tx.clone())?;
+        // Capture the journal cursor before starting the first stream. If no
+        // callback has run by the time exclusions change, this still precedes
+        // every event that might be waiting in the old stream's latency window.
+        let last_delivered_id =
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() }));
+        let stream = FsEventsStream::start(
+            &root,
+            &exclusion_paths,
+            backend_tx.clone(),
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::clone(&last_delivered_id),
+        )?;
         let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(
             observed_generation,
@@ -80,28 +128,59 @@ impl ProjectWatcher {
                         );
                         let replacement_exclusions = replacement_plan.selected;
                         let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
-                        match FsEventsStream::start(&root, &replacement_paths, stream.sender()) {
-                            Ok(replacement) => {
-                                stream = replacement;
-                                observed_generation = generation;
-                                counters.set_backend_exclusions(
-                                    observed_generation,
-                                    replacement_paths,
-                                    watcher_exclusion_paths(&replacement_plan.dropped),
-                                );
-                                if replacement_exclusions != exclusions {
-                                    super::log_exclusions(
-                                        &root,
-                                        &replacement_exclusions,
-                                        observed_generation,
-                                    );
-                                    exclusions = replacement_exclusions;
+                        // Starting a replacement with SinceNow can lose file events
+                        // delivered between the old stream's last callback and the
+                        // new stream's first callback. A new matcher generation alone
+                        // does not require a new stream when its backend exclusions
+                        // are unchanged.
+                        if replacement_paths != watcher_exclusion_paths(&exclusions) {
+                            let since_when = last_delivered_id.load(Ordering::Acquire);
+                            #[cfg(test)]
+                            write_during_stream_handoff_for_test(&root);
+                            let replacement = match FsEventsStream::start(
+                                &root,
+                                &replacement_paths,
+                                stream.sender(),
+                                if since_when == 0 {
+                                    fs::kFSEventStreamEventIdSinceNow
+                                } else {
+                                    since_when
+                                },
+                                Arc::clone(&last_delivered_id),
+                            ) {
+                                Ok(replacement) => replacement,
+                                Err(error) => {
+                                    let _ = tx.send(Err(error));
+                                    return;
                                 }
-                            }
-                            Err(error) => {
-                                let _ = tx.send(Err(error));
+                            };
+                            // The old stream stays active until the replacement
+                            // starts. Replaying from the last delivered event ID
+                            // covers events still buffered by the old stream.
+                            stream = replacement;
+                            if since_when == 0
+                                && tx
+                                    .send(Ok(Event::new(EventKind::Other)
+                                        .set_flag(Flag::Rescan)
+                                        .set_info("rescan: missing event cursor")))
+                                    .is_err()
+                            {
                                 return;
                             }
+                        }
+                        observed_generation = generation;
+                        counters.set_backend_exclusions(
+                            observed_generation,
+                            replacement_paths,
+                            watcher_exclusion_paths(&replacement_plan.dropped),
+                        );
+                        if replacement_exclusions != exclusions {
+                            super::log_exclusions(
+                                &root,
+                                &replacement_exclusions,
+                                observed_generation,
+                            );
+                            exclusions = replacement_exclusions;
                         }
                     }
 
@@ -145,10 +224,15 @@ impl FsEventsStream {
         root: &Path,
         exclusions: &[PathBuf],
         sender: mpsc::Sender<notify::Result<Event>>,
+        since_when: fs::FSEventStreamEventId,
+        last_delivered_id: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
         let watched_paths = create_cf_path_array(std::slice::from_ref(&root.to_path_buf()))?;
         let context_info = Box::into_raw(Box::new(CallbackContext {
             sender: sender.clone(),
+            last_delivered_id,
+            #[cfg(test)]
+            replay_stream: since_when != fs::kFSEventStreamEventIdSinceNow,
         }));
         let context = fs::FSEventStreamContext {
             version: 0,
@@ -163,7 +247,7 @@ impl FsEventsStream {
                 callback,
                 &context,
                 watched_paths,
-                fs::kFSEventStreamEventIdSinceNow,
+                since_when,
                 FSEVENTS_LATENCY_SECONDS,
                 fs::kFSEventStreamCreateFlagFileEvents,
             )
@@ -277,6 +361,9 @@ impl Drop for FsEventsStream {
 
 struct CallbackContext {
     sender: mpsc::Sender<notify::Result<Event>>,
+    last_delivered_id: Arc<AtomicU64>,
+    #[cfg(test)]
+    replay_stream: bool,
 }
 
 extern "C" fn release_context(info: *const libc::c_void) {
@@ -291,7 +378,7 @@ extern "C" fn callback(
     event_count: usize,
     event_paths: *mut libc::c_void,
     event_flags: *const fs::FSEventStreamEventFlags,
-    _event_ids: *const fs::FSEventStreamEventId,
+    event_ids: *const fs::FSEventStreamEventId,
 ) {
     unsafe {
         let context = &*(info as *const CallbackContext);
@@ -299,23 +386,51 @@ extern "C" fn callback(
         for index in 0..event_count {
             let bytes = CStr::from_ptr(*paths.add(index)).to_bytes().to_vec();
             let path = PathBuf::from(OsString::from_vec(bytes));
+            #[cfg(test)]
+            if !context.replay_stream {
+                // The handoff test withholds this file from the old stream so
+                // only journal replay by the replacement can deliver it.
+                let guard = HANDOFF_WRITE_FOR_TEST.lock().unwrap();
+                if let Some(hook) = guard
+                    .as_ref()
+                    .filter(|hook| hook.path == path && hook.written)
+                {
+                    hook.observed_by_old.store(true, Ordering::Release);
+                    continue;
+                }
+            }
             let flags = *event_flags.add(index);
             for event in translate_event(flags, &path) {
                 if context.sender.send(Ok(event)).is_err() {
                     return;
                 }
             }
+            if has_flag(flags, fs::kFSEventStreamEventFlagEventIdsWrapped) {
+                context.last_delivered_id.store(0, Ordering::Release);
+            } else if !has_flag(flags, fs::kFSEventStreamEventFlagHistoryDone) {
+                context
+                    .last_delivered_id
+                    .fetch_max(*event_ids.add(index), Ordering::Release);
+            }
         }
     }
 }
 
 fn translate_event(flags: fs::FSEventStreamEventFlags, path: &Path) -> Vec<Event> {
+    if has_flag(flags, fs::kFSEventStreamEventFlagEventIdsWrapped) {
+        return vec![Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .set_info("rescan: event IDs wrapped")];
+    }
     if has_flag(flags, fs::kFSEventStreamEventFlagHistoryDone) {
         return Vec::new();
     }
 
     let mut events = Vec::new();
-    if has_flag(flags, fs::kFSEventStreamEventFlagMustScanSubDirs) {
+    if has_flag(flags, fs::kFSEventStreamEventFlagMustScanSubDirs)
+        || has_flag(flags, fs::kFSEventStreamEventFlagUserDropped)
+        || has_flag(flags, fs::kFSEventStreamEventFlagKernelDropped)
+    {
         let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
         events.push(if has_flag(flags, fs::kFSEventStreamEventFlagUserDropped) {
             event.set_info("rescan: user dropped")
@@ -617,12 +732,15 @@ mod tests {
         assert_eq!(user[0].info(), Some("rescan: user dropped"));
         assert!(kernel[0].need_rescan());
         assert_eq!(kernel[0].info(), Some("rescan: kernel dropped"));
+        let wrapped = translate_event(fs::kFSEventStreamEventFlagEventIdsWrapped, path);
+        assert!(wrapped[0].need_rescan());
+        assert!(translate_event(fs::kFSEventStreamEventFlagHistoryDone, path).is_empty());
     }
 
     /// The backend half of a matcher loaded after the watcher started: the
     /// first plan can only see `.git`, and publishing the matcher (which always
     /// bumps the generation) must make the running backend re-derive and
-    /// install `target/` without a restart.
+    /// install `target/` without losing an event at the stream handoff.
     #[test]
     #[ignore = "requires a live macOS FSEvents service"]
     fn backend_rederives_exclusions_when_matcher_is_published_after_start() {
@@ -636,7 +754,7 @@ mod tests {
         let matcher: SharedGitignore = Arc::new(RwLock::new(None));
         let generation = Arc::new(AtomicU64::new(0));
         let counters = crate::context::watcher_counters_for_root(&canonical_root);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let watcher = ProjectWatcher::create(
             canonical_root.clone(),
             Vec::new(),
@@ -652,6 +770,16 @@ mod tests {
         let mut builder = GitignoreBuilder::new(&canonical_root);
         builder.add(canonical_root.join(".gitignore"));
         *matcher.write().unwrap() = Some(Arc::new(builder.build().unwrap()));
+        // Deliver the write to the old callback before starting the new
+        // stream; that callback is suppressed in this test so replay must
+        // recover the event from the journal without a full rescan.
+        let handoff_file = canonical_root.join("handoff-visible.txt");
+        *HANDOFF_WRITE_FOR_TEST.lock().unwrap() = Some(HandoffWriteForTest {
+            root: canonical_root.clone(),
+            path: handoff_file.clone(),
+            written: false,
+            observed_by_old: Arc::new(AtomicBool::new(false)),
+        });
         generation.fetch_add(1, Ordering::SeqCst);
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -659,13 +787,48 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let after = counters.backend_exclusions();
-        drop(watcher);
         assert_eq!(after.matcher_generation, 1);
         assert!(
             after.paths.contains(&target),
             "published matcher never reached the running backend: {:?}",
             after.paths
         );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_handoff_file = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(event)) => {
+                    assert!(
+                        !event.need_rescan(),
+                        "journal replay should avoid a rescan: {event:?}"
+                    );
+                    saw_handoff_file |= event.paths.contains(&handoff_file);
+                    if saw_handoff_file {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => panic!("backend error: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("backend disconnected: {error}"),
+            }
+        }
+        assert!(saw_handoff_file, "handoff write was not delivered");
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(100)) {
+            assert!(
+                !event.expect("backend event should succeed").need_rescan(),
+                "journal replay must not request a full rescan"
+            );
+        }
+        assert!(
+            HANDOFF_WRITE_FOR_TEST
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .written
+        );
+        HANDOFF_WRITE_FOR_TEST.lock().unwrap().take();
+        drop(watcher);
     }
 
     #[test]
@@ -677,8 +840,14 @@ mod tests {
         assert!(!excluded.exists());
 
         let (tx, rx) = mpsc::channel();
-        let stream =
-            FsEventsStream::start(&canonical_root, std::slice::from_ref(&excluded), tx).unwrap();
+        let stream = FsEventsStream::start(
+            &canonical_root,
+            std::slice::from_ref(&excluded),
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
         let _startup_events = rx.try_iter().collect::<Vec<_>>();
 
@@ -770,7 +939,14 @@ mod tests {
         assert!(!target.exists());
 
         let (tx, rx) = mpsc::channel();
-        let stream = FsEventsStream::start(&canonical_root, &exclusion_paths, tx).unwrap();
+        let stream = FsEventsStream::start(
+            &canonical_root,
+            &exclusion_paths,
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
         let _startup_events = rx.try_iter().collect::<Vec<_>>();
         let debug = target.join("debug");
@@ -1030,7 +1206,14 @@ mod tests {
         let exclusion_paths = watcher_exclusion_paths(&plan.selected);
 
         let (tx, rx) = mpsc::channel();
-        let stream = FsEventsStream::start(&root, &exclusion_paths, tx).unwrap();
+        let stream = FsEventsStream::start(
+            &root,
+            &exclusion_paths,
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
         let _startup_events = rx.try_iter().count();
         for index in 0..200 {
@@ -1056,7 +1239,14 @@ mod tests {
             .filter(|path| path != &nested)
             .collect::<Vec<_>>();
         let (tx, rx) = mpsc::channel();
-        let stream = FsEventsStream::start(&root, &control_exclusions, tx).unwrap();
+        let stream = FsEventsStream::start(
+            &root,
+            &control_exclusions,
+            tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(100));
         let _startup_events = rx.try_iter().count();
         for index in 200..400 {

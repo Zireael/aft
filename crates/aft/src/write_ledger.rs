@@ -198,6 +198,7 @@ impl Counter {
     }
 }
 
+#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
 fn saturating_add(value: &AtomicU64, delta: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(delta))
@@ -520,7 +521,12 @@ fn fold_minute_with_sample(
         .zip(process_sample)
         .and_then(|(before, after)| after.delta(before));
 
-    let tx = conn.transaction()?;
+    // Take the write lock at BEGIN, where SQLite's busy handler covers the
+    // wait. A deferred transaction that reads before its first write has to
+    // upgrade its lock later, and SQLite answers a contended upgrade with
+    // `database is locked` at once, without waiting. A busy result here leaves
+    // every pending counter untouched for the next fold.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (entry, logical, physical) in &folded {
         tx.execute(
             "INSERT INTO write_ledger_minutes
@@ -984,6 +990,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expired, 0);
+    }
+
+    /// A fold that cannot open its transaction (in production: another
+    /// process holds the write lock) must lose nothing: its bytes stay pending
+    /// in memory and the next successful fold writes all of them.
+    #[test]
+    fn fold_that_cannot_begin_keeps_pending_bytes_for_the_next_fold() {
+        let _guard = test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let root = test_root("deferred-fold");
+        let counter = register(Domain::SemanticDelta, root.clone());
+        let start = 20 * MINUTE_MS;
+        set_process_baseline_for_test(Some(Bytes::default()), start);
+        counter.credit(11, 7);
+
+        // An open transaction on the same connection makes the fold's BEGIN
+        // fail before it writes anything, like a busy write lock would.
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(fold_minute_with_sample(&mut conn, start, None).is_err());
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(pending_for_test(Domain::SemanticDelta, &root), (11, 7));
+
+        counter.credit(2, 1);
+        fold_minute_with_sample(&mut conn, start + MINUTE_MS, None).unwrap();
+        let folded: (u64, u64) = conn
+            .query_row(
+                "SELECT SUM(logical_bytes), SUM(physical_bytes)
+                 FROM write_ledger_minutes WHERE root_id = ?1",
+                [&root],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(folded, (13, 8));
+        assert_eq!(pending_for_test(Domain::SemanticDelta, &root), (0, 0));
     }
 
     #[test]

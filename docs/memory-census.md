@@ -44,6 +44,7 @@ The `data` payload is:
       "lsp_idle_ttl_ms": 600000,
       "evictable_in_ms": 1800000,
       "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "inspect": 0},
+      "semantic_worker_bytes": 0,
       "attributed_bytes": 0,
       "evictable_bytes": 0,
       "lsp_children": {"count": 0, "rss_bytes": 0}
@@ -66,7 +67,18 @@ The `data` payload is:
 }
 ```
 
-`roots` is never capped. `evictable_in_ms` is null while a root has a bound
+`roots` is never capped. `semantic_worker_bytes` is the private index payload
+owned by semantic refresh threads for that root and is **already included** in
+`planes.semantic` and the attributed totals. It sums overlapping retiring and
+replacement workers until they exit; detaching a worker handle does not erase
+its allocation. Shared bases contribute zero to this field and remain counted
+once in the process shared-base total. Estimates update on worker creation and
+after each refresh (including failed refreshes); transient in-flight buffers,
+allocator capacity/size-class overhead and embedding models are not included.
+The richer status semantic estimate separates `serving_index_bytes` and
+`worker_index_bytes`.
+
+`evictable_in_ms` is null while a root has a bound
 route, and otherwise is the configured root idle TTL minus its request age
 (clamped at zero). `evictable_bytes` is the artifact, symbol, and inspect data
 released by the idle reaper, not a second estimate.

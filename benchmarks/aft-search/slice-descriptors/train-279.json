@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rust-core-audit-boundaries",
+    "bash-rewrite-literal-only",
+    "rust-analyzer-target-dir",
+    "git-hook-dispatch-scopes",
+    "worker-guide"
+  ],
+  "note": "No ranking-fence file is touched: Rust core boundary fixes (UTF-8 tail and percent-decode slicing, fuzzy whitespace width and CRLF separators, generated-path relativization in inspect, LSP utf8 charset, case-only rename, Cargo workspace membership, compressor global options); the bash rewrite declines expanding words and heredocs; rust-analyzer checks use their own target directory; the git hook dispatcher resolves core.hooksPath across worktree, local, global and system scopes; the mason worker guide."
+}

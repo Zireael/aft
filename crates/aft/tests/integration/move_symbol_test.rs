@@ -907,8 +907,10 @@ export function useHelper(): string {
     );
 
     let source_content = std::fs::read_to_string(&source).expect("read source");
+    // The source file has no other imports and no formatter config, so the new
+    // statement takes the same default spelling add_import uses.
     assert!(
-        source_content.contains("import { helper } from './helpers';"),
+        source_content.contains("import { helper } from \"./helpers\";"),
         "source should import the moved helper from destination:
 {source_content}"
     );
@@ -1038,8 +1040,10 @@ export function useLogger(): string {
     assert_eq!(resp["success"], true, "move should succeed: {resp:?}");
 
     let source_content = std::fs::read_to_string(&source).expect("read source");
+    // The source file has no other imports and no formatter config, so the new
+    // statement takes the same default spelling add_import uses.
     assert!(
-        source_content.contains("import { logger } from './dest';"),
+        source_content.contains("import { logger } from \"./dest\";"),
         "unshadowed source reference should import logger from dest:\n{source_content}"
     );
     assert!(

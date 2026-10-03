@@ -57,7 +57,8 @@ maybeDescribe("e2e import commands", () => {
 
     expect(response.success).toBe(true);
     expect(response.added).toBe(true);
-    expect(await readTextFile(filePath)).toContain("import { debounce } from 'lodash';");
+    // The fixture's imports use double quotes, and new imports follow the file.
+    expect(await readTextFile(filePath)).toContain('import { debounce } from "lodash";');
   });
 
   test("removes an import", async () => {
@@ -86,8 +87,8 @@ maybeDescribe("e2e import commands", () => {
 
     expect(response.success).toBe(true);
     const content = await readTextFile(filePath);
-    const axiosIndex = content.indexOf("import axios from 'axios';");
-    const parseIndex = content.indexOf("import { parse } from 'jsonc-parser';");
+    const axiosIndex = content.indexOf('import axios from "axios";');
+    const parseIndex = content.indexOf('import { parse } from "jsonc-parser";');
     expect(axiosIndex).toBeGreaterThanOrEqual(0);
     expect(parseIndex).toBeGreaterThanOrEqual(0);
     expect(axiosIndex).toBeLessThan(parseIndex);
@@ -109,7 +110,7 @@ maybeDescribe("e2e import commands", () => {
     expect(added).toContain(`file ${resolvedFilePath}`);
     expect(added).toContain("group ");
     expect(added.trim().startsWith("{")).toBe(false);
-    expect(await readTextFile(filePath)).toContain("import { debounce } from 'lodash';");
+    expect(await readTextFile(filePath)).toContain('import { debounce } from "lodash";');
 
     const alreadyPresent = toolResultText(
       await tool.execute(
@@ -180,7 +181,8 @@ maybeDescribe("e2e import commands", () => {
       expect(output).toContain("added zod");
       expect(asks.some((call) => call.permission === "external_directory")).toBe(true);
       expect(asks.some((call) => call.permission === "edit")).toBe(true);
-      expect(await readTextFile(externalFile)).toContain("import { z } from 'zod';");
+      // A file with no imports and no formatter config gets double quotes.
+      expect(await readTextFile(externalFile)).toContain('import { z } from "zod";');
     } finally {
       rmSync(external, { recursive: true, force: true });
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SUBC_CORE_TAG="subc-core-v0.3.0"
+SUBC_CORE_TAG="subc-core-v0.14.0"
 SUBC_CORE_WIRE_VERSION="2"
 SUBC_REPO="cortexkit/subconscious"
 BIN_NAME="ck-subc"
@@ -89,7 +89,7 @@ extract_cached_binary() {
   local temp_extract
   temp_extract="$(mktemp -d "${TMPDIR:-/tmp}/subc-core-extract.XXXXXX")"
   trap 'rm -rf "$temp_extract"' RETURN
-  tar -xzf "$tarball" -C "$temp_extract"
+  unzip -q "$tarball" -d "$temp_extract"
   [[ -f "$temp_extract/$BIN_NAME" ]] || fail "Archive $tarball did not contain $BIN_NAME"
   mkdir -p "$destination_dir"
   cp "$temp_extract/$BIN_NAME" "$destination_dir/$BIN_NAME"
@@ -101,14 +101,14 @@ extract_cached_binary() {
 TARGET="$(resolve_target)"
 case "$TARGET" in
   darwin-arm64)
-    EXPECTED_SHA256="6c5876f3c1ea5d3fc6a710fe724113985b6c0a61a76744af4f7a43c5d474756b"
+    EXPECTED_SHA256="170021619fe1d89617e9b85c06cab58ce5f834bc386d43ded60e32a5db227604"
     ;;
   linux-x64)
-    EXPECTED_SHA256="b2a3894f3b87db29f23ae4f289d88aff3484c2246b8a1332330c42e3b727f7e3"
+    EXPECTED_SHA256="33e6285726408a96998cc4be74ad0c1797fb4f3d7e2a1bc33a7f5f83c4755ac0"
     ;;
 esac
 SHA256_TOOL="$(resolve_sha256_tool)"
-TARBALL_NAME="$BIN_NAME-$TARGET.tar.gz"
+TARBALL_NAME="$BIN_NAME-$TARGET.zip"
 SIDECAR_NAME="$TARBALL_NAME.sha256"
 CACHED_TARBALL="$CACHE_DIR/$TARBALL_NAME"
 CACHED_SIDECAR="$CACHE_DIR/$SIDECAR_NAME"

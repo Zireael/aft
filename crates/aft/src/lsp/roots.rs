@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use globset::Glob;
-
 use crate::lsp::registry::ServerKind;
 
 pub fn find_workspace_root<S>(file_path: &Path, markers: &[S]) -> Option<PathBuf>
@@ -178,6 +176,21 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
     let Ok(crate_relative_path) = crate_root.strip_prefix(workspace_root) else {
         return false;
     };
+    // Cargo gives literal members precedence over excludes. This only models
+    // declared members; implicit membership through path dependencies is not
+    // inferred here.
+    if workspace
+        .get("members")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .any(|member| Path::new(member.trim()) == crate_relative_path)
+        })
+    {
+        return true;
+    }
     if workspace
         .get("exclude")
         .and_then(toml::Value::as_array)
@@ -185,7 +198,7 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
             patterns
                 .iter()
                 .filter_map(toml::Value::as_str)
-                .any(|pattern| cargo_member_pattern_matches(pattern, crate_relative_path))
+                .any(|pattern| crate_relative_path.starts_with(pattern.trim()))
         })
     {
         return false;
@@ -205,9 +218,62 @@ fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> b
 }
 
 fn cargo_member_pattern_matches(pattern: &str, crate_relative_path: &Path) -> bool {
-    Glob::new(pattern.trim())
+    globset::GlobBuilder::new(pattern.trim())
+        .literal_separator(true)
+        .build()
         .map(|glob| glob.compile_matcher().is_match(crate_relative_path))
         .unwrap_or(false)
+}
+
+/// The highest directory, from `nearest` up to `project_root`, that holds one
+/// of a server's root markers. `nearest` is returned when it lies outside the
+/// project root or no higher directory has a marker.
+pub fn outermost_marker_root(
+    nearest: &Path,
+    project_root: &Path,
+    has_marker: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let mut chosen = nearest.to_path_buf();
+    if !nearest.starts_with(&project_root) {
+        return chosen;
+    }
+    let mut current = nearest.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(&project_root) {
+            break;
+        }
+        if has_marker(dir) {
+            chosen = dir.to_path_buf();
+        }
+        if dir == project_root {
+            break;
+        }
+        current = dir.parent();
+    }
+    chosen
+}
+
+/// Whether a walk that chooses language servers skips this entry and
+/// everything under it.
+///
+/// Dependency and build output directories hold no project sources. Test
+/// fixtures, corpora and `spikes/` do hold sources, but they are inputs to
+/// tests or throwaway experiments, often with their own manifests: each one
+/// would start another server (a fixture `Cargo.toml` is a separate
+/// rust-analyzer workspace; a spike with a stale `Cargo.lock` fails its
+/// workspace load) whose diagnostics nobody asked for. The walk root itself
+/// (`depth == 0`) is never skipped, so a scope that names such a directory
+/// still gets its servers. Ignore files (`.gitignore`, `.aftignore`) are
+/// applied by the walker itself.
+pub fn skip_in_server_walk(name: &str, depth: usize) -> bool {
+    if matches!(
+        name,
+        ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".turbo"
+    ) {
+        return true;
+    }
+    depth > 0 && (name == "spikes" || crate::inspect::job::is_test_support_dir_name(name))
 }
 
 /// Composite key for caching server instances.
@@ -462,5 +528,51 @@ mod tests {
             None,
             "marker lookup must not cross the session project root"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn cargo_member_star_stays_in_directory() {
+        assert!(super::cargo_member_pattern_matches(
+            "crates/*",
+            std::path::Path::new("crates/a")
+        ));
+        assert!(!super::cargo_member_pattern_matches(
+            "crates/*",
+            std::path::Path::new("crates/a/b")
+        ));
+    }
+    #[test]
+    fn cargo_exclude_respects_literal_member_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        // Cargo metadata exited 0 for these manifests: literal x survived its
+        // own exclude; glob x was excluded by x and by the parent crates path.
+        for (members, exclude, x_expected, xyz_expected) in [
+            ("crates/x", "crates/x", true, false),
+            ("crates/*", "crates/x", false, true),
+            ("crates/*", "crates", false, false),
+        ] {
+            std::fs::write(dir.path().join("Cargo.toml"), format!("[workspace]\nresolver=\"2\"\nmembers=[\"{members}\"]\nexclude=[\"{exclude}\"]\n")).unwrap();
+            for (name, expected) in [("crates/x", x_expected), ("crates/xyz", xyz_expected)] {
+                let root = dir.path().join(name);
+                std::fs::create_dir_all(root.join("src")).unwrap();
+                std::fs::write(root.join("src/lib.rs"), "").unwrap();
+                std::fs::write(
+                    root.join("Cargo.toml"),
+                    format!(
+                        "[package]\nname=\"{}\"\nversion=\"0.1.0\"\n",
+                        name.replace('/', "-")
+                    ),
+                )
+                .unwrap();
+                assert_eq!(
+                    super::cargo_workspace_contains_crate(dir.path(), &root),
+                    expected,
+                    "{members} / {exclude} / {name}"
+                );
+            }
+        }
     }
 }

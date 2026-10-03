@@ -65,6 +65,52 @@ function disclosureCount(text: string): number {
 }
 
 describe("aft_search adapter", () => {
+  test("forwards pattern beside query, or alone, and treats a blank pattern as absent", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerSemanticTool(api, makePluginContext(bridge));
+    const tool = tools.get("aft_search")!;
+
+    await executeTool(tool, { query: "how is config loaded", pattern: "load_config|Config " });
+    await executeTool(tool, { pattern: "^export" });
+    await executeTool(tool, { query: "needle", pattern: "   " });
+
+    expect(calls.map(toolArgs)).toEqual([
+      // The regex is sent as written, trailing space included.
+      { query: "how is config loaded", pattern: "load_config|Config " },
+      { pattern: "^export" },
+      { query: "needle" },
+    ]);
+    expect(schemaAccepts(tool.parameters, { pattern: "^export" })).toBe(true);
+  });
+
+  test("refuses a request with neither query nor pattern", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerSemanticTool(api, makePluginContext(bridge));
+    const tool = tools.get("aft_search")!;
+
+    await expect(executeTool(tool, {})).rejects.toThrow("`query` must be");
+    await expect(executeTool(tool, { query: " ", pattern: "" })).rejects.toThrow(
+      "at least one of `query` or `pattern`",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("surfaces the backend's invalid_pattern refusal", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge(() => ({
+      success: false,
+      code: "invalid_pattern",
+      message: "invalid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+    }));
+    registerSemanticTool(api, makePluginContext(bridge));
+
+    await expect(executeTool(tools.get("aft_search")!, { pattern: "[" })).rejects.toThrow(
+      "unclosed character class",
+    );
+  });
+
   test("maps topK while ignoring a legacy hint and carries structured details", async () => {
     const { api, tools } = makeMockApi();
     const bridgeResponse = {

@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "rerank-core-onnx",
+    "rerank-remote-synapse",
+    "bun-install-summary-compression",
+    "inspect-uncovered-diagnostics-rollup"
+  ],
+  "note": "Adds the search.rerank stage (fixed top-N prefix permutation, frozen per list identity), a pinned local ONNX backend, remote /rerank and Synapse backends built off the search path, and the search.rerank config (default off; project tier may only turn it off). With rerank off, which is the default and the benchmark configuration, the ranking path is unchanged, so every ranked row must stay byte-identical to the committed reference. Also keeps bun install's no-change summary in bash output compression, and rolls up aft_inspect's uncovered-file diagnostics gaps by cause with a topK-bounded path list."
+}

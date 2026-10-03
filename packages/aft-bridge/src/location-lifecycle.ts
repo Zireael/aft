@@ -1,3 +1,4 @@
+import type { VersionMismatchCallback } from "./bridge.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type {
@@ -53,6 +54,16 @@ export interface BridgeLifecycleCensusOptions {
 interface StandaloneOwner {
   readonly pool: AftTransportPool;
   readonly configByRoot: Map<string, Record<string, unknown>>;
+  /**
+   * Each live Location's own version-mismatch handler, in acquisition order.
+   * The pool is built once with the first Location's options, but that
+   * handler closes over the first Location's lease, which throws once that
+   * Location is released while others still use the pool. The pool therefore
+   * calls a live Location's handler instead (see `acquireBridge`). Absent on
+   * an owner created by an older copy of this package loaded in the same
+   * process, since the owner lives on `globalThis`.
+   */
+  readonly versionMismatchHandlers?: Map<LocationBridgeLease, VersionMismatchCallback>;
   readonly referencesByRoot: Map<string, number>;
   references: number;
 }
@@ -223,6 +234,7 @@ export async function acquireBridge(
       let owner = state.standalone;
       if (!owner) {
         const configByRoot = new Map<string, Record<string, unknown>>();
+        const versionMismatchHandlers = new Map<LocationBridgeLease, VersionMismatchCallback>();
         const configuredLoader = options.poolOptions.projectConfigLoader;
         const pool = await createPool({
           ...options,
@@ -233,9 +245,20 @@ export async function acquireBridge(
               ...(configuredLoader?.(projectRoot) ?? {}),
               ...(configByRoot.get(canonicalizeProjectRoot(projectRoot)) ?? {}),
             }),
+            // The most recently acquired live Location answers. With none live
+            // the last lease is being released and the pool is shutting down,
+            // so null declines the upgrade and the running binary stays.
+            onVersionMismatch: (binaryVersion, minVersion) =>
+              [...versionMismatchHandlers.values()].at(-1)?.(binaryVersion, minVersion) ?? null,
           },
         });
-        owner = { pool, configByRoot, referencesByRoot: new Map(), references: 0 };
+        owner = {
+          pool,
+          configByRoot,
+          versionMismatchHandlers,
+          referencesByRoot: new Map(),
+          references: 0,
+        };
         state.standalone = owner;
       }
 
@@ -243,24 +266,33 @@ export async function acquireBridge(
       owner.referencesByRoot.set(directory, (owner.referencesByRoot.get(directory) ?? 0) + 1);
       owner.configByRoot.set(directory, { ...options.configOverrides });
       const acquiredOwner = owner;
-      return new LocationBridgeLease(directory, mode, owner.pool, async () => {
-        await withLock(directory, () =>
-          withLock(OWNER_LOCK, async () => {
-            const current = lifecycleState().standalone;
-            if (current !== acquiredOwner) return;
-            current.references -= 1;
-            const rootReferences = (current.referencesByRoot.get(directory) ?? 1) - 1;
-            if (rootReferences > 0) current.referencesByRoot.set(directory, rootReferences);
-            else {
-              current.referencesByRoot.delete(directory);
-              current.configByRoot.delete(directory);
-            }
-            if (current.references > 0) return;
-            lifecycleState().standalone = null;
-            await current.pool.shutdown();
-          }),
-        );
-      });
+      const lease: LocationBridgeLease = new LocationBridgeLease(
+        directory,
+        mode,
+        owner.pool,
+        async () => {
+          await withLock(directory, () =>
+            withLock(OWNER_LOCK, async () => {
+              const current = lifecycleState().standalone;
+              if (current !== acquiredOwner) return;
+              current.versionMismatchHandlers?.delete(lease);
+              current.references -= 1;
+              const rootReferences = (current.referencesByRoot.get(directory) ?? 1) - 1;
+              if (rootReferences > 0) current.referencesByRoot.set(directory, rootReferences);
+              else {
+                current.referencesByRoot.delete(directory);
+                current.configByRoot.delete(directory);
+              }
+              if (current.references > 0) return;
+              lifecycleState().standalone = null;
+              await current.pool.shutdown();
+            }),
+          );
+        },
+      );
+      const onVersionMismatch = options.poolOptions.onVersionMismatch;
+      if (onVersionMismatch) owner.versionMismatchHandlers?.set(lease, onVersionMismatch);
+      return lease;
     });
   });
 }

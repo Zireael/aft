@@ -5,7 +5,7 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-import Foo from './Foo.vue';
+import Foo from './Foo.vue'
 
 const x = ref(0)
 </script>

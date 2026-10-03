@@ -7,12 +7,20 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
+import { hashlineTagSourceSentence } from "./hashline-tag-sources.js";
 import { log } from "./logger.js";
+import { skipsEagerStartup } from "./session-kind.js";
 import { piHashlineEffective } from "./tool-registration.js";
 
 export interface WorkflowHintsOpts {
   bashBackgroundEnabled: boolean;
   bashCompressionEnabled: boolean;
+  /**
+   * Resolved `bash.rewrite` flag. Only rewritten `cat`/`head`/`tail` commands
+   * mint hashline tags through bash, so the hashline hint names them only when
+   * rewriting is on. Omitted means on.
+   */
+  bashRewriteEnabled?: boolean;
   /** Set of tool names KNOWN-ABSENT from the registered surface. */
   absentTools: Set<string>;
   /** Whether the hashline `edit` arm is the one actually registered. */
@@ -22,14 +30,20 @@ export interface WorkflowHintsOpts {
 const HEADING = "## IMPORTANT NOTICE about your tools";
 
 /**
- * Routing rule for hashline sessions. Kept byte-identical to the OpenCode copy.
- *
- * Navigation tools return source that looks edit-ready but never publishes a
- * snapshot, so an agent that inspects a symbol and then patches it is refused
- * for a tag it believes it already has.
+ * Routing rule for hashline sessions: which calls mint the tags a patch
+ * addresses (see `hashlineTagSourceSentence`). The bash rewrite path and each
+ * AFT navigation tool are named only when present. Kept byte-identical to the
+ * OpenCode copy.
  */
-export const HASHLINE_TAG_SOURCE_HINT =
-  "**Hashline edit tags**: Only `read` (and accepted AFT `cat`/`head`/`tail` rewrites) mint hashline tags. `aft_zoom`, `aft_outline`, `grep`, `aft_search`, and conflict snippets do not. After navigation, call `read` on every file and range the patch addresses.";
+export function hashlineTagSourceHint(
+  bashRewritesMintTags: boolean,
+  isRegistered: (toolName: string) => boolean = () => true,
+): string {
+  return `**Hashline edit tags**: ${hashlineTagSourceSentence(bashRewritesMintTags, isRegistered)}`;
+}
+
+/** The hashline hint for a session whose bash rewrites `cat`/`head`/`tail`. */
+export const HASHLINE_TAG_SOURCE_HINT = hashlineTagSourceHint(true);
 
 export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const sections: string[] = [];
@@ -47,6 +61,9 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const hasInspect = !opts.absentTools.has("aft_inspect");
   const hasBash = !opts.absentTools.has(bashName);
   const hasBgBash = opts.bashBackgroundEnabled && hasBash && !opts.absentTools.has("bash_status");
+  // Each background section names its companion, so it needs that tool too.
+  const hasWatch = !opts.absentTools.has("bash_watch");
+  const hasWrite = !opts.absentTools.has("bash_write");
 
   if (hasBash && opts.bashCompressionEnabled) {
     // The section itself is config-gated, so the text never hedges with
@@ -116,7 +133,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
     );
   }
 
-  if (hasBgBash) {
+  if (hasBgBash && hasWatch) {
     sections.push(
       [
         `**Long-running commands** (builds, installs, full test suites): run them in the FOREGROUND — use \`${bashName}({ command, wait: true })\` when you know it is long and need the result before anything else; if you send a new message, the wait detaches to background; otherwise omit \`wait\` so auto-promote can hand you a reminder while you work.`,
@@ -124,6 +141,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
         "- `bash_watch` is for blocking on an ALREADY-backgrounded task once you've run out of parallel work (sync — the user can interrupt), or reacting to a specific early output line (async: background:true + pattern). Never loop `bash_status` to wait — it's a one-shot inspector.",
       ].join("\n"),
     );
+  }
+  if (hasBgBash && hasWrite) {
     sections.push(
       `**PTY / interactive commands**: PTY mode is for interactive REPLs and terminal apps (python, node, bash itself, vim). Start with \`${bashName}({ command: "python", pty: true, background: true })\`, read the screen with \`bash_status({ task_id, output_mode: "screen" })\`, and send input with \`bash_write({ task_id, input: "..." })\`.`,
     );
@@ -132,7 +151,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // Conditional on the hashline arm being the registered one: a legacy-edit
   // session has no tags and must not be told to go mint them.
   if (opts.hashlineEffective === true) {
-    sections.push(HASHLINE_TAG_SOURCE_HINT);
+    sections.push(
+      hashlineTagSourceHint(
+        hasBash && opts.bashRewriteEnabled !== false,
+        (name) => !opts.absentTools.has(name),
+      ),
+    );
   }
 
   if (sections.length === 0) {
@@ -158,9 +182,11 @@ export function buildHintsFromConfig(
   // Background-bash gating reads the resolved bash config so the graduated
   // `bash.background` setting controls whether the hint appears. See
   // `resolveBashConfig` in config.ts.
+  const bashCfg = resolveBashConfig(config);
   return buildWorkflowHints({
-    bashBackgroundEnabled: resolveBashConfig(config).background,
-    bashCompressionEnabled: resolveBashConfig(config).compress,
+    bashBackgroundEnabled: bashCfg.background,
+    bashCompressionEnabled: bashCfg.compress,
+    bashRewriteEnabled: bashCfg.rewrite,
     absentTools,
     hashlineEffective,
   });
@@ -181,21 +207,95 @@ interface ToolSurfaceFlags {
   hoistEdit: boolean;
   hoistRead: boolean;
   bashStatus: boolean;
+  bashWatch: boolean;
+  bashWrite: boolean;
+}
+
+/**
+ * Name of the prompt section that carries the hints on hosts with structured
+ * system prompt sections. Pi renders it as
+ * `<aft_workflow_hints>\n…\n</aft_workflow_hints>` and requires names to match
+ * `^[a-z][a-z0-9_-]*$`.
+ */
+export const WORKFLOW_HINTS_SECTION = "aft_workflow_hints";
+
+/**
+ * The parts of a `before_agent_start` event the hints handler reads, across
+ * the hosts the plugin runs on:
+ * - upstream Pi 0.86.0 and later expose `systemPromptOptions.sections`, a
+ *   per-run copy that handlers may mutate, and `forceSystemPrompt`, which is
+ *   set once any handler has returned `systemPrompt` for this run;
+ * - older upstream Pi passes `systemPromptOptions` without `sections` (and it
+ *   is the session's base options object, so it must not be mutated);
+ * - oh-my-pi (OMP) passes `systemPrompt` as an array with one entry per
+ *   provider system block and has no `systemPromptOptions`.
+ */
+export interface WorkflowHintsStartEvent {
+  systemPrompt: string | readonly string[];
+  systemPromptOptions?: {
+    sections?: Record<string, string>;
+    forceSystemPrompt?: string;
+  };
+}
+
+export type WorkflowHintsStartResult = { systemPrompt: string | string[] } | undefined;
+
+/**
+ * Add the hints block to one `before_agent_start` run.
+ *
+ * Where the host has prompt sections, the block goes into its own section and
+ * nothing is returned. Returning `systemPrompt` would force the whole prompt
+ * for the run: Pi then sends one collapsed system message and drops the
+ * transcript-backed mid-conversation tool and prompt changes, so every later
+ * tool activation rewrites the whole prompt cache. As a section, the block is
+ * diffed like any other part of the prompt and, being identical on every run,
+ * is sent once and stays in the cached prefix.
+ *
+ * Hosts without sections only accept a returned replacement prompt, so the
+ * block is appended to the prompt they passed in: as a new last entry when the
+ * prompt is an array of system blocks (OMP), keeping the existing blocks
+ * intact, or after a blank line when it is a single string (older Pi).
+ */
+export function applyWorkflowHints(
+  event: WorkflowHintsStartEvent,
+  hintsBlock: string,
+): WorkflowHintsStartResult {
+  const options = event.systemPromptOptions;
+  const sections = options?.sections;
+  if (sections !== null && typeof sections === "object") {
+    sections[WORKFLOW_HINTS_SECTION] = hintsBlock;
+    // An earlier handler already forced this run's prompt, and Pi sends forced
+    // text exactly as given, so the section above would not reach the model.
+    // Append to the forced text instead; the run is forced either way, so this
+    // costs nothing extra. Keeping the section set as well means the recorded
+    // transcript sections do not change between forced and unforced runs.
+    if (options?.forceSystemPrompt !== undefined) {
+      return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
+    }
+    return undefined;
+  }
+  if (Array.isArray(event.systemPrompt)) {
+    return { systemPrompt: [...event.systemPrompt, hintsBlock] };
+  }
+  return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
 }
 
 /**
  * Register the workflow-hints extension on Pi via `before_agent_start`.
  *
- * Pi assembles a fresh system prompt for every turn, then fires
- * `before_agent_start` with the assembled prompt. Our handler appends the
- * AFT workflow hints block to that prompt. If multiple extensions return a
- * `systemPrompt`, Pi chains them — so we always append (never replace).
+ * Pi fires `before_agent_start` once per user prompt with the prompt it
+ * assembled; {@link applyWorkflowHints} adds the hints block to it without
+ * dropping other extensions' contributions. The block is built once here, so
+ * it is byte-identical on every run of the session.
+ * Magic Context's short-lived Pi children don't need these workflow hints.
  */
 export function registerWorkflowHints(
   pi: ExtensionAPI,
   config: AftConfig,
   surface: ToolSurfaceFlags,
 ): void {
+  if (skipsEagerStartup()) return;
+
   // Build the absent-tools set from the resolved registration predicates.
   const absent = new Set<string>();
   if (!surface.outline) absent.add("aft_outline");
@@ -207,21 +307,20 @@ export function registerWorkflowHints(
   if (!surface.hoistRead) absent.add("read");
   if (!surface.hoistBash) absent.add("bash");
   if (!surface.bashStatus) absent.add("bash_status");
+  if (!surface.bashWatch) absent.add("bash_watch");
+  if (!surface.bashWrite) absent.add("bash_write");
 
   const hintsBlock = buildHintsFromConfig(config, absent, piHashlineEffective(config, surface));
   if (!hintsBlock) return;
 
   log(`Workflow hints injected (${hintsBlock.length} chars)`);
 
-  // Pi's `before_agent_start` handler can return `systemPrompt` to chain
-  // an additional system prompt onto the assembled one. We always APPEND
-  // — never overwrite — so other extensions' prompt contributions survive.
+  // The installed Pi typings predate prompt sections and OMP's array prompt,
+  // so the handler is registered against the cross-host event shape.
   (
     pi.on as (
       event: "before_agent_start",
-      handler: (event: { systemPrompt: string }) => unknown,
+      handler: (event: WorkflowHintsStartEvent) => WorkflowHintsStartResult,
     ) => void
-  )("before_agent_start", (event) => {
-    return { systemPrompt: `${event.systemPrompt}\n\n${hintsBlock}` };
-  });
+  )("before_agent_start", (event) => applyWorkflowHints(event, hintsBlock));
 }

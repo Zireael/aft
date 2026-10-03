@@ -1,0 +1,12 @@
+{
+  "search": {
+    "rerank": {
+      "backend": "remote",
+      "model": "bge-reranker-v2-m3",
+      "endpoint": "http://localhost:8080/rerank",
+      "api_key_env": "RERANK_KEY",
+      "top_n": 15,
+      "timeout_ms": 900
+    }
+  }
+}

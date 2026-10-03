@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "callgraph-wal-before-publish"
+  ],
+  "note": "callgraph_store generation is switched to WAL before its pointer is published; no ranking-fenced files."
+}

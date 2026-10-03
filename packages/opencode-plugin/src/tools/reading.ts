@@ -1,4 +1,11 @@
-import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
+import {
+  coerceBoolean,
+  coerceJsonCollectionParam,
+  coerceTargetParam,
+  formatZoomText,
+  isBlankParam,
+  usableZoomTargets,
+} from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig, toolEnabled } from "../config.js";
@@ -15,6 +22,11 @@ import { whenGhReadEnabled } from "./hoisted.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
+
+/** GitHub discussion targets are fetched by the server, not read from disk. */
+function isGithubPathArg(value: unknown): boolean {
+  return typeof value === "string" && (value.startsWith("issue://") || value.startsWith("pr://"));
+}
 
 function buildZoomTitle(args: {
   path?: string;
@@ -60,6 +72,23 @@ interface ZoomBatchResult {
 /**
  * Tool definitions for code reading commands: outline + zoom.
  */
+/**
+ * The outline description's steer toward focused reading. It names
+ * `aft_search`, `aft_zoom` and `aft_callgraph` only when each is registered,
+ * falling back to `read` for symbol reading.
+ */
+function outlineFocusSteer(config: PluginContext["config"]): string {
+  const zoomEnabled = toolEnabled(config, "aft_zoom");
+  const reader = zoomEnabled ? "aft_zoom" : "read";
+  const locate = toolEnabled(config, "aft_search") ? `aft_search + ${reader}` : reader;
+  const callgraph = zoomEnabled
+    ? toolEnabled(config, "aft_callgraph")
+      ? " aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces."
+      : " aft_zoom with `callgraph:true` gives one-level forward calls-out."
+    : "";
+  return `For understanding a specific feature, prefer ${locate} on named symbols; use aft_outline on a whole directory only for high-level structure mapping.${callgraph}`;
+}
+
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
   const ghReadEnabled = resolveGithubConfig(ctx.config).read;
@@ -77,9 +106,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
         (zoomEnabled ? "aft_zoom" : "read") +
         ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
-        (zoomEnabled
-          ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n"
-          : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping.\n\n") +
+        outlineFocusSteer(ctx.config) +
+        "\n\n" +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
         "  • directory path → outline source files under it\n" +
@@ -168,7 +196,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line." +
         (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
       args: {
         path: z.string().optional().describe("Path to file (absolute or relative to project root)"),
@@ -197,7 +225,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           ])
           .optional()
           .describe(
-            "Cross-file batch: `{ path, symbol }` or an array of them. Mutually exclusive with path/url/symbols.",
+            "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
           ),
         contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
           "Lines of context before/after the symbol (default: 3)",
@@ -210,33 +238,16 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           ),
       },
       execute: async (args, context): Promise<ToolResult> => {
-        // GPT-family models send empty strings / empty arrays / empty objects
-        // instead of omitting optional params. Use `isEmptyParam` so e.g.
-        // `targets: []` or `url: ""` don't trigger mutual-exclusion errors
-        // against fields the agent didn't actually intend to provide.
-        // `targets` also accepts nested object/array shapes. Treat `targets` as
-        // omitted only when every entry is empty, such as
-        // `[{path: "", symbol: ""}]` or `{path: "", symbol: ""}`.
-        // When any target entry contains a non-empty field, treat `targets` as
-        // supplied and let per-entry validation report an error such as
-        // `targets[0].path must be non-empty`.
-        const hasTargetsProvided = (t: unknown): boolean => {
-          if (isEmptyParam(t)) return false;
-          const entryEmpty = (entry: unknown): boolean => {
-            if (!entry || typeof entry !== "object") return true;
-            const fp = (entry as { path?: unknown }).path;
-            const sym = (entry as { symbol?: unknown }).symbol;
-            const fpEmpty = typeof fp !== "string" || fp.length === 0;
-            const symEmpty = typeof sym !== "string" || sym.length === 0;
-            return fpEmpty && symEmpty;
-          };
-          if (Array.isArray(t)) return !t.every(entryEmpty);
-          return !entryEmpty(t);
-        };
-        const hasFilePath = !isEmptyParam(args.path);
-        const hasUrl = !isEmptyParam(args.url);
-        const hasTargets = hasTargetsProvided(args.targets);
-        const hasSymbols = !isEmptyParam(args.symbols);
+        // Some models fill every declared property on every call, sending
+        // empty strings / arrays / objects (or whitespace) for the ones they
+        // do not mean. Blank values count as absent, and `targets` entries
+        // whose path and symbol are both blank are dropped as placeholders.
+        const targetsInput = coerceJsonCollectionParam(args.targets, "targets");
+        const targetEntries = usableZoomTargets(targetsInput);
+        const hasFilePath = !isBlankParam(args.path);
+        const hasUrl = !isBlankParam(args.url);
+        const hasTargets = targetEntries.length > 0;
+        const hasSymbols = !isBlankParam(args.symbols);
         // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
         const wantCallgraph = coerceBoolean(args.callgraph);
         const contextLines = coerceOptionalInt(
@@ -254,7 +265,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // can't carry a title: OpenCode skips `tool.execute.after` when execute
         // throws, and the plugin `context.metadata()` callback is unbridged, so
         // the return value is the only channel that survives.)
-        const zoomTitle = buildZoomTitle(args);
+        const zoomTitle = buildZoomTitle({
+          ...args,
+          targets: (hasTargets ? targetEntries : undefined) as Parameters<
+            typeof buildZoomTitle
+          >[0]["targets"],
+        });
         const zoomDisplay: Record<string, unknown> = { title: zoomTitle };
         if (hasFilePath) zoomDisplay.path = args.path;
         if (hasUrl) zoomDisplay.url = args.url;
@@ -262,7 +278,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           zoomDisplay.symbols =
             typeof args.symbols === "string" ? args.symbols : JSON.stringify(args.symbols);
         }
-        if (hasTargets) zoomDisplay.targets = JSON.stringify(args.targets);
+        if (hasTargets) zoomDisplay.targets = JSON.stringify(targetEntries);
         if (contextLines !== undefined) zoomDisplay.contextLines = contextLines;
         if (wantCallgraph) zoomDisplay.callgraph = true;
         const withMeta = (output: string): ToolResult => ({
@@ -271,30 +287,30 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           metadata: zoomDisplay,
         });
 
-        // Multi-target mode (cross-file). Mutually exclusive with the other
-        // modes so the agent doesn't accidentally provide overlapping inputs
-        // that get silently ignored.
+        // Cross-file batch. `path`/`url` + `symbols` sent alongside `targets`
+        // join the same batch instead of being refused: the server answers
+        // every lookup and reports each one that fails on its own line.
         if (hasTargets) {
-          if (hasFilePath || hasUrl || hasSymbols) {
-            throw new Error("'targets' is mutually exclusive with 'path', 'url', and 'symbols'");
+          if (hasFilePath && hasUrl) {
+            throw new Error("Provide exactly ONE of 'path' or 'url' — not both");
           }
-          const targets = Array.isArray(args.targets)
-            ? (args.targets as Array<{ path: string; symbol: string }>)
-            : ([args.targets] as Array<{ path: string; symbol: string }>);
-          if (targets.length === 0) {
-            throw new Error("'targets' must be a non-empty object or array");
-          }
-          for (const [i, entry] of targets.entries()) {
-            const targetPath = entry?.path;
-            if (typeof targetPath !== "string" || targetPath.length === 0) {
+          const targets = targetEntries.map((entry, i) => {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
               throw new Error(`targets[${i}].path must be a non-empty string`);
             }
-            if (typeof entry.symbol !== "string" || entry.symbol.length === 0) {
-              throw new Error(`targets[${i}].symbol must be a non-empty string`);
-            }
-          }
+            const record = entry as Record<string, unknown>;
+            const targetPath = isBlankParam(record.path) ? record.filePath : record.path;
+            return {
+              path: typeof targetPath === "string" ? targetPath : "",
+              symbol: typeof record.symbol === "string" ? record.symbol : "",
+            };
+          });
+          const localPaths = targets
+            .map((target) => target.path)
+            .filter((path) => path.trim().length > 0 && !isGithubPathArg(path));
+          if (hasFilePath && !isGithubPathArg(args.path)) localPaths.push(args.path as string);
           const resolvedTargets = await Promise.all(
-            targets.map((t) => resolvePathArg(ctx, context, t.path)),
+            localPaths.map((path) => resolvePathArg(ctx, context, path)),
           );
           const permissionDenied = await assertPathExternalPermissions(
             ctx,
@@ -309,6 +325,9 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
               symbol: target.symbol,
             })),
           };
+          if (hasFilePath) rawArgs.filePath = args.path;
+          else if (hasUrl) rawArgs.url = args.url;
+          if (hasSymbols) rawArgs.symbols = args.symbols;
           if (contextLines !== undefined) rawArgs.contextLines = contextLines;
           if (wantCallgraph) rawArgs.callgraph = true;
 
@@ -330,10 +349,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // File mode still resolves locally before dispatch so external-directory
         // permission checks approve the same path the server will read.
         const githubPath =
-          (hasFilePath &&
-            (String(args.path).startsWith("issue://") || String(args.path).startsWith("pr://"))) ||
-          (hasUrl &&
-            (String(args.url).startsWith("issue://") || String(args.url).startsWith("pr://")));
+          (hasFilePath && isGithubPathArg(args.path)) || (hasUrl && isGithubPathArg(args.url));
         if (!hasUrl && !githubPath) {
           const file = await resolvePathArg(ctx, context, args.path as string);
           const permissionDenied = await assertPathExternalPermissions(ctx, context, file);

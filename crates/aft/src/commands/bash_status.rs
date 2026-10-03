@@ -9,7 +9,7 @@ use serde_json::json;
 
 const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 
-pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling.";
+pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling.";
 
 pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
     format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
@@ -67,11 +67,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = crate::bash_background::task_storage_dir(ctx);
     if ctx.bash_background().has_erased_watch_reference(&task_id) {
         return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
     }
-    match ctx.bash_background().status(
+    // Settled: a kill in flight is waited out (bounded) so callers that stop
+    // polling at the first non-running status see its terminal outcome.
+    match ctx.bash_background().status_settled(
         &task_id,
         req.session(),
         ctx.config().project_root.as_deref(),
@@ -160,11 +162,20 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 Response::success(&req.id, data)
             }
         }
-        None => Response::error(
-            &req.id,
-            "task_not_found",
-            format_unknown_task_message(&task_id),
-        ),
+        None => {
+            let unadopted = ctx.config().project_root.as_deref().and_then(|root| {
+                ctx.bash_background()
+                    .unadopted_task_message(&task_id, req.session(), root)
+            });
+            match unadopted {
+                Some(message) => Response::error(&req.id, "task_not_adopted", message),
+                None => Response::error(
+                    &req.id,
+                    "task_not_found",
+                    format_unknown_task_message(&task_id),
+                ),
+            }
+        }
     }
 }
 
@@ -208,7 +219,7 @@ mod tests {
     fn unknown_task_message_steers_agents_to_rerun() {
         assert_eq!(
             format_unknown_task_message("bash-unknown"),
-            "background task not found: bash-unknown. Task IDs only come from a bash tool result or completion notice. If you never received one, the command was not promoted — re-run the command instead of polling."
+            "background task not found: bash-unknown. No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling."
         );
     }
 

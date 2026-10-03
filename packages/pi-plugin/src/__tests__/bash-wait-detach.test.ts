@@ -108,3 +108,9 @@ describe("Pi input interrupts waits by one decision", () => {
     expect(delivered).toBe("(requested background detach)");
   });
 });
+
+test("detach preserves indentation and TSV away from the token", () => {
+  expect(stripUserMessageDetachKeyword("&detach please\n    print('x')\na\t\tb\n| a  | b |")).toBe(
+    " please\n    print('x')\na\t\tb\n| a  | b |",
+  );
+});

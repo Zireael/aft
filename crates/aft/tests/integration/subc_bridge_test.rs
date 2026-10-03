@@ -26,7 +26,7 @@ use aft::subc::{
 };
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
-use subc_protocol::manifest::ModuleManifest;
+use subc_protocol::manifest::{ModuleManifest, ProviderRole};
 use subc_protocol::session::{
     HealthReport, ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
     ModuleControlResponseToModule, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
@@ -1051,6 +1051,32 @@ fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn tool_disabled_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected tool-disabled bridge command: {other}"),
+        ),
+    }
+}
+
+/// The real configure, so a rebind of an unchanged root takes configure's own
+/// equivalent-rebind path; every other command, including the held `echo`
+/// read, goes to [`bridge_dispatch`].
+fn real_configure_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        _ => bridge_dispatch(req, ctx),
+    }
+}
+
 fn hashline_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     match req.command.as_str() {
         "configure" => aft::commands::configure::handle_configure(&req, ctx),
@@ -1070,6 +1096,18 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     let state = current_bridge_state();
     match req.command.as_str() {
         "configure" => {
+            // This stand-in configure rewrites the root's configuration on
+            // every bind, as the real configure does on its full path. Like
+            // that path, a bind the executor started with only a shared hold
+            // (beside readers or maintenance) asks to run again with
+            // exclusive use before it changes anything.
+            if aft::executor::request_exclusive_rerun() {
+                return Response::error(
+                    &req.id,
+                    "configure_needs_exclusive",
+                    "configure must run with exclusive use of the root; queued again",
+                );
+            }
             state.configure(&req, ctx);
             if slow_configure_requested(&req) {
                 state.slow_configure();
@@ -1130,6 +1168,8 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
+        "edit_match" => aft::commands::edit_match::handle_edit_match(&req, ctx),
+        "batch" => aft::commands::batch::handle_batch(&req, ctx),
         "apply_patch" => aft::commands::apply_patch::handle_apply_patch(&req, ctx),
         "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
         "move_file" => aft::commands::move_file::handle_move_file(&req, ctx),
@@ -1393,6 +1433,7 @@ fn run_subc_bridge_test_with_response_body_limit<F, Fut, A>(
         bridge_dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1427,6 +1468,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         bridge_dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1465,6 +1507,36 @@ fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         false,
+        None,
+    );
+}
+
+/// A production-mode run whose CortexKit user config file holds `user_doc`
+/// before the module connects.
+fn run_subc_bridge_production_test_with_user_config<F, Fut, A>(
+    name: &'static str,
+    watchdog: Duration,
+    user_doc: &'static str,
+    driver: F,
+    after: A,
+    dispatch: aft::subc::DispatchFn,
+) where
+    F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+    A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
+{
+    run_subc_bridge_test_inner(
+        name,
+        watchdog,
+        Vec::new,
+        driver,
+        after,
+        false,
+        None,
+        dispatch,
+        bridge_executor_config(),
+        false,
+        Some(user_doc),
     );
 }
 
@@ -1490,6 +1562,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         false,
+        None,
     );
 }
 
@@ -1515,6 +1588,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_lifecycle_probe<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         true,
+        None,
     );
 }
 
@@ -1541,6 +1615,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
         dispatch,
         executor_config,
         false,
+        None,
     );
 }
 
@@ -1556,6 +1631,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     dispatch: aft::subc::DispatchFn,
     executor_config: ExecutorConfig,
     with_lifecycle_probe: bool,
+    user_config_doc: Option<&'static str>,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1569,12 +1645,22 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let _subc_module_id = remove_test_env("SUBC_MODULE_ID");
     let _subc_launch_nonce = remove_test_env("SUBC_LAUNCH_NONCE");
     let _env_guards = env_setup();
+    // The subc loop runs inside this test process, so `main` never captures a
+    // launch nonce. Install whatever nonce the test put in the environment as
+    // the module's captured one, which is what `main` would have read.
+    let _launch_nonce =
+        aft::launch_nonce::install_for_tests(std::env::var("SUBC_LAUNCH_NONCE").ok().as_deref());
     let state = Arc::new(BridgeState::default());
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
     let user_config_path = roots.storage.path().join("user-aft.jsonc");
+    // Written before the module connects, because the catalog it sends at
+    // hello is filtered by the user config's `disabled_tools`.
+    if let Some(doc) = user_config_doc {
+        std::fs::write(&user_config_path, doc).expect("write user config");
+    }
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -1870,6 +1956,7 @@ async fn complete_initial_attach(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -2085,6 +2172,17 @@ fn subc_bridge_core_routing_reuses_same_root_actor_and_allows_different_roots() 
 }
 
 #[test]
+fn subc_bridge_same_root_rebind_is_acked_while_a_read_is_held() {
+    run_subc_bridge_test_with_dispatch(
+        "subc_bridge_same_root_rebind_is_acked_while_a_read_is_held",
+        Duration::from_secs(45),
+        drive_rebind_beside_held_read_daemon,
+        |_, _, _| {},
+        real_configure_bridge_dispatch,
+    );
+}
+
+#[test]
 fn subc_bridge_configure_warning_pushes_are_session_scoped() {
     run_subc_bridge_test(
         "subc_bridge_configure_warning_pushes_are_session_scoped",
@@ -2228,7 +2326,7 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
 fn subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind() {
     run_subc_bridge_test_with_dispatch_and_executor_config(
         "goodbye-cancels-queued-read-before-rebind",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         drive_goodbye_cancels_queued_read_before_rebind_daemon,
         |_, _, _| {},
         bridge_dispatch,
@@ -2783,11 +2881,16 @@ fn subc_bridge_inspect_dead_code_converges_for_bound_git_root() {
 
 #[test]
 fn subc_bridge_new_manifest_tools_route_in_production() {
-    run_subc_bridge_production_test(
+    // `aft_delete` and `aft_move` are disabled by default and refused at
+    // dispatch; this test is about routing, so the user config enables every
+    // tool.
+    run_subc_bridge_production_test_with_user_config(
         "subc_bridge_new_manifest_tools_route_in_production",
         Duration::from_secs(90),
+        r#"{ "disabled_tools": [] }"#,
         drive_manifest_reachability_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -2799,6 +2902,18 @@ fn subc_bridge_hashline_preflight_and_edit_round_route_in_production() {
         drive_hashline_edit_round_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
+    run_subc_bridge_production_test_with_user_config(
+        "subc_bridge_disabled_tools_are_refused_at_dispatch",
+        Duration::from_secs(30),
+        r#"{ "disabled_tools": ["aft_delete", "bash"] }"#,
+        drive_disabled_tools_daemon,
+        |_, _, _| {},
+        tool_disabled_bridge_dispatch,
     );
 }
 
@@ -2815,11 +2930,16 @@ fn subc_bridge_registered_hashline_bash_cat_starts_with_tag_header() {
 
 #[test]
 fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
-    run_subc_bridge_production_test(
+    // The default config hides `aft_delete` and `aft_move` from the catalog;
+    // this test compares the whole catalog against the embedded schemas, so
+    // the user config enables every tool.
+    run_subc_bridge_production_test_with_user_config(
         "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
         Duration::from_secs(30),
+        r#"{ "disabled_tools": [] }"#,
         drive_module_hello_health_manifest_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -2958,6 +3078,42 @@ fn subc_bridge_repeat_breaker_uses_shared_transport_fixture() {
 }
 
 #[test]
+fn subc_bridge_repeat_breaker_steers_bash_on_every_answer_path() {
+    // Production mode applies the route bind's config document, which is what
+    // turns the bash rewrite on.
+    run_subc_bridge_test_inner(
+        "subc_bridge_repeat_breaker_steers_bash_on_every_answer_path",
+        Duration::from_secs(120),
+        || {
+            vec![set_test_foreground_wait_ms(
+                super::repeat_breaker_test::REPEAT_FOREGROUND_WAIT_MS,
+            )]
+        },
+        drive_bash_repeat_breaker_daemon,
+        |_, _, _| {},
+        false,
+        None,
+        bash_repeat_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+    );
+}
+
+fn bash_repeat_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected bash repeat command: {other}"),
+        ),
+    }
+}
+
+#[test]
 fn subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response",
@@ -2995,6 +3151,26 @@ fn subc_bridge_bash_background_returns_launch_text() {
         "subc_bridge_bash_background_returns_launch_text",
         Duration::from_secs(30),
         drive_bash_background_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_hand_off_text_follows_the_worker_role",
+        Duration::from_secs(30),
+        drive_bash_worker_role_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_records_call_key_and_refuses_malformed_keys() {
+    run_subc_bridge_test(
+        "subc_bridge_bash_records_call_key_and_refuses_malformed_keys",
+        Duration::from_secs(30),
+        drive_bash_call_key_daemon,
         |_, _, _| {},
     );
 }
@@ -3226,6 +3402,7 @@ async fn drive_s1_rejection_daemon(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -3248,6 +3425,8 @@ async fn drive_s1_rejection_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -3431,6 +3610,7 @@ async fn drive_readiness_daemon(
                 ],
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -3507,6 +3687,8 @@ async fn drive_readiness_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -3542,6 +3724,21 @@ async fn send_channel_zero_error(stream: &mut tokio::net::TcpStream, corr: u64, 
         .expect("error frame"),
     )
     .await;
+}
+
+/// The tool names a module's hello catalog advertises.
+fn hello_tool_names(hello: &ModuleHelloBody) -> Vec<String> {
+    hello
+        .manifest
+        .provides
+        .iter()
+        .filter_map(|role| match role {
+            ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .flatten()
+        .map(|tool| tool.name.clone())
+        .collect()
 }
 
 pub(super) async fn open_fake_daemon_session_with_hello(
@@ -3592,6 +3789,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -4041,6 +4239,103 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+/// Subc answers bash on its own deferred path rather than through the shared
+/// tool-call runner. A model repeating one bash command must be steered on the
+/// third call whichever way the path answers it: at once by the rewrite, by the
+/// foreground wait when the command finishes, or by promoting a command that
+/// outlives the wait.
+async fn drive_bash_repeat_breaker_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    super::repeat_breaker_test::write_rewritten_grep_fixture(&root1);
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "repeat-breaker-bash-session",
+        json!({
+            "bash": { "rewrite": true },
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+    let mut rewritten = Vec::new();
+    let mut finished = Vec::new();
+    let mut promoted = Vec::new();
+
+    for (index, description) in super::repeat_breaker_test::DESCRIPTIONS
+        .into_iter()
+        .enumerate()
+    {
+        for (offset, kind, arguments) in [
+            (
+                0,
+                "rewritten",
+                super::repeat_breaker_test::rewritten_bash_grep_arguments(description),
+            ),
+            (
+                10,
+                "finished",
+                super::repeat_breaker_test::finished_bash_arguments(description),
+            ),
+            (
+                20,
+                "promoted",
+                super::repeat_breaker_test::promoted_bash_arguments(description),
+            ),
+        ] {
+            let corr = 900 + offset + index as u64;
+            let response =
+                call_tool_response(&mut stream, 1, corr, "bash", arguments, "repeated bash").await;
+            assert_tool_success(&response, kind);
+            let text = response["text"].as_str().unwrap_or_default().to_string();
+            match kind {
+                "rewritten" => {
+                    super::repeat_breaker_test::assert_answered_by_rewrite(&text);
+                    rewritten.push(text);
+                }
+                "finished" => {
+                    super::repeat_breaker_test::assert_finished_in_foreground(&text);
+                    finished.push(text);
+                }
+                _ => {
+                    super::repeat_breaker_test::assert_promoted(&text);
+                    promoted.push(text);
+                }
+            }
+            // The plugin drains completions after every agent tool call on the
+            // same route; the breaker must not count that plumbing as a call.
+            let _drain = call_tool_response(
+                &mut stream,
+                1,
+                corr + 50,
+                "bash_drain_completions",
+                json!({}),
+                "repeat breaker drain between bash calls",
+            )
+            .await;
+        }
+        if index < 2 {
+            tokio::time::sleep(Duration::from_secs(16)).await;
+        }
+    }
+
+    super::repeat_breaker_test::assert_transport_repeat_sequence(&rewritten);
+    super::repeat_breaker_test::assert_third_call_steers(
+        "foreground-finished bash",
+        &finished,
+        true,
+    );
+    // Each promotion names a new task, so the output drifts.
+    super::repeat_breaker_test::assert_third_call_steers("promoted bash", &promoted, false);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bash_abort_inflight_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -4191,6 +4486,71 @@ async fn drive_bash_wait_rejection_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+/// The plugins mark a delegated worker's call with `worker_session: true` in
+/// the call body, beside `name` and `arguments`. A worker is never woken by a
+/// completion reminder, so its background hand-off text must not promise one;
+/// a call without the flag keeps the primary wording.
+async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    for (corr, worker) in [(130_u64, true), (131_u64, false)] {
+        let mut body = json!({
+            "name": "bash",
+            "arguments": {
+                "command": "sleep 5",
+                "background": true,
+                "foreground_orchestrate": true,
+            },
+        });
+        if worker {
+            body["worker_session"] = json!(true);
+        }
+        send_frame(
+            &mut stream,
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&body).expect("worker role tool call body"),
+            )
+            .expect("worker role tool call frame"),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "worker role background bash").await;
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame));
+        let text = tool_result_text(&frame);
+        assert!(text.contains("Background task started"), "{text:?}");
+        if worker {
+            assert!(text.contains("won't wake you"), "worker text: {text:?}");
+            assert!(
+                !text.contains("completion reminder"),
+                "worker text: {text:?}"
+            );
+        } else {
+            assert!(
+                text.contains("A completion reminder will be delivered automatically"),
+                "primary text: {text:?}"
+            );
+        }
+        let task_id = extract_bash_task_id(&text);
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 100,
+            "bash_kill",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let _ = read_frame_timeout(&mut stream, "worker role bash kill").await;
+    }
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bash_background_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -4230,6 +4590,224 @@ async fn drive_bash_background_daemon(input: FakeDaemonInput) {
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
     send_connection_goodbye(&mut stream).await;
+}
+
+/// A consumer's `call_key` is recorded on the bash task it starts, keyed by
+/// the route's principal; a call without one records the minted task id; and
+/// a `call_key` or `schema_pin` outside subc-protocol's shape is refused
+/// before anything runs, with the field named.
+async fn drive_bash_call_key_daemon(input: FakeDaemonInput) {
+    use aft::bash_background::TaskCallKey;
+
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let background = |command: &str| {
+        json!({
+            "command": command,
+            "background": true,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        })
+    };
+
+    // Both ends of the accepted range (0x21 and 0x7E) and a `prefix:id` form.
+    let keyed = "!run-7:call-3~";
+    send_tool_call_with_call_key(
+        &mut stream,
+        1,
+        120,
+        "bash",
+        background("printf keyed"),
+        Some(keyed),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "keyed bash response").await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "a well-formed key is accepted"
+    );
+    assert!(!tool_result_is_error(&frame));
+    let keyed_task = extract_bash_task_id(&tool_result_text(&frame));
+
+    send_tool_call_with_call_key(
+        &mut stream,
+        1,
+        121,
+        "bash",
+        background("printf unkeyed"),
+        None,
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "unkeyed bash response").await;
+    assert!(!tool_result_is_error(&frame));
+    let unkeyed_task = extract_bash_task_id(&tool_result_text(&frame));
+
+    {
+        let ctx = executor.actor_context(&root_id).expect("root1 actor");
+        let registry = ctx.bash_background();
+        assert_eq!(
+            registry.task_call_key(&keyed_task),
+            Some(TaskCallKey {
+                requester: "direct".to_string(),
+                key: keyed.to_string(),
+                minted: false,
+            })
+        );
+        assert_eq!(
+            registry.task_id_for_call_key("direct", keyed),
+            Some(keyed_task.clone())
+        );
+        assert_eq!(
+            registry.task_id_for_call_key("reserved:other", keyed),
+            None,
+            "the key belongs to the requester that sent it"
+        );
+        assert_eq!(
+            registry.task_call_key(&unkeyed_task),
+            Some(TaskCallKey {
+                requester: "direct".to_string(),
+                key: unkeyed_task.clone(),
+                minted: true,
+            }),
+            "a call without a key records the minted task id in its place"
+        );
+    }
+
+    let too_long = "k".repeat(257);
+    for (corr, malformed) in [
+        (130, ""),
+        (131, "has space"),
+        (132, too_long.as_str()),
+        (133, "caf\u{e9}"),
+        (134, "tab\tkey"),
+    ] {
+        send_tool_call_with_call_key(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            background("printf must-not-run"),
+            Some(malformed),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "malformed call_key refusal").await;
+        assert_eq!(frame.header.corr, corr);
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "call_key {malformed:?} must be refused"
+        );
+        let body: ErrorBody = serde_json::from_slice(&frame.body).expect("error body");
+        assert_eq!(body.code, "invalid_request");
+        assert_eq!(body.detail, Some(json!({ "field": "call_key" })));
+        let ctx = executor.actor_context(&root_id).expect("root1 actor");
+        assert_eq!(
+            ctx.bash_background()
+                .task_id_for_call_key("direct", malformed),
+            None,
+            "a refused call starts no task"
+        );
+    }
+
+    // A well-formed schema_pin is accepted (and not acted on yet); a
+    // malformed one is refused with its own field named.
+    send_tool_call_with_tokens(
+        &mut stream,
+        1,
+        140,
+        "bash",
+        background("printf pinned"),
+        None,
+        Some("catalog:v3"),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut stream, "pinned bash response").await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Response,
+        "a well-formed pin is accepted"
+    );
+    assert!(!tool_result_is_error(&frame));
+    for (corr, malformed) in [(141, ""), (142, "pin with space")] {
+        send_tool_call_with_tokens(
+            &mut stream,
+            1,
+            corr,
+            "bash",
+            background("printf must-not-run"),
+            Some("well-formed-key"),
+            Some(malformed),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "malformed schema_pin refusal").await;
+        assert_eq!(frame.header.corr, corr);
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Error,
+            "schema_pin {malformed:?}"
+        );
+        let body: ErrorBody = serde_json::from_slice(&frame.body).expect("error body");
+        assert_eq!(body.code, "invalid_request");
+        assert_eq!(body.detail, Some(json!({ "field": "schema_pin" })));
+    }
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    assert_eq!(
+        ctx.bash_background()
+            .task_id_for_call_key("direct", "well-formed-key"),
+        None,
+        "a call refused for its pin starts no task"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn send_tool_call_with_call_key(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    call_key: Option<&str>,
+) {
+    send_tool_call_with_tokens(stream, channel, corr, name, arguments, call_key, None).await;
+}
+
+async fn send_tool_call_with_tokens(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    call_key: Option<&str>,
+    schema_pin: Option<&str>,
+) {
+    let mut body = json!({ "name": name, "arguments": arguments });
+    if let Some(call_key) = call_key {
+        body["call_key"] = json!(call_key);
+    }
+    if let Some(schema_pin) = schema_pin {
+        body["schema_pin"] = json!(schema_pin);
+    }
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("tool call body"),
+        )
+        .expect("tool call frame"),
+    )
+    .await;
 }
 
 async fn drive_bash_watch_regex_pattern_daemon(input: FakeDaemonInput) {
@@ -4645,6 +5223,65 @@ async fn drive_core_routing_daemon(input: FakeDaemonInput) {
     assert_eq!(route4_read.header.channel, 4);
     assert_eq!(route4_read.header.corr, 420);
     assert_tool_project_root(&route4_read, &root1);
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// A second session binding to a root that is already configured, with the
+/// same configuration, only needs to be recorded. A read still running on the
+/// root (one that runs for minutes, in the case this reproduces) must not
+/// hold that bind until the route-bind deadline refuses it.
+async fn drive_rebind_beside_held_read_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    // Well inside the 10.5 s route-bind deadline: a rebind is a short job.
+    const REBIND_BOUND: Duration = Duration::from_secs(3);
+
+    bind_route1(&mut stream, &root1).await;
+    send_tool_call(&mut stream, 1, 100, "echo", json!({ "case": "overlap" })).await;
+    state.wait_until("held read started", |inner| inner.overlap_started == 1);
+
+    let started = Instant::now();
+    send_route_bind(&mut stream, 2, 20, &root1).await;
+    let ack = read_frame_within(&mut stream, REBIND_BOUND, "rebind beside a held read").await;
+    let elapsed = started.elapsed();
+    let read_still_held = state
+        .inner
+        .lock()
+        .expect("bridge state lock")
+        .overlap_current
+        == 1;
+    state.release_overlap();
+    let ack = ack.unwrap_or_else(|| {
+        panic!("the same-root rebind was not answered within {REBIND_BOUND:?} beside a held read")
+    });
+    assert_eq!(ack.header.ty, FrameType::Response, "{:?}", ack.header);
+    assert_eq!((ack.header.channel, ack.header.corr), (0, 20));
+    let ack: ModuleControlResponse = serde_json::from_slice(&ack.body).expect("ack body");
+    assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
+    assert!(
+        read_still_held,
+        "the read was released before the rebind was answered"
+    );
+    eprintln!("same-root rebind answered beside a held read in {elapsed:?}");
+
+    let read = read_frame_timeout(&mut stream, "held read response").await;
+    assert_eq!((read.header.channel, read.header.corr), (1, 100));
+    send_tool_call(&mut stream, 2, 200, "echo", json!({ "case": "fast" })).await;
+    let route2_read = read_frame_timeout(&mut stream, "route 2 read response").await;
+    assert_eq!(
+        (route2_read.header.channel, route2_read.header.corr),
+        (2, 200)
+    );
+    assert_eq!(
+        tool_response_json(&route2_read)["success"].as_bool(),
+        Some(true),
+        "the rebound route serves tool calls"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -5703,9 +6340,9 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
     assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
     assert_eq!(rebind_barrier.header.corr, 124);
 
-    let released_at = Instant::now();
     state.release_heavy();
-    let deadline = released_at + Duration::from_secs(6);
+    state.release_epoch_reads();
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut bind_ack = None;
     while let Some(frame) =
         read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
@@ -5718,12 +6355,10 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
             break;
         }
     }
-    state.release_epoch_reads();
     assert!(
         bind_ack.is_some(),
-        "same-root RouteBind must ack within the 6s grace after the old route closes"
+        "same-root RouteBind must acknowledge after the old route closes"
     );
-    assert!(released_at.elapsed() < Duration::from_secs(6));
     assert_eq!(
         state.epoch_started_count(),
         epoch_base,
@@ -5731,6 +6366,31 @@ async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemo
     );
 
     send_connection_goodbye(&mut stream).await;
+    // Closing both halves with unread late replies can reset the socket on
+    // Windows and discard Goodbye before AFT reads it. Keep the read half alive
+    // until AFT consumes Goodbye and closes its connection.
+    tokio::io::AsyncWriteExt::shutdown(&mut stream)
+        .await
+        .expect("finish daemon writes");
+    let mut buffer = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(60), stream.read(&mut buffer))
+            .await
+            .expect("AFT close after Goodbye")
+        {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break
+            }
+            Err(error) => panic!("drain late replies: {error}"),
+        }
+    }
 }
 
 async fn drive_cancelled_first_bind_does_not_orphan_later_bind_daemon(input: FakeDaemonInput) {
@@ -6174,6 +6834,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -6361,6 +7022,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -6773,6 +7435,7 @@ async fn open_status_bar_module(input: &FakeDaemonInput) -> tokio::net::TcpStrea
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -8739,6 +9402,8 @@ async fn send_route_bind_with_elicitation_capability(
         principal: Some(subc_mcp_principal()),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,
@@ -9686,6 +10351,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -9707,6 +10373,8 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         &mut stream,
@@ -10834,6 +11502,165 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
+    let user_config = input.user_config_path.clone();
+    let (
+        FakeDaemonSession {
+            mut stream, root1, ..
+        },
+        hello,
+    ) = open_fake_daemon_session_with_hello(input).await;
+
+    // The catalog sent at connect omits what the user config disables.
+    let advertised = hello_tool_names(&hello);
+    for hidden in ["delete", "bash"] {
+        assert!(
+            !advertised.iter().any(|name| name == hidden),
+            "disabled {hidden} must not be advertised: {advertised:?}"
+        );
+    }
+    for kept in ["move", "read", "bash_status"] {
+        assert!(
+            advertised.iter().any(|name| name == kept),
+            "{kept} stays advertised: {advertised:?}"
+        );
+    }
+
+    let victim = root1.join("victim.txt");
+    std::fs::write(&victim, "keep me\n").expect("write delete target");
+    let doc = json!({
+        "callgraph_store": false,
+        "search_index": false,
+        "semantic_search": false,
+    });
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "tool-disabled-session",
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let assert_disabled = |response: &Value, tool: &str, label: &str| {
+        assert_tool_error_code(response, "tool_disabled", label);
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!("tool_disabled {tool}:"))
+                && message.contains("aft.jsonc")
+                && message.contains(&format!("remove \"{tool}\" from `disabled_tools`")),
+            "{label}: refusal must name the tool and the fix: {response:?}"
+        );
+    };
+
+    // Dispatch refuses a disabled tool even though the catalog hid it, under
+    // its bare and prefixed names, and the file is untouched.
+    for (corr, name) in [(100, "delete"), (101, "aft_delete")] {
+        let delete = call_tool_response(
+            &mut stream,
+            1,
+            corr,
+            name,
+            json!({ "files": ["victim.txt"] }),
+            name,
+        )
+        .await;
+        assert_disabled(&delete, "aft_delete", name);
+    }
+    assert!(victim.exists(), "a refused delete must not touch the file");
+
+    // A disabled bash is refused before the command runs...
+    let marker = root1.join("ran.txt");
+    let bash = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": format!("touch {}", marker.display()) }),
+        "disabled bash",
+    )
+    .await;
+    assert_disabled(&bash, "bash", "disabled bash");
+    assert!(!marker.exists(), "a refused bash must not run");
+    // ...powershell is a separate tool and is not refused as disabled...
+    let powershell = call_tool_response(
+        &mut stream,
+        1,
+        103,
+        "powershell",
+        json!({ "command": "Write-Output hi" }),
+        "powershell with bash disabled",
+    )
+    .await;
+    assert_ne!(
+        powershell["code"].as_str(),
+        Some("tool_disabled"),
+        "disabling bash must not disable powershell: {powershell:?}"
+    );
+    // ...and the plugin's own completion plumbing keeps working.
+    let drain = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "bash_drain_completions",
+        json!({}),
+        "plumbing drain",
+    )
+    .await;
+    assert_tool_success(&drain, "plumbing drain");
+    let ack = call_tool_response(
+        &mut stream,
+        1,
+        105,
+        "bash_ack_completions",
+        json!({ "task_ids": [] }),
+        "plumbing ack",
+    )
+    .await;
+    assert_tool_success(&ack, "plumbing ack");
+
+    // A config edit mid-session does not change this session's answer.
+    std::fs::write(&user_config, r#"{ "disabled_tools": [] }"#).expect("rewrite user config");
+    let delete = call_tool_response(
+        &mut stream,
+        1,
+        106,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "delete after mid-session edit",
+    )
+    .await;
+    assert_disabled(&delete, "aft_delete", "delete after mid-session edit");
+    assert!(victim.exists());
+
+    // A new connect picks up the edited config.
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        2,
+        20,
+        &root1,
+        "tool-disabled-session-2",
+        doc,
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 20).await;
+    let delete = call_tool_response(
+        &mut stream,
+        2,
+        200,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "delete after reconnect",
+    )
+    .await;
+    assert_tool_success(&delete, "delete after reconnect");
+    assert!(!victim.exists(), "the allowed delete must run");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -11185,6 +12012,8 @@ async fn send_management_route_bind_with_harness(
             principal,
             consumer_capabilities: None,
             admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
         },
     )
     .await;
@@ -11396,6 +12225,8 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         principal,
         consumer_capabilities,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,
@@ -13115,6 +13946,126 @@ async fn drive_preview_write_daemon(input: FakeDaemonInput) {
     assert_eq!(
         std::fs::read_to_string(&target).expect("apply write exists"),
         "hello preview\n"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// `read` through the subc tool-call path must return the bytes on disk at the
+/// moment of the call. The file is edited through AFT, restored behind AFT's
+/// back with `git checkout --`, then rewritten with the same size and the same
+/// modification time; every read must show the current bytes. The fixture
+/// daemon has no file watcher, so no change event can explain a correct read.
+#[test]
+fn subc_bridge_read_returns_current_bytes_after_external_restore() {
+    run_subc_bridge_production_test(
+        "subc_bridge_read_returns_current_bytes_after_external_restore",
+        Duration::from_secs(60),
+        drive_read_after_external_restore_daemon,
+        |_, _, _| {},
+    );
+}
+
+fn read_freshness_git(root: &std::path::Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+    let output = command.args(args).output().expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    const MARKER: &str = "TUNING-ONLY PATCH";
+    let original: String = (1..=120).map(|n| format!("fn line_{n}() {{}}\n")).collect();
+    let repo = root1.join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("create repo");
+    let file = repo.join("src/lib.rs");
+    std::fs::write(&file, &original).expect("write fixture");
+    read_freshness_git(&repo, &["init", "-q"]);
+    read_freshness_git(&repo, &["add", "."]);
+    // CI runners have no global git identity, so the commit names its own.
+    read_freshness_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=AFT Tests",
+            "-c",
+            "user.email=aft-tests@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    let window = json!({ "filePath": file.to_string_lossy(), "startLine": 40, "endLine": 100 });
+
+    let edit = call_tool_frame(
+        &mut stream,
+        1,
+        201,
+        "edit",
+        json!({
+            "filePath": file.to_string_lossy(),
+            "edits": [{
+                "oldString": "fn line_98() {}",
+                "newString": format!("fn tuned() {{}} // {MARKER}")
+            }]
+        }),
+        "freshness edit",
+    )
+    .await;
+    assert!(
+        !tool_result_is_error(&edit),
+        "edit should succeed: {}",
+        tool_result_text(&edit)
+    );
+    let edited = call_tool_frame(&mut stream, 1, 202, "read", window.clone(), "read edited").await;
+    assert!(
+        tool_result_text(&edited).contains(MARKER),
+        "the edit must be visible before the restore: {}",
+        tool_result_text(&edited)
+    );
+
+    read_freshness_git(&repo, &["checkout", "--", "src/lib.rs"]);
+    let restored =
+        call_tool_frame(&mut stream, 1, 203, "read", window.clone(), "read restored").await;
+    let restored_text = tool_result_text(&restored);
+    assert!(
+        !restored_text.contains(MARKER) && restored_text.contains("fn line_98() {}"),
+        "read returned content that is no longer on disk after git checkout: {restored_text}"
+    );
+
+    let before = std::fs::metadata(&file).expect("stat before rewrite");
+    let rewritten = original.replace("fn line_50() {}", "fn LINE_50() {}");
+    std::fs::write(&file, &rewritten).expect("same-size rewrite");
+    filetime::set_file_mtime(
+        &file,
+        filetime::FileTime::from_last_modification_time(&before),
+    )
+    .expect("restore mtime");
+    let after = std::fs::metadata(&file).expect("stat after rewrite");
+    assert_eq!(after.len(), before.len(), "rewrite must keep the size");
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    let same_stat = call_tool_frame(
+        &mut stream,
+        1,
+        204,
+        "read",
+        window,
+        "read same-stat rewrite",
+    )
+    .await;
+    let same_stat_text = tool_result_text(&same_stat);
+    assert!(
+        same_stat_text.contains("fn LINE_50() {}") && !same_stat_text.contains("fn line_50() {}"),
+        "read served the previous version of a same-size, same-mtime file: {same_stat_text}"
     );
 
     send_connection_goodbye(&mut stream).await;

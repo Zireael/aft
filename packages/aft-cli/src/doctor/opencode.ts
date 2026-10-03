@@ -8,6 +8,7 @@ import type { OpenCodeHostDetection, OpenCodeHostRuntime } from "../setup/host-g
 import {
   AFT_OPENCODE_PACKAGE,
   acceptV1Entry,
+  describePluginEntry,
   isAftNpmEntry,
   type OpenCodeConfigGeneration,
   type OpenCodePluginKey,
@@ -41,6 +42,11 @@ export interface OpenCodeDoctorResult {
   takenLoadPath: OpenCodeLoadPath | null;
   pluginVersion: string | null;
   problems: string[];
+  /**
+   * The entry-needs-pinning line when it is one of `problems`, so a caller
+   * that reports the same fix another way can leave it out.
+   */
+  pinProblem: string | null;
 }
 
 interface PluginManifest {
@@ -153,14 +159,7 @@ function pluginManifest(entry: string | null, cachePath: string): PluginManifest
  * entry --fix writes, so the report and the fix always agree.
  */
 export function pinProblem(entry: string, pinned: string): string {
-  const tag = entry === AFT_OPENCODE_PACKAGE ? null : entry.slice(entry.lastIndexOf("@") + 1);
-  const current =
-    tag === null
-      ? "has no version, so OpenCode may load any release of the plugin"
-      : tag === "latest"
-        ? "follows the newest release, which can differ from this CLI and its binary"
-        : `asks for version ${tag}, not the version of this CLI and its binary`;
-  return `the plugin entry ${entry} ${current}; run \`${CLI} doctor --fix\` to pin it to ${pinned}`;
+  return `the plugin entry ${entry} ${describePluginEntry(entry)}; run \`${CLI} doctor --fix\` to pin it to ${pinned}`;
 }
 
 function latestLoggedLoadPath(logPath: string): OpenCodeLoadPath | null {
@@ -217,6 +216,7 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     configuredVersion(entry) ??
     null;
   const problems: string[] = [...describePluginKeyProblems(config, generation)];
+  let entryPinProblem: string | null = null;
   if (
     entry &&
     isAftNpmEntry(entry) &&
@@ -224,7 +224,8 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     entry !== input.expectedPluginEntry &&
     !(input.acceptExplicitPluginVersion && acceptV1Entry(entry))
   ) {
-    problems.push(pinProblem(entry, input.expectedPluginEntry));
+    entryPinProblem = pinProblem(entry, input.expectedPluginEntry);
+    problems.push(entryPinProblem);
   }
   if (generation === "ambiguous") {
     problems.push(
@@ -239,7 +240,7 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     );
   }
 
-  return { expectedLoadPath, takenLoadPath, pluginVersion, problems };
+  return { expectedLoadPath, takenLoadPath, pluginVersion, problems, pinProblem: entryPinProblem };
 }
 
 /**

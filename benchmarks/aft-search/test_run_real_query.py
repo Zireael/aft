@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import struct
 import tempfile
@@ -16,12 +18,14 @@ from embedding_fixture_server import Server, corpus_key, query_key
 from evidence_tree import evidence_tree_sha256
 from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
-from run_real_query import ROOT, assemble_score, load_inputs, score_manifest_rows
+from run_real_query import ROOT, assemble_score, load_inputs, score_manifest_rows, probe_pattern_capability
 from search_quality_lib import (
     D_0,
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
+    PAGE_INVARIANCE_FAILED_FIELD,
     PAGE_SIZE,
+    REFERENCE_NOT_PAGE_INVARIANT_FIELD,
     InputFault,
     canonical_json,
     choose_stop,
@@ -75,6 +79,29 @@ class CrossBoundaryDuplicateClient(FakeClient):
         }
 
 
+class PageSizeDependentClient(FakeClient):
+    """An engine whose ranking changes with the page size: a 10-result page
+    returns its files in reverse, like a result cap applied before sorting."""
+
+    def __init__(self) -> None:
+        super().__init__(total=500)
+
+    def search(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        response = super().search(arguments)
+        if int(arguments["topK"]) == 10:
+            response["results"] = list(reversed(response["results"]))
+        return response
+
+
+def paged_capability() -> dict[str, Any]:
+    return {
+        "schema_path": "fixture.json",
+        "schema_sha256": "0" * 64,
+        "offset_declared": True,
+        "offset_bounds": {"minimum": 0, "maximum": 10000},
+    }
+
+
 def manifest(include_tests: bool = True) -> dict[str, Any]:
     return {
         "rows": [
@@ -107,6 +134,157 @@ def concept_report() -> dict[str, Any]:
             }
         ]
     }
+
+
+class SplitQueryRunnerTests(unittest.TestCase):
+    def split_manifest(self, pattern: str = "anchor") -> dict[str, Any]:
+        document = manifest(False)
+        document["rows"][0].update(pattern=pattern, answer_kind="concept", split_kind="R2")
+        return document
+
+    def test_partial_search_reply_is_allowed_only_for_building_fixture_client(self) -> None:
+        from run_real_query import NdjsonClient, AftProtocolError
+        client = object.__new__(NdjsonClient)
+        client.call = lambda *args, **kwargs: {"success": True, "status": "building", "complete": False, "results": []}
+        client.allow_building = False
+        with self.assertRaises(AftProtocolError):
+            client.search({"query": "question"})
+        client.allow_building = True
+        self.assertIs(client.search({"query": "question"})["complete"], False)
+        client.call = lambda *args, **kwargs: {"success": True, "status": "failed", "results": []}
+        with self.assertRaises(AftProtocolError):
+            client.search({"query": "question"})
+
+    def test_split_replay_refuses_a_vector_rejected_by_its_endpoint(self) -> None:
+        from run_real_query import fixture_endpoint
+        with tempfile.TemporaryDirectory() as directory:
+            pack = {"embed_template_version": "test", "vectors": {query_key("known", "test"): [1.0]}}
+            with self.assertRaisesRegex(InputFault, "vector_missing"):
+                with fixture_endpoint(pack, Path(directory) / "log") as endpoint:
+                    request = urllib.request.Request(endpoint + "/v1/embeddings", data=json.dumps({"input": "unknown"}).encode(), headers={"Content-Type": "application/json"})
+                    with self.assertRaises(urllib.error.HTTPError):
+                        urllib.request.urlopen(request, timeout=5)
+
+    def test_building_fixture_holds_corpus_but_serves_query_embeddings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            release = threading.Event()
+            template = "test"
+            vectors = {corpus_key("chunk", template): [1.0], query_key("question", template): [2.0], corpus_key("model probe", template): [3.0]}
+            server = Server(("127.0.0.1", 0), vectors, template, Path(directory) / "log", corpus_release=release, unheld_corpus_texts={"model probe"})
+            serving = threading.Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            replies = []
+            def embed(text: str) -> dict:
+                request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/v1/embeddings", data=json.dumps({"input": text}).encode(), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return json.load(response)
+            corpus = threading.Thread(target=lambda: replies.append(embed("chunk")), daemon=True)
+            try:
+                corpus.start()
+                self.assertTrue(server.corpus_waiting.wait(3), "corpus embedding reached the held endpoint")
+                self.assertEqual(embed("question")["data"][0]["embedding"], [2.0])
+                self.assertEqual(embed("model probe")["data"][0]["embedding"], [3.0])
+                self.assertEqual(replies, [], "semantic indexing must still be held")
+            finally:
+                release.set()
+                corpus.join(5)
+                server.shutdown()
+                server.server_close()
+                serving.join(5)
+            self.assertEqual(replies[0]["data"][0]["embedding"], [1.0])
+
+    def test_split_rows_cover_kinds_and_tuning_is_disjoint(self) -> None:
+        gate = json.loads(Path(__file__).with_name("real-query-manifest.json").read_text())
+        tuning = json.loads(Path(__file__).with_name("split-tuning-manifest.json").read_text())
+        rows = [row for row in gate["rows"] if "pattern" in row]
+        self.assertGreaterEqual(len(rows), 12)
+        self.assertEqual({row["split_kind"] for row in rows}, {f"R{number}" for number in range(1, 8)})
+        dual = [row for row in rows if row["split_kind"] == "R4"]
+        self.assertEqual(len(dual), 2)
+        self.assertEqual((dual[0]["query"], dual[0]["pattern"]), (dual[1]["query"], dual[1]["pattern"]))
+        self.assertEqual({row["answer_kind"] for row in dual}, {"concept", "definition"})
+        self.assertTrue(tuning["tuning_only"])
+        self.assertGreaterEqual(len(tuning["rows"]), 8)
+        self.assertTrue(all(row["tuning_only"] for row in tuning["rows"]))
+        self.assertTrue({(row["query"], row["pattern"]) for row in rows}.isdisjoint({(row["query"], row["pattern"]) for row in tuning["rows"]}))
+        self.assertTrue(all(row["row_source"] and row["answer_key_basis"] for row in rows + tuning["rows"]))
+        from run_real_query import load_manifest_and_tree
+        manifest_path = Path(__file__).with_name("real-query-manifest.json")
+        # The self-test runs before the gate provisions the pinned evidence tree,
+        # so materialize it here; provision() reuses an already-matching tree.
+        with contextlib.redirect_stdout(io.StringIO()):
+            provision(manifest_path)
+        _, tree, _, _ = load_manifest_and_tree(manifest_path)
+        import re
+        broad = next(row for row in rows if row["split_kind"] == "R3")
+        matched = [path for path in (tree / "crates/aft/src").rglob("*.rs") if re.search(broad["pattern"], path.read_text(), re.MULTILINE)]
+        self.assertEqual(len(matched), broad["pattern_files"])
+        self.assertIn(tree / broad["opened_file"], matched)
+        self.assertTrue(all((tree / row["opened_file"]).is_file() for row in rows + tuning["rows"]))
+
+    def test_binary_capability_probe_classifies_invalid_pattern_and_ignored_input(self) -> None:
+        class Probe:
+            def __init__(self, response: dict[str, Any]):
+                self.response = response
+            def call(self, command: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                self.request = arguments
+                return self.response
+        for response, expected in (({"success": False, "code": "invalid_pattern"}, True), ({"success": True}, False)):
+            client = Probe(response)
+            self.assertEqual(probe_pattern_capability(client)["pattern_declared"], expected)
+            self.assertEqual(client.request["arguments"]["pattern"], "[")
+        with self.assertRaisesRegex(InputFault, "pattern_capability_probe_failed"):
+            probe_pattern_capability(Probe({"success": False, "code": "unrelated"}))
+
+    def test_split_parameters_and_prose_pair_are_separate(self) -> None:
+        client = FakeClient()
+        capability = {"offset_declared": False, "pattern_declared": True}
+        rows = score_manifest_rows(self.split_manifest(), "single_page", capability, client, Path("/fixture"))
+        self.assertEqual(client.calls[0]["query"], "recorded test visibility")
+        self.assertEqual(client.calls[0]["pattern"], "anchor")
+        self.assertNotIn("pattern", client.calls[1])
+        self.assertEqual(rows[0]["input_form"], "split")
+        self.assertEqual(rows[0]["prose_only"]["requests"], [client.calls[1]])
+
+    def test_legacy_join_is_recorded_and_empty_pattern_does_not_add_space(self) -> None:
+        capability = {"offset_declared": False, "pattern_declared": False}
+        for pattern, expected in (("anchor", "recorded test visibility anchor"), ("   ", "recorded test visibility")):
+            client = FakeClient()
+            rows = score_manifest_rows(self.split_manifest(pattern), "single_page", capability, client, Path("/fixture"))
+            self.assertEqual(client.calls[0]["query"], expected)
+            self.assertNotIn("pattern", client.calls[0])
+            self.assertEqual(rows[0]["input_form"], "joined")
+
+    def test_empty_pattern_result_drift_is_refused(self) -> None:
+        class Drifting(FakeClient):
+            def search(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+                response = super().search(arguments)
+                if "pattern" in arguments:
+                    response["results"].reverse()
+                return response
+        document = self.split_manifest("")
+        document["rows"][0]["split_kind"] = "R5"
+        with self.assertRaisesRegex(InputFault, "empty_pattern_not_identical"):
+            score_manifest_rows(document, "single_page", {"pattern_declared": True}, Drifting(), Path("/fixture"))
+
+    def assembled(self, capability: dict[str, Any]) -> dict[str, Any]:
+        document = self.split_manifest()
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_bytes(canonical_json(document))
+            binary = root / "aft"
+            binary.write_bytes(b"fake-aft-binary")
+            return assemble_score(document, rows, "single_page", capability, "fixture-model", exact_report(), concept_report(), manifest_path, binary, root / "missing-reference.json")
+
+    def test_score_names_split_rows_an_engine_ignoring_pattern_cannot_be_judged_on(self) -> None:
+        base = {"schema_path": "fixture.json", "schema_sha256": "0" * 64, "offset_declared": False}
+        ignored = self.assembled(base | {"pattern_declared": False, "pattern_probe": "ignored_pattern"})
+        self.assertEqual(ignored["split_rows_not_applicable"]["rows"], [ignored["rows"][0]["episode_id"]])
+        self.assertIn("ignored_pattern", ignored["split_rows_not_applicable"]["reason"])
+        honoured = self.assembled(base | {"pattern_declared": True, "pattern_probe": "invalid_pattern"})
+        self.assertNotIn("split_rows_not_applicable", honoured)
 
 
 class RealQueryRunnerTests(unittest.TestCase):
@@ -256,6 +434,23 @@ class RealQueryRunnerTests(unittest.TestCase):
             corpus, repos = parse_corpus_toml(corpus_path)
             with self.assertRaisesRegex(CorpusMissing, r"corpus_missing:missing:run=python3 benchmarks/aft-search/provision_corpus.py"):
                 validate_corpus(corpus_path, corpus, repos)
+
+    def test_unflagged_row_breaking_page_invariance_faults(self) -> None:
+        with self.assertRaisesRegex(InputFault, r"^page_invariance_failed:followup-census:1$"):
+            score_manifest_rows(manifest(), "paged", paged_capability(), PageSizeDependentClient(), Path("."))
+
+    def test_flagged_row_breaking_page_invariance_records_a_miss(self) -> None:
+        document = manifest()
+        document["rows"][0]["opened_file"] = "src/file000.py"
+        document["rows"][0][REFERENCE_NOT_PAGE_INVARIANT_FIELD] = "defect under measurement"
+        invariant = score_manifest_rows(document, "paged", paged_capability(), FakeClient(total=500), Path("."))
+        self.assertEqual(invariant[0]["metrics"]["mrr_at_10"], 1.0)
+        self.assertNotIn(PAGE_INVARIANCE_FAILED_FIELD, invariant[0])
+        rows = score_manifest_rows(document, "paged", paged_capability(), PageSizeDependentClient(), Path("."))
+        self.assertEqual(rows[0][PAGE_INVARIANCE_FAILED_FIELD], "page_invariance_failed:followup-census:1")
+        self.assertEqual(rows[0]["metrics"], {"mrr_at_10": 0.0, "hit_at_1": 0.0, "hit_at_5": 0.0})
+        self.assertEqual((rows[0]["ranked_paths"], rows[0]["page_zero_ranked_paths"], rows[0]["retrieval_depth"]), ([], [], 0))
+        validate_profile_score({"profile": "paged", "capability": paged_capability() | {"probe_pages_differ": True}, "rows": rows})
 
     def test_recorded_include_tests_changes_ranked_paths(self) -> None:
         true_rows = score_manifest_rows(manifest(True), "single_page", {"offset_declared": False}, FakeClient(), Path("."))

@@ -149,6 +149,24 @@ impl CompressionAggregateCache {
         Ok((project, session))
     }
 
+    /// The aggregates last computed for this key, without revalidating them
+    /// against the table. `status` uses this when the shared connection is busy,
+    /// because it answers from memory rather than waiting for the database.
+    pub fn cached_for_session(
+        &self,
+        harness: &str,
+        project_key: &str,
+        session_id: &str,
+    ) -> Option<(CompressionAggregate, CompressionAggregate)> {
+        let project_key = ProjectAggregateKey::new(harness, project_key);
+        let session_key = SessionAggregateKey::new(harness, &project_key.project_key, session_id);
+        let inner = self.inner.lock();
+        Some((
+            inner.projects.get(&project_key)?.aggregate,
+            inner.sessions.get(&session_key)?.aggregate,
+        ))
+    }
+
     /// Apply a row that was inserted successfully on `conn`.
     ///
     /// A warm entry is advanced only when its watermark matches the row that
@@ -345,6 +363,37 @@ const RETENTION_LOCK_BUDGET_MICROS: u128 = 100_000;
 // (and under 1 ms in each count/selection lock). Allow 10 ms for that contention,
 // still well below the 100 ms maximum hold for a retention transaction.
 const RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS: u128 = 10_000;
+// A retention transaction keeps retrying for this long while another process
+// holds the write lock, releasing the shared connection mutex between attempts.
+const RETENTION_MUTATION_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+// The count budget above is deliberately short, so losing the mutex to a
+// request or to the write-ledger fold (started on the same tick) is routine.
+// A skipped sweep retries after this delay instead of a full minute later.
+const RETENTION_SKIP_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+// Consecutive skipped sweeps (about five minutes of retries) after which
+// retention reports itself starved at WARN, once per streak.
+const RETENTION_STARVATION_WARN_SKIPS: u64 = 60;
+
+static RETENTION_SKIPS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RETENTION_CONSECUTIVE_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Sweeps skipped because their opening count could not get the connection
+/// mutex: `(total since process start, current consecutive streak)`.
+pub fn retention_sweep_skip_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        RETENTION_SKIPS_TOTAL.load(Ordering::Relaxed),
+        RETENTION_CONSECUTIVE_SKIPS.load(Ordering::Relaxed),
+    )
+}
+
+/// Earliest time the next retention sweep may start.
+fn retention_next_due() -> &'static Mutex<Option<std::time::Instant>> {
+    static NEXT_DUE: std::sync::OnceLock<Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    NEXT_DUE.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionSweepSkipReason {
@@ -489,6 +538,8 @@ fn prune_compression_events_in_transaction(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut folded: HashMap<(String, String, Option<String>), (i64, i64, i64)> = HashMap::new();
     let mut deleted = 0;
+    // One compiled statement for the batch instead of one per pruned row.
+    let mut delete = conn.prepare_cached("DELETE FROM compression_events WHERE id = ?1")?;
     for (id, _, harness, project, session, original, compressed, live) in &candidates {
         if *live || *id == max_id {
             continue;
@@ -499,7 +550,7 @@ fn prune_compression_events_in_transaction(
         totals.0 += 1;
         totals.1 += original;
         totals.2 += compressed;
-        deleted += conn.execute("DELETE FROM compression_events WHERE id = ?1", [id])?;
+        deleted += delete.execute([id])?;
     }
     for ((harness, project, session), (events, original, compressed)) in folded {
         conn.execute(
@@ -646,18 +697,27 @@ fn prune_retention_once_observed(
     crate::db::bash_tasks::cap_prepared_terminal_rows(&mut prepared, BASH_TASK_STEADY_STATE_ROWS);
     let stat_micros = stat_started.elapsed().as_micros();
 
-    let mut conn = match db.try_lock() {
-        Ok(conn) => conn,
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Poisoned(_)) => {
+    let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
+    // Time only the attempt that committed: pauses between busy attempts are
+    // spent without the mutex and do not count against its hold budget.
+    let mut mutation_lock_micros = 0;
+    let mutation = match crate::db::maintenance_write(db, budget, |conn| {
+        let attempt_started = Instant::now();
+        let mutation = apply_prepared_retention_tick_timed(conn, now_ms, prepared.clone());
+        mutation_lock_micros = attempt_started.elapsed().as_micros();
+        mutation
+    }) {
+        Ok(mutation) => mutation,
+        // Another thread holds the mutex, or another process held the write
+        // lock for the whole budget: stop this sweep and let a later one retry.
+        Err(
+            crate::db::MaintenanceWriteError::MutexHeld | crate::db::MaintenanceWriteError::Busy(_),
+        ) => return Ok(None),
+        Err(crate::db::MaintenanceWriteError::Poisoned) => {
             return Err("retention database mutex poisoned".to_string())
         }
+        Err(crate::db::MaintenanceWriteError::Failed(error)) => return Err(error.to_string()),
     };
-    let mutation_started = Instant::now();
-    let mutation = apply_prepared_retention_tick_timed(&mut conn, now_ms, prepared)
-        .map_err(|error| error.to_string())?;
-    drop(conn);
-    let mutation_lock_micros = mutation_started.elapsed().as_micros();
 
     Ok(Some(RetentionPass {
         tick: mutation.tick,
@@ -798,24 +858,40 @@ fn eligible_terminal_rows_observed(
     Ok(EligibleTerminalRows::Count { rows, lock_micros })
 }
 
-fn retention_db_key(db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>) -> usize {
+type SharedDb = std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>;
+
+fn retention_db_key(db: &SharedDb) -> usize {
     std::sync::Arc::as_ptr(db) as usize
 }
 
-fn retention_skip_reasons() -> &'static Mutex<HashMap<usize, RetentionSweepSkipReason>> {
-    static SKIPS: std::sync::OnceLock<Mutex<HashMap<usize, RetentionSweepSkipReason>>> =
+/// Last sweep skip reason per shared connection, keyed by the connection's
+/// allocation address. Each entry holds a `Weak` to that allocation: while the
+/// weak count is non-zero the allocator cannot hand the address to a new
+/// connection, so a reopened database never inherits the previous
+/// connection's skip reason. Entries whose connection was dropped are pruned
+/// on every write so the map stays bounded by the live connections.
+struct RetentionSkip {
+    owner: std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>,
+    reason: RetentionSweepSkipReason,
+}
+
+fn retention_skip_reasons() -> &'static Mutex<HashMap<usize, RetentionSkip>> {
+    static SKIPS: std::sync::OnceLock<Mutex<HashMap<usize, RetentionSkip>>> =
         std::sync::OnceLock::new();
     SKIPS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_retention_sweep_skip(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-    reason: Option<RetentionSweepSkipReason>,
-) {
-    let mut skips = retention_skip_reasons().lock();
+fn record_retention_sweep_skip(db: &SharedDb, reason: Option<RetentionSweepSkipReason>) {
+    let mut skips = retention_skips_pruned(retention_skip_reasons().lock());
     match reason {
         Some(reason) => {
-            skips.insert(retention_db_key(db), reason);
+            skips.insert(
+                retention_db_key(db),
+                RetentionSkip {
+                    owner: std::sync::Arc::downgrade(db),
+                    reason,
+                },
+            );
         }
         None => {
             skips.remove(&retention_db_key(db));
@@ -823,13 +899,18 @@ fn record_retention_sweep_skip(
     }
 }
 
-pub fn last_retention_sweep_skip_reason(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-) -> Option<RetentionSweepSkipReason> {
+fn retention_skips_pruned(
+    mut skips: parking_lot::MutexGuard<'static, HashMap<usize, RetentionSkip>>,
+) -> parking_lot::MutexGuard<'static, HashMap<usize, RetentionSkip>> {
+    skips.retain(|_, skip| skip.owner.strong_count() > 0);
+    skips
+}
+
+pub fn last_retention_sweep_skip_reason(db: &SharedDb) -> Option<RetentionSweepSkipReason> {
     retention_skip_reasons()
         .lock()
         .get(&retention_db_key(db))
-        .copied()
+        .map(|skip| skip.reason)
 }
 
 /// Use a separate read-only connection when the shared connection has a database file path;
@@ -970,28 +1051,24 @@ fn prune_retention_sweep_observed(
 }
 
 /// Schedule bounded retention away from the daemon and standalone request loops.
-/// A process can have only one sweep in flight and attempts at most once a minute.
+/// A process can have only one sweep in flight and attempts at most once a
+/// minute, or a few seconds after a sweep skipped for lack of the mutex.
 pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
     registries: Option<Vec<crate::bash_background::BgTaskRegistry>>,
 ) {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        OnceLock,
-    };
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
     static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     let Some(db) = db else {
         return;
     };
-    let mut last = LAST.get_or_init(|| Mutex::new(None)).lock();
-    if last.is_some_and(|value| value.elapsed() < Duration::from_secs(60))
-        || IN_FLIGHT.swap(true, Ordering::AcqRel)
-    {
+    let mut next_due = retention_next_due().lock();
+    if next_due.is_some_and(|due| Instant::now() < due) || IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
     }
-    *last = Some(Instant::now());
+    *next_due = Some(Instant::now() + crate::db::maintenance_interval());
+    drop(next_due);
     if let Err(error) = std::thread::Builder::new()
         .name("aft-retention".into())
         .spawn(move || {
@@ -1005,6 +1082,7 @@ pub fn maybe_spawn_retention(
                 registries.as_deref(),
             ) {
                 Ok(RetentionSweepOutcome::Completed(sweep)) => {
+                    RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
                     crate::slog_info!(
                         "bash task retention: initial_eligible={} removed={} remaining_eligible={:?} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={}",
                         sweep.initial_eligible_rows,
@@ -1018,8 +1096,10 @@ pub fn maybe_spawn_retention(
                         sweep.worst_lock_micros,
                         sweep.elapsed_micros
                     );
+                    // The closing count only refreshes the health backlog
+                    // figure; the sweep itself finished, so this is routine.
                     if let Some(skip) = sweep.count_skip {
-                        crate::slog_warn!(
+                        crate::slog_debug!(
                             "bash task retention count skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
                             skip.reason.as_str(),
                             skip.attempts,
@@ -1041,13 +1121,26 @@ pub fn maybe_spawn_retention(
                         );
                     }
                 }
-                Ok(RetentionSweepOutcome::Skipped(skip)) => crate::slog_warn!(
-                    "bash task retention skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
-                    skip.reason.as_str(),
-                    skip.attempts,
-                    skip.waited_micros,
-                    RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
-                ),
+                Ok(RetentionSweepOutcome::Skipped(skip)) => {
+                    if note_skipped_sweep() {
+                        crate::slog_warn!(
+                            "bash task retention starved: {} consecutive sweeps could not get the database connection within retry_budget_us={}; last reason={} attempts={} waited_us={}",
+                            RETENTION_STARVATION_WARN_SKIPS,
+                            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS,
+                            skip.reason.as_str(),
+                            skip.attempts,
+                            skip.waited_micros
+                        );
+                    } else {
+                        crate::slog_debug!(
+                            "bash task retention skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
+                            skip.reason.as_str(),
+                            skip.attempts,
+                            skip.waited_micros,
+                            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+                        );
+                    }
+                }
                 Err(error) => crate::slog_warn!("retention failed: {}", error),
             }
             IN_FLIGHT.store(false, Ordering::Release);
@@ -1056,6 +1149,25 @@ pub fn maybe_spawn_retention(
         IN_FLIGHT.store(false, Ordering::Release);
         crate::slog_warn!("compression retention worker failed: {}", error);
     }
+}
+
+/// Count a sweep skipped at its opening count and bring the next attempt
+/// forward to the skip retry delay. Returns true only for the skip that makes
+/// the streak reach the starvation threshold, so a starved process warns once
+/// per streak rather than once per attempt.
+fn note_skipped_sweep() -> bool {
+    use std::sync::atomic::Ordering;
+    RETENTION_SKIPS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let streak = RETENTION_CONSECUTIVE_SKIPS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let retry_at =
+        std::time::Instant::now() + RETENTION_SKIP_RETRY.min(crate::db::maintenance_interval());
+    let mut next_due = retention_next_due().lock();
+    if next_due.is_none_or(|due| retry_at < due) {
+        *next_due = Some(retry_at);
+    }
+    streak == RETENTION_STARVATION_WARN_SKIPS
 }
 
 #[cfg(test)]
@@ -1073,6 +1185,48 @@ mod tests {
             [task_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn retention_skip_reason_belongs_to_the_connection_that_recorded_it() {
+        let dir = tempdir().unwrap();
+        let first = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("first.db")).unwrap(),
+        ));
+        record_retention_sweep_skip(
+            &first,
+            Some(RetentionSweepSkipReason::OpeningCountLockBudgetExhausted),
+        );
+        let first_key = retention_db_key(&first);
+        assert_eq!(
+            last_retention_sweep_skip_reason(&first),
+            Some(RetentionSweepSkipReason::OpeningCountLockBudgetExhausted)
+        );
+        drop(first);
+
+        // While the entry exists it keeps the dropped connection's allocation
+        // reserved; once a later write prunes it, the address may be reused,
+        // but then there is no entry to inherit. Either way a new connection
+        // must read no reason.
+        let replacements: Vec<SharedDb> = (0..64)
+            .map(|index| {
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::db::open(&dir.path().join(format!("next-{index}.db"))).unwrap(),
+                ))
+            })
+            .collect();
+        for db in &replacements {
+            assert_eq!(last_retention_sweep_skip_reason(db), None);
+        }
+
+        // The next write prunes the dropped connection's entry. Tests running
+        // in parallel share this map, so an entry now at that address may
+        // belong to another live connection, never to the dropped one.
+        record_retention_sweep_skip(&replacements[0], None);
+        assert!(retention_skip_reasons()
+            .lock()
+            .get(&first_key)
+            .is_none_or(|skip| skip.owner.strong_count() > 0));
     }
 
     #[test]

@@ -1,10 +1,46 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { loadScenarios, materializeParityScenarios } from "../../harness/scenario-loader.js";
 import extension from "./read.extension.js";
 
 describe("read OpenCode 2 scenarios", () => {
+  for (const [fixture, count] of [["complete", 1], ["incomplete", 1001]] as const) {
+    test(`T6 ${fixture} prepares a directory with ${count} entries`, async () => {
+      const scenarios = await loadScenarios(resolve(import.meta.dir));
+      const scenario = scenarios.find((candidate) => candidate.id === `read/T6/read-directory-payload-entries/${fixture}`)!;
+      const project = await mkdtemp(join(tmpdir(), "read-t6-"));
+      try {
+        await extension.beforeScenario?.({
+          scenario,
+          project_root: project,
+          run_root: project,
+          forensic_dir: project,
+          host_generation: "v2",
+        });
+        const turn = scenario.turns[0];
+        if (turn.response.kind !== "tool_calls") throw new Error("expected directory read call");
+        const directory = turn.response.calls[0].arguments.filePath as string;
+        const entries = await readdir(join(project, directory));
+        expect(entries).toHaveLength(count);
+        expect(entries).toContain("entry-0000.txt");
+        expect(scenario.metadata?.t6).toMatchObject({
+          surface_id: "read.directory.payload.entries",
+          owner: "read",
+          fixture,
+          ...(fixture === "incomplete" ? {
+            triggered_reason: "cap",
+            expected_trailer: "shown 1000 of 1001 items (cap) · narrow: path, offset, limit",
+          } : {}),
+        });
+      } finally {
+        await rm(project, { recursive: true, force: true });
+      }
+    });
+  }
+
   test("load through the harness loader and satisfy the slice validator", async () => {
     const root = resolve(import.meta.dir);
     const scenarios = materializeParityScenarios(await loadScenarios(root));
@@ -15,6 +51,8 @@ describe("read OpenCode 2 scenarios", () => {
       "read/T3/read_ask_allow",
       "read/T3/read_ask_deny",
       "read/T3/read_config_deny",
+      "read/T6/read-directory-payload-entries/complete",
+      "read/T6/read-directory-payload-entries/incomplete",
       "read/T7/happy",
     ]);
     await extension.validate?.({

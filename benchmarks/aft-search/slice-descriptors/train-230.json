@@ -1,0 +1,18 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "search-output-bound",
+    "disabled-tools-dispatch",
+    "gh-shim-unbound-writes",
+    "inspect-unknown-counts",
+    "rust-analyzer-locked",
+    "small-fixes",
+    "undo-external-change"
+  ],
+  "note": "Fence files touched: semantic_search/mod.rs and the new semantic_search/snippet_bounds.rs (aft_search now windows each printed line to 500 characters around the match and stops the reply at a ~50 KB budget with a trailer), plus lib.rs (new tool_gate module). Nothing changes which files are ranked or their order: lanes, fusion, admission and truncation are untouched, and the worker measured identical rankings on every repro. Ranked rows should be byte-equal to the reference."
+}

@@ -410,7 +410,7 @@ pub(super) fn extend_projection_dependents(
     file: &str,
     callers: &mut BTreeSet<String>,
 ) -> Result<()> {
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT caller_file FROM refs WHERE target_file = ?1
          UNION SELECT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id WHERE e.target_file = ?1
          UNION SELECT file_path FROM file_dependencies WHERE dep_file = ?1",
@@ -721,8 +721,31 @@ fn entry_point_symbols_from_store(
             roots.insert(row.scoped_name);
         }
     }
+    // Unknown receivers are liveness roots, not invented caller edges. Legacy
+    // databases have no such table and retain their existing projection.
+    let has_unknown: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='view_unknown_live')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_unknown {
+        let mut query = conn.prepare("SELECT DISTINCT target_file, target_symbol FROM view_unknown_live WHERE (?1 IS NULL OR target_file=?1)")?;
+        for row in query.query_map([file], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (target_file, symbol) = row?;
+            by_file
+                .entry(paths.resolve(&target_file))
+                .or_default()
+                .insert(symbol);
+        }
+    }
     Ok(by_file)
 }
+
+/// Provenance of a projected call built from an unresolved, path-qualified value
+/// reference such as `.map(Type::method)`.
+const UNRESOLVED_VALUE_PATH_PROVENANCE: &str = "unresolved_value_path";
 
 const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
             r.caller_node,
@@ -808,8 +831,19 @@ fn outbound_calls_query(
     let mut calls = Vec::with_capacity(rows.len());
     let mut stale_caller_nodes = 0usize;
     for row in rows {
+        // An unresolved value reference is usually a bare identifier that
+        // merely shares a function's name, so it is dropped. A path-qualified
+        // one (`.map(Type::method)`, `.then(module::f)`) does name a function;
+        // keep it as its path so the dead-code scanner can link it.
+        let unresolved_value_path = row.provenance == PROVENANCE_VALUE_REF
+            && !matches!(row.status.as_str(), "resolved" | "resolved_local")
+            && row
+                .full_ref
+                .as_deref()
+                .is_some_and(|full_ref| full_ref.contains("::"));
         if row.provenance == PROVENANCE_VALUE_REF
             && !matches!(row.status.as_str(), "resolved" | "resolved_local")
+            && !unresolved_value_path
         {
             continue;
         }
@@ -818,11 +852,14 @@ fn outbound_calls_query(
         if stale_caller_node {
             stale_caller_nodes += 1;
         }
-        let short_name = row
-            .short_name
-            .as_deref()
-            .or(row.full_ref.as_deref())
-            .unwrap_or_default();
+        let short_name = if unresolved_value_path {
+            row.full_ref.as_deref().unwrap_or_default()
+        } else {
+            row.short_name
+                .as_deref()
+                .or(row.full_ref.as_deref())
+                .unwrap_or_default()
+        };
         let mut target = if is_resolved_edge(&row.status, Some(row.provenance.as_str())) {
             match (row.target_file.as_deref(), row.target_symbol.as_deref()) {
                 (Some(target_file), Some(target_symbol)) => {
@@ -835,10 +872,11 @@ fn outbound_calls_query(
             short_name.to_string()
         };
 
-        if row
-            .full_ref
-            .as_deref()
-            .is_some_and(|full_ref| is_method_dispatch_callee(full_ref, short_name))
+        if !row.ref_id.starts_with("view:")
+            && row
+                .full_ref
+                .as_deref()
+                .is_some_and(|full_ref| is_method_dispatch_callee(full_ref, short_name))
         {
             target.push(crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR);
             target.push_str(row.full_ref.as_deref().unwrap_or_default());
@@ -849,7 +887,13 @@ fn outbound_calls_query(
             caller_symbol,
             target,
             line: row.line,
-            provenance: row.provenance,
+            // `value_ref` promises a resolved function reference; an unresolved
+            // path is only a candidate the scanner may still link.
+            provenance: if unresolved_value_path {
+                UNRESOLVED_VALUE_PATH_PROVENANCE.to_string()
+            } else {
+                row.provenance
+            },
         });
     }
     if stale_caller_nodes > 0 {

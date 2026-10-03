@@ -24,6 +24,12 @@ pub struct CanonicalListKey {
     pub snapshot_generation: String,
     pub normalized_query: String,
     pub include_tests: bool,
+    /// Present only for a request that supplied both `query` and `pattern`:
+    /// the split-mode marker, carrying the pattern and its compile flags.
+    /// Absent from the serialized key of every query-only request, so those
+    /// keys keep their existing form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<super::split_query::SplitListIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

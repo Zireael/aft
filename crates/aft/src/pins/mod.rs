@@ -11,9 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::blob_store::v2::{FamilyKey, FamilyStore, TouchReport};
 use crate::blob_store::FullKey;
 use crate::fs_lock;
 use crate::root_cache::{self, ReadMarker};
+use crate::views::registry::ViewRegistration;
+
+mod live;
+pub use live::LivePin;
 
 /// A pin remains live for thirty minutes after its most recent successful renewal.
 pub const PIN_TTL_MS: u64 = 30 * 60 * 1_000;
@@ -41,6 +46,11 @@ pub enum PinError {
     Io(io::Error),
     Serialize(serde_json::Error),
     InvalidGeneration(String),
+    /// The view is no longer registered, so it may not be pinned; see
+    /// `ViewRegistration::under_pin_barrier`.
+    NotRegistered(String),
+    /// The family registry could not be read or locked.
+    Registry(String),
 }
 
 impl fmt::Display for PinError {
@@ -51,6 +61,10 @@ impl fmt::Display for PinError {
             Self::InvalidGeneration(generation) => {
                 write!(f, "invalid pin generation `{generation}`")
             }
+            Self::NotRegistered(scope) => {
+                write!(f, "view `{scope}` is not registered and cannot be pinned")
+            }
+            Self::Registry(error) => write!(f, "pin registry error: {error}"),
         }
     }
 }
@@ -60,7 +74,7 @@ impl std::error::Error for PinError {
         match self {
             Self::Io(error) => Some(error),
             Self::Serialize(error) => Some(error),
-            Self::InvalidGeneration(_) => None,
+            Self::InvalidGeneration(_) | Self::NotRegistered(_) | Self::Registry(_) => None,
         }
     }
 }
@@ -96,9 +110,45 @@ impl AssemblyPin {
         generation: impl Into<String>,
         keys: &[FullKey],
     ) -> Result<Self, PinError> {
-        let family = family.into();
-        let view = view.into();
+        Self::create_with_hex_keys(
+            view_dir,
+            family.into(),
+            view.into(),
+            generation.into(),
+            keys.iter().map(FullKey::to_hex).collect(),
+        )
+    }
+
+    /// Creates a pin for per-checkout (v2) work, under the registry barrier of
+    /// `registration`. It must list every key the work will rely on, in every
+    /// plane, including keys that are already stored; see
+    /// [`protect_then_touch`]. Fails with [`PinError::NotRegistered`] once the
+    /// view has been deregistered.
+    pub fn create_v2(
+        registration: &ViewRegistration,
+        generation: impl Into<String>,
+        keys: &[FamilyKey],
+    ) -> Result<Self, PinError> {
         let generation = generation.into();
+        let keys = keys.iter().map(FamilyKey::to_hex).collect();
+        registration.under_pin_barrier(|view_dir| {
+            Self::create_with_hex_keys(
+                view_dir,
+                registration.family().to_owned(),
+                registration.scope().to_owned(),
+                generation,
+                keys,
+            )
+        })
+    }
+
+    fn create_with_hex_keys(
+        view_dir: &Path,
+        family: String,
+        view: String,
+        generation: String,
+        keys: Vec<String>,
+    ) -> Result<Self, PinError> {
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
         fs::create_dir_all(&pins_dir)?;
@@ -133,6 +183,24 @@ impl AssemblyPin {
 
     pub fn keys_path(&self) -> &Path {
         &self.keys_path
+    }
+
+    /// Checks, before a publisher's CAS, that its pin files still exist with
+    /// its own metadata. A sweep may have reclaimed a pin it wrongly judged
+    /// dead; publishing without it would expose keys nothing protected.
+    pub fn verify_held(&self) -> Result<(), PinError> {
+        let stored: PinMetadata = serde_json::from_slice(&fs::read(&self.metadata_path)?)?;
+        if stored.owner != self.metadata.owner
+            || stored.generation != self.metadata.generation
+            || stored.family != self.metadata.family
+            || !self.keys_path.is_file()
+        {
+            return Err(PinError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the assembly pin was replaced or reclaimed",
+            )));
+        }
+        Ok(())
     }
 
     /// Renews the pin when a put is due. A renewal error is returned before the
@@ -201,6 +269,47 @@ pub(crate) fn pin_paths(view_dir: &Path, generation: &str) -> (PathBuf, PathBuf)
     )
 }
 
+/// Something whose key list is durable on disk, where a family sweep reads it.
+pub trait Protection {
+    fn durable_keys_path(&self) -> &Path;
+}
+
+impl Protection for AssemblyPin {
+    fn durable_keys_path(&self) -> &Path {
+        &self.keys_path
+    }
+}
+
+/// Touches `keys` in `store`, but only after checking that every one of them
+/// is already listed in `protection`'s durable key file. This is the
+/// "protect, then touch" order the family GC relies on: a sweep either saw
+/// the protection while marking, or the touch landed at its new epoch.
+/// Keys reported missing must be put again from the caller's bytes.
+pub fn protect_then_touch(
+    protection: &dyn Protection,
+    store: &FamilyStore,
+    keys: &[FamilyKey],
+) -> Result<TouchReport, PinError> {
+    let listed = read_keys(protection.durable_keys_path())?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(unprotected) = keys.iter().find(|key| !listed.contains(key.as_bytes())) {
+        return Err(PinError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("key {unprotected} is touched before it is protected"),
+        )));
+    }
+    store
+        .touch(keys)
+        .map_err(|error| PinError::Io(io::Error::other(error.to_string())))
+}
+
+/// Reads a pin's metadata, failing on anything unreadable or malformed. The
+/// family sweep aborts on such an error instead of skipping the pin.
+pub(crate) fn read_metadata_strict(path: &Path) -> Result<PinMetadata, PinError> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
 pub(crate) fn read_keys(path: &Path) -> Result<Vec<[u8; 32]>, PinError> {
     let contents = fs::read_to_string(path)?;
     contents.lines().map(parse_hex_key).collect()
@@ -230,18 +339,72 @@ fn validate_generation(generation: &str) -> Result<(), PinError> {
     Ok(())
 }
 
-fn write_keys(path: &Path, keys: &[FullKey]) -> Result<(), PinError> {
-    let mut encoded = keys.iter().map(FullKey::to_hex).collect::<Vec<_>>();
+fn write_keys(path: &Path, mut encoded: Vec<String>) -> Result<(), PinError> {
     encoded.sort_unstable();
     encoded.dedup();
-    let mut file = create_private(path)?;
-    for key in encoded {
-        writeln!(file, "{key}")?;
-    }
-    file.sync_all()?;
-    drop(file);
+    let file = create_private(path)?;
+    write_key_lines(file, encoded.iter().map(String::as_str))?;
     fs_lock::sync_parent(path);
     Ok(())
+}
+
+/// Writes one key per line and syncs the file. The lines are assembled in
+/// memory and handed to the kernel in one `write_all`: writing line by line
+/// on an unbuffered `File` costs a system call (or two) per key, which adds
+/// up when a pin lists thousands of blobs.
+pub(crate) fn write_key_lines<'a>(
+    file: File,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    let mut contents = Vec::new();
+    for key in keys {
+        contents.extend_from_slice(key.as_bytes());
+        contents.push(b'\n');
+    }
+    let mut file = work_counters::CountingFile(file);
+    file.write_all(&contents)?;
+    file.sync_all()
+}
+
+/// Counts the system-call work spent writing pin key files, so tests can pin
+/// the number of writes and fsyncs a batch costs. Counting is per thread so
+/// parallel tests do not see each other's work; a thread-local increment is
+/// negligible next to the write and fsync it counts.
+#[doc(hidden)]
+pub mod work_counters {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::{self, Write};
+
+    thread_local! {
+        static WRITES: Cell<u64> = const { Cell::new(0) };
+        static SYNCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Pin key-file `(write calls, fsyncs)` made on this thread so far.
+    pub fn key_file_work() -> (u64, u64) {
+        (WRITES.with(Cell::get), SYNCS.with(Cell::get))
+    }
+
+    pub(crate) struct CountingFile(pub(crate) File);
+
+    impl CountingFile {
+        pub(crate) fn sync_all(&self) -> io::Result<()> {
+            SYNCS.with(|c| c.set(c.get() + 1));
+            self.0.sync_all()
+        }
+    }
+
+    impl Write for CountingFile {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            WRITES.with(|c| c.set(c.get() + 1));
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
 }
 
 fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {

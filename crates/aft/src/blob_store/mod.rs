@@ -16,6 +16,8 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 
 use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 
+pub mod v2;
+
 /// The SQLite busy wait used by every blob-store connection.
 pub const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// SQLite's documented connection default.  The blob store reads this value

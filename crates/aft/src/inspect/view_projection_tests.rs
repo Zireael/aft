@@ -58,6 +58,7 @@ fn view_projection_fixture() -> (
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put: true,
+        callgraph: true,
     };
     (project, storage, job, request)
 }
@@ -195,7 +196,9 @@ fn views_tier2_head_mismatch_is_pending() {
 #[test]
 fn views_tier2_watcher_edit_is_pending_until_publication() {
     let (_project, _storage, job, mut request) = view_projection_fixture();
+    let view = crate::views::ViewStore::open(&request.storage, &request.scope).unwrap();
     crate::views::assembly::publish_checkout(&request).unwrap();
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     let path = request.project_root.join("target.ts");
     write_projection_cache_file(&path, "export function used() { return 2; }\n");
     let before = LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get);
@@ -205,6 +208,9 @@ fn views_tier2_watcher_edit_is_pending_until_publication() {
     );
     request.changed_paths.insert(b"target.ts".to_vec());
     crate::views::assembly::publish_checkout(&request).unwrap();
+    // Publication schedules a detached checkpoint whose keeper close can briefly
+    // contend with a zero-wait reader. Test content freshness after it settles.
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     assert!(build_tier2_callgraph_snapshot_with_refresh(&job, true, &[path]).is_some());
     assert_eq!(LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get), before);
 }
@@ -272,4 +278,37 @@ fn views_profile_navigation_reads_on_drill_artifacts() {
         rows.push((caller_count, impact_count));
     }
     assert_eq!(rows[0], rows[1]);
+}
+
+#[test]
+fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
+    let (_project, _storage, job, mut request) = view_projection_fixture();
+    // Publish the current generation without call graph data, as a session
+    // with the call graph off does.
+    request.callgraph = false;
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    // Both with and without paths to verify against the generation: the
+    // path check alone already rejects a keyless entry, so the projection
+    // with no refresh paths is the one the generation-wide guard protects.
+    for refresh_paths in [&job.scope_files[..], &[]] {
+        assert!(
+            build_tier2_callgraph_snapshot_with_refresh(&job, true, refresh_paths).is_none(),
+            "a generation without call graph data must not project an empty graph"
+        );
+    }
+    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&job);
+    assert_eq!(aggregate["callgraph_available"], false);
+    assert_eq!(
+        aggregate["callgraph_unavailable_reason"],
+        crate::views::read::CALLGRAPH_DISABLED
+    );
+    assert_eq!(aggregate["notes"][1], "callgraph_disabled");
+    // With the index itself off, the reason names that configuration setting.
+    let mut off = job.clone();
+    Arc::make_mut(&mut off.config).indexes.callgraph = false;
+    let aggregate = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate_for_job(&off);
+    assert_eq!(
+        aggregate["callgraph_unavailable_reason"],
+        "call graph is disabled (indexes.callgraph=false)"
+    );
 }

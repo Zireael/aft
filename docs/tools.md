@@ -22,14 +22,31 @@ from "ran but partial":
   - `format_skipped_reason`: `unsupported_language` | `no_formatter_configured` | `formatter_not_installed` | `formatter_excluded_path` | `timeout` | `error`
   - `validate_skipped_reason`: `unsupported_language` | `no_checker_configured` | `checker_not_installed` | `timeout` | `error`
 
+### When an index is off or still building
+
+Tools that read a background index (`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`)
+say so instead of returning an empty result:
+
+- `grep` and `glob` scan the filesystem while the trigram index is not ready and mark the
+  answer `fallback: "filesystem"`.
+- `aft_search` uses whichever lanes are ready and names the ones it left out. With no lane
+  ready it refuses with `no_search_lanes_enabled` (both indexes configured off) or
+  `search_lanes_unavailable`, with each lane's status and cause. Use `grep` meanwhile.
+- `aft_callgraph` refuses with `callgraph_off`, `callgraph_building` or `callgraph_unavailable`.
+- `aft_inspect` reports dead code as unavailable rather than zero findings.
+- `glob` and `aft_search` leave out indexed paths that no longer exist on disk and count them
+  in `missing_on_disk_dropped`.
+
 ## Hoisted tools
 
 These replace the host harness's built-ins under the same names. A tool is registered unless
 its name is in `disabled_tools`; disabling a host name (for example `"grep"`) leaves the
 host's own tool in place. There are no `aft_`-prefixed alternatives. The `bash_status`,
-`bash_watch`, `bash_write`, and `bash_kill` companions register independently of `bash`.
-Index state and runtime settings never remove a registration: a tool whose index is off or
-building reports that when called.
+`bash_watch`, `bash_write`, and `bash_kill` companions register independently of `bash`,
+but only while `bash.background` is on: they act only on background tasks. Apart from that,
+index state and runtime settings never remove a registration: a tool whose index is off or
+building reports that when called. The `bash` arguments follow their features the same way
+(see [shell-tool-surface.md](shell-tool-surface.md)).
 
 The Pi/OMP adapter has no `apply_patch` or `glob` implementation, so those two tools are not
 registered there.
@@ -216,7 +233,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | Param | Type | Description |
 |---|---|---|
 | `command` | string | Shell command to execute |
-| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset. NOT a polling window — see below. |
+| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset, except a delegated (subagent) session's `wait: true` call, which has no hard kill unless one is passed. NOT a polling window — see below. |
 | `workdir` | string | Working directory for command execution |
 | `description` | string | Short human-readable summary for harness UI metadata |
 | `background` | boolean | Spawn detached and return a `taskId` (requires the background flag) |
@@ -331,11 +348,15 @@ and return a `taskId`.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
 
-**`bash_watch`** — block on or register for a background task's output. Sync waits are for a
-short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default);
-for anything longer end the turn on `bash({background:true})` and let the completion reminder
-wake you, or use `bash({wait:true})` when the result is needed before anything else. Sync mode
-waits until a `pattern` matches, the task exits, or `timeoutMs` elapses. Async mode (`background: true`)
+**`bash_watch`** — block on or register for a background task's output. In a main session sync
+waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s
+by default); for anything longer end the turn on `bash({background:true})` and let the completion
+reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
+delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
+`timeoutMs` has no deadline and returns when the task exits, and an explicit `timeoutMs` is used
+as given rather than capped. Sync mode
+waits until a `pattern` matches, the task exits, `timeoutMs` elapses, a new message arrives, or the
+call is aborted. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default
 completion reminder. (Wait/watch semantics moved here from `bash_status` — `bash_status` is
 snapshot-only.)
@@ -721,8 +742,36 @@ synthetic "file-summary" chunk that captures filename, parent directory, leading
 comment, and export list — this lifts recall for filename-shaped concept queries like
 *"the bridge spawn helper"*.
 
-Parameters: `query` (required — natural language description), `topK` (optional — default 10),
-`path` (optional — search a different project root, see below).
+Parameters: `query` (natural language description, or a single auto-routed string), `pattern`
+(a regex for names or text that must appear), `topK` (optional — default 10), `path` (optional —
+search a different project root, see below). At least one of `query` and `pattern` is required;
+an empty or whitespace `pattern` counts as absent.
+
+**Query and pattern together.** When you know a name the answer must contain but also want the
+file that explains a concept, give both:
+
+```json
+{ "query": "how is the config file loaded", "pattern": "load_config|ConfigLoader" }
+```
+
+`pattern` uses grep's regex syntax and is case-sensitive, like grep. The ranking starts from
+exactly the ranking `query` alone would return, and the pattern only adds bounded evidence to
+it. Each top-level alternative of the pattern (`a|b`, and the branches of a single group such as
+`^pub struct (A|B)`) is judged on its own; one that matches more than 50 files, or that nothing
+declares, adds nothing. A leading result moves up a little for its own lines that match a
+selective alternative, a little more if it declares the name. An alternative's definition is
+placed right after the best-placed leading result that mentions the name (a caller always
+does), never above it, and marked with `supports`. With no such result, the definition is added
+only when the query has no semantic lane (identifier-shaped prose, or the semantic index is
+still building) or when it is relevant to the query on its own (semantic or lexical score);
+otherwise the summary line still names it. The reply
+opens with a pattern summary line: how many files matched, how many
+the query also found, up to three definition sites (or "no definition found"), and "examined N
+of M candidate files" when the pattern's examination hit its bound. Each result carries
+`matched_by` (`query`, `pattern` or `both`). A reply is marked incomplete when either input
+was bounded. An invalid regex is refused with grep's `invalid_pattern` error and position.
+`pattern` alone ranks the files it matches, definitions first, one result per file. `pattern`
+cannot yet be combined with `path`.
 
 #### Cross-project search
 
@@ -903,6 +952,38 @@ Parameters: `sections` (string or array of category names, or `"all"`; omit for 
 `scope` (file or directory to restrict results to — applied as a result filter), `topK` (max
 drill-down items per category, default 20).
 
+#### Terminal results
+
+Every call ends in exactly one terminal result, named by `inspect_terminal` and rendered as the
+first line of the tool output:
+
+| `inspect_terminal` | Header | Meaning |
+|---|---|---|
+| `fresh` | `FRESH` | Completed, and every diagnostics producer gave an authoritative answer. Carries `wait_stamp` (`text` and `phases`). |
+| `partial` | `PARTIAL: diagnostics unknown for rust, typescript (see below)` | Completed with the same payload and `wait_stamp` as `fresh`, but diagnostics are unknown for the named producers. `partial_reason` holds the header text without the `PARTIAL:` prefix. The body names each producer and its server root, for example `Incomplete diagnostics: producer rust @ spikes/x failed (...)`. |
+| `interrupted` | prose | Cancelled before completion; `completed_phases` lists what finished. |
+| `phase_failed` | prose | A phase failed; `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` say which and why. |
+
+`FRESH` never heads a result whose diagnostics summary reads `diagnostics: unknown`. A missing
+language server binary (for example `docker-langserver`) leaves its files' diagnostics unknown and
+the result `partial`; install the server or disable it with `lsp.disabled` to get `fresh`.
+
+The wait stamp counts phases instead of listing each one:
+`waited: yes; completed: lsp_start ×9 (typescript 3, python 2, bash 1, ...), lsp_quiescence ×9 (...), tier2_rescan ×5 (...)`.
+Repeated TypeScript runtime notes collapse the same way
+(`TypeScript 5.9.3: project installation ×3 (first: ...)`).
+
+#### Which language servers start
+
+A blocking inspect walks the project (or the scope) and starts one server per (server, workspace
+root) its files need, all at once, under one shared startup deadline. The walk honors `.gitignore`
+and `.aftignore`, and skips dependency and build output directories, test-fixture directories
+(`fixtures`, `__fixtures__`, `testdata`, `test-data`, `__mocks__`, `__snapshots__`, `corpora`) and
+`spikes/`, unless the scope itself names one of them. Roots are shared where one server can serve
+several packages: TypeScript packages that see the same installed TypeScript version share one
+server, and Bash and YAML use the outermost root marker in the project. Rust uses the owning Cargo
+workspace.
+
 Registered on the `recommended` and `all` tiers; disable via `inspect.enabled: false` in config.
 
 ---
@@ -921,8 +1002,29 @@ when it removes many files. Single-file callers pass a single-element array.
 { "files": ["dist/foo.js", "dist/bar.js", "dist/baz.js"] }
 ```
 
-Deleting a directory requires `recursive: true`. Every file inside is individually backed up
-before the tree is removed; symlinks and empty directories are rejected before any mutation.
+Deleting a directory requires `recursive: true`. The tree is backed up before it is removed,
+and one `aft_safety undo` restores it exactly:
+
+- directories, including empty ones, with their permissions;
+- file contents;
+- hard links inside the tree, relinked so they share one file again;
+- symlinks: the link itself is deleted and restored with its exact target text (also when
+  dangling or pointing outside the tree); the target is never followed or touched.
+
+Reported as warnings: sockets are deleted but not restored (they hold no data, and a recreated
+one would have no process listening), and a file hard-linked to paths outside the tree comes
+back as an independent copy. Refused before anything is deleted: a mount point of another
+filesystem (removing it would delete that filesystem's contents), named pipes, device nodes,
+and symlinks undo cannot recreate exactly (a non-UTF-8 target, or any symlink on Windows).
+The delete removes only the entries it backed up, deepest first; if something new appears in
+the tree meanwhile, it stops with `partial: true`, leaves the new entry in place, and undo
+restores what was removed.
+
+Paths under the system temp directory are never backed up, and neither is anything when
+backups are disabled; such deletes skip these checks and the backup budget, and only a mount
+point is refused. A recursive delete whose backup would record more than 2,000 entries (files,
+directories and links) or copy 100 MiB in one call is refused; delete it in smaller pieces or
+use bash `rm -rf` when no undo is needed.
 
 ```json
 { "files": ["build/cache"], "recursive": true }

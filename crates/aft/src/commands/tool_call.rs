@@ -26,7 +26,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     handle_with_dispatch(req, ctx, &dispatch)
 }
 
-fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>) -> Response {
+#[doc(hidden)]
+pub fn handle_with_dispatch(
+    req: &RawRequest,
+    ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+) -> Response {
     let Some(name) = req
         .params
         .get("name")
@@ -48,9 +53,19 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         );
     }
 
+    // Standalone callers historically send `args`; silently ignoring that
+    // field turns a scoped inspect into a whole-project inspect.
+    if req.params.get("args").is_some() && req.params.get("arguments").is_some() {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "tool_call: pass either 'args' or 'arguments', not both",
+        );
+    }
     let arguments = req
         .params
         .get("arguments")
+        .or_else(|| req.params.get("args"))
         .cloned()
         .unwrap_or_else(|| json!({}));
     let preview = req
@@ -69,6 +84,9 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         }
         None => None,
     };
+    if ctx.claim_database_runtime_retry(name) {
+        ctx.retry_database_runtime();
+    }
     let report_registration_downgrade = edit_slot_survives.is_some();
     let config = ctx.config();
     let project_root = config
@@ -86,6 +104,11 @@ fn handle_with_dispatch(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchF
         // A later session that explicitly disables hashline has no configure
         // response, so its first tool call emits that session's one-shot warning.
         report_registration_downgrade,
+        standard_edit_grammar: false,
+        // Standalone tool calls use the `disabled_tools` list configure resolved
+        // when the session connected (the root config).
+        disabled_tools: None,
+        worker_session: req.worker_session(),
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);

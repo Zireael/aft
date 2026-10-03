@@ -1250,6 +1250,61 @@ mod tests {
     use crate::hashline::integration::RegistrationRequest;
     use crate::protocol::DEFAULT_SESSION_ID;
 
+    // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the
+    // WSL launcher, which fails without an installed distribution, so the byte
+    // comparison runs on Unix runners only.
+    #[cfg(unix)]
+    #[test]
+    fn literal_append_rewrites_match_bash_bytes() {
+        use crate::bash_rewrite::parser::tests::LITERAL_APPEND_CASES;
+        use std::process::Command;
+
+        if which::which("bash").is_err() {
+            eprintln!("skipping bash byte oracle: bash is unavailable");
+            return;
+        }
+        let native = tempfile::tempdir().unwrap();
+        let rewritten = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(rewritten.path().to_path_buf()),
+                experimental_bash_rewrite: true,
+                restrict_to_project_root: true,
+                ..Config::default()
+            },
+        );
+        for command in LITERAL_APPEND_CASES {
+            fs::write(native.path().join("notes.txt"), "existing\n").unwrap();
+            fs::write(rewritten.path().join("notes.txt"), "existing\n").unwrap();
+            let output = Command::new("bash")
+                .args(["--noprofile", "--norc", "-c", command])
+                .env_remove("BASH_ENV")
+                .current_dir(native.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "bash failed: {command}: {output:?}"
+            );
+            let RewriteDecision::Accept(request) =
+                super::CatAppendRule.decide(command, "literal-oracle", None, &ctx)
+            else {
+                panic!("must rewrite: {command}");
+            };
+            let response = super::CatAppendRule.execute(&request, &ctx);
+            assert!(
+                response.success || response.data["code"] == "no_change",
+                "rewrite failed: {command}: {response:?}"
+            );
+            assert_eq!(
+                fs::read(rewritten.path().join("notes.txt")).unwrap(),
+                fs::read(native.path().join("notes.txt")).unwrap(),
+                "byte mismatch: {command}"
+            );
+        }
+    }
+
     fn fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("src")).unwrap();

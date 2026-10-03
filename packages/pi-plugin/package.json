@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-pi",
-  "version": "0.57.2",
+  "version": "0.58.2",
   "type": "module",
   "description": "Pi coding agent extension for Agent File Tools (AFT) — tree-sitter and LSP-powered code analysis",
   "main": "dist/index.js",
@@ -23,30 +23,32 @@
     "test:unit": "bun test src/__tests__ --path-ignore-patterns 'src/__tests__/e2e/**'"
   },
   "dependencies": {
-    "@cortexkit/aft-bridge": "0.57.2",
+    "@cortexkit/aft-bridge": "0.58.2",
     "comment-json": "^5.0.0",
     "diff": "^8.0.4",
-    "typebox": "1.1.38",
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
-    "@cortexkit/aft-darwin-arm64": "0.57.2",
-    "@cortexkit/aft-darwin-x64": "0.57.2",
-    "@cortexkit/aft-linux-arm64": "0.57.2",
-    "@cortexkit/aft-linux-x64": "0.57.2",
-    "@cortexkit/aft-win32-arm64": "0.57.2",
-    "@cortexkit/aft-win32-x64": "0.57.2"
+    "@cortexkit/aft-darwin-arm64": "0.58.2",
+    "@cortexkit/aft-darwin-x64": "0.58.2",
+    "@cortexkit/aft-linux-arm64": "0.58.2",
+    "@cortexkit/aft-linux-x64": "0.58.2",
+    "@cortexkit/aft-win32-arm64": "0.58.2",
+    "@cortexkit/aft-win32-x64": "0.58.2"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",
     "@earendil-works/pi-ai": "^0.80.2",
     "@earendil-works/pi-tui": "^0.80.2",
     "@types/node": "^22.0.0",
+    "typebox": "1.1.38",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "exports": {
     ".": {

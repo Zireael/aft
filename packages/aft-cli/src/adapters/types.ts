@@ -33,6 +33,14 @@ export interface PluginCacheInfo {
   cached?: string;
   latest?: string;
   exists: boolean;
+  /**
+   * The npm registration the harness config holds for the plugin, exactly as
+   * written (for example `@cortexkit/aft-opencode` or
+   * `@cortexkit/aft-opencode@0.57.2`). Only OpenCode reports it; doctor uses it
+   * to say whether `doctor --fix` must pin the entry as well as update the
+   * plugin.
+   */
+  configuredEntry?: string;
 }
 
 export interface PluginEntryResult {

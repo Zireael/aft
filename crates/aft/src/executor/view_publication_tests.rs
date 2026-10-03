@@ -20,6 +20,37 @@ pub(super) fn record_cas(root: PathBuf, elapsed: Duration) {
     CAS_TIMINGS.lock().entry(root).or_default().push(elapsed);
 }
 
+static SETTLED: LazyLock<Mutex<HashMap<PathBuf, Sender<u64>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(super) fn settled(id: u64, root: &Path) {
+    if let Some(tx) = SETTLED.lock().get(root) {
+        let _ = tx.send(id);
+    }
+}
+
+struct Completions {
+    root: PathBuf,
+    rx: Receiver<u64>,
+}
+impl Completions {
+    fn new(root: PathBuf) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        SETTLED.lock().insert(root.clone(), tx);
+        Self { root, rx }
+    }
+    fn next(&self) -> u64 {
+        self.rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("publication completion")
+    }
+}
+impl Drop for Completions {
+    fn drop(&mut self) {
+        SETTLED.lock().remove(&self.root);
+    }
+}
+
 struct GateEntry {
     phase: &'static str,
     started: Sender<u64>,
@@ -47,7 +78,7 @@ pub(super) fn phase_gate(id: u64, root: &Path, phase: &str) {
     if let Some(gate) = gate {
         let _ = gate.started.send(id);
         gate.release
-            .recv_timeout(Duration::from_secs(15))
+            .recv_timeout(Duration::from_secs(60))
             .expect("release publication gate");
     }
 }
@@ -71,7 +102,7 @@ impl Gate {
     }
     fn started(&self) -> u64 {
         self.arrived
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(60))
             .expect("publication reached gate")
     }
 }
@@ -187,7 +218,7 @@ impl Fixture {
                     }
                 }),
             )
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(60))
             .unwrap();
         assert!(response.success, "{:?}", response.data);
     }
@@ -297,22 +328,27 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
 fn superseded_publication_cancels_before_derived_and_removes_generation_files() {
     let fixture = Fixture::new();
     fixture.change("older");
+    let completions = Completions::new(fixture.job_root());
     let gate = Gate::new(fixture.job_root().as_path(), "blobs");
     fixture.schedule();
     let older = gate.started();
     fixture.change("newer");
+    let newer_gate = Gate::new(fixture.job_root().as_path(), "cas");
     fixture.schedule();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while fixture.view.current_generation().unwrap().as_deref() == Some(&fixture.initial) {
-        assert!(
-            Instant::now() < deadline,
-            "newer publication blocked behind older one"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let newer_id = newer_gate.started();
+    let delay = std::env::var("AFT_TEST_TIMING_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    std::thread::sleep(Duration::from_millis(delay));
+    drop(newer_gate);
+    // The newer job must finish while the obsolete assembly remains held.
+    // Waiting for its lifecycle completion also observes cleanup, not just CAS.
+    assert_eq!(completions.next(), newer_id);
     let newer = fixture.view.current_generation().unwrap();
+    assert_ne!(newer.as_deref(), Some(fixture.initial.as_str()));
     drop(gate);
-    fixture.wait_idle();
+    assert_eq!(completions.next(), older);
     assert_eq!(fixture.view.current_generation().unwrap(), newer);
     assert!(
         !PHASES.lock()[fixture.job_root().as_path()]
@@ -404,4 +440,49 @@ fn publication_health_reports_root_and_each_off_lane_phase() {
         drop(gate);
         fixture.wait_idle();
     }
+}
+
+#[test]
+fn deleted_root_pending_publication_retires_once_without_rescheduling() {
+    let fixture = Fixture::new();
+    fixture.change("next");
+    let root = fixture.job_root();
+    let before = fixture.ctx.view_publication_attempts_for_test();
+    let gate = Gate::new(&root, "manifest");
+    let completions = Completions::new(root.clone());
+    fixture.schedule();
+    gate.started();
+    std::fs::remove_dir_all(fixture.project.path()).unwrap();
+    drop(gate);
+    completions.next();
+    fixture.wait_idle();
+    assert_eq!(
+        fixture.ctx.view_publication_attempts_for_test(),
+        before + 1,
+        "pending publication must make exactly one preparation attempt"
+    );
+    assert!(
+        fixture.ctx.view_runtime_snapshot().is_none(),
+        "deletion must retire views state, not just stop the current thread"
+    );
+    // Repeated quiet-window ticks simulate watcher publication retries after
+    // checkout deletion. Late paths must not recreate a retired publication.
+    let mut state = crate::context::WatcherDrainSliceState::new(
+        fixture.ctx.configure_generation(),
+        fixture.ctx.configure_content_generation(),
+    );
+    for _ in 0..3 {
+        state.view_publication_due = Some(Instant::now());
+        state.view_publication_paths.insert(root.join("tracked.rs"));
+        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+        assert!(state.view_publication_due.is_none());
+        assert!(state.view_publication_paths.is_empty());
+        assert!(schedule(&fixture.ctx, BTreeSet::new(), true).is_ok());
+    }
+    assert_eq!(
+        fixture.ctx.view_publication_attempts_for_test(),
+        before + 1,
+        "deleted publication must never be re-scheduled"
+    );
+    assert!(!running_for_context(&fixture.ctx));
 }

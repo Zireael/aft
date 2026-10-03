@@ -1,0 +1,146 @@
+{
+  "registry_artifacts": [
+    {
+      "name": "cortexkit-role-tool-provider",
+      "version": "0.4.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "068c305434e881773a662aab07193edae5a961b82bbf409712a01aa093af2a23",
+      "dependency_kind": "normal",
+      "release_tag": "cortexkit-role-tool-provider-v0.4.5"
+    },
+    {
+      "name": "cortexkit-role-tool-provider-conformance",
+      "version": "0.4.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "1bfed5e7ef0f6ed1db0f5a349eab687fb76502f2901e0888f6f122113cc91d04",
+      "dependency_kind": "dev",
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.4.5"
+    },
+    {
+      "name": "cortexkit-role-harness",
+      "version": "0.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "54901f6290132d5f70ffbf6bd3e06d31c128cb70566a73fb201866b8394bb8aa",
+      "dependency_kind": "dev",
+      "release_tag": "cortexkit-role-harness-v0.1.0"
+    }
+  ],
+  "slice_a": {
+    "declaration": {
+      "majors": [
+        {
+          "version": "tool-provider/v1",
+          "ops": [
+            "role.describe",
+            "tool.catalog",
+            "tool.call"
+          ],
+          "stability": "alpha"
+        }
+      ],
+      "implementation_version": "<built-package-version>",
+      "capabilities": []
+    },
+    "enabled_cases": [
+      "role_describe_shape",
+      "role_describe_cacheable",
+      "catalog_schemas_flat",
+      "catalog_schema_digest_stable",
+      "catalog_digest_only",
+      "catalog_unknown_preset_refused",
+      "catalog_disabled_tool_absent",
+      "call_disabled_tool_refused_by_name",
+      "terminal_frame_on_success",
+      "terminal_frame_on_refusal",
+      "terminal_frame_on_cancel",
+      "call_key_malformed_refused",
+      "call_key_well_formed_accepted",
+      "schema_pin_current_accepted",
+      "schema_pin_malformed_refused"
+    ],
+    "skipped_cases": [
+      "withdraw_unknown_call",
+      "withdraw_answer_identical_on_repeat_and_owner",
+      "withdraw_owner_as_carrier_needs_no_carrier",
+      "withdraw_owner_without_carrier_refused",
+      "withdraw_carrier_naming_other_carrier_refused",
+      "withdraw_scope_mismatch_refused",
+      "withdraw_top_level_call_key_refused",
+      "withdraw_malformed_target_key_refused",
+      "withdraw_not_permitted_is_route_error",
+      "late_results_cursor_round_trip",
+      "late_results_ack",
+      "late_results_incarnation_change_refused",
+      "crash_after_prepared_not_started",
+      "crash_after_authorized_not_started"
+    ],
+    "capabilities": [
+      "disable_tool",
+      "cancellation",
+      "call_key",
+      "schema_pin"
+    ]
+  },
+  "slice_b": {
+    "declaration": {
+      "majors": [
+        {
+          "version": "tool-provider/v1",
+          "ops": [
+            "role.describe",
+            "tool.catalog",
+            "tool.call",
+            "tool.withdraw",
+            "late_results",
+            "late_results.ack"
+          ],
+          "stability": "alpha"
+        }
+      ],
+      "implementation_version": "<built-package-version>",
+      "capabilities": []
+    },
+    "enabled_cases": [
+      "role_describe_shape",
+      "role_describe_cacheable",
+      "catalog_schemas_flat",
+      "catalog_schema_digest_stable",
+      "catalog_digest_only",
+      "catalog_unknown_preset_refused",
+      "catalog_disabled_tool_absent",
+      "call_disabled_tool_refused_by_name",
+      "terminal_frame_on_success",
+      "terminal_frame_on_refusal",
+      "terminal_frame_on_cancel",
+      "call_key_malformed_refused",
+      "call_key_well_formed_accepted",
+      "schema_pin_current_accepted",
+      "schema_pin_malformed_refused",
+      "withdraw_unknown_call",
+      "withdraw_answer_identical_on_repeat_and_owner",
+      "withdraw_owner_as_carrier_needs_no_carrier",
+      "withdraw_owner_without_carrier_refused",
+      "withdraw_carrier_naming_other_carrier_refused",
+      "withdraw_scope_mismatch_refused",
+      "withdraw_top_level_call_key_refused",
+      "withdraw_malformed_target_key_refused",
+      "withdraw_not_permitted_is_route_error",
+      "late_results_cursor_round_trip",
+      "late_results_ack",
+      "late_results_incarnation_change_refused",
+      "crash_after_prepared_not_started",
+      "crash_after_authorized_not_started"
+    ],
+    "skipped_cases": [],
+    "capabilities": [
+      "disable_tool",
+      "cancellation",
+      "call_key",
+      "schema_pin",
+      "held_calls",
+      "scope_stamp",
+      "late_results",
+      "approval_execution"
+    ]
+  }
+}

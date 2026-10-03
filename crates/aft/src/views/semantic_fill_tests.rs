@@ -38,6 +38,7 @@ fn semantic_fill_has_no_derived_writes_or_checkpoint_and_reader_uses_owner() {
         semantic_keys: Default::default(),
         require_semantic: true,
         allow_blob_put: true,
+        callgraph: true,
     };
     let initial = publish_checkout(&request).unwrap();
     assert!(initial.published);
@@ -118,6 +119,7 @@ fn prepared_callgraph_retains_committed_wal_before_pointer_publication() {
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put: true,
+        callgraph: true,
     };
     let prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
     let (path, _) = prepared

@@ -49,6 +49,32 @@ fn assert_no_bare_list_envelope_key_recursive(val: &Value) {
 }
 
 #[test]
+fn grep_scan_deadline_reports_a_lower_bound_total() {
+    // An indexed scan that ran out of time has unread candidate files, so
+    // even an uncapped page must not claim an exact total.
+    let payload = serde_json::json!({
+        "matches": [
+            {"file": "a.rs", "line": 1, "column": 1, "line_text": "x", "match_text": "x"},
+        ],
+        "total_matches": 1,
+        "truncated": false,
+        "scan_deadline_reached": true,
+        "skipped_foreign_mounts": 0,
+    });
+    let envelope = build_grep_envelope(&payload).expect("a timed-out scan is not complete");
+    assert_eq!(envelope.reason, Some(Reason::Walk));
+    assert_eq!(envelope.total, Total::AtLeast(1));
+
+    let complete = serde_json::json!({
+        "matches": payload["matches"].clone(),
+        "total_matches": 1,
+        "truncated": false,
+        "skipped_foreign_mounts": 0,
+    });
+    assert!(build_grep_envelope(&complete).is_none());
+}
+
+#[test]
 fn grep_surface_metadata_matches_registry() {
     assert_eq!(COMMAND, "grep");
     assert_eq!(LIST_ID, "payload.matches");

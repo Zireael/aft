@@ -107,7 +107,13 @@ pub fn build_grep_envelope(data: &Value) -> Option<ListEnvelope> {
     let walk_truncated = data
         .get("walk_truncated")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        // A scan stopped by its time budget left candidate files unread, the
+        // same traversal cut as a walk stopped early: the total is a floor.
+        || data
+            .get("scan_deadline_reached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let skipped_foreign_mounts = data
         .get("skipped_foreign_mounts")
         .and_then(Value::as_u64)

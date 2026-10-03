@@ -627,27 +627,34 @@ fn declaration_scanner_does_not_absorb_unrelated_following_occurrences() {
 
 #[test]
 fn bare_identifiers_rank_declarations_before_repeated_consumers() {
+    // Definition credit goes only to source files, so each declaration sits in
+    // a file of its own language.
     let cases = [
         (
             "SessionStatus",
+            "ts",
             "export namespace SessionStatus { export type Value = string; }\n",
             "// SessionStatus consumer SessionStatus consumer SessionStatus\n",
         ),
         (
             "fn write_gather_log",
+            "rs",
             "fn write_gather_log() {}\n",
             "// fn write_gather_log consumer fn write_gather_log consumer\n",
         ),
         (
             "carry_required",
+            "rs",
             "struct TransformState {\n    carry_required: bool,\n}\n",
             "// carry_required consumer carry_required consumer carry_required\n",
         ),
     ];
 
-    for (case_index, (query, definition, consumer)) in cases.into_iter().enumerate() {
+    for (case_index, (query, extension, definition, consumer)) in cases.into_iter().enumerate() {
         let dir = create_temp_corpus();
-        let definition_path = dir.path().join(format!("src/definition_{case_index}.txt"));
+        let definition_path = dir
+            .path()
+            .join(format!("src/definition_{case_index}.{extension}"));
         let consumer_path = dir.path().join(format!("src/consumer_{case_index}.txt"));
         fs::write(&definition_path, definition).expect("write definition fixture");
         fs::write(&consumer_path, consumer.repeat(20)).expect("write consumer fixture");
@@ -816,4 +823,106 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
         "natural_language"
     );
     assert_eq!(response["structuredContent"]["plan"]["exact_input"], phrase);
+}
+
+/// A code-literal query whose identifier also appears inside a large
+/// single-line JSON document: the source that defines the identifier ranks
+/// above the data file, and the reply prints a bounded window of the JSON line
+/// instead of the whole line.
+#[test]
+fn code_literal_query_bounds_single_line_json_output_and_ranks_source_first() {
+    let dir = create_temp_corpus();
+    fs::write(
+        dir.path().join("src/artifacts.rs"),
+        concat!(
+            "pub struct Paths;\n",
+            "pub fn open_task_artifact(paths: &Paths, artifact: u8) -> Option<u8> {\n",
+            "    let _ = paths;\n",
+            "    Some(artifact)\n",
+            "}\n",
+            "pub fn reopen(paths: &Paths) -> Option<u8> {\n",
+            "    open_task_artifact(paths, 1)\n",
+            "}\n",
+        ),
+    )
+    .expect("write source specimen");
+    fs::create_dir_all(dir.path().join("docs")).expect("create docs dir");
+    // One line of about 600 KB that mentions the identifier many times, the
+    // shape of a captured census or benchmark result document.
+    let entries = (0..4_000)
+        .map(|index| {
+            format!(
+                "{{\"id\":{index},\"call\":\"open_task_artifact(paths, {index})\",\"note\":\"{}\"}}",
+                "n".repeat(100)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let census = format!("{{\"entries\":[{entries}]}}");
+    assert!(census.len() > 500_000);
+    fs::write(dir.path().join("docs/census.json"), &census).expect("write census");
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        },
+    );
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SearchIndex::build(dir.path()));
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "code-literal-single-line-json",
+        "command": "semantic_search",
+        "query": "open_task_artifact(",
+        "top_k": 10
+    }))
+    .expect("build engine request");
+    let response = serde_json::to_value(handle_semantic_search(&request, &ctx))
+        .expect("serialize engine response");
+
+    assert_eq!(response["success"], true, "{response:?}");
+    let text = response["text"].as_str().expect("text");
+    // The grep tool's page budget, plus room for the footer lines.
+    assert!(
+        text.len() < 50 * 1024 + 2_048,
+        "search text is {} bytes",
+        text.len()
+    );
+    assert!(text.contains("… [line truncated]"), "{text}");
+    assert!(
+        text.lines().all(|line| line.chars().count() <= 600),
+        "a printed line exceeds the snippet line cap"
+    );
+    let response_bytes = serde_json::to_string(&response).expect("serialize").len();
+    assert!(
+        response_bytes < 100 * 1024,
+        "search response is {response_bytes} bytes"
+    );
+
+    let files = response["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .unwrap_or_default()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    let source_rank = files
+        .iter()
+        .position(|file| file.ends_with("src/artifacts.rs"))
+        .expect("source file in results");
+    let data_rank = files
+        .iter()
+        .position(|file| file.ends_with("docs/census.json"))
+        .expect("data file in results");
+    assert!(
+        source_rank < data_rank,
+        "source must rank above the data file: {files:?}"
+    );
+    assert_eq!(source_rank, 0, "{files:?}");
 }

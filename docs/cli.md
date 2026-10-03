@@ -18,7 +18,18 @@ Add `--harness opencode` or `--harness pi` to any command to target one harness 
 
 **`setup`** — Registers AFT with each installed harness (edits the harness config to enable
 the AFT plugin). When multiple harnesses are detected, prompts you to pick which ones to
-configure.
+configure. It then shows a checklist of features (search and navigation tools, editing tools,
+the `bash` tool and its settings, the three indexes, GitHub read and write) and saves your
+choices to `~/.config/cortexkit/aft.jsonc`, keeping its comments and other keys. Rerun it, or
+run `doctor --reconfigure`, to change them. For scripts, three modes skip the prompts:
+
+- `aft setup --plan` prints every feature with its default, your value and its current state
+  (`off`, `building`, `ready`, `unavailable`) as JSON.
+- `aft setup --answers <file|->` applies `{"plan_version":1,"selections":{"<feature-id>":true}}`;
+  features you leave out keep their setting.
+- `aft setup --yes` saves the defaults for settings your file does not have yet.
+
+All three accept `--harness opencode|pi|omp`.
 
 **`doctor`** — Read-only health check. Reports host install state, plugin registration,
 plugin cache version, binary cache, config parse errors, ONNX Runtime availability (for
@@ -27,7 +38,9 @@ something needs attention so it can be wired into CI scripts. Pure inspection �
 is modified.
 
 **`doctor --fix`** — Applies the fixes doctor would otherwise just report. Registers
-missing plugin entries in your harness config, downloads the matching `aft` binary if
+missing plugin entries in your harness config, pins the OpenCode plugin entry to this CLI's
+exact version (for example `@cortexkit/aft-opencode@0.58.0`, never `@latest`) and updates a
+plugin older than the CLI, downloads the matching `aft` binary if
 `~/.cache/aft/bin` is empty (run this after `--clear` or after wiping the cache to recover
 without opening a session), and repairs ONNX Runtime version mismatches by clearing AFT's
 managed ONNX cache so the next bridge launch redownloads. Each step asks confirmation
@@ -53,7 +66,7 @@ Server attempts:
 ```
 
 **`doctor --clear`** — Walks you through interactive cache cleanup. Useful when you're on
-an old version and `@latest` doesn't seem to update (some harness installers cache npm
+an old version and updating doesn't seem to take effect (some harness installers cache npm
 packages aggressively), or when you want to reset the LSP server cache to force a fresh
 download. Targets harness plugin cache, binary cache, downloaded LSP servers, and semantic
 index storage.

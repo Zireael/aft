@@ -1467,6 +1467,10 @@ expect_out "example/derived" "the slug is derived from origin's configured URL"
 # (names mirror BROCA's suite so the two copies stay comparable) --------------
 lock_held() { printf '%s/work/.git/train-push-locks/held' "$1"; }
 plant_owner() { mkdir -p "$(lock_held "$1")"; printf '%s %s\n' "$2" "$3" > "$(lock_held "$1")/owner"; }
+# plant_owner_started DIR PID NAME START: an owner recorded with a start time.
+plant_owner_started() { mkdir -p "$(lock_held "$1")"; printf '%s %s\n%s\n' "$2" "$3" "$4" > "$(lock_held "$1")/owner"; }
+process_start() { ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}'; }
+owner_line() { head -1 "$(lock_held "$1")/owner" 2>/dev/null; }
 # test_clean_state_does_not_refuse_for_concurrency
 dir="$(new_fixture pidlock-clean)"
 add_train_commit "$dir/work" "clean"
@@ -1482,7 +1486,7 @@ echo "failure" > "$dir/ci-state/conclusion"
 echo "Unit / broken" > "$dir/ci-state/failed_job"
 run_train "$dir" lockorder
 expect_rc 1 "the CI-red run stops before landing"
-case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+case "$(owner_line "$dir")" in
   *" lockorder") ok "this train owns the lock after a run that never landed" ;;
   *) fail "the lock was not claimed before the push" ;;
 esac
@@ -1491,7 +1495,7 @@ dir="$(new_fixture live-lock)"
 add_train_commit "$dir/work" "live"
 sleep 60 &
 sleeper=$!
-plant_owner "$dir" "$sleeper" other
+plant_owner_started "$dir" "$sleeper" other "$(process_start "$sleeper")"
 run_train "$dir" live
 kill "$sleeper" 2>/dev/null || true
 expect_rc 2 "a live lock refuses the second train"
@@ -1508,10 +1512,35 @@ add_train_commit "$dir/work" "stale"
 plant_owner "$dir" 2147483000 gone
 run_train "$dir" stale
 expect_rc 0 "a stale lock (dead pid) does not refuse"
-case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+case "$(owner_line "$dir")" in
   *" gone") fail "the stale owner was obeyed instead of replaced" ;;
   *" stale") ok "the stale owner was replaced by this train" ;;
   *) fail "the owner file is neither the stale owner nor this train" ;;
+esac
+# test_a_recycled_pid_is_stale: the recorded pid is alive but is a different
+# process (its start time differs), as when macOS reuses a finished train's pid.
+dir="$(new_fixture recycled-pid)"
+add_train_commit "$dir/work" "recycled"
+sleep 60 &
+recycled=$!
+plant_owner_started "$dir" "$recycled" gone "Mon Jan  1 00:00:00 2001"
+run_train "$dir" recycled
+expect_rc 0 "a live pid with a different start time does not refuse"
+case "$(owner_line "$dir")" in
+  *" recycled") ok "the recycled pid's lock was replaced by this train" ;;
+  *) fail "the recycled pid's lock was obeyed" ;;
+esac
+# test_a_legacy_owner_on_a_non_train_pid_is_stale: a lock written before start
+# times were recorded, whose pid now runs something that is not a train.
+dir="$(new_fixture legacy-owner)"
+add_train_commit "$dir/work" "legacy"
+plant_owner "$dir" "$recycled" gone
+run_train "$dir" legacy
+kill "$recycled" 2>/dev/null || true
+expect_rc 0 "a legacy lock on a non-train pid does not refuse"
+case "$(owner_line "$dir")" in
+  *" legacy") ok "the legacy lock was replaced by this train" ;;
+  *) fail "the legacy lock on a non-train pid was obeyed" ;;
 esac
 # an unreadable owner (killed between mkdir and the owner write) is refused,
 # never dispossessed
@@ -1556,7 +1585,7 @@ racer_a=$!
 racer_b=$!
 wait "$racer_a" || true
 wait "$racer_b" || true
-race_owner="$(cat "$(lock_held "$dir")/owner" 2>/dev/null)"
+race_owner="$(owner_line "$dir")"
 case "$race_owner" in
   *" racer-a") race_loser="racer-b" ;;
   *" racer-b") race_loser="racer-a" ;;

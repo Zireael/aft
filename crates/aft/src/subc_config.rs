@@ -107,6 +107,33 @@ pub fn read_local_cortexkit_config_tiers(
     )
 }
 
+/// The `disabled_tools` list the module-wide subc catalog is filtered by,
+/// read once when the module connects. Only the user file applies: the catalog
+/// is shared by every route, so project files and per-harness overrides (which
+/// differ per route) cannot shape it. A config the resolver rejects yields the
+/// default list, the same one a missing file gives.
+pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
+    let tiers: Vec<ConfigTier> = user_config_path
+        .and_then(|path| {
+            let doc = std::fs::read_to_string(path).ok()?;
+            Some(ConfigTier {
+                tier: "user".to_string(),
+                source: path.to_string_lossy().into_owned(),
+                doc,
+            })
+        })
+        .into_iter()
+        .collect();
+    let resolved = crate::config_resolve::resolve_config(&tiers);
+    if !resolved.errors.is_empty() {
+        log::warn!(
+            "subc catalog: user config rejected ({}); filtering by the default disabled_tools",
+            resolved.errors.join(", ")
+        );
+    }
+    resolved.config.disabled_tools
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

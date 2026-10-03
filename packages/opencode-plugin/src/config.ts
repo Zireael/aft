@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
@@ -173,6 +173,37 @@ const SemanticConfigSchema = z.object({
   /** Maximum number of project files to semantically index (default 20000). */
   max_files: z.number().int().positive().optional(),
 });
+
+const RerankConfigSchema = z.object({
+  /**
+   * Reranker for the head of aft_search results: "off" (default), "onnx"
+   * (local ONNX Runtime), "remote" (a Cohere-style /rerank endpoint) or
+   * "synapse". Only prose questions are reranked. A project config may only
+   * set "off".
+   */
+  backend: z.enum(["off", "onnx", "remote", "synapse"]).optional(),
+  /**
+   * Reranker model. For "onnx": bge-reranker-base (default),
+   * bge-reranker-v2-m3, jina-reranker-v1-turbo or gte-reranker-modernbert-base.
+   * Required for "remote" and "synapse". User config only.
+   */
+  model: z.string().trim().min(1).optional(),
+  /** Base URL of the "remote" endpoint (AFT appends /rerank; tei+ for TEI). User config only. */
+  endpoint: z.string().trim().min(1).optional(),
+  /** Environment variable holding the "remote" endpoint's API key. User config only. */
+  api_key_env: z.string().trim().min(1).optional(),
+  /** How many leading results are reranked (default 20, at most 200). User config only. */
+  top_n: z.number().int().positive().optional(),
+  /** Reranking budget per search in milliseconds (default 1500). User config only. */
+  timeout_ms: z.number().int().positive().optional(),
+});
+
+const SearchConfigSchema = z.object({
+  /** Optional cross-encoder reranking of aft_search results. Default off. */
+  rerank: RerankConfigSchema.optional(),
+});
+
+type RerankConfig = z.infer<typeof RerankConfigSchema>;
 
 const LspExtensionSchema = z
   .string()
@@ -354,6 +385,24 @@ const SubcConfigSchema = z.object({
    * lifecycle cleanup for the user's host process.
    */
   client_reaper: z.boolean().optional(),
+});
+
+const OpenCodeHostConfigSchema = z.object({
+  /**
+   * Base URL of the OpenCode 2 server AFT raises permission prompts on, for
+   * example `http://127.0.0.1:4096`. When set, AFT uses it instead of looking
+   * for the server it runs inside. USER-tier ONLY: a project config naming a
+   * server could send this machine's permission prompts to a server the
+   * repository controls (enforced by getStrippedTopLevelKeys). Read at startup.
+   */
+  server_url: z.string().optional(),
+  /**
+   * Name of the environment variable holding that server's password (sent as
+   * Basic auth with OpenCode's fixed username `opencode`). A variable name, never
+   * the password itself, so the secret stays out of config files. When absent,
+   * AFT reads OpenCode's own `OPENCODE_PASSWORD` / `OPENCODE_SERVER_PASSWORD`.
+   */
+  server_password_env: z.string().optional(),
 });
 
 const GhShimConfigSchema = z.object({
@@ -587,12 +636,16 @@ const AftConfigFieldsSchema = z.object({
   url_fetch_allow_private: z.boolean().optional(),
   /** External semantic backend configuration for embedding and retrieval. */
   semantic: SemanticConfigSchema.optional(),
+  /** aft_search settings; a project config may only turn reranking off. */
+  search: SearchConfigSchema.optional(),
   /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
   auto_update: z.boolean().optional(),
   /** Per-bridge transport timeout and stalled-connection handling; user-only across the shared pool. */
   bridge: BridgeConfigSchema.optional(),
   /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
   subc: SubcConfigSchema.optional(),
+  /** OpenCode 2 server used for permission prompts (USER-only). */
+  opencode: OpenCodeHostConfigSchema.optional(),
   /** User-only GitHub capability gates. */
   github: GithubConfigSchema.optional(),
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
@@ -618,6 +671,7 @@ export const AftConfigSchema = z.preprocess(
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
 export type GithubConfig = z.infer<typeof GithubConfigSchema>;
+export type OpenCodeHostConfig = z.infer<typeof OpenCodeHostConfigSchema>;
 
 export interface ResolvedGithubConfig {
   shim: boolean;
@@ -851,6 +905,8 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
+  const rerank = definedEntries(config.search?.rerank);
+  if (rerank !== undefined) overrides.search = { rerank };
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
   if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
@@ -1382,6 +1438,34 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig | n
 export type ConfigLoadError = { path: string; message: string };
 
 let configLoadErrors: ConfigLoadError[] = [];
+let configValidationErrors: ConfigLoadError[] = [];
+let configLoadSources: string[] = [];
+let configLoadTexts = new Map<string, string>();
+
+/**
+ * The config files the last load actually read, in load order. A file that
+ * did not exist when the loader looked is not listed. A live config reload
+ * compares this with the previous accepted load to tell that a file it relied
+ * on has disappeared, rather than probing the filesystem separately.
+ */
+export function getConfigLoadSources(): readonly string[] {
+  return configLoadSources;
+}
+
+/** The text of each file the last load read, keyed by path. */
+export function getConfigLoadTexts(): ReadonlyMap<string, string> {
+  return configLoadTexts;
+}
+
+/**
+ * Settings the last load dropped because their value did not validate. A
+ * normal load keeps the rest of the file and uses defaults for these; a live
+ * config reload treats any of them as an invalid file and keeps the last valid
+ * config instead, so a typo cannot reset a key while the host runs.
+ */
+export function getConfigValidationErrors(): readonly ConfigLoadError[] {
+  return configValidationErrors;
+}
 
 /** Errors from the most recent {@link loadAftConfig} call (parse failures only). */
 export function getConfigLoadErrors(): readonly ConfigLoadError[] {
@@ -1456,6 +1540,8 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     }
 
     const content = readFileSync(configPath, "utf-8");
+    configLoadSources.push(configPath);
+    configLoadTexts.set(configPath, content);
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     migrateRawConfig(rawConfig, configPath, { log, warn });
     // comment-json attaches Symbol(before/after:<key>) props to track comments.
@@ -1510,6 +1596,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   } else {
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    configValidationErrors.push({ path: configPath, message: errorMsg });
     parsed = parseConfigPartially(cleanConfig);
   }
   if (!parsed) return null;
@@ -1772,6 +1859,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
+  // "opencode" — USER ONLY (chooses the server permission prompts are sent to).
   // "github" and its deprecated aliases are USER ONLY because they change
   // capabilities and global tool descriptions. Project-specific surface changes
   // would also destabilize prefix caches.
@@ -1815,12 +1903,42 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
+  stripped.push(...projectRerankStrippedKeys(override.search?.rerank));
   return stripped;
+}
+
+/** Project rerank keys that are ignored: everything except `backend: "off"`. */
+function projectRerankStrippedKeys(rerank: RerankConfig | undefined): string[] {
+  if (rerank === undefined) return [];
+  const stripped: string[] = [];
+  if (rerank.backend !== undefined && rerank.backend !== "off")
+    stripped.push("search.rerank.backend");
+  for (const key of ["model", "endpoint", "api_key_env", "top_n", "timeout_ms"] as const) {
+    if (rerank[key] !== undefined) stripped.push(`search.rerank.${key}`);
+  }
+  return stripped;
+}
+
+/** A project may set `search.rerank.backend: "off"` and nothing else. */
+function mergeProjectSearchConfig(
+  base: AftConfig["search"],
+  project: AftConfig["search"],
+): AftConfig["search"] {
+  if (project?.rerank?.backend !== "off") return base;
+  return { ...base, rerank: { ...base?.rerank, backend: "off" } };
+}
+
+/** A copy of `value` without its undefined entries, or undefined when none are left. */
+function definedEntries<T extends object>(value: T | undefined): Partial<T> | undefined {
+  if (value === undefined) return undefined;
+  const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
+  return entries.length > 0 ? (Object.fromEntries(entries) as Partial<T>) : undefined;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
@@ -1837,6 +1955,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
+  const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
   const bash = mergeBashConfig(base.bash, override.bash);
@@ -1875,6 +1994,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // Always set semantic to the merge result (even if undefined) to prevent
     // override.semantic from leaking through any future spread above.
     semantic,
+    // Same for search: only the project-safe rerank disable is merged.
+    search,
     ...(bridge !== undefined ? { bridge } : {}),
     ...(indexes !== undefined ? { indexes } : {}),
     // Union — both levels contribute to the disabled set
@@ -1990,6 +2111,9 @@ export function buildConfigTierConfigureParams(
  */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
+  configValidationErrors = [];
+  configLoadSources = [];
+  configLoadTexts = new Map();
   configLoadNotices = [];
   semanticInputSupplied = false;
 
@@ -2050,4 +2174,49 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   });
   if (costNotice !== null) configLoadNotices.push(costNotice);
   return resolved;
+}
+
+/**
+ * Identity of each config file a load for `projectDirectory` would read:
+ * path plus device, inode, size, mtime and ctime, or "absent". Any edit,
+ * replacement, chmod or deletion changes it.
+ */
+function configFilesIdentity(projectDirectory: string): string {
+  const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(projectDirectory);
+  return [userConfigPath, projectConfigPath]
+    .map((path) => {
+      try {
+        const info = statSync(path, { bigint: true });
+        return `${path}:${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+      } catch {
+        return `${path}:absent`;
+      }
+    })
+    .join("|");
+}
+
+/**
+ * Wrap a config loader for hot paths that only need the current value (the
+ * OpenCode `chat.message` hook loads it on every message). A full load reads
+ * and parses each file twice (once for the on-disk migration check, once to
+ * load it) and validates the result; while neither file has changed, the last
+ * successful result for the project is returned after two stat calls instead.
+ *
+ * The identity is taken before loading, so a file written during the load
+ * (including the loader's own migration rewrite) forces one more load next
+ * time. A load that throws is not remembered, so a rejected config is retried
+ * (and reported) on every call as before.
+ */
+export function createUnchangedConfigLoader(
+  load: (projectDirectory: string) => AftConfig,
+): (projectDirectory: string) => AftConfig {
+  const lastLoads = new Map<string, { identity: string; config: AftConfig }>();
+  return (projectDirectory: string): AftConfig => {
+    const identity = configFilesIdentity(projectDirectory);
+    const last = lastLoads.get(projectDirectory);
+    if (last && last.identity === identity) return last.config;
+    const config = load(projectDirectory);
+    lastLoads.set(projectDirectory, { identity, config });
+    return config;
+  };
 }

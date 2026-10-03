@@ -151,11 +151,34 @@ describe("diagnostic issue summaries", () => {
     expect(section).toContain(
       "Plugin version (0.29.1) is older than CLI (0.30.3). New binary cache won't be used until you update the plugin.",
     );
+    // The remedy is the one `doctor --fix` applies, at this CLI's exact
+    // version; `@latest` would contradict the pinning doctor asks for elsewhere.
     expect(section).toContain(
-      "Remediation: Update `@cortexkit/aft-opencode` in your harness config to `@latest`.",
+      "Remediation: Run `npx @cortexkit/aft doctor --fix` to update the plugin to 0.30.3.",
     );
+    expect(section).not.toContain("@latest");
     expect(section.includes(String.fromCharCode(27))).toBe(false);
     expect(issues.some((issue) => issue.code === "plugin_cli_version_skew")).toBe(true);
+  });
+
+  test("names an exact plugin version for Pi and OMP, never @latest", () => {
+    const skewFor = (kind: "pi" | "omp", displayName: string) =>
+      findPluginCliVersionSkews(
+        makeReport(
+          makeHarness({
+            kind,
+            displayName,
+            pluginCache: { path: "/tmp/pi/aft-pi", exists: true, cached: "0.29.1" },
+          }),
+        ),
+      )[0]?.remediation;
+
+    expect(skewFor("pi", "Pi")).toBe(
+      "Run `pi install npm:@cortexkit/aft-pi@0.30.3` to update the plugin to 0.30.3.",
+    );
+    expect(skewFor("omp", "Oh My Pi (OMP)")).toBe(
+      "In Oh My Pi (OMP), update the plugin to 0.30.3 (`@cortexkit/aft-pi@0.30.3`), the version of this CLI.",
+    );
   });
 
   test("skips plugin/CLI skew when the plugin package is not installed", () => {

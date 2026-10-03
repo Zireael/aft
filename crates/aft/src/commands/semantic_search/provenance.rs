@@ -162,6 +162,7 @@ impl<'a> ObservedProvenance<'a> {
         provenance.tier_depth()?;
         for lane in SearchLaneKind::ALL
             .into_iter()
+            .chain(SearchLaneKind::PATTERN_LANES)
             .filter(|lane| lane.is_scored())
         {
             let observed_count = provenance.observed_count(lane);

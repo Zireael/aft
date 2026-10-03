@@ -7,10 +7,21 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "@cortexkit/aft-bridge";
 import {
+  _extractArchiveSafelyForTesting as extractArchiveSafely,
   _precheckArchiveSizeForTesting as precheckArchiveSize,
   validateExtraction,
 } from "../lsp-github-install.js";
@@ -29,12 +40,59 @@ afterEach(() => {
 });
 
 describe("precheckArchiveSize", () => {
-  test("rejects an archive TOC with a sparse-sized member before extraction", () => {
+  test("rejects an archive TOC with a sparse-sized member before extraction", async () => {
     const root = createStagingFixture();
     const archivePath = join(root, "bomb.zip");
     writeFakeZipWithUncompressedSize(archivePath, 1024 * 1024 * 1024 + 1);
 
-    expect(() => precheckArchiveSize(archivePath, "zip")).toThrow(/archive uncompressed size/);
+    await expect(precheckArchiveSize(archivePath, "zip")).rejects.toThrow(
+      /archive uncompressed size/,
+    );
+  });
+});
+
+describe("extractArchiveSafely", () => {
+  // Listing and extracting a large LSP archive can take minutes. The host's
+  // event loop must keep turning meanwhile: a synchronous child process froze
+  // every other plugin hook for the whole extraction.
+  test("extracts without blocking the event loop", async () => {
+    const root = createStagingFixture();
+    const source = join(root, "source");
+    mkdirSync(join(source, "bin"), { recursive: true });
+    writeFileSync(join(source, "bin", "server"), "binary");
+    const archivePath = join(root, "server.tar.gz");
+    execFileSync("tar", ["-czf", archivePath, "-C", source, "bin"]);
+    const dest = join(root, "extract");
+
+    let turns = 0;
+    let spinning = true;
+    const spin = (): void => {
+      if (!spinning) return;
+      turns += 1;
+      setImmediate(spin);
+    };
+    setImmediate(spin);
+    try {
+      await extractArchiveSafely(archivePath, dest, "tar.gz");
+    } finally {
+      spinning = false;
+    }
+
+    expect(readFileSync(join(dest, "bin", "server"), "utf8")).toBe("binary");
+    // A synchronous extraction returns before any setImmediate callback runs.
+    expect(turns).toBeGreaterThan(0);
+  });
+
+  test("a failed extraction leaves no staging directory behind", async () => {
+    const root = createStagingFixture();
+    const archivePath = join(root, "broken.tar.gz");
+    writeFileSync(archivePath, "not an archive");
+    const dest = join(root, "extract");
+
+    await expect(extractArchiveSafely(archivePath, dest, "tar.gz")).rejects.toThrow();
+    expect(existsSync(dest)).toBe(false);
+    const leftovers = readdirSync(root).filter((entry) => entry.startsWith("extract.staging-"));
+    expect(leftovers).toEqual([]);
   });
 });
 

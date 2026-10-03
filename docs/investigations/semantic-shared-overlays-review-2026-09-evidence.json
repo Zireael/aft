@@ -1,0 +1,116 @@
+{
+  "integration_base": "85d8e83e8849765d1ade599cb8924b47e5997ba8",
+  "large_base": {
+    "entries": 1000000,
+    "added_paths": 512,
+    "before_seconds": 34.9703195,
+    "after_seconds": 0.015205834,
+    "test": "semantic_index::tests::revision_new_file_batch_has_bounded_serving_lock_time"
+  },
+  "mutation_evidence": [
+    {
+      "control": "linear membership scan",
+      "expected_red": "semantic_index::tests::revision_new_file_batch_has_bounded_serving_lock_time",
+      "captured_output": "test semantic_index::tests::revision_new_file_batch_has_bounded_serving_lock_time ... FAILED\nnew-file batch scanned the base: 34.9703195s\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "private fallback on live old generation",
+      "expected_red": "semantic_index::tests::revision_rebuilt_generation_is_shared_while_old_base_is_live",
+      "captured_output": "test semantic_index::tests::revision_rebuilt_generation_is_shared_while_old_base_is_live ... FAILED\nnew generation must stay shared\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "pre-freeze pending estimate",
+      "expected_red": "commands::configure::tests::revision_pending_install_counts_only_post_freeze_private_bytes",
+      "captured_output": "test commands::configure::tests::revision_pending_install_counts_only_post_freeze_private_bytes ... FAILED\nassertion `left == right` failed: pending-install must not recount the frozen corpus\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "borrower donor eligibility",
+      "expected_red": "context::subc_lifecycle_admission_tests::revision_borrower_is_not_a_resident_semantic_donor",
+      "captured_output": "test context::subc_lifecycle_admission_tests::revision_borrower_is_not_a_resident_semantic_donor ... FAILED\nanother borrower must never donate branch-local state\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "copy donor delta into late borrower",
+      "expected_red": "semantic_index::tests::revision_late_borrower_starts_from_owner_base_not_owner_delta",
+      "captured_output": "test semantic_index::tests::revision_late_borrower_starts_from_owner_base_not_owner_delta ... FAILED\nassertion `left == right` failed: owner checkout deltas must not cross roots\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "skip resident checkout verification",
+      "expected_red": "commands::configure::tests::revision_late_adoption_masks_different_checkout_before_queries",
+      "captured_output": "test commands::configure::tests::revision_late_adoption_masks_different_checkout_before_queries ... FAILED\ndifferent-tree donor rows must be masked before queries\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "skip disk checkout verification",
+      "expected_red": "runtime_drain::tests::revision_borrowed_disk_ready_masks_different_checkout",
+      "captured_output": "test runtime_drain::tests::revision_borrowed_disk_ready_masks_different_checkout ... FAILED\nassertion `left == right` failed: disk adoption published another tree's rows\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "accept stale file completion",
+      "expected_red": "runtime_drain::tests::revision_same_worker_stale_batch_cannot_resurrect_second_edit",
+      "captured_output": "test runtime_drain::tests::revision_same_worker_stale_batch_cannot_resurrect_second_edit ... FAILED\nassertion `left == right` failed: stale completion resurrected first edit\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "skip corpus completion verification",
+      "expected_red": "runtime_drain::tests::revision_same_worker_stale_corpus_cannot_resurrect_second_edit",
+      "captured_output": "test runtime_drain::tests::revision_same_worker_stale_corpus_cannot_resurrect_second_edit ... FAILED\nassertion `left == right` failed: stale completion resurrected first edit\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/commands/configure.rs |  6 ++--\n crates/aft/src/context.rs            |  2 +-\n crates/aft/src/runtime_drain.rs      |  1 +\n crates/aft/src/semantic_index.rs     | 66 +++++++++++++++++++++++++++++-------\n 4 files changed, 59 insertions(+), 16 deletions(-); staged live state had empty unstaged diff; empty after git checkout -- paths && touch paths",
+      "outcome": "reddened"
+    },
+    {
+      "control": "Demand strict hash verification for deliberately skipped oversized empty result",
+      "expected_red": "runtime_drain::tests::revision_oversized_empty_completion_does_not_retry_forever",
+      "captured_output": "test runtime_drain::tests::revision_oversized_empty_completion_does_not_retry_forever ... FAILED\nunchanged oversized skip was requeued\n0 passed; 1 failed; no other tests ran",
+      "applied_evidence": "crates/aft/src/runtime_drain.rs: empty unstaged diff after staging; mutant 1 file changed, 1 insertion(+), 1 deletion(-); empty after git checkout -- path && touch path",
+      "outcome": "reddened"
+    }
+  ],
+  "checks": {
+    "revision_filter": "14 passed, 1 ignored",
+    "semantic_serial": "330 passed, 3 ignored",
+    "config_live_serial": "32 passed",
+    "large_base_ignored": "1 passed",
+    "cargo_check": "passed"
+  },
+  "ranking": {
+    "slice_class": "engine_unwired",
+    "result": "passed",
+    "rows": 49,
+    "canonical_rows_bytes": 274761,
+    "reference_rows_sha256": "37aaacf461fba56d0d023a5fbc7b8dc79cdc4cd09ac40306d1540b0aeadf8268",
+    "candidate_rows_sha256": "37aaacf461fba56d0d023a5fbc7b8dc79cdc4cd09ac40306d1540b0aeadf8268",
+    "binary_sha256": "962a051accfa710d084f4d7806dbef3c47fa540426a3017257bb914fbfd3c173",
+    "source_ref": "9af8a48c376eb3ebfef8f2605aadc2cad67d7c0a",
+    "families": {
+      "concept_recall": {
+        "hit_at_1": 0.5384615384615384,
+        "hit_at_5": 0.7692307692307693,
+        "mrr_at_10": 0.6394230769230769
+      },
+      "exact_recall": {
+        "hit_at_1": 1.0,
+        "hit_at_5": 1.0,
+        "mrr_at_10": 1.0
+      },
+      "real_query": {
+        "hit_at_1": 0.12244897959183673,
+        "hit_at_5": 0.3673469387755102,
+        "mrr_at_10": 0.22023809523809523
+      }
+    }
+  }
+}

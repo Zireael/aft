@@ -28,10 +28,32 @@ pub const REASON_KIND: ReasonKind = ReasonKind::Selecting;
 /// Narrowing parameters: bash accepts no narrowing parameter.
 pub const NARROW: &[&str] = &[];
 
-/// Count lines in agent-facing output text.
+/// Count output lines, excluding recovery metadata, the omitted-lines marker a
+/// compressor puts where it cut, and the canonical cap trailer.
 #[inline]
 pub fn count_output_lines(output: &str) -> usize {
-    output.lines().count()
+    output
+        .lines()
+        .filter(|line| {
+            let recovery_marker = line.starts_with('[')
+                && line.ends_with(']')
+                && (line.contains("; full output:")
+                    || line.contains("; full output unavailable")
+                    || line.contains("; retained output:")
+                    || line.contains("; see remaining: tail -n +")
+                    || line.contains("; use bash_status("));
+            let trailer = line.strip_prefix("shown ").is_some_and(|rest| {
+                rest.strip_suffix(" lines (cap)").is_some_and(|counts| {
+                    counts.split_once(" of ").is_some_and(|(shown, total)| {
+                        shown.parse::<usize>().is_ok() && total.parse::<usize>().is_ok()
+                    })
+                })
+            });
+            !recovery_marker
+                && !trailer
+                && !crate::compress::line_cut::is_omitted_lines_marker(line)
+        })
+        .count()
 }
 
 /// Derive the wire key for serializing the bash envelope.
@@ -75,24 +97,14 @@ pub fn build_envelope_from_output(
 
 /// Append the text-surface trailer and return its envelope when compression dropped lines.
 ///
-/// The trailer is itself part of the agent-facing line count, so `shown` includes the
-/// one line appended here. Uncompressed text remains byte-identical.
+/// Recovery markers and the trailer describe output; they are not output lines.
+/// Uncompressed text remains byte-identical.
 pub fn append_envelope_trailer(
     agent_received_output: &mut String,
     input_line_count: usize,
 ) -> Option<ListEnvelope> {
-    let body_lines = count_output_lines(agent_received_output);
-    if body_lines >= input_line_count {
-        return None;
-    }
-
-    let envelope = ListEnvelope::new(
-        body_lines.saturating_add(1),
-        Total::Exact(input_line_count),
-        UNIT,
-        vec![REASON],
-        NARROW,
-    );
+    let envelope = build_envelope_from_output(agent_received_output, input_line_count)?;
+    debug_assert!(envelope.shown < input_line_count);
     let trailer = envelope_trailer(&envelope);
     if !agent_received_output.is_empty() && !agent_received_output.ends_with('\n') {
         agent_received_output.push('\n');

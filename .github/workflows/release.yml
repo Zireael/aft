@@ -30,8 +30,6 @@ jobs:
   unit:
     name: Unit
     uses: ./.github/workflows/_unit-suite.yml
-    # The subc-core fetch needs the CK_CI_APP_* secrets (see tests.yml).
-    secrets: inherit
     with:
       strict: true
 

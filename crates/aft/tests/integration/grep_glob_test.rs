@@ -58,25 +58,7 @@ fn send(aft: &mut AftProcess, request: Value) -> Value {
 }
 
 fn fake_server_path() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            option_env!("CARGO_BIN_EXE_fake-lsp-server")
-                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
-                .map(PathBuf::from)
-        })
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
-        .or_else(|| {
-            let mut path = std::env::current_exe().ok()?;
-            path.pop();
-            path.pop();
-            path.push("fake-lsp-server");
-            Some(path)
-        })
-        .filter(|path| path.exists())
-        .expect("fake-lsp-server binary path not set")
+    crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
 fn wait_for_index_ready<F>(aft: &mut AftProcess, mut request: F) -> Value
@@ -481,7 +463,8 @@ fn grep_text_uses_relative_paths_and_compact_format() {
     // No "Line" prefix, no indentation
     assert!(text.contains("1: fn alpha()"));
     assert!(text.contains("1: fn beta()"));
-    assert!(text.ends_with("Found 2 match across 2 file [index: fallback]"));
+    assert!(text
+        .ends_with("Found 2 match across 2 file [index: fallback; searched all 2 files directly]"));
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -626,6 +609,136 @@ fn case_insensitive_unicode_regex_agrees_between_indexed_and_fallback_grep() {
     let indexed = wait_for_index_ready(&mut indexed_aft, request);
     assert_eq!(indexed["total_matches"], 1, "indexed grep: {indexed:?}");
     assert!(indexed_aft.shutdown().success());
+}
+
+/// Matched `(file name, line, column, match text)` rows of a grep response,
+/// sorted so the indexed and walked answers compare independent of order.
+fn match_rows(response: &Value) -> Vec<(String, u64, u64, String)> {
+    let mut rows: Vec<_> = response["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|row| {
+            let file = row["file"].as_str().expect("file").replace('\\', "/");
+            let name = file.rsplit('/').next().unwrap_or_default().to_string();
+            (
+                name,
+                row["line"].as_u64().expect("line"),
+                row["column"].as_u64().expect("column"),
+                row["match_text"].as_str().expect("match text").to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn em_dash_patterns_match_the_same_lines_on_indexed_and_fallback_grep() {
+    let project = setup_project(&[
+        (
+            ".fixture-id",
+            "em_dash_patterns_match_the_same_lines_on_indexed_and_fallback_grep\n",
+        ),
+        ("docs/notes.md", "Intro — the em dash here\nplain line\n"),
+        ("src/lib.rs", "// café — résumé text\nfn main() {}\n"),
+    ]);
+    // (pattern, case_sensitive, expected matches). The em dash is three UTF-8
+    // bytes, so it alone forms a trigram; the others mix it with ASCII and
+    // other multi-byte characters, as a literal, a regex and case-folded.
+    let cases: [(&str, bool, u64); 4] = [
+        ("—", true, 2),
+        ("Intro — the", true, 1),
+        (r"—\s+r\S+", true, 1),
+        ("INTRO — THE", false, 1),
+    ];
+    let request = |pattern: &str, case_sensitive: bool| {
+        json!({
+            "id": "grep-em-dash-parity",
+            "command": "grep",
+            "pattern": pattern,
+            "case_sensitive": case_sensitive,
+        })
+    };
+
+    let mut fallback_aft = AftProcess::spawn();
+    configure(&mut fallback_aft, project.path());
+    let mut fallback_rows = Vec::new();
+    for (pattern, case_sensitive, expected) in cases {
+        let fallback = send(&mut fallback_aft, request(pattern, case_sensitive));
+        assert_eq!(fallback["index_status"], "Fallback", "{fallback:?}");
+        assert_eq!(
+            fallback["total_matches"], expected,
+            "fallback grep for {pattern:?}: {fallback:?}"
+        );
+        fallback_rows.push(match_rows(&fallback));
+    }
+    assert!(fallback_aft.shutdown().success());
+
+    let mut indexed_aft = AftProcess::spawn();
+    configure_with_index(&mut indexed_aft, project.path());
+    let (first_pattern, first_case_sensitive, _) = cases[0];
+    wait_for_index_ready(&mut indexed_aft, || {
+        request(first_pattern, first_case_sensitive)
+    });
+    for ((pattern, case_sensitive, expected), fallback_rows) in cases.into_iter().zip(fallback_rows)
+    {
+        let indexed = send(&mut indexed_aft, request(pattern, case_sensitive));
+        assert_eq!(indexed["index_status"], "Ready", "{indexed:?}");
+        assert_eq!(
+            indexed["total_matches"], expected,
+            "indexed grep for {pattern:?}: {indexed:?}"
+        );
+        assert_eq!(
+            match_rows(&indexed),
+            fallback_rows,
+            "indexed and fallback grep disagree for {pattern:?}"
+        );
+    }
+    assert!(indexed_aft.shutdown().success());
+}
+
+/// While the trigram index is still building, grep answers from a walk. The
+/// reply must say the walk read every file, so a zero is trustworthy; a bare
+/// "[index: building]" next to the count would leave that unknown. The debug
+/// hook holds the first index build open long enough to observe that state.
+#[cfg(debug_assertions)]
+#[test]
+fn grep_while_index_builds_says_the_walk_searched_every_file() {
+    let project = setup_project(&[
+        (
+            ".fixture-id",
+            "grep_while_index_builds_says_the_walk_searched_every_file\n",
+        ),
+        ("src/a.rs", "fn a() {}\n"),
+        ("src/b.rs", "fn b() {}\n"),
+    ]);
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_SEARCH_REBUILD_PUBLISH_DELAY_MS",
+        std::ffi::OsStr::new("5000"),
+    )]);
+    configure_with_index(&mut aft, project.path());
+
+    let response = send(
+        &mut aft,
+        json!({
+            "id": "grep-while-building",
+            "command": "grep",
+            "pattern": "definitely_absent_token",
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:?}");
+    assert_eq!(response["index_status"], "Building", "{response:?}");
+    let text = response["text"].as_str().expect("grep text");
+    // The fixture marker file is searched too, so three files in all.
+    assert_eq!(
+        text, "Found 0 match across 0 file [index: building; searched all 3 files directly]",
+        "{response:?}"
+    );
+    assert_eq!(response["complete"], true, "{response:?}");
+    assert_eq!(response["files_read_directly"], 3, "{response:?}");
+
+    assert!(aft.shutdown().success());
 }
 
 #[test]
@@ -1477,4 +1590,66 @@ fn explicit_symlink_escaping_root_is_refused_when_restricted() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn filtered_scope_distinguishes_no_files_from_no_matches() {
+    for indexed in [false, true] {
+        let project = setup_project(&[("src/a.txt", "hello\n"), ("src/b.rs", "hello\n")]);
+        fs::create_dir(project.path().join("empty")).unwrap();
+        let mut aft = AftProcess::spawn();
+        if indexed {
+            configure_with_index(&mut aft, project.path());
+            wait_for_index_ready(
+                &mut aft,
+                || json!({"id":"ready", "command":"grep", "pattern":"hello"}),
+            );
+        } else {
+            configure(&mut aft, project.path());
+        }
+        for (extra, empty) in [
+            (json!({}), false),
+            (json!({"include":"*.nosuchext"}), true),
+            (json!({"path": project.path().join("empty")}), true),
+            (json!({"include":"*.rs"}), false),
+            (json!({"exclude":["*.rs", "*.txt"]}), true),
+        ] {
+            let mut request = json!({"id":"filtered-scope", "command":"grep", "pattern":"ZQNOPE"});
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response = send(&mut aft, request);
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(
+                response["no_files_matched_scope"], empty,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing was searched"),
+                empty
+            );
+        }
+        for (pattern, empty) in [("*.nosuchext", true), ("**/*.rs", false)] {
+            let response = send(
+                &mut aft,
+                json!({"id":"glob-filtered", "command":"glob", "pattern":pattern}),
+            );
+            assert_eq!(
+                response["no_files_matched_scope"], empty,
+                "indexed={indexed}: {response}"
+            );
+            assert_eq!(
+                response["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("nothing was searched"),
+                empty
+            );
+        }
+        assert!(aft.shutdown().success());
+    }
 }

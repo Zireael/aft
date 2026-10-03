@@ -865,6 +865,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -903,6 +904,8 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,

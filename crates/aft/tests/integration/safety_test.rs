@@ -795,8 +795,27 @@ fn undo_after_append_created_file_deletes_it() {
 }
 
 #[cfg(unix)]
+fn send_json(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
+    aft.send(&serde_json::to_string(&request).unwrap())
+}
+
+#[cfg(unix)]
+fn undo_operation(aft: &mut AftProcess, id: &str) -> serde_json::Value {
+    send_json(aft, serde_json::json!({ "id": id, "command": "undo" }))
+}
+
+#[cfg(unix)]
+fn inode(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().ino()
+}
+
+/// Deleting a symlink removes the link, never its target, and undo recreates
+/// the link with its exact target text. (This replaced a test that asserted
+/// the symlink delete was refused, from before undo could restore symlinks.)
+#[cfg(unix)]
 #[test]
-fn symlink_file_delete_is_rejected_without_project_restriction() {
+fn symlink_file_delete_is_undoable_without_project_restriction() {
     let dir = temp_dir("delete_single_symlink_unrestricted");
     let target = dir.join("target.txt");
     let symlink = dir.join("target-link.txt");
@@ -805,32 +824,32 @@ fn symlink_file_delete_is_rejected_without_project_restriction() {
     std::os::unix::fs::symlink(&target, &symlink).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-single-symlink-unrestricted",
-        "command": "delete_file",
-        "file": symlink.display().to_string(),
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "invalid_request");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains("refusing to delete symlink"),
-        "message should explain symlink rejection: {resp:?}"
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-single-symlink-unrestricted",
+            "command": "delete_file",
+            "file": symlink.display().to_string(),
+        }),
     );
-    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(fs::symlink_metadata(&symlink).is_err(), "link removed");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let undo = undo_operation(&mut aft, "undo-single-symlink");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_link(&symlink).unwrap(), target);
     assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
+/// Same as above with the project-root restriction on. (Replaced a test that
+/// asserted the refusal.)
 #[cfg(unix)]
 #[test]
-fn symlink_file_delete_is_rejected_with_project_restriction() {
+fn symlink_file_delete_is_undoable_with_project_restriction() {
     let dir = temp_dir("delete_single_symlink_restricted");
     let target = dir.join("target.txt");
     let symlink = dir.join("target-link.txt");
@@ -839,137 +858,155 @@ fn symlink_file_delete_is_rejected_with_project_restriction() {
     std::os::unix::fs::symlink(&target, &symlink).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let configure = serde_json::json!({
-        "id": "cfg-delete-single-symlink",
-        "command": "configure",
+    let cfg = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "cfg-delete-single-symlink",
+            "command": "configure",
             "harness": "opencode",
-        "project_root": dir.display().to_string(),
-        "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
-    });
-    let cfg = aft.send(&serde_json::to_string(&configure).unwrap());
+            "project_root": dir.display().to_string(),
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true })),
+        }),
+    );
     assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
 
-    let delete = serde_json::json!({
-        "id": "delete-single-symlink-restricted",
-        "command": "delete_file",
-        "file": symlink.display().to_string(),
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "invalid_request");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains("refusing to delete symlink"),
-        "message should explain symlink rejection: {resp:?}"
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-single-symlink-restricted",
+            "command": "delete_file",
+            "file": symlink.display().to_string(),
+        }),
     );
-    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(fs::symlink_metadata(&symlink).is_err(), "link removed");
     assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let undo = undo_operation(&mut aft, "undo-single-symlink-restricted");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_link(&symlink).unwrap(), target);
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
+/// A relative path to a symlink resolves against the project root and the
+/// link itself is deleted and restored. (Replaced a test that asserted the
+/// refusal.)
 #[cfg(unix)]
 #[test]
-fn relative_symlink_file_delete_is_rejected_with_project_restriction() {
+fn relative_symlink_file_delete_is_undoable_with_project_restriction() {
     let dir = temp_dir("delete_relative_symlink_restricted");
     let target = dir.join("target.txt");
     let symlink = dir.join("target-link.txt");
 
     fs::write(&target, "target content").unwrap();
-    std::os::unix::fs::symlink(&target, &symlink).unwrap();
+    std::os::unix::fs::symlink("target.txt", &symlink).unwrap();
 
     let mut aft = AftProcess::spawn();
     configure_restricted(&mut aft, &dir, "cfg-delete-relative-symlink");
 
-    let delete = serde_json::json!({
-        "id": "delete-relative-symlink-restricted",
-        "command": "delete_file",
-        "file": "target-link.txt",
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "invalid_request");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains("refusing to delete symlink"),
-        "message should explain symlink rejection: {resp:?}"
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-relative-symlink-restricted",
+            "command": "delete_file",
+            "file": "target-link.txt",
+        }),
     );
-    assert!(
-        std::fs::symlink_metadata(&symlink).is_ok(),
-        "symlink should remain intact"
-    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(fs::symlink_metadata(&symlink).is_err(), "link removed");
     assert_eq!(fs::read_to_string(&target).unwrap(), "target content");
+
+    let undo = undo_operation(&mut aft, "undo-relative-symlink");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(
+        fs::read_link(&symlink).unwrap(),
+        std::path::PathBuf::from("target.txt"),
+        "the relative target text must come back unchanged"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
+/// A recursive delete removes symlinks without following them, and undo
+/// recreates each one exactly: an absolute link to a file outside the tree, a
+/// relative link, and a dangling link. (Replaced a test that asserted a
+/// symlink to an outside file blocked the delete.)
 #[cfg(unix)]
 #[test]
-fn symlink_to_outside_file_blocks_recursive_delete() {
-    let dir = temp_dir("delete_recursive_blocks_file_symlink");
-    let target_dir = temp_dir("delete_recursive_blocks_file_symlink_target");
-    let real_file = dir.join("real.txt");
+fn recursive_delete_undo_recreates_symlinks_exactly() {
+    let dir = temp_dir("delete_recursive_symlinks");
+    let target_dir = temp_dir("delete_recursive_symlinks_target");
+    let tree = dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    let real_file = tree.join("real.txt");
     let outside_file = target_dir.join("outside.txt");
-    let symlink = dir.join("outside-link.txt");
-
     fs::write(&real_file, "inside").unwrap();
     fs::write(&outside_file, "outside").unwrap();
-    std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+    std::os::unix::fs::symlink(&outside_file, tree.join("outside-link.txt")).unwrap();
+    std::os::unix::fs::symlink("real.txt", tree.join("relative-link.txt")).unwrap();
+    std::os::unix::fs::symlink("../nowhere/missing", tree.join("dangling")).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-file-symlink-tree",
-        "command": "delete_file",
-        "file": dir.display().to_string(),
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "unsupported_directory_contents");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains(&symlink.display().to_string()),
-        "message should mention symlink path: {resp:?}"
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-symlink-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
     );
-    assert!(dir.exists(), "directory should remain intact");
-    assert!(real_file.exists(), "regular file should remain intact");
-    assert!(symlink.exists(), "symlink should remain intact");
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err(), "tree removed");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+
+    let undo = undo_operation(&mut aft, "undo-symlink-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&real_file).unwrap(), "inside");
+    assert_eq!(
+        fs::read_link(tree.join("outside-link.txt")).unwrap(),
+        outside_file
+    );
+    assert_eq!(
+        fs::read_link(tree.join("relative-link.txt")).unwrap(),
+        std::path::PathBuf::from("real.txt")
+    );
+    assert_eq!(
+        fs::read_link(tree.join("dangling")).unwrap(),
+        std::path::PathBuf::from("../nowhere/missing")
+    );
+    assert!(!tree.join("dangling").exists(), "still dangling");
     assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
+/// A tree whose only failure is a refused entry (a FIFO) reports the batch
+/// as all-failed and deletes nothing. (This used a symlink to force the
+/// refusal before symlinks were supported.)
 #[cfg(unix)]
 #[test]
 fn batch_with_only_failed_recursive_delete_reports_failure() {
     let dir = temp_dir("delete_recursive_batch_all_failed");
-    let target_dir = temp_dir("delete_recursive_batch_all_failed_target");
-    let outside_file = target_dir.join("outside.txt");
-    let symlink = dir.join("outside-link.txt");
-
-    fs::write(&outside_file, "outside").unwrap();
-    std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+    let fifo = dir.join("pipe");
+    let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    fs::write(dir.join("file.txt"), "kept").unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-file-batch-all-failed",
-        "command": "delete_file",
-        "files": [dir.display().to_string()],
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-file-batch-all-failed",
+            "command": "delete_file",
+            "files": [dir.display().to_string()],
+            "recursive": true,
+        }),
+    );
 
     assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
     assert_eq!(resp["code"], "delete_failed");
@@ -979,159 +1016,356 @@ fn batch_with_only_failed_recursive_delete_reports_failure() {
     let message = resp["message"].as_str().expect("failure message");
     assert!(message.contains("delete failed for all 1 file(s)"));
     assert!(message.contains(&dir.display().to_string()));
-    assert!(message.contains("symlink"));
-    assert!(dir.exists(), "directory should remain intact");
-    assert!(symlink.exists(), "symlink should remain intact");
-    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+    assert!(message.contains("named pipe"), "{message}");
+    assert!(fs::symlink_metadata(&fifo).is_ok(), "fifo should remain");
+    assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "kept");
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
+/// A symlink to a directory outside the tree is removed as a link: the
+/// directory it points at, and its contents, are untouched, and undo
+/// recreates the link. (Replaced a test that asserted the delete was refused.)
 #[cfg(unix)]
 #[test]
-fn symlink_to_directory_blocks_recursive_delete() {
-    let dir = temp_dir("delete_recursive_blocks_dir_symlink");
-    let target_dir = temp_dir("delete_recursive_blocks_dir_symlink_target");
-    let real_file = dir.join("real.txt");
-    let symlink = dir.join("outside-dir-link");
-
-    fs::write(&real_file, "inside").unwrap();
+fn recursive_delete_never_follows_a_symlink_to_a_directory() {
+    let dir = temp_dir("delete_recursive_dir_symlink");
+    let target_dir = temp_dir("delete_recursive_dir_symlink_target");
+    let tree = dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("real.txt"), "inside").unwrap();
     fs::write(target_dir.join("outside.txt"), "outside").unwrap();
+    let symlink = tree.join("outside-dir-link");
     std::os::unix::fs::symlink(&target_dir, &symlink).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-dir-symlink-tree",
-        "command": "delete_file",
-        "file": dir.display().to_string(),
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-dir-symlink-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["files_deleted"], 2, "{resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err());
+    assert_eq!(
+        fs::read_to_string(target_dir.join("outside.txt")).unwrap(),
+        "outside",
+        "the linked directory's contents must survive"
+    );
 
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "unsupported_directory_contents");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains(&symlink.display().to_string()),
-        "message should mention symlink path: {resp:?}"
-    );
-    assert!(dir.exists(), "directory should remain intact");
-    assert!(real_file.exists(), "regular file should remain intact");
-    assert!(symlink.exists(), "symlink should remain intact");
-    assert!(
-        target_dir.join("outside.txt").exists(),
-        "symlink target should remain intact"
-    );
+    let undo = undo_operation(&mut aft, "undo-dir-symlink-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_link(&symlink).unwrap(), target_dir);
+    assert_eq!(fs::read_to_string(tree.join("real.txt")).unwrap(), "inside");
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 
-#[test]
-fn empty_subdir_blocks_recursive_delete() {
-    let dir = temp_dir("delete_recursive_blocks_empty_subdir");
-    let content_file = dir.join("with_content.txt");
-    let empty_subdir = dir.join("empty_subdir");
-
-    fs::write(&content_file, "content").unwrap();
-    fs::create_dir(&empty_subdir).unwrap();
-
-    let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-empty-subdir-tree",
-        "command": "delete_file",
-        "file": dir.display().to_string(),
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "unsupported_directory_contents");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains(&empty_subdir.display().to_string()),
-        "message should mention empty directory path: {resp:?}"
-    );
-    assert!(dir.exists(), "directory should remain intact");
-    assert_eq!(fs::read_to_string(&content_file).unwrap(), "content");
-    assert!(
-        empty_subdir.exists(),
-        "empty subdirectory should remain intact"
-    );
-
-    let status = aft.shutdown();
-    assert!(status.success());
-}
-
+/// Empty directories are recorded and recreated by undo, and every restored
+/// directory gets its original mode back. (Replaced a test that asserted an
+/// empty subdirectory blocked the delete.)
 #[cfg(unix)]
 #[test]
-fn unix_socket_blocks_recursive_delete() {
+fn recursive_delete_undo_recreates_empty_directories_and_modes() {
+    let dir = temp_dir("delete_recursive_empty_dirs");
+    let tree = dir.join("tree");
+    let empty = tree.join("empty");
+    let nested_empty = tree.join("outer").join("inner");
+    let locked = tree.join("locked");
+    fs::create_dir_all(&empty).unwrap();
+    fs::create_dir_all(&nested_empty).unwrap();
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(tree.join("with_content.txt"), "content").unwrap();
+    fs::write(tree.join("outer").join("in-outer.txt"), "in outer").unwrap();
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&tree.join("outer"), fs::Permissions::from_mode(0o750)).unwrap();
+    // Read-only and empty: removable, and undo must apply this mode only
+    // after nothing else needs to be created inside it.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let mode = |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let modes_before =
+        [&tree, &empty, &tree.join("outer"), &nested_empty, &locked].map(|path| mode(path));
+
+    let mut aft = AftProcess::spawn();
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-empty-subdir-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["directories_deleted"], 5, "{resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err());
+
+    let undo = undo_operation(&mut aft, "undo-empty-subdir-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert!(empty.is_dir() && fs::read_dir(&empty).unwrap().next().is_none());
+    assert!(nested_empty.is_dir());
+    assert_eq!(
+        fs::read_to_string(tree.join("with_content.txt")).unwrap(),
+        "content"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("outer").join("in-outer.txt")).unwrap(),
+        "in outer"
+    );
+    let modes_after =
+        [&tree, &empty, &tree.join("outer"), &nested_empty, &locked].map(|path| mode(path));
+    assert_eq!(modes_after, modes_before);
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// A socket is deleted and reported as not restorable; the rest of the tree
+/// is restored by undo. (Replaced a test that asserted a socket blocked the
+/// delete.)
+#[cfg(unix)]
+#[test]
+fn recursive_delete_deletes_socket_and_reports_it_not_restored() {
     use std::os::unix::net::UnixListener;
 
+    // Socket paths are limited to about 100 bytes, so this tree lives in a
+    // short temp path; backups under temp paths are allowed in these tests.
     let dir = std::env::temp_dir().join(format!("aft_sock_{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let content_file = dir.join("with_content.txt");
     let socket_path = dir.join("socket.sock");
     fs::write(&content_file, "content").unwrap();
-    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let listener = UnixListener::bind(&socket_path).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-socket-tree",
-        "command": "delete_file",
-        "file": dir.display().to_string(),
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
-
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "unsupported_directory_contents");
-    assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains(&socket_path.display().to_string()),
-        "message should mention socket path: {resp:?}"
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-socket-tree",
+            "command": "delete_file",
+            "file": dir.display().to_string(),
+            "recursive": true,
+        }),
     );
-    assert!(dir.exists(), "directory should remain intact");
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    let warnings = resp["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings.iter().any(|warning| {
+            let text = warning.as_str().unwrap();
+            text.contains("socket.sock") && text.contains("not restorable")
+        }),
+        "{resp:?}"
+    );
+    assert!(fs::symlink_metadata(&dir).is_err());
+
+    let undo = undo_operation(&mut aft, "undo-socket-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
     assert_eq!(fs::read_to_string(&content_file).unwrap(), "content");
-    assert!(socket_path.exists(), "socket should remain intact");
+    assert!(
+        fs::symlink_metadata(&socket_path).is_err(),
+        "socket is not recreated"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
-    drop(_listener);
+    drop(listener);
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Hard links inside the tree are relinked by undo, so the restored paths
+/// share one file again. (Replaced a test that asserted a hard link blocked
+/// the delete.)
 #[cfg(unix)]
 #[test]
-fn hard_link_blocks_recursive_delete() {
-    let dir = temp_dir("delete_recursive_blocks_hard_link");
-    let file = dir.join("file.txt");
-    let link = dir.join("file-hardlink.txt");
+fn recursive_delete_undo_relinks_hard_links() {
+    let dir = temp_dir("delete_recursive_hard_link");
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    let file = tree.join("file.txt");
+    let link = tree.join("sub").join("file-hardlink.txt");
     fs::write(&file, "content").unwrap();
     fs::hard_link(&file, &link).unwrap();
 
     let mut aft = AftProcess::spawn();
-    let delete = serde_json::json!({
-        "id": "delete-hardlink-tree",
-        "command": "delete_file",
-        "file": dir.display().to_string(),
-        "recursive": true,
-    });
-    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-hardlink-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(resp.get("warnings").is_none(), "{resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err());
 
-    assert_eq!(resp["success"], false, "delete should fail: {resp:?}");
-    assert_eq!(resp["code"], "unsupported_directory_contents");
-    assert!(dir.exists(), "directory should remain intact");
+    let undo = undo_operation(&mut aft, "undo-hardlink-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
     assert_eq!(fs::read_to_string(&file).unwrap(), "content");
     assert_eq!(fs::read_to_string(&link).unwrap(), "content");
+    assert_eq!(inode(&file), inode(&link), "undo must relink, not copy");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// A file hard-linked to a path outside the tree cannot be relinked to it,
+/// because undo does not know where that path is. The delete warns, the
+/// outside file is untouched, and undo restores the content as a copy with a
+/// warning.
+#[cfg(unix)]
+#[test]
+fn recursive_delete_restores_outside_hard_link_as_copy_with_warning() {
+    let dir = temp_dir("delete_recursive_outside_hard_link");
+    let outside_dir = temp_dir("delete_recursive_outside_hard_link_target");
+    let tree = dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    let outside = outside_dir.join("shared.txt");
+    let inside = tree.join("shared.txt");
+    fs::write(&outside, "shared").unwrap();
+    fs::hard_link(&outside, &inside).unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-outside-hardlink-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert!(
+        resp["warnings"][0]
+            .as_str()
+            .is_some_and(|warning| warning.contains("independent copy")),
+        "{resp:?}"
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "shared");
+
+    let undo = undo_operation(&mut aft, "undo-outside-hardlink-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(&inside).unwrap(), "shared");
+    assert_ne!(inode(&inside), inode(&outside), "restored as a copy");
+    assert!(
+        undo["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("independent copy")),
+        "{undo:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// An entry created after the delete took its backups has no backup, so the
+/// delete must not remove it: it stops partway, reports it, keeps the entry
+/// and the directories holding it, and undo restores what was removed.
+#[cfg(unix)]
+#[test]
+fn recursive_delete_stops_when_an_entry_appears_mid_delete() {
+    let dir = temp_dir("delete_recursive_mid_delete_race");
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("a")).unwrap();
+    fs::create_dir_all(tree.join("b")).unwrap();
+    fs::write(tree.join("a/x.txt"), "x").unwrap();
+    fs::write(tree.join("b/y.txt"), "y").unwrap();
+    fs::write(tree.join("top.txt"), "top").unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_RECURSIVE_DELETE_INJECT",
+        std::ffi::OsStr::new("a/late.txt"),
+    )]);
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-racing-tree",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], false, "delete must stop: {resp:?}");
+    assert_eq!(resp["partial"], true, "{resp:?}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap()
+            .contains("created after the delete started"),
+        "{resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(tree.join("a/late.txt")).unwrap(),
+        "created during the delete",
+        "the unbacked entry must survive"
+    );
+
+    let undo = undo_operation(&mut aft, "undo-racing-tree");
+    assert_eq!(undo["success"], true, "undo: {undo:?}");
+    assert_eq!(fs::read_to_string(tree.join("a/x.txt")).unwrap(), "x");
+    assert_eq!(fs::read_to_string(tree.join("b/y.txt")).unwrap(), "y");
+    assert_eq!(fs::read_to_string(tree.join("top.txt")).unwrap(), "top");
+    assert_eq!(
+        fs::read_to_string(tree.join("a/late.txt")).unwrap(),
+        "created during the delete"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// If a directory of the deleted tree comes back as a symlink before undo,
+/// undo must refuse instead of writing through it, and leave nothing behind.
+#[cfg(unix)]
+#[test]
+fn undo_refuses_when_a_deleted_directory_came_back_as_a_symlink() {
+    let dir = temp_dir("delete_recursive_undo_symlinked_ancestor");
+    let elsewhere = temp_dir("delete_recursive_undo_symlinked_ancestor_elsewhere");
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("sub/file.txt"), "content").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let resp = send_json(
+        &mut aft,
+        serde_json::json!({
+            "id": "delete-before-replant",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+
+    fs::create_dir(&tree).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, tree.join("sub")).unwrap();
+
+    let undo = undo_operation(&mut aft, "undo-after-replant");
+    assert_eq!(undo["success"], false, "undo must refuse: {undo:?}");
+    assert!(
+        undo["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer a real directory"),
+        "{undo:?}"
+    );
+    assert!(
+        fs::read_dir(&elsewhere).unwrap().next().is_none(),
+        "nothing may be written through the symlink"
+    );
+    assert_eq!(fs::read_link(tree.join("sub")).unwrap(), elsewhere);
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -1172,10 +1406,13 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
     assert_eq!(resp["code"], "recursive_delete_backup_too_large");
     let message = resp["message"].as_str().unwrap();
     assert!(
-        message.contains("at least 2001 files"),
+        message.contains("at least 2001 entries"),
         "the count must stop just past the cap and say so: {message}"
     );
-    assert!(message.contains("2000 files"), "names the limit: {message}");
+    assert!(
+        message.contains("2000 entries"),
+        "names the limit: {message}"
+    );
     assert!(
         message.contains("rm -rf"),
         "names the no-undo alternative: {message}"
@@ -1209,6 +1446,111 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
     assert!(status.success());
 }
 
+/// Under a system temp directory no entry is backed up, so there is no undo
+/// whose shape an empty directory, symlink, hard link or socket could break.
+/// The delete must go through, remove links without touching what they point
+/// at, and report that undo is unavailable.
+#[cfg(unix)]
+#[test]
+fn temp_tree_without_backups_deletes_links_empty_dirs_and_sockets() {
+    use std::os::unix::net::UnixListener;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let tree = scratch.path().join("tree");
+    fs::create_dir_all(tree.join("empty")).unwrap();
+    fs::write(tree.join("file.txt"), "content").unwrap();
+    fs::hard_link(tree.join("file.txt"), tree.join("file-link.txt")).unwrap();
+    let outside_file = outside.path().join("outside.txt");
+    fs::write(&outside_file, "outside").unwrap();
+    std::os::unix::fs::symlink(&outside_file, tree.join("to-outside")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tree.join("to-outside-dir")).unwrap();
+    std::os::unix::fs::symlink("missing-target", tree.join("dangling")).unwrap();
+    let _listener = UnixListener::bind(tree.join("s.sock")).unwrap();
+
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_TEST_ALLOW_TEMP_BACKUPS", std::ffi::OsStr::new("0"))]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-tree-delete",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["backup_skipped_reason"], "temp_path", "{resp:?}");
+    assert!(fs::symlink_metadata(&tree).is_err(), "tree must be gone");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+    assert!(outside.path().is_dir(), "a linked directory must survive");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// A single symlink under a system temp directory has no undo to protect
+/// either; deleting it removes the link and leaves its target alone.
+#[cfg(unix)]
+#[test]
+fn temp_symlink_without_backups_is_deleted_without_touching_its_target() {
+    let scratch = tempfile::tempdir().unwrap();
+    let target = scratch.path().join("target.txt");
+    let link = scratch.path().join("link.txt");
+    fs::write(&target, "target").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_TEST_ALLOW_TEMP_BACKUPS", std::ffi::OsStr::new("0"))]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-symlink-delete",
+            "command": "delete_file",
+            "file": link.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["backup_skipped_reason"], "temp_path");
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// The backup budget bounds how much a delete copies into the undo store. A
+/// tree under a system temp directory copies nothing, so it has no budget.
+#[test]
+fn temp_tree_without_backups_is_not_limited_by_the_backup_budget() {
+    let scratch = tempfile::tempdir().unwrap();
+    let tree = scratch.path().join("node_modules");
+    for index in 0..2_100 {
+        let package = tree.join(format!("pkg-{:03}", index / 50));
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join(format!("f{index}.js")), "x").unwrap();
+    }
+
+    let mut aft =
+        AftProcess::spawn_with_env(&[("AFT_TEST_ALLOW_TEMP_BACKUPS", std::ffi::OsStr::new("0"))]);
+    let resp = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-tree-over-budget",
+            "command": "delete_file",
+            "file": tree.display().to_string(),
+            "recursive": true,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(resp["success"], true, "delete: {resp:?}");
+    assert_eq!(resp["files_deleted"], 2_100);
+    assert_eq!(resp["backup_skipped_reason"], "temp_path");
+    assert!(!tree.exists());
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn regular_tree_with_files_works_after_validation() {
     let dir = temp_dir("delete_recursive_regular_tree");
@@ -1236,7 +1578,8 @@ fn regular_tree_with_files_works_after_validation() {
     let undo = aft.send(r#"{"id":"undo-regular-tree","command":"undo"}"#);
     assert_eq!(undo["success"], true, "undo: {undo:?}");
     assert_eq!(undo["operation"], true);
-    assert_eq!(undo["restored_count"], 2);
+    // Two files and the two directories holding them.
+    assert_eq!(undo["restored_count"], 4);
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "root file");
     assert_eq!(fs::read_to_string(&file_b).unwrap(), "nested file");
 

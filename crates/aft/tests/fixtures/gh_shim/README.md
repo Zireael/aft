@@ -7,6 +7,16 @@ material. Release builds compile an EMPTY trust set, so none of these
 signatures can move a release binary past R2; production trust material
 arrives with the separately reviewed custody ceremony release.
 
+`v15-manifest.json` is synthetic unsigned test data built from the tracked v12
+fixture, with the v13 release/protection rows, `run rerun`, the v14 speech and
+operator-label rows, and v15 `run cancel`. Its only binding is the test identity
+`cortexkit/aft` → `alfonso-aft`; it is not a production signing payload. Runtime
+tests sign a fresh copy with the development test key.
+
+`v16-manifest.json` is `v15-manifest.json` run through
+`scripts/prepare-gh-shim-v16.py`: version 16, one governed `pr create` row, and
+its `fields-only` canonicalization. Same synthetic binding, same status.
+
 ## Envelope v2 shape
 
 One file on disk carries the whole artifact:

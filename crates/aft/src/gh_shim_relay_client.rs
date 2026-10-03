@@ -35,12 +35,14 @@ pub(super) const RELAY_UNSERVED_TEXT: &str = "the running AFT daemon does not se
 const RELAY_MODULE_ID: &str = "aft";
 /// Budget for connecting, listing the catalog and opening the route.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Budget for one relayed request. It must cover a prefrontal mint, the plexus
-/// call and GitHub's write: a request with no reply inside it is reported as
-/// an unknown outcome and never resent, so a short budget on a loaded host
-/// would report writes that landed as failures.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// Debug builds only: lets the binary-level tests shorten the request budget
+/// Budget for the whole relayed exchange: every attempt, every transient
+/// retry sleep and any bindings read share it, so the command never waits
+/// longer than one attempt used to. It must cover a prefrontal mint, the
+/// plexus call and GitHub's write: a request with no reply inside it is
+/// reported as an unknown outcome and never resent, so a short budget on a
+/// loaded host would report writes that landed as failures.
+const RELAY_BUDGET: Duration = Duration::from_secs(30);
+/// Debug builds only: lets the binary-level tests shorten the relay budget
 /// so a silent daemon does not cost them the full production wait.
 #[cfg(debug_assertions)]
 const REQUEST_TIMEOUT_TEST_ENV: &str = "AFT_GH_SHIM_RELAY_TIMEOUT_MS";
@@ -54,8 +56,8 @@ pub(super) struct RelayContext {
     pub(super) connection_file: Option<PathBuf>,
     pub(super) ticket: Option<String>,
     pub(super) transient_delays: [Duration; 2],
-    /// Per-attempt budget for a relayed request.
-    pub(super) request_timeout: Duration,
+    /// Budget for the whole relayed exchange, retries included.
+    pub(super) relay_budget: Duration,
 }
 
 impl RelayContext {
@@ -64,12 +66,12 @@ impl RelayContext {
             connection_file: super::configured_connection_file(),
             ticket: std::env::var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).ok(),
             transient_delays: TRANSIENT_RETRY_DELAYS,
-            request_timeout: request_timeout_from_process(),
+            relay_budget: relay_budget_from_process(),
         }
     }
 }
 
-fn request_timeout_from_process() -> Duration {
+fn relay_budget_from_process() -> Duration {
     #[cfg(debug_assertions)]
     if let Some(millis) = std::env::var(REQUEST_TIMEOUT_TEST_ENV)
         .ok()
@@ -78,7 +80,7 @@ fn request_timeout_from_process() -> Duration {
     {
         return Duration::from_millis(millis);
     }
-    REQUEST_TIMEOUT
+    RELAY_BUDGET
 }
 
 /// `aft` when the catalog shows it serving the relay operation. No other
@@ -264,7 +266,15 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
                     },
                     None => Reply::Malformed("plexus refused without a refusal_code".to_string()),
                 },
-                _ => Reply::Malformed("plexus's reply had no known result.status".to_string()),
+                // New statuses need an explicit contract before they can authorize
+                // success, refusal, or retry; never infer one from other fields.
+                _ => {
+                    let status = result.get("status").unwrap_or(&Value::Null);
+                    log::warn!("gh-shim: unrecognised plexus result.status: {status}");
+                    Reply::Malformed(format!(
+                        "plexus's reply had no known result.status: {status}"
+                    ))
+                }
             }
         }
         Some("error") => match data.get("refusal_code").and_then(Value::as_str) {
@@ -470,24 +480,57 @@ fn new_nonce() -> String {
     format!("gh-shim-{hex}")
 }
 
+#[cfg(test)]
+thread_local! {
+    static ATTEMPT_DEADLINES: std::cell::RefCell<Option<Vec<Instant>>> = const { std::cell::RefCell::new(None) };
+}
+
 struct Exchange<'a> {
     consumer: &'a SubcConsumer,
     route: &'a subc_client_rs::RouteHandle,
     ticket: &'a str,
     stage: &'a Mutex<ProbeStage>,
-    request_timeout: Duration,
+    /// When the exchange began; `budget` after it is the exchange's deadline.
+    started: Instant,
+    budget: Duration,
 }
 
 impl Exchange<'_> {
+    fn deadline(&self) -> Instant {
+        self.started + self.budget
+    }
+
+    fn budget_ms(&self) -> u64 {
+        self.budget.as_millis() as u64
+    }
+
+    /// Each attempt gets only what is left of the exchange's budget. With
+    /// nothing left the request is not sent at all, which is a known
+    /// not-sent outcome rather than an unknown one.
     async fn send(&self, body: &Value) -> Result<Vec<u8>, RouteOutcome> {
         *self.stage.lock().unwrap() = ProbeStage::Request;
         let bytes = serde_json::to_vec(body)
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
+        let now = Instant::now();
+        let remaining = self.deadline().saturating_duration_since(now);
+        if remaining.is_zero() {
+            return Err(RouteOutcome::Unavailable(format!(
+                "the gh relay's {} ms budget ran out before the request could be sent; nothing was sent",
+                self.budget_ms()
+            )));
+        }
         let options = CallOptions {
-            timeout: self.request_timeout,
+            timeout: remaining,
             ..CallOptions::default()
         };
-        let started = Instant::now();
+        #[cfg(test)]
+        if body["op"] == BOT_REQUEST_OPERATION {
+            ATTEMPT_DEADLINES.with(|slot| {
+                if let Some(deadlines) = slot.borrow_mut().as_mut() {
+                    deadlines.push(now + options.timeout);
+                }
+            });
+        }
         match self.consumer.request(self.route, bytes, options).await {
             Ok(bytes) => Ok(bytes),
             Err(CallError::NotSent(_)) => Err(RouteOutcome::GovernanceUnavailable),
@@ -498,8 +541,10 @@ impl Exchange<'_> {
                     body.code, body.message
                 ),
             }),
+            // Reported as the time the whole exchange waited, which is what
+            // the caller experienced; it never exceeds the budget.
             Err(_) => Err(RouteOutcome::OutcomeUnknown {
-                elapsed_ms: started.elapsed().min(self.request_timeout).as_millis() as u64,
+                elapsed_ms: self.started.elapsed().min(self.budget).as_millis() as u64,
             }),
         }
     }
@@ -562,7 +607,9 @@ impl Exchange<'_> {
 }
 
 /// Send one governed request through the relay, retrying only as the plexus
-/// refusal class allows and always with this invocation's single nonce.
+/// refusal class allows and always with this invocation's single nonce. The
+/// whole exchange shares one budget: attempts and retry sleeps come out of
+/// it, and a retry sleep that would run past it is not taken.
 #[allow(clippy::too_many_arguments)]
 async fn exchange(
     exchange: &Exchange<'_>,
@@ -634,7 +681,13 @@ async fn exchange(
                 }
                 return RouteOutcome::Result(output);
             }
-            Reply::Malformed(message) => return RouteOutcome::SchemaMismatch(message),
+            Reply::Malformed(message) => {
+                // The request was sent; an unreadable reply cannot prove the
+                // write did not happen, so returning a refusal risks a duplicate.
+                return RouteOutcome::OutcomeUndetermined(outcome_undetermined_text(&format!(
+                    "unreadable plexus reply: {message}"
+                )));
+            }
             Reply::Refused {
                 code,
                 stage,
@@ -650,7 +703,19 @@ async fn exchange(
                 let class = classify_code(&code);
                 match class {
                     CodeClass::Transient if transient_retries < transient_delays.len() => {
-                        tokio::time::sleep(transient_delays[transient_retries]).await;
+                        let delay = transient_delays[transient_retries];
+                        if Instant::now() + delay >= exchange.deadline() {
+                            // Plexus refused this attempt, so nothing was
+                            // written; stopping here is a named refusal.
+                            return RouteOutcome::RelayRefusal {
+                                text: format!(
+                                    "plexus refused the bot write: {code} (transient, but the gh relay's {} ms budget would run out before the next retry, so it was not resent)",
+                                    exchange.budget_ms()
+                                ),
+                                code,
+                            };
+                        }
+                        tokio::time::sleep(delay).await;
                         transient_retries += 1;
                     }
                     CodeClass::Remint if !reminted => reminted = true,
@@ -786,7 +851,16 @@ pub(super) fn route(
                 route: &route,
                 ticket: &ticket,
                 stage: &stage,
-                request_timeout: relay.request_timeout,
+                started: {
+                    #[cfg(test)]
+                    ATTEMPT_DEADLINES.with(|slot| {
+                        if slot.borrow().is_some() {
+                            std::thread::sleep(Duration::from_millis(400));
+                        }
+                    });
+                    Instant::now()
+                },
+                budget: relay.relay_budget,
             },
             paths,
             agent_binding,

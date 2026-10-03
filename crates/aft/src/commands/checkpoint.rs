@@ -11,11 +11,13 @@ use crate::protocol::{RawRequest, Response};
 /// - `files` (array of strings, optional) — files to include. If omitted, uses
 ///   all files tracked by the backup store.
 ///
-/// Returns: `{ name, file_count, created_at, storage_path, durability }`.
-/// `storage_path` names the durable on-disk directory callers can inspect.
+/// Returns: `{ name, file_count, paths, created_at, storage_path, durability }`,
+/// plus `requested_count` when `files` was given. `paths` lists the snapshotted
+/// files. `storage_path` names the durable on-disk directory callers can inspect.
 /// Explicit files are read directly, including untracked or gitignored files. When any requested
 /// file cannot be read, `file_count` includes only restorable snapshots and the
-/// response adds `skipped: [{ file, error }, ...]` for every omitted path.
+/// response adds `skipped: [{ file, error }, ...]` for every omitted path. When
+/// none of the requested files can be read, the command fails instead.
 pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
     match handle_checkpoint_impl(req, ctx) {
         Ok(resp) | Err(resp) => resp,
@@ -45,6 +47,7 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
         })
         .unwrap_or_default();
 
+    let explicit_request = !files.is_empty();
     let file_list = if files.is_empty() {
         let backup = ctx.backup().lock();
         backup.tracked_files(req.session())
@@ -53,6 +56,9 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
     };
 
     let validated_files = validate_checkpoint_files(&req.id, ctx, file_list)?;
+    // Two spellings of one file count once, so `requested_count` compares
+    // like with like against the snapshot count.
+    let requested_count = validated_files.len();
 
     let backup = ctx.backup().lock();
     let mut checkpoint_store = ctx.checkpoint().lock();
@@ -73,7 +79,15 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
                 "created_at": info.created_at,
                 "storage_path": storage_path,
                 "durability": checkpoint_durability(std::path::Path::new(&storage_path)),
+                "paths": info
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
             });
+            if explicit_request {
+                payload["requested_count"] = serde_json::json!(requested_count);
+            }
             if !info.evicted.is_empty() {
                 payload["evicted"] = serde_json::json!(info.evicted);
             }
@@ -111,7 +125,10 @@ fn validate_checkpoint_files(
         // Creation and restore must authorize and key the same final object.
         // Resolving only ancestors preserves a final symlink for the snapshot
         // reader while still rejecting symlinked parents that escape the root.
-        validated.push(ctx.validate_write_location(req_id, &input)?);
+        let validated_path = ctx.validate_write_location(req_id, &input)?;
+        if !validated.contains(&validated_path) {
+            validated.push(validated_path);
+        }
     }
     Ok(validated)
 }

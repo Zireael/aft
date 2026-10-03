@@ -62,7 +62,7 @@ import {
   writeVersionCheck,
 } from "./lsp-cache.js";
 import { assertSafeVersion, isSafeVersion } from "./lsp-github-probe.js";
-import { NPM_LSP_TABLE, type NpmServerSpec } from "./lsp-npm-table.js";
+import { isVersionSupported, NPM_LSP_TABLE, type NpmServerSpec } from "./lsp-npm-table.js";
 import {
   hasPackageJsonDep,
   hasRootMarker,
@@ -195,8 +195,13 @@ export async function abortInFlightAutoInstalls(): Promise<void> {
  *
  * `null` callers should fall back to whatever's installed (if anything),
  * else skip + warn.
+ *
+ * Apart from a user pin, the result always satisfies the entry's
+ * `supportedMajor`: a cached decision outside it is treated as a cache miss.
+ * Callers compare the result against the installed version, so a cached
+ * install of the wrong major is then replaced.
  */
-async function resolveTargetVersion(
+export async function resolveTargetVersion(
   spec: NpmServerSpec,
   config: AutoInstallConfig,
   fetchImpl: typeof fetch = fetch,
@@ -220,13 +225,17 @@ async function resolveTargetVersion(
   // unsafe cache as miss so the next branch forces a fresh probe.
   const cached = readVersionCheck(spec.npm);
   const weeklyMs = config.graceDays * 24 * 60 * 60 * 1000;
-  const cachedSafe = isSafeVersion(cached?.latest_eligible ?? null);
+  const cachedSafe =
+    isSafeVersion(cached?.latest_eligible ?? null) &&
+    isVersionSupported(spec, cached?.latest_eligible as string);
   if (cached && !shouldRecheckVersion(cached, weeklyMs) && cachedSafe) {
     return { version: cached.latest_eligible as string, pinned: false, probe: null };
   }
 
   // 3. Probe the registry.
-  const probe = await probeRegistry(spec.npm, config.graceDays, fetchImpl);
+  const probe = await probeRegistry(spec.npm, config.graceDays, fetchImpl, (candidate) =>
+    isVersionSupported(spec, candidate),
+  );
   if (!probe) {
     // Probe failed entirely — fall back to cached if any (and only if safe).
     return {
@@ -429,7 +438,7 @@ async function ensureServerInstalled(
     // Grace blocked + nothing installed = skip with warning.
     if (!version) {
       const installed = isInstalled(spec.npm, spec.binary);
-      if (installed) {
+      if (installed && installedVersionAllowed(spec, config)) {
         warn(
           `[lsp] no eligible version of ${spec.npm} (grace=${config.graceDays}d); keeping existing install`,
         );
@@ -437,7 +446,16 @@ async function ensureServerInstalled(
       }
       const blocked = probe?.blockedByGrace
         ? `all versions are within ${config.graceDays}-day grace window`
-        : "registry probe failed";
+        : probe?.outsideSupportedRange
+          ? `no ${spec.supportedMajor}.x release on the registry`
+          : "registry probe failed";
+      if (installed) {
+        // An install of an unsupported major is not worth keeping: it is the
+        // one the version cap exists to replace, and it is not surfaced.
+        const reason = `cached ${spec.npm} ${readInstalledMeta(spec.npm)?.version ?? "(unknown version)"} is outside the supported ${spec.supportedMajor}.x line and no replacement is available: ${blocked}`;
+        warn(`[lsp] ${reason}`);
+        return { started: false, reason };
+      }
       warn(`[lsp] skipping ${spec.npm}: ${blocked}`);
       return { started: false, reason: blocked };
     }
@@ -617,6 +635,27 @@ function validateCachedNpmInstall(spec: NpmServerSpec): boolean {
 }
 
 /**
+ * True when the cached install's recorded version is one this entry may use:
+ * inside `supportedMajor`, or exactly the user's `lsp.versions` pin. A cached
+ * install outside it is neither surfaced to the binary nor kept as a fallback,
+ * so the next install replaces it.
+ */
+export function installedVersionAllowed(spec: NpmServerSpec, config: AutoInstallConfig): boolean {
+  const installed = readInstalledMeta(spec.npm)?.version;
+  if (!installed) return spec.supportedMajor === undefined;
+  return isVersionSupported(spec, installed) || config.versions[spec.npm] === installed;
+}
+
+/** A cached install that is present, untampered, and of an allowed version. */
+function cachedInstallUsable(spec: NpmServerSpec, config: AutoInstallConfig): boolean {
+  return (
+    isInstalled(spec.npm, spec.binary) &&
+    validateCachedNpmInstall(spec) &&
+    installedVersionAllowed(spec, config)
+  );
+}
+
+/**
  * Top-level entry point. Returns the list of bin directories that already
  * have an installed binary AND kicks off background installs for missing
  * packages relevant to this project.
@@ -646,11 +685,14 @@ export function runAutoInstall(
 
   for (const spec of NPM_LSP_TABLE) {
     // 1. Always include cached bin dirs the Rust resolver can use right now.
-    if (isInstalled(spec.npm, spec.binary) && validateCachedNpmInstall(spec)) {
+    if (cachedInstallUsable(spec, config)) {
       cachedBinDirs.push(lspBinDir(spec.npm));
     }
 
-    if (config.disabled.has(spec.id)) {
+    if (
+      config.disabled.has(spec.id) ||
+      (spec.id === "typescript-sdk" && config.disabled.has("typescript"))
+    ) {
       skipped.push({ id: spec.id, reason: "disabled by config" });
       continue;
     }
@@ -703,9 +745,9 @@ export function runAutoInstall(
     skipped,
     installsComplete: Promise.all(installPromises).then(() => {}),
     getCachedBinDirs: () =>
-      NPM_LSP_TABLE.filter(
-        (spec) => isInstalled(spec.npm, spec.binary) && validateCachedNpmInstall(spec),
-      ).map((spec) => lspBinDir(spec.npm)),
+      NPM_LSP_TABLE.filter((spec) => cachedInstallUsable(spec, config)).map((spec) =>
+        lspBinDir(spec.npm),
+      ),
   };
 }
 

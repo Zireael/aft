@@ -9,12 +9,16 @@ export interface RecentSession {
   id: string;
   title: string;
   lastActivity: number;
+  projectRoot?: string;
+  startedAt?: number;
 }
 
 interface OpenCodeSessionRow {
   id: unknown;
   title: unknown;
   time_updated: unknown;
+  time_created?: unknown;
+  directory?: unknown;
 }
 
 interface SqliteDatabase {
@@ -43,10 +47,15 @@ export function mapOpenCodeSessionRows(rows: OpenCodeSessionRow[]): RecentSessio
       const lastActivity =
         typeof row.time_updated === "number" ? row.time_updated : Number(row.time_updated);
       if (!Number.isFinite(lastActivity)) return null;
+      const startedAt = Number(row.time_created);
       return {
         id: row.id,
         title: row.title,
         lastActivity,
+        ...(typeof row.directory === "string" && row.directory
+          ? { projectRoot: row.directory }
+          : {}),
+        ...(row.time_created != null && Number.isFinite(startedAt) ? { startedAt } : {}),
       } satisfies RecentSession;
     })
     .filter((session): session is RecentSession => session !== null)
@@ -66,7 +75,9 @@ function listRecentOpenCodeSessions(): RecentSession[] {
     };
     db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
     const rows = db
-      .prepare("SELECT id, title, time_updated FROM session ORDER BY time_updated DESC LIMIT 5")
+      .prepare(
+        "SELECT id, title, time_updated, time_created, directory FROM session ORDER BY time_updated DESC LIMIT 5",
+      )
       .all();
     return mapOpenCodeSessionRows(rows);
   } catch {
@@ -153,9 +164,11 @@ function collectJsonlFiles(root: string): string[] {
 export function parsePiSessionJsonl(
   jsonl: string,
   fallbackFilename = "",
-): Pick<RecentSession, "id" | "title"> | null {
+): Pick<RecentSession, "id" | "title" | "projectRoot" | "startedAt"> | null {
   let id: string | null = extractUuidFromFilename(fallbackFilename);
   let title: string | null = null;
+  let projectRoot: string | undefined;
+  let startedAt: number | undefined;
 
   for (const line of jsonl.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -169,8 +182,13 @@ export function parsePiSessionJsonl(
     if (!value || typeof value !== "object") continue;
     const record = value as Record<string, unknown>;
 
-    if (record.type === "session" && typeof record.id === "string" && record.id.length > 0) {
-      id = record.id;
+    if (record.type === "session") {
+      if (typeof record.id === "string" && record.id.length > 0) id = record.id;
+      if (typeof record.cwd === "string" && record.cwd.length > 0) projectRoot = record.cwd;
+      if (typeof record.timestamp === "string") {
+        const time = Date.parse(record.timestamp);
+        if (Number.isFinite(time)) startedAt = time;
+      }
     }
 
     if (title === null) {
@@ -182,7 +200,12 @@ export function parsePiSessionJsonl(
   }
 
   if (!id) return null;
-  return { id, title: title ?? id };
+  return {
+    id,
+    title: title ?? id,
+    ...(projectRoot ? { projectRoot } : {}),
+    ...(startedAt !== undefined ? { startedAt } : {}),
+  };
 }
 
 function extractPiUserMessageText(record: Record<string, unknown>): string | null {

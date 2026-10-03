@@ -90,6 +90,10 @@ pub struct ToolCallPhaseDurations {
 }
 
 impl PhaseTrace {
+    pub(crate) fn received_at(&self) -> Instant {
+        self.frame_decoded
+    }
+
     pub fn new(frame_decoded: Instant) -> Self {
         Self {
             frame_decoded,
@@ -205,6 +209,18 @@ pub struct ToolCallContext {
     /// Whether configure's immediate registration-downgrade warning was discarded
     /// by this transport and must be reported on the first tool call instead.
     pub report_registration_downgrade: bool,
+    /// A v1 route serves the standard edit schema without changing plugin bindings.
+    pub standard_edit_grammar: bool,
+    /// The session's `disabled_tools` as resolved when it connected. A subc
+    /// route carries its own bind-time list because routes with different
+    /// harnesses can share one root context; `None` uses the configure
+    /// snapshot in the root's config.
+    pub disabled_tools: Option<std::sync::Arc<Vec<String>>>,
+    /// The caller is a delegated worker session (see
+    /// [`RawRequest::worker_session`]). It decides how the repeat breaker and
+    /// bash hand-off texts are worded, and it lets a worker's `wait: true`
+    /// bash call run without the default hard kill.
+    pub worker_session: bool,
 }
 
 pub(crate) fn ensure_hashline_registration(
@@ -281,6 +297,37 @@ pub(crate) fn prepare_tool_call(
     app_ctx: &AppContext,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> Result<PreparedToolCall, ToolCallResult> {
+    // A tool the user disabled is refused before anything else happens: no
+    // hashline registration, translation, permission preflight or backup.
+    let refusal = match ctx.disabled_tools.as_deref() {
+        Some(disabled) => crate::tool_gate::refusal(&ctx.request_id, bare_name, &args, disabled),
+        None => crate::tool_gate::refusal(
+            &ctx.request_id,
+            bare_name,
+            &args,
+            &app_ctx.config().disabled_tools,
+        ),
+    };
+    if let Some(response) = refusal {
+        if let Some(trace) = phase_trace.as_mut() {
+            trace.mark_translate_done();
+            trace.mark_execute_done();
+        }
+        let result = tool_call_result_from_response(bare_name, format_context, response, false);
+        if let Some(trace) = phase_trace.as_mut() {
+            trace.mark_format_done();
+            trace.mark_finalize_done();
+        }
+        return Err(result);
+    }
+    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id, bare_name) {
+        return Err(tool_call_result_from_response(
+            bare_name,
+            format_context,
+            response,
+            false,
+        ));
+    }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
         .canonical_cache_root_opt()
@@ -289,20 +336,20 @@ pub(crate) fn prepare_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let surface_downgraded = ensure_hashline_registration(
-        app_ctx,
-        &ctx.project_root,
-        session,
-        ctx.edit_slot_survives,
-        ctx.report_registration_downgrade,
-    );
+    let surface_downgraded = !ctx.standard_edit_grammar
+        && ensure_hashline_registration(
+            app_ctx,
+            &ctx.project_root,
+            session,
+            ctx.edit_slot_survives,
+            ctx.report_registration_downgrade,
+        );
     let binding_guard = app_ctx.hashline_bindings().capture(binding_root, session);
     let translate_context = crate::subc_translate::TranslateContext {
         diagnostics_on_edit: ctx.diagnostics_on_edit,
         preview: ctx.preview,
-        effective_hashline: crate::hashline::integration::effective_for_capture(
-            binding_guard.as_ref(),
-        ),
+        effective_hashline: !ctx.standard_edit_grammar
+            && crate::hashline::integration::effective_for_capture(binding_guard.as_ref()),
     };
     let translated_bare_name = match bare_name {
         // The public tool is registered as `aft_inspect`, while hoisted plugin
@@ -408,6 +455,90 @@ pub(crate) fn finish_tool_call_response(
     ToolCallResult { text, response }
 }
 
+/// One agent tool call as the repeat breaker sees it, captured from the call's
+/// arguments before execution consumes them.
+///
+/// Every path that answers an agent tool call must observe it exactly once,
+/// through this type. The shared runner does so for most tools; subc answers
+/// `bash` and `powershell` on its own deferred path and observes there, and the
+/// standalone request loop observes the top-level `bash`/`powershell` requests
+/// plugins send directly (`bash_orchestrate::RawBashRepeat`). A
+/// path that skips observation leaves the breaker blind to that tool: a model
+/// can then repeat one bash command indefinitely without being steered.
+#[derive(Debug, Clone)]
+pub(crate) struct RepeatObservation {
+    session_id: String,
+    tool: String,
+    semantic_key: String,
+    /// Picks the reminder's wording: a delegated worker is never told to end
+    /// its turn.
+    worker_session: bool,
+}
+
+impl RepeatObservation {
+    /// Returns `None` for calls the breaker must not count.
+    ///
+    /// Plumbing calls are the plugin's, not the model's: after every agent tool
+    /// call the plugin drains completions (`bash_drain_completions`) under the
+    /// same session, so counting them would reset the run on every agent call
+    /// and the breaker could never see two agent calls in a row. The first live
+    /// probe found exactly that: five identical bash calls over 78 s, no steer.
+    ///
+    /// A preview is the first half of a hoisted mutation (`write`, `edit`,
+    /// `apply_patch`): the plugin previews, asks for permission, then applies,
+    /// all for one model call. Counting the preview as well would count every
+    /// mutation twice, fire on the second genuine repeat, and misread the
+    /// preview's different text as drifting output.
+    ///
+    /// The key is taken from the arguments the model sent. A bash command that
+    /// AFT answers by rewriting it into another tool (for example `grep` into
+    /// the grep tool) still keys as `bash` with its `command` and `workdir`,
+    /// because that is the call the model repeats.
+    ///
+    /// `worker_session` is the caller's role (see `RawRequest::worker_session`).
+    pub(crate) fn for_agent_call(
+        session_id: &str,
+        tool: &str,
+        args: &Value,
+        preview: bool,
+        worker_session: bool,
+    ) -> Option<Self> {
+        if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_string(),
+            tool: tool.to_string(),
+            semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
+            worker_session,
+        })
+    }
+
+    /// Records the call and appends the breaker's reminder to `text` when the
+    /// call is a repeat worth steering.
+    ///
+    /// `text` must be the rendered tool text before the status bar, alerts, and
+    /// trailers are attached. Those decorations carry moving counts, so hashing
+    /// afterward would make identical results appear different forever and
+    /// silently prevent the breaker from firing.
+    pub(crate) fn observe(self, app_ctx: &AppContext, text: &mut String) {
+        let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
+        if let Some(intervention) = app_ctx.repeat_breaker().observe(
+            &self.session_id,
+            &self.tool,
+            self.semantic_key,
+            output_hash,
+        ) {
+            crate::response_finalize::append_repeat_breaker_reminder(
+                text,
+                &self.session_id,
+                &intervention,
+                self.worker_session,
+            );
+        }
+    }
+}
+
 pub fn run_tool_call(
     bare_name: &str,
     args: Value,
@@ -418,7 +549,20 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
-    let semantic_key = crate::response_finalize::repeat_breaker::semantic_key(bare_name, &args);
+    // The preflight below and the dispatched command share one config
+    // snapshot, even if a live config reload publishes in between.
+    let _config_pin = app_ctx.pin_config();
+    let session_id = ctx
+        .session_id
+        .as_deref()
+        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+    let repeat = RepeatObservation::for_agent_call(
+        session_id,
+        bare_name,
+        &args,
+        ctx.preview,
+        ctx.worker_session,
+    );
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
@@ -441,6 +585,7 @@ pub fn run_tool_call(
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
             if response.success && response.data.get("backup_skipped_reason").is_none() {
                 let session = ctx
                     .session_id
@@ -474,37 +619,8 @@ pub fn run_tool_call(
         }
     };
 
-    let session_id = ctx
-        .session_id
-        .as_deref()
-        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    // Plumbing calls are the plugin's, not the model's: after every agent tool
-    // call the plugin drains completions (`bash_drain_completions`) under the
-    // same session, so counting them would reset the run on every agent call
-    // and the breaker could never see two agent calls in a row. The first live
-    // probe found exactly that: five identical bash calls over 78 s, no steer.
-    // Hash the rendered tool text before status bars, alerts, and trailers are attached. Those
-    // decorations carry moving counts, so hashing afterward would make identical results appear
-    // different forever and silently prevent the breaker from firing.
-    let output_hash = crate::response_finalize::repeat_breaker::output_hash(&result.text);
-    // A preview is the first half of a hoisted mutation (`write`, `edit`,
-    // `apply_patch`): the plugin previews, asks for permission, then applies,
-    // all for one model call. Counting the preview as well would count every
-    // mutation twice, fire on the second genuine repeat, and misread the
-    // preview's different text as drifting output.
-    let intervention = if crate::subc::is_subc_native_plumbing_tool(bare_name) || ctx.preview {
-        None
-    } else {
-        app_ctx
-            .repeat_breaker()
-            .observe(session_id, bare_name, semantic_key, output_hash)
-    };
-    if let Some(intervention) = intervention {
-        crate::response_finalize::append_repeat_breaker_reminder(
-            &mut result.text,
-            session_id,
-            &intervention,
-        );
+    if let Some(repeat) = repeat {
+        repeat.observe(app_ctx, &mut result.text);
     }
     // Finalize after hashing: the status bar the finalizer may append carries moving counts.
     if finalize_after_breaker {
@@ -537,6 +653,16 @@ fn raw_request_from_translated(
         params.remove("command");
     }
     params.remove("session_id");
+    // The caller's role comes from the request envelope, never from the
+    // agent's arguments: an agent must not be able to claim it is a worker
+    // to lift the default hard kill on its commands.
+    params.remove(crate::protocol::WORKER_SESSION_FIELD);
+    if ctx.worker_session {
+        params.insert(
+            crate::protocol::WORKER_SESSION_FIELD.to_string(),
+            json!(true),
+        );
+    }
     let lsp_hints = params.remove("lsp_hints").filter(|value| !value.is_null());
 
     Ok(RawRequest {
@@ -675,6 +801,9 @@ mod tests {
                 preview,
                 edit_slot_survives: None,
                 report_registration_downgrade: false,
+                standard_edit_grammar: false,
+                disabled_tools: None,
+                worker_session: false,
             }
         }
 
@@ -707,6 +836,28 @@ mod tests {
                 }),
             );
             serde_json::to_vec(&response).expect("serialize recording dispatch response")
+        }
+
+        #[test]
+        fn worker_role_comes_from_the_context_never_the_agent_arguments() {
+            let spoofed = object(json!({ "command": "make", "worker_session": true }));
+            let primary =
+                raw_request_from_translated("bash".to_string(), spoofed.clone(), &context(false))
+                    .unwrap();
+            assert!(
+                !primary.worker_session(),
+                "an agent argument must not set the role"
+            );
+
+            let mut worker_ctx = context(false);
+            worker_ctx.worker_session = true;
+            let worker = raw_request_from_translated(
+                "bash".to_string(),
+                object(json!({ "command": "make" })),
+                &worker_ctx,
+            )
+            .unwrap();
+            assert!(worker.worker_session());
         }
 
         #[test]

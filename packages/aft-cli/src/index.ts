@@ -27,6 +27,9 @@ function printHelp(): void {
   console.log(
     "    backups purge    Remove undo backups by --path and/or --session (dry run unless --yes)",
   );
+  console.log(
+    "    cache prune-legacy  Delete legacy index caches past their rollback window (dry run unless --yes)",
+  );
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor --profile [seconds]  Profile a running AFT daemon");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
@@ -53,6 +56,7 @@ function printHelp(): void {
   console.log(`    ${CLI} setup`);
   console.log(`    ${CLI} index`);
   console.log(`    ${CLI} backups purge --path ./build --yes`);
+  console.log(`    ${CLI} cache prune-legacy`);
   console.log(`    ${CLI} doctor`);
   console.log(`    ${CLI} doctor --profile 4`);
   console.log(`    ${CLI} doctor lsp ./src/main.py`);
@@ -80,6 +84,10 @@ async function main(): Promise<number> {
   if (command === "backups") {
     const { runBackups } = await import("./commands/backups.js");
     return runBackups(args);
+  }
+  if (command === "cache") {
+    const { runCache } = await import("./commands/cache.js");
+    return runCache(args);
   }
   if (command === "doctor") {
     if (args.includes("--profile")) {

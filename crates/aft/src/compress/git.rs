@@ -63,46 +63,56 @@ fn command_head(command: &str) -> Option<&str> {
 }
 
 fn git_subcommand(command: &str) -> Option<String> {
-    let mut seen_git = false;
-    for token in command.split_whitespace() {
-        if !seen_git {
-            if token == "git" {
-                seen_git = true;
-            }
-            continue;
+    git_command_tokens(command).next().map(str::to_string)
+}
+
+// Global options that take a separate value must not make that value look like
+// the subcommand. Attached values are already contained in the option token.
+fn git_command_tokens(command: &str) -> impl Iterator<Item = &str> {
+    let mut tokens = command.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "git" {
+            break;
         }
-        if token.starts_with('-') || token.contains('=') {
-            continue;
-        }
-        if crate::compress::is_shell_boundary(token) {
-            return None;
-        }
-        return Some(token.to_string());
     }
-    None
+    while let Some(token) = tokens.next() {
+        if crate::compress::is_shell_boundary(token) {
+            return "".split_whitespace();
+        }
+        if matches!(
+            token,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--config-env"
+                | "--super-prefix"
+        ) {
+            if tokens.next().is_none_or(crate::compress::is_shell_boundary) {
+                return "".split_whitespace();
+            }
+        } else if !token.starts_with('-') {
+            // Return the original suffix so callers can also inspect commands
+            // such as `git remote add` without parsing global options twice.
+            let offset = token.as_ptr() as usize - command.as_ptr() as usize;
+            return command[offset..].split_whitespace();
+        }
+    }
+    "".split_whitespace()
 }
 
 fn git_subcommand_after(command: &str, subcommand: &str) -> Option<String> {
-    let mut seen_git = false;
-    let mut seen_subcommand = false;
-    for token in command.split_whitespace() {
-        if !seen_git {
-            if token == "git" {
-                seen_git = true;
-            }
-            continue;
+    let mut tokens = git_command_tokens(command);
+    if tokens.next()? != subcommand {
+        return None;
+    }
+    for token in tokens {
+        if crate::compress::is_shell_boundary(token) {
+            return None;
         }
-        if !seen_subcommand {
-            if token.starts_with('-') || token.contains('=') {
-                continue;
-            }
-            seen_subcommand = token == subcommand;
-            continue;
+        if !token.starts_with('-') && !token.contains('=') {
+            return Some(token.to_string());
         }
-        if token.starts_with('-') || token.contains('=') {
-            continue;
-        }
-        return Some(token.to_string());
     }
     None
 }
@@ -319,13 +329,12 @@ fn looks_like_pull_marker(line: &str) -> bool {
     trimmed == "Fast-forward" || trimmed.starts_with("Merge made by ")
 }
 
-fn cap_git_lines(mut lines: Vec<String>, summary_name: &str, keep_lines: usize) -> String {
-    if lines.len() > keep_lines {
-        let omitted = lines.len() - keep_lines;
-        lines.truncate(keep_lines);
-        lines.push(format!("... ({} more {})", omitted, summary_name));
-    }
-    trim_trailing_lines(&lines.join("\n"))
+fn cap_git_lines(lines: Vec<String>, summary_name: &str, keep_lines: usize) -> String {
+    // Head plus tail: `git stash pop` and `git pull` end with their outcome
+    // ("Dropped refs/stash@{0}", the files-changed summary), so the cut goes in
+    // the middle rather than after the first lines.
+    let kept = crate::compress::line_cut::cap_lines_head_tail(&lines, keep_lines, summary_name);
+    trim_trailing_lines(&kept.join("\n"))
 }
 
 fn compress_status(output: &str) -> String {
@@ -962,5 +971,34 @@ mod tests {
     #[test]
     fn git_subcommand_unaffected_without_metacharacters() {
         assert_eq!(git_subcommand("git log --oneline").as_deref(), Some("log"));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn git_global_options_before_subcommand() {
+        assert_eq!(super::git_subcommand("git -C | head"), None);
+        assert_eq!(super::git_subcommand("git -C"), None);
+        assert_eq!(
+            super::git_subcommand_after("git -C /repo remote add", "remote").as_deref(),
+            Some("add")
+        );
+        for command in [
+            "git -C /repo log",
+            "git -c k=v log",
+            "git --no-pager log",
+            "git --git-dir /repo log",
+            "git --work-tree /repo log",
+            "git --git-dir=/repo log",
+            "git -C/repo log",
+            "git --namespace ns log",
+        ] {
+            assert_eq!(
+                super::git_subcommand(command).as_deref(),
+                Some("log"),
+                "{command}"
+            );
+        }
     }
 }

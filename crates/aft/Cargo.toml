@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.57.2"
+version = "0.58.2"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -9,6 +9,9 @@ keywords = ["tree-sitter", "code-analysis", "ai-agent", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 rust-version.workspace = true
+# Aggregate integration suites avoid linking one executable per source file.
+# Explicit targets leave fixture/descriptor paths stable without autodiscovery.
+autotests = false
 
 [lib]
 name = "aft"
@@ -18,11 +21,67 @@ path = "src/lib.rs"
 name = "aft"
 path = "src/main.rs"
 
-[[bin]]
-name = "fake-lsp-server"
-path = "tests/lsp/fake_server.rs"
+[[test]]
+name = "engine"
+path = "tests/engine/main.rs"
+
+[[test]]
+name = "list_envelope"
+path = "tests/list_envelope/main.rs"
+
+[[test]]
+name = "semantic"
+path = "tests/semantic/main.rs"
+
+[[test]]
+name = "alert"
+path = "tests/alert/main.rs"
+
+[[test]]
+name = "rest"
+path = "tests/rest/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+
+# Live watchers must not share a harness with unrelated process-heavy tests.
+[[test]]
+name = "watcher_integration"
+path = "tests/watcher_integration/main.rs"
+
+# CI runs sandbox probes single-threaded with mandatory Landlock on Linux.
+[[test]]
+name = "sandbox_launch_probe"
+path = "tests/sandbox_launch_probe.rs"
+
+# The semantic wrapper changes process cwd; keep it out of the shared harness.
+[[test]]
+name = "semantic_test"
+path = "tests/semantic_test.rs"
+
+# Counting allocators measure the entire process heap, so unrelated tests would
+# contaminate their working-set bounds even with a shared allocator implementation.
+[[test]]
+name = "semantic_embed_working_set_test"
+path = "tests/semantic_embed_working_set_test.rs"
+
+[[test]]
+name = "semantic_embed_overflow_recovery_working_set_test"
+path = "tests/semantic_embed_overflow_recovery_working_set_test.rs"
+
+# Ignored macOS heap probes also need an uncontaminated process-wide allocator.
+[[test]]
+name = "daemon_malloc_small_growth_repro"
+path = "tests/daemon_malloc_small_growth_repro.rs"
+
+[lints.rust]
+# The ignored navigation profile is enabled explicitly for manual measurements.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'] }
 
 [features]
+# Explicit opt-in for cross-process timing controls used by integration tests.
+test-timing-hooks = []
 semantic-chunk-census = []
 
 [dependencies]
@@ -94,7 +153,7 @@ oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.57.2" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.58.2" }
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
@@ -131,12 +190,21 @@ ndarray = "0.17.2"
 half = "2"
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 htmd = "0.5.4"
+# The DOM type behind htmd's `Element::node`; keep the major in lockstep with
+# htmd so the URL fetcher can read <pre> text nodes verbatim.
+markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-subc-protocol = "=0.23.0"
-subc-transport = "=0.7.2"
-subc-client-rs = "=0.15.6"
+cortexkit-role-tool-provider = "=0.4.5"
+jsonschema = { version = "0.33", default-features = false }
+subc-protocol = "=0.28.0"
+subc-transport = "=0.9.0"
+subc-client-rs = "=0.25.0"
+# The one reader of the daemon's launch nonce (pipe first, environment copy
+# second). subc-client-rs reads through the same cached accessor, so this pin
+# must match the version subc-client-rs depends on.
+subc-os = "=0.1.3"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 jsonc-parser = { version = "0.33", features = ["cst"] }
@@ -159,6 +227,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+cortexkit-role-tool-provider-conformance = "=0.4.5"
+cortexkit-role-harness = "=0.1.0"
+async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"

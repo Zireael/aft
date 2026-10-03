@@ -13,10 +13,12 @@ import {
 } from "../bridge-bootstrap.js";
 import { resolveBridgePoolTransportOptions } from "../config.js";
 import { buildConfigErrorToolMap } from "../config-error-surface.js";
+import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
-import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
+import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
+import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
   buildAftToolDefinitions,
@@ -33,12 +35,16 @@ const defaults = {
   registerTools: registerAftTools,
   registerRpc: registerAftRpc,
   registerConfigErrorRpc: registerAftConfigErrorRpc,
-  toolConsumers: (context) => ({
-    ...hoistedV2ToolConsumers(context),
+  registerPromptHook: registerV2PromptDetachHook,
+  // The prompt server comes from the user-only `opencode` block of the
+  // Location's config; without it AFT finds the server it runs inside.
+  toolConsumers: (context, config) => ({
+    ...hoistedV2ToolConsumers(context, v2PromptChannelFor(config?.opencode)),
     ...createV2RuntimeConsumer(context),
   }),
   acquireBridge,
   releaseBridge,
+  startLiveConfigReload: startOpenCodeLiveConfigReload,
   resolvePoolOptions: resolveBridgePoolTransportOptions,
   resolveVersion: () => resolvePluginVersion(import.meta.url),
 };
@@ -73,7 +79,7 @@ async function bootLocation(context, location, dependencies) {
     dependencies,
   );
   const canonicalDirectory = location.project?.canonical ?? directory;
-  const consumers = dependencies.toolConsumers(context);
+  const consumers = dependencies.toolConsumers(context, config);
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);
@@ -113,7 +119,19 @@ async function bootLocation(context, location, dependencies) {
   const { hashlineEditRegistered } = applyToolSurfaceOverrides(pool, config, registeredTools);
   reportHashlineDowngrade(config, registeredTools, notify);
   toolContext.hashlineEffective = hashlineEditRegistered;
-  return { consumers, pool, tools };
+  // Keep this Location's live config keys current when a config file changes.
+  // The finalizer that releases the bridge also stops the watch.
+  const liveConfigReload = dependencies.startLiveConfigReload({
+    directory,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
+    getConfig: () => toolContext.config,
+    setConfig: (next) => {
+      toolContext.config = next;
+    },
+    notify,
+  });
+  return { consumers, pool, tools, liveConfigReload, toolContext, directory };
 }
 
 /**
@@ -185,12 +203,25 @@ export function makeServerEffect(overrides = {}) {
 
       yield* Effect.addFinalizer(() =>
         Effect.promise(async () => {
+          runtime.liveConfigReload?.stop();
           runtime.consumers.dispose?.();
           await dependencies.releaseBridge(runtime.pool);
         }),
       );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
+      // OpenCode 2 has no chat.message hook; its session prompt hook is where a
+      // new message detaches a waiting bash, as chat.message does on OpenCode 1.
+      // The config is read through the tool context so live reloads apply.
+      // The bridge asked first is the one this Location's tools run on, the
+      // Location's own directory; for a Location in a linked git worktree that
+      // is the worktree, not the canonical main checkout the pool was acquired
+      // for (issue #387). Other bridges are still tried after it.
+      yield* dependencies.registerPromptHook(context, {
+        pool: runtime.pool,
+        projectRoot: runtime.directory,
+        getConfig: () => runtime.toolContext.config,
+      });
       yield* dependencies.registerTools(
         context,
         location,

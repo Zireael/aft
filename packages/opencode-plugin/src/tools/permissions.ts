@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "@cortexkit/aft-bridge";
+import { execFileSync, relativePathEscapesRoot } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
@@ -243,12 +243,12 @@ export async function askEditPermission(
 
 /**
  * Check if `child` is inside `parent`. Mirrors `AppFileSystem.contains` in
- * opencode core (uses `path.relative` and ensures it doesn't start with `..`).
+ * opencode core (uses `path.relative` and rejects parent-directory segments).
  */
 function containsPath(parent: string, child: string): boolean {
   if (!parent) return false;
   const rel = path.relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  return !relativePathEscapesRoot(rel);
 }
 
 function systemTempRoots(): string[] {
@@ -377,6 +377,7 @@ function normalizePathPattern(p: string): string {
 export const _permissionsInternalsForTest = {
   classifyPermissionError,
   containsPath,
+  gitRootProbeCount: (): number => gitRootProbeCount,
   isSystemTempPath,
   normalizePathPattern,
 };
@@ -418,11 +419,18 @@ export async function assertExternalDirectoryPermission(
   const rawWorktree = (context as { worktree?: string }).worktree;
   const worktree = rawWorktree && rawWorktree !== "/" ? normalizePath(rawWorktree) : rawWorktree;
 
+  // Read once: a live config reload may replace `ctx.config` while this
+  // check awaits the server.
+  const restrictToProjectRoot = ctx.config.restrict_to_project_root === true;
+
   if (directory && containsPath(directory, absoluteTarget)) return undefined;
   // Non-git projects set worktree to "/" which matches ANY absolute path.
   // Match opencode's behavior: skip the worktree check in that case so we
-  // still ask for external paths.
+  // still ask for external paths. Under the project restriction a worktree
+  // path outside the project root is outside AFT's root too, so it is denied
+  // below rather than let through.
   if (
+    !restrictToProjectRoot &&
     worktree &&
     worktree !== "/" &&
     worktree !== directory &&
@@ -438,11 +446,19 @@ export async function assertExternalDirectoryPermission(
   // boundary anyway — that produced the issue #125 "approved but still fails"
   // footgun). Instead the agent gets a clear denial and the user gets a
   // throttled informational panel explaining the restriction.
-  if (ctx.config.restrict_to_project_root === true) {
-    // A session-owned bash artifact lives outside the project by design. The
-    // plugin has no access to Rust's task registry, so read calls cross this
-    // boundary and let Rust apply its exact, session-scoped artifact check.
-    if (options?.serverValidatedRead === true) return undefined;
+  if (restrictToProjectRoot) {
+    // A session-owned bash artifact lives outside the project by design. Only
+    // a read the server confirms as one of this session's artifacts passes;
+    // every other external read is denied here even if the server's own
+    // restriction is momentarily off (a live config change reaches this
+    // plugin and the server at slightly different times, and each side must
+    // enforce its own `true`).
+    if (
+      options?.serverValidatedRead === true &&
+      (await isSessionOwnedBashArtifact(ctx, context, absoluteTarget))
+    ) {
+      return undefined;
+    }
     notifyRestrictBlocked(ctx, context, absoluteTarget);
     return restrictDenialMessage(absoluteTarget);
   }
@@ -490,7 +506,59 @@ export async function assertExternalDirectoryPermission(
   }
 }
 
+/** Spawned `git rev-parse` probes; tests use it to pin when the probe is needed. */
+let gitRootProbeCount = 0;
+
+/**
+ * Whether `dir` is the top level of a git working tree, judged from its `.git`
+ * entry without spawning git: a repository directory (HEAD, objects and refs
+ * present, which is what git itself requires) or a linked worktree's
+ * `gitdir:` file. Environment overrides that move the repository elsewhere
+ * make the answer unknowable here, so they report false.
+ */
+function isGitToplevel(dir: string): boolean {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE) return false;
+  const dotGit = path.join(dir, ".git");
+  try {
+    const info = fs.statSync(dotGit);
+    if (info.isDirectory()) {
+      return (
+        fs.statSync(path.join(dotGit, "HEAD")).isFile() &&
+        fs.statSync(path.join(dotGit, "objects")).isDirectory() &&
+        fs.statSync(path.join(dotGit, "refs")).isDirectory()
+      );
+    }
+    if (info.isFile()) {
+      const fd = fs.openSync(dotGit, "r");
+      try {
+        const head = Buffer.alloc(8);
+        const read = fs.readSync(fd, head, 0, head.length, 0);
+        return head.subarray(0, read).toString("utf8") === "gitdir: ";
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch {
+    // Missing or unreadable: not a known top level.
+  }
+  return false;
+}
+
+/**
+ * A target inside a git top level `root` has its own git root at or below
+ * `root`: git's upward discovery stops at the first valid repository, and
+ * `root` is one. If discovery fails instead, the fallback root is the target
+ * itself, also inside `root`. Either way the containment check below passes,
+ * so the `git rev-parse` spawn can be skipped.
+ */
+function targetStaysInsideGitToplevel(root: string | undefined, canonicalTarget: string): boolean {
+  return Boolean(
+    root && root !== "/" && containsPath(root, canonicalTarget) && isGitToplevel(root),
+  );
+}
+
 function gitRootForNearestExistingParent(resolved: string): string | undefined {
+  gitRootProbeCount += 1;
   const nearest = normalizeNearestExistingParent(resolved);
   let cwd = nearest;
   try {
@@ -532,13 +600,23 @@ export async function assertAftSearchExternalPermission(
 
   const resolved = resolveAbsolutePath(context, target);
   const absoluteTarget = normalizePath(resolved);
-  const externalRoot =
-    gitRootForNearestExistingParent(resolved) ?? normalizeNearestExistingParent(resolved);
 
   const root = projectRootFor(context);
   const directory = root ? normalizePath(root) : root;
   const rawWorktree = (context as { worktree?: string }).worktree;
   const worktree = rawWorktree && rawWorktree !== "/" ? normalizePath(rawWorktree) : rawWorktree;
+
+  // The common case (a path inside the project's own repository) needs no
+  // git process: decide containment from the `.git` entry first.
+  const canonicalTarget = normalizeNearestExistingParent(resolved);
+  if (
+    targetStaysInsideGitToplevel(directory, canonicalTarget) ||
+    targetStaysInsideGitToplevel(worktree, canonicalTarget)
+  ) {
+    return undefined;
+  }
+
+  const externalRoot = gitRootForNearestExistingParent(resolved) ?? canonicalTarget;
 
   if (directory && containsPath(directory, externalRoot)) return undefined;
   if (

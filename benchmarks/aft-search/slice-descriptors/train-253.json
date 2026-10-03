@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "callgraph-macro-callers",
+    "lsp-forward-watched-files"
+  ],
+  "note": "Callgraph Rust macro_rules! template calls and macro notes, plus forwarding watcher file changes to LSP servers. No aft_search ranking file is touched."
+}

@@ -1,0 +1,6 @@
+{
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "server_password_env": "OPENCODE_SERVER_PASSWORD"
+  }
+}

@@ -15,10 +15,10 @@ use crate::context::AppContext;
 use crate::pattern_compile::{CompiledPattern, LiteralSearch};
 use crate::protocol::Response;
 use crate::search_index::{
-    build_path_filters, decompose_grep_pattern, has_any_project_file_from, read_searchable_text,
-    resolve_search_scope, sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc,
-    try_read_with_budget, GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult,
-    IndexStatus, PathFilters, RegexQuery, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    build_path_filters, decompose_grep_pattern, read_searchable_text, resolve_search_scope,
+    sort_grep_matches_by_mtime_desc, sort_walked_paths_by_mtime_desc, try_read_with_budget,
+    GrepMatch, GrepPathExclusion, GrepQueryPhaseTimings, GrepResult, IndexStatus, PathFilters,
+    RegexQuery, WalkBound, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
@@ -37,7 +37,8 @@ pub struct FallbackWalkOutcome {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct FallbackWalkProgress {
-    walk_truncated: bool,
+    /// The limit that stopped the walk early; `None` when it reached every file.
+    bound: Option<WalkBound>,
     skipped_foreign_mounts: usize,
 }
 
@@ -161,19 +162,52 @@ pub fn compute_filter_root(
     }
 }
 
-pub fn scope_has_files(project_root: &Path, scope: &GrepScope) -> bool {
-    scope.roots.iter().any(|root| {
+pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Option<bool> {
+    let mut unknown = false;
+    for root in &scope.roots {
         // An explicitly-named existing file is always in scope (it's searched
         // directly even if gitignored / .aftignored), so don't report it as
         // "no files matched scope".
         if root.search_root.is_file() {
-            return true;
+            return Some(true);
         }
-        let catch_all =
-            build_path_filters(&["**/*".to_string()], &[]).expect("valid catch-all glob");
-        has_any_project_file_from(&root.filter_root, &root.search_root, &catch_all)
-            || has_any_project_file_from(project_root, &root.search_root, &catch_all)
-    })
+        match bounded_scope_has_files(&root.filter_root, &root.search_root, filters) {
+            Some(true) => return Some(true),
+            None => unknown = true,
+            Some(false) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// Stop at the first eligible file; an exhausted probe cannot prove an empty scope.
+fn bounded_scope_has_files(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+) -> Option<bool> {
+    let started = Instant::now();
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let builder = fallback_project_walk_builder(search_root, Arc::clone(&skipped));
+    for (visited, entry) in builder.build().enumerate() {
+        if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
+            || started.elapsed() >= FALLBACK_WALK_BUDGET
+            || crate::executor::current_job_cancelled()
+        {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        if entry.file_type().is_some_and(|kind| kind.is_file())
+            && filters.matches(filter_root, entry.path())
+        {
+            return Some(true);
+        }
+    }
+    (skipped.load(Ordering::Relaxed) == 0).then_some(false)
 }
 
 pub fn execute(
@@ -373,7 +407,9 @@ fn execute_root_profiled(
                     snapshot_acquire,
                     query_decomposition: Duration::ZERO,
                     query: query_timings,
-                    indexed_scope_has_files: Some(indexed_scope_has_files),
+                    indexed_scope_has_files: Some(
+                        snapshot.has_file_in_scope_with_filters(&root.search_root, filters),
+                    ),
                 },
             );
         }
@@ -443,6 +479,9 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
         walk_truncated: false,
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
+        scan_deadline_reached: false,
+        files_read_directly: 0,
+        walk_bound: None,
     }
 }
 
@@ -465,6 +504,9 @@ fn grep_explicit_file(
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
     let job_cancellation = crate::executor::current_job_cancellation();
+    // A single named file gets the walk's time budget too: one huge file
+    // with a slow pattern must not hold the request open indefinitely.
+    let deadline = Instant::now() + FALLBACK_WALK_BUDGET;
 
     let matches = fallback_search_file(
         &file.to_path_buf(),
@@ -477,21 +519,26 @@ fn grep_explicit_file(
         &truncated,
         &engine_capped,
         job_cancellation.as_ref(),
-        None,
+        Some(deadline),
     );
+    let engine_capped = engine_capped.load(Ordering::Relaxed);
+    let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
-        files_searched: files_searched.load(Ordering::Relaxed),
+        files_searched,
         files_with_matches: files_with_matches.load(Ordering::Relaxed),
         index_status,
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: false,
-        engine_capped: engine_capped.load(Ordering::Relaxed),
+        engine_capped,
         walk_truncated: false,
         skipped_foreign_mounts: 0,
         missing_on_disk: 0,
+        scan_deadline_reached: engine_capped && Instant::now() >= deadline,
+        files_read_directly: files_searched,
+        walk_bound: None,
     }
 }
 
@@ -511,6 +558,9 @@ pub fn merge_grep_results(
     let mut walk_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
     let mut missing_on_disk = 0usize;
+    let mut scan_deadline_reached = false;
+    let mut files_read_directly = 0usize;
+    let mut walk_bound = None;
     let mut seen_match_keys = HashSet::new();
 
     for result in results {
@@ -524,6 +574,9 @@ pub fn merge_grep_results(
         walk_truncated |= result.walk_truncated;
         skipped_foreign_mounts += result.skipped_foreign_mounts;
         missing_on_disk += result.missing_on_disk;
+        scan_deadline_reached |= result.scan_deadline_reached;
+        files_read_directly += result.files_read_directly;
+        walk_bound = walk_bound.or(result.walk_bound);
 
         for grep_match in result.matches {
             let file_key = canonical_key(&grep_match.file);
@@ -551,10 +604,13 @@ pub fn merge_grep_results(
         walk_truncated,
         skipped_foreign_mounts,
         missing_on_disk,
+        scan_deadline_reached,
+        files_read_directly,
+        walk_bound,
     }
 }
 
-fn fallback_project_walk_builder(
+pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
@@ -618,7 +674,51 @@ pub(crate) fn bounded_fallback_walk_files(
     )
 }
 
-fn bounded_fallback_walk_files_with_limits(
+/// Enumerate source paths before documentation and data, with no file-count cap.
+/// Check the deadline on each directory entry, including entries rejected as files.
+pub(crate) fn source_first_fallback_walk_files(
+    root: &Path,
+    deadline: Instant,
+) -> FallbackWalkOutcome {
+    let mut files = Vec::new();
+    let mut entries_visited = 0;
+    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
+    let mut walk_truncated = false;
+    'phases: for source_phase in [true, false] {
+        let builder = fallback_project_walk_builder(root, Arc::clone(&skipped_foreign_mounts));
+        for entry in builder.build() {
+            entries_visited += 1;
+            if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+                walk_truncated = true;
+                break 'phases;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().is_some_and(|kind| kind.is_file())
+                && is_fallback_source_path(entry.path()) == source_phase
+            {
+                files.push(entry.into_path());
+            }
+        }
+    }
+    FallbackWalkOutcome {
+        files,
+        walk_truncated,
+        skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
+        entries_visited,
+    }
+}
+
+pub(crate) fn is_fallback_source_path(path: &Path) -> bool {
+    use crate::parser::LangId;
+    crate::parser::detect_language(path).is_some_and(|language| {
+        !matches!(
+            language,
+            LangId::Markdown | LangId::Json | LangId::Yaml | LangId::Toml
+        )
+    })
+}
+
+pub(crate) fn bounded_fallback_walk_files_with_limits(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -634,7 +734,7 @@ fn bounded_fallback_walk_files_with_limits(
 
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         entries_visited += 1;
-        if started.elapsed() >= budget {
+        if started.elapsed() >= budget || entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
             break;
         }
@@ -664,29 +764,6 @@ fn bounded_fallback_walk_files_with_limits(
     }
 }
 
-fn for_each_bounded_fallback_walk_file<F>(
-    filter_root: &Path,
-    search_root: &Path,
-    filters: &PathFilters,
-    project_root: &Path,
-    path_exclusion: Option<GrepPathExclusion>,
-    mut on_file: F,
-) -> FallbackWalkProgress
-where
-    F: FnMut(&PathBuf),
-{
-    for_each_bounded_fallback_walk_file_with_limits(
-        filter_root,
-        search_root,
-        filters,
-        project_root,
-        path_exclusion,
-        MAX_FALLBACK_WALK_FILES,
-        FALLBACK_WALK_BUDGET,
-        &mut on_file,
-    )
-}
-
 fn for_each_bounded_fallback_walk_file_with_limits<F>(
     filter_root: &Path,
     search_root: &Path,
@@ -708,13 +785,13 @@ where
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if crate::executor::current_job_cancelled() {
             return FallbackWalkProgress {
-                walk_truncated: true,
+                bound: Some(WalkBound::Cancelled),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
             };
         }
         if started.elapsed() >= budget {
             return FallbackWalkProgress {
-                walk_truncated: true,
+                bound: Some(WalkBound::TimeBudget),
                 skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
             };
         }
@@ -732,7 +809,7 @@ where
             files_seen += 1;
             if files_seen > max_files {
                 return FallbackWalkProgress {
-                    walk_truncated: true,
+                    bound: Some(WalkBound::FileLimit(max_files)),
                     skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
                 };
             }
@@ -740,7 +817,7 @@ where
         }
     }
     FallbackWalkProgress {
-        walk_truncated: false,
+        bound: None,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
     }
 }
@@ -788,6 +865,35 @@ fn fallback_grep(
     index_status: IndexStatus,
     path_exclusion: Option<GrepPathExclusion>,
 ) -> GrepResult {
+    fallback_grep_with_limits(
+        project_root,
+        search_root,
+        filter_root,
+        pattern,
+        filters,
+        max_results,
+        index_status,
+        path_exclusion,
+        MAX_FALLBACK_WALK_FILES,
+        FALLBACK_WALK_BUDGET,
+    )
+}
+
+/// [`fallback_grep`] with explicit walk limits: at most `max_files` eligible
+/// files, and `budget` of wall-clock time for walking and searching them.
+#[allow(clippy::too_many_arguments)]
+fn fallback_grep_with_limits(
+    project_root: &Path,
+    search_root: &Path,
+    filter_root: &Path,
+    pattern: &CompiledPattern,
+    filters: &PathFilters,
+    max_results: usize,
+    index_status: IndexStatus,
+    path_exclusion: Option<GrepPathExclusion>,
+    max_files: usize,
+    budget: Duration,
+) -> GrepResult {
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
     let files_with_matches = AtomicUsize::new(0);
@@ -795,7 +901,7 @@ fn fallback_grep(
     let engine_capped = AtomicBool::new(false);
     let stop_after = max_results.saturating_mul(2);
     let stop_scan = Arc::new(AtomicBool::new(false));
-    let scan_deadline = Instant::now() + FALLBACK_WALK_BUDGET;
+    let scan_deadline = Instant::now() + budget;
     let job_cancellation = crate::executor::current_job_cancellation();
 
     let mut matches = Vec::new();
@@ -842,13 +948,15 @@ fn fallback_grep(
         matches.extend(partial);
     };
 
-    let progress = for_each_bounded_fallback_walk_file(
+    let progress = for_each_bounded_fallback_walk_file_with_limits(
         filter_root,
         search_root,
         filters,
         project_root,
         path_exclusion,
-        |path| {
+        max_files,
+        budget,
+        &mut |path: &PathBuf| {
             if stop_scan.load(Ordering::Relaxed) {
                 return;
             }
@@ -859,26 +967,33 @@ fn fallback_grep(
         },
     );
     flush_batch(&mut batch, &mut matches);
-    let mut walk_truncated = progress.walk_truncated;
+    let mut walk_bound = progress.bound;
     if Instant::now() >= scan_deadline {
-        walk_truncated = true;
+        // Files handed to the search after the deadline were skipped, so the
+        // walk is incomplete even when its own loop finished.
+        walk_bound = walk_bound.or(Some(WalkBound::TimeBudget));
         engine_capped.store(true, Ordering::Relaxed);
     }
 
     sort_grep_matches_by_mtime_desc(&mut matches, project_root);
+    let files_searched = files_searched.load(Ordering::Relaxed);
 
     GrepResult {
         total_matches: total_matches.load(Ordering::Relaxed),
         matches,
-        files_searched: files_searched.load(Ordering::Relaxed),
+        files_searched,
         files_with_matches: files_with_matches.load(Ordering::Relaxed),
         index_status,
         truncated: truncated.load(Ordering::Relaxed),
         fully_degraded: true,
         engine_capped: engine_capped.load(Ordering::Relaxed),
-        walk_truncated,
+        walk_truncated: walk_bound.is_some(),
         skipped_foreign_mounts: progress.skipped_foreign_mounts,
         missing_on_disk: 0,
+        // The walk's own time budget is reported through `walk_truncated`.
+        scan_deadline_reached: false,
+        files_read_directly: files_searched,
+        walk_bound,
     }
 }
 
@@ -908,7 +1023,8 @@ fn fallback_search_file(
     files_searched.fetch_add(1, Ordering::Relaxed);
 
     let line_starts = line_starts(&content);
-    let mut seen_lines = HashSet::new();
+    // Start of the line after the last reported one; see `search_literal_in_text`.
+    let mut reported_line_end = 0usize;
     let mut matched_this_file = false;
     let mut matches = Vec::new();
 
@@ -921,7 +1037,7 @@ fn fallback_search_file(
             max_results,
             stop_after,
             total_matches,
-            &mut seen_lines,
+            &mut reported_line_end,
             truncated,
             engine_capped,
             &mut matched_this_file,
@@ -943,11 +1059,16 @@ fn fallback_search_file(
                     break;
                 }
 
-                let (line, column, line_text) =
-                    line_details(&content, &line_starts, matched.start());
-                if !seen_lines.insert(line) {
+                // Regex matches are not skipped ahead: a later match on the
+                // same line can run past its newline, and where the next
+                // non-overlapping match starts depends on it. Same-line
+                // matches are still dropped before any line text is built.
+                if matched.start() < reported_line_end {
                     continue;
                 }
+                let (line, column, line_text, next_line_start) =
+                    line_details_with_next(&content, &line_starts, matched.start());
+                reported_line_end = next_line_start;
 
                 matched_this_file = true;
                 let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
@@ -982,7 +1103,7 @@ fn search_literal_in_text(
     max_results: usize,
     stop_after: usize,
     total_matches: &AtomicUsize,
-    seen_lines: &mut HashSet<u32>,
+    reported_line_end: &mut usize,
     truncated: &AtomicBool,
     engine_capped: &AtomicBool,
     matched_this_file: &mut bool,
@@ -1010,11 +1131,21 @@ fn search_literal_in_text(
         }
 
         let offset = start + position;
-        start = offset + 1;
-        let (line, column, line_text) = line_details(content, line_starts, offset);
-        if !seen_lines.insert(line) {
+        // Grep reports the first match on each line. Occurrences arrive in
+        // increasing offset order, so one before `reported_line_end` is on the
+        // line already reported (a line with many occurrences then costs one
+        // line lookup, not one per occurrence).
+        if offset < *reported_line_end {
+            start = offset + 1;
             continue;
         }
+        let (line, column, line_text, next_line_start) =
+            line_details_with_next(content, line_starts, offset);
+        *reported_line_end = next_line_start;
+        // The finder reports every occurrence, overlapping ones included, so
+        // resuming at the next line finds exactly the occurrence a one-byte
+        // step would have reported next.
+        start = next_line_start.max(offset + 1);
 
         *matched_this_file = true;
         let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1101,22 +1232,38 @@ pub fn truncate_at_char_boundary(content: &str, max_bytes: usize) -> &str {
     &content[..end]
 }
 
+/// Line number, 1-based character column and printable text of the line
+/// holding `offset`. The text is bounded the way grep prints it, see
+/// [`crate::search_index::bounded_grep_line_text`].
 pub fn line_details(content: &str, line_starts: &[usize], offset: usize) -> (u32, u32, String) {
+    let (line, column, line_text, _) = line_details_with_next(content, line_starts, offset);
+    (line, column, line_text)
+}
+
+/// [`line_details`] plus the byte offset where the next line starts (the end
+/// of `content` for the last line).
+fn line_details_with_next(
+    content: &str,
+    line_starts: &[usize],
+    offset: usize,
+) -> (u32, u32, String, usize) {
     let offset = floor_char_boundary_str(content, offset);
     let line_index = match line_starts.binary_search(&offset) {
         Ok(index) => index,
         Err(index) => index.saturating_sub(1),
     };
     let line_start = line_starts.get(line_index).copied().unwrap_or(0);
-    let line_end = content[line_start..]
-        .find('\n')
-        .map(|length| line_start + length)
-        .unwrap_or(content.len());
-    let line_text = content[line_start..line_end]
-        .trim_end_matches('\r')
-        .to_string();
+    // Every entry after the first in `line_starts` follows a newline, so the
+    // next entry, when there is one, is one byte past this line's newline.
+    let (line_end, next_line_start) = match line_starts.get(line_index + 1) {
+        Some(&next) => (next - 1, next),
+        None => (content.len(), content.len()),
+    };
+    let line_text = crate::search_index::bounded_grep_line_text(
+        content[line_start..line_end].trim_end_matches('\r'),
+    );
     let column = content[line_start..offset].chars().count() as u32 + 1;
-    (line_index as u32 + 1, column, line_text)
+    (line_index as u32 + 1, column, line_text, next_line_start)
 }
 
 #[cfg(test)]
@@ -1146,6 +1293,9 @@ mod tests {
             walk_truncated: false,
             skipped_foreign_mounts: 0,
             missing_on_disk: 0,
+            scan_deadline_reached: false,
+            files_read_directly: 0,
+            walk_bound: None,
         }
     }
 
@@ -1205,6 +1355,135 @@ mod tests {
         assert_eq!(visible.matches[0].file, source_file);
         assert!(!visible.truncated);
         assert!(!visible.engine_capped);
+    }
+
+    /// A tempdir holding `count` small text files, none containing `absent_token`.
+    fn walk_fixture(count: usize) -> tempfile::TempDir {
+        let project = tempfile::tempdir().expect("project");
+        for index in 0..count {
+            std::fs::write(
+                project.path().join(format!("file_{index}.txt")),
+                format!("line {index} — nothing to see\n"),
+            )
+            .expect("fixture file");
+        }
+        project
+    }
+
+    fn literal(pattern: &str) -> CompiledPattern {
+        match crate::pattern_compile::compile(
+            pattern,
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal: {other:?}"),
+        }
+    }
+
+    /// The grep tool's reply text for `result`, as `handle_grep` builds it.
+    fn grep_tool_text(result: &GrepResult, project_root: &Path) -> String {
+        let page_matches: Vec<&GrepMatch> = result.matches.iter().collect();
+        let page = crate::commands::grep::render_grep_page(
+            &page_matches,
+            project_root,
+            crate::commands::grep::GREP_MAX_OUTPUT_BYTES,
+        );
+        let mut text = crate::commands::grep::grep_page_text(result, &page, 0, false);
+        if let Some(note) = crate::commands::grep::walk_coverage_note(result) {
+            text.push_str("\n\n");
+            text.push_str(&note);
+        }
+        text
+    }
+
+    #[test]
+    fn complete_fallback_walk_while_index_builds_says_every_file_was_searched() {
+        let project = walk_fixture(3);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            10,
+            FALLBACK_WALK_BUDGET,
+        );
+        assert_eq!(result.walk_bound, None);
+        assert!(!result.walk_truncated);
+        assert_eq!(result.files_read_directly, 3);
+
+        let text = grep_tool_text(&result, project.path());
+        assert_eq!(
+            text,
+            "Found 0 match across 0 file [index: building; searched all 3 files directly]"
+        );
+    }
+
+    #[test]
+    fn bounded_fallback_walk_while_index_builds_says_it_is_incomplete() {
+        let project = walk_fixture(5);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            2,
+            FALLBACK_WALK_BUDGET,
+        );
+        assert_eq!(result.walk_bound, Some(WalkBound::FileLimit(2)));
+        assert!(result.walk_truncated);
+        assert_eq!(result.files_read_directly, 2);
+
+        let text = grep_tool_text(&result, project.path());
+        assert!(
+            text.starts_with(
+                "Found 0 match across 0 file [index: building; incomplete: checked 2 files before the walk's 2-file limit]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("(checked 2 of more than 2 files (index building);"),
+            "{text}"
+        );
+        assert!(
+            text.contains("retry once the index is ready"),
+            "the note must name an exhaustive alternative: {text}"
+        );
+        assert!(!text.contains("searched all"), "{text}");
+    }
+
+    #[test]
+    fn walk_time_budget_marks_the_walk_incomplete() {
+        let project = walk_fixture(3);
+        let result = fallback_grep_with_limits(
+            project.path(),
+            project.path(),
+            project.path(),
+            &literal("absent_token"),
+            &PathFilters::default(),
+            10,
+            IndexStatus::Building,
+            None,
+            10,
+            Duration::ZERO,
+        );
+        assert_eq!(result.walk_bound, Some(WalkBound::TimeBudget));
+        let text = grep_tool_text(&result, project.path());
+        assert!(
+            text.contains("incomplete: checked 0 files before the walk's time budget ran out"),
+            "{text}"
+        );
+        assert!(text.contains("ran out of its time budget"), "{text}");
     }
 
     #[test]
@@ -1414,6 +1693,45 @@ mod tests {
         };
         for matched in compiled.find_iter(content.as_bytes()) {
             let _ = line_details(content, &starts, matched.start());
+        }
+    }
+
+    #[test]
+    fn explicit_file_grep_reports_one_match_for_a_long_line_in_every_arm() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("minified.js");
+        let line = format!("start {}", "needle-pad".repeat(100_000));
+        std::fs::write(&file, format!("{line}\nsecond needle line\n")).expect("write file");
+        let compile = |pattern: &str, literal: bool, case_insensitive: bool| {
+            match crate::pattern_compile::compile(
+                pattern,
+                crate::pattern_compile::CompileOpts {
+                    literal,
+                    case_insensitive,
+                    ..crate::pattern_compile::CompileOpts::default()
+                },
+            ) {
+                crate::pattern_compile::CompileResult::Ok(compiled) => compiled,
+                other => panic!("compile {pattern:?}: {other:?}"),
+            }
+        };
+        for pattern in [
+            compile("needle", true, false),
+            compile("NEEDLE", true, true),
+            compile("ne+dle", false, false),
+        ] {
+            let result = grep_explicit_file(&file, &pattern, 100, IndexStatus::Fallback);
+            let found: Vec<(u32, u32)> = result
+                .matches
+                .iter()
+                .map(|matched| (matched.line, matched.column))
+                .collect();
+            assert_eq!(found, vec![(1, 7), (2, 8)], "{pattern:?}");
+            assert_eq!(
+                result.matches[0].line_text,
+                crate::search_index::bounded_grep_line_text(&line)
+            );
+            assert!(!result.scan_deadline_reached);
         }
     }
 

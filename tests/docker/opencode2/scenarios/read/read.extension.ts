@@ -1,8 +1,8 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
+import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const EXPECTED_IDS = new Set([
@@ -12,6 +12,8 @@ const EXPECTED_IDS = new Set([
   "read/T3/read_ask_allow",
   "read/T3/read_ask_deny",
   "read/T3/read_config_deny",
+  "read/T6/read-directory-payload-entries/complete",
+  "read/T6/read-directory-payload-entries/incomplete",
   "read/T7/happy",
 ]);
 
@@ -44,7 +46,7 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
     T3: "applicable",
     T4: "n/a:no-abortable-operation",
     T5: "n/a:no-background-capability",
-    T6: "n/a:no-list-surface",
+    T6: "applicable",
     T7: "applicable",
   };
   if (!row || JSON.stringify(row.trajectories) !== JSON.stringify(expected)) {
@@ -64,9 +66,21 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
   }
 }
 
+async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
+  if (context.scenario.tool !== "read" || context.scenario.trajectory !== "T6") return;
+  const directory = join(context.project_root, "entries");
+  await mkdir(directory, { recursive: true });
+  // Exceed read's 1000-entry display cap without checking in 1001 tiny files.
+  const count = context.scenario.id === "read/T6/read-directory-payload-entries/incomplete" ? 1001 : 1;
+  for (let index = 0; index < count; index++) {
+    await writeFile(join(directory, `entry-${String(index).padStart(4, "0")}.txt`), "fixture\n");
+  }
+}
+
 const extension: HarnessExtension = {
   name: "read-scenarios-v1",
   validate: validateReadScenarios,
+  beforeScenario,
 };
 
 export default extension;

@@ -94,7 +94,12 @@ impl Lifecycle {
 }
 impl Drop for Lifecycle {
     fn drop(&mut self) {
-        JOBS.lock().remove(&self.0);
+        let job = JOBS.lock().remove(&self.0);
+        #[cfg(test)]
+        if let Some(job) = job.as_ref() {
+            tests::settled(self.0, &job.root);
+        }
+        drop(job);
     }
 }
 
@@ -114,13 +119,80 @@ fn write_epoch_as_detached_writer(target: &Target) -> parking_lot::RwLockWriteGu
     guard
 }
 
-/// Scheduling succeeds once ownership has moved to the detached worker. Direct
-/// standalone callers have no actor epoch and retain the synchronous API.
+/// The standalone (stdin/stdout) runtime's stand-in for a root actor's epoch.
+///
+/// The subc daemon runs configure maintenance as executor jobs inside a root
+/// actor, so [`schedule`] detaches a view publication there. The standalone
+/// runtime serves requests and maintenance on one thread with no actor; without
+/// this, the first publication of a large checkout ran inline on that thread
+/// and every request waited for it. Standalone maintenance installs this
+/// epoch with [`install_standalone_scope`], so publications detach, and each
+/// standalone request holds its read side through [`standalone_request_gate`],
+/// so a detached publication's commit (the write side) never runs in the
+/// middle of a request or a maintenance unit.
+struct StandaloneEpoch {
+    epoch: Arc<RwLock<()>>,
+    detached_writers: Arc<AtomicUsize>,
+}
+
+static STANDALONE_EPOCH: LazyLock<StandaloneEpoch> = LazyLock::new(|| StandaloneEpoch {
+    epoch: Arc::new(RwLock::new(())),
+    detached_writers: Arc::new(AtomicUsize::new(0)),
+});
+
+/// Held while a standalone request or maintenance unit runs. The read is
+/// recursive because a request can dispatch a nested request (`tool_call`).
+/// The writer is never starved: requests and maintenance run one at a time on
+/// the standalone thread, so between two of them no read is held and a waiting
+/// publication commits; at most it waits for the one request in flight.
+pub struct StandaloneGate {
+    _read: parking_lot::RwLockReadGuard<'static, ()>,
+}
+
+pub fn standalone_request_gate() -> StandaloneGate {
+    StandaloneGate {
+        _read: STANDALONE_EPOCH.epoch.read_recursive(),
+    }
+}
+
+/// Lets view publications scheduled by standalone configure maintenance on
+/// `ctx` detach instead of running inline, for as long as the returned value
+/// lives. It also holds the request gate, as a maintenance unit is serialized
+/// with publication commits the same way a request is.
+pub struct StandaloneScope {
+    _scope: ActorScope,
+    _gate: StandaloneGate,
+}
+
+pub fn install_standalone_scope(ctx: Arc<AppContext>) -> StandaloneScope {
+    StandaloneScope {
+        _gate: standalone_request_gate(),
+        _scope: ActorScope::install(
+            ctx,
+            Arc::clone(&STANDALONE_EPOCH.epoch),
+            Arc::clone(&STANDALONE_EPOCH.detached_writers),
+        ),
+    }
+}
+
+pub(crate) fn cancel_for_context(ctx: &AppContext) {
+    let context = ctx as *const AppContext as usize;
+    for job in JOBS.lock().values().filter(|job| job.context == context) {
+        job.token.request_cancel();
+    }
+}
+
+/// Scheduling succeeds once ownership has moved to the detached worker.
+/// Callers outside any actor scope (tests and one-shot tools that drain
+/// configure maintenance themselves) retain the synchronous API.
 pub(crate) fn schedule(
     ctx: &AppContext,
     mut paths: BTreeSet<Vec<u8>>,
     allow_blob_put: bool,
 ) -> Result<(), String> {
+    if ctx.retire_deleted_view_root() {
+        return Ok(());
+    }
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
         return ctx.publish_view_paths(paths, allow_blob_put).map(|_| ());
@@ -129,7 +201,12 @@ pub(crate) fn schedule(
         .canonical_cache_root_opt()
         .ok_or("view root is not configured")?;
     let content_generation = ctx.configure_content_generation();
-    let token = JobCancellation::new();
+    if ctx.subc_unbound_quiesced() || !root.is_dir() {
+        return Err("view root is unbound or missing".to_owned());
+    }
+    let token = JobCancellation::new()
+        .with_root(&root)
+        .with_lifecycle(ctx.subc_lifecycle_admission());
     token.mark_running();
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     {
@@ -162,6 +239,9 @@ pub(crate) fn schedule(
         .spawn(move || {
             let _cancellation = super::install_job_cancellation(token.clone());
             loop {
+                if target.ctx.retire_deleted_view_root() {
+                    break;
+                }
                 if token.cancel_requested_before_commit()
                     || target.ctx.configure_content_generation() != content_generation
                     || !target.ctx.config().views.enabled
@@ -214,6 +294,9 @@ pub(crate) fn schedule(
                 match result {
                     Ok(()) => break,
                     Err(error) => {
+                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none() {
+                            break;
+                        }
                         log::warn!("content-addressed view publication failed: {}", error);
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.

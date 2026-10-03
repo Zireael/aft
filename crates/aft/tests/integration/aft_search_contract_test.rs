@@ -758,8 +758,12 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     let storage = tempfile::tempdir().expect("storage");
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
+    // This test covers the generic scan, so the query has two words. A query
+    // that is one identifier takes the exact identifier sweep instead, which
+    // reads every file and is not degraded (see
+    // external_identifier_without_index_returns_every_source_use_and_no_dump).
     let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+        &request_with_path("fn needle_symbol", Some("literal"), external_project.path()),
         &ctx,
     ));
 
@@ -767,7 +771,18 @@ fn external_absent_cache_degrades_to_lexical_fallback_scan() {
     // disclosure — not dead-end with a not_indexed error (which pushes agents
     // to shell out to grep/bash instead of staying on aft_search).
     assert_eq!(response["success"], true, "expected success: {response:?}");
-    assert_eq!(response["fully_degraded"], true);
+    // The reply says in plain words that no index exists and how much of the
+    // project the literal scan read, so it no longer carries the
+    // `fully_degraded` flag, whose rendering ("Search status: fully
+    // degraded") told the agent nothing it could act on.
+    assert_eq!(response["fully_degraded"], false);
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("No AFT index exists for")
+            && text.contains("It read all 1 text file under")
+            && text.contains("Use grep with path for an exhaustive check"),
+        "expected the plain no-index coverage paragraph: {text}"
+    );
     assert_eq!(response["semantic_status"], "external_unindexed");
     assert_eq!(response["borrowed"], true);
     let results = response["results"].as_array().expect("results array");
@@ -807,6 +822,16 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
         &request_with("needle_symbol", Some("literal")),
         &ctx,
     ));
+    let subfolder = project.path().join("nested");
+    std::fs::create_dir(&subfolder).expect("create subfolder");
+    let with_subfolder = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), &subfolder),
+        &ctx,
+    ));
+    assert_eq!(
+        with_subfolder, without_path,
+        "same-repo subfolder is not a filter"
+    );
     let with_path = response_value(handle_semantic_search(
         &request_with_path("needle_symbol", Some("literal"), project.path()),
         &ctx,
@@ -924,6 +949,9 @@ fn external_non_git_path_still_returns_not_a_git_root() {
 
     assert_eq!(response["success"], false);
     assert_eq!(response["code"], "not_a_git_root");
+    let message = response["message"].as_str().expect("error message");
+    assert!(message.contains("another Git project"));
+    assert!(message.contains("grep or glob with path"));
 }
 
 #[test]
@@ -1021,6 +1049,11 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
         text.contains("pub fn needle_symbol() -> bool { false }"),
         "FileSummary snippet should be regenerated from current disk content: {response:?}"
     );
+    assert!(
+        text.contains("The saved semantic index of")
+            && text.contains("predates 1 file that changed or was added since"),
+        "the semantic lane answered from vectors older than the edit, and says so: {text}"
+    );
     handle.join().expect("embedding server thread");
 }
 
@@ -1034,8 +1067,11 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
     persist_mismatched_semantic_index(external_project.path(), &external_source, storage.path());
     let ctx = test_context_with_storage(session_project.path(), storage.path());
 
+    // This test covers the ranked lanes, so the query has two words. A query
+    // that is one identifier takes the exact identifier sweep instead, which
+    // has no semantic lane to miss and so is not partial.
     let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", None, external_project.path()),
+        &request_with_path("fn needle_symbol", None, external_project.path()),
         &ctx,
     ));
 
@@ -1196,6 +1232,315 @@ fn ranked_files(response: &Value) -> Vec<String> {
                 .replace('\\', "/")
         })
         .collect()
+}
+
+/// Only `scripts/check.py` contains the literal `residue-source-hash`. The other
+/// two files hold its parts: `src/server.rs` declares a field named `source`,
+/// and `docs/notes.md` mentions all three words within three lines. Before
+/// hyphenated queries were verified as literals, both of those ranked above
+/// the file holding the string and were labelled `[exact]`.
+fn project_with_hyphenated_literal() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
+    let project = tempfile::tempdir().expect("create project dir");
+    let files = [
+        (
+            "src/server.rs",
+            "pub struct Registry {\n    source: String,\n}\n",
+        ),
+        (
+            "docs/notes.md",
+            "The residue left behind\nby the source\nchanges its hash.\n",
+        ),
+        (
+            "scripts/check.py",
+            "CHECKS = [\"residue-source-hash\", \"slice-fences\"]\n",
+        ),
+    ];
+    let mut entries = Vec::new();
+    for (relative, text) in files {
+        let path = project.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&path, text).expect("write file");
+        entries.push((path, text.to_string()));
+    }
+    (project, entries)
+}
+
+/// Every result marked exact, in the JSON and in the rendered `[exact]`
+/// header, must be a file that contains `literal` verbatim.
+fn assert_exact_only_on_files_containing(response: &Value, literal: &str) {
+    let mut exact_files = Vec::new();
+    for result in response["results"].as_array().expect("results array") {
+        let file = result["file"].as_str().expect("result file");
+        if result["exact"] == true {
+            let text = std::fs::read_to_string(file).expect("read exact result");
+            assert!(
+                text.contains(literal),
+                "{file} is marked exact but does not contain {literal:?}: {response}"
+            );
+            exact_files.push(file.replace('\\', "/"));
+        }
+    }
+    let rendered = response["text"].as_str().expect("rendered response");
+    for line in rendered.lines().filter(|line| line.contains("[exact]")) {
+        // A header reads `<path>[:line] [exact]`; local replies show the path
+        // relative to the project, external ones show it absolute.
+        let shown = line
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .replace('\\', "/");
+        let shown = shown
+            .rsplit_once(':')
+            .filter(|(_, line_number)| line_number.chars().all(|c| c.is_ascii_digit()))
+            .map_or(shown.as_str(), |(path, _)| path)
+            .to_string();
+        assert!(
+            exact_files.iter().any(|file| file.ends_with(&shown)),
+            "[exact] header on a file that does not contain {literal:?}: {line}\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact() {
+    let (project, entries) = project_with_hyphenated_literal();
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("residue-source-hash", None, 5),
+        &ctx,
+    ));
+
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("scripts/check.py"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["exact"], true, "{response}");
+    assert!(response["text"]
+        .as_str()
+        .expect("rendered response")
+        .contains("[exact]"));
+    assert_exact_only_on_files_containing(&response, "residue-source-hash");
+}
+
+#[test]
+fn external_hyphenated_literal_ranks_the_containing_file_first_and_only_it_is_exact() {
+    // A path naming another Git project searches that project's persisted
+    // (borrowed) index instead of the session's own, so the literal routing
+    // must hold on that path too.
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (external_project, _entries) = project_with_hyphenated_literal();
+    init_git(external_project.path());
+    commit_all(external_project.path());
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let session_project = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session_project.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("residue-source-hash", None, external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(response["borrowed"], true, "{response}");
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("scripts/check.py"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["exact"], true, "{response}");
+    assert_exact_only_on_files_containing(&response, "residue-source-hash");
+}
+
+/// Write `files` (project-relative path, text) under a fresh project and
+/// return it with the entries for `install_lexical_index_entries`.
+fn project_with_files(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
+    let project = tempfile::tempdir().expect("create project dir");
+    // The canonical root (macOS temp dirs sit behind a /var symlink) so the
+    // indexed paths match the root the reply strips from displayed paths.
+    let root = std::fs::canonicalize(project.path()).expect("canonical project dir");
+    let mut entries = Vec::new();
+    for (relative, text) in files {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dir");
+        std::fs::write(&path, text).expect("write file");
+        entries.push((path, text.to_string()));
+    }
+    (project, entries)
+}
+
+/// Run `query` over `files` with a ready trigram index and no semantic lane.
+fn lexical_search(files: &[(&str, &str)], query: &str) -> (tempfile::TempDir, Value) {
+    let (project, entries) = project_with_files(files);
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k(query, None, 10),
+        &ctx,
+    ));
+    assert_eq!(response["success"], true, "{response}");
+    (project, response)
+}
+
+#[test]
+fn definition_hit_is_rendered_at_its_declaration_line() {
+    // Line 1 holds a longer name containing the query; the declaration of
+    // `running_tasks` itself is on line 5. The definition hit must show line 5.
+    let (_project, response) = lexical_search(
+        &[(
+            "src/registry.rs",
+            "pub fn kill_running_tasks_for_root(root: &str) {\n    drop(root);\n}\n\npub fn running_tasks(&self) -> usize {\n    0\n}\n",
+        )],
+        "running_tasks",
+    );
+
+    let first = &response["results"][0];
+    assert!(
+        path_ends_with(first["file"].as_str().unwrap(), "src/registry.rs"),
+        "{response}"
+    );
+    assert_eq!(first["exact"], true, "{response}");
+    assert_eq!(first["start_line"], 5, "{response}");
+    assert!(
+        first["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("pub fn running_tasks(&self)"),
+        "{response}"
+    );
+    // The rendered header uses the platform's path separator.
+    let header = format!("{}:5", Path::new("src").join("registry.rs").display());
+    assert!(
+        response["text"].as_str().unwrap().contains(&header),
+        "{response}"
+    );
+}
+
+#[test]
+fn source_declaration_outranks_a_document_that_quotes_it() {
+    // The note quotes the declaration and sorts first by path (`.` < `c`);
+    // only the Rust file declares the function.
+    let (_project, response) = lexical_search(
+        &[
+            (
+                ".gsd/milestones/S05-RESEARCH.md",
+                "Planned helper:\n\nfn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {\n",
+            ),
+            (
+                "crates/aft/src/edit.rs",
+                "pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {\n    0\n}\n",
+            ),
+        ],
+        "line_col_to_byte",
+    );
+
+    let files = ranked_files(&response);
+    assert!(
+        files[0].ends_with("crates/aft/src/edit.rs"),
+        "ranked: {files:?}"
+    );
+    assert!(files[1].ends_with("S05-RESEARCH.md"), "ranked: {files:?}");
+}
+
+#[test]
+fn receiver_member_query_ranks_the_member_declaration_first() {
+    // `ask.list_pending_for_user` reads like its call site; the declaration
+    // says `fn list_pending_for_user`. The file whose path names the receiver
+    // comes first even though the other declaration's path sorts before it,
+    // then that other declaration, then the call site.
+    let (_project, response) = lexical_search(
+        &[
+            (
+                "src/handlers.rs",
+                "fn handle() {\n    ask.list_pending_for_user(user);\n}\n",
+            ),
+            (
+                "src/ask/store.rs",
+                "impl AskStore {\n    pub fn list_pending_for_user(&self, user: &str) {}\n}\n",
+            ),
+            (
+                "src/admin/registry.rs",
+                "pub fn list_pending_for_user(user: &str) {}\n",
+            ),
+        ],
+        "ask.list_pending_for_user",
+    );
+
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("src/ask/store.rs"), "ranked: {files:?}");
+    assert!(
+        files[1].ends_with("src/admin/registry.rs"),
+        "ranked: {files:?}"
+    );
+    assert!(files[2].ends_with("src/handlers.rs"), "ranked: {files:?}");
+    assert_eq!(response["results"][0]["start_line"], 2, "{response}");
+}
+
+#[test]
+fn missing_identifier_answers_not_found_with_nearest_names() {
+    let (_project, response) = lexical_search(
+        &[
+            (
+                "src/state.rs",
+                "pub fn mark_file_refreshed(id: u32) {}\npub fn mark_file_stale(id: u32) {}\n",
+            ),
+            (
+                "src/caller.rs",
+                "fn run() {\n    mark_file_refreshed(1);\n}\n",
+            ),
+        ],
+        "mark_file_refreshing",
+    );
+
+    let text = response["text"].as_str().unwrap();
+    // Locations use the platform's path separator, like result headers.
+    let state = Path::new("src").join("state.rs").display().to_string();
+    assert!(
+        text.starts_with(&format!(
+            "`mark_file_refreshing` not found in this project. Nearest names: \
+             `mark_file_refreshed` ({state}:1), `mark_file_stale` ({state}:2)"
+        )),
+        "{text}"
+    );
+    let results = response["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{response}");
+    assert_eq!(results[0]["name"], "mark_file_refreshed", "{response}");
+    assert_eq!(results[0]["source"], "nearest_name", "{response}");
+    assert_eq!(results[0]["start_line"], 1, "{response}");
+    assert_eq!(response["more_available"], false, "{response}");
+}
+
+#[test]
+fn identifier_that_occurs_anywhere_keeps_the_ordinary_ranking() {
+    // `refresh_all` occurs only inside a longer name, and `rebuild_cache`
+    // only in a test file the request excludes. Neither is absent from the
+    // project, so neither gets a not-found answer.
+    let files = [
+        ("src/state.rs", "pub fn refresh_all_files() {}\n"),
+        ("tests/cache_test.rs", "fn rebuild_cache() {}\n"),
+        ("src/cache.rs", "pub fn rebuild_index() {}\n"),
+    ];
+    for query in ["refresh_all", "rebuild_cache"] {
+        let (_project, response) = lexical_search(&files, query);
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            !text.contains("not found in this project"),
+            "{query}: {text}"
+        );
+        assert!(
+            response["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result["source"] != "nearest_name"),
+            "{query}: {response}"
+        );
+    }
 }
 
 #[test]
@@ -2439,5 +2784,271 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
             .count(),
         1,
         "external engine reply must contain exactly one trailer: {rendered}"
+    );
+}
+
+const EXTERNAL_IDENTIFIER: &str = "requireCredentialStamps";
+
+/// Source files that each use `EXTERNAL_IDENTIFIER` once; `pool.ts` declares it.
+const EXTERNAL_IDENTIFIER_SOURCES: [(&str, &str); 6] = [
+    (
+        "src/store/pool.ts",
+        "export interface PoolOptions {\n  requireCredentialStamps?: boolean\n}\n",
+    ),
+    (
+        "src/store/mutate.ts",
+        "if (options.requireCredentialStamps) {\n  rejectUnstamped()\n}\n",
+    ),
+    (
+        "src/store/runtime.ts",
+        "const strict = config.requireCredentialStamps ?? false\n",
+    ),
+    (
+        "src/store/schema.ts",
+        "// requireCredentialStamps turns unbound rows into errors\n",
+    ),
+    (
+        "src/store/torn.ts",
+        "export function check(o) { return o.requireCredentialStamps }\n",
+    ),
+    (
+        "src/guard.ts",
+        "assert(opts.requireCredentialStamps === true)\n",
+    ),
+];
+
+/// A Git project whose captured JSON dumps repeat the identifier's sub-tokens
+/// on one giant line without ever spelling it. With `with_identifier` false the
+/// source files hold a placeholder instead, so an index built now predates
+/// the identifier.
+fn external_identifier_project(with_identifier: bool) -> tempfile::TempDir {
+    let project = tempfile::tempdir().expect("external project");
+    let root = project.path();
+    write_external_identifier_sources(root, with_identifier);
+    fs::write(
+        root.join("src/credentials.ts"),
+        "// credential stamps are required before a row is used\nexport const requireStamps = true\n",
+    )
+    .expect("write related source");
+    let dumps = root.join("research/evidence/dumps");
+    fs::create_dir_all(&dumps).expect("create dumps dir");
+    let body = format!(
+        "{{\"model\":\"m\",\"instructions\":\"{}\"}}",
+        "require credential stamps; the Credential store must require Stamps. ".repeat(3_000)
+    );
+    for index in 0..8 {
+        fs::write(dumps.join(format!("{index:04}-main.body.json")), &body).expect("write dump");
+    }
+    init_git(root);
+    commit_all(root);
+    project
+}
+
+fn write_external_identifier_sources(root: &Path, with_identifier: bool) {
+    for (relative, content) in EXTERNAL_IDENTIFIER_SOURCES {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("source parent")).expect("create source dir");
+        let content = if with_identifier {
+            content.to_string()
+        } else {
+            content.replace(EXTERNAL_IDENTIFIER, "placeholderOption")
+        };
+        fs::write(path, content).expect("write source");
+    }
+}
+
+fn external_identifier_request(root: &Path) -> RawRequest {
+    serde_json::from_value(serde_json::json!({
+        "id": "aft-search-contract",
+        "command": "semantic_search",
+        "query": EXTERNAL_IDENTIFIER,
+        "top_k": 25,
+        "path": root.display().to_string(),
+    }))
+    .expect("build external identifier request")
+}
+
+fn result_suffixes(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("result file")
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+fn assert_every_source_use_first_and_no_dump(response: &Value) {
+    let files = result_suffixes(response);
+    assert!(
+        files.len() >= 6,
+        "every source use must come back: {response:#?}"
+    );
+    assert!(
+        files[0].ends_with("src/store/pool.ts"),
+        "the declaring file leads: {files:#?}"
+    );
+    for (relative, _) in EXTERNAL_IDENTIFIER_SOURCES {
+        assert!(
+            files[..6].iter().any(|file| file.ends_with(relative)),
+            "{relative} must be among the first six results: {files:#?}"
+        );
+    }
+    assert!(
+        !files
+            .iter()
+            .any(|file| file.contains("/dumps/") || file.ends_with(".json")),
+        "no dump file may pad an identifier query: {files:#?}"
+    );
+    assert!(
+        response["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .all(|result| result["source"] == "exact"),
+        "only exact occurrences are listed: {response:#?}"
+    );
+}
+
+#[test]
+fn external_identifier_without_index_returns_every_source_use_and_no_dump() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let external = external_identifier_project(true);
+    let session = tempfile::tempdir().expect("session project");
+    let storage = tempfile::tempdir().expect("storage");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &external_identifier_request(external.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["semantic_status"], "external_unindexed");
+    assert_every_source_use_first_and_no_dump(&response);
+    assert_eq!(response["result_count"], 6);
+    assert_eq!(response["complete"], true);
+    assert_eq!(
+        response["fully_degraded"], false,
+        "a sweep that read every file is not a degraded answer"
+    );
+    assert_eq!(response["exact_sweep"]["complete"], true);
+    assert_eq!(response["exact_sweep"]["used_index"], false);
+    assert!(
+        response["exact_sweep"]["coverage"]
+            .as_str()
+            .is_some_and(|coverage| coverage.starts_with("exact pass: complete; checked all")),
+        "the summary carries the coverage sentence for JSON renderers: {response:#?}"
+    );
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("exact pass: complete; checked all"),
+        "a finished walk says it covered the project: {text}"
+    );
+    assert!(
+        !text.contains("use grep for an exhaustive check"),
+        "a finished walk does not send the agent to grep: {text}"
+    );
+    assert!(
+        response.get("results_list_envelope").is_none(),
+        "a complete, uncut list carries no trailer: {response:#?}"
+    );
+}
+
+#[test]
+fn external_identifier_with_stale_borrowed_index_returns_every_source_use_and_no_dump() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let external = external_identifier_project(false);
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external.path(), storage.path());
+    // The identifier arrives after the project's own index was written, as it
+    // does when nobody has opened a session in that project since.
+    std::thread::sleep(Duration::from_millis(20));
+    write_external_identifier_sources(external.path(), true);
+    let session = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &external_identifier_request(external.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["borrowed"], true);
+    assert_every_source_use_first_and_no_dump(&response);
+    assert_eq!(response["result_count"], 6);
+    assert_eq!(response["exact_sweep"]["used_index"], true);
+    assert_eq!(response["exact_sweep"]["complete"], true);
+    assert_eq!(
+        response["complete"], true,
+        "the identifier plan has no semantic lane, so a full sweep is complete"
+    );
+    assert!(
+        response.get("saved_index_unverified").is_none(),
+        "a sweep that read every changed file needs no unchecked-index notice"
+    );
+    assert!(
+        response["exact_sweep"]["index_answered_files"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "unchanged files are answered by the project's own index: {response:#?}"
+    );
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("this project's own AFT index answered"),
+        "the reply says when the project's own index was used: {text}"
+    );
+}
+
+/// The saved index was written before a file existed. A prose query that only
+/// that file answers must still find it: the saved index is compared with the
+/// disk first, and the new file is read into the copy that answers.
+#[test]
+fn external_prose_query_finds_a_file_added_after_the_saved_index() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (external_project, _source_file, _source) = git_project_with_needle();
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external_project.path(), storage.path());
+    let added = external_project.path().join("src/quokkalith.rs");
+    fs::write(
+        &added,
+        "// Assemble the zephyrine quokkalith from its parts.\npub fn assemble_zephyrine_quokkalith() {}\n",
+    )
+    .expect("write file added after the index was saved");
+    let session = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path(
+            "where is the zephyrine quokkalith assembled",
+            None,
+            external_project.path(),
+        ),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], true, "{response:#?}");
+    assert_eq!(response["borrowed"], true);
+    assert!(
+        result_suffixes(&response)
+            .iter()
+            .any(|file| file.ends_with("src/quokkalith.rs")),
+        "the file added after the index was saved must be found: {response:#?}"
+    );
+    assert_eq!(response["saved_index_check"]["complete"], true);
+    assert_eq!(response["saved_index_check"]["added"], 1);
+    assert!(
+        response.get("saved_index_unverified").is_none(),
+        "a saved index compared with every file needs no unchecked notice: {response:#?}"
+    );
+    let text = response["text"].as_str().expect("text");
+    assert!(
+        text.contains("Checked the saved AFT index of")
+            && text.contains("since it was saved 1 file was added"),
+        "the reply says the index was checked and what changed: {text}"
     );
 }

@@ -231,4 +231,41 @@ describe("Location bridge lifecycle", () => {
 
     await Promise.all([releaseBridge(first), releaseBridge(second)]);
   });
+
+  test("a version mismatch after the creating Location is released goes to a live Location's handler", async () => {
+    let factoryOptions: AftTransportFactoryOptions | undefined;
+    const pool = new FakePool();
+    const createPool = async (received: AftTransportFactoryOptions) => {
+      factoryOptions = received;
+      return pool;
+    };
+    const calls: string[] = [];
+    const handler = (label: string) => async (binaryVersion: string, minVersion: string) => {
+      calls.push(`${label}:${binaryVersion}<${minVersion}`);
+      return `/fixture/${label}/aft`;
+    };
+    const first = await acquireBridge(
+      "/fixture/a",
+      { ...options(), poolOptions: { onVersionMismatch: handler("a") } },
+      { createPool },
+    );
+    const second = await acquireBridge(
+      "/fixture/b",
+      { ...options(), poolOptions: { onVersionMismatch: handler("b") } },
+      { createPool },
+    );
+
+    // The pool was built from the first Location's options. In the plugin that
+    // handler swaps the binary through the first Location's own lease, which
+    // throws once released, so after release a live Location must answer.
+    await releaseBridge(first);
+    expect(await factoryOptions?.poolOptions.onVersionMismatch?.("0.1.0", "0.2.0")).toBe(
+      "/fixture/b/aft",
+    );
+    expect(calls).toEqual(["b:0.1.0<0.2.0"]);
+
+    await releaseBridge(second);
+    expect(await factoryOptions?.poolOptions.onVersionMismatch?.("0.1.0", "0.2.0")).toBeNull();
+    expect(calls).toHaveLength(1);
+  });
 });

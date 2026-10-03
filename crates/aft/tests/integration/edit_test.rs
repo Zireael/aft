@@ -10,28 +10,7 @@ use super::helpers::warm_executable;
 use super::helpers::{fixture_path, user_config, AftProcess};
 
 fn fake_server_path() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_fake_lsp_server")
-        .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_fake-lsp-server"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            option_env!("CARGO_BIN_EXE_fake-lsp-server")
-                .or(option_env!("CARGO_BIN_EXE_fake_lsp_server"))
-                .map(PathBuf::from)
-        })
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake-lsp-server").map(PathBuf::from))
-        .or_else(|| std::env::var_os("CARGO_BIN_EXE_fake_lsp_server").map(PathBuf::from))
-        .or_else(|| {
-            let mut path = std::env::current_exe().ok()?;
-            path.pop();
-            path.pop();
-            path.push("fake-lsp-server");
-            if path.exists() {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .expect("fake-lsp-server binary path")
+    crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
 #[cfg(unix)]
@@ -1084,6 +1063,29 @@ fn edit_match_handles_brackets_in_relative_literal_path() {
 // ============================================================================
 
 #[test]
+fn batch_table_replace_all_preserves_fuzzy_boundaries() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("table.md");
+    fs::write(
+        &target,
+        "  | For  a task | b |  \n  | For  a task | b |  \n",
+    )
+    .unwrap();
+    let resp = aft.send(&serde_json::json!({
+        "id": "batch-table", "command": "batch", "file": target,
+        "edits": [{"oldString": "| For a task | b |", "newString": "| Changed | b |", "replaceAll": true}]
+    }).to_string());
+    assert_eq!(resp["success"], true, "{resp:?}");
+    assert_eq!(resp["fuzzy_matches"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "  | Changed | b |  \n  | Changed | b |  \n"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn batch_multiple_edits() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
@@ -1324,7 +1326,7 @@ fn batch_fuzzy_preserves_trailing_newline() {
 
     let result = fs::read_to_string(&target).unwrap();
     assert!(
-        result.contains("  const c = 3;\n  return a + b;"),
+        result.contains("  const c = 3;   \n  return a + b;"),
         "the line after the match must not be merged: {result:?}"
     );
     assert!(
@@ -1576,8 +1578,8 @@ fn batch_fuzzy_matching_covers_all_progressive_passes() {
         fs::read_to_string(&target).unwrap(),
         concat!(
             "exact = 10\n",
-            "trailing = 20\n",
-            "trimmed = 30\n",
+            "trailing = 20   \n",
+            "    trimmed = 30   \n",
             "normalized space = 40\n"
         )
     );
@@ -2213,10 +2215,7 @@ exit 0
 // ============================================================================
 // no_op honest reporting tests (v0.27.1, GitHub #45)
 //
-// Rust sets `no_op: true` on the response when the post-write file content is
-// byte-identical to the pre-write state. This separates "matched but produced
-// no change" from a real failure mode so Pi/OpenCode UIs can render an
-// informative message instead of a bare +0/-0 that looks like a tool bug.
+// Identity edits fail before mutation; real changes retain diff information.
 // ============================================================================
 
 #[test]
@@ -2237,14 +2236,11 @@ fn edit_match_no_op_when_old_string_equals_new_string() {
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
-    assert_eq!(resp["success"], true, "edit should succeed: {resp:?}");
-    assert_eq!(resp["replacements"], 1, "match was found and applied once");
     assert_eq!(
-        resp["no_op"], true,
-        "byte-identical replacement must surface no_op: true"
+        resp["success"], false,
+        "identity edit should be rejected: {resp:?}"
     );
-    assert_eq!(resp["diff"]["additions"], 0);
-    assert_eq!(resp["diff"]["deletions"], 0);
+    assert_eq!(resp["code"], "no_change");
 
     // File should genuinely be unchanged on disk
     assert_eq!(fs::read(&target).unwrap(), original);
@@ -2302,14 +2298,11 @@ fn write_no_op_when_content_identical_to_existing_file() {
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
-    assert_eq!(resp["success"], true, "write should succeed: {resp:?}");
-    assert_eq!(resp["created"], false);
     assert_eq!(
-        resp["no_op"], true,
-        "writing the same bytes must surface no_op: true"
+        resp["success"], false,
+        "identity write should be rejected: {resp:?}"
     );
-    assert_eq!(resp["diff"]["additions"], 0);
-    assert_eq!(resp["diff"]["deletions"], 0);
+    assert_eq!(resp["code"], "no_change");
 
     let _ = fs::remove_file(&target);
     let status = aft.shutdown();

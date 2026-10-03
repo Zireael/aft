@@ -73,6 +73,24 @@ struct BashParams {
     env: HashMap<String, String>,
 }
 
+/// The hard kill for a bash request.
+///
+/// An explicit `timeout` always wins. Without one the registry's default
+/// (30 minutes) applies, except to a delegated worker's `wait: true` call
+/// (`worker_session`, see [`RawRequest::worker_session`]): the worker blocks
+/// on it because it has nothing else to do until the command finishes, and
+/// killing a long build at an implicit limit would only make it start over.
+/// That wait still ends on a new message (which detaches the command to the
+/// background) or on an abort of the tool call.
+fn hard_kill_for(params: &BashParams, worker_session: bool) -> crate::bash_background::HardKill {
+    use crate::bash_background::HardKill;
+    match params.timeout {
+        Some(_) => HardKill::from_timeout_ms(params.timeout),
+        None if worker_session && params.wait => HardKill::Never,
+        None => HardKill::Default,
+    }
+}
+
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let raw_params = req
         .params
@@ -358,7 +376,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         shell_path,
         workdir,
         env,
-        params.timeout,
+        hard_kill_for(&params, req.worker_session()),
         ctx,
         effective_background,
         params.notify_on_completion,
@@ -813,6 +831,126 @@ mod tests {
         {
             let _ = ctx.bash_background().kill(task_id, "sandbox-spawn-test");
         }
+    }
+
+    /// A foreground bash that hits its timeout is reported to a status
+    /// poller as `timed_out` with exit code 124 and the kill's exit marker,
+    /// even when the poll lands while the timeout kill is still signaling the
+    /// process group (held there by the kill's test gate): `bash_status`
+    /// waits for the kill's outcome rather than answering `killing`.
+    #[cfg(unix)]
+    #[test]
+    fn foreground_timeout_status_is_timed_out_with_the_exit_marker() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let mut request = spawn_test_request("fg-timeout", "sleep 5", false);
+        request.params["params"]["timeout"] = json!(100);
+        let launched = handle(&request, &ctx);
+        assert!(launched.success, "spawn failed: {:?}", launched.data);
+        assert_eq!(launched.data["status"], "running");
+        let task_id = launched.data["task_id"].as_str().unwrap().to_string();
+        // Install the kill's test gate before the 100 ms timeout can expire:
+        // the watchdog's timeout kill then pauses after publishing `killing`
+        // and before it signals.
+        let (reached, release) =
+            crate::bash_background::registry::install_kill_signal_gate_for_test(&task_id);
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the timeout kill reached its signal step");
+
+        let status_request: RawRequest = serde_json::from_value(json!({
+            "id": "fg-timeout-status",
+            "command": "bash_status",
+            "session_id": "sandbox-spawn-test",
+            "params": { "task_id": task_id },
+        }))
+        .unwrap();
+        let status = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let ctx = &ctx;
+            let status_request = &status_request;
+            scope.spawn(move || {
+                let _ = done_tx.send(crate::commands::bash_status::handle(status_request, ctx));
+            });
+            let answered_early = done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .ok();
+            release.send(()).expect("release the timeout kill");
+            answered_early.unwrap_or_else(|| {
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("bash_status answered once the kill settled")
+            })
+        });
+
+        assert!(status.success, "bash_status failed: {:?}", status.data);
+        assert_eq!(
+            status.data["status"], "timed_out",
+            "status: {:?}",
+            status.data
+        );
+        assert_eq!(status.data["exit_code"], 124, "status: {:?}", status.data);
+        let exit_path = ctx
+            .bash_background()
+            .task_exit_path(&task_id, "sandbox-spawn-test")
+            .expect("task exit path");
+        assert_eq!(std::fs::read_to_string(exit_path).unwrap(), "killed");
+    }
+
+    /// The hard kill recorded for the task a `bash` request spawned.
+    #[cfg(unix)]
+    fn spawned_hard_kill_ms(extra: serde_json::Value) -> Option<u64> {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let mut request = spawn_test_request("hard-kill", "sleep 30", false);
+        for (key, value) in extra.as_object().unwrap() {
+            // `worker_session` sits beside `session_id`, outside the bash arguments,
+            // as the plugins send it.
+            if key == crate::protocol::WORKER_SESSION_FIELD {
+                request.params[key] = value.clone();
+            } else {
+                request.params["params"][key] = value.clone();
+            }
+        }
+        let response = handle(&request, &ctx);
+        assert!(response.success, "spawn failed: {:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let json_path = ctx
+            .bash_background()
+            .task_json_path(&task_id, "sandbox-spawn-test")
+            .expect("task json path");
+        let task = crate::bash_background::persistence::read_task(&json_path).unwrap();
+        stop_spawned_test_task(&ctx, &response);
+        task.timeout_ms
+    }
+
+    // A delegated worker blocks on `wait: true` until its command finishes, so
+    // the implicit 30-minute kill must not cut a long build short. Everything
+    // else keeps the default, and an explicit timeout always wins.
+    #[cfg(unix)]
+    #[test]
+    fn worker_wait_without_timeout_gets_no_default_hard_kill() {
+        let default_ms = crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64;
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "wait": true, "worker_session": true })),
+            None
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "wait": true })),
+            Some(default_ms)
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(json!({ "worker_session": true })),
+            Some(default_ms)
+        );
+        assert_eq!(
+            spawned_hard_kill_ms(
+                json!({ "wait": true, "worker_session": true, "timeout": 45_000 })
+            ),
+            Some(45_000)
+        );
     }
 
     #[cfg(unix)]

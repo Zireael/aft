@@ -7,11 +7,13 @@
 //!
 //! Currently supports: TypeScript, TSX, JavaScript, Python, Rust, Go.
 
+pub(crate) mod quotes;
+
 use std::ops::Range;
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
-use crate::parser::{grammar_for, LangId};
+use crate::parser::LangId;
 
 mod c;
 pub(crate) use c::{classify_group_c_import_kind, normalize_include_module};
@@ -127,8 +129,8 @@ pub enum ImportForm {
     },
     /// Rust `use path;` / `pub use path;`. `visibility` replaces the
     /// `default_import == "pub"` overload (`Some("pub")`, `Some("pub(crate)")`,
-    /// …). The brace/use-tree text remains carried by `module_path` per the
-    /// lossless-round-trip decision; `named` holds extracted use-list names.
+    /// …). For use lists, `module_path` is the prefix (empty for a root list)
+    /// and `named` contains complete top-level entries, including nested trees.
     RustUse {
         visibility: Option<String>,
         named: Vec<String>,
@@ -386,7 +388,11 @@ impl ImportSyntax for RustSyntax {
         parse_rs_imports(source, tree)
     }
     fn generate_line(&self, req: &ImportRequest) -> String {
-        generate_rs_import_line(req.module_path, req.names, req.type_only)
+        let line = generate_rs_import_line(req.module_path, req.names, req.type_only);
+        match req.default_import {
+            Some(visibility) if !visibility.is_empty() => format!("{visibility} {line}"),
+            _ => line,
+        }
     }
     fn classify_group(&self, module_path: &str) -> ImportGroup {
         classify_group_rs(module_path)
@@ -510,17 +516,13 @@ fn parse_vue_imports(source: &str, tree: &Tree) -> ImportBlock {
         };
     };
     let inner = &source[start..end];
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&grammar_for(LangId::TypeScript))
-        .is_err()
-    {
-        return ImportBlock {
-            imports: Vec::new(),
-            byte_range: None,
-        };
-    }
-    let Some(inner_tree) = parser.parse(inner, None) else {
+    // This thread's retained parser: building a parser and loading the grammar
+    // per call was a fixed cost on every file an imports scan visits.
+    let Ok(inner_tree) = crate::parser::parse_source_with_cached_parser(
+        std::path::Path::new("<vue script>"),
+        inner,
+        LangId::TypeScript,
+    ) else {
         return ImportBlock {
             imports: Vec::new(),
             byte_range: None,
@@ -1288,6 +1290,31 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
     type_only: bool,
     attribute_clause: Option<&str>,
 ) -> String {
+    generate_import_line_with_namespace_and_attribute_clause_and_style(
+        lang,
+        module_path,
+        names,
+        default_import,
+        namespace_import,
+        type_only,
+        attribute_clause,
+        None,
+    )
+}
+
+/// Generate a line spelled with `style` (quote and terminator) for ES
+/// languages; `None` uses [`quotes::EsImportStyle::default`]. Other language
+/// engines ignore the style.
+pub(crate) fn generate_import_line_with_namespace_and_attribute_clause_and_style(
+    lang: LangId,
+    module_path: &str,
+    names: &[String],
+    default_import: Option<&str>,
+    namespace_import: Option<&str>,
+    type_only: bool,
+    attribute_clause: Option<&str>,
+    style: Option<quotes::EsImportStyle>,
+) -> String {
     if matches!(
         lang,
         LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
@@ -1299,6 +1326,7 @@ pub(crate) fn generate_import_line_with_namespace_and_attribute_clause(
             namespace_import,
             type_only,
             attribute_clause,
+            style.unwrap_or_default(),
         );
     }
 
@@ -1349,19 +1377,9 @@ pub fn parse_file_imports(
             path: format!("{}: {}", path.display(), e),
         })?;
 
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|e| crate::error::AftError::ParseError {
-            message: format!("grammar init failed for {:?}: {}", lang, e),
-        })?;
-
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| crate::error::AftError::ParseError {
-            message: format!("tree-sitter parse returned None for {}", path.display()),
-        })?;
+    // This thread's retained parser: building a parser and loading the grammar
+    // per call was a fixed cost on every file an imports scan visits.
+    let tree = crate::parser::parse_source_with_cached_parser(path, &source, lang)?;
 
     let block = parse_imports(&source, &tree, lang);
     Ok((source, tree, block))
@@ -1409,7 +1427,10 @@ fn parse_single_ts_import(source: &str, node: &Node) -> Option<ImportStatement> 
     let byte_range = node.byte_range();
 
     // Find the source module (string/string_fragment child of the import)
-    let module_path = extract_module_path(source, node)?;
+    let module_path = node
+        .child_by_field_name("source")
+        .and_then(|module| decode_js_attribute_atom(&source[module.byte_range()]))
+        .or_else(|| extract_module_path(source, node))?;
 
     // Determine if this is a type-only import: `import type ...`
     let is_type_only = has_type_keyword(node);
@@ -1539,9 +1560,12 @@ fn parse_es_import_attribute_type(clause: &str) -> Option<String> {
             .then_some(rest)
     })?;
     let synthetic = format!("import 'module' with{body};");
-    let mut parser = Parser::new();
-    parser.set_language(&grammar_for(LangId::TypeScript)).ok()?;
-    let tree = parser.parse(&synthetic, None)?;
+    let tree = crate::parser::parse_source_with_cached_parser(
+        std::path::Path::new("<import attributes>"),
+        &synthetic,
+        LangId::TypeScript,
+    )
+    .ok()?;
     (!tree.root_node().has_error())
         .then(|| find_type_attribute(&synthetic, tree.root_node()))
         .flatten()
@@ -1797,6 +1821,7 @@ fn generate_ts_import_line(
         namespace_import,
         type_only,
         None,
+        quotes::EsImportStyle::default(),
     )
 }
 
@@ -1807,54 +1832,61 @@ fn generate_ts_import_line_with_attribute_clause(
     namespace_import: Option<&str>,
     type_only: bool,
     attribute_clause: Option<&str>,
+    style: quotes::EsImportStyle,
 ) -> String {
-    let line = generate_ts_import_line_base(
+    let mut line = generate_ts_import_line_base(
         module_path,
         names,
         default_import,
         namespace_import,
         type_only,
+        style.quote,
     );
-    let Some(attribute_clause) = attribute_clause else {
-        return line;
-    };
-
-    let line = line.strip_suffix(';').unwrap_or(&line);
-    format!("{line} {};", attribute_clause.trim())
+    if let Some(attribute_clause) = attribute_clause {
+        line.push(' ');
+        line.push_str(attribute_clause.trim());
+    }
+    if style.semicolon {
+        line.push(';');
+    }
+    line
 }
 
+/// The statement without its terminator, which the caller adds per style.
 fn generate_ts_import_line_base(
     module_path: &str,
     names: &[String],
     default_import: Option<&str>,
     namespace_import: Option<&str>,
     type_only: bool,
+    quote: char,
 ) -> String {
+    let module_path = quotes::module_literal(module_path, quote);
     let type_prefix = if type_only { "type " } else { "" };
 
     // Side-effect import
     if names.is_empty() && default_import.is_none() && namespace_import.is_none() {
-        return format!("import '{module_path}';");
+        return format!("import {module_path}");
     }
 
     // Namespace import only
     if names.is_empty() && default_import.is_none() {
         if let Some(namespace) = namespace_import {
-            return format!("import {type_prefix}* as {namespace} from '{module_path}';");
+            return format!("import {type_prefix}* as {namespace} from {module_path}");
         }
     }
 
     // Default + namespace import
     if names.is_empty() {
         if let (Some(def), Some(namespace)) = (default_import, namespace_import) {
-            return format!("import {type_prefix}{def}, * as {namespace} from '{module_path}';");
+            return format!("import {type_prefix}{def}, * as {namespace} from {module_path}");
         }
     }
 
     // Default import only
     if names.is_empty() && namespace_import.is_none() {
         if let Some(def) = default_import {
-            return format!("import {type_prefix}{def} from '{module_path}';");
+            return format!("import {type_prefix}{def} from {module_path}");
         }
     }
 
@@ -1863,7 +1895,7 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{{ {names_str} }} from '{module_path}';");
+        return format!("import {type_prefix}{{ {names_str} }} from {module_path}");
     }
 
     // Namespace + named imports
@@ -1873,7 +1905,7 @@ fn generate_ts_import_line_base(
             sort_named_specifiers(&mut sorted_names);
             let names_str = sorted_names.join(", ");
             return format!(
-                "import {type_prefix}{{ {names_str} }}, * as {namespace} from '{module_path}';"
+                "import {type_prefix}{{ {names_str} }}, * as {namespace} from {module_path}"
             );
         }
     }
@@ -1884,7 +1916,7 @@ fn generate_ts_import_line_base(
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
         return format!(
-            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from '{module_path}';"
+            "import {type_prefix}{def}, {{ {names_str} }}, * as {namespace} from {module_path}"
         );
     }
 
@@ -1893,11 +1925,11 @@ fn generate_ts_import_line_base(
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
         let names_str = sorted_names.join(", ");
-        return format!("import {type_prefix}{def}, {{ {names_str} }} from '{module_path}';");
+        return format!("import {type_prefix}{def}, {{ {names_str} }} from {module_path}");
     }
 
     // Shouldn't reach here, but handle gracefully
-    format!("import '{module_path}';")
+    format!("import {module_path}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,10 +2402,14 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
                 }
                 "scoped_use_list" => {
                     // e.g. `serde::{Deserialize, Serialize}`
-                    use_path = source[child.byte_range()].to_string();
-                    // Also extract the individual names from the use_list
+                    use_path = child
+                        .child_by_field_name("path")
+                        .map(|path| source[path.byte_range()].to_string())
+                        .unwrap_or_default();
+                    // Keep each top-level subtree intact when merging or removing names.
                     extract_rs_use_list_names(source, &child, &mut names);
                 }
+                "use_list" => extract_rs_use_list_names(source, &child, &mut names),
                 _ => {}
             }
             if !c.goto_next_sibling() {
@@ -2382,7 +2418,7 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
         }
     }
 
-    if use_path.is_empty() {
+    if use_path.is_empty() && names.is_empty() {
         return None;
     }
 
@@ -2406,31 +2442,36 @@ fn parse_rs_use_declaration(source: &str, node: &Node) -> Option<ImportStatement
     })
 }
 
-/// Extract individual names from a Rust `scoped_use_list` node.
+/// Extract top-level Rust use-list entries, preserving aliases and nested trees.
 fn extract_rs_use_list_names(source: &str, node: &Node, names: &mut Vec<String>) {
-    let mut c = node.walk();
-    if c.goto_first_child() {
-        loop {
-            let child = c.node();
-            if child.kind() == "use_list" {
-                // Walk into the use_list to find identifiers
-                let mut lc = child.walk();
-                if lc.goto_first_child() {
-                    loop {
-                        let lchild = lc.node();
-                        if lchild.kind() == "identifier" || lchild.kind() == "scoped_identifier" {
-                            names.push(source[lchild.byte_range()].to_string());
-                        }
-                        if !lc.goto_next_sibling() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if !c.goto_next_sibling() {
-                break;
-            }
+    let list = if node.kind() == "use_list" {
+        *node
+    } else {
+        let mut cursor = node.walk();
+        let Some(list) = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "use_list")
+        else {
+            return;
+        };
+        list
+    };
+    let mut cursor = list.walk();
+    for child in list.named_children(&mut cursor) {
+        if !matches!(child.kind(), "line_comment" | "block_comment") {
+            names.push(source[child.byte_range()].to_string());
         }
+    }
+}
+
+/// Reassemble a Rust use tree for consumers that interpret the whole path.
+pub(crate) fn rust_use_tree(import: &ImportStatement) -> String {
+    if import.names.is_empty() {
+        import.module_path.clone()
+    } else if import.module_path.is_empty() {
+        format!("{{{}}}", import.names.join(", "))
+    } else {
+        format!("{}::{{{}}}", import.module_path, import.names.join(", "))
     }
 }
 
@@ -2441,7 +2482,11 @@ fn generate_rs_import_line(module_path: &str, names: &[String], _type_only: bool
     } else {
         let mut sorted_names = names.to_vec();
         sort_named_specifiers(&mut sorted_names);
-        format!("use {module_path}::{{{}}};", sorted_names.join(", "))
+        let separator = if module_path.is_empty() { "" } else { "::" };
+        format!(
+            "use {module_path}{separator}{{{}}};",
+            sorted_names.join(", ")
+        )
     }
 }
 
@@ -2907,6 +2952,29 @@ fn skip_newline(source: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::grammar_for;
+    use tree_sitter::Parser;
+
+    /// Parsing imports file after file must reuse this thread's parser rather
+    /// than build a parser and load the grammar for every file.
+    #[test]
+    fn parse_file_imports_reuses_the_thread_parser() {
+        use crate::parser::work_counters::grammar_loads;
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..10 {
+            let path = temp.path().join(format!("f{index}.ts"));
+            std::fs::write(&path, format!("import {{ a{index} }} from './a';\n")).unwrap();
+            paths.push(path);
+        }
+        parse_file_imports(&paths[0], LangId::TypeScript).unwrap();
+        let before = grammar_loads();
+        for (index, path) in paths.iter().enumerate() {
+            let (_, _, block) = parse_file_imports(path, LangId::TypeScript).unwrap();
+            assert_eq!(block.imports.len(), 1, "f{index}");
+        }
+        assert_eq!(grammar_loads() - before, 0);
+    }
 
     // --- ImportForm field-mapping contract (Stream M) ---
     //
@@ -3378,6 +3446,35 @@ import { Config } from '../config';
             false,
         );
         assert_eq!(line, "import React, { useState } from 'react';");
+    }
+
+    #[test]
+    fn generate_es_line_follows_style_terminator() {
+        let render = |semicolon, clause| {
+            generate_import_line_with_namespace_and_attribute_clause_and_style(
+                LangId::TypeScript,
+                "./data.json",
+                &[],
+                Some("data"),
+                None,
+                false,
+                clause,
+                Some(quotes::EsImportStyle {
+                    quote: '\'',
+                    semicolon,
+                }),
+            )
+        };
+        assert_eq!(render(false, None), "import data from './data.json'");
+        assert_eq!(render(true, None), "import data from './data.json';");
+        assert_eq!(
+            render(false, Some("with { type: 'json' }")),
+            "import data from './data.json' with { type: 'json' }"
+        );
+        assert_eq!(
+            render(true, Some("with { type: 'json' }")),
+            "import data from './data.json' with { type: 'json' };"
+        );
     }
 
     #[test]

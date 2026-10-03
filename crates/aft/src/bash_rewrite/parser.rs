@@ -27,8 +27,14 @@ fn split_heredoc(command: &str) -> Option<(&str, Option<String>)> {
     };
 
     let after_operator = op_start + 2;
+    // Tab-stripping heredocs need different body and terminator handling.
+    if command[after_operator..].starts_with('-') {
+        return None;
+    }
     let after_spaces = skip_horizontal_space(command, after_operator);
-    let (delimiter, delimiter_end) = read_unquoted_word(command, after_spaces)?;
+    let (delimiter, consumed) = tokenize_word(&command[after_spaces..])?;
+    let delimiter_end = after_spaces + consumed;
+    let quoted = command[after_spaces..delimiter_end].contains(['\'', '"', '\\']);
     if delimiter.is_empty() {
         return None;
     }
@@ -38,19 +44,27 @@ fn split_heredoc(command: &str) -> Option<(&str, Option<String>)> {
         None => return None,
     };
 
-    let body = &command[line_start..];
-    let terminator = format!("\n{delimiter}");
-    let (content, rest_start) = if body == delimiter {
-        ("", line_start + delimiter.len())
-    } else if let Some(stripped) = body.strip_prefix(&format!("{delimiter}\n")) {
-        ("", command.len() - stripped.len())
-    } else if let Some(offset) = body.find(&terminator) {
-        let content = &body[..offset + 1];
-        let rest_start = line_start + offset + terminator.len();
-        (content, rest_start)
-    } else {
+    if !command[delimiter_end..line_start].trim().is_empty() || delimiter.contains('\n') {
         return None;
-    };
+    }
+    let body = &command[line_start..];
+    // A terminator must occupy the whole line, not just a line prefix.
+    let mut offset = 0;
+    let mut terminator = None;
+    for line in body.split_inclusive('\n') {
+        if line.strip_suffix('\n').unwrap_or(line) == delimiter {
+            terminator = Some(offset);
+            break;
+        }
+        offset += line.len();
+    }
+    let offset = terminator?;
+    let content = &body[..offset];
+    let rest_start = line_start + offset + delimiter.len();
+    // Quote removal on any part of the delimiter disables body expansion.
+    if !quoted && content.contains(['$', '`', '\\']) {
+        return None;
+    }
 
     let rest = &command[rest_start..];
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
@@ -75,7 +89,7 @@ fn find_heredoc_operator(command: &str) -> Option<Option<usize>> {
             Quote::Double => match ch {
                 '"' => quote = Quote::None,
                 '`' => return None,
-                '$' if matches!(chars.peek(), Some((_, '(' | '{'))) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 '\\' => {
                     chars.next();
                 }
@@ -85,7 +99,7 @@ fn find_heredoc_operator(command: &str) -> Option<Option<usize>> {
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
                 '`' => return None,
-                '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 '\\' => {
                     chars.next();
                 }
@@ -121,7 +135,7 @@ fn tokenize(header: &str, heredoc: Option<String>) -> Option<ParsedCommand> {
             Quote::Double => match ch {
                 '"' => quote = Quote::None,
                 '`' => return None,
-                '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 '\\' => match chars.next() {
                     Some((_, escaped)) => push_double_quoted_backslash(&mut token, escaped),
                     None => token.push('\\'),
@@ -137,7 +151,7 @@ fn tokenize(header: &str, heredoc: Option<String>) -> Option<ParsedCommand> {
                     None => token.push('\\'),
                 },
                 '`' => return None,
-                '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 '|' | ';' => return None,
                 '&' if matches!(chars.peek(), Some((_, '&'))) => return None,
                 '>' if matches!(chars.peek(), Some((_, '>'))) => {
@@ -223,7 +237,7 @@ fn tokenize_word(input: &str) -> Option<(String, usize)> {
             Quote::Double => match ch {
                 '"' => quote = Quote::None,
                 '`' => return None,
-                '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 '\\' => match chars.next() {
                     Some((next_idx, escaped)) => {
                         consumed = next_idx + escaped.len_utf8();
@@ -249,7 +263,7 @@ fn tokenize_word(input: &str) -> Option<(String, usize)> {
                 },
                 '|' | ';' | '<' | '>' | '`' => return None,
                 '&' if matches!(chars.peek(), Some((_, '&'))) => return None,
-                '$' if is_unsupported_variable_start(chars.peek().map(|(_, c)| *c)) => return None,
+                ch if !word_character_is_literal(ch, quote) => return None,
                 _ => token.push(ch),
             },
         }
@@ -273,22 +287,6 @@ fn skip_horizontal_space(input: &str, start: usize) -> usize {
         .unwrap_or(input.len())
 }
 
-fn read_unquoted_word(input: &str, start: usize) -> Option<(String, usize)> {
-    let mut end = start;
-    let mut word = String::new();
-    for (offset, ch) in input[start..].char_indices() {
-        if ch.is_whitespace() {
-            break;
-        }
-        if matches!(ch, '\'' | '"' | '`' | '$' | '|' | ';' | '&' | '<' | '>') {
-            return None;
-        }
-        word.push(ch);
-        end = start + offset + ch.len_utf8();
-    }
-    Some((word, end))
-}
-
 fn push_double_quoted_backslash(token: &mut String, escaped: char) {
     match escaped {
         '\n' => {}
@@ -300,8 +298,15 @@ fn push_double_quoted_backslash(token: &mut String, escaped: char) {
     }
 }
 
-fn is_unsupported_variable_start(next: Option<char>) -> bool {
-    matches!(next, Some('(' | '{')) || next.is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+fn word_character_is_literal(ch: char, quote: Quote) -> bool {
+    // Escaped characters are consumed separately. Single quotes disable all
+    // expansion; double quotes still allow parameter and command substitution.
+    // History expansion (!) is disabled in non-interactive bash.
+    match quote {
+        Quote::Single => true,
+        Quote::Double => !matches!(ch, '$' | '`'),
+        Quote::None => !matches!(ch, '$' | '`' | '*' | '?' | '[' | '{' | '}' | '~'),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,4 +314,93 @@ enum Quote {
     None,
     Single,
     Double,
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::parse;
+
+    pub(crate) const LITERAL_APPEND_CASES: &[&str] = &[
+        "echo plain words >> notes.txt",
+        "echo '$? $$ $! $# $* $@ $- $0 $9 $HOME ${HOME} $(date) $((1+2)) `date`' >> notes.txt",
+        "echo '* ? [abc] {a,b} {1..3} ~ ~root' >> notes.txt",
+        "echo \"* ? [abc] {a,b} {1..3} ~ ~root\" >> notes.txt",
+        "echo \\$HOME \\`date\\` \\* \\? \\[abc] \\{a,b\\} \\~root >> notes.txt",
+        "echo \"\\$HOME \\`date\\`\" >> notes.txt",
+        "echo hello! >> notes.txt",
+        "echo hi >> 'notes.txt'",
+        "echo hi >> \"notes.txt\"",
+        "cat >> notes.txt <<EOF\nliteral text\nEOF",
+        "cat >> notes.txt <<EOF\nEOF",
+        "cat >> notes.txt <<'EOF'\n$HOME $(date) `date` \\literal\nEOF",
+        "cat >> notes.txt <<\"EOF\"\n$HOME $(date) `date` \\literal\nEOF",
+        "cat >> notes.txt <<\\EOF\n$HOME $(date) `date` \\literal\nEOF",
+        "cat >> notes.txt <<E'OF'\n$HOME\nEOF",
+        "cat >> notes.txt <<'EOF'\nEOFsuffix\nmore\nEOF",
+    ];
+
+    #[test]
+    fn literal_append_table() {
+        for command in LITERAL_APPEND_CASES {
+            assert!(parse(command).is_some(), "must accept: {command}");
+        }
+        for command in [
+            "cat >> notes.txt <<-EOF\n\ttext\n\tEOF",
+            "cat >> notes.txt <<-'EOF'\n\t$HOME\n\tEOF",
+            "cat >> notes.txt <<EOF ignored\ntext\nEOF",
+        ] {
+            assert!(parse(command).is_none(), "must decline: {command}");
+        }
+    }
+
+    #[test]
+    fn unquoted_heredoc_expansions_decline() {
+        for body in ["$HOME $(date)", "`date`", "back\\slash"] {
+            let command = format!("cat >> notes.txt <<EOF\n{body}\nEOF");
+            assert!(parse(&command).is_none(), "must decline: {command}");
+        }
+    }
+
+    #[test]
+    fn expanding_words_decline() {
+        let mut accepted = Vec::new();
+        for word in [
+            "$?",
+            "$$",
+            "$!",
+            "$#",
+            "$*",
+            "$@",
+            "$-",
+            "$0",
+            "$9",
+            "$HOME",
+            "${HOME}",
+            "$(date)",
+            "$((1 + 2))",
+            "`date`",
+            "$'hello'",
+            "$\"hello\"",
+            "*",
+            "?",
+            "[abc]",
+            "{a,b}",
+            "{1..3}",
+            "~",
+            "~root",
+            "\"$?\"",
+            "\"$$\"",
+            "\"`date`\"",
+        ] {
+            for command in [
+                format!("echo {word} >> notes.txt"),
+                format!("echo hi >> {word}"),
+            ] {
+                if parse(&command).is_some() {
+                    accepted.push(command);
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "must decline: {accepted:?}");
+    }
 }

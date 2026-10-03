@@ -16,17 +16,142 @@ from search_quality import (
     synthetic_documents,
 )
 from search_quality_lib import (
+    PAGE_INVARIANCE_FAILED_FIELD,
     PAGE_SIZE,
+    REFERENCE_NOT_PAGE_INVARIANT_FIELD,
+    SPLIT_ROWS_NOT_APPLICABLE_REASON,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
+    UNREACHABLE_SPLIT_ROWS_FIELD,
+    apply_unreachable_split_rows,
     included_manifest_ids,
+    real_query_behavior_diff,
+    split_paired_failures,
+    split_rows_not_applicable,
+    evaluate_predicate,
     mean_metrics,
+    row_metrics,
     total_gate,
     validate_included_row_mechanisms,
     validate_manifest_maintenance_scores,
     validate_manifest_relabels,
     validate_profile_score,
+    validate_scored_population,
+    validate_unreachable_split_rows,
 )
+
+
+class SplitPairedTests(unittest.TestCase):
+    def candidate(self, combined: float, prose: float, form: str = "split", kind: str = "concept") -> dict:
+        return {"rows": [{"episode_id": "followup-census:910003", "input_form": form, "answer_kind": kind,
+            "metrics": {"mrr_at_10": combined, "hit_at_1": 0.0, "hit_at_5": 1.0},
+            "prose_only": {"metrics": {"mrr_at_10": prose, "hit_at_1": 0.0, "hit_at_5": 1.0}}}]}
+
+    def test_paired_check_fails_harmed_concept_row(self) -> None:
+        failures = split_paired_failures(self.candidate(0.25, 0.5))
+        self.assertEqual(failures, ["split_paired_harm:followup-census:910003:mrr_delta=-0.250000"])
+
+    def test_paired_check_passes_improved_concept_row(self) -> None:
+        self.assertEqual(split_paired_failures(self.candidate(0.5, 0.25)), [])
+
+    def test_paired_check_does_not_protect_definition_answer(self) -> None:
+        self.assertEqual(split_paired_failures(self.candidate(0.25, 0.5, kind="definition")), [])
+
+    def test_joined_form_cannot_be_evaluated_as_split(self) -> None:
+        with self.assertRaisesRegex(InputFault, "split_candidate_required.*joined"):
+            split_paired_failures(self.candidate(0.5, 0.25, form="joined"))
+
+    def ranking_score_with_probe(self, pattern_declared: bool, pattern_probe: str) -> tuple[dict, dict]:
+        """A ranking evaluation whose only split row is joined and harmed."""
+        _, reference, score = synthetic_documents()
+        score["rows"] = self.candidate(0.25, 0.5, form="joined")["rows"]
+        score["rows"][0]["split_kind"] = "R1"
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        score["capability"].update(pattern_declared=pattern_declared, pattern_probe=pattern_probe)
+        return reference, score
+
+    def test_engine_ignoring_pattern_skips_joined_split_rows_under_ranking(self) -> None:
+        reference, score = self.ranking_score_with_probe(False, "ignored_pattern")
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertEqual(evaluate_predicate(reference, score, descriptor), [])
+        self.assertEqual(
+            split_rows_not_applicable(score),
+            {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": ["followup-census:910003"]},
+        )
+
+    def test_engine_honouring_pattern_still_fails_a_missing_split_candidate(self) -> None:
+        reference, score = self.ranking_score_with_probe(True, "invalid_pattern")
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertIsNone(split_rows_not_applicable(score))
+        with self.assertRaisesRegex(InputFault, "split_candidate_required:followup-census:910003:joined"):
+            evaluate_predicate(reference, score, descriptor)
+
+    def test_skip_needs_an_explicit_ignored_pattern_probe(self) -> None:
+        # A score with no probe result, or a probe that contradicts the
+        # declared capability, is judged in full.
+        for capability in ({}, {"pattern_declared": False}, {"pattern_declared": True, "pattern_probe": "ignored_pattern"}):
+            score = self.candidate(0.5, 0.25, form="joined")
+            score["capability"] = capability
+            self.assertIsNone(split_rows_not_applicable(score), capability)
+            with self.assertRaisesRegex(InputFault, "split_candidate_required"):
+                split_paired_failures(score)
+
+    def test_skip_annotation_is_ignored_by_behaviour_comparison(self) -> None:
+        _, reference, score = synthetic_documents()
+        named = copy.deepcopy(score)
+        named["split_rows_not_applicable"] = {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": ["followup-census:910003"]}
+        self.assertEqual(real_query_behavior_diff(reference, named), real_query_behavior_diff(reference, score))
+
+    def test_ranking_predicate_invokes_paired_check(self) -> None:
+        _, reference, score = synthetic_documents()
+        score["rows"] = self.candidate(0.25, 0.5)["rows"]
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        descriptor = {"slice_class": "ranking", "targeted_mechanism": "topk_cut"}
+        self.assertIn("split_paired_harm:followup-census:910003:mrr_delta=-0.250000", evaluate_predicate(reference, score, descriptor))
+
+    def test_population_check_refuses_joined_row_relabelled_as_split(self) -> None:
+        from test_run_real_query import FakeClient, manifest
+        from run_real_query import score_manifest_rows
+        document = manifest(False)
+        document["rows"][0].update(pattern="anchor", answer_kind="concept", split_kind="R2")
+        capability = {"pattern_declared": False}
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        score = {"rows": rows, "capability": capability}
+        validate_scored_population(document, score)
+        rows[0]["input_form"] = "split"
+        with self.assertRaisesRegex(InputFault, "split_input_form_mismatch"):
+            validate_scored_population(document, score)
+
+    def test_population_check_refuses_forged_prose_pair(self) -> None:
+        from test_run_real_query import FakeClient, manifest
+        from run_real_query import score_manifest_rows
+        document = manifest(False)
+        document["rows"][0].update(pattern="anchor", answer_kind="concept", split_kind="R2")
+        capability = {"pattern_declared": True}
+        rows = score_manifest_rows(document, "single_page", capability, FakeClient(), Path("/fixture"))
+        rows[0]["prose_only"]["requests"][0]["query"] += " anchor"
+        with self.assertRaisesRegex(InputFault, "split_prose_pair_mismatch"):
+            validate_scored_population(document, {"rows": rows, "capability": capability})
+
+    def test_split_kind_answer_constraints_are_enforced(self) -> None:
+        for kind, expected in (("R1", "split_rank1_required"), ("R3", "split_hit5_required"), ("R4", "split_hit3_required"), ("R6", "split_partial_hit_required")):
+            score = self.candidate(0.0, 0.0)
+            score["rows"][0]["split_kind"] = kind
+            score["rows"][0]["metrics"]["hit_at_5"] = 0.0
+            self.assertTrue(any(item.startswith(expected) for item in split_paired_failures(score)), kind)
+        partial = self.candidate(0.5, 0.25, kind="definition")
+        partial["rows"][0].update(split_kind="R6", envelope_complete=False)
+        self.assertEqual(split_paired_failures(partial), [])
+
+    def test_tuning_score_is_not_gate_eligible(self) -> None:
+        document, _, score = synthetic_documents()
+        score["tuning_only"] = True
+        with self.assertRaisesRegex(InputFault, "tuning_only_score_not_gate_eligible"):
+            validate_scored_population(document, score)
+
+    def test_tuning_manifest_is_not_gate_eligible(self) -> None:
+        with self.assertRaisesRegex(InputFault, "tuning_only_manifest_not_gate_eligible"):
+            included_manifest_ids(json.loads(Path(__file__).with_name("split-tuning-manifest.json").read_text()))
 
 
 class MeanMetricsTests(unittest.TestCase):
@@ -379,6 +504,80 @@ class EngineUnwiredGateTests(unittest.TestCase):
         self.assertIn("train-55", descriptor_labels("alfonso/task/r48-engine-unwired-train-55-"))
 
 
+class PageInvarianceExcuseGateTests(unittest.TestCase):
+    """A manifest's page-invariance excuse covers the reference, never a changed engine."""
+
+    RANKING = (
+        {"slice_class": "ranking", "targeted_mechanism": "none", "kind": "paging", "fixtures": ["paging"]},
+        ["crates/aft/src/commands/semantic_search/memo.rs"],
+    )
+    ENGINE_UNWIRED = (
+        {
+            "slice_class": "engine_unwired",
+            "targeted_mechanism": "none",
+            "kind": "harness",
+            "fixtures": [TOOL_CALL_PARITY_FIXTURE_SOURCE],
+        },
+        ["crates/aft/src/commands/semantic_search/memo.rs"],
+    )
+    NON_RANKING = (None, [])
+
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.manifest["rows"][0][REFERENCE_NOT_PAGE_INVARIANT_FIELD] = "defect under measurement"
+        self.episode_id = self.score["rows"][0]["episode_id"]
+        self.failure = f"page_invariance_failed:{self.episode_id}"
+
+    def record_miss(self, document: dict) -> dict:
+        changed = copy.deepcopy(document)
+        changed["rows"][0][PAGE_INVARIANCE_FAILED_FIELD] = self.failure
+        changed["rows"][0]["metrics"] = {"mrr_at_10": 0.0, "hit_at_1": 0.0, "hit_at_5": 0.0}
+        return changed
+
+    def gate(self, reference: dict, score: dict, slice_: tuple) -> tuple:
+        descriptor, paths = slice_
+        result = total_gate(reference, score, self.manifest, descriptor, paths)
+        return result.exit_code, result.reasons
+
+    def test_ranking_slice_faults_on_a_flagged_row_that_breaks_page_invariance(self) -> None:
+        reference = self.record_miss(self.reference)
+        self.assertEqual(self.gate(reference, self.score, self.RANKING)[0], 2)  # rows differ: latency-only
+        # Even a byte-exact reproduction of the reference's miss is refused.
+        self.assertEqual(
+            self.gate(reference, self.record_miss(self.score), self.RANKING),
+            (2, (f"{self.failure}:candidate",)),
+        )
+
+    def test_unchanged_engine_slice_accepts_a_reproduced_reference_miss(self) -> None:
+        reference = self.record_miss(self.reference)
+        candidate = self.record_miss(self.score)
+        self.assertEqual(self.gate(reference, candidate, self.NON_RANKING), (0, ()))
+        self.assertEqual(self.gate(reference, candidate, self.ENGINE_UNWIRED), (0, ()))
+
+    def test_unchanged_engine_slice_faults_when_the_miss_is_not_reproduced(self) -> None:
+        fault = (2, (f"page_invariance_failed:{self.episode_id}:reference_miss_not_reproduced",))
+        reference_miss = self.record_miss(self.reference)
+        candidate_miss = self.record_miss(self.score)
+        # A row the reference scored normally now fails invariance.
+        self.assertEqual(self.gate(self.reference, candidate_miss, self.NON_RANKING), fault)
+        # The reference's miss is not reproduced: the row is invariant now.
+        self.assertEqual(self.gate(reference_miss, self.score, self.NON_RANKING), fault)
+        # The failure record differs.
+        other = copy.deepcopy(candidate_miss)
+        other["rows"][0][PAGE_INVARIANCE_FAILED_FIELD] = f"{self.failure}:scoring"
+        self.assertEqual(self.gate(reference_miss, other, self.NON_RANKING), fault)
+        # A failing row that still scores is not a miss.
+        scored = copy.deepcopy(candidate_miss)
+        scored["rows"][0]["metrics"]["mrr_at_10"] = 1.0
+        self.assertEqual(self.gate(reference_miss, scored, self.NON_RANKING), fault)
+        self.assertEqual(self.gate(self.reference, candidate_miss, self.ENGINE_UNWIRED), fault)
+
+    def test_invariance_failure_on_an_unflagged_row_is_refused_by_population_check(self) -> None:
+        self.manifest["rows"][0].pop(REFERENCE_NOT_PAGE_INVARIANT_FIELD)
+        with self.assertRaisesRegex(InputFault, "not_excused_by_manifest"):
+            validate_scored_population(self.manifest, self.record_miss(self.score))
+
+
 class LatencyOnlyRankingGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest, self.reference, self.score = synthetic_documents()
@@ -407,6 +606,103 @@ class LatencyOnlyRankingGateTests(unittest.TestCase):
             result.reasons,
             ("latency_only_ranking_mismatch:row=real_query.followup-census:1",),
         )
+
+
+class UnreachableSplitRowTests(unittest.TestCase):
+    """The `unreachable_split_rows` waiver for absolute split predicates."""
+
+    STALE = "followup-census:910001"
+    ANSWER = "crates/aft/src/commands/ast_search.rs"
+
+    def documents(self, split_paths, prose_paths, *, kind="R1", answer_kind="concept", pattern="ast_grep_search"):
+        """A ranking evaluation with one split row whose answer is ANSWER."""
+        _, reference, score = synthetic_documents()
+        manifest = {"rows": [{"episode_id": self.STALE, "pattern": pattern, "opened_file": self.ANSWER,
+                              "split_kind": kind, "answer_kind": answer_kind}]}
+        row = {"episode_id": self.STALE, "input_form": "split", "answer_kind": answer_kind, "split_kind": kind,
+               "ranked_paths": split_paths, "metrics": row_metrics(split_paths, self.ANSWER),
+               "prose_only": {"ranked_paths": prose_paths, "metrics": row_metrics(prose_paths, self.ANSWER)}}
+        score["rows"] = [row]
+        score["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.6
+        return reference, score, manifest
+
+    def descriptor(self, predicate="split_rank1_required", episode_id=None):
+        return {"slice_class": "ranking", "targeted_mechanism": "topk_cut", "kind": "ranking",
+                UNREACHABLE_SPLIT_ROWS_FIELD: [{"episode_id": episode_id or self.STALE, "predicate": predicate,
+                                                 "reason": "stale name; prose never ranks the answer"}]}
+
+    def judge(self, reference, score, manifest, descriptor, answer_text="fn handle(req) {}\n"):
+        failures = evaluate_predicate(reference, score, descriptor)
+        return apply_unreachable_split_rows(failures, score, manifest, descriptor, lambda path: answer_text)
+
+    def test_a_verified_unreachable_row_is_waived_and_printed(self) -> None:
+        paths = ["other.rs", "another.rs"]
+        reference, score, manifest = self.documents(paths, paths)
+        self.assertIn(f"split_rank1_required:{self.STALE}", evaluate_predicate(reference, score, self.descriptor()))
+        remaining, notes = self.judge(reference, score, manifest, self.descriptor())
+        self.assertEqual(remaining, [])
+        self.assertEqual(notes, [f"unreachable_split_row_waived:{self.STALE}:split_rank1_required:"
+                                 "split_rank=-:prose_rank=-:pattern_in_answer_file=none:"
+                                 "reason=stale name; prose never ranks the answer"])
+
+    def test_a_waiver_is_refused_when_the_pattern_moved_the_answer(self) -> None:
+        reference, score, manifest = self.documents(["other.rs", self.ANSWER], ["other.rs", "x.rs", self.ANSWER])
+        remaining, notes = self.judge(reference, score, manifest, self.descriptor())
+        self.assertIn(f"split_rank1_required:{self.STALE}", remaining)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      "ranks_differ:split_rank=2:prose_rank=3", remaining)
+        self.assertEqual(notes, [])
+
+    def test_a_waiver_is_refused_when_the_pattern_matches_the_answer_file(self) -> None:
+        paths = ["other.rs", self.ANSWER]
+        reference, score, manifest = self.documents(paths, paths)
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor(),
+                                  answer_text="use x;\n// see ast_grep_search\n")
+        self.assertIn(f"split_rank1_required:{self.STALE}", remaining)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      f"pattern_matches_answer_file:{self.ANSWER}:2", remaining)
+
+    def test_a_waiver_is_refused_when_the_answer_file_cannot_be_read(self) -> None:
+        paths = ["other.rs"]
+        reference, score, manifest = self.documents(paths, paths)
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor(), answer_text=None)
+        self.assertIn(f"unreachable_split_row_refused:{self.STALE}:split_rank1_required:"
+                      f"answer_file_unreadable_at_pin:{self.ANSWER}", remaining)
+
+    def test_paired_harm_can_never_be_waived(self) -> None:
+        with self.assertRaisesRegex(InputFault, "predicate_not_waivable:split_paired_harm"):
+            validate_unreachable_split_rows(self.descriptor(predicate="split_paired_harm"))
+        # Even with a valid waiver for the row's absolute predicate, harm stands.
+        reference, score, manifest = self.documents(["x.rs", "y.rs", self.ANSWER], [self.ANSWER])
+        remaining, _ = self.judge(reference, score, manifest, self.descriptor())
+        self.assertTrue(any(item.startswith(f"split_paired_harm:{self.STALE}") for item in remaining), remaining)
+
+    def test_the_validator_refuses_malformed_entries(self) -> None:
+        base = self.descriptor()
+        cases = {
+            "not_a_nonempty_list": [],
+            "keys_must_be_episode_id_predicate_reason": [{"episode_id": self.STALE, "predicate": "split_rank1_required"}],
+            "invalid_episode_id": [{"episode_id": "910001", "predicate": "split_rank1_required", "reason": "r"}],
+            "predicate_not_waivable:shape": [{"episode_id": self.STALE, "predicate": "shape", "reason": "r"}],
+            ":reason": [{"episode_id": self.STALE, "predicate": "split_rank1_required", "reason": "  "}],
+            "duplicate": base[UNREACHABLE_SPLIT_ROWS_FIELD] * 2,
+        }
+        for expected, entries in cases.items():
+            descriptor = dict(base, **{UNREACHABLE_SPLIT_ROWS_FIELD: entries})
+            with self.assertRaisesRegex(InputFault, expected, msg=expected):
+                validate_unreachable_split_rows(descriptor)
+        for slice_class in ("non_ranking", "engine_unwired"):
+            descriptor = dict(base, slice_class=slice_class)
+            with self.assertRaisesRegex(InputFault, "ranking_only"):
+                validate_unreachable_split_rows(descriptor)
+
+    def test_a_waiver_naming_the_wrong_kind_or_a_non_split_row_is_refused(self) -> None:
+        paths = ["other.rs"]
+        reference, score, manifest = self.documents(paths, paths, kind="R4")
+        with self.assertRaisesRegex(InputFault, "predicate_does_not_judge_row"):
+            self.judge(reference, score, manifest, self.descriptor())
+        with self.assertRaisesRegex(InputFault, "not_a_split_row:followup-census:1"):
+            self.judge(reference, score, manifest, self.descriptor(episode_id="followup-census:1"))
 
 
 if __name__ == "__main__":

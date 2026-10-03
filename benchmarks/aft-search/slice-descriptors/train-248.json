@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "inspect-scoped-diagnostics-sweep",
+    "typescript-7-investigation"
+  ],
+  "note": "Scoped blocking aft_inspect has its language servers analyze the scoped files: it pulls or opens them, waits for rust-analyzer's cargo check, and never holds the language-server manager lock across a diagnostics wait (also fixed for lsp_diagnostics and the post-edit pull). Standalone tool_call aft_inspect now returns rendered text instead of serialized JSON. Adds the TypeScript 7 native LSP investigation report. No ranking-fence files."
+}

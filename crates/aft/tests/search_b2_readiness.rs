@@ -432,6 +432,32 @@ fn transition_during_wait_changes_the_selected_plan() {
 }
 
 #[test]
+fn ready_symbols_wait_for_trigram_before_selecting_lexical_plan() {
+    let source = SequenceSource::new([
+        observation(
+            SemanticIndexStatus::Disabled,
+            IndexStatus::Building,
+            SymbolIndexStatus::Ready,
+        ),
+        observation(
+            SemanticIndexStatus::Disabled,
+            IndexStatus::Ready,
+            SymbolIndexStatus::Ready,
+        ),
+    ]);
+
+    let readiness = sample(&source);
+    let (shape, facts) =
+        DefaultSearchExtensions.classify(&RawQuery::new("request authentication handler"));
+    let plan = DefaultSearchExtensions.plan(&shape, &facts, &readiness);
+    assert!(plan.contains(SearchLaneKind::Lexical));
+    assert!(readiness.retained().trigram().is_some());
+    assert!(!plan.contains(SearchLaneKind::Semantic));
+    assert_eq!(source.wait_count.load(Ordering::SeqCst), 1);
+    assert_eq!(source.sample_count.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn one_ready_source_skips_wait_and_second_sample() {
     let source = SequenceSource::new([
         observation(

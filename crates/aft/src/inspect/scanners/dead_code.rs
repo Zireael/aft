@@ -3,7 +3,7 @@ use std::collections::{
 };
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -15,8 +15,8 @@ use crate::callgraph::{resolve_module_path, resolve_reexported_symbol_target};
 use crate::calls::extract_type_references;
 use crate::imports::{parse_imports, specifier_imported_name, specifier_local_name};
 use crate::inspect::job::{
-    canonicalize_normalized, dead_code_skipped_language, is_test_file, is_test_support_file,
-    language_name, CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER,
+    canonicalize_normalized, dead_code_skipped_language, is_test_tree_file, language_name,
+    ExcludedTestTally, CALLGRAPH_PROVENANCE_REEXPORT, CALLGRAPH_PROVENANCE_TREESITTER,
     DISPATCHED_CALLEE_SEPARATOR,
 };
 use crate::inspect::oxc_engine::{
@@ -33,8 +33,9 @@ use crate::parser::{detect_language, grammar_for, LangId};
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 4;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 5;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
+const RUST_PATH_LIVENESS_PROVENANCE: &str = "rust_path_liveness";
 const RUST_MACRO_REF_SHAPE_CALL: &str = "call";
 const RUST_MACRO_REF_SHAPE_METHOD: &str = "method";
 const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
@@ -83,6 +84,8 @@ struct DeadCodeFileFragment {
     test_only_items: Vec<Value>,
     uncertain_items: Vec<Value>,
     by_language: BTreeMap<String, usize>,
+    /// Dead symbols of this file withheld because it is test code.
+    excluded_test_findings: usize,
 }
 
 impl DeadCodeFileFragment {
@@ -118,6 +121,9 @@ struct FileAnalysis {
     attribute_entry_points: Vec<String>,
     macro_token_refs: Vec<MacroTokenRefContribution>,
     cfg_test_ranges: Vec<RustCfgTestRange>,
+    cfg_test_module_files: Vec<String>,
+    globs_parent_module: bool,
+    trait_impl_methods: Vec<String>,
     type_ref_names: BTreeSet<String>,
 }
 
@@ -168,7 +174,12 @@ struct OxcDeadCodeFactsPayload<'a> {
 }
 
 impl DeadCodeFileAnalyzer {
-    fn analyze_file(&mut self, file: &Path, has_oxc_file: bool) -> FileAnalysis {
+    fn analyze_file(
+        &mut self,
+        file: &Path,
+        relative_file: &str,
+        has_oxc_file: bool,
+    ) -> FileAnalysis {
         let Some(lang) = detect_language(file) else {
             return FileAnalysis::default();
         };
@@ -245,6 +256,7 @@ impl DeadCodeFileAnalyzer {
                         roots.insert(entry.name);
                         roots.insert(entry.scoped_name);
                     }
+                    roots.extend(rust_serde_function_references(&source));
                     roots.into_iter().collect()
                 })
                 .unwrap_or_default()
@@ -266,6 +278,24 @@ impl DeadCodeFileAnalyzer {
         } else {
             Vec::new()
         };
+        let cfg_test_module_files = if lang == LangId::Rust {
+            tree.as_ref()
+                .map(|tree| rust_cfg_test_module_files(&source, tree.root_node(), relative_file))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let globs_parent_module = lang == LangId::Rust
+            && tree
+                .as_ref()
+                .is_some_and(|tree| rust_globs_parent_module(&source, tree.root_node()));
+        let trait_impl_methods = if lang == LangId::Rust {
+            tree.as_ref()
+                .map(|tree| rust_trait_impl_methods(&source, tree.root_node()))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         FileAnalysis {
             raw_imports,
@@ -274,6 +304,9 @@ impl DeadCodeFileAnalyzer {
             attribute_entry_points,
             macro_token_refs,
             cfg_test_ranges,
+            cfg_test_module_files,
+            globs_parent_module,
+            trait_impl_methods,
             type_ref_names,
         }
     }
@@ -315,7 +348,7 @@ fn run_dead_code_scan_with_oxc_started(
         let success = InspectScanSuccess {
             scanned_files: job.scope_files.clone(),
             contributions: Vec::new(),
-            aggregate: callgraph_unavailable_aggregate(job.scope_files.len()),
+            aggregate: callgraph_unavailable_aggregate_for_job(job),
         };
         return InspectResult::success(job, success, started.elapsed());
     };
@@ -483,8 +516,11 @@ fn gather_file_contribution(
         attribute_entry_points,
         macro_token_refs,
         cfg_test_ranges,
+        cfg_test_module_files,
+        globs_parent_module,
+        trait_impl_methods,
         type_ref_names,
-    } = file_analyzer.analyze_file(file, oxc_facts.is_some());
+    } = file_analyzer.analyze_file(file, &file_name, oxc_facts.is_some());
 
     let mut payload = json!({
         "file": file_name,
@@ -523,6 +559,15 @@ fn gather_file_contribution(
     }
     if !cfg_test_ranges.is_empty() {
         payload["cfg_test_ranges"] = json!(cfg_test_ranges);
+    }
+    if !cfg_test_module_files.is_empty() {
+        payload["cfg_test_module_files"] = json!(cfg_test_module_files);
+    }
+    if globs_parent_module {
+        payload["globs_parent_module"] = json!(true);
+    }
+    if !trait_impl_methods.is_empty() {
+        payload["trait_impl_methods"] = json!(trait_impl_methods);
     }
     if let Some(facts) = oxc_facts {
         payload["provenance"] = json!(OXC_PROVENANCE);
@@ -618,6 +663,31 @@ pub(crate) fn callgraph_unavailable_aggregate(scanned_files: usize) -> serde_jso
     callgraph_unavailable_aggregate_with_reason(scanned_files, None)
 }
 
+/// The unavailable aggregate for `job`, naming the cause when the call graph
+/// was never built: the index is off, or (with views on) the current view
+/// generation was published while it was off. Either way dead code is not
+/// determined, so no count is reported.
+pub(crate) fn callgraph_unavailable_aggregate_for_job(job: &InspectJob) -> serde_json::Value {
+    let mut aggregate = callgraph_unavailable_aggregate(job.scope_files.len());
+    let disabled = if !job.config.indexes.callgraph {
+        Some("call graph is disabled (indexes.callgraph=false)")
+    } else if job.config.views.enabled
+        && crate::views::read::current_generation_lacks_callgraph(
+            &crate::bash_background::storage_dir(job.config.storage_dir.as_deref()),
+            &job.project_root,
+        )
+    {
+        Some(crate::views::read::CALLGRAPH_DISABLED)
+    } else {
+        None
+    };
+    if let Some(reason) = disabled {
+        aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_disabled"]);
+        aggregate["callgraph_unavailable_reason"] = json!(reason);
+    }
+    aggregate
+}
+
 /// Report a terminal callgraph capability gap without inventing a dead-code
 /// count. Path-identity gaps include the raw path so an operator can correct a
 /// mount or alias mismatch instead of retrying the same unavailable store.
@@ -640,6 +710,27 @@ pub(crate) fn callgraph_unavailable_aggregate_with_reason(
         aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_path_identity_mismatch"]);
         aggregate["callgraph_unavailable_reason"] = json!(reason);
     }
+    aggregate
+}
+
+/// Gap reason for dead code in a borrow-only root.
+pub(crate) const BORROW_ONLY_DEAD_CODE_REASON: &str =
+    "dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout";
+
+/// Dead-code aggregate for a borrow-only root with no readable call graph. It
+/// carries no `count`: the analysis did not run, so there is nothing to count,
+/// and a zero would read as "no dead code". It is marked unavailable with a
+/// named gap so every surface reports it as incomplete.
+pub(crate) fn borrow_only_unavailable_aggregate(scanned_files: usize) -> serde_json::Value {
+    let mut aggregate = callgraph_unavailable_aggregate_with_reason(scanned_files, None);
+    aggregate["notes"] = json!(["callgraph_unavailable", "callgraph_borrow_only"]);
+    aggregate["callgraph_unavailable_reason"] = json!(BORROW_ONLY_DEAD_CODE_REASON);
+    aggregate["unavailable"] = json!(true);
+    aggregate["complete"] = json!(false);
+    aggregate["gaps"] = json!([{
+        "kind": "tier2_unavailable",
+        "reason": BORROW_ONLY_DEAD_CODE_REASON,
+    }]);
     aggregate
 }
 
@@ -1086,6 +1177,9 @@ fn fragments_from_aggregate(
                     .into_iter()
                     .filter(|(_, count)| *count > 0)
                     .collect(),
+                    excluded_test_findings: aggregate["excluded_test_by_file"][file.as_str()]
+                        .as_u64()
+                        .unwrap_or(0) as usize,
                 },
             )
         })
@@ -1197,6 +1291,11 @@ fn fold_dead_code_fragments(
     if !skipped_files.is_empty() {
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
+    let mut excluded = ExcludedTestTally::default();
+    for (file, fragment) in fragments {
+        excluded.record_many(file, fragment.excluded_test_findings);
+    }
+    excluded.write_into(&mut aggregate);
     aggregate
 }
 
@@ -1248,6 +1347,12 @@ fn materialize_dead_code_contributions(
         .flatten()
         .map(|contribution| (contribution.file.as_str(), contribution))
         .collect::<BTreeMap<_, _>>();
+    let test_module_files = cfg_test_module_files(&parsed);
+    let rust_imports_by_file = parsed
+        .iter()
+        .filter(|contribution| !contribution.rust_imports.is_empty())
+        .map(|contribution| (contribution.file.clone(), contribution.rust_imports.clone()))
+        .collect::<BTreeMap<_, _>>();
 
     parsed
         .into_iter()
@@ -1269,22 +1374,39 @@ fn materialize_dead_code_contributions(
                 .map(oxc_export_contributions)
                 .unwrap_or_else(|| contribution.exports.clone());
 
+            let imports_in_scope = rust_imports_in_scope(
+                &contribution.file,
+                &contribution.rust_imports,
+                contribution.globs_parent_module,
+                &rust_imports_by_file,
+            );
             let mut internal_calls = outbound_calls_for_file
                 .iter()
                 .copied()
-                .filter_map(|call| {
-                    project_internal_call(
+                .flat_map(|call| {
+                    let test_origin = is_test_code_file(&contribution.file, &test_module_files)
+                        || contribution
+                            .cfg_test_ranges
+                            .iter()
+                            .any(|range| range.contains(call.line));
+                    match project_internal_call(
                         project_root,
                         call,
                         &contribution.file,
-                        is_test_file(&contribution.file)
-                            || contribution
-                                .cfg_test_ranges
-                                .iter()
-                                .any(|range| range.contains(call.line)),
+                        test_origin,
                         &exported_symbols_by_file,
                         &files_by_exported_symbol,
-                    )
+                    ) {
+                        Some(internal_call) => vec![internal_call],
+                        None => rust_unresolved_path_call_edges(
+                            call,
+                            &contribution.file,
+                            &imports_in_scope,
+                            test_origin,
+                            &exported_symbols_by_file,
+                            &files_by_exported_symbol,
+                        ),
+                    }
                 })
                 .collect::<Vec<_>>();
             internal_calls.extend(resolve_raw_reexport_liveness_edges(
@@ -1334,6 +1456,7 @@ fn materialize_dead_code_contributions(
             if let Some(snapshot_roots) = attribute_roots_from_snapshot.get(&contribution.file) {
                 attribute_entry_points.extend(snapshot_roots.iter().cloned());
             }
+            attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
             let liveness_roots = liveness_roots_for_file(
                 &contribution.file,
                 &exports,
@@ -1491,7 +1614,10 @@ fn aggregate_materialized_dead_code_contributions(
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> serde_json::Value {
     let test_only_callers = test_only_callers_by_target(facts);
+    let test_reachable = test_reachable_nodes(facts);
+    let caller_files = std::cell::OnceCell::new();
     let referenced_type_names = collect_referenced_type_names(facts);
+    let test_module_files = cfg_test_module_files(facts);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
@@ -1502,26 +1628,24 @@ fn aggregate_materialized_dead_code_contributions(
     let mut test_only_items = Vec::new();
     let mut uncertain_count = 0usize;
     let mut uncertain_items: Vec<serde_json::Value> = Vec::new();
+    let mut excluded_by_file: BTreeMap<String, usize> = BTreeMap::new();
     for contribution in parsed {
         let generated_file = crate::inspect::generated::is_generated_file_with_cached_hint(
             project_root,
             &contribution.file,
             contribution.generated,
         );
-        // Test-support files (fixtures, corpora, mock data) are consumed by
-        // path, never imported, so their exports always look dead. Skip
-        // REPORTING them — their edges already kept real code live above.
-        if is_test_support_file(&contribution.file) {
-            continue;
-        }
+        // Test code (test files, fixtures, mock data, `#[cfg(test)]` module
+        // files) is analyzed so its calls keep product code live and mark
+        // test-only usage, but its own dead symbols are not product findings:
+        // they are tallied as excluded instead of counted.
+        let test_code = is_test_code_file(&contribution.file, &test_module_files);
         let is_public_api_file = public_api_files.contains(&contribution.file);
-        for export in &contribution.exports {
+        for (export, other_lines) in exports_deduplicated_by_node(&contribution.exports) {
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
                     LivenessVerdict::Used => {
-                        if !is_test_file(&contribution.file)
-                            && !export.test_only_reference_files.is_empty()
-                        {
+                        if !test_code && !export.test_only_reference_files.is_empty() {
                             let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
@@ -1542,6 +1666,7 @@ fn aggregate_materialized_dead_code_contributions(
                         }
                         continue;
                     }
+                    LivenessVerdict::Uncertain if test_code => continue,
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
                         if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
@@ -1559,9 +1684,7 @@ fn aggregate_materialized_dead_code_contributions(
                         continue;
                     }
                     LivenessVerdict::Unused => {
-                        if !is_test_file(&contribution.file)
-                            && !export.test_only_reference_files.is_empty()
-                        {
+                        if !test_code && !export.test_only_reference_files.is_empty() {
                             let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
@@ -1588,22 +1711,32 @@ fn aggregate_materialized_dead_code_contributions(
                 }
             } else {
                 let node = (contribution.file.clone(), export.symbol.clone());
-                if !is_test_file(&contribution.file)
+                if !test_code
                     && !is_public_api_file
                     && !export.is_entry_point
                     && !production_reachable.contains(&node)
-                    && test_only_callers.contains_key(&node)
+                    && (test_only_callers.contains_key(&node) || test_reachable.contains(&node))
                 {
-                    let item = json!({
+                    // A symbol reached only through other test-only code (a
+                    // production-file helper that only tests call) is test
+                    // usage too; name its direct callers' files.
+                    let used_by = test_only_callers.get(&node).cloned().unwrap_or_else(|| {
+                        caller_files
+                            .get_or_init(|| caller_files_by_target(facts))
+                            .get(&node)
+                            .map(|files| files.iter().cloned().collect())
+                            .unwrap_or_default()
+                    });
+                    let mut item = json!({
                         "file": contribution.file,
                         "symbol": export.symbol,
                         "kind": export.kind,
                         "line": export.line,
                         "provenance": CALLGRAPH_PROVENANCE_TREESITTER,
-                        "used_by": test_only_callers.get(&node).cloned().unwrap_or_default(),
+                        "used_by": used_by,
                     });
+                    add_other_definition_lines(&mut item, &other_lines);
                     if generated_file {
-                        let mut item = item;
                         item["generated"] = json!(true);
                         generated_count += 1;
                         generated_items.push(item);
@@ -1631,6 +1764,12 @@ fn aggregate_materialized_dead_code_contributions(
                 }
             }
 
+            if test_code {
+                *excluded_by_file
+                    .entry(contribution.file.clone())
+                    .or_default() += 1;
+                continue;
+            }
             let mut item = json!({
                 "file": contribution.file,
                 "symbol": export.symbol,
@@ -1641,6 +1780,7 @@ fn aggregate_materialized_dead_code_contributions(
                 item["provenance"] = json!(provenance);
             }
             add_reexport_contexts(&mut item, &export.also_reexported);
+            add_other_definition_lines(&mut item, &other_lines);
             if generated_file {
                 item["generated"] = json!(true);
                 generated_count += 1;
@@ -1716,7 +1856,51 @@ fn aggregate_materialized_dead_code_contributions(
     if !skipped_files.is_empty() {
         aggregate["skipped_files"] = Value::Array(skipped_files);
     }
+    let mut excluded = ExcludedTestTally::default();
+    for (file, findings) in &excluded_by_file {
+        excluded.record_many(file, *findings);
+    }
+    excluded.write_into(&mut aggregate);
+    // Per-file breakdown of the withheld findings. The incremental rollup
+    // stores it in each file's fragment so a later partial re-render keeps an
+    // exact total; the folded aggregate it produces omits this field.
+    aggregate["excluded_test_by_file"] = json!(excluded_by_file);
     aggregate
+}
+
+/// A Rust file can define several exports with one name and kind (a method
+/// `new` on two types, or `#[cfg]` platform variants of one function). Liveness
+/// is tracked per (file, name) node, so they are always alive or dead together;
+/// report the node once at its first definition and list the other definition
+/// lines instead of emitting what reads as a duplicate entry. Exports of a
+/// different kind stay separate because dispatch liveness treats methods and
+/// free functions differently.
+fn exports_deduplicated_by_node(
+    exports: &[ExportContribution],
+) -> Vec<(&ExportContribution, Vec<u32>)> {
+    let mut deduplicated: Vec<(&ExportContribution, Vec<u32>)> = Vec::new();
+    let mut index_by_node: HashMap<(&str, &str), usize> = HashMap::new();
+    for export in exports {
+        match index_by_node.entry((export.symbol.as_str(), export.kind.as_str())) {
+            Entry::Occupied(entry) => {
+                let (first, other_lines) = &mut deduplicated[*entry.get()];
+                if first.line != export.line && !other_lines.contains(&export.line) {
+                    other_lines.push(export.line);
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(deduplicated.len());
+                deduplicated.push((export, Vec::new()));
+            }
+        }
+    }
+    deduplicated
+}
+
+fn add_other_definition_lines(item: &mut Value, other_lines: &[u32]) {
+    if !other_lines.is_empty() {
+        item["other_lines"] = json!(other_lines);
+    }
 }
 
 fn add_reexport_contexts(item: &mut Value, contexts: &[OxcReExportContext]) {
@@ -1787,6 +1971,46 @@ fn edges_by_source(
     }
 
     edges
+}
+
+/// Nodes reachable from test code: the targets of test-origin calls and every
+/// node they reach in turn. A node in this set that production code never
+/// reaches is used only by tests, even when its direct caller lives in a
+/// production file (a helper that only tests call).
+fn test_reachable_nodes(contributions: &[DeadCodeContribution]) -> BTreeSet<ExportNode> {
+    let edges = edges_by_source(contributions, false);
+    let mut frontier = contributions
+        .iter()
+        .flat_map(|contribution| contribution.internal_calls.iter())
+        .filter(|call| call.test_origin == Some(true))
+        .map(|call| (call.file.clone(), call.symbol.clone()))
+        .collect::<Vec<_>>();
+    let mut reached = BTreeSet::new();
+    while let Some(node) = frontier.pop() {
+        if let Some(targets) = edges.get(&node) {
+            if !reached.contains(&node) {
+                frontier.extend(targets.iter().cloned());
+            }
+        }
+        reached.insert(node);
+    }
+    reached
+}
+
+/// For every call target, the files whose code calls it directly.
+fn caller_files_by_target(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<ExportNode, BTreeSet<String>> {
+    let mut callers: BTreeMap<ExportNode, BTreeSet<String>> = BTreeMap::new();
+    for contribution in contributions {
+        for call in &contribution.internal_calls {
+            callers
+                .entry((call.file.clone(), call.symbol.clone()))
+                .or_default()
+                .insert(contribution.file.clone());
+        }
+    }
+    callers
 }
 
 fn test_only_callers_by_target(
@@ -2296,6 +2520,197 @@ fn project_internal_call(
     })
 }
 
+/// Imports in scope for resolving paths written in `file`: its own, plus its
+/// parent module's when it glob-imports the parent (`use super::*;`, the usual
+/// first line of an out-of-line `tests.rs`).
+fn rust_imports_in_scope(
+    file: &str,
+    own_imports: &[RawImportContribution],
+    globs_parent_module: bool,
+    rust_imports_by_file: &BTreeMap<String, Vec<RawImportContribution>>,
+) -> Vec<RawImportContribution> {
+    let mut imports = own_imports.to_vec();
+    if globs_parent_module {
+        if let Some(parent_imports) = rust_parent_module_files(file)
+            .iter()
+            .find_map(|parent| rust_imports_by_file.get(parent))
+        {
+            imports.extend(parent_imports.iter().cloned());
+        }
+    }
+    imports
+}
+
+/// Whether the file has a file-level `use super::*;` (the import parser keeps
+/// no record of glob imports, so this reads the syntax tree directly).
+fn rust_globs_parent_module(source: &str, root: tree_sitter::Node) -> bool {
+    let mut cursor = root.walk();
+    let globs = root.children(&mut cursor).any(|node| {
+        node.kind() == "use_declaration"
+            && node_text(source, node)
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .ends_with("usesuper::*;")
+    });
+    globs
+}
+
+/// Functions named by serde field attributes (`deserialize_with = "f"`,
+/// `serialize_with`, `default`, `skip_serializing_if`). serde calls them from
+/// derived code the callgraph never sees, so they are liveness roots. Only the
+/// last path segment is kept: the root applies to this file's definition.
+fn rust_serde_function_references(source: &str) -> Vec<String> {
+    static SERDE_FUNCTION_ATTRIBUTE: OnceLock<regex::Regex> = OnceLock::new();
+    let pattern = SERDE_FUNCTION_ATTRIBUTE.get_or_init(|| {
+        regex::Regex::new(
+            r#"\b(?:deserialize_with|serialize_with|default|skip_serializing_if)\s*=\s*"([A-Za-z_][A-Za-z0-9_:]*)""#,
+        )
+        .expect("serde function attribute pattern compiles")
+    });
+    pattern
+        .captures_iter(source)
+        .filter_map(|captures| captures.get(1))
+        .filter_map(|path| path.as_str().rsplit("::").next().map(str::to_string))
+        .collect()
+}
+
+/// Names of the methods defined inside `impl Trait for Type` blocks anywhere
+/// in the file (including inline modules).
+fn rust_trait_impl_methods(source: &str, root: tree_sitter::Node) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "impl_item" && node.child_by_field_name("trait").is_some() {
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for item in body.children(&mut cursor) {
+                    if item.kind() == "function_item" {
+                        if let Some(name) = item.child_by_field_name("name") {
+                            names.insert(node_text(source, name).to_string());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    names.into_iter().collect()
+}
+
+/// Files that can declare the module `file` belongs to. `x/y/z.rs` is module
+/// `z` of `x/y` (declared in `x/y.rs` or `x/y/mod.rs`, or a crate root there);
+/// `x/y/mod.rs` is module `y` of `x`.
+fn rust_parent_module_files(file: &str) -> Vec<String> {
+    let normalized = file.replace('\\', "/");
+    let Some((dir, name)) = normalized.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let module_dir = if name == "mod.rs" {
+        match dir.rsplit_once('/') {
+            Some((parent, _)) => parent.to_string(),
+            None => return Vec::new(),
+        }
+    } else {
+        dir.to_string()
+    };
+    vec![
+        format!("{module_dir}.rs"),
+        format!("{module_dir}/mod.rs"),
+        format!("{module_dir}/lib.rs"),
+        format!("{module_dir}/main.rs"),
+    ]
+}
+
+/// Liveness edges for a Rust path call (`module::f()`, `Self::f()`,
+/// `Type::f()`) that the callgraph left unresolved.
+///
+/// The callgraph keeps such a call as its bare path text, which never names a
+/// definition, so the callee looked dead even though it is plainly called.
+/// This resolves the path the way rustc would for the common shapes, from the
+/// same per-file facts the macro-token resolver uses:
+/// - `Self::f` names an associated function of a type in the caller's file;
+/// - `Type::f` names `f` in a file that exports `Type` (unknown types such as
+///   `String` match nothing, so std calls add no edges);
+/// - `a::b::f` is resolved as a module path: child modules of the caller first
+///   (Rust 2018 paths are relative to the current module), then `use` aliases
+///   including `use crate::a::{self, ..}`, then crate-relative.
+///
+/// Every resolved target gets an edge, so an ambiguous `Type::f` keeps all
+/// matching definitions live rather than guessing one.
+fn rust_unresolved_path_call_edges(
+    call: &CallgraphOutboundCall,
+    caller_file: &str,
+    rust_imports: &[RawImportContribution],
+    test_origin: bool,
+    exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
+    files_by_exported_symbol: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<InternalCall> {
+    if language_for_file(caller_file) != "rust" {
+        return Vec::new();
+    }
+    let (target, _) = split_call_target_metadata(&call.target);
+    // Generic arguments (`Vec::<u8>::new`, `Foo::<T>::bar`) are not part of
+    // the item path.
+    let segments = rust_path_segments(target)
+        .into_iter()
+        .filter(|segment| !segment.starts_with('<'))
+        .collect::<Vec<_>>();
+    let Some((name, path)) = segments.split_last() else {
+        return Vec::new();
+    };
+    let Some(qualifier) = path.last() else {
+        return Vec::new();
+    };
+    if !rust_macro_text_is_identifier(name) {
+        return Vec::new();
+    }
+
+    let exports_symbol = |file: &str, symbol: &str| {
+        exported_symbols_by_file
+            .get(file)
+            .is_some_and(|symbols| symbols.contains(symbol))
+    };
+    let mut targets = BTreeSet::new();
+    if qualifier == "Self" {
+        if exports_symbol(caller_file, name) {
+            targets.insert((caller_file.to_string(), name.clone()));
+        }
+    } else if rust_macro_name_is_upper_camel(qualifier) {
+        for file in files_by_exported_symbol
+            .get(qualifier.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if exports_symbol(file, name) {
+                targets.insert((file.clone(), name.clone()));
+            }
+        }
+    } else {
+        targets.extend(resolve_macro_module_targets(
+            caller_file,
+            path,
+            name,
+            rust_imports,
+            exported_symbols_by_file,
+        ));
+    }
+
+    targets
+        .into_iter()
+        .map(|(file, symbol)| InternalCall {
+            caller_symbol: call.caller_symbol.clone(),
+            file,
+            symbol,
+            line: call.line,
+            provenance: RUST_PATH_LIVENESS_PROVENANCE.to_string(),
+            test_origin: Some(test_origin),
+        })
+        .collect()
+}
+
 fn resolve_macro_token_liveness_edges(
     _project_root: &Path,
     caller_file: &str,
@@ -2447,20 +2862,20 @@ fn resolve_macro_module_targets(
     let mut targets = BTreeSet::new();
     for candidate in rust_macro_module_path_candidates(module_path, rust_imports) {
         let segment_refs = candidate.iter().map(String::as_str).collect::<Vec<_>>();
-        let Some(resolved_segments) = rust_resolve_segments_for_macro(caller_file, &segment_refs)
-        else {
-            continue;
-        };
-        let Some(file) = rust_file_for_segments_from_contributions(
-            caller_file,
-            &resolved_segments,
-            exported_symbols_by_file,
-        ) else {
-            continue;
-        };
-        if let Some(target) = exported_symbol_target(&file, target_symbol, exported_symbols_by_file)
-        {
-            targets.insert(target);
+        for resolved_segments in rust_resolve_segment_candidates(caller_file, &segment_refs) {
+            let Some(file) = rust_file_for_segments_from_contributions(
+                caller_file,
+                &resolved_segments,
+                exported_symbols_by_file,
+            ) else {
+                continue;
+            };
+            if let Some(target) =
+                exported_symbol_target(&file, target_symbol, exported_symbols_by_file)
+            {
+                targets.insert(target);
+                break;
+            }
         }
     }
     targets
@@ -2483,22 +2898,20 @@ fn imported_macro_targets_for_local(
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            let Some(resolved_segments) =
-                rust_resolve_segments_for_macro(caller_file, &segment_refs)
-            else {
-                continue;
-            };
-            let Some(file) = rust_file_for_segments_from_contributions(
-                caller_file,
-                &resolved_segments,
-                exported_symbols_by_file,
-            ) else {
-                continue;
-            };
-            if let Some(target) =
-                exported_symbol_target(&file, &imported.imported_name, exported_symbols_by_file)
-            {
-                targets.insert(target);
+            for resolved_segments in rust_resolve_segment_candidates(caller_file, &segment_refs) {
+                let Some(file) = rust_file_for_segments_from_contributions(
+                    caller_file,
+                    &resolved_segments,
+                    exported_symbols_by_file,
+                ) else {
+                    continue;
+                };
+                if let Some(target) =
+                    exported_symbol_target(&file, &imported.imported_name, exported_symbols_by_file)
+                {
+                    targets.insert(target);
+                    break;
+                }
             }
         }
     }
@@ -2512,13 +2925,11 @@ fn rust_macro_module_path_candidates(
     let mut candidates = Vec::new();
     if let Some(first) = path.first() {
         for import in rust_imports {
-            let Some((local_name, mut import_segments)) = rust_import_module_alias_segments(import)
-            else {
-                continue;
-            };
-            if &local_name == first {
-                import_segments.extend(path[1..].iter().cloned());
-                push_unique_macro_path_candidate(&mut candidates, import_segments);
+            for (local_name, mut import_segments) in rust_import_module_alias_segments(import) {
+                if &local_name == first {
+                    import_segments.extend(path[1..].iter().cloned());
+                    push_unique_macro_path_candidate(&mut candidates, import_segments);
+                }
             }
         }
     }
@@ -2526,23 +2937,60 @@ fn rust_macro_module_path_candidates(
     candidates
 }
 
-fn rust_import_module_alias_segments(
-    import: &RawImportContribution,
-) -> Option<(String, Vec<String>)> {
+/// Module aliases a `use` declaration brings into scope: `use a::b;` and
+/// `use a::b as c;` bind one module name, and a use list binds `self` (the
+/// prefix module itself) plus each lowercase entry, so
+/// `use crate::pins::{self, PinError};` makes `pins::f()` resolvable.
+/// Upper-camel names are types, not modules, and are skipped.
+fn rust_import_module_alias_segments(import: &RawImportContribution) -> Vec<(String, Vec<String>)> {
     let path = import.source.trim().trim_end_matches(';').trim();
-    if path.contains("::{") || path.contains('{') || path.contains('*') {
-        return None;
+    if path.contains('*') {
+        return Vec::new();
+    }
+    if let Some((prefix, rest)) = path.split_once("::{") {
+        if rest.contains('{') {
+            return Vec::new();
+        }
+        let prefix_segments = rust_path_segments(prefix);
+        return rest
+            .trim_end_matches('}')
+            .split(',')
+            .filter_map(|specifier| {
+                let specifier = specifier.trim();
+                let (path_without_alias, alias) = specifier
+                    .split_once(" as ")
+                    .map(|(left, right)| (left.trim(), Some(right.trim())))
+                    .unwrap_or((specifier, None));
+                if path_without_alias == "self" {
+                    let local_name =
+                        alias.or_else(|| prefix_segments.last().map(String::as_str))?;
+                    return Some((local_name.to_string(), prefix_segments.clone()));
+                }
+                let mut segments = prefix_segments.clone();
+                segments.extend(rust_path_segments(path_without_alias));
+                let local_name = alias.or_else(|| segments.last().map(String::as_str))?;
+                (!local_name.is_empty()
+                    && local_name != "_"
+                    && !rust_macro_name_is_upper_camel(local_name))
+                .then(|| (local_name.to_string(), segments.clone()))
+            })
+            .collect();
+    }
+    if path.contains('{') {
+        return Vec::new();
     }
     let (path_without_alias, alias) = path
         .split_once(" as ")
         .map(|(left, right)| (left.trim(), Some(right.trim())))
         .unwrap_or((path, None));
     let segments = rust_path_segments(path_without_alias);
-    let local_name = alias.or_else(|| segments.last().map(String::as_str))?;
+    let Some(local_name) = alias.or_else(|| segments.last().map(String::as_str)) else {
+        return Vec::new();
+    };
     if rust_macro_name_is_upper_camel(local_name) {
-        return None;
+        return Vec::new();
     }
-    Some((local_name.to_string(), segments))
+    vec![(local_name.to_string(), segments)]
 }
 
 fn rust_imported_symbol_specs(import: &RawImportContribution) -> Vec<RustImportedSymbolSpec> {
@@ -2597,34 +3045,41 @@ fn push_unique_macro_path_candidate(candidates: &mut Vec<Vec<String>>, candidate
     }
 }
 
-fn rust_resolve_segments_for_macro(caller_file: &str, segments: &[&str]) -> Option<Vec<String>> {
+/// Module paths a Rust path's leading segments can denote, most likely first.
+/// `crate`, `self` and `super` are unambiguous. A bare first segment is, in
+/// Rust 2018, resolved relative to the current module (a child module such as
+/// `mod registry;` used as `registry::f()`); the older crate-relative reading
+/// (a sibling of a top-level module) is kept as a second candidate.
+fn rust_resolve_segment_candidates(caller_file: &str, segments: &[&str]) -> Vec<Vec<String>> {
     if segments.is_empty() {
-        return Some(Vec::new());
+        return vec![Vec::new()];
     }
     let caller_segments = rust_module_segments_for_rel(caller_file);
+    let rest = |from: usize| segments[from..].iter().map(|item| (*item).to_string());
     match segments[0] {
-        "crate" => Some(
-            segments[1..]
-                .iter()
-                .map(|item| (*item).to_string())
-                .collect(),
-        ),
+        "crate" => vec![rest(1).collect()],
         "self" => {
             let mut resolved = caller_segments;
-            resolved.extend(segments[1..].iter().map(|item| (*item).to_string()));
-            Some(resolved)
+            resolved.extend(rest(1));
+            vec![resolved]
         }
         "super" => {
             let mut resolved = caller_segments;
             resolved.pop();
-            resolved.extend(segments[1..].iter().map(|item| (*item).to_string()));
-            Some(resolved)
+            resolved.extend(rest(1));
+            vec![resolved]
         }
         _ => {
-            let mut resolved = caller_segments;
-            resolved.pop();
-            resolved.extend(segments.iter().map(|item| (*item).to_string()));
-            Some(resolved)
+            let mut child = caller_segments.clone();
+            child.extend(rest(0));
+            let mut sibling = caller_segments;
+            sibling.pop();
+            sibling.extend(rest(0));
+            if child == sibling {
+                vec![child]
+            } else {
+                vec![child, sibling]
+            }
         }
     }
 }
@@ -2742,7 +3197,7 @@ fn rust_raw_import_contributions(
         .imports
         .into_iter()
         .map(|import| RawImportContribution {
-            source: import.module_path,
+            source: crate::imports::rust_use_tree(&import),
             names: import.names,
             default_import: None,
             namespace_import: None,
@@ -2776,6 +3231,126 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
     ranges.sort_by_key(|range| (range.start_line, range.end_line));
     ranges.dedup();
     ranges
+}
+
+/// Project-relative files of out-of-line modules declared under `#[cfg(test)]`
+/// (`#[cfg(test)] mod tests;`, optionally with `#[path = "..."]`). Such a file
+/// is compiled only for tests even though its name does not look like a test,
+/// so its calls are test usage and its own items are test code.
+///
+/// Both candidate locations are returned for a plain declaration (`name.rs`
+/// and `name/mod.rs`); callers only ever match them against files that exist.
+fn rust_cfg_test_module_files(
+    source: &str,
+    root: tree_sitter::Node,
+    relative_file: &str,
+) -> Vec<String> {
+    let normalized = relative_file.replace('\\', "/");
+    let (dir, file_name) = normalized
+        .rsplit_once('/')
+        .map_or(("", normalized.as_str()), |(dir, name)| (dir, name));
+    // `mod x;` in `mod.rs`, `lib.rs` or `main.rs` resolves next to the file;
+    // in `foo.rs` it resolves under `foo/`.
+    let module_dir = match file_name.strip_suffix(".rs") {
+        Some("mod" | "lib" | "main") | None => dir.to_string(),
+        Some(stem) if dir.is_empty() => stem.to_string(),
+        Some(stem) => format!("{dir}/{stem}"),
+    };
+    let join = |base: &str, rest: &str| {
+        if base.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{base}/{rest}")
+        }
+    };
+
+    let mut files = Vec::new();
+    let mut cursor = root.walk();
+    for node in root.children(&mut cursor) {
+        // Only file-level declarations: nested inline modules change the base
+        // directory, and test-only nested declarations are rare.
+        if node.kind() != "mod_item"
+            || node.child_by_field_name("body").is_some()
+            || !rust_node_has_cfg_test_attribute(source, node)
+        {
+            continue;
+        }
+        if let Some(path) = rust_path_attribute_value(source, node) {
+            // A `#[path]` on a file-level declaration is relative to the
+            // directory of the declaring file.
+            files.push(normalize_relative_segments(&join(dir, &path)));
+            continue;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .map(|name| node_text(source, name).to_string())
+        else {
+            continue;
+        };
+        files.push(join(&module_dir, &format!("{name}.rs")));
+        files.push(join(&module_dir, &format!("{name}/mod.rs")));
+    }
+    files
+}
+
+/// The string value of a `#[path = "..."]` attribute attached to `node`.
+fn rust_path_attribute_value(source: &str, node: tree_sitter::Node<'_>) -> Option<String> {
+    let mut previous = node.prev_sibling();
+    while let Some(attribute) = previous {
+        match attribute.kind() {
+            "attribute_item" => {
+                let text = &source[attribute.byte_range()];
+                let inner = text
+                    .trim()
+                    .strip_prefix("#[")
+                    .and_then(|inner| inner.strip_suffix(']'))
+                    .map(str::trim);
+                if let Some(value) = inner
+                    .and_then(|inner| inner.strip_prefix("path"))
+                    .map(str::trim_start)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .map(str::trim)
+                    .and_then(|rest| rest.strip_prefix('"'))
+                    .and_then(|rest| rest.strip_suffix('"'))
+                {
+                    return Some(value.replace('\\', "/"));
+                }
+                previous = attribute.prev_sibling();
+            }
+            "line_comment" | "block_comment" => previous = attribute.prev_sibling(),
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Resolves `.` and `..` segments of a project-relative path textually.
+fn normalize_relative_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// Every file named by some contribution's `#[cfg(test)] mod` declarations.
+fn cfg_test_module_files(contributions: &[DeadCodeContribution]) -> BTreeSet<String> {
+    contributions
+        .iter()
+        .flat_map(|contribution| contribution.cfg_test_module_files.iter().cloned())
+        .collect()
+}
+
+/// Whether `file` is test code: a test-tree path (tests, fixtures, mocks) or
+/// a module file that is only compiled under `#[cfg(test)]`.
+fn is_test_code_file(file: &str, cfg_test_module_files: &BTreeSet<String>) -> bool {
+    is_test_tree_file(file) || cfg_test_module_files.contains(file)
 }
 
 fn rust_node_has_cfg_test_attribute(source: &str, node: tree_sitter::Node<'_>) -> bool {
@@ -3276,6 +3851,7 @@ fn resolve_raw_reexport_liveness_edges(
                     raw.line,
                     exported_symbols_by_file,
                     default_export_symbols_by_file,
+                    true,
                 ));
             }
             "rust" => {
@@ -3300,6 +3876,7 @@ fn resolve_raw_reexport_liveness_edges(
                     raw.line,
                     exported_symbols_by_file,
                     default_export_symbols_by_file,
+                    false,
                 ));
             }
             _ => {}
@@ -3338,6 +3915,7 @@ fn resolve_oxc_reexport_liveness_edges(
             fact.line,
             exported_symbols_by_file,
             default_export_symbols_by_file,
+            true,
         ));
     }
     edges
@@ -3354,6 +3932,7 @@ fn resolve_reexport_fact_edge(
     line: u32,
     exported_symbols_by_file: &BTreeMap<String, BTreeSet<String>>,
     default_export_symbols_by_file: &BTreeMap<String, String>,
+    require_declared_export: bool,
 ) -> Vec<InternalCall> {
     match kind {
         "star" => reexport_edges_for_all_target_symbols(
@@ -3387,9 +3966,15 @@ fn resolve_reexport_fact_edge(
         _ => {
             let imported = imported.unwrap_or_default();
             let exported = exported.unwrap_or(imported);
+            // A Rust `pub use` / `pub(crate) use` is itself the export: the
+            // callgraph records no definition for the re-exported name in the
+            // re-exporting file, so requiring one would drop every such edge
+            // and leave the item dead even when callers import it through
+            // the re-export.
             if imported.is_empty()
                 || exported.is_empty()
-                || !file_exports_symbol(file_name, exported, exported_symbols_by_file)
+                || (require_declared_export
+                    && !file_exports_symbol(file_name, exported, exported_symbols_by_file))
             {
                 return Vec::new();
             }
@@ -4128,6 +4713,14 @@ fn liveness_roots_for_file(
     roots.insert("<top-level>".to_string());
     if is_public_api_file {
         roots.extend(exports.iter().map(|export| export.symbol.clone()));
+        // Names a public API file re-exports (`pub use inner::f;`) are part of
+        // its API even though the file defines no item with that name.
+        roots.extend(
+            internal_calls
+                .iter()
+                .filter(|call| call.provenance == CALLGRAPH_PROVENANCE_REEXPORT)
+                .map(|call| call.caller_symbol.clone()),
+        );
     } else if let Some(executable_root_exports) = executable_root_exports {
         roots.extend(executable_root_exports.iter().cloned());
     } else {
@@ -4260,6 +4853,21 @@ struct DeadCodeContribution {
     attribute_entry_points: Vec<String>,
     #[serde(default)]
     cfg_test_ranges: Vec<RustCfgTestRange>,
+    /// Files of out-of-line modules this file declares under `#[cfg(test)]`
+    /// (`#[cfg(test)] mod tests;`). Each declaration lists both candidate
+    /// paths (`name.rs` and `name/mod.rs`); only existing files ever match.
+    #[serde(default)]
+    cfg_test_module_files: Vec<String>,
+    /// The file starts with a file-level `use super::*;`, so its parent
+    /// module's imports are in scope for path resolution.
+    #[serde(default)]
+    globs_parent_module: bool,
+    /// Names of methods defined in `impl Trait for Type` blocks. Rust code
+    /// calls them through the trait (`Default::default()`, `.parse()`,
+    /// formatting, drop glue), which the callgraph rarely sees, so they are
+    /// liveness roots: what they call is used whenever the trait is.
+    #[serde(default)]
+    trait_impl_methods: Vec<String>,
     #[serde(default)]
     oxc_facts: Option<OxcFactsContribution>,
     #[serde(default)]
@@ -5362,8 +5970,11 @@ mod tests {
             "[package]\nname = \"dead-code-test-module-fixture\"\nversion = \"0.1.0\"\n",
         )
         .expect("write manifest");
-        let analysis =
-            DeadCodeFileAnalyzer::default().analyze_file(&root.join("src/index.rs"), false);
+        let analysis = DeadCodeFileAnalyzer::default().analyze_file(
+            &root.join("src/index.rs"),
+            "src/index.rs",
+            false,
+        );
         assert!(
             analysis
                 .cfg_test_ranges
@@ -5782,6 +6393,26 @@ pub fn false_helper() -> String { "dead".to_string() }
     }
 
     #[test]
+    fn rust_macro_token_liveness_resolves_use_list_calls() {
+        let aggregate = rust_entry_scan(
+            &[
+                (
+                    "src/main.rs",
+                    "mod m;\nuse crate::m::{helper, other};\nfn main() { wrapper!(helper()); }\n",
+                ),
+                ("src/m.rs", "pub fn helper() {}\npub fn other() {}\n"),
+            ],
+            &[
+                ("src/main.rs", "main", "function"),
+                ("src/m.rs", "helper", "function"),
+                ("src/m.rs", "other", "function"),
+            ],
+        );
+        assert!(!aggregate_has_item(&aggregate, "src/m.rs", "helper"));
+        assert!(aggregate_has_item(&aggregate, "src/m.rs", "other"));
+    }
+
+    #[test]
     fn rust_macro_token_liveness_rescues_turbofish_calls() {
         let aggregate = rust_entry_scan(
             &[(
@@ -5854,5 +6485,553 @@ pub fn false_helper() -> String { "dead".to_string() }
         assert_eq!(aggregate["count"], 1);
         assert_eq!(aggregate["items"][0]["symbol"], "build");
         assert_eq!(aggregate["uncertain_count"], 0);
+    }
+
+    fn canonical_fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
+        let (temp_dir, root, paths) = fixture_project(files);
+        let root = fs::canonicalize(root).expect("canonical project root");
+        let paths = paths
+            .into_iter()
+            .map(|path| fs::canonicalize(path).expect("canonical fixture file"))
+            .collect::<Vec<_>>();
+        (temp_dir, root, paths)
+    }
+
+    fn resolved_target(root: &Path, file: &str, symbol: &str) -> String {
+        format!("{}::{symbol}", root.join(file).display())
+    }
+
+    fn headline_symbols(aggregate: &serde_json::Value) -> Vec<String> {
+        aggregate["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                format!(
+                    "{}::{}",
+                    item["file"].as_str().unwrap_or_default(),
+                    item["symbol"].as_str().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    /// The callgraph keeps a Rust path call it could not resolve as its bare
+    /// path text. The scanner must still link `module::f`, a module bound by
+    /// `use crate::m::{self, ..}`, `Type::f` and `Self::f`.
+    #[test]
+    fn unresolved_rust_path_calls_keep_their_targets_live() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod cache;\nmod net;\nfn main() { net::start(); }\n"),
+            (
+                "src/net/mod.rs",
+                "mod registry;\nuse crate::cache::{self, Cache};\n\npub fn start() {\n    registry::resolve_shell();\n    cache::warm();\n    let _ = Cache::open();\n}\n",
+            ),
+            ("src/net/registry.rs", "pub fn resolve_shell() {}\n"),
+            (
+                "src/cache.rs",
+                "pub struct Cache;\nimpl Cache {\n    pub fn open() -> Self { Self::with_loader() }\n    pub fn with_loader() -> Self { Cache }\n}\npub fn warm() {}\npub fn planted_dead() {}\n",
+            ),
+        ]);
+        let exports = [
+            ("src/main.rs", "main", "function"),
+            ("src/net/mod.rs", "start", "function"),
+            ("src/net/registry.rs", "resolve_shell", "function"),
+            ("src/cache.rs", "Cache", "struct"),
+            ("src/cache.rs", "open", "method"),
+            ("src/cache.rs", "with_loader", "method"),
+            ("src/cache.rs", "warm", "function"),
+            ("src/cache.rs", "planted_dead", "function"),
+        ]
+        .iter()
+        .map(|(file, symbol, kind)| export(&root, file, symbol, kind))
+        .collect::<Vec<_>>();
+        let calls = vec![
+            outbound(
+                &root,
+                "src/main.rs",
+                "main",
+                &resolved_target(&root, "src/net/mod.rs", "start"),
+            ),
+            outbound(&root, "src/net/mod.rs", "start", "registry::resolve_shell"),
+            outbound(&root, "src/net/mod.rs", "start", "cache::warm"),
+            outbound(&root, "src/net/mod.rs", "start", "Cache::open"),
+            outbound(&root, "src/cache.rs", "open", "Self::with_loader"),
+            // A std path names no project definition and must add nothing.
+            outbound(&root, "src/net/mod.rs", "start", "String::planted_dead"),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/cache.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// End to end through a real callgraph store: a binary calling its library
+    /// through the crate name, `crate::` and child-module paths, a use-list
+    /// `self` alias, a struct-literal field call next to a nested
+    /// `use super::{..}`, a `FromStr` impl used through `.parse()`, and a
+    /// library item used only by an example.
+    #[test]
+    fn store_backed_rust_path_forms_examples_and_trait_impls_are_live() {
+        let (temp_dir, root, paths) = canonical_fixture(&[
+            (
+                "src/lib.rs",
+                "pub mod alerts;\npub mod cache;\npub mod lang;\npub mod net;\npub mod util;\n",
+            ),
+            (
+                "src/main.rs",
+                "fn main() {\n    path_forms::net::start();\n    let _ = path_forms::lang::parse_lang(\"rust\");\n}\n",
+            ),
+            (
+                "src/net/mod.rs",
+                "mod registry;\nuse crate::cache::{self, Cache};\n\npub fn start() {\n    registry::resolve_shell();\n    cache::warm();\n    let _ = Cache::open();\n}\n",
+            ),
+            ("src/net/registry.rs", "pub fn resolve_shell() {}\n"),
+            (
+                "src/cache.rs",
+                "pub struct Cache;\n\nimpl Cache {\n    pub fn open() -> Self {\n        Self::with_loader()\n    }\n\n    pub fn with_loader() -> Self {\n        Cache\n    }\n}\n\npub fn warm() {\n    crate::alerts::build(\"x\");\n}\n",
+            ),
+            (
+                "src/alerts.rs",
+                "pub struct Alert {\n    pub message: String,\n}\n\npub fn build(message: &str) -> Alert {\n    Alert {\n        message: normalize(message),\n    }\n}\n\npub fn normalize(message: &str) -> String {\n    message.trim().to_string()\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{normalize, Alert};\n\n    #[test]\n    fn normalizes() {\n        let _ = Alert { message: normalize(\" x \") };\n    }\n}\n",
+            ),
+            (
+                "src/lang.rs",
+                "use std::str::FromStr;\n\npub struct Lang;\n\nimpl FromStr for Lang {\n    type Err = ();\n\n    fn from_str(_text: &str) -> Result<Self, Self::Err> {\n        Ok(Lang)\n    }\n}\n\npub fn parse_lang(text: &str) -> Option<Lang> {\n    text.parse().ok()\n}\n",
+            ),
+            (
+                "src/util.rs",
+                "pub fn only_from_example() {}\n\npub fn planted_dead() {}\n",
+            ),
+            (
+                "examples/demo.rs",
+                "fn main() {\n    path_forms::util::only_from_example();\n}\n",
+            ),
+        ]);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"path-forms\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write manifest");
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp_dir.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .expect("open callgraph store");
+        store.cold_build(&paths).expect("build callgraph store");
+        let snapshot = crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path())
+            .expect("project dead-code snapshot");
+        let aggregate = scan(job(&root, paths, snapshot));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/util.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
+    }
+
+    #[test]
+    fn dead_exports_in_test_trees_are_excluded_from_the_product_count() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/product.ts", "export function productDead() {}\n"),
+            (
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "export const bulkSymbol0 = 0;\nexport const bulkSymbol1 = 1;\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/product.ts", "productDead", "function"),
+            export(
+                &root,
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "bulkSymbol0",
+                "variable",
+            ),
+            export(
+                &root,
+                "tests/docker/scenarios/edit/fixture/bulk/bulk.ts",
+                "bulkSymbol1",
+                "variable",
+            ),
+        ];
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(paths, exports, Vec::new()),
+        ));
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["total_count"], 1, "{aggregate:#}");
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/product.ts::productDead".to_string()]
+        );
+        assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 1, "{aggregate:#}");
+    }
+
+    /// `#[cfg(test)] mod tests;` pulls in a file whose name does not look like a
+    /// test. Its calls are test usage and its own items are test code.
+    #[test]
+    fn cfg_test_module_file_is_test_code() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod index;\nfn main() { index::run(); }\n"),
+            (
+                "src/index.rs",
+                "pub fn run() {}\npub fn only_tests() {}\n\n#[cfg(test)]\nmod tests;\n",
+            ),
+            (
+                "src/index/tests.rs",
+                "use super::only_tests;\npub fn helper() {\n    only_tests();\n}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/index.rs", "run", "function"),
+            export(&root, "src/index.rs", "only_tests", "function"),
+            export(&root, "src/index/tests.rs", "helper", "function"),
+        ];
+        let calls = vec![
+            outbound(
+                &root,
+                "src/main.rs",
+                "main",
+                &resolved_target(&root, "src/index.rs", "run"),
+            ),
+            outbound(
+                &root,
+                "src/index/tests.rs",
+                "helper",
+                &resolved_target(&root, "src/index.rs", "only_tests"),
+            ),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert!(
+            aggregate_test_only_item(&aggregate, "src/index.rs", "only_tests").is_some(),
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["excluded_test_count"], 1, "{aggregate:#}");
+        assert_eq!(aggregate["excluded_test_files"], 1, "{aggregate:#}");
+    }
+
+    /// A call the callgraph resolved only as far as a re-exporting module
+    /// (`pub(crate) use projection::{project_snapshot};`) must still reach the
+    /// definition behind the re-export.
+    #[test]
+    fn rust_crate_visible_reexport_carries_liveness_to_the_definition() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                "mod inspect;\nmod store;\nfn main() { inspect::run(); }\n",
+            ),
+            (
+                "src/store/mod.rs",
+                "mod projection;\npub(crate) use projection::{project_snapshot};\n",
+            ),
+            (
+                "src/store/projection.rs",
+                "pub fn project_snapshot() {}\npub fn planted_dead() {}\n",
+            ),
+            (
+                "src/inspect.rs",
+                "use crate::store::project_snapshot;\npub fn run() { project_snapshot(); }\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/inspect.rs", "run", "function"),
+            export(
+                &root,
+                "src/store/projection.rs",
+                "project_snapshot",
+                "function",
+            ),
+            export(&root, "src/store/projection.rs", "planted_dead", "function"),
+        ];
+        let calls = vec![
+            outbound(
+                &root,
+                "src/main.rs",
+                "main",
+                &resolved_target(&root, "src/inspect.rs", "run"),
+            ),
+            outbound(
+                &root,
+                "src/inspect.rs",
+                "run",
+                &resolved_target(&root, "src/store/mod.rs", "project_snapshot"),
+            ),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/store/projection.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// An out-of-line test module that starts with `use super::*;` sees its
+    /// parent's imports, so `store::f()` there resolves through the parent's
+    /// `use crate::store;` and counts as test-only usage.
+    #[test]
+    fn glob_super_import_in_test_module_file_uses_parent_imports() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            (
+                "src/main.rs",
+                "mod index;\nmod store;\nfn main() { index::run(); }\n",
+            ),
+            (
+                "src/index.rs",
+                "use crate::store;\npub fn run() {}\n\n#[cfg(test)]\nmod tests;\n",
+            ),
+            (
+                "src/index/tests.rs",
+                "use super::*;\npub fn helper() {\n    store::only_tests();\n}\n",
+            ),
+            ("src/store.rs", "pub fn only_tests() {}\n"),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/index.rs", "run", "function"),
+            export(&root, "src/index/tests.rs", "helper", "function"),
+            export(&root, "src/store.rs", "only_tests", "function"),
+        ];
+        let calls = vec![
+            outbound(
+                &root,
+                "src/main.rs",
+                "main",
+                &resolved_target(&root, "src/index.rs", "run"),
+            ),
+            outbound(&root, "src/index/tests.rs", "helper", "store::only_tests"),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert!(headline_symbols(&aggregate).is_empty(), "{aggregate:#}");
+        assert!(
+            aggregate_test_only_item(&aggregate, "src/store.rs", "only_tests").is_some(),
+            "{aggregate:#}"
+        );
+    }
+
+    /// Trait-impl methods run through the trait (`Default::default()`,
+    /// `.parse()`, formatting), which the callgraph does not see, so what
+    /// they call must stay live.
+    #[test]
+    fn calls_inside_trait_impl_methods_keep_targets_live() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod slot;\nfn main() {}\n"),
+            (
+                "src/slot.rs",
+                "pub struct Slot;\nimpl Slot {\n    pub fn with_constructor() -> Self { Slot }\n    pub fn planted_dead() {}\n}\nimpl Default for Slot {\n    fn default() -> Self {\n        Self::with_constructor()\n    }\n}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/slot.rs", "with_constructor", "method"),
+            export(&root, "src/slot.rs", "planted_dead", "method"),
+        ];
+        let calls = vec![outbound(
+            &root,
+            "src/slot.rs",
+            "default",
+            &resolved_target(&root, "src/slot.rs", "with_constructor"),
+        )];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/slot.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A production-file helper that only tests call is test-only usage, and so
+    /// is everything only that helper calls.
+    #[test]
+    fn symbols_reached_only_through_test_only_code_are_test_only() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod calls;\nfn main() {}\n"),
+            (
+                "src/calls.rs",
+                "pub fn extract_in_range() { walk(); }\npub fn walk() {}\npub fn planted_dead() {}\n",
+            ),
+            (
+                "tests/calls_test.rs",
+                "#[test]\nfn extracts() { demo::calls::extract_in_range(); }\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/calls.rs", "extract_in_range", "function"),
+            export(&root, "src/calls.rs", "walk", "function"),
+            export(&root, "src/calls.rs", "planted_dead", "function"),
+        ];
+        let calls = vec![
+            outbound(
+                &root,
+                "tests/calls_test.rs",
+                "extracts",
+                &resolved_target(&root, "src/calls.rs", "extract_in_range"),
+            ),
+            outbound(
+                &root,
+                "src/calls.rs",
+                "extract_in_range",
+                &resolved_target(&root, "src/calls.rs", "walk"),
+            ),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/calls.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+        let walk = aggregate_test_only_item(&aggregate, "src/calls.rs", "walk")
+            .unwrap_or_else(|| panic!("walk is reached only from tests: {aggregate:#}"));
+        assert_eq!(walk["used_by"], json!(["src/calls.rs"]), "{walk:#}");
+        assert!(
+            aggregate_test_only_item(&aggregate, "src/calls.rs", "extract_in_range").is_some(),
+            "{aggregate:#}"
+        );
+    }
+
+    /// serde calls `deserialize_with` / `default` functions from derived code
+    /// the callgraph never sees; what they call must stay live.
+    #[test]
+    fn serde_attribute_functions_are_liveness_roots() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod config;\nfn main() {}\n"),
+            (
+                "src/config.rs",
+                "#[derive(serde::Deserialize)]\npub struct Git {\n    #[serde(deserialize_with = \"deserialize_author\")]\n    pub author: Option<String>,\n}\n\nfn deserialize_author<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {\n    let _ = d;\n    Ok(normalize_author(\"x\"))\n}\n\npub fn normalize_author(value: &str) -> Option<String> {\n    Some(value.to_string())\n}\n\npub fn planted_dead() {}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/config.rs", "normalize_author", "function"),
+            export(&root, "src/config.rs", "planted_dead", "function"),
+        ];
+        let calls = vec![outbound(
+            &root,
+            "src/config.rs",
+            "deserialize_author",
+            &resolved_target(&root, "src/config.rs", "normalize_author"),
+        )];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, calls, entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/config.rs::planted_dead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// A struct built only with a struct literal is used even though no type
+    /// annotation names it.
+    #[test]
+    fn struct_built_by_a_struct_literal_is_live() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod zoom;\nfn main() {}\n"),
+            (
+                "src/zoom.rs",
+                "pub struct ZoomResponse {\n    pub lines: usize,\n}\npub struct PlantedDead;\npub fn respond() -> usize {\n    let response = ZoomResponse { lines: 1 };\n    response.lines\n}\n",
+            ),
+        ]);
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            export(&root, "src/zoom.rs", "ZoomResponse", "struct"),
+            export(&root, "src/zoom.rs", "PlantedDead", "struct"),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, Vec::new(), entry_points),
+        ));
+
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/zoom.rs::PlantedDead".to_string()],
+            "{aggregate:#}"
+        );
+    }
+
+    /// Two `new` methods on different types in one file share one liveness
+    /// node; report it once with both definition lines instead of twice.
+    #[test]
+    fn same_named_exports_in_one_file_are_reported_once() {
+        let (_temp_dir, root, paths) = canonical_fixture(&[
+            ("src/main.rs", "mod guards;\nfn main() {}\n"),
+            (
+                "src/guards.rs",
+                "pub struct A;\nimpl A {\n    pub fn new() -> Self { A }\n}\npub struct B;\nimpl B {\n    pub fn new() -> Self { B }\n}\n",
+            ),
+        ]);
+        let new_at = |line| CallgraphExport {
+            file: root.join("src/guards.rs"),
+            symbol: "new".to_string(),
+            kind: "method".to_string(),
+            line,
+        };
+        let exports = vec![
+            export(&root, "src/main.rs", "main", "function"),
+            new_at(3),
+            new_at(7),
+        ];
+        let entry_points = [root.join("src/main.rs")].into_iter().collect();
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(paths, exports, Vec::new(), entry_points),
+        ));
+
+        assert_eq!(aggregate["count"], 1, "{aggregate:#}");
+        let item = aggregate_item(&aggregate, "src/guards.rs", "new").expect("new item");
+        assert_eq!(item["line"], 3, "{item:#}");
+        assert_eq!(item["other_lines"], json!([7]), "{item:#}");
     }
 }

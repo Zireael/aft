@@ -1,3 +1,6 @@
+const LINE_COUNT_BYTES: u64 = 1024 * 1024;
+const ENTRY_BUDGET: usize = 10_000;
+
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -11,7 +14,7 @@ use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, FileParser, LangId, TreeSitterProvider};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
@@ -397,6 +400,7 @@ struct OutlineDirectoryStats {
     dirs: usize,
     files: usize,
     lines: usize,
+    unknown_lines: usize,
     data_doc_files: usize,
     code_files: usize,
     code_lines: usize,
@@ -490,6 +494,7 @@ struct OutlineWalkOptions {
 
 #[derive(Debug, Clone)]
 struct OutlineFileDiscovery {
+    entries_examined: usize,
     files: Vec<String>,
     directories: Vec<String>,
     walk_truncated: bool,
@@ -514,6 +519,7 @@ fn handle_outline_files_mode(
     let mut file_entries = Vec::new();
     let mut directory_nodes = Vec::new();
     let mut tree_roots = Vec::new();
+    let mut entries_examined = 0usize;
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
@@ -545,6 +551,7 @@ fn handle_outline_files_mode(
             &dir_path
         };
         let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
+        entries_examined += discovery.entries_examined;
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
@@ -572,7 +579,15 @@ fn handle_outline_files_mode(
     );
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
-    let text = table.into_string();
+    let mut text = table.into_string();
+    let unknown_lines = file_entries
+        .iter()
+        .filter(|entry| entry.lines.is_none() && entry.language != "binary")
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if !unknown_lines.is_empty() {
+        text.push_str("\nLine counts unknown for unreadable files or text exceeding the 1048576-byte count budget; narrow: read a file range.\n");
+    }
     let rollup_count = rows
         .iter()
         .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
@@ -608,7 +623,7 @@ fn handle_outline_files_mode(
             .push("<additional files not counted: 10000-file walk limit reached>".to_string());
     }
     if collection_truncated {
-        unchecked_files.push("<additional files not counted: directory walk failed>".to_string());
+        unchecked_files.push("<additional files not counted: directory walk failed or 10000-entry examination budget reached>".to_string());
     }
     if skipped_foreign_mounts > 0 {
         unchecked_files.push(format!(
@@ -622,7 +637,10 @@ fn handle_outline_files_mode(
         "files": file_entries,
         "complete": !walk_truncated
             && !collection_truncated
-            && skipped_foreign_mounts == 0,
+            && skipped_foreign_mounts == 0
+            && unknown_lines.is_empty(),
+        "line_count_gaps": unknown_lines,
+        "entries_examined": entries_examined,
         "walk_truncated": walk_truncated,
         "walk_limit": OUTLINE_FILE_COLLECTION_CAP,
         "collection_truncated": collection_truncated,
@@ -806,6 +824,7 @@ fn aggregate_outline_directory(
         let entry = &file_entries[file_id];
         stats.files += 1;
         stats.lines += entry.lines.unwrap_or(0);
+        stats.unknown_lines += usize::from(entry.lines.is_none() && entry.language != "binary");
         if entry.data_doc {
             stats.data_doc_files += 1;
         } else {
@@ -818,6 +837,7 @@ fn aggregate_outline_directory(
         stats.dirs += child_stats.dirs + 1;
         stats.files += child_stats.files;
         stats.lines += child_stats.lines;
+        stats.unknown_lines += child_stats.unknown_lines;
         stats.data_doc_files += child_stats.data_doc_files;
         stats.code_files += child_stats.code_files;
         stats.code_lines += child_stats.code_lines;
@@ -1091,6 +1111,13 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
         });
     }
 
+    if file.metadata()?.len() > LINE_COUNT_BYTES {
+        return Ok(OutlineFileContentStats {
+            binary: false,
+            lines: None,
+        });
+    }
+    let mut file = file.take(LINE_COUNT_BYTES + 1 - sample_len as u64);
     let mut newline_count = sample[..sample_len]
         .iter()
         .filter(|byte| **byte == b'\n')
@@ -1108,6 +1135,12 @@ fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileConte
         last_byte = Some(buffer[read - 1]);
     }
 
+    if total_bytes as u64 > LINE_COUNT_BYTES {
+        return Ok(OutlineFileContentStats {
+            binary: false,
+            lines: None,
+        });
+    }
     let lines = newline_count + usize::from(total_bytes > 0 && last_byte != Some(b'\n'));
     Ok(OutlineFileContentStats {
         binary: false,
@@ -1241,7 +1274,10 @@ fn format_files_table(
                         entry.language,
                         entry.symbols.unwrap_or(0)
                     ),
-                    entry.lines.map(|lines| lines.to_string()),
+                    entry
+                        .lines
+                        .map(|lines| lines.to_string())
+                        .or_else(|| (entry.language == "binary").then(|| "-".to_string())),
                 )
             }
             OutlineTableRow::Rollup(node_id) => {
@@ -1249,13 +1285,13 @@ fn format_files_table(
                 (
                     format!("{}/", node.path.trim_end_matches('/')),
                     directory_rollup_summary(&node.stats),
-                    Some(node.stats.lines.to_string()),
+                    (node.stats.unknown_lines == 0).then(|| node.stats.lines.to_string()),
                 )
             }
         };
         output.push_str(&format!(
             "{path:<path_width$}  {middle:<middle_width$} {lines:>7} lines\n",
-            lines = lines.as_deref().unwrap_or("-"),
+            lines = lines.as_deref().unwrap_or("unknown"),
         ));
     }
 
@@ -1312,6 +1348,15 @@ fn outline_many_files(
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
     let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    // One parser for the whole batch, sharing the provider's symbol cache:
+    // the syntax check below leaves its tree in this parser's tree cache, and
+    // symbol extraction for the same file then reuses that tree instead of
+    // parsing the file a second time. Other providers keep the old path.
+    let mut batch_parser = ctx
+        .provider()
+        .as_any()
+        .downcast_ref::<TreeSitterProvider>()
+        .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()));
 
     for file in files {
         let path = match ctx.validate_path(req_id, Path::new(file)) {
@@ -1324,12 +1369,24 @@ fn outline_many_files(
         }
 
         let rel_path = display_path(&path, file, project_root);
-        if let Some(reason) = outline_skip_reason(&path) {
+        if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
+            if let Some(parser) = batch_parser.as_mut() {
+                parser.evict_parse_tree(&path);
+            }
             skipped_files.push(SkippedFile::new(rel_path, reason));
             continue;
         }
 
-        match ctx.provider().list_symbols(&path) {
+        let symbols = match batch_parser.as_mut() {
+            Some(parser) => {
+                let symbols = parser.extract_symbols(&path);
+                // Each file is outlined once; keeping its tree only adds memory.
+                parser.evict_parse_tree(&path);
+                symbols
+            }
+            None => ctx.provider().list_symbols(&path),
+        };
+        match symbols {
             Ok(symbols) => {
                 let entries = build_outline_tree(&symbols);
                 file_outlines.push(FileOutline {
@@ -1360,6 +1417,7 @@ fn discover_outline_files_with_options(
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut directories = Vec::new();
+    let mut entries_examined = 0;
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
@@ -1370,7 +1428,7 @@ fn discover_outline_files_with_options(
     if let Ok(boundary) = boundary {
         let mut device_lookup = crate::walk_boundary::filesystem_device_id;
         if breadth_first {
-            collect_outline_files_breadth_first_with_device_lookup(
+            entries_examined = collect_outline_files_breadth_first_with_device_lookup(
                 directory,
                 &mut files,
                 &mut directories,
@@ -1401,6 +1459,7 @@ fn discover_outline_files_with_options(
     directories.sort();
 
     OutlineFileDiscovery {
+        entries_examined,
         files,
         directories,
         walk_truncated,
@@ -1493,20 +1552,29 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
     options: Option<&OutlineWalkOptions>,
     boundary: &crate::walk_boundary::DeviceBoundary,
     device_lookup: &mut F,
-) where
+) -> usize
+where
     F: FnMut(&Path) -> std::io::Result<Option<u64>>,
 {
     let mut pending = VecDeque::from([directory.to_path_buf()]);
+    let mut entries_examined = 0usize;
 
     while let Some(current) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
-            return;
+            return entries_examined;
         }
         let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
-        let mut entries = entries.flatten().collect::<Vec<_>>();
+        let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
+        let mut entries = entries.take(remaining + 1).collect::<Vec<_>>();
+        entries_examined += entries.len();
+        if entries.len() > remaining {
+            entries.truncate(remaining);
+            *collection_truncated = true;
+        }
+        let mut entries = entries.into_iter().flatten().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
@@ -1541,7 +1609,7 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
                     *collection_truncated = true;
-                    return;
+                    return entries_examined;
                 }
             }
         }
@@ -1549,14 +1617,18 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
         for path in child_files {
             if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
                 *walk_truncated = true;
-                return;
+                return entries_examined;
             }
             if is_ignored_outline_path(&path, false, options) {
                 continue;
             }
             files.push(path.to_string_lossy().to_string());
         }
+        if *collection_truncated {
+            return entries_examined;
+        }
     }
+    entries_examined
 }
 
 fn is_ignored_outline_path(
@@ -1615,7 +1687,7 @@ fn display_path(path: &Path, fallback: &str, project_root: Option<&Path>) -> Str
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn outline_skip_reason(path: &Path) -> Option<&'static str> {
+fn outline_skip_reason(path: &Path, parser: Option<&mut FileParser>) -> Option<&'static str> {
     if !path.is_file() {
         return Some("file_not_found");
     }
@@ -1636,11 +1708,13 @@ fn outline_skip_reason(path: &Path) -> Option<&'static str> {
     // return whatever symbols it can recover from a partially-broken file rather
     // than surfacing a parse error. To honor the contract that parse-error files
     // land in `skipped_files` (not the rendered outline), we still run
-    // `validate_syntax()` here. The cost is one extra parse per file, but
-    // Track 0's parser cache (per-language reused `Parser`, global compiled
-    // `Query`) makes that parse cheap relative to the full symbol-extraction
-    // pass that follows.
-    match edit::validate_syntax(path) {
+    // `validate_syntax()` here. With a batch parser the tree it builds is
+    // reused by the symbol extraction that follows, so the file is parsed once.
+    let validated = match parser {
+        Some(parser) => edit::validate_syntax_with_parser(parser, path),
+        None => edit::validate_syntax(path),
+    };
+    match validated {
         Ok(Some(false)) => Some("parse_error"),
         Ok(Some(true)) | Ok(None) => None,
         Err(e) => Some(outline_error_reason(&e)),
@@ -1891,6 +1965,51 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    /// Multi-file outline checks each file's syntax and then extracts its
+    /// symbols. Both steps must share one parse; the syntax check used to
+    /// build its own parser and tree, so every outlined file was parsed twice
+    /// and every call loaded a grammar.
+    #[test]
+    fn multi_file_outline_parses_each_file_once() {
+        use crate::parser::work_counters::{grammar_loads, tree_parses};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut files = Vec::new();
+        for index in 0..20 {
+            let path = temp.path().join(format!("f{index:02}.ts"));
+            std::fs::write(&path, format!("export function f{index}() {{}}\n")).unwrap();
+            files.push(path.display().to_string());
+        }
+        let broken = temp.path().join("broken.ts");
+        std::fs::write(&broken, "function (\n").unwrap();
+        files.push(broken.display().to_string());
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "outline-parses",
+            "command": "outline",
+            "files": files,
+        }))
+        .unwrap();
+
+        let parses_before = tree_parses();
+        let loads_before = grammar_loads();
+        let response = serde_json::to_value(handle_outline(&request, &ctx)).unwrap();
+        let parses = tree_parses() - parses_before;
+        let loads = grammar_loads() - loads_before;
+
+        assert_eq!(parses, 21, "one parse per outlined file");
+        assert!(loads <= 1, "grammar loaded {loads} times for one language");
+        let text = response["text"].as_str().expect("outline text");
+        for index in 0..20 {
+            assert!(text.contains(&format!("f{index}")), "{text}");
+        }
+        let skipped = response["skipped_files"].as_array().expect("skipped files");
+        assert_eq!(skipped.len(), 1, "{response}");
+        assert_eq!(skipped[0]["reason"], "parse_error");
+    }
 
     #[test]
     fn outline_walk_skips_and_reports_injected_foreign_mount() {

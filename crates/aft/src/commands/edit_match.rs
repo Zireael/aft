@@ -196,6 +196,11 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return Response::success(&req.id, result);
     }
 
+    if existed && append_content.is_empty() {
+        return edit::no_change_response(&req.id);
+    }
+
+    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
     if create_dirs {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -232,10 +237,9 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    // Capture before-content for diff computation if requested. Only read it
-    // when the caller asked, since this allocates the whole file string.
+    // Capture the original text for the host's unified diff.
     let want_diff = edit::wants_diff(&req.params);
-    let before_content = if want_diff && existed {
+    let before_content = if existed {
         std::fs::read_to_string(path.as_path()).unwrap_or_default()
     } else {
         String::new()
@@ -383,6 +387,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         write_result.append_reformatted_excerpt_to(&mut result);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &before_content, &final_content);
     Response::success(&req.id, result)
 }
 
@@ -573,9 +578,20 @@ fn handle_glob_edit_match(
                     "deletions": deletions,
                 },
                 "preview_diff": preview_diff,
+                "metadata": { "diff": preview_diff },
             }),
         );
     }
+
+    if pending
+        .iter()
+        .all(|edit| edit.original_source == edit.new_source)
+    {
+        return edit::no_change_response(&req.id);
+    }
+    pending.retain(|edit| edit.original_source != edit.new_source);
+    let _view_intent =
+        crate::views::intent::record_paths(pending.iter().map(|edit| edit.path.as_path()));
 
     let mut captures = pending
         .iter()
@@ -807,6 +823,15 @@ fn handle_glob_edit_match(
         "format_skipped_count": format_skipped_count,
         "format_skip_reasons": format_skip_reasons,
     });
+    let diff = pending
+        .iter()
+        .map(|edit| {
+            let after =
+                std::fs::read_to_string(&edit.path).unwrap_or_else(|_| edit.new_source.clone());
+            edit::build_unified_diff(&edit.file_str, &edit.original_source, &after)
+        })
+        .collect::<String>();
+    result["metadata"] = serde_json::json!({ "diff": diff });
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
     Response::success(&req.id, result)
 }
@@ -1028,7 +1053,21 @@ pub(crate) fn push_fuzzy_replacement(
     matched: &crate::fuzzy_match::FuzzyMatch,
     replacement: &str,
 ) {
-    output.push_str(replacement);
+    let end = matched.byte_start + matched.byte_len;
+    // When the match leaves the source line separator outside its span, a
+    // replacement ending in a newline must not introduce a second separator.
+    let remaining = source[end..].trim_start_matches([' ', '\t']);
+    let separator_is_outside =
+        matched.pass > 1 && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
+    if separator_is_outside && replacement.ends_with('\n') {
+        output.push_str(
+            replacement
+                .strip_suffix("\r\n")
+                .unwrap_or(&replacement[..replacement.len() - 1]),
+        );
+    } else {
+        output.push_str(replacement);
+    }
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
         output.push('\n');
     }
@@ -1275,9 +1314,24 @@ fn handle_single_file_edit_match(
         if source == new_source {
             result["no_op"] = serde_json::json!(true);
         }
+        if fuzzy_matches[0].pass > 1 {
+            let selected = if replace_all {
+                &fuzzy_matches[..]
+            } else {
+                &fuzzy_matches[occurrence.unwrap_or(0)..occurrence.unwrap_or(0) + 1]
+            };
+            result["fuzzy_match"] =
+                crate::fuzzy_match::replacement_detail(&source, match_str, selected);
+        }
         edit::attach_preview_diff(&mut result, &req.params, file, &source, &new_source);
         return Response::success(&req.id, result);
     }
+
+    if source == new_source {
+        return edit::no_change_response(&req.id);
+    }
+
+    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
 
     // Auto-backup before mutation
     let label = if replace_all {
@@ -1328,6 +1382,15 @@ fn handle_single_file_edit_match(
         "formatted": write_result.formatted,
     });
 
+    if fuzzy_matches[0].pass > 1 {
+        let selected = if replace_all {
+            &fuzzy_matches[..]
+        } else {
+            &fuzzy_matches[occurrence.unwrap_or(0)..occurrence.unwrap_or(0) + 1]
+        };
+        result["fuzzy_match"] =
+            crate::fuzzy_match::replacement_detail(&source, match_str, selected);
+    }
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }
@@ -1375,6 +1438,7 @@ fn handle_single_file_edit_match(
         result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
+    edit::attach_mutation_diff(&mut result, file, &source, &final_content);
     Response::success(&req.id, result)
 }
 
@@ -1467,6 +1531,25 @@ mod replace_all_tests {
         assert_eq!(
             allocations, 1,
             "output construction must not allocate once per match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn fuzzy_crlf_separator_is_not_duplicated() {
+        let source = "a\r\nb\r\nc\r\n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, "a\nb\n");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\r\ny\r\n")
+                .unwrap(),
+            "x\r\ny\r\nc\r\n"
+        );
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\ny\n").unwrap(),
+            "x\ny\r\nc\r\n"
         );
     }
 }

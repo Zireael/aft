@@ -734,18 +734,74 @@ impl JobOutcome {
 /// the path, kept conservative to avoid hiding real product directories.
 pub(crate) fn is_test_support_file(relative_path: &str) -> bool {
     let normalized = relative_path.replace('\\', "/");
-    normalized.split('/').any(|segment| {
-        matches!(
-            segment,
-            "fixtures"
-                | "__fixtures__"
-                | "testdata"
-                | "test-data"
-                | "__mocks__"
-                | "__snapshots__"
-                | "corpora"
-        )
-    })
+    normalized.split('/').any(is_test_support_dir_name)
+}
+
+/// Whether one path segment is a conventional test-support directory name
+/// (fixtures, corpora, mock data, snapshots). Shared by the reporting filter
+/// above and the language-server walk, which starts no server for these
+/// directories.
+pub(crate) fn is_test_support_dir_name(segment: &str) -> bool {
+    matches!(
+        segment,
+        "fixtures"
+            | "__fixtures__"
+            | "testdata"
+            | "test-data"
+            | "__mocks__"
+            | "__snapshots__"
+            | "corpora"
+    )
+}
+
+/// Whether a project-relative path belongs to a test tree: an automated-test
+/// file or a test-support file (fixture, corpus, mock, snapshot). This is the
+/// same pair of predicates `aft_search` uses for its `includeTests` filter.
+///
+/// The code-health counts (dead code, unused exports, duplicates, TODOs) are
+/// meant to describe product code. Findings in these files are still computed
+/// (test files keep product symbols live, and test-only usage is reported
+/// separately), but they are withheld from the headline counts and reported
+/// as an `excluded_test_*` tally instead, so a generated fixture with hundreds
+/// of exports or TODOs cannot drown the numbers a reader actually acts on.
+pub(crate) fn is_test_tree_file(relative_path: &str) -> bool {
+    is_test_file(relative_path) || is_test_support_file(relative_path)
+}
+
+/// Findings withheld from a headline count because their file is a test-tree
+/// file (see [`is_test_tree_file`]). Recorded so the aggregate can say what was
+/// left out instead of silently dropping it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExcludedTestTally {
+    findings: usize,
+    files: BTreeSet<String>,
+}
+
+impl ExcludedTestTally {
+    pub(crate) fn record(&mut self, file: &str) {
+        self.record_many(file, 1);
+    }
+
+    /// Records one finding that spans several files (a duplicate group).
+    pub(crate) fn record_in_files<'a>(&mut self, files: impl IntoIterator<Item = &'a str>) {
+        self.findings += 1;
+        self.files.extend(files.into_iter().map(str::to_string));
+    }
+
+    pub(crate) fn record_many(&mut self, file: &str, findings: usize) {
+        if findings == 0 {
+            return;
+        }
+        self.findings += findings;
+        self.files.insert(file.to_string());
+    }
+
+    /// Writes `excluded_test_count` (withheld findings) and
+    /// `excluded_test_files` (distinct files they came from) into an aggregate.
+    pub(crate) fn write_into(&self, aggregate: &mut serde_json::Value) {
+        aggregate["excluded_test_count"] = serde_json::json!(self.findings);
+        aggregate["excluded_test_files"] = serde_json::json!(self.files.len());
+    }
 }
 
 /// Whether a project-relative path is an actual automated-test file (unit /

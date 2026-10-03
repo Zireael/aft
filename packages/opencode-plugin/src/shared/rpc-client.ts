@@ -133,19 +133,46 @@ export class AftRpcClient {
     const { signal } = options;
     throwIfAborted(signal);
 
+    // Fast path: reuse the endpoint that served the last warm response while
+    // it is still the newest live port file, skipping discovery's sequential
+    // health checks. Anything other than an accepted warm response falls back
+    // to the full scan below.
+    let placeholder: T | null = null;
+    let lastError: unknown = null;
+    let answeredPort: number | null = null;
+    const cached = this.cachedEndpoint();
+    if (cached) {
+      try {
+        const result = await this.callOne<T>(method, params, cached, signal);
+        if (this.looksLikePlaceholder(result)) {
+          placeholder = result;
+          answeredPort = cached.port;
+        } else if (!options.accept || options.accept(result)) {
+          return result;
+        } else {
+          answeredPort = cached.port;
+        }
+      } catch {
+        throwIfAborted(signal);
+      }
+      this.port = null;
+      this.token = null;
+    }
+
     // Try ALL discovered ports for this project (OpenCode TUI under --port 0
     // loads our plugin twice in the same process, so two RPC servers listen
-    // and we have to try both — only one's bridge is actually warm).
-    const infos = await this.resolvePortInfos(signal);
-    if (infos.length === 0) {
+    // and we have to try both — only one's bridge is actually warm). A port
+    // that already answered on the fast path is not asked again.
+    const infos = (await this.resolvePortInfos(signal)).filter(
+      (info) => info.port !== answeredPort,
+    );
+    if (infos.length === 0 && placeholder === null) {
       throw new Error("AFT RPC server not available");
     }
 
     // First pass: try every port. Prefer responses that look like "warm
     // bridge" output (i.e. not the synthetic `status: "not_initialized"`
     // placeholder served when this instance's bridge hasn't been spawned).
-    let placeholder: T | null = null;
-    let lastError: unknown = null;
     for (const info of infos) {
       throwIfAborted(signal);
       try {
@@ -248,6 +275,20 @@ export class AftRpcClient {
     if (!result || typeof result !== "object") return false;
     const status = (result as Record<string, unknown>).status;
     return status === "not_initialized";
+  }
+
+  /**
+   * The endpoint that served the last warm response, if it is still the newest
+   * live port file for this project. Discovery tries ports newest first and
+   * returns the first warm answer, so while this holds the full scan would
+   * reach the same server first. Reading the port files also drops entries
+   * whose owning process has died, so a dead server is never reused.
+   */
+  private cachedEndpoint(): PortInfo | null {
+    if (this.port === null) return null;
+    const [newest] = this.readAllPortFiles();
+    if (!newest || newest.port !== this.port || newest.token !== this.token) return null;
+    return newest;
   }
 
   /** Check if any RPC server is reachable. */

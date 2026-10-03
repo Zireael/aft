@@ -60,4 +60,19 @@ describe("BinaryBridge toolCall transport", () => {
     expect(result.bg_completions).toEqual(rawResponse.bg_completions);
     expect(result.preview_diff).toBe(rawResponse.preview_diff);
   });
+
+  test("puts the worker role in the tool_call envelope beside the session", async () => {
+    const bridge = new MockBridge({ id: "1", success: true, text: "ok" });
+
+    await bridge.toolCall("session-123", "bash", { command: "make" }, { workerSession: true });
+
+    expect(bridge.calls[0]?.params).toEqual({
+      name: "bash",
+      arguments: { command: "make" },
+      session_id: "session-123",
+      worker_session: true,
+    });
+    // worker_session is part of the request, not a transport option.
+    expect(bridge.calls[0]?.options).toBeUndefined();
+  });
 });

@@ -285,6 +285,14 @@ pub fn format_response_with_context(
     response: &Response,
     ctx: &FormatContext,
 ) -> String {
+    // The inspect tool is registered as `aft_inspect`; standalone tool calls
+    // keep that spelling while subc hoists it to `inspect`. Both must reach
+    // the inspect renderer rather than the raw-JSON fallback for tools the
+    // formatter does not know.
+    let bare_name = match bare_name {
+        "aft_inspect" => "inspect",
+        other => other,
+    };
     if !is_core_agent_tool(bare_name) {
         return serialized_text_or_failure(
             serde_json::to_string(response),
@@ -445,18 +453,26 @@ fn format_delete(data: &Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
-    if deleted.len() == 1 && skipped.is_empty() {
+    let mut text = if deleted.len() == 1 && skipped.is_empty() {
         let file = deleted[0]
             .get("file")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return format!("Deleted {file}");
+        format!("Deleted {file}")
+    } else {
+        let total = deleted.len() + skipped.len();
+        format!("Deleted {}/{} file(s)", deleted.len(), total)
+    };
+    // One `warning <text>` line per warning, the same shape undo uses.
+    for warning in deleted
+        .iter()
+        .flat_map(|entry| string_array(entry.get("warnings")))
+    {
+        text.push_str("\nwarning ");
+        text.push_str(&warning);
     }
-
-    let total = deleted.len() + skipped.len();
-    format!("Deleted {}/{} file(s)", deleted.len(), total)
+    text
 }
-
 fn format_move(data: &Value, ctx: &FormatContext) -> String {
     let response = data.as_object();
     let Some(file) = ctx
@@ -614,11 +630,20 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                         .map(|items| items.len().to_string())
                         .unwrap_or_else(|| "0".to_string())
                 });
-                [
+                let mut lines = vec![
                     format!("restored operation {op_id}"),
                     format!("files {files}"),
-                ]
-                .join("\n")
+                ];
+                lines.extend(
+                    response
+                        .get("warnings")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(|warning| format!("warning {warning}")),
+                );
+                lines.join("\n")
             } else {
                 // Prefer the agent's own path spelling: translate resolves a
                 // relative filePath against the project root before the undo
@@ -632,11 +657,14 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                     .unwrap_or_else(|| "(file)".to_string());
                 let backup =
                     import_string_field(response, "backup_id").unwrap_or_else(|| "—".to_string());
-                [
+                let mut lines = vec![
                     format!("restored {}", shorten_path(&file)),
                     format!("backup {backup}"),
-                ]
-                .join("\n")
+                ];
+                if let Some(warning) = import_string_field(response, "warning") {
+                    lines.push(format!("warning {warning}"));
+                }
+                lines.join("\n")
             }
         }
         Some("history") => {
@@ -671,6 +699,38 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                                 line.push_str("\n   ");
                                 line.push_str(description);
                             }
+                            let mut labels = entry
+                                .get("markers")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .filter(|marker| *marker != "external_change_checkpoint")
+                                .map(|marker| marker.replace('_', " "))
+                                .collect::<Vec<_>>();
+                            if let Some(checkpoint) = entry
+                                .get("external_change_checkpoint")
+                                .and_then(Value::as_str)
+                            {
+                                labels.push(format!(
+                                    "external change saved as checkpoint '{checkpoint}'"
+                                ));
+                            }
+                            if entry.get("previous_file").and_then(Value::as_bool) == Some(true) {
+                                let generation = entry
+                                    .get("generation")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default();
+                                labels.push(format!(
+                                    "previous file at this path (#{})",
+                                    generation + 1
+                                ));
+                            }
+                            if !labels.is_empty() {
+                                line.push_str("\n   [");
+                                line.push_str(&labels.join("; "));
+                                line.push(']');
+                            }
                             line
                         })
                         .collect::<Vec<_>>()
@@ -685,6 +745,9 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 .unwrap_or_else(|| "(checkpoint)".to_string());
             let files =
                 import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
+            let file_count = number_field(response, "file_count").unwrap_or(0);
+            let requested = number_field(response, "requested_count");
+            let paths = string_array(response.get("paths"));
             let skipped = records_field(response, "skipped");
             let skipped_text = if skipped.is_empty() {
                 "No skipped files.".to_string()
@@ -706,11 +769,28 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                     .join("\n");
                 format!("skipped\n{details}")
             };
-            let mut lines = vec![
-                format!("checkpoint created {name}"),
-                format!("files {files}"),
-                skipped_text,
-            ];
+            // A partial or empty checkpoint must not read like a full one.
+            let header = if file_count == 0 {
+                format!("checkpoint created {name} (empty)")
+            } else {
+                format!("checkpoint created {name}")
+            };
+            let files_line = match requested {
+                Some(requested) if requested != file_count => {
+                    format!("files {files} of {requested} requested")
+                }
+                _ => format!("files {files}"),
+            };
+            let mut lines = vec![header, files_line];
+            lines.extend(checkpoint_path_lines(&paths, &[]));
+            if file_count == 0 {
+                lines.push(if requested.is_none() {
+                    "Nothing was snapshotted: no files were named and this session has no AFT-edited files to fall back on. Name the files to keep with 'files' or 'path'.".to_string()
+                } else {
+                    "Nothing was snapshotted.".to_string()
+                });
+            }
+            lines.push(skipped_text);
             let evicted = response
                 .get("evicted")
                 .and_then(Value::as_array)
@@ -736,10 +816,35 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
                 .unwrap_or_else(|| "(checkpoint)".to_string());
             let files =
                 import_number_field(response, "file_count").unwrap_or_else(|| "0".to_string());
-            let mut lines = vec![
-                format!("checkpoint restored {name}"),
-                format!("files {files}"),
-            ];
+            let file_count = number_field(response, "file_count").unwrap_or(0);
+            let paths = string_array(response.get("paths"));
+            let unchanged = string_array(response.get("unchanged"));
+            let unchanged_count = i64::try_from(unchanged.len()).unwrap_or(i64::MAX);
+            // Only a restore that changed at least one file reads as
+            // "checkpoint restored"; an empty checkpoint, or one whose files
+            // all already matched, says that nothing changed instead.
+            let mut lines = if file_count == 0 {
+                vec![
+                    format!("checkpoint {name} holds no files; nothing was restored"),
+                    format!("files {files}"),
+                ]
+            } else if unchanged_count >= file_count {
+                vec![
+                    format!("checkpoint {name}: nothing to restore"),
+                    format!("files {files}, all already matched the checkpoint; none changed"),
+                ]
+            } else if unchanged_count > 0 {
+                vec![
+                    format!("checkpoint restored {name}"),
+                    format!("files {files} ({unchanged_count} already matched the checkpoint)"),
+                ]
+            } else {
+                vec![
+                    format!("checkpoint restored {name}"),
+                    format!("files {files}"),
+                ]
+            };
+            lines.extend(checkpoint_path_lines(&paths, &unchanged));
             if let Some(durability) = import_string_field(response, "durability") {
                 lines.push(durability);
             }
@@ -784,6 +889,32 @@ fn format_safety(data: &Value, ctx: &FormatContext) -> String {
     }
 }
 
+/// Most paths a checkpoint or restore result lists before summarising the rest.
+const CHECKPOINT_PATH_LINE_LIMIT: usize = 10;
+
+/// One `↳ path` line per checkpoint file, marking those in `unchanged`, so an
+/// agent can see which files a checkpoint or restore actually covered.
+fn checkpoint_path_lines(paths: &[String], unchanged: &[String]) -> Vec<String> {
+    let mut lines = paths
+        .iter()
+        .take(CHECKPOINT_PATH_LINE_LIMIT)
+        .map(|path| {
+            if unchanged.contains(path) {
+                format!("  ↳ {} (unchanged)", shorten_path(path))
+            } else {
+                format!("  ↳ {}", shorten_path(path))
+            }
+        })
+        .collect::<Vec<_>>();
+    if paths.len() > CHECKPOINT_PATH_LINE_LIMIT {
+        lines.push(format!(
+            "  ↳ … and {} more",
+            paths.len() - CHECKPOINT_PATH_LINE_LIMIT
+        ));
+    }
+    lines
+}
+
 fn format_timestamp(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
         return Some(text.to_string());
@@ -808,7 +939,7 @@ fn format_timestamp(value: &Value) -> Option<String> {
     Some(format_unix_millis_utc(millis.trunc() as i64))
 }
 
-fn format_unix_millis_utc(millis: i64) -> String {
+pub(crate) fn format_unix_millis_utc(millis: i64) -> String {
     let seconds = div_floor_i64(millis, 1000);
     let millisecond = millis.rem_euclid(1000);
     let days = div_floor_i64(seconds, 86_400);
@@ -2163,12 +2294,36 @@ fn format_inspect(response: &Response) -> String {
     if let Some(text) = format_inspect_terminal(&response.data) {
         return text;
     }
-    if let Some(text) = response.data.get("text").and_then(Value::as_str) {
-        return append_rendered_diagnostics(text, &response.data);
+    let body = if let Some(text) = response.data.get("text").and_then(Value::as_str) {
+        append_rendered_diagnostics(text, &response.data)
+    } else {
+        let json =
+            serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
+        append_rendered_diagnostics(&json, &response.data)
+    };
+    match inspect_partial_header(&response.data) {
+        Some(header) => format!("{header}\n{body}"),
+        None => body,
     }
-    let json =
-        serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
-    append_rendered_diagnostics(&json, &response.data)
+}
+
+#[cfg(test)]
+pub(crate) fn format_inspect_for_test(response: &Response) -> String {
+    format_inspect(response)
+}
+
+/// The one-line header of a partial inspect: it completed, but diagnostics
+/// are unknown for the named producers. Mirrors the OpenCode and Pi
+/// renderers.
+fn inspect_partial_header(data: &Value) -> Option<String> {
+    if data.get("inspect_terminal").and_then(Value::as_str) != Some("partial") {
+        return None;
+    }
+    let reason = data
+        .get("partial_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("diagnostics unknown");
+    Some(format!("PARTIAL: {reason} (see below)"))
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts appendRenderedDiagnostics.
@@ -2220,8 +2375,94 @@ fn render_inspect_diagnostics(data: &Value) -> String {
     lines.join("\n")
 }
 
-fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
+pub(crate) fn format_diagnostics_summary(summary: Option<&Value>) -> Option<String> {
+    format_diagnostics_summary_with(summary, false)
+}
+
+/// `format_diagnostics_summary` for a body that has already printed every
+/// non-file gap with its full reason (the inspect text does, on its
+/// "Incomplete diagnostics: producer ... failed (...)" lines). There the
+/// summary names each such producer and points at that line instead of
+/// repeating a reason that can be a multi-line cargo error.
+pub(crate) fn format_diagnostics_summary_with(
+    summary: Option<&Value>,
+    gap_reasons_rendered_above: bool,
+) -> Option<String> {
     let section = summary?.get("diagnostics")?.as_object()?;
+    if section.get("complete").and_then(Value::as_bool) == Some(false) {
+        let all_gaps = section
+            .get("gaps")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        // Scoped files without a report are counted, not named: a scope can
+        // hold hundreds of them, and inspect lists their causes and a bounded
+        // sample of paths on separate lines.
+        let uncovered_files = all_gaps
+            .iter()
+            .filter(|gap| gap.get("kind").and_then(Value::as_str) == Some("uncovered_file"))
+            .count();
+        let mut gaps = all_gaps
+            .iter()
+            .filter(|gap| gap.get("kind").and_then(Value::as_str) != Some("uncovered_file"))
+            .map(|gap| {
+                let producer =
+                    gap.get("producer").and_then(Value::as_str).map(|producer| {
+                        match gap.get("root").and_then(Value::as_str) {
+                            Some(root) => format!("{producer} @ {root}"),
+                            None => producer.to_string(),
+                        }
+                    });
+                let reason = gap
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable");
+                // A `checking_producer` gap is a server whose `cargo check`
+                // is still running, not a failure; its reason already names
+                // the server, so it is shown as it is.
+                if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
+                    return reason.to_string();
+                }
+                if let (true, Some(producer)) = (gap_reasons_rendered_above, &producer) {
+                    return format!("producer {producer} failed, reason above");
+                }
+                format!(
+                    "{}: {reason}",
+                    producer
+                        .as_deref()
+                        .or_else(|| gap.get("file").and_then(Value::as_str))
+                        .unwrap_or("unknown producer"),
+                )
+            })
+            .collect::<Vec<_>>();
+        if uncovered_files > 0 {
+            let files = if uncovered_files == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            gaps.push(format!(
+                "{uncovered_files} {files} without an authoritative report"
+            ));
+        }
+        let mut text = "diagnostics: unknown".to_string();
+        if !gaps.is_empty() {
+            text.push_str(&format!(" ({})", gaps.join("; ")));
+        }
+        if let Some(producers) = section.get("by_producer").and_then(Value::as_object) {
+            for (producer, counts) in producers {
+                if let (Some(errors), Some(warnings), Some(info), Some(hints)) = (
+                    counts.get("errors").and_then(Value::as_u64),
+                    counts.get("warnings").and_then(Value::as_u64),
+                    counts.get("info").and_then(Value::as_u64),
+                    counts.get("hints").and_then(Value::as_u64),
+                ) {
+                    text.push_str(&format!("; {errors} errors, {warnings} warnings, {info} info, {hints} hints from {producer}"));
+                }
+            }
+        }
+        return Some(text);
+    }
     let errors = section.get("errors").and_then(Value::as_u64);
     let warnings = section.get("warnings").and_then(Value::as_u64);
     let info = section.get("info").and_then(Value::as_u64);
@@ -2369,7 +2610,28 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         "impact" => format_impact_sections(record),
         _ => format_trace_data_sections(record),
     };
-    sections.join("\n")
+    let body = sections.join("\n");
+    // A checkout that reads another checkout's callgraph gets a one-line
+    // notice that the callers and line numbers below may not match its own
+    // files, followed, when the answer depends on files the borrowed graph
+    // does not reflect, by a line saying which and what to grep. The notices
+    // go first rather than last because a list cut short must end with its
+    // "shown N of M" line.
+    let notice = |field: &str| {
+        record
+            .get(field)
+            .and_then(Value::as_object)
+            .and_then(|notice| string_field(notice, "message"))
+    };
+    let mut lines: Vec<&str> = ["borrowed_callgraph", "borrowed_coverage"]
+        .into_iter()
+        .filter_map(notice)
+        .collect();
+    if lines.is_empty() {
+        return body;
+    }
+    lines.push(&body);
+    lines.join("\n")
 }
 
 fn missing_callgraph_collection(
@@ -2584,6 +2846,9 @@ fn format_call_tree_sections(
 
     let mut lines = Vec::new();
     render_call_tree_node(record, 0, &mut lines, include_unresolved);
+    if let Some(gap) = string_field(record, "gap") {
+        lines.push(gap.to_string());
+    }
     let hidden_test_callers = number_field(record, "hidden_test_callers").unwrap_or(0);
     if hidden_test_callers > 0 {
         lines.push(format!(
@@ -2593,7 +2858,10 @@ fn format_call_tree_sections(
     let is_envelope_governed =
         crate::list_surfaces::find_surface("callgraph", "call_tree", "payload.tree").is_some();
     let truncated = number_field(record, "truncated").unwrap_or(0);
-    let warning = if envelope.is_some() || (is_envelope_governed && truncated == 0) {
+    let warning = if record.contains_key("gap")
+        || envelope.is_some()
+        || (is_envelope_governed && truncated == 0)
+    {
         String::new()
     } else {
         depth_warning(record, "depth_limited", "truncated")
@@ -2756,6 +3024,13 @@ fn format_callers_sections(record: &serde_json::Map<String, Value>) -> Vec<Strin
             "{hidden_test_callers} callers in tests hidden — includeTests: true shows them"
         ));
     }
+    if let Some(note) = record
+        .get("macro_note")
+        .and_then(Value::as_object)
+        .and_then(|note| string_field(note, "message"))
+    {
+        sections.push(note.to_string());
+    }
     if let Some(env) = envelope {
         if let Some(trailer) = render_envelope_trailer(&env) {
             sections.push(String::new());
@@ -2777,14 +3052,17 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
         } else {
             "exact"
         };
-        let key = format!("{symbol}\0{provenance}");
+        let via = string_field(caller, "via").unwrap_or("");
+        let key = format!("{symbol}\0{via}\0{provenance}");
         let bucket = by_symbol_provenance.entry(key).or_default();
         if let Some(line) = number_field(caller, "line") {
             bucket.push(line);
         }
     }
     for (key, mut line_nums) in by_symbol_provenance {
-        let symbol = key.split('\0').next().unwrap_or("(unknown)");
+        let mut parts = key.split('\0');
+        let symbol = parts.next().unwrap_or("(unknown)");
+        let via = parts.next().unwrap_or("");
         let is_name_match = key.ends_with("\0name_match");
         line_nums.sort_unstable();
         let line_part = if line_nums.is_empty() {
@@ -2797,7 +3075,12 @@ fn render_callers_group_lines(group: &serde_json::Map<String, Value>) -> Vec<Str
                 .join(", ")
         };
         let marker = if is_name_match { " ~" } else { "" };
-        lines.push(format!("  ↳ {symbol}:{line_part}{marker}"));
+        let via_part = if via.is_empty() {
+            String::new()
+        } else {
+            format!(" via {via}")
+        };
+        lines.push(format!("  ↳ {symbol}:{line_part}{marker}{via_part}"));
     }
     lines
 }
@@ -3623,6 +3906,108 @@ mod status_memory_tests {
 }
 
 #[cfg(test)]
+mod safety_checkpoint_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn render(op: &str, data: Value) -> String {
+        let ctx = FormatContext::from_tool_call(
+            "safety",
+            &json!({ "op": op, "name": "cp" }),
+            Path::new("/repo"),
+        );
+        let response = Response {
+            id: "1".to_string(),
+            success: true,
+            data,
+        };
+        format_response_with_context("safety", &response, &ctx)
+    }
+
+    #[test]
+    fn checkpoint_lists_snapshotted_files_and_counts_against_the_request() {
+        let text = render(
+            "checkpoint",
+            json!({
+                "name": "cp",
+                "file_count": 1,
+                "requested_count": 2,
+                "paths": ["/repo/a.txt"],
+                "skipped": [{ "file": "/repo/gone.txt", "error": "No such file" }],
+            }),
+        );
+        assert_eq!(
+            text,
+            "checkpoint created cp\nfiles 1 of 2 requested\n  ↳ /repo/a.txt\nskipped\n  ↳ /repo/gone.txt: No such file"
+        );
+    }
+
+    #[test]
+    fn empty_tracked_file_checkpoint_says_nothing_was_snapshotted() {
+        let text = render(
+            "checkpoint",
+            json!({ "name": "cp", "file_count": 0, "paths": [] }),
+        );
+        assert!(
+            text.starts_with("checkpoint created cp (empty)\nfiles 0\nNothing was snapshotted"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn restore_lists_written_files_and_marks_those_already_in_place() {
+        let text = render(
+            "restore",
+            json!({
+                "name": "cp",
+                "file_count": 2,
+                "changed_count": 1,
+                "paths": ["/repo/a.txt", "/repo/b.txt"],
+                "unchanged": ["/repo/b.txt"],
+            }),
+        );
+        assert_eq!(
+            text,
+            "checkpoint restored cp\nfiles 2 (1 already matched the checkpoint)\n  ↳ /repo/a.txt\n  ↳ /repo/b.txt (unchanged)"
+        );
+    }
+
+    #[test]
+    fn restore_that_changed_nothing_does_not_read_as_restored() {
+        let text = render(
+            "restore",
+            json!({
+                "name": "cp",
+                "file_count": 1,
+                "changed_count": 0,
+                "paths": ["/repo/a.txt"],
+                "unchanged": ["/repo/a.txt"],
+            }),
+        );
+        assert!(!text.contains("checkpoint restored"), "{text}");
+        assert!(
+            text.starts_with(
+                "checkpoint cp: nothing to restore\nfiles 1, all already matched the checkpoint; none changed"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn restore_of_an_empty_checkpoint_does_not_read_as_restored() {
+        let text = render(
+            "restore",
+            json!({ "name": "cp", "file_count": 0, "paths": [], "unchanged": [] }),
+        );
+        assert!(!text.contains("checkpoint restored"), "{text}");
+        assert!(
+            text.starts_with("checkpoint cp holds no files; nothing was restored"),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod callgraph_format_tests {
     use super::*;
     use serde_json::json;
@@ -3726,6 +4111,30 @@ mod callgraph_format_tests {
 
         assert!(rendered.starts_with("1 path · 1 entry point"));
         assert!(!rendered.contains("at least"));
+    }
+
+    #[test]
+    fn borrowed_callgraph_disclosure_is_the_first_line_and_absent_otherwise() {
+        let plain = json!({ "total_callers": 0, "callers": [] });
+        let rendered = format_callgraph("callers", &plain, false);
+        assert_eq!(rendered, "0 callers · 0 file groups");
+
+        let mut borrowed = plain.clone();
+        borrowed["complete"] = json!(false);
+        borrowed["borrowed_callgraph"] = json!({ "message": "callgraph: borrowed from /owner" });
+        assert_eq!(
+            format_callgraph("callers", &borrowed, false),
+            "callgraph: borrowed from /owner\n0 callers · 0 file groups"
+        );
+
+        // The note about files the borrowed graph cannot see follows the
+        // disclosure, ahead of the answer.
+        borrowed["borrowed_coverage"] =
+            json!({ "message": "callgraph: the borrowed graph does not reflect 2 files here" });
+        assert_eq!(
+            format_callgraph("callers", &borrowed, false),
+            "callgraph: borrowed from /owner\ncallgraph: the borrowed graph does not reflect 2 files here\n0 callers · 0 file groups"
+        );
     }
 }
 
@@ -3912,5 +4321,34 @@ mod bash_companion_format_tests {
             ),
             "background task is not a PTY task: bash-1"
         );
+    }
+}
+
+#[cfg(test)]
+mod incomplete_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn failed_producer_never_renders_legacy_zero_as_a_total() {
+        let summary = serde_json::json!({"diagnostics": {
+            "complete": false, "errors": 0, "warnings": 0,
+            "gaps": [{"producer": "typescript", "reason": "initialize crashed"}]
+        }});
+        let text = format_diagnostics_summary(Some(&summary)).unwrap();
+        assert_eq!(
+            text,
+            "diagnostics: unknown (typescript: initialize crashed)"
+        );
+    }
+
+    #[test]
+    fn incomplete_diagnostics_keep_answering_producer_zero_labelled() {
+        let summary = serde_json::json!({"diagnostics": {
+            "complete": false, "errors": null, "warnings": null,
+            "gaps": [{"producer": "typescript", "reason": "initialize timed out"}],
+            "by_producer": {"rust": {"errors": 0, "warnings": 1, "info": 0, "hints": 0}}
+        }});
+        let text = format_diagnostics_summary(Some(&summary)).unwrap();
+        assert_eq!(text, "diagnostics: unknown (typescript: initialize timed out); 0 errors, 1 warnings, 0 info, 0 hints from rust");
     }
 }

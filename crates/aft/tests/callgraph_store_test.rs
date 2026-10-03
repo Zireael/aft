@@ -1,5 +1,5 @@
 #[path = "helpers/mod.rs"]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 use aft::callgraph::walk_project_files;
 use aft::callgraph_store::{
@@ -616,11 +616,13 @@ export function caller() { used(); }
     }
     assert_no_dangling_caller_nodes(store.sqlite_path());
 
+    // Adding `extra` above `used` moves `used`, so the caller's `used()` call
+    // is re-resolved and the caller becomes a dependency caller of this edit.
     let target = root.join("src/target.ts");
     write_file(
         &target,
-        "export function used() { return 1; }
-export function extra() { return 2; }
+        "export function extra() { return 2; }
+export function used() { return 1; }
 ",
     );
     bump_mtime(&target);
@@ -2897,4 +2899,79 @@ fn canonicalize_like_projection(path: &std::path::Path) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(display)
+}
+
+#[test]
+fn layered_diamond_call_tree_has_total_node_budget() {
+    let dir = tempdir().unwrap();
+    let mut source = String::new();
+    for level in 0..14 {
+        source.push_str(&format!(
+            "function layer{level}() {{ layer{}(); layer{}(); }}\n",
+            level + 1,
+            level + 1
+        ));
+    }
+    source.push_str("function layer14() {}\n");
+    write_file(&dir.path().join("main.ts"), &source);
+    let store =
+        CallGraphStore::open(dir.path().join(".store-budget"), dir.path().to_path_buf()).unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+    fn count(node: &aft::callgraph::CallTreeNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    let started = std::time::Instant::now();
+    let tree = store.call_tree(Path::new("main.ts"), "layer0", 20).unwrap();
+    eprintln!(
+        "diamond: nodes={}, elapsed={:?}",
+        count(&tree),
+        started.elapsed()
+    );
+    assert!(
+        count(&tree) <= 1000,
+        "total expansion must be bounded independently of depth"
+    );
+    assert!(tree.truncated > 0);
+}
+
+#[test]
+fn adapter_call_tree_shares_store_node_budget_and_gap() {
+    let dir = tempdir().unwrap();
+    let mut source = String::new();
+    for level in 0..14 {
+        source.push_str(&format!(
+            "function layer{level}() {{\n layer{}();\n layer{}();\n }}\n",
+            level + 1,
+            level + 1
+        ));
+    }
+    source.push_str("function layer14() {}\n");
+    write_file(&dir.path().join("main.ts"), &source);
+    let store = CallGraphStore::open(
+        dir.path().join(".store-adapter-budget"),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    store.cold_build(&project_files(dir.path())).unwrap();
+    let tree = aft::commands::callgraph_store_adapter::call_tree_result(
+        &store,
+        Path::new("main.ts"),
+        "layer0",
+        20,
+        true,
+    )
+    .unwrap();
+    fn count(node: &aft::commands::callgraph_store_adapter::StoreCallTreeNode) -> usize {
+        1 + node.children.iter().map(count).sum::<usize>()
+    }
+    assert!(count(&tree) <= 1000);
+    let adapter = serde_json::to_value(tree).unwrap();
+    let direct =
+        serde_json::to_value(store.call_tree(Path::new("main.ts"), "layer0", 20).unwrap()).unwrap();
+    assert_eq!(adapter["complete"], false);
+    assert_eq!(adapter["gap"], direct["gap"]);
+    assert_eq!(adapter["nodes_examined"], 1000);
+    let response = aft::protocol::Response::success("budget", adapter);
+    let text = aft::subc_format::format_response("call_tree", &response, false);
+    assert!(text.contains(aft::callgraph::CALL_TREE_WORK_GAP));
 }

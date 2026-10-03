@@ -13,6 +13,7 @@ import {
 } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
+import { describePluginEntry, pinnedPluginEntry } from "../setup/opencode-config.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
 import { type BuildBreakerSuspension, readBuildBreakerSuspensions } from "./build-breaker.js";
@@ -382,6 +383,41 @@ function pluginPackageNameForHarness(kind: string): string {
   return "@cortexkit/aft-opencode";
 }
 
+/**
+ * The OpenCode entry `doctor --fix` would rewrite: the configured npm entry
+ * when it is anything other than this CLI's exact pin, otherwise null.
+ */
+function openCodeEntryToPin(harness: HarnessDiagnostic, cliVersion: string): string | null {
+  if (harness.kind !== "opencode") return null;
+  const entry = harness.pluginCache.configuredEntry;
+  return entry && entry !== pinnedPluginEntry(normalizeVersion(cliVersion)) ? entry : null;
+}
+
+/**
+ * How to bring the plugin to this CLI's version. Every harness gets an exact
+ * version, never `@latest`: the plugin, the CLI and the binary must match, and
+ * for OpenCode the text names exactly what `doctor --fix` does (it pins the
+ * entry to this CLI's version and reinstalls the plugin package).
+ */
+function pluginVersionSkewRemediation(
+  harness: HarnessDiagnostic,
+  cliVersion: string,
+  older: boolean,
+): string {
+  const version = normalizeVersion(cliVersion);
+  const change = `${older ? "update" : "switch"} the plugin to ${version}`;
+  if (harness.kind === "pi") {
+    return `Run \`pi install npm:${pluginPackageNameForHarness(harness.kind)}@${version}\` to ${change}.`;
+  }
+  if (harness.kind === "omp") {
+    return `In ${harness.displayName}, ${change} (\`${pluginPackageNameForHarness(harness.kind)}@${version}\`), the version of this CLI.`;
+  }
+  const entry = openCodeEntryToPin(harness, cliVersion);
+  return entry
+    ? `Run \`${CLI} doctor --fix\` to pin the plugin entry to ${pinnedPluginEntry(version)} and ${change}.`
+    : `Run \`${CLI} doctor --fix\` to ${change}.`;
+}
+
 function pluginVersionSkewIssue(
   harness: HarnessDiagnostic,
   cliVersion: string,
@@ -390,19 +426,33 @@ function pluginVersionSkewIssue(
   if (!pluginVersion) return null;
   if (normalizeVersion(pluginVersion) === normalizeVersion(cliVersion)) return null;
 
-  const relation =
-    compareLooseSemver(pluginVersion, cliVersion) < 0 ? "older than" : "different from";
-  const packageName = pluginPackageNameForHarness(harness.kind);
+  const older = compareLooseSemver(pluginVersion, cliVersion) < 0;
+  const skew = older
+    ? `Plugin version (${pluginVersion}) is older than CLI (${cliVersion}). New binary cache won't be used until you update the plugin.`
+    : `Plugin version (${pluginVersion}) does not match CLI (${cliVersion}). New binary cache may not be used until the plugin and CLI match.`;
+  // An OpenCode entry that is not pinned to this CLI is the same problem with
+  // the same fix, so it is described here rather than reported separately.
+  const entry = openCodeEntryToPin(harness, cliVersion);
   return {
     code: "plugin_cli_version_skew",
     severity: "high",
     scope: harness.displayName,
-    message:
-      relation === "older than"
-        ? `Plugin version (${pluginVersion}) is older than CLI (${cliVersion}). New binary cache won't be used until you update the plugin.`
-        : `Plugin version (${pluginVersion}) does not match CLI (${cliVersion}). New binary cache may not be used until the plugin and CLI match.`,
-    remediation: `Update \`${packageName}\` in your harness config to \`@latest\`.`,
+    message: entry ? `${skew} The plugin entry ${entry} ${describePluginEntry(entry)}.` : skew,
+    remediation: pluginVersionSkewRemediation(harness, cliVersion, older),
   };
+}
+
+/**
+ * The plugin/CLI version-skew issue for one harness, or null when there is
+ * none. Doctor prints it in the harness section as well as under "Issues
+ * found", so both places carry the same text.
+ */
+export function pluginVersionSkewFor(
+  report: DiagnosticReport,
+  harness: HarnessDiagnostic,
+): DiagnosticIssue | null {
+  if (!harness.hostInstalled || !harness.aftConfig.enabled) return null;
+  return pluginVersionSkewIssue(harness, report.cliVersion);
 }
 
 export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIssue[] {
@@ -476,8 +526,8 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
       });
     }
 
-    const skewIssue = pluginVersionSkewIssue(h, report.cliVersion);
-    if (h.aftConfig.enabled && skewIssue) issues.push(skewIssue);
+    const skewIssue = pluginVersionSkewFor(report, h);
+    if (skewIssue) issues.push(skewIssue);
 
     if (h.aftConfig.enabled && h.onnxRuntime.required) {
       if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {

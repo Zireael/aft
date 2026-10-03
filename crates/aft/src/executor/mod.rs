@@ -1,5 +1,8 @@
 mod single_flight;
 pub(crate) mod view_publication;
+pub use view_publication::{
+    install_standalone_scope, standalone_request_gate, StandaloneGate, StandaloneScope,
+};
 
 #[cfg(test)]
 mod tests;
@@ -23,6 +26,12 @@ use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Respons
 pub use single_flight::SingleFlight;
 
 const JOB_COST: isize = 1;
+/// How long the subc frame loop's scheduler probes (`try_actor_context`,
+/// `try_actor_is_idle`, `try_retire_idle_actor_in_background`) wait for the
+/// scheduler lock before answering "busy". The lock guards short map
+/// updates; a few milliseconds rides out an ordinary holder that was
+/// preempted, while a holder stuck for longer cannot stall the loop.
+const SCHEDULER_PROBE_WAIT: Duration = Duration::from_millis(5);
 /// Continuous wake producers must not keep the scheduler mutex across an
 /// unbounded receiver drain; health probes and submitters get a lock turn
 /// between batches.
@@ -73,6 +82,9 @@ pub(crate) enum MaintenanceCoalesceKey {
     /// already scopes queue state by root, so this key cannot coalesce work for
     /// separate standing roots.
     StandingPass,
+    /// A live config reload re-reads the files, so one queued reload covers
+    /// every edit made before it runs.
+    ConfigReload,
 }
 
 pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>;
@@ -478,6 +490,8 @@ pub struct BindBlockerSnapshot {
 #[derive(Debug, Clone)]
 pub struct JobCancellation {
     inner: Arc<JobCancellationInner>,
+    root: Option<Arc<std::path::PathBuf>>,
+    lifecycle: Option<crate::context::SubcLifecycleAdmission>,
 }
 
 #[derive(Debug)]
@@ -500,7 +514,29 @@ impl JobCancellation {
                 wait_lock: Mutex::new(()),
                 wake: Condvar::new(),
             }),
+            root: None,
+            lifecycle: None,
         }
+    }
+
+    pub(crate) fn with_root(mut self, root: &std::path::Path) -> Self {
+        self.root = Some(Arc::new(root.to_path_buf()));
+        self
+    }
+
+    pub(crate) fn with_lifecycle(
+        mut self,
+        lifecycle: crate::context::SubcLifecycleAdmission,
+    ) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        let mut token = Self::new();
+        token.root = self.root.clone();
+        token.lifecycle = self.lifecycle.clone();
+        token
     }
 
     fn mark_running(&self) -> bool {
@@ -627,6 +663,14 @@ impl JobCancellation {
 
     /// True when a cancel won the state race and the job must abort.
     pub fn cancel_requested_before_commit(&self) -> bool {
+        // A deleted checkout cannot publish useful work. Check here as well as
+        // at admission so deletion during a batch does not wait for the reaper.
+        if self.root.as_ref().is_some_and(|root| !root.is_dir()) {
+            self.request_cancel();
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_if_abandoned(|| self.request_cancel());
+        }
         self.state() == JOB_CANCEL_STATE_CANCELLED
     }
 
@@ -794,8 +838,8 @@ pub(crate) fn install_actor_waiting_writers_for_test(
 }
 
 /// A route-bind job that can run more than once. The scheduler may admit such
-/// a bind beside a running maintenance job with only a shared hold on the
-/// actor's epoch gate; when the configure finds it must change the root, the
+/// a bind beside a running maintenance job or interactive readers with only a
+/// shared hold on the actor's epoch gate; when the configure finds it must change the root, the
 /// run is discarded and the same job is queued again as an exclusive writer.
 pub type RepeatableJob = Arc<dyn Fn(&AppContext) -> Response + Send + Sync + 'static>;
 
@@ -838,8 +882,10 @@ impl Drop for SharedBindScope {
 /// unchanged. That rebind only reads the published configuration and records
 /// the session in state behind its own locks, so it is safe next to readers,
 /// and making it wait for exclusive use would park it behind a configure tail
-/// unit that can run for many seconds on a large root. Such a bind starts with
-/// a shared hold; a configure that turns out to change the root calls
+/// unit that can run for many seconds on a large root, or behind a slow
+/// interactive read for as long as that read runs. Such a bind starts with a
+/// shared hold beside whatever already holds the gate for reading; a
+/// configure that turns out to change the root calls
 /// [`request_exclusive_rerun`] before its first change to actor state.
 pub fn current_bind_gate_is_shared() -> bool {
     CURRENT_BIND_GATE_SHARED.with(std::cell::Cell::get)
@@ -874,6 +920,7 @@ struct RunningJob {
     execution_started: Arc<AtomicBool>,
     completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
+    cancellation: Option<JobCancellation>,
 }
 
 #[derive(Debug, Clone)]
@@ -1032,11 +1079,12 @@ impl Executor {
         state.actors.get(root_id).is_some_and(ActorState::is_idle)
     }
 
-    /// Non-blocking idle probe for maintenance sweeps. A contended scheduler is
-    /// reported separately so root retirement can conservatively wait for the
-    /// next sweep without stalling the module loop.
+    /// Idle probe for maintenance sweeps that waits at most
+    /// [`SCHEDULER_PROBE_WAIT`] for the scheduler lock. A contended scheduler
+    /// is reported separately so root retirement can conservatively wait for
+    /// the next sweep without stalling the module loop.
     pub fn try_actor_is_idle(&self, root_id: &ProjectRootId) -> Option<bool> {
-        let state = self.inner.state.try_lock()?;
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
         Some(state.actors.get(root_id).is_some_and(ActorState::is_idle))
     }
 
@@ -1052,6 +1100,29 @@ impl Executor {
             state.actor_order.retain(|actor_root| actor_root != root_id);
             state.actors.remove(root_id)
         };
+        self.finish_idle_actor_retirement(root_id, removed)
+    }
+
+    /// [`Self::retire_idle_actor_in_background`] for the subc frame loop:
+    /// `None` when the scheduler lock stays contended past
+    /// [`SCHEDULER_PROBE_WAIT`], so the caller retries on its next sweep.
+    pub fn try_retire_idle_actor_in_background(&self, root_id: &ProjectRootId) -> Option<bool> {
+        let removed = {
+            let mut state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+            if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
+                return Some(false);
+            }
+            state.actor_order.retain(|actor_root| actor_root != root_id);
+            state.actors.remove(root_id)
+        };
+        Some(self.finish_idle_actor_retirement(root_id, removed))
+    }
+
+    fn finish_idle_actor_retirement(
+        &self,
+        root_id: &ProjectRootId,
+        removed: Option<ActorState>,
+    ) -> bool {
         let Some(actor) = removed else {
             return false;
         };
@@ -1087,6 +1158,69 @@ impl Executor {
         cancelled
     }
 
+    /// Quiesce drops queued maintenance; running jobs consult the lifecycle grace
+    /// through their tokens rather than being abandoned on a short disconnect.
+    pub(crate) fn cancel_queued_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let cancelled = self
+            .inner
+            .state
+            .lock()
+            .actors
+            .get_mut(root_id)
+            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .unwrap_or(0);
+        self.wake_scheduler();
+        cancelled
+    }
+
+    /// Cancel queued maintenance and signal running root work at its checkpoints.
+    /// Interactive tools other than inspect retain their normal completion path.
+    pub(crate) fn cancel_root_maintenance(&self, root_id: &ProjectRootId) -> usize {
+        let mut state = self.inner.state.lock();
+        if let Some(actor) = state.actors.get(root_id) {
+            view_publication::cancel_for_context(&actor.ctx);
+        }
+        let mut cancelled = state
+            .actors
+            .get_mut(root_id)
+            .map(|actor| actor.maintenance.cancel_queued_jobs())
+            .unwrap_or(0);
+        if let Some(actor) = state.actors.get_mut(root_id) {
+            for lane in [
+                Lane::PureRead,
+                Lane::SerialLspStatus,
+                Lane::HeavyInit,
+                Lane::Mutating,
+                Lane::MaintenanceCommit,
+            ] {
+                for job in actor
+                    .interactive
+                    .queue(lane)
+                    .iter()
+                    .filter(|job| job.command == "inspect")
+                {
+                    if let Some(token) = &job.cancellation {
+                        token.request_cancel();
+                        cancelled += 1;
+                    }
+                }
+            }
+        }
+        for job in state.running_jobs.values() {
+            if &job.root_id == root_id
+                && (job.job_class == JobClass::Maintenance || job.command == "inspect")
+            {
+                if let Some(token) = &job.cancellation {
+                    token.request_cancel();
+                    cancelled += 1;
+                }
+            }
+        }
+        drop(state);
+        self.wake_scheduler();
+        cancelled
+    }
+
     /// Return whether scheduler state currently has an actor for this root.
     pub fn actor_registered(&self, root_id: &ProjectRootId) -> bool {
         let state = self.inner.state.lock();
@@ -1101,6 +1235,29 @@ impl Executor {
             .actors
             .get(root_id)
             .map(|actor| Arc::clone(&actor.ctx))
+    }
+
+    /// [`Self::actor_context`] waiting at most [`SCHEDULER_PROBE_WAIT`] for
+    /// the scheduler lock: the outer `None` means it stayed contended. The subc frame
+    /// loop's maintenance sweeps use this and retry on the next sweep. Request
+    /// routing keeps the blocking form, because there a missing actor and a
+    /// busy scheduler mean different things.
+    pub fn try_actor_context(&self, root_id: &ProjectRootId) -> Option<Option<Arc<AppContext>>> {
+        let state = self.inner.state.try_lock_for(SCHEDULER_PROBE_WAIT)?;
+        Some(
+            state
+                .actors
+                .get(root_id)
+                .map(|actor| Arc::clone(&actor.ctx)),
+        )
+    }
+
+    /// Hold the scheduler state lock for the duration of `while_held`, so a
+    /// test can prove a caller does not wait for it.
+    #[cfg(test)]
+    pub(crate) fn hold_state_lock_for_test(&self, while_held: impl FnOnce()) {
+        let _held = self.inner.state.lock();
+        while_held();
     }
 
     /// Snapshot the registered actor contexts.
@@ -1218,12 +1375,40 @@ impl Executor {
         (completion_rx, cancellation)
     }
 
+    /// [`Executor::submit_cancellable_async`] for a tool call: the job is
+    /// labelled with the tool's name, so the census and the blockers a
+    /// waiting bind reports say which tool a long-running job is running.
+    pub fn submit_tool_call_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let cancellation = JobCancellation::new();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Interactive,
+            lane,
+            request_id,
+            tool.to_string(),
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+            None,
+        );
+        (completion_rx, cancellation)
+    }
+
     /// Submit a route-bind configure (a request id starting `subc-bind-`)
     /// that may run more than once, with an exact-job cancellation token.
     ///
     /// Unlike [`Executor::submit_cancellable_async`], the scheduler may admit
-    /// it beside a running maintenance job of its actor with only a shared
-    /// hold on the epoch gate; see [`request_exclusive_rerun`] for how a run
+    /// it beside a running maintenance job or readers of its actor with only a
+    /// shared hold on the epoch gate; see [`request_exclusive_rerun`] for how a run
     /// that must change the root hands its worker back.
     pub fn submit_bind_cancellable_async(
         &self,
@@ -1349,6 +1534,30 @@ impl Executor {
         self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
     }
 
+    /// Final persistence is allowed after unbind so TTL eviction does not lose
+    /// retained deltas. This exception does not admit indexing or refresh work.
+    pub(crate) fn submit_unbound_teardown_async(
+        &self,
+        root_id: ProjectRootId,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> oneshot::Receiver<Response> {
+        let (tx, rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Maintenance,
+            Lane::MaintenanceCommit,
+            request_id,
+            "unbound-teardown-persist".to_owned(),
+            job,
+            CompletionSender::Async(tx),
+            None,
+            None,
+            None,
+        );
+        rx
+    }
+
     #[cfg(test)]
     fn submit_maintenance_cancellable_async(
         &self,
@@ -1434,7 +1643,42 @@ impl Executor {
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
         rerun: Option<RepeatableJob>,
     ) {
-        let command = job_command(job_class, lane);
+        self.submit_labeled(
+            root_id,
+            job_class,
+            lane,
+            request_id,
+            job_command(job_class, lane),
+            job,
+            completion,
+            cancellation,
+            maintenance_coalesce_key,
+            rerun,
+        );
+    }
+
+    /// Queue one job. `command` is the label census, blocker and panic lines
+    /// show for it.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_labeled(
+        &self,
+        root_id: ProjectRootId,
+        job_class: JobClass,
+        lane: Lane,
+        request_id: String,
+        command: String,
+        job: ExecutorJob,
+        completion: CompletionSender,
+        cancellation: Option<JobCancellation>,
+        maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+        rerun: Option<RepeatableJob>,
+    ) {
+        let cancellation = if job_class == JobClass::Maintenance || command == "inspect" {
+            Some(cancellation.unwrap_or_else(JobCancellation::new))
+        } else {
+            cancellation
+        };
+        let mut cancellation = cancellation.map(|token| token.with_root(root_id.as_path()));
         let mut rerun = rerun;
         let mut job = Some(job);
         let mut completion = Some(completion);
@@ -1445,9 +1689,24 @@ impl Executor {
             match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
+                    if (job_class == JobClass::Maintenance || command == "inspect")
+                        && command != "unbound-teardown-persist"
+                    {
+                        cancellation = cancellation.map(|token| {
+                            token.with_lifecycle(actor.ctx.subc_lifecycle_admission())
+                        });
+                    }
                     let mut admission_error = None;
                     if job_class == JobClass::Maintenance {
-                        if maintenance_coalesce_key
+                        if (actor.ctx.subc_unbound_quiesced()
+                            && command != "unbound-teardown-persist")
+                            || !root_id.as_path().is_dir()
+                        {
+                            admission_error = Some(maintenance_cancelled_response(
+                                request_id.clone(),
+                                "maintenance root is unbound or missing",
+                            ));
+                        } else if maintenance_coalesce_key
                             .is_some_and(|key| actor.maintenance.has_maintenance_coalesce_key(key))
                         {
                             admission_error = Some(maintenance_cancelled_response(
@@ -1565,6 +1824,21 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
+    /// Snapshot RouteBind blockers, waiting for the scheduler lock if it is
+    /// held. The module's bind-deadline refusal uses it to name what held the
+    /// bind; it takes the same lock right after to cancel the bind, so
+    /// waiting here costs nothing extra.
+    pub fn bind_blocker_snapshot(
+        &self,
+        root_id: &ProjectRootId,
+        request_id: &str,
+    ) -> BindBlockerSnapshot {
+        self.inner
+            .state
+            .lock()
+            .bind_blocker_snapshot(root_id, request_id)
     }
 
     /// Snapshot RouteBind blockers without waiting on scheduler state. The subc
@@ -1857,6 +2131,19 @@ impl SchedulerState {
         snapshots
     }
 
+    /// When the most recently admitted reader still running on `root_id`
+    /// started, for interactive admission (see `next_interactive_lane`).
+    fn newest_in_flight_reader_started_at(&self, root_id: &ProjectRootId) -> Option<Instant> {
+        self.running_jobs
+            .values()
+            .filter(|job| {
+                job.root_id == *root_id
+                    && matches!(job.lane, Lane::PureRead | Lane::SerialLspStatus)
+            })
+            .map(|job| job.started_at)
+            .max()
+    }
+
     fn mutating_job_state_label(&self, root_id: &ProjectRootId, request_id: &str) -> &'static str {
         let Some(actor) = self.actors.get(root_id) else {
             return "actor_missing";
@@ -2066,7 +2353,8 @@ struct ActorState {
     actor_total_inflight: usize,
     writer_inflight: bool,
     /// The running writer is a route bind that started with a shared epoch
-    /// hold beside running maintenance (see `current_bind_gate_is_shared`).
+    /// hold beside running maintenance or readers (see
+    /// `current_bind_gate_is_shared`).
     shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
@@ -2270,14 +2558,30 @@ impl ClassQueues {
     /// overlap each other and never barrier the actor), then remaining lanes
     /// in arrival order. Maintenance keeps strict arrival order via
     /// `front_lane`.
-    fn next_interactive_lane(&self, now: Instant) -> Option<Lane> {
+    ///
+    /// `newest_reader_started_at` is when the most recently admitted reader
+    /// still running on this actor started. A writer is not promoted while
+    /// every running reader started before it queued and has run for
+    /// `READER_STUCK_CENSUS_AGE`: the writer cannot run until those readers
+    /// end, which may be never, so holding back new reads would only add an
+    /// outage of every read on the root to the writer's own wait.
+    fn next_interactive_lane(
+        &self,
+        now: Instant,
+        newest_reader_started_at: Option<Instant>,
+    ) -> Option<Lane> {
+        let stuck_readers_started_by = newest_reader_started_at
+            .filter(|started| now.saturating_duration_since(*started) >= READER_STUCK_CENSUS_AGE);
         let starved_writer = self.mutating.iter().any(|job| {
             let promotion_age = if is_configure_request(&job.request_id) {
                 BIND_PROMOTION_AGE
             } else {
                 INTERACTIVE_WRITER_PROMOTION_AGE
             };
+            let waits_only_on_stuck_readers =
+                stuck_readers_started_by.is_some_and(|newest| newest <= job.queued_at);
             now.saturating_duration_since(job.queued_at) >= promotion_age
+                && !waits_only_on_stuck_readers
         });
         if starved_writer {
             // Also stops NEW readers from being admitted on this actor while
@@ -2626,8 +2930,8 @@ struct RunJob {
     /// The actor's parked detached writers, also reported through
     /// [`current_actor_writer_waiting`].
     detached_writers: Arc<AtomicUsize>,
-    /// A route bind admitted while a maintenance job held the epoch gate: it
-    /// runs with a shared hold (see [`current_bind_gate_is_shared`]).
+    /// A route bind admitted while a maintenance job or reader held the epoch
+    /// gate: it runs with a shared hold (see [`current_bind_gate_is_shared`]).
     shared_bind_gate: bool,
     /// How to run this bind again if it has to be queued again.
     rerun: Option<RepeatableJob>,
@@ -3009,6 +3313,10 @@ fn dispatch_runnable_class(
         }
         let root_id = state.actor_order[state.cursor].clone();
         state.cursor = (state.cursor + 1) % state.actor_order.len();
+        let newest_reader_started_at = match job_class {
+            JobClass::Interactive => state.newest_in_flight_reader_started_at(&root_id),
+            JobClass::Maintenance => None,
+        };
 
         let run_job = {
             let Some(actor) = state.actors.get_mut(&root_id) else {
@@ -3042,6 +3350,7 @@ fn dispatch_runnable_class(
                 AdmissionPass::Class(job_class),
                 &state.config,
                 heavy,
+                newest_reader_started_at,
             )
         };
 
@@ -3094,7 +3403,14 @@ fn dispatch_queued_binds(
             let Some(actor) = state.actors.get_mut(&root_id) else {
                 continue;
             };
-            try_admit_actor(&root_id, actor, AdmissionPass::Bind, &state.config, heavy)
+            try_admit_actor(
+                &root_id,
+                actor,
+                AdmissionPass::Bind,
+                &state.config,
+                heavy,
+                None,
+            )
         };
         if let Some(run_job) = run_job {
             made_progress = true;
@@ -3140,6 +3456,7 @@ fn launch_run_job(
             execution_started: Arc::clone(&run_job.execution_started),
             completion_ownership: Arc::downgrade(&ownership),
             occupancy_reported: false,
+            cancellation: run_job.cancellation.clone(),
         },
     );
     debug_assert!(replaced.is_none());
@@ -3196,6 +3513,7 @@ fn try_admit_actor(
     pass: AdmissionPass,
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
+    newest_reader_started_at: Option<Instant>,
 ) -> Option<RunJob> {
     let bind_pass = pass == AdmissionPass::Bind;
     let job_class = match pass {
@@ -3212,7 +3530,7 @@ fn try_admit_actor(
             .map(|_| Lane::Mutating)?,
         AdmissionPass::Class(JobClass::Interactive) => actor
             .class_queues(JobClass::Interactive)
-            .next_interactive_lane(Instant::now())?,
+            .next_interactive_lane(Instant::now(), newest_reader_started_at)?,
         AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
     };
     let mut heavy_permit = None;
@@ -3280,16 +3598,18 @@ fn try_admit_actor(
         // A bind skips the per-actor interactive cap: HeavyInit jobs count
         // toward that cap without holding the epoch gate, and the writer only
         // needs the gate itself to be free. A repeatable bind also does not
-        // wait for a running maintenance job (typically a configure tail,
-        // whose single units can run for seconds on a large root) to release
-        // the gate: it starts beside it with a shared hold, which is all a
-        // rebind of an unchanged root needs. A run that must change the root
-        // is sent back and queued again as an exclusive writer. Interactive
-        // readers are short and stop being admitted once a bind has waited
-        // `BIND_PROMOTION_AGE`, so a bind still waits for them as before.
+        // wait for whatever holds the gate for reading (a configure tail,
+        // whose single units can run for seconds on a large root, or
+        // interactive readers, which are usually short but are not bounded:
+        // one slow read would otherwise hold every bind of its root until the
+        // bind deadline). It starts beside them with a shared hold, which is
+        // all a rebind of an unchanged root needs, the same hold readers
+        // admitted after it already overlap. A run that must change the root
+        // is sent back and queued again as an exclusive writer, which does
+        // wait for readers and maintenance. `writer_inflight` above still
+        // serializes binds and other writers per root.
         Lane::Mutating => {
-            (bind_may_share && actor.read_inflight == 0 && !actor.lsp_inflight)
-                || (!has_epoch_reader && (bind_pass || actor_has_interactive_capacity))
+            bind_may_share || (!has_epoch_reader && (bind_pass || actor_has_interactive_capacity))
         }
         // This lane has separate global and per-actor bounds: maintenance_cap
         // reserves workers globally, and the boolean prevents same-actor
@@ -3561,6 +3881,14 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             .is_some_and(JobCancellation::cancel_requested_before_commit)
     };
     let run = |job: ExecutorJob| {
+        if cancel_requested()
+            || ((run_job.job_class == JobClass::Maintenance || run_job.command == "inspect")
+                && ((run_job.ctx.subc_unbound_quiesced()
+                    && run_job.command != "unbound-teardown-persist")
+                    || !run_job.root_id.as_path().is_dir()))
+        {
+            return cancelled_before_execution();
+        }
         let can_start = run_job
             .cancellation
             .as_ref()
@@ -3646,8 +3974,14 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             // Same gate as reads: the job's mutations are protected by the
             // touched subsystems' own locks, and holding only the read gate
             // lets interactive PureReads overlap freely.
-            let _epoch = run_job.epoch.read();
-            run(job)
+            loop {
+                if cancel_requested() {
+                    return LaneRun::Finished(cancelled_before_execution());
+                }
+                if let Some(_epoch) = run_job.epoch.try_read_for(EPOCH_WAIT_POLL) {
+                    return LaneRun::Finished(run(job));
+                }
+            }
         }
     };
     LaneRun::Finished(response)

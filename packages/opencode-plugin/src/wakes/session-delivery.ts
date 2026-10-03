@@ -1,5 +1,22 @@
 import { Effect } from "effect";
 
+/**
+ * The `metadata.source` value on every prompt AFT admits into a session itself
+ * (background-completion wakes). OpenCode 2 runs every prompt, AFT's own
+ * included, through the session `prompt` hook; the hook reads this marker to
+ * tell AFT's machine-written text from text an operator typed, never the text.
+ */
+export const AFT_PROMPT_SOURCE = "aft";
+
+/** True when a prompt's metadata marks it as one AFT admitted itself. */
+export function isAftOriginatedPrompt(metadata: unknown): boolean {
+  return (
+    typeof metadata === "object" &&
+    metadata !== null &&
+    (metadata as { source?: unknown }).source === AFT_PROMPT_SOURCE
+  );
+}
+
 export interface V2SessionPromptInput {
   readonly sessionID: string;
   readonly text: string;
@@ -61,6 +78,9 @@ export class V2SessionDelivery {
           delivery: "steer",
           metadata: {
             ...input.metadata,
+            // Set last so no caller metadata can drop the marker the prompt
+            // hook relies on to treat this wake as machine-written.
+            source: AFT_PROMPT_SOURCE,
             task_ids: [...new Set(input.taskIDs)],
           },
         })

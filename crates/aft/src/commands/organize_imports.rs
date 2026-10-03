@@ -702,6 +702,7 @@ fn organized_from_statement(imp: &ImportStatement, lang: LangId) -> OrganizedImp
         namespace_import: imp.namespace_import.clone(),
         kind: imp.kind,
         attribute_clause: imports::es_import_attribute_clause(imp).map(str::to_string),
+        style: Some(imports::quotes::statement_style(&imp.raw_text)),
         raw_override,
     }
 }
@@ -741,6 +742,8 @@ struct OrganizedImport {
     namespace_import: Option<String>,
     kind: ImportKind,
     attribute_clause: Option<String>,
+    /// Quote and terminator of the source statement, kept when regenerating it.
+    style: Option<imports::quotes::EsImportStyle>,
     /// When set, the import is rendered verbatim from this string instead of
     /// being regenerated from the structured fields. Used by dialect-sensitive
     /// languages (e.g. Scala) where re-rendering would normalize across
@@ -827,6 +830,7 @@ fn organize_generic_group(
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
             attribute_clause: attribute_clause.map(str::to_string),
+            style: Some(imports::quotes::statement_style(&imp.raw_text)),
             raw_override: None,
         });
     }
@@ -878,6 +882,7 @@ fn organize_raw_preserving_group(
             namespace_import: imp.namespace_import.clone(),
             kind: imp.kind,
             attribute_clause: imports::es_import_attribute_clause(imp).map(str::to_string),
+            style: Some(imports::quotes::statement_style(&imp.raw_text)),
             raw_override: Some(imp.raw_text.trim().to_string()),
         })
         .collect();
@@ -960,13 +965,16 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
 
     for imp in imps {
         let visibility = imp.default_import.clone();
-        let mp = &imp.module_path;
+        // The parser separates a use-list prefix from its top-level entries.
+        // This organizer works on full use trees, unlike add/remove operations.
+        let use_tree = imports::rust_use_tree(imp);
+        let mp = &use_tree;
 
         // Check if this already has a use list (contains '{')
         if mp.contains('{') {
             // Already a tree like "serde::{Deserialize, Serialize}"
             // Extract prefix and items
-            if let Some(brace_pos) = mp.find("::{") {
+            if let Some(brace_pos) = mp.find("::{").filter(|_| !imp.module_path.is_empty()) {
                 let prefix = mp[..brace_pos].to_string();
                 let items_str = &mp[brace_pos + 3..mp.len() - 1]; // strip ::{ and }
                                                                   // Split on TOP-LEVEL commas only. A naive split(',') corrupts
@@ -1058,6 +1066,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
                     namespace_import: None,
                     kind: up.kind,
                     attribute_clause: None,
+                    style: None,
                     raw_override: None,
                 });
             }
@@ -1075,13 +1084,14 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             _ => ImportKind::Value,
         };
 
-        let module_path = if items.len() == 1 {
-            // Single item — no braces needed
-            format!("{}::{}", prefix, items[0])
-        } else {
-            // Multiple items — use tree
-            format!("{}::{{{}}}", prefix, items.join(", "))
-        };
+        let module_path =
+            if items.len() == 1 && items[0] != "self" && !items[0].starts_with("self as ") {
+                // Single item — no braces needed
+                format!("{}::{}", prefix, items[0])
+            } else {
+                // Multiple items — use tree
+                format!("{}::{{{}}}", prefix, items.join(", "))
+            };
 
         organized.push(OrganizedImport {
             module_path,
@@ -1090,6 +1100,7 @@ fn organize_rust_group(imps: &[&ImportStatement]) -> (Vec<OrganizedImport>, usiz
             namespace_import: None,
             kind,
             attribute_clause: None,
+            style: None,
             raw_override: None,
         });
     }
@@ -1209,7 +1220,7 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
             }
         }
         LangId::TypeScript | LangId::Tsx | LangId::JavaScript => {
-            imports::generate_import_line_with_namespace_and_attribute_clause(
+            imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
                 lang,
                 &imp.module_path,
                 &imp.names,
@@ -1217,6 +1228,7 @@ fn generate_organized_line(imp: &OrganizedImport, lang: LangId) -> String {
                 imp.namespace_import.as_deref(),
                 imp.kind == ImportKind::Type,
                 imp.attribute_clause.as_deref(),
+                imp.style,
             )
         }
         _ => {

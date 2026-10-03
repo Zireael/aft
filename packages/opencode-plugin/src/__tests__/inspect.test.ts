@@ -101,6 +101,29 @@ function freshTerminal() {
 }
 
 describe("aft_inspect tool", () => {
+  test("heads unknown diagnostics PARTIAL, never FRESH, and collapses repeated phases", () => {
+    const phases = [
+      ...Array.from({ length: 3 }, () => ({ id: "lsp_start", producer: "typescript" })),
+      { id: "lsp_start", producer: "rust" },
+      { id: "lsp_quiescence", producer: "rust" },
+    ];
+    const terminal = parseInspectTerminal({
+      inspect_terminal: "partial",
+      partial_reason: "diagnostics unknown for rust, typescript",
+      wait_stamp: { text: "waited: yes; completed: lsp_start ×4", phases },
+    });
+    expect(terminal?.kind).toBe("PARTIAL");
+    const rendered = renderInspectTerminal(terminal!, "body");
+    const lines = rendered.split("\n");
+    expect(lines[0]).toBe("PARTIAL: diagnostics unknown for rust, typescript (see below)");
+    expect(rendered).not.toContain("FRESH");
+    expect(rendered).toContain("- lsp_start ×4 (typescript 3, rust 1)");
+    expect(rendered).toContain("- lsp_quiescence (rust)");
+    expect(lines.filter((line) => line.startsWith("- lsp_start"))).toHaveLength(1);
+
+    const fresh = parseInspectTerminal({ inspect_terminal: "fresh", wait_stamp: { phases } });
+    expect(renderInspectTerminal(fresh!).split("\n")[0]).toBe("FRESH");
+  });
   test("documents blocking-fresh results, scope narrowing, and the alert channel", () => {
     const { tools } = createInspectHarness(() => freshTerminal());
     const inspect = tools.aft_inspect;
@@ -246,6 +269,26 @@ describe("aft_inspect tool", () => {
     await tools.aft_inspect.execute({}, createMockSdkContext(projectRoot));
 
     expect(toolCallCalls[0]?.options).toMatchObject({ transportTimeoutMs: 150_000 });
+  });
+
+  test("parses JSON-stringified sections and preserves scalar sections", async () => {
+    const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal());
+    for (const sections of ['["dead_code"]', '["todos","dead_code"]', "all"]) {
+      await tools.aft_inspect.execute({ sections }, createMockSdkContext(projectRoot));
+    }
+    expect(toolCallCalls.map((call) => call.rawArgs.sections)).toEqual([
+      ["dead_code"],
+      ["todos", "dead_code"],
+      "all",
+    ]);
+  });
+
+  test("rejects malformed JSON sections before dispatch", async () => {
+    const { toolCallCalls, tools } = createInspectHarness(() => freshTerminal());
+    await expect(
+      tools.aft_inspect.execute({ sections: '["dead_code"' }, createMockSdkContext(projectRoot)),
+    ).rejects.toThrow(/sections.*valid JSON/);
+    expect(toolCallCalls).toHaveLength(0);
   });
 
   test("sends explicit inspect arguments with the configured diagnostics budget", async () => {

@@ -47,6 +47,21 @@ maybeDescribe("hoisted tools (real bridge)", () => {
     expect(text).not.toContain("readFileSync"); // line 1 excluded
   });
 
+  test("read refuses an inverted range by name instead of returning nothing", async () => {
+    // Models that fill every declared property send inverted ranges like
+    // this one (startLine 12, endLine 4). It must be refused by name, not
+    // returned as an empty success.
+    await expect(
+      harness.callTool("read", {
+        path: "sample.ts",
+        startLine: 12,
+        endLine: 4,
+        offset: 12,
+        limit: 70,
+      }),
+    ).rejects.toThrow("invalid_range: startLine 12 is after endLine 4");
+  });
+
   test("read directory lists entries", async () => {
     const result = await harness.callTool("read", { path: "directory" });
     const text = harness.text(result);

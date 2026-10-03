@@ -184,6 +184,35 @@ export function runZoomToolcallSuite(
       ).rejects.toThrow("symbol 'missingSymbol' not found");
     });
 
+    test("placeholder targets merge with a real path + symbols request", async () => {
+      // Models that fill every declared property send a real path + symbols
+      // lookup next to a placeholder target {path: "x", symbol: "x"}. The real
+      // lookup must be answered and the `x` target reported on its own line.
+      const h = await harness();
+
+      const output = await runZoom(h, {
+        filePath: "sample.ts",
+        symbols: ["funcA", "funcB"],
+        url: "",
+        targets: { path: "x", symbol: "x" },
+        contextLines: 0,
+        callgraph: false,
+      });
+
+      expect(output).toContain("sample.ts:15-17 [function funcA]");
+      expect(output).toContain("sample.ts:19-21 [function funcB]");
+      expect(output).toContain('Symbol "x" not found in x:');
+
+      const empty = await runZoom(h, {
+        filePath: "sample.ts",
+        symbols: "funcA",
+        url: "",
+        targets: { path: "", symbol: "" },
+      });
+      expect(empty).toContain("sample.ts:15-17 [function funcA]");
+      expect(empty).not.toContain("Incomplete");
+    });
+
     test("cross-file targets return all-success server-rendered text through tool_call", async () => {
       const h = await harness();
 

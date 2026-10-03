@@ -1,10 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
-
-use super::persistence::ValidatedArtifact;
-
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 const MAX_WATCHES_PER_TASK: usize = 8;
 const CONTEXT_BEFORE: usize = 100;
@@ -176,6 +172,10 @@ impl WatchRegistry {
         self.watches.keys().cloned().collect()
     }
 
+    pub fn watch_specs(&self, task_id: &str) -> Vec<WatchSpec> {
+        self.watches.get(task_id).cloned().unwrap_or_default()
+    }
+
     /// Reconcile process-local watch state with the durable rows shared by actors.
     pub fn reconcile_watch_ids(
         &mut self,
@@ -246,47 +246,23 @@ impl WatchRegistry {
         self.watches.get(task_id).map_or(0, Vec::len)
     }
 
-    pub fn prime_file_cursor(&mut self, cursor_key: &str, file: &ValidatedArtifact) {
-        if self.scan_cursors.contains_key(cursor_key) {
-            return;
-        }
-        let len = file.len().unwrap_or(0);
-        self.scan_cursors.insert(cursor_key.to_string(), len);
-    }
-
     pub fn set_file_cursor(&mut self, cursor_key: &str, offset: u64) {
         self.scan_cursors.insert(cursor_key.to_string(), offset);
         self.scan_overlaps.remove(cursor_key);
     }
 
-    pub fn scan_file_new_bytes(
+    pub fn scan_chunk(
         &mut self,
         cursor_key: &str,
         task_id: &str,
-        file: &mut ValidatedArtifact,
+        bytes: &[u8],
+        start: u64,
     ) -> Vec<PatternMatch> {
-        if self.active_count(task_id) == 0 {
-            return Vec::new();
-        }
-        let cursor = self
-            .scan_cursors
-            .get(cursor_key)
-            .copied()
-            .unwrap_or_else(|| {
-                // Start at current EOF so a newly registered watch does not match old spill content.
-                file.len().unwrap_or(0)
-            });
-        if file.seek(SeekFrom::Start(cursor)).is_err() {
-            return Vec::new();
-        }
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
-            self.scan_cursors.insert(cursor_key.to_string(), cursor);
-            return Vec::new();
-        }
-        let next = cursor.saturating_add(bytes.len() as u64);
-        self.scan_cursors.insert(cursor_key.to_string(), next);
-        self.scan_new_bytes_at(cursor_key, task_id, &bytes, cursor)
+        self.scan_cursors.insert(
+            cursor_key.to_string(),
+            start.saturating_add(bytes.len() as u64),
+        );
+        self.scan_new_bytes_at(cursor_key, task_id, bytes, start)
     }
 
     pub fn scan_new_bytes(&mut self, task_id: &str, bytes: &[u8]) -> Vec<PatternMatch> {

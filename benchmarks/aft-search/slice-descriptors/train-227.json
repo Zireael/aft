@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "doctor-plugin-remediation",
+    "doctor-plugin-update-honest",
+    "zoom-targets-inspect-sections-json-string",
+    "release-notes-0.58"
+  ],
+  "note": "doctor plugin-skew reporting, doctor --fix plugin-update honesty, stringified aft_zoom targets and aft_inspect sections parsed at the plugin and translation boundary, release notes. No aft_search ranking, fusion, lane admission or truncation change."
+}

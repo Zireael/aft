@@ -66,10 +66,16 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact(
                     "crates/aft/src/commands/semantic_search/evidence_descriptor.rs",
                 ),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/external_disk_check.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/external_exact.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/nearest_names.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/plan_table.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/regex_route.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/snippet_bounds.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/split_query.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_comparator_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_lint_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_plan_table_test.rs"),
@@ -82,10 +88,16 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/commands/semantic_search/comparator.rs",
                 "crates/aft/src/commands/semantic_search/data_file.rs",
                 "crates/aft/src/commands/semantic_search/evidence_descriptor.rs",
+                "crates/aft/src/commands/semantic_search/external_disk_check.rs",
+                "crates/aft/src/commands/semantic_search/external_exact.rs",
                 "crates/aft/src/commands/semantic_search/generation_token.rs",
                 "crates/aft/src/commands/semantic_search/mod.rs",
+                "crates/aft/src/commands/semantic_search/nearest_names.rs",
                 "crates/aft/src/commands/semantic_search/plan_table.rs",
                 "crates/aft/src/commands/semantic_search/recall_audit.rs",
+                "crates/aft/src/commands/semantic_search/regex_route.rs",
+                "crates/aft/src/commands/semantic_search/snippet_bounds.rs",
+                "crates/aft/src/commands/semantic_search/split_query.rs",
                 "crates/aft/tests/engine_comparator_test.rs",
                 "crates/aft/tests/engine_lint_test.rs",
                 "crates/aft/tests/engine_plan_table_test.rs",
@@ -245,6 +257,22 @@ fn slices() -> Vec<Slice> {
             id: "A10-fence-and-ownership-audit",
             fence: vec![FenceRule::Prefix("crates/aft/tests/engine_audit_")],
             landed_paths: vec![AUDIT_PATH],
+        },
+        Slice {
+            id: "C1-rerank-core",
+            fence: vec![FenceRule::Prefix(
+                "crates/aft/src/commands/semantic_search/rerank/",
+            )],
+            landed_paths: vec![
+                "crates/aft/src/commands/semantic_search/rerank/fixture.rs",
+                "crates/aft/src/commands/semantic_search/rerank/mod.rs",
+                "crates/aft/src/commands/semantic_search/rerank/onnx.rs",
+                "crates/aft/src/commands/semantic_search/rerank/pool_export.rs",
+                "crates/aft/src/commands/semantic_search/rerank/remote.rs",
+                "crates/aft/src/commands/semantic_search/rerank/slot.rs",
+                "crates/aft/src/commands/semantic_search/rerank/synapse.rs",
+                "crates/aft/src/commands/semantic_search/rerank/tests.rs",
+            ],
         },
         Slice {
             id: "A11-live-engine-integration",
@@ -445,7 +473,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        19,
+        33,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {

@@ -97,7 +97,8 @@ jobs:
 
   unit-linux:
     name: Unit tests (Linux)
-    runs-on: ubuntu-22.04
+    # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -220,40 +221,13 @@ jobs:
         if: inputs.strict == true
         run: bun run --filter '*' build
 
-      # cortexkit/subconscious is a private repo, so the job-scoped
-      # GITHUB_TOKEN cannot read its releases. Family convention (also used
-      # by cortexkit-e2e / llm-runner / ai-proxy): mint a ~1h fine-grained
-      # cortexkit-ci App installation token per job — no PAT rotation.
-      # Secrets are absent on fork/contributor PRs (and until the repo gets
-      # them): skip the mint + fetch then (the subc e2e suites skip loudly)
-      # instead of failing CI. When the token IS minted, any fetch failure
-      # stays a hard failure.
-      - name: Check cross-repo app secrets
-        id: app_secrets
-        env:
-          APP_ID: ${{ secrets.CK_CI_APP_ID }}
-        run: echo "present=${APP_ID:+true}" >> "$GITHUB_OUTPUT"
-
-      - name: Mint cross-repo read token
-        id: app_token
-        if: steps.app_secrets.outputs.present == 'true'
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious
-
+      # cortexkit/subconscious is public, so the default job-scoped token can
+      # read its pinned release assets, including on fork pull requests.
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::notice::cross-repo token unavailable (fork PR?) — subc e2e suites will skip"
-            echo "path=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
@@ -265,6 +239,76 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
+
+  plugin-e2e-linux:
+    name: Plugin e2e (${{ matrix.suite }}, Linux)
+    # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: opencode-ndjson
+            package: opencode-plugin
+            args: "--path-ignore-patterns '**/subc-parity.e2e.test.ts'"
+          - suite: opencode-subc
+            package: opencode-plugin
+            args: "--test-name-pattern 'subc transport parity sweep'"
+          - suite: pi
+            package: pi-plugin
+            args: ""
+          - suite: bridge
+            package: aft-bridge
+            args: ""
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-linux
+          cache-on-failure: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install search parity dependency
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+      - name: Build aft-bridge dist
+        run: bun run --cwd packages/aft-bridge build
+      - name: Build aft before running e2e
+        run: cargo build -p agent-file-tools --bin aft
+      - name: Fetch pinned subc-core
+        id: subc_core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          path="$(./scripts/fetch-subc-core.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+      # Real process startup, git fixtures and module attachment can exceed Bun's
+      # five-second unit default. Individual deadline assertions remain unchanged.
+      - name: Run e2e suite
+        working-directory: packages/${{ matrix.package }}
+        run: time bun test --timeout 30000 src/__tests__/e2e/ ${{ matrix.args }}
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
+          AFT_SUBC_E2E_LOG_DIR: ${{ runner.temp }}/aft-subc-e2e-logs
+      - name: Upload subc diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: subc-e2e-logs-${{ matrix.suite }}-linux
+          path: ${{ runner.temp }}/aft-subc-e2e-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
   unit-linux-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (Linux)
@@ -279,6 +323,8 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-analyzer
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -300,6 +346,21 @@ jobs:
       - name: Install Pyright integration dependency
         run: npm install --global pyright@1.1.411
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Real TypeScript 7 and TypeScript 5 installs for
+      # typescript_native_lsp_test; the script exports their paths. Without
+      # them those tests skip, and the native server path has no coverage.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
+
+      - name: Install TypeScript test servers (pinned)
+        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
+
       - uses: actions/download-artifact@v4
         with:
           name: linux-nextest-archive
@@ -316,6 +377,9 @@ jobs:
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+          # rust-analyzer is installed above; tests that need a real one
+          # fail instead of skipping when it is missing.
+          AFT_TEST_REQUIRE_RUST_ANALYZER: "1"
           AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
 
       - name: Upload Linux integration crash cores
@@ -589,35 +653,13 @@ jobs:
           # unit-linux-storm job is the release-storm arbiter.
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
-      # See the Linux job: private-repo release read via the cortexkit-ci
-      # App token; absent secrets (fork PR / not yet configured) skip
-      # instead of failing.
-      - name: Check cross-repo app secrets
-        id: app_secrets
-        env:
-          APP_ID: ${{ secrets.CK_CI_APP_ID }}
-        run: echo "present=${APP_ID:+true}" >> "$GITHUB_OUTPUT"
-
-      - name: Mint cross-repo read token
-        id: app_token
-        if: steps.app_secrets.outputs.present == 'true'
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious
-
+      # cortexkit/subconscious is public, so the default job-scoped token can
+      # read its pinned release assets, including on fork pull requests.
       - name: Fetch pinned subc-core
         id: subc_core
         env:
-          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::notice::cross-repo token unavailable (fork PR?) — subc e2e suites will skip"
-            echo "path=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           path="$(./scripts/fetch-subc-core.sh)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
@@ -627,6 +669,7 @@ jobs:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
 
   unit-macos-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (macOS)
@@ -654,6 +697,25 @@ jobs:
           mkdir -p "$HOME/.cargo/bin"
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Real TypeScript 7 and TypeScript 5 installs for
+      # typescript_native_lsp_test; the script exports their paths. Without
+      # them those tests skip, and the native server path has no coverage.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
+
+      - name: Install TypeScript test servers (pinned)
+        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
 
       - uses: actions/download-artifact@v4
         with:
@@ -760,7 +822,10 @@ jobs:
   unit-windows-libtest:
     name: Cargo libtest + watcher (Windows)
     runs-on: windows-2022
-    timeout-minutes: 25
+    # A normal run takes about 18 minutes (build, lib tests, then the serial
+    # watcher suite). Windows runners vary by up to 1.6x in speed, which
+    # pushed a run with no failing test past a 25-minute limit.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 

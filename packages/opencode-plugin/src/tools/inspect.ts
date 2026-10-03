@@ -1,3 +1,4 @@
+import { coerceJsonCollectionParam } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
@@ -13,7 +14,7 @@ const INSPECT_TRANSPORT_HEADROOM_MS = 30_000;
 
 type ToolArg = ToolDefinition["args"][string];
 type StringOrStringArray = string | string[];
-export type InspectTerminalKind = "FRESH" | "INTERRUPTED" | "PHASE-FAILED";
+export type InspectTerminalKind = "FRESH" | "PARTIAL" | "INTERRUPTED" | "PHASE-FAILED";
 
 /** A completed inspect phase, normalized once for every terminal outcome. */
 export interface InspectPhaseEntry {
@@ -27,6 +28,8 @@ export interface InspectTerminal {
   kind: InspectTerminalKind;
   phases: InspectPhaseEntry[];
   waitStampText?: string;
+  /** Set for PARTIAL: which diagnostics producers are unknown. */
+  partialReason?: string;
   failedPhase?: InspectPhaseEntry;
   failureReason?: string;
   failureDetail?: string;
@@ -98,7 +101,12 @@ function terminalKind(response: Record<string, unknown>): InspectTerminalKind | 
   ]) {
     if (typeof value !== "string") continue;
     const normalized = value.toUpperCase().replaceAll("_", "-");
-    if (normalized === "FRESH" || normalized === "INTERRUPTED" || normalized === "PHASE-FAILED") {
+    if (
+      normalized === "FRESH" ||
+      normalized === "PARTIAL" ||
+      normalized === "INTERRUPTED" ||
+      normalized === "PHASE-FAILED"
+    ) {
       return normalized;
     }
   }
@@ -145,8 +153,11 @@ export function parseInspectTerminal(payload: unknown): InspectTerminal | undefi
     response.waitStamp,
     response.blocking_wait_stamp,
   );
+  // PARTIAL is a completed result like FRESH (it carries the same wait
+  // stamp); only its diagnostics are not authoritative.
+  const completed = kind === "FRESH" || kind === "PARTIAL";
   const phases = parseInspectPhaseEntries(
-    kind === "FRESH"
+    completed
       ? (waitStamp?.phases ??
           response.completed_phases ??
           response.completedPhases ??
@@ -158,8 +169,11 @@ export function parseInspectTerminal(payload: unknown): InspectTerminal | undefi
     return {
       kind,
       phases,
-      waitStampText:
-        kind === "FRESH" ? firstString(waitStamp?.text, waitStamp?.human_text) : undefined,
+      waitStampText: completed ? firstString(waitStamp?.text, waitStamp?.human_text) : undefined,
+      partialReason:
+        kind === "PARTIAL"
+          ? (asString(response.partial_reason) ?? "diagnostics unknown")
+          : undefined,
     };
   }
 
@@ -192,27 +206,54 @@ export function parseInspectTerminal(payload: unknown): InspectTerminal | undefi
   };
 }
 
-function formatPhase(entry: InspectPhaseEntry): string {
-  const details = [
-    entry.producer ? `producer: ${entry.producer}` : undefined,
-    entry.category ? `category: ${entry.category}` : undefined,
-    entry.alsoSatisfied.length > 0
-      ? `also satisfied: ${entry.alsoSatisfied.join(", ")}`
-      : undefined,
-  ].filter((detail): detail is string => Boolean(detail));
-  return details.length > 0 ? `${entry.id} (${details.join("; ")})` : entry.id;
+/**
+ * One line per phase id, with a count and a per-producer (or per-category)
+ * breakdown, largest first: `lsp_start ×25 (typescript 12, bash 6)`. A project
+ * with two dozen language servers otherwise printed two dozen near-identical
+ * lines. Mirrors `collapse_phase_entries` in the Rust phase log.
+ */
+export function collapseInspectPhases(phases: InspectPhaseEntry[]): string[] {
+  const groups: { id: string; count: number; labels: Map<string, number>; also: Set<string> }[] =
+    [];
+  for (const phase of phases) {
+    let group = groups.find((candidate) => candidate.id === phase.id);
+    if (!group) {
+      group = { id: phase.id, count: 0, labels: new Map(), also: new Set() };
+      groups.push(group);
+    }
+    group.count += 1;
+    const label = phase.producer ?? phase.category;
+    if (label) group.labels.set(label, (group.labels.get(label) ?? 0) + 1);
+    for (const category of phase.alsoSatisfied) group.also.add(category);
+  }
+  return groups.map((group) => {
+    // Array.prototype.sort is stable, so equal counts keep first-seen order.
+    const labels = [...group.labels.entries()].sort((left, right) => right[1] - left[1]);
+    const details: string[] = [];
+    if (group.count === 1 && labels.length === 1) details.push(labels[0][0]);
+    else if (labels.length > 0)
+      details.push(labels.map(([label, n]) => `${label} ${n}`).join(", "));
+    if (group.also.size > 0) details.push(`also satisfied: ${[...group.also].join(", ")}`);
+    const head = group.count > 1 ? `${group.id} ×${group.count}` : group.id;
+    return details.length > 0 ? `${head} (${details.join("; ")})` : head;
+  });
 }
 
 /** Render every terminal honestly without reducing failures to a generic error. */
 export function renderInspectTerminal(terminal: InspectTerminal, serverText?: string): string {
-  if (terminal.kind === "FRESH") {
-    const lines: string[] = [
-      terminal.kind,
-      `wait-stamp: ${terminal.waitStampText ?? "not supplied"}`,
-    ];
+  if (terminal.kind === "FRESH" || terminal.kind === "PARTIAL") {
+    // FRESH never heads a result whose diagnostics are unknown: that result
+    // is PARTIAL, and the header names the producers.
+    const header =
+      terminal.kind === "PARTIAL"
+        ? `PARTIAL: ${terminal.partialReason ?? "diagnostics unknown"} (see below)`
+        : terminal.kind;
+    const lines: string[] = [header, `wait-stamp: ${terminal.waitStampText ?? "not supplied"}`];
     lines.push(
       terminal.phases.length > 0
-        ? `completed phases:\n${terminal.phases.map((phase) => `- ${formatPhase(phase)}`).join("\n")}`
+        ? `completed phases:\n${collapseInspectPhases(terminal.phases)
+            .map((phase) => `- ${phase}`)
+            .join("\n")}`
         : "completed phases: none",
     );
     if (serverText?.trim()) lines.push(serverText);
@@ -303,7 +344,7 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
+      "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\n" +
       "Use `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\n" +
@@ -336,7 +377,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       ),
     },
     execute: async (args, context): Promise<string> => {
-      const sections = normalizeStringOrArray(args.sections);
+      const sections = normalizeStringOrArray(coerceJsonCollectionParam(args.sections, "sections"));
       const scoped = await resolveAndGateScope(ctx, context, normalizeStringOrArray(args.scope));
       if (scoped.denial) return permissionDeniedResponse(scoped.denial);
       const rawArgs: Record<string, unknown> = {};

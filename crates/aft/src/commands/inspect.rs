@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{Map, Value};
 
 use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
+use crate::config::Config;
 use crate::context::AppContext;
 use crate::inspect::diagnostics_category::{inspect_request_timeout, run_diagnostics_category};
 #[cfg(test)]
@@ -14,9 +15,10 @@ use crate::inspect::{
     format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
 };
+use crate::lsp::client::RustCheckState;
 use crate::lsp::manager::{
     ApplicabilityResolutionError, ApplicableServerFailure, ApplicableServerSnapshot,
-    ApplicableServerStartOutcomes,
+    ApplicableServerStartOutcomes, NotApplicableServer,
 };
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
@@ -24,7 +26,10 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
-const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
+// Give each waiting phase at most half the remaining work time so a slow
+// producer leaves room for other categories and final freshness verification.
+// The cap avoids turning large configured budgets into equally long waits.
+const INSPECT_PHASE_WAIT_CAP: Duration = Duration::from_secs(60);
 /// Reserve time inside the configured request budget for terminal assembly and
 /// egress. The server always answers before the client gives up: server work
 /// stops before `diagnostics_timeout_ms`, while the client waits for that budget
@@ -64,7 +69,8 @@ impl InspectRequestDeadline {
     }
 
     fn phase_deadline(self, phase_limit: Duration) -> Instant {
-        (Instant::now() + phase_limit).min(self.work_at)
+        let now = Instant::now();
+        now + (self.work_at.saturating_duration_since(now) / 2).min(phase_limit)
     }
 
     fn has_work_budget(self) -> bool {
@@ -174,6 +180,48 @@ fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
 #[cfg(not(test))]
 fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
     false
+}
+
+// Host abort tests need the call to remain in flight, regardless of project size.
+// This environment-only seam also obeys the request budget and cancellation so
+// an abort never has to wait for the artificial delay to expire.
+fn delay_inspect_body_from_env_for_test(deadline: InspectRequestDeadline) {
+    let Some(delay) = std::env::var("AFT_TEST_INSPECT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+    else {
+        return;
+    };
+    wait_inspect_test_delay(
+        delay,
+        deadline,
+        crate::executor::current_job_cancellation().as_ref(),
+    );
+}
+
+fn wait_inspect_test_delay(
+    delay: Duration,
+    deadline: InspectRequestDeadline,
+    cancellation: Option<&crate::executor::JobCancellation>,
+) {
+    let started = Instant::now();
+    loop {
+        let remaining = delay
+            .saturating_sub(started.elapsed())
+            .min(deadline.work_at().saturating_duration_since(Instant::now()));
+        if remaining.is_zero() {
+            return;
+        }
+        let wait = remaining.min(Duration::from_millis(50));
+        if let Some(token) = cancellation {
+            if token.wait_for_cancellation(wait) {
+                return;
+            }
+        } else {
+            std::thread::sleep(wait);
+        }
+    }
 }
 
 struct DeferredInspectRootPermit {
@@ -299,7 +347,35 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], None, None)
+    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None)
+}
+
+/// Resolve the language servers an inspect should start, within the request
+/// deadline. A scoped inspect considers only files inside the scope: a server
+/// is selected only when at least one scoped file is one it handles, so a
+/// scope of `.rs` files never starts TypeScript because some `.mjs` file lives
+/// elsewhere in the project, and rust-analyzer starts only for the Cargo
+/// workspace that owns the scoped Rust files.
+///
+/// The filesystem walk runs without the language-server manager lock; only
+/// the per-server classification takes it. The walk covers the whole
+/// inspected tree, and while it held the lock every other manager user
+/// waited, including the standalone request loop, so a sibling `read` sent
+/// during an inspect was not answered until the walk finished.
+fn resolve_inspect_applicability(
+    ctx: &AppContext,
+    project_root: &Path,
+    scoped_roots: Option<&[PathBuf]>,
+    config: &Config,
+    deadline: Instant,
+) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+    let walk = crate::lsp::manager::walk_applicable_area(
+        project_root,
+        scoped_roots,
+        config,
+        Some(deadline),
+    )?;
+    Ok(ctx.lsp().classify_applicable_servers(walk, config))
 }
 
 /// Test-only warm-path entry that preserves nonblocking diagnostics semantics
@@ -309,7 +385,18 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 #[doc(hidden)]
 pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
-    handle_inspect_payload(req, ctx, false, false, &[], &[], Some(&phase_log), None)
+    handle_inspect_payload(
+        req,
+        ctx,
+        false,
+        false,
+        &[],
+        &[],
+        &[],
+        &[],
+        Some(&phase_log),
+        None,
+    )
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -343,15 +430,13 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let scope = parse_scope(req, ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = {
-        let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_inspect(
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
+    let applicability = resolve_inspect_applicability(
+        ctx,
+        &snapshot.project_root,
+        scoped_roots,
+        &snapshot.config,
+        deadline.work_at(),
+    );
     let response = match applicability {
         Ok(applicability) => {
             run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
@@ -371,17 +456,20 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     response
 }
 
-/// Diagnostics collection is always the warm working set, with or without a
-/// request scope: scope filters rendered findings and adds per-file authority
-/// (named gaps for scoped files no producer has authoritatively analyzed),
-/// never extra collection work.
+/// Diagnostics read the warm working set, with or without a request scope.
+/// A blocking scoped request first has its started language servers analyze
+/// the scoped files (see `scoped_diagnostics_sweep`); scope then filters the
+/// rendered findings and adds per-file authority (named gaps for scoped files
+/// no producer has authoritatively analyzed).
 fn handle_inspect_payload(
     req: &RawRequest,
     ctx: &AppContext,
     force_root_diagnostics: bool,
     applicability_is_empty: bool,
     producer_failures: &[ApplicableServerFailure],
+    not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
+    indexing_gaps: &[(ServerKey, String)],
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
 ) -> Response {
@@ -411,11 +499,27 @@ fn handle_inspect_payload(
         return inspect_interrupted_response(&req.id);
     }
 
+    // Wait while the request's config/query guard is alive. The result is pinned
+    // once and handed into workers; they must not open another generation.
+    let routed_store = if ctx.checkout_query_runtime_active() {
+        ctx.callgraph_store_for_ops()
+    } else {
+        crate::context::CallgraphStoreAccess::Unavailable
+    };
+    let checkout_routed = ctx.checkout_query_outcome().is_some();
+    let checkout_store = if checkout_routed {
+        match routed_store {
+            crate::context::CallgraphStoreAccess::Ready(store) => Some(store),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let manager = ctx.inspect_manager();
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
-            InspectRequestDeadline::work_at,
+            |deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
         )
     });
     let mut outcomes = BTreeMap::new();
@@ -442,21 +546,22 @@ fn handle_inspect_payload(
         .copied()
         .filter(|category| category.is_tier2())
     {
-        if !ctx.inspect_writer() {
+        if scope_was_provided || !ctx.inspect_writer() {
             continue;
         }
-        let phase_entry = InspectPhaseEntry::category(InspectPhaseId::Tier2Rescan, category);
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
-            return phase_failure_response(
-                &req.id,
-                &phase_entry,
-                "inspect_request_timeout",
-                request_deadline
-                    .expect("checked request deadline")
-                    .timeout_detail(InspectPhaseId::Tier2Rescan),
+            outcomes.insert(
+                category,
+                JobOutcome::Failed {
+                    message: request_deadline
+                        .expect("checked request deadline")
+                        .timeout_detail(InspectPhaseId::Tier2Rescan),
+                },
             );
+            continue;
         }
         let manager = manager.clone();
+        let checkout_store = checkout_store.clone();
         let snapshot = snapshot.clone();
         let scope = scope.clone();
         let callgraph_phase = phase_log.and_then(|phase_log| {
@@ -485,7 +590,9 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         std::thread::spawn(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if force_root_diagnostics {
+            let outcome = if checkout_routed {
+                manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
+            } else if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
             } else {
                 manager.tier2_run_with_reuse_blocking(snapshot, category, scope)
@@ -497,8 +604,8 @@ fn handle_inspect_payload(
             (
                 rx,
                 request_deadline.map_or_else(
-                    || std::time::Instant::now() + BLOCKING_TIER2_PHASE_TIMEOUT,
-                    |deadline| deadline.phase_deadline(BLOCKING_TIER2_PHASE_TIMEOUT),
+                    || std::time::Instant::now() + INSPECT_PHASE_WAIT_CAP,
+                    |deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
                 ),
                 callgraph_phase,
                 tier2_phase,
@@ -506,7 +613,19 @@ fn handle_inspect_payload(
         );
     }
 
-    for category in InspectCategory::active() {
+    // Diagnostics goes last: a blocking scoped request spends part of the
+    // budget asking language servers to analyze the scoped files, and the
+    // other categories' scans must not find their shared deadline already
+    // used up by that wait.
+    let ordered_categories = InspectCategory::active()
+        .iter()
+        .filter(|category| **category != InspectCategory::Diagnostics)
+        .chain(
+            InspectCategory::active()
+                .iter()
+                .filter(|category| **category == InspectCategory::Diagnostics),
+        );
+    for category in ordered_categories {
         if outcomes.contains_key(category) {
             continue;
         }
@@ -514,9 +633,9 @@ fn handle_inspect_payload(
             return inspect_interrupted_response(&req.id);
         }
         let outcome = if *category == InspectCategory::Diagnostics {
-            // Diagnostics use the serial LSP lane rather than the inspect worker
-            // pool. A non-authoritative collection remains a non-fresh outcome;
-            // it is never converted into a partial inspect payload below.
+            // Read the warm LSP store with named gaps for producers whose wait
+            // expired. A blocking scoped request first has its started servers
+            // analyze the scoped files, within half the remaining budget.
             run_diagnostics_category(
                 ctx,
                 &snapshot,
@@ -524,7 +643,12 @@ fn handle_inspect_payload(
                 scope_was_provided,
                 applicability_is_empty,
                 producer_failures,
+                not_applicable,
                 expected_producers,
+                indexing_gaps,
+                request_deadline
+                    .filter(|_| scope_was_provided)
+                    .map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline, callgraph_phase, tier2_phase)) =
@@ -538,26 +662,7 @@ fn handle_inspect_payload(
                     request_deadline,
                 ) {
                     Some(outcome) => {
-                        let request_timed_out = outcome.payload().is_none()
-                            && matches!(
-                                &outcome,
-                                JobOutcome::Failed { message }
-                                    if message.contains("inspect_request_timeout")
-                            );
                         finish_tier2_phases(&outcome, callgraph_phase, tier2_phase);
-                        if request_timed_out {
-                            return phase_failure_response(
-                                &req.id,
-                                &InspectPhaseEntry::category(
-                                    InspectPhaseId::Tier2Rescan,
-                                    *category,
-                                ),
-                                "inspect_request_timeout",
-                                request_deadline
-                                    .expect("request timeout requires a shared deadline")
-                                    .timeout_detail(InspectPhaseId::Tier2Rescan),
-                            );
-                        }
                         outcome
                     }
                     None => return inspect_interrupted_response(&req.id),
@@ -581,13 +686,135 @@ fn handle_inspect_payload(
     // than reading as zero.
     refresh_status_bar_counts(ctx, &outcomes);
 
+    // Scoped inspection never schedules or joins project-wide Tier-2 work.
+    // Missing or stale cached results are gaps, not verified zero counts.
+    if scope_was_provided {
+        for (category, outcome) in &mut outcomes {
+            if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
+                let reason = match &*outcome {
+                    JobOutcome::Failed { message } => message.clone(),
+                    JobOutcome::Stale { .. } => "cached analysis could not be stat-verified".into(),
+                    _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
+                    _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
+                };
+                *outcome = JobOutcome::Fresh {
+                    payload: serde_json::json!({"unavailable": true, "complete": false,
+                        "gaps": [{"kind": "tier2_unavailable", "reason": reason}]}),
+                };
+            }
+        }
+    }
+    if request_deadline.is_some() {
+        // Completed categories survive another scanner's budget exhaustion. Do
+        // not reuse unverified stale rows as if they were current findings.
+        for (category, outcome) in outcomes.iter_mut() {
+            if !matches!(outcome, JobOutcome::Fresh { .. }) {
+                let reason = match &*outcome {
+                    JobOutcome::Failed { message } => message.clone(),
+                    _ => "analysis did not finish within its wait budget".to_string(),
+                };
+                // Name the scanner that did not finish; the gap has no
+                // language server behind it.
+                let producer = if category.is_tier2() {
+                    format!("{} analysis (Tier-2)", category.as_str())
+                } else {
+                    format!("{} scanner", category.as_str())
+                };
+                *outcome = JobOutcome::Fresh {
+                    payload: serde_json::json!({
+                        "unavailable": true, "complete": false,
+                        "gaps": [{"kind": "analysis_incomplete", "producer": producer, "reason": format!("{reason}; retry aft_inspect") }]
+                    }),
+                };
+            }
+        }
+    }
     let payloads = match fresh_payloads(&outcomes) {
         Ok(payloads) => payloads,
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
     };
 
-    let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
+    let mut payload =
+        build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
+    // A scoped answer carries only the notes of servers for its own files; a
+    // TypeScript SDK note from a server started for another request does not
+    // belong in an answer about Rust files.
+    let runtime_notes = if scope_was_provided {
+        let producers =
+            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures);
+        ctx.lsp().runtime_notes_for(&producers)
+    } else {
+        ctx.lsp().runtime_notes()
+    };
+    if !runtime_notes.is_empty() {
+        if let Some(text) = payload.get_mut("text") {
+            if let Some(existing) = text.as_str() {
+                *text = serde_json::Value::String(format!(
+                    "{existing}\n{}",
+                    collapse_runtime_notes(&runtime_notes).join("\n")
+                ));
+            }
+        }
+        payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
+    }
     Response::success(&req.id, payload)
+}
+
+/// Collapse runtime notes that differ only in their trailing parenthesized
+/// path, such as one "TypeScript 5.9.3: project installation (<tsserver>)"
+/// per TypeScript server, into one line with a count and the first path.
+/// Distinct notes keep their first-seen order.
+fn collapse_runtime_notes(notes: &[String]) -> Vec<String> {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for note in notes {
+        let (head, detail) = match note
+            .strip_suffix(')')
+            .and_then(|rest| rest.rsplit_once(" ("))
+        {
+            Some((head, detail)) => (head, detail),
+            None => (note.as_str(), ""),
+        };
+        match groups.iter_mut().find(|(known, _)| *known == head) {
+            Some((_, details)) => {
+                if !details.contains(&detail) {
+                    details.push(detail);
+                }
+            }
+            None => groups.push((head, vec![detail])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(head, details)| match details.as_slice() {
+            [""] => head.to_string(),
+            [detail] => format!("{head} ({detail})"),
+            [first, ..] => format!("{head} ×{} (first: {first})", details.len()),
+            [] => head.to_string(),
+        })
+        .collect()
+}
+
+/// The language servers a scoped inspect answers for. A blocking request
+/// already resolved them from the scoped files (started or failed); the
+/// nonblocking path derives them from the scoped files directly.
+fn scope_producer_keys(
+    snapshot: &InspectSnapshot,
+    scope: &JobScope,
+    expected_producers: &[ServerKey],
+    producer_failures: &[ApplicableServerFailure],
+) -> std::collections::HashSet<ServerKey> {
+    if expected_producers.is_empty() && producer_failures.is_empty() {
+        return crate::inspect::diagnostics_category::scope_producer_keys(snapshot, scope);
+    }
+    expected_producers
+        .iter()
+        .cloned()
+        .chain(
+            producer_failures
+                .iter()
+                .map(|failure| failure.server_key.clone()),
+        )
+        .collect()
 }
 
 /// Register one inspect completion whose poll closure only observes the result
@@ -630,15 +857,13 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let scope = parse_scope(req, &ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = {
-        let lsp = ctx.lsp();
-        lsp.resolve_applicable_servers_for_inspect(
-            &snapshot.project_root,
-            scoped_roots,
-            &snapshot.config,
-            deadline.work_at(),
-        )
-    };
+    let applicability = resolve_inspect_applicability(
+        &ctx,
+        &snapshot.project_root,
+        scoped_roots,
+        &snapshot.config,
+        deadline.work_at(),
+    );
     let applicability = match applicability {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -671,13 +896,21 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let worker_cancellation = cancellation.clone();
     let root = snapshot.project_root.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    // The request's admitted config, installed on the worker below.
+    let admitted_config = ctx.config();
     std::thread::spawn(move || {
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+        if ctx.checkout_query_runtime_active() {
+            // Pin the one final wait outcome even when diagnostics terminate
+            // before Tier-2 submission. Finalization below uses this same guard.
+            let _ = ctx.callgraph_store_for_ops();
+        }
         // Queueing instead of sharing a response keeps request-specific scopes,
         // phase logs, and terminals independent while bounding expensive work to
         // one detached inspect body per root.
-        let response = match DeferredInspectRootPermit::acquire(root, deadline) {
+        let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
             Some(_permit) => {
                 run_blocking_inspect_body(&request, &ctx, applicability, phase_log, deadline)
             }
@@ -690,6 +923,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
                 request_deadline_terminal(next_phase(&applicability), deadline),
             ),
         };
+        crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {
@@ -869,6 +1103,7 @@ fn run_blocking_inspect_body(
         }
     };
     wait_at_deferred_inspect_body_gate_for_test(deadline);
+    delay_inspect_body_from_env_for_test(deadline);
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
@@ -889,44 +1124,56 @@ fn run_blocking_inspect_body(
     }
 
     let mut start_outcomes = ApplicableServerStartOutcomes::default();
-    for server in &applicability.server_keys {
-        let phase_entry = InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server);
-        if !deadline.has_work_budget() {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                request_deadline_terminal(Some(phase_entry), deadline),
-            );
-        }
-        let phase = phase_log.start(phase_entry.clone());
-        let outcome = {
-            let mut lsp = ctx.lsp();
-            lsp.start_applicable_server_until(
-                &applicability,
-                server,
-                &ctx.config(),
-                deadline.work_at(),
-            )
-        };
-        if inspect_cancellation_requested() {
+    let startup_deadline = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
+    let starts = applicability
+        .server_keys
+        .iter()
+        .map(|server| {
+            let phase = phase_log.start(InspectPhaseEntry::lsp(InspectPhaseId::LspStart, server));
+            (server, phase)
+        })
+        .collect::<Vec<_>>();
+    let outcomes = start_applicable_servers_concurrently(ctx, &applicability, startup_deadline);
+    if inspect_cancellation_requested() {
+        for (_, phase) in starts {
             phase.fail("inspect request cancelled");
-            return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
         }
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    for ((server, phase), outcome) in starts.into_iter().zip(outcomes) {
         let deadline_exceeded = outcome.deadline_exceeded.is_some();
         finish_start_phases(vec![(server.clone(), phase)], &outcome);
         start_outcomes.successful.extend(outcome.successful);
         start_outcomes.failures.extend(outcome.failures);
-        if deadline_exceeded {
-            return build_inspect_terminal(
-                &req.id,
-                &phase_log,
-                request_deadline_terminal(Some(phase_entry), deadline),
-            );
+        if deadline_exceeded
+            && !start_outcomes
+                .failures
+                .iter()
+                .any(|failure| failure.server_key == *server)
+        {
+            start_outcomes.failures.push(ApplicableServerFailure {
+                server_key: server.clone(),
+                result: crate::lsp::manager::ServerAttemptResult::SpawnFailed {
+                    binary: String::new(),
+                    reason: "startup wait budget exhausted; retry aft_inspect".into(),
+                },
+            });
         }
     }
 
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+    }
+    // A rust-analyzer that was already running may hold a workspace load
+    // (possibly a failed one) made from manifests that have changed since,
+    // for example a stale Cargo.lock fixed with `cargo update` in a shell.
+    // Ask it to reload before waiting, so the wait below observes the new
+    // load instead of returning the old result.
+    let reload_scope_roots = parse_scope(req, ctx, &project_root)
+        .map(|scope| scope.roots)
+        .unwrap_or_default();
+    for server in &start_outcomes.successful {
+        ctx.lsp_reload_rust_workspace_if_manifests_changed(server, &reload_scope_roots);
     }
     if !deadline.has_work_budget() {
         let failed_phase = start_outcomes
@@ -952,11 +1199,16 @@ fn run_blocking_inspect_body(
             ))
         })
         .collect::<Vec<_>>();
-    // A blocking inspection waits for the producers it started so the warm
-    // store holds their settled view before the payload reads it. The wait is
-    // root-level — producers fill the warm store by publishing while events
-    // are drained — and never per-file: a request scope cannot change it.
-    let wait_outcome = wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline);
+    // Give producers a bounded chance to settle before reading the warm store.
+    // The wait is root-level: producers publish while events are drained. A
+    // scoped request's per-file work happens later, in the diagnostics
+    // category, with its own share of the budget; that step also waits for
+    // rust-analyzer's `cargo check`, so only an unscoped request waits for
+    // it here.
+    let scoped_request =
+        scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
+    let wait_outcome =
+        wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request);
     if inspect_cancellation_requested() {
         for phase in quiescence {
             phase.fail("inspect request cancelled");
@@ -966,12 +1218,12 @@ fn run_blocking_inspect_body(
     // A blocking inspection is an explicit diagnostics observation source. Keep
     // accepted producer snapshots intact until the inspect response is built;
     // flattened category payloads cannot recover producer ownership.
-    let accepted_snapshots = match wait_outcome {
-        Ok((snapshots, blocked)) => {
+    let (accepted_snapshots, indexing_gaps) = match wait_outcome {
+        Ok((snapshots, blocked, gaps)) => {
             if blocked {
                 phase_log.note_blocking_wait();
             }
-            snapshots
+            (snapshots, gaps)
         }
         Err(message) => {
             // Name the phase that was still in flight before the handles are
@@ -992,17 +1244,23 @@ fn run_blocking_inspect_body(
             );
         }
     };
-    for phase in quiescence {
-        phase.complete();
+    for (server, phase) in start_outcomes.successful.iter().zip(quiescence) {
+        if let Some((_, reason)) = indexing_gaps.iter().find(|(key, _)| key == server) {
+            phase.fail(reason);
+        } else {
+            phase.complete();
+        }
     }
     let inspect_snapshot = build_snapshot(ctx).ok();
-    let response = handle_inspect_payload(
+    let mut response = handle_inspect_payload(
         req,
         ctx,
         true,
         applicability.server_keys.is_empty(),
         &start_outcomes.failures,
+        &applicability.not_applicable,
         &start_outcomes.successful,
+        &indexing_gaps,
         Some(&phase_log),
         Some(deadline),
     );
@@ -1025,19 +1283,36 @@ fn run_blocking_inspect_body(
             },
         );
     }
-    if !deadline.has_work_budget() {
-        let failed_phase =
-            InspectPhaseEntry::category(InspectPhaseId::StatVerification, InspectCategory::Metrics);
-        return build_inspect_terminal(
-            &req.id,
-            &phase_log,
-            request_deadline_terminal(Some(failed_phase), deadline),
-        );
-    }
-
     if let Err(terminal) =
         verify_final_root_stats(&project_root, &initial_stats, &phase_log, deadline)
     {
+        if response.success
+            && matches!(
+                &terminal,
+                InspectTerminal::PhaseFailed {
+                    failure_reason: "inspect_request_timeout",
+                    ..
+                }
+            )
+        {
+            response.data["complete"] = Value::Bool(false);
+            let gap = serde_json::json!({"kind": "stat_verification_incomplete",
+                "reason": "file freshness verification exceeded the request budget; retry aft_inspect"});
+            if !response.data["gaps"].is_array() {
+                response.data["gaps"] = serde_json::json!([]);
+            }
+            response.data["gaps"].as_array_mut().unwrap().push(gap);
+            if let Some(text) = response.data["text"].as_str() {
+                response.data["text"] = Value::String(format!(
+                    "{text}\ncomplete: false — file freshness unverified; retry aft_inspect"
+                ));
+            }
+            return build_inspect_terminal(
+                &req.id,
+                &phase_log,
+                InspectTerminal::Fresh(response.data),
+            );
+        }
         return build_inspect_terminal(&req.id, &phase_log, terminal);
     }
     if let Some(inspect_snapshot) = &inspect_snapshot {
@@ -1069,29 +1344,86 @@ fn run_blocking_inspect_body(
 /// Wait for every successfully started producer to settle before the payload
 /// reads the warm store: a producer settles once it holds a current
 /// authoritative (non-stale, non-provisional) report or stops warming
-/// (declares quiescence). Events are drained with the manager lock held only
-/// for the drain itself, so producers keep publishing while the wait ticks.
-/// Cancellation and the shared request deadline are checked at every tick.
+/// (declares quiescence). With `wait_for_rust_check`, a rust-analyzer
+/// producer must also have no `cargo check` running or just requested (an
+/// edit's save starts one): until it finishes, the compiler errors in the
+/// store describe the files before the edit. Events are drained with the
+/// manager lock held only for the drain and the checks, so producers keep
+/// publishing while the wait ticks. Cancellation and the bounded phase
+/// deadline are checked at every tick. At the deadline, retain observations
+/// and name only the unsettled producers.
 fn wait_for_root_quiescence(
     ctx: &AppContext,
     expected: &[ServerKey],
     deadline: InspectRequestDeadline,
-) -> Result<(Vec<AcceptedDiagnosticSnapshot>, bool), String> {
+    wait_for_rust_check: bool,
+) -> Result<
+    (
+        Vec<AcceptedDiagnosticSnapshot>,
+        bool,
+        Vec<(ServerKey, String)>,
+    ),
+    String,
+> {
+    let started = Instant::now();
+    let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
     let mut accepted_snapshots = Vec::new();
     let mut blocked = false;
+    let rust_check_state = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
+        if wait_for_rust_check {
+            lsp.rust_check_state(server)
+        } else {
+            RustCheckState::Current
+        }
+    };
+    if wait_for_rust_check {
+        let mut lsp = ctx.lsp();
+        for server in expected {
+            lsp.rearm_unreported_rust_check(server);
+        }
+    }
     loop {
         if inspect_cancellation_requested() {
             return Err("inspect request cancelled during LSP quiescence".to_string());
         }
-        if !deadline.has_work_budget() {
-            return Err(deadline.timeout_detail(InspectPhaseId::LspQuiescence));
-        }
         accepted_snapshots.extend(ctx.lsp().drain_events().accepted_snapshots);
-        if root_producers_settled(ctx, expected) {
-            return Ok((accepted_snapshots, blocked));
+        let settled = root_producers_settled(ctx, expected);
+        // A check that was expected and did not begin by its deadline is not
+        // waited for: its results are unknown however long this waits.
+        let checking = {
+            let lsp = ctx.lsp();
+            expected
+                .iter()
+                .any(|server| rust_check_state(&lsp, server) == RustCheckState::Running)
+        };
+        if (settled && !checking) || Instant::now() >= wait_until {
+            let lsp = ctx.lsp();
+            let gaps = expected
+                .iter()
+                .filter_map(|server| {
+                    if !lsp.producer_has_settled(server) {
+                        Some((
+                            server.clone(),
+                            format!(
+                    "still indexing after {:.1}s; retry aft_inspect after the server settles",
+                    started.elapsed().as_secs_f64()
+                ),
+                        ))
+                    } else if rust_check_state(&lsp, server) != RustCheckState::Current {
+                        Some((
+                            server.clone(),
+                            crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON
+                                .to_string(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            return Ok((accepted_snapshots, blocked, gaps));
         }
         blocked = true;
-        let remaining = deadline.work_at().saturating_duration_since(Instant::now());
+        let remaining = wait_until.saturating_duration_since(Instant::now());
         std::thread::sleep(Duration::from_millis(50).min(remaining));
     }
 }
@@ -1101,8 +1433,9 @@ fn root_producers_settled(ctx: &AppContext, expected: &[ServerKey]) -> bool {
     // entries, so delivered file events invalidate this wait immediately. File
     // delivery is asynchronous, however; the terminal StatVerification phase
     // compares the scanned file set directly and closes that latency window.
-    // The unscoped diagnostics gate uses this same producer-settled check, so
-    // a wait that returns cannot then be judged incomplete for lack of reports.
+    // Settlement ends the producer wait, not the authority obligation. The
+    // diagnostics collection rechecks reports and compiler progress and names
+    // missing results as gaps instead of certifying a quiescent empty store.
     ctx.lsp().producers_settled(expected)
 }
 
@@ -1132,30 +1465,6 @@ fn request_deadline_terminal(
         failed_phase,
         failure_reason: "inspect_request_timeout",
         failure_detail: Some(deadline.timeout_detail(phase)),
-    }
-}
-
-fn phase_failure_response(
-    request_id: &str,
-    phase: &InspectPhaseEntry,
-    failure_reason: &'static str,
-    detail: String,
-) -> Response {
-    let mut data = serde_json::json!({
-        "code": failure_reason,
-        "message": detail,
-        "failed_phase": phase.id,
-    });
-    if let Some(producer) = &phase.producer {
-        data["producer"] = Value::String(producer.clone());
-    }
-    if let Some(category) = &phase.category {
-        data["category"] = Value::String(category.clone());
-    }
-    Response {
-        id: request_id.to_string(),
-        success: false,
-        data,
     }
 }
 
@@ -1198,6 +1507,66 @@ fn inspect_failure_reason(response: &Response) -> &'static str {
         "lsp_quiescence_timeout"
     } else {
         "inspect_not_fresh"
+    }
+}
+
+/// Start every applicable producer at once, each bounded by the same startup
+/// deadline, and return one outcome per server in `server_keys` order.
+///
+/// Starting them one after another made the startup budget a sum: on a busy
+/// machine a project with a dozen servers spent it on the first few
+/// handshakes, and every later server was reported as "startup wait budget
+/// exhausted" without ever having been tried. Each start already runs its
+/// spawn and `initialize` handshake without the manager lock, so starts of
+/// different servers do not wait on each other.
+fn start_applicable_servers_concurrently(
+    ctx: &AppContext,
+    applicability: &ApplicableServerSnapshot,
+    startup_deadline: Instant,
+) -> Vec<ApplicableServerStartOutcomes> {
+    let config = ctx.config();
+    let start = |server: &crate::lsp::roots::ServerKey| {
+        ctx.lsp_start_applicable_server_until(applicability, server, &config, startup_deadline)
+    };
+    std::thread::scope(|scope| {
+        let handles = applicability
+            .server_keys
+            .iter()
+            .map(|server| {
+                let spawned = std::thread::Builder::new()
+                    .name("aft-inspect-lsp-start".into())
+                    .spawn_scoped(scope, move || start(server));
+                (server, spawned)
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(server, spawned)| match spawned {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| start_panicked_outcome(server, "server start panicked")),
+                // If the thread cannot be spawned, start the server on this
+                // thread instead: slower, because it no longer overlaps the
+                // other starts, but the server is still started.
+                Err(_) => start(server),
+            })
+            .collect()
+    })
+}
+
+fn start_panicked_outcome(
+    server: &crate::lsp::roots::ServerKey,
+    reason: &str,
+) -> ApplicableServerStartOutcomes {
+    ApplicableServerStartOutcomes {
+        failures: vec![ApplicableServerFailure {
+            server_key: server.clone(),
+            result: crate::lsp::manager::ServerAttemptResult::SpawnFailed {
+                binary: String::new(),
+                reason: reason.to_string(),
+            },
+        }],
+        ..ApplicableServerStartOutcomes::default()
     }
 }
 
@@ -1261,6 +1630,39 @@ enum InspectTerminal {
     },
 }
 
+/// Why a completed inspect is partial, or `None` when its diagnostics are
+/// authoritative (or were not part of the answer). The reason names every
+/// producer the diagnostics gaps attribute, in first-seen order, for example
+/// "diagnostics unknown for rust, typescript".
+pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<String> {
+    let diagnostics = payload.get("summary")?.get("diagnostics")?;
+    if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let mut producers = Vec::<String>::new();
+    for gap in diagnostics
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let producer = gap
+            .get("producer")
+            .or_else(|| gap.get("cause").and_then(|cause| cause.get("producer")))
+            .and_then(Value::as_str);
+        if let Some(producer) = producer {
+            if !producers.iter().any(|known| known == producer) {
+                producers.push(producer.to_string());
+            }
+        }
+    }
+    Some(if producers.is_empty() {
+        "diagnostics unknown".to_string()
+    } else {
+        format!("diagnostics unknown for {}", producers.join(", "))
+    })
+}
+
 fn build_inspect_terminal(
     request_id: &str,
     log: &InspectPhaseLog,
@@ -1276,10 +1678,25 @@ fn build_inspect_terminal(
                     "inspect payload was not an object",
                 );
             };
+            // A completed request whose diagnostics are unknown for some
+            // producer is not fresh: it is partial, and its header says so
+            // and for which producers, so a reader never sees FRESH above
+            // "diagnostics: unknown".
+            let partial = partial_terminal_reason(payload);
             payload.insert(
                 "inspect_terminal".to_string(),
-                Value::String("fresh".to_string()),
+                Value::String(
+                    if partial.is_some() {
+                        "partial"
+                    } else {
+                        "fresh"
+                    }
+                    .to_string(),
+                ),
             );
+            if let Some(reason) = partial {
+                payload.insert("partial_reason".to_string(), Value::String(reason));
+            }
             payload.insert(
                 "wait_stamp".to_string(),
                 serde_json::json!({
@@ -1504,6 +1921,11 @@ fn receive_tier2_completion_until(
     request_deadline: Option<InspectRequestDeadline>,
 ) -> Option<JobOutcome> {
     loop {
+        // Another category may have used this wait's budget after the worker
+        // finished. Keep an already published result even at the deadline.
+        if let Ok(outcome) = rx.try_recv() {
+            return Some(outcome);
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
@@ -1515,9 +1937,8 @@ fn receive_tier2_completion_until(
             }
             return Some(JobOutcome::Failed {
                 message: format!(
-                    "inspect_phase_timeout: tier2 {} aggregate did not complete within {}s; builder_state={}",
+                    "inspect_phase_timeout: tier2 {} aggregate did not complete within its phase wait budget; builder_state={}",
                     category.as_str(),
-                    BLOCKING_TIER2_PHASE_TIMEOUT.as_secs(),
                     manager.tier2_builder_state_detail(category),
                 ),
             });
@@ -1820,6 +2241,23 @@ fn build_inspect_payload(
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
+        if payload.get("unavailable").and_then(Value::as_bool) == Some(true) {
+            let category_gaps = payload["gaps"].as_array().expect("unavailable gaps");
+            gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
+                gap["categories"] = serde_json::json!([category.as_str()]);
+                gap
+            }));
+            summary.insert(
+                category.as_str().to_string(),
+                serde_json::json!({
+                    "unavailable": true, "complete": false, "gaps": category_gaps,
+                }),
+            );
+            if sections.includes(*category) {
+                details.insert(category.as_str().to_string(), Value::Null);
+            }
+            continue;
+        }
         let mut category_summary = summary_for(*category, payload);
         let dead_code_unavailable =
             *category == InspectCategory::DeadCode && dead_code_callgraph_unavailable(payload);
@@ -1846,6 +2284,9 @@ fn build_inspect_payload(
                     gap
                 }));
             }
+        }
+        if *category == InspectCategory::Diagnostics {
+            attach_uncovered_file_rollup(&mut category_summary, &mut details, payload, top_k);
         }
         summary.insert(category.as_str().to_string(), category_summary);
         if dead_code_unavailable {
@@ -2000,7 +2441,24 @@ fn render_inspect_text(
 
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
-    render_incomplete_categories(&mut lines, summary);
+    render_incomplete_categories(&mut lines, summary, details);
+    // Uncomputed categories have no counts, so the incomplete-category notice
+    // is their only output.
+    let available_summary = summary
+        .iter()
+        .filter(|(_, value)| value.get("unavailable").and_then(Value::as_bool) != Some(true))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Map<String, Value>>();
+    let summary = &available_summary;
+    render_not_applicable_producers(&mut lines, summary);
+    render_scoped_diagnostics_coverage(&mut lines, summary);
+    if let Some(notes) = summary
+        .get("diagnostics")
+        .and_then(|diagnostics| diagnostics.get("notes"))
+        .and_then(Value::as_array)
+    {
+        lines.extend(notes.iter().filter_map(Value::as_str).map(str::to_string));
+    }
     render_group_category(
         &mut lines,
         "Duplicates",
@@ -2025,7 +2483,78 @@ fn render_inspect_text(
     lines.join("\n")
 }
 
-fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+/// Say how many scoped files a blocking scoped inspect obtained authoritative
+/// diagnostics for, and how many it left out because of the file cap. The
+/// count is of files with authoritative diagnostics, not of files handed to a
+/// server: a file a server was asked about but never certified (its workspace
+/// failed to load, say) is a gap, and counting it here would read as success
+/// next to the gap line.
+fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    let Some(coverage) = summary
+        .get("diagnostics")
+        .and_then(|section| section.get("coverage"))
+    else {
+        return;
+    };
+    let files = coverage.get("files").and_then(Value::as_u64).unwrap_or(0);
+    if files == 0 {
+        return;
+    }
+    let authoritative = coverage
+        .get("authoritative")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let not_examined = coverage
+        .get("not_examined")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let noun = if files == 1 { "file" } else { "files" };
+    let mut line =
+        format!("diagnostics: authoritative results for {authoritative} of {files} scoped {noun}");
+    if not_examined > 0 {
+        let cap = coverage
+            .get("file_cap")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        line.push_str(&format!(
+            " ({not_examined} not examined: at most {cap} files per scoped inspect; narrow the scope)"
+        ));
+    }
+    lines.push(line);
+}
+
+/// Name servers that were deliberately not started because the inspected area
+/// has none of their files. Without this line a Rust repository whose
+/// `package.json` exists only to install a tool gives no hint why TypeScript
+/// produced nothing; it is not a failure and does not make the result partial.
+fn render_not_applicable_producers(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    for (category, value) in summary {
+        for entry in value
+            .get("not_applicable")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let producer = entry
+                .get("producer")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown producer");
+            let reason = entry
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no files to analyze");
+            lines.push(format!(
+                "{category}: producer {producer} not applicable ({reason})"
+            ));
+        }
+    }
+}
+
+fn render_incomplete_categories(
+    lines: &mut Vec<String>,
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+) {
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
             continue;
@@ -2040,25 +2569,134 @@ fn render_incomplete_categories(lines: &mut Vec<String>, summary: &Map<String, V
                 .get("reason")
                 .and_then(Value::as_str)
                 .unwrap_or("unavailable");
-            if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
-                let file = gap
-                    .get("file")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown file");
+            if gap.get("kind").and_then(Value::as_str) == Some("tier2_unavailable") {
                 lines.push(format!(
-                    "Incomplete {category}: no authoritative diagnostics for {file} ({reason})"
+                    "Incomplete {category}: Tier-2 unavailable ({reason})"
                 ));
                 continue;
             }
-            let producer = gap
-                .get("producer")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown producer");
-            lines.push(format!(
-                "Incomplete {category}: producer {producer} failed ({reason})"
-            ));
+            if gap.get("kind").and_then(Value::as_str) == Some("uncovered_file") {
+                // Rendered below as one line per cause, not one line per file.
+                continue;
+            }
+            if gap.get("kind").and_then(Value::as_str) == Some("checking_producer") {
+                // Not a failure: the producer is still checking, and the
+                // reason names it.
+                match gap.get("root").and_then(Value::as_str) {
+                    Some(root) => {
+                        lines.push(format!("Incomplete {category}: {reason} (root {root})"))
+                    }
+                    None => lines.push(format!("Incomplete {category}: {reason}")),
+                }
+                continue;
+            }
+            if gap.get("kind").and_then(Value::as_str) == Some("analysis_incomplete") {
+                // A scanner, not a language server, did not finish. An
+                // aggregate gap that names no scanner keeps just its category
+                // and reason rather than an invented producer name.
+                match gap.get("producer").and_then(Value::as_str) {
+                    Some(producer) => lines.push(format!(
+                        "Incomplete {category}: {producer} did not finish ({reason})"
+                    )),
+                    None => lines.push(format!("Incomplete {category}: {reason}")),
+                }
+                continue;
+            }
+            if let Some(producer) = gap.get("producer").and_then(Value::as_str) {
+                let producer = match gap.get("root").and_then(Value::as_str) {
+                    Some(root) => format!("{producer} @ {root}"),
+                    None => producer.to_string(),
+                };
+                if gap.get("kind").and_then(Value::as_str) == Some("unreported_producer") {
+                    lines.push(format!("Incomplete {category}: {producer}: {reason}"));
+                } else {
+                    lines.push(format!(
+                        "Incomplete {category}: producer {producer} failed ({reason})"
+                    ));
+                }
+            } else {
+                lines.push(format!("Incomplete {category}: {reason}"));
+            }
         }
+        render_uncovered_file_groups(lines, category, value, details);
     }
+}
+
+/// Render scoped files that no producer analyzed as one line per
+/// (producer root, producer, reason) with a file count, then at most `topK`
+/// of the affected paths. A scope over a few hundred files whose producer is
+/// unavailable would otherwise print the same reason once per file and bury
+/// the one fact the agent needs: why nothing was analyzed.
+fn render_uncovered_file_groups(
+    lines: &mut Vec<String>,
+    category: &str,
+    section: &Value,
+    details: &Map<String, Value>,
+) {
+    let Some(groups) = section
+        .get("uncovered_file_groups")
+        .and_then(Value::as_array)
+        .filter(|groups| !groups.is_empty())
+    else {
+        return;
+    };
+    for group in groups {
+        let count = group.get("files").and_then(Value::as_u64).unwrap_or(0);
+        let files = if count == 1 { "file" } else { "files" };
+        let reason = group
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        let producer = group.get("producer").and_then(Value::as_str);
+        let root = group.get("root").and_then(Value::as_str);
+        // A cause that is the failure of a producer already printed on its
+        // own "producer ... failed" line refers to that line by producer
+        // name: a multi-line cargo error printed twice buries everything else.
+        let reason = match producer {
+            Some(producer) if producer_failure_is_rendered(section, producer, reason) => {
+                format!("producer {producer} failed, reason above")
+            }
+            _ => reason.to_string(),
+        };
+        let cause = match (producer, root) {
+            (Some(producer), Some(root)) => format!("{producer} in {root}: {reason}"),
+            (Some(producer), None) => format!("{producer}: {reason}"),
+            (None, _) => reason,
+        };
+        lines.push(format!(
+            "Incomplete {category}: no authoritative diagnostics for {count} {files} ({cause})"
+        ));
+    }
+    let list_key = format!("{category}_uncovered_files");
+    lines.push("Files without authoritative diagnostics:".to_string());
+    for file in details
+        .get(&list_key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        lines.push(format!("  {file}"));
+    }
+    if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, &list_key) {
+        lines.push(trailer);
+    }
+}
+
+/// True when `section` carries a failed-producer gap for `producer` with
+/// exactly `reason`; `render_incomplete_categories` prints such a gap with
+/// its full reason on its own line.
+fn producer_failure_is_rendered(section: &Value, producer: &str, reason: &str) -> bool {
+    section
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|gap| {
+            gap.get("kind").and_then(Value::as_str) == Some("failed_producer")
+                && gap.get("producer").and_then(Value::as_str) == Some(producer)
+                && gap.get("reason").and_then(Value::as_str) == Some(reason)
+        })
 }
 
 fn render_complexity_category(
@@ -2250,11 +2888,14 @@ fn render_symbol_category(
     let suffix = dead_code_language_suffix(section);
     let skipped_suffix = dead_code_skipped_language_suffix(section);
     let generated_suffix = generated_count_suffix(section);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
-        lines.push(format!("{label}: 0{generated_suffix}{skipped_suffix}"));
+        lines.push(format!(
+            "{label}: 0{generated_suffix}{skipped_suffix}{excluded}"
+        ));
     } else {
         lines.push(format!(
-            "{label}: {count}{suffix}{generated_suffix}{skipped_suffix}:"
+            "{label}: {count}{suffix}{generated_suffix}{skipped_suffix}{excluded}:"
         ));
         if let Some(items) = category_items(summary, details, key) {
             for item in items.iter().filter(|item| !item_is_generated(item)) {
@@ -2269,6 +2910,43 @@ fn render_symbol_category(
     }
     render_generated_symbol_usage(lines, summary, details, key);
     render_test_only_usage(lines, summary, details, key);
+}
+
+/// The headline clause for findings a category withheld because they live in
+/// test trees or fixtures (`excluded_test_count` in `excluded_test_files`
+/// files). Empty when nothing was withheld, so product-only counts never hide
+/// that more exists.
+fn excluded_test_clause(section: &Value) -> String {
+    let count = section
+        .get("excluded_test_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if count == 0 {
+        return String::new();
+    }
+    let files = section
+        .get("excluded_test_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let file_label = if files == 1 { "file" } else { "files" };
+    format!(
+        " · excluded {} in {} test/fixture {file_label} (pass includeTests to see them)",
+        thousands(count),
+        thousands(files)
+    )
+}
+
+/// `2940` as `2,940`.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 fn generated_count_suffix(section: &Value) -> String {
@@ -2461,11 +3139,12 @@ fn render_group_category(
         return;
     }
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
-        lines.push(format!("{label}: 0"));
+        lines.push(format!("{label}: 0{excluded}"));
         return;
     }
-    lines.push(format!("{label}: {count} (top by cost):"));
+    lines.push(format!("{label}: {count}{excluded} (top by cost):"));
     if let Some(items) = category_items(summary, details, key) {
         for item in items.iter().filter(|item| !item_is_generated(item)) {
             let cost = item.get("cost").and_then(Value::as_u64).unwrap_or(0);
@@ -2508,14 +3187,15 @@ fn render_duplicates_category(
     } else {
         format!(" (generated: {generated_count})")
     };
+    let excluded = excluded_test_clause(section);
     let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
         if count == 0 {
-            lines.push(format!("{label}: 0{generated_suffix}"));
+            lines.push(format!("{label}: 0{generated_suffix}{excluded}"));
             render_generated_duplicate_usage(lines, summary, details, key);
             return;
         }
         lines.push(format!(
-            "{label}: {count}{}{generated_suffix} (top by cost):",
+            "{label}: {count}{}{generated_suffix}{excluded} (top by cost):",
             duplicate_suppression_clause(section)
         ));
         render_duplicate_rows(lines, summary, details, key);
@@ -2553,7 +3233,7 @@ fn render_duplicates_category(
         String::new()
     };
     lines.push(format!(
-        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{suffix}",
+        "{label}: {duplicated_lines} duplicated lines{percent_clause} across {file_count} files, {group_count} {}{suppression_clause}{generated_suffix}{excluded}{suffix}",
         plural_group(group_count),
     ));
     if count > 0 {
@@ -2700,7 +3380,12 @@ fn render_todos(
         return;
     };
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let excluded = excluded_test_clause(section);
     if count == 0 {
+        // Zero product TODOs prints nothing, unless some were withheld.
+        if !excluded.is_empty() {
+            lines.push(format!("TODOs: 0{excluded}"));
+        }
         return;
     }
     let by_kind = section
@@ -2720,9 +3405,9 @@ fn render_todos(
         })
         .unwrap_or_default();
     if by_kind.is_empty() {
-        lines.push(format!("TODOs: {count}"));
+        lines.push(format!("TODOs: {count}{excluded}"));
     } else {
-        lines.push(format!("TODOs: {count} ({by_kind})"));
+        lines.push(format!("TODOs: {count} ({by_kind}){excluded}"));
     }
     // Detail rows only when explicitly drilled into (sections: ["todos"]) — the
     // scanner populates details["todos"] only then, keeping the default summary
@@ -2746,67 +3431,27 @@ fn render_diagnostics_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
-    let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics")
-    else {
+    // Non-file gaps already have their reasons printed by
+    // `render_incomplete_categories`, so the diagnostics summary line names
+    // each such producer without repeating its reason.
+    if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
+        Some(&Value::Object(summary.clone())),
+        true,
+    ) {
+        lines.push(line);
+    }
+    let trailer = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics");
+    if trailer.is_none()
+        && details
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
         return;
-    };
+    }
 
     if !lines.is_empty() {
         lines.push(String::new());
-    }
-
-    if let Some(section) = summary.get("diagnostics").and_then(Value::as_object) {
-        let errors = section.get("errors").and_then(Value::as_u64);
-        let warnings = section.get("warnings").and_then(Value::as_u64);
-        let info = section.get("info").and_then(Value::as_u64);
-        let hints = section.get("hints").and_then(Value::as_u64);
-        let has_counts = [errors, warnings, info, hints].iter().any(|v| v.is_some());
-        let counts = format!(
-            "{} errors, {} warnings, {} info, {} hints",
-            errors.unwrap_or(0),
-            warnings.unwrap_or(0),
-            info.unwrap_or(0),
-            hints.unwrap_or(0)
-        );
-        let status = section.get("status").and_then(Value::as_str);
-        let provisional_counts = section.get("provisional_counts").and_then(Value::as_object);
-        let provisional_text = provisional_counts.map(|counts| {
-            format!(
-                " ({} errors, {} warnings, {} info, {} hints)",
-                counts.get("errors").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("info").and_then(Value::as_u64).unwrap_or(0),
-                counts.get("hints").and_then(Value::as_u64).unwrap_or(0),
-            )
-        });
-        let provisional_framing = || {
-            format!(
-                "provisional — analyzer not ready; counts excluded from E/W{}",
-                provisional_text.as_deref().unwrap_or("")
-            )
-        };
-
-        match status {
-            Some("pending") => lines.push(format!(
-                "diagnostics: {} — still pending (servers: {}); wait for the LSP update and use the next normal aft_inspect, not repeated polling",
-                provisional_framing(),
-                diagnostics_server_summary(section)
-            )),
-            Some("incomplete") => lines.push(format!(
-                "diagnostics: {} (incomplete — servers: {})",
-                provisional_framing(),
-                diagnostics_server_summary(section)
-            )),
-            _ if provisional_counts.is_some() => lines.push(format!(
-                "diagnostics: {}",
-                provisional_framing()
-            )),
-            _ => {
-                if has_counts {
-                    lines.push(format!("diagnostics: {counts}"));
-                }
-            }
-        }
     }
 
     let provisional = summary.get("diagnostics").is_some_and(|section| {
@@ -2844,7 +3489,9 @@ fn render_diagnostics_category(
             }
         }
     }
-    lines.push(trailer);
+    if let Some(trailer) = trailer {
+        lines.push(trailer);
+    }
 }
 
 fn format_diagnostic_location(d: &Map<String, Value>) -> String {
@@ -2859,34 +3506,6 @@ fn format_diagnostic_location(d: &Map<String, Value>) -> String {
         (Some(line), None) => format!("{file}:{line}"),
         (Some(line), Some(col)) => format!("{file}:{line}:{col}"),
     }
-}
-
-fn diagnostics_server_summary(section: &Map<String, Value>) -> String {
-    let pending = string_array(section.get("servers_pending"));
-    let not_installed = string_array(section.get("servers_not_installed"));
-    let mut parts = Vec::new();
-    if !pending.is_empty() {
-        parts.push(format!("pending: {}", pending.join(", ")));
-    }
-    if !not_installed.is_empty() {
-        parts.push(format!("not installed: {}", not_installed.join(", ")));
-    }
-    if parts.is_empty() {
-        "none reported".to_string()
-    } else {
-        parts.join("; ")
-    }
-}
-
-fn string_array(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// True when the dead-code aggregate could not run because the callgraph was
@@ -2948,7 +3567,7 @@ fn summary_for(category: InspectCategory, payload: &Value) -> Value {
 }
 
 fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
-    match category {
+    let mut summary = match category {
         InspectCategory::Diagnostics => diagnostics_summary_for(payload),
         InspectCategory::Metrics => serde_json::json!({
             "files": payload.get("files").or_else(|| payload.pointer("/totals/file_count")).and_then(Value::as_u64).unwrap_or(0),
@@ -3039,16 +3658,159 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
             "worst": payload.get("worst").cloned().unwrap_or(Value::Null),
         }),
         _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
+    };
+    // Findings withheld from `count` because they live in test files or
+    // fixtures; carried through so a reader can see what was left out.
+    if matches!(
+        category,
+        InspectCategory::Todos
+            | InspectCategory::DeadCode
+            | InspectCategory::UnusedExports
+            | InspectCategory::Duplicates
+    ) && summary.is_object()
+    {
+        for key in ["excluded_test_count", "excluded_test_files"] {
+            if let Some(value) = payload.get(key) {
+                summary[key] = value.clone();
+            }
+        }
     }
+    summary
 }
 
 fn diagnostics_summary_for(payload: &Value) -> Value {
-    serde_json::json!({
-        "errors": payload.get("errors").and_then(Value::as_u64).unwrap_or(0),
-        "warnings": payload.get("warnings").and_then(Value::as_u64).unwrap_or(0),
-        "info": payload.get("info").and_then(Value::as_u64).unwrap_or(0),
-        "hints": payload.get("hints").and_then(Value::as_u64).unwrap_or(0),
-    })
+    let mut summary = serde_json::json!({
+        "errors": payload.get("errors"),
+        "warnings": payload.get("warnings"),
+        "info": payload.get("info"),
+        "hints": payload.get("hints"),
+    });
+    if let Some(by_producer) = payload.get("by_producer") {
+        summary["by_producer"] = by_producer.clone();
+    }
+    if let Some(notes) = payload.get("notes") {
+        summary["notes"] = notes.clone();
+    }
+    if let Some(not_applicable) = payload.get("not_applicable") {
+        summary["not_applicable"] = not_applicable.clone();
+    }
+    if let Some(coverage) = payload.get("coverage") {
+        summary["coverage"] = coverage.clone();
+    }
+    summary
+}
+
+/// Scoped files sharing one cause for their missing diagnostics: the
+/// producer that should have analyzed them, that producer's workspace root,
+/// and why it has no report. Both `producer` and `root` are absent when no
+/// producer applies to the files at all.
+struct UncoveredFileGroup<'a> {
+    producer: Option<&'a str>,
+    root: Option<&'a str>,
+    reason: &'a str,
+    files: Vec<&'a str>,
+}
+
+/// Group `uncovered_file` gaps by (root, producer, reason). Largest group
+/// first so a cut path list shows the dominant cause; ties and files within a
+/// group are ordered by name so the output is stable.
+fn uncovered_file_groups(gaps: &[Value]) -> Vec<UncoveredFileGroup<'_>> {
+    let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();
+    for gap in gaps {
+        if gap.get("kind").and_then(Value::as_str) != Some("uncovered_file") {
+            continue;
+        }
+        let Some(file) = gap.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        // Gaps without a `cause` still group, under their generic reason.
+        let cause = gap.get("cause");
+        let producer = cause
+            .and_then(|cause| cause.get("producer"))
+            .and_then(Value::as_str);
+        let root = cause
+            .and_then(|cause| cause.get("root"))
+            .and_then(Value::as_str);
+        let reason = cause
+            .and_then(|cause| cause.get("reason"))
+            .or_else(|| gap.get("reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable");
+        groups
+            .entry((root, producer, reason))
+            .or_default()
+            .push(file);
+    }
+    let mut groups = groups
+        .into_iter()
+        .map(|((root, producer, reason), mut files)| {
+            files.sort_unstable();
+            UncoveredFileGroup {
+                producer,
+                root,
+                reason,
+                files,
+            }
+        })
+        .collect::<Vec<_>>();
+    // The map yields groups in (root, producer, reason) order; the stable
+    // size sort keeps that order when group sizes tie.
+    groups.sort_by(|left, right| right.files.len().cmp(&left.files.len()));
+    groups
+}
+
+/// Add the per-cause rollup of uncovered files to the diagnostics summary and
+/// the first `top_k` affected paths to `details`, with a list envelope when
+/// the path list is cut. The full per-file gap rows stay in `gaps` for
+/// machine consumers; only the rendered path list is bounded.
+fn attach_uncovered_file_rollup(
+    category_summary: &mut Value,
+    details: &mut Map<String, Value>,
+    payload: &Value,
+    top_k: usize,
+) {
+    let Some(gaps) = payload.get("gaps").and_then(Value::as_array) else {
+        return;
+    };
+    let groups = uncovered_file_groups(gaps);
+    if groups.is_empty() {
+        return;
+    }
+    category_summary["uncovered_file_groups"] = Value::Array(
+        groups
+            .iter()
+            .map(|group| {
+                serde_json::json!({
+                    "producer": group.producer,
+                    "root": group.root,
+                    "reason": group.reason,
+                    "files": group.files.len(),
+                })
+            })
+            .collect(),
+    );
+    let (listed, total) = uncovered_files_details_for(&groups, top_k);
+    let shown = listed.len();
+    let key = format!("{}_uncovered_files", InspectCategory::Diagnostics.as_str());
+    details.insert(
+        key.clone(),
+        Value::Array(listed.into_iter().map(Value::from).collect()),
+    );
+    crate::list_surfaces::inspect::attach_inspect_envelope(details, &key, shown, total);
+}
+
+/// The first `top_k` uncovered paths in group order, and the total count.
+fn uncovered_files_details_for<'a>(
+    groups: &[UncoveredFileGroup<'a>],
+    top_k: usize,
+) -> (Vec<&'a str>, usize) {
+    let total = groups.iter().map(|group| group.files.len()).sum();
+    let listed = groups
+        .iter()
+        .flat_map(|group| group.files.iter().copied())
+        .take(top_k)
+        .collect();
+    (listed, total)
 }
 
 fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Value {
@@ -3328,6 +4090,22 @@ mod render_text_tests {
 
     fn render_with_details(summary: Value, details: Value) -> String {
         render_inspect_text(&summary_map(summary), &summary_map(details), None)
+    }
+
+    #[test]
+    fn aggregate_gap_renders_category_and_reason_without_a_producer() {
+        let text = render(serde_json::json!({
+            "dead_code": {
+                "unavailable": true,
+                "complete": false,
+                "gaps": [{
+                    "kind": "analysis_incomplete",
+                    "reason": "tier2 dead_code aggregate did not complete; retry aft_inspect"
+                }]
+            }
+        }));
+        assert!(text.contains("Incomplete dead_code: tier2 dead_code aggregate did not complete; retry aft_inspect"), "{text}");
+        assert!(!text.contains("producer"), "{text}");
     }
 
     #[test]
@@ -4133,6 +4911,353 @@ mod fresh_payload_tests {
         ));
     }
 
+    /// Diagnostics payload for a scoped request where no producer analyzed any
+    /// of the scoped files: eight TypeScript files whose server binary is
+    /// missing and four Biome files the running server never reported on.
+    fn uncovered_diagnostics_payload() -> Value {
+        let missing = "typescript-language-server is unavailable; no node_modules in web: \
+                       the project's dependencies are not installed; run your package \
+                       manager's install";
+        let unreported = "running, but has not reported on these files";
+        let mut gaps = vec![serde_json::json!({
+            "kind": "failed_producer",
+            "producer": "typescript",
+            "reason": missing,
+        })];
+        for index in 0..8 {
+            gaps.push(serde_json::json!({
+                "kind": "uncovered_file",
+                "file": format!("web/src/file_{index:02}.ts"),
+                "reason": "no LSP producer has a current diagnostic report for this file",
+                "cause": { "producer": "typescript", "root": "web", "reason": missing },
+            }));
+        }
+        for index in 0..4 {
+            gaps.push(serde_json::json!({
+                "kind": "uncovered_file",
+                "file": format!("tools/lint_{index}.ts"),
+                "reason": "no LSP producer has a current diagnostic report for this file",
+                "cause": { "producer": "biome", "root": "tools", "reason": unreported },
+            }));
+        }
+        serde_json::json!({
+            "errors": null,
+            "warnings": null,
+            "info": null,
+            "hints": null,
+            "items": [],
+            "by_producer": {},
+            "complete": false,
+            "gaps": gaps,
+        })
+    }
+
+    #[test]
+    fn uncovered_diagnostic_files_roll_up_by_cause_and_list_at_most_top_k_paths() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            uncovered_diagnostics_payload(),
+        );
+        let roots = [PathBuf::from("/repo/web"), PathBuf::from("/repo/tools")];
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            Some(&roots),
+        );
+        let text = payload["text"].as_str().expect("text");
+
+        // One line per (root, producer, reason), with the file count, instead
+        // of one line per file.
+        let group_lines = text
+            .lines()
+            .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            group_lines,
+            vec![
+                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: producer typescript failed, reason above)",
+                "Incomplete diagnostics: no authoritative diagnostics for 4 files (biome in tools: running, but has not reported on these files)",
+            ],
+            "{text}"
+        );
+        // At most topK (5 here) affected paths, largest group first, then the
+        // list trailer.
+        let listed = text
+            .lines()
+            .filter(|line| line.starts_with("  web/") || line.starts_with("  tools/"))
+            .count();
+        assert_eq!(listed, 5, "{text}");
+        assert!(
+            text.contains(
+                "  web/src/file_04.ts\nshown 5 of 12 items (cap) · narrow: topK, scope, sections"
+            ),
+            "{text}"
+        );
+        // The one-line diagnostics status stays bounded too: it counts the
+        // uncovered files instead of naming each one.
+        let status = text
+            .lines()
+            .find(|line| line.starts_with("diagnostics: unknown"))
+            .expect("diagnostics status line");
+        assert!(!status.contains("file_0"), "{status}");
+        assert!(
+            status.contains("12 files without an authoritative report"),
+            "{status}"
+        );
+
+        // The payload keeps every structured gap row; the path list in
+        // `details` is the bounded one, with its truncation envelope.
+        let uncovered = payload["gaps"]
+            .as_array()
+            .expect("gaps")
+            .iter()
+            .filter(|gap| gap["kind"] == "uncovered_file")
+            .count();
+        assert_eq!(uncovered, 12);
+        assert_eq!(payload["complete"], false);
+        assert_eq!(payload["summary"]["diagnostics"]["complete"], false);
+        assert_eq!(
+            payload["details"]["diagnostics_uncovered_files"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            payload["details"]["diagnostics_uncovered_files_list_envelope"]["total"]["value"],
+            12
+        );
+        assert_eq!(
+            payload["summary"]["diagnostics"]["uncovered_file_groups"],
+            serde_json::json!([
+                {
+                    "producer": "typescript",
+                    "root": "web",
+                    "reason": "typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install",
+                    "files": 8,
+                },
+                {
+                    "producer": "biome",
+                    "root": "tools",
+                    "reason": "running, but has not reported on these files",
+                    "files": 4,
+                },
+            ])
+        );
+    }
+
+    /// Findings withheld from a category's count because they live in test
+    /// trees or fixtures are still reported, as a clause on that category's
+    /// summary line.
+    #[test]
+    fn withheld_test_findings_are_counted_on_each_category_headline() {
+        let summary = serde_json::json!({
+            "dead_code": {"count": 865, "excluded_test_count": 2940, "excluded_test_files": 21},
+            "unused_exports": {"count": 0, "excluded_test_count": 0, "excluded_test_files": 0},
+            "duplicates": {"count": 0, "excluded_test_count": 3, "excluded_test_files": 1},
+            "todos": {"count": 0, "excluded_test_count": 4, "excluded_test_files": 2},
+        });
+        let text = render_inspect_text(summary.as_object().unwrap(), &Map::new(), None);
+        let lines = text.lines().collect::<Vec<_>>();
+        assert!(
+            lines.contains(&"Dead code: 865 · excluded 2,940 in 21 test/fixture files (pass includeTests to see them):"),
+            "{text}"
+        );
+        assert!(lines.contains(&"Unused exports: 0"), "{text}");
+        assert!(
+            lines.contains(&"Duplicates: 0 · excluded 3 in 1 test/fixture file (pass includeTests to see them)"),
+            "{text}"
+        );
+        assert!(
+            lines.contains(
+                &"TODOs: 0 · excluded 4 in 2 test/fixture files (pass includeTests to see them)"
+            ),
+            "{text}"
+        );
+    }
+
+    /// A scanner that did not finish within the inspect wait budget is named
+    /// on its incomplete line, instead of the generic "unknown producer".
+    #[test]
+    fn unfinished_scanner_gap_names_its_scanner() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Todos,
+            serde_json::json!({
+                "unavailable": true, "complete": false,
+                "gaps": [{"kind": "analysis_incomplete", "producer": "todos scanner",
+                    "reason": "analysis did not finish within its wait budget; retry aft_inspect"}]
+            }),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            None,
+        );
+        let text = payload["text"].as_str().expect("text");
+        assert!(
+            text.contains("Incomplete todos: todos scanner did not finish (analysis did not finish within its wait budget; retry aft_inspect)"),
+            "{text}"
+        );
+        assert!(!text.contains("unknown producer"), "{text}");
+    }
+
+    #[test]
+    fn runtime_notes_that_differ_only_by_path_collapse_to_one_line() {
+        let notes = [
+            "TypeScript 5.9.3: project installation (/r/a/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/b/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/c/node_modules/typescript/lib/tsserver.js)",
+            "TypeScript 5.4.0: project installation (/r/d/node_modules/typescript/lib/tsserver.js)",
+            "rust-analyzer warning: proc macros unavailable",
+        ]
+        .map(String::from);
+        assert_eq!(
+            collapse_runtime_notes(&notes),
+            vec![
+                "TypeScript 5.9.3: project installation ×3 (first: /r/a/node_modules/typescript/lib/tsserver.js)",
+                "TypeScript 5.4.0: project installation (/r/d/node_modules/typescript/lib/tsserver.js)",
+                "rust-analyzer warning: proc macros unavailable",
+            ]
+        );
+    }
+
+    /// A producer whose workspace failed to load (rust-analyzer run with
+    /// `--locked` over a stale Cargo.lock) leaves the one scoped file without
+    /// diagnostics. The multi-line cargo error is printed once, on the
+    /// producer line; the file-group line and the status line name the
+    /// producer instead of repeating it, and the coverage line counts files
+    /// with authoritative diagnostics (none), so it cannot read as success
+    /// beside the gap.
+    #[test]
+    fn failed_producer_error_renders_once_and_coverage_counts_authoritative_files() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let cargo_error =
+            "Failed to read Cargo metadata with dependencies for `/repo/Cargo.toml`: \
+            `cargo metadata` exited with an error:\n\nerror: cannot update the lock file \
+            /tmp/rust-analyzer1-0/Cargo.lock because --locked was passed to prevent this";
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({
+                "errors": null,
+                "warnings": null,
+                "info": null,
+                "hints": null,
+                "items": [],
+                "by_producer": {},
+                "complete": false,
+                "gaps": [
+                    { "kind": "failed_producer", "producer": "rust", "root": ".", "reason": cargo_error },
+                    {
+                        "kind": "uncovered_file",
+                        "file": "src/lib.rs",
+                        "reason": "no LSP producer has a current diagnostic report for this file",
+                        "cause": { "producer": "rust", "root": ".", "reason": cargo_error },
+                    },
+                ],
+                "coverage": {
+                    "files": 1,
+                    "examined": 1,
+                    "authoritative": 0,
+                    "not_examined": 0,
+                    "file_cap": 200,
+                },
+            }),
+        );
+        let roots = [PathBuf::from("/repo/src/lib.rs")];
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            5,
+            &ctx,
+            Some(&roots),
+        );
+        let text = payload["text"].as_str().expect("text");
+
+        assert_eq!(
+            text.matches("--locked was passed").count(),
+            1,
+            "the producer error must be printed once: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "Incomplete diagnostics: producer rust @ . failed ({cargo_error})"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Incomplete diagnostics: no authoritative diagnostics for 1 file (rust in .: producer rust failed, reason above)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "diagnostics: unknown (producer rust @ . failed, reason above; 1 file without an authoritative report)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("diagnostics: authoritative results for 0 of 1 scoped file"),
+            "{text}"
+        );
+        assert!(!text.contains("analyzed 1 of 1"), "{text}");
+        // The structured gap keeps the full reason for programmatic readers.
+        assert_eq!(
+            payload["summary"]["diagnostics"]["uncovered_file_groups"][0]["reason"],
+            cargo_error
+        );
+    }
+
+    #[test]
+    fn uncovered_diagnostic_files_within_top_k_render_without_a_trailer() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            uncovered_diagnostics_payload(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::summary_only(),
+            20,
+            &ctx,
+            None,
+        );
+        let text = payload["text"].as_str().expect("text");
+        assert!(!text.contains("(cap)"), "{text}");
+        assert!(
+            text.ends_with("  tools/lint_3.ts") || text.contains("  tools/lint_3.ts\n"),
+            "{text}"
+        );
+        assert!(payload["details"]
+            .get("diagnostics_uncovered_files_list_envelope")
+            .is_none());
+    }
+
     #[test]
     fn build_inspect_payload_uncapped_renders_no_trailers_and_serializes_no_envelope() {
         let ctx = AppContext::new(
@@ -4187,6 +5312,52 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     use super::*;
+
+    #[test]
+    fn inspect_test_delay_holds_until_elapsed() {
+        let started = Instant::now();
+        wait_inspect_test_delay(
+            Duration::from_millis(60),
+            InspectRequestDeadline::new(Duration::from_secs(5), Duration::ZERO),
+            None,
+        );
+        assert!(started.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[test]
+    fn inspect_test_delay_wakes_on_cancellation() {
+        let token = crate::executor::JobCancellation::new();
+        let worker_token = token.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            wait_inspect_test_delay(
+                Duration::from_secs(30),
+                InspectRequestDeadline::new(Duration::from_secs(60), Duration::ZERO),
+                Some(&worker_token),
+            );
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(60)).is_err());
+        token.request_cancel();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation must wake the hold");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn inspect_test_delay_obeys_request_budget() {
+        let started = Instant::now();
+        wait_inspect_test_delay(
+            Duration::from_secs(30),
+            InspectRequestDeadline::new(Duration::from_millis(60), Duration::ZERO),
+            None,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn deferred_preflight_uses_one_terminal_poll_response() {
@@ -4354,6 +5525,60 @@ mod deferred_terminal_tests {
         assert!(failed.data.get("failed_phase").is_none());
     }
 
+    fn diagnostics_payload(diagnostics: Value) -> Value {
+        serde_json::json!({"summary": {"diagnostics": diagnostics}, "text": "body"})
+    }
+
+    /// A completed request whose diagnostics are unknown for any producer is
+    /// PARTIAL, never FRESH, and its reason names every producer the gaps
+    /// attribute, from failure rows and from uncovered scoped files alike.
+    #[test]
+    fn unknown_diagnostics_make_the_terminal_partial_and_name_producers() {
+        let log = InspectPhaseLog::for_request("inspect-partial-header");
+        let payload = diagnostics_payload(serde_json::json!({
+            "complete": false,
+            "gaps": [
+                {"kind": "failed_producer", "producer": "rust", "root": "spikes/x", "reason": "Failed to load workspaces."},
+                {"kind": "failed_producer", "producer": "rust", "root": ".", "reason": "still indexing"},
+                {"kind": "uncovered_file", "file": "a.ts", "reason": "no report", "cause": {"producer": "typescript", "root": ".", "reason": "x"}}
+            ]
+        }));
+        let response = build_inspect_terminal(
+            "inspect-partial-header",
+            &log,
+            InspectTerminal::Fresh(payload),
+        );
+        assert!(response.success);
+        assert_eq!(response.data["inspect_terminal"], "partial");
+        assert_eq!(
+            response.data["partial_reason"],
+            "diagnostics unknown for rust, typescript"
+        );
+        assert!(response.data["wait_stamp"]["text"].is_string());
+        let rendered = crate::subc_format::format_inspect_for_test(&response);
+        assert_eq!(
+            rendered.lines().next(),
+            Some("PARTIAL: diagnostics unknown for rust, typescript (see below)")
+        );
+    }
+
+    #[test]
+    fn authoritative_diagnostics_keep_the_terminal_fresh() {
+        let log = InspectPhaseLog::for_request("inspect-fresh-header");
+        let payload = diagnostics_payload(serde_json::json!({
+            "errors": 0, "warnings": 0, "info": 0, "hints": 0, "items": []
+        }));
+        let response = build_inspect_terminal(
+            "inspect-fresh-header",
+            &log,
+            InspectTerminal::Fresh(payload),
+        );
+        assert_eq!(response.data["inspect_terminal"], "fresh");
+        assert!(response.data.get("partial_reason").is_none());
+        let rendered = crate::subc_format::format_inspect_for_test(&response);
+        assert!(!rendered.contains("PARTIAL"), "{rendered}");
+    }
+
     #[test]
     fn writer_lease_deadline_has_a_named_terminal_reason() {
         let response = Response::error(
@@ -4362,6 +5587,25 @@ mod deferred_terminal_tests {
             "dead_code failed: writer_lease_timeout: inspect writer lease deadline elapsed",
         );
         assert_eq!(inspect_failure_reason(&response), "writer_lease_timeout");
+    }
+
+    #[test]
+    fn completed_tier2_result_survives_an_expired_wait_budget() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(JobOutcome::Fresh {
+            payload: serde_json::json!({"count": 3}),
+        })
+        .unwrap();
+        let manager = crate::inspect::InspectManager::new();
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            Instant::now(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.payload().unwrap()["count"], 3);
     }
 
     #[test]
@@ -4399,23 +5643,27 @@ mod deferred_terminal_tests {
             });
         });
         let manager = crate::inspect::InspectManager::new();
+        // The phase wait takes half the budget left after the reserve (450 ms
+        // here), so the budget assertion below tolerates up to 450 ms of
+        // scheduling overshoot. A 120 ms budget left only 40 ms, which a loaded
+        // macOS runner exceeded.
         let deadline =
-            InspectRequestDeadline::new(Duration::from_millis(120), Duration::from_millis(40));
+            InspectRequestDeadline::new(Duration::from_millis(1_000), Duration::from_millis(100));
         let outcome = receive_tier2_completion_until(
             rx,
             &manager,
             InspectCategory::DeadCode,
-            deadline.phase_deadline(BLOCKING_TIER2_PHASE_TIMEOUT),
+            deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
             Some(deadline),
         )
         .expect("deadline produces an honest failure");
         assert!(
-            !deadline.has_work_budget(),
-            "the receive loop must not return before the shared work deadline"
+            deadline.has_work_budget(),
+            "the phase wait must leave budget for other categories and verification"
         );
         assert!(matches!(
             outcome,
-            JobOutcome::Failed { message } if message.contains("inspect_request_timeout")
+            JobOutcome::Failed { message } if message.contains("inspect_phase_timeout")
         ));
         let _ = release_tx.send(());
 
@@ -4452,12 +5700,19 @@ mod deferred_terminal_tests {
             true,
             &[],
             &[],
+            &[],
+            &[],
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
         );
 
-        assert!(!response.success);
-        assert_eq!(response.data["failed_phase"], "tier2_rescan");
+        assert!(response.success);
+        assert_eq!(response.data["complete"], false);
+        assert!(response.data["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["kind"] == "analysis_incomplete"));
         assert_eq!(manager.reuse_start_count_for_test(), starts_before);
     }
 
@@ -4553,5 +5808,120 @@ mod deferred_terminal_tests {
             "build_denied (borrow-only)"
         );
         assert_eq!(InspectBuilderState::Absent.as_str(), "absent");
+    }
+}
+
+#[cfg(test)]
+mod checkout_deferred_tests {
+    use super::*;
+    use crate::views::contracts::{QueryWait, ViewAccess, WaitOutcome};
+    use crate::views::manifest_v2::{ManifestHeader, ManifestV2, Producers};
+    use crate::views::snapshot::{LiveDelta, OpenGeneration, Snapshot};
+
+    struct Timeout {
+        snapshot: Snapshot,
+        gap: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl QueryWait for Timeout {
+        fn wait_for(
+            &self,
+            _: &ViewAccess,
+            _: crate::blob_store::v2::FamilyPlane,
+            _: Duration,
+        ) -> WaitOutcome {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WaitOutcome::TimedOut {
+                snapshot: self.snapshot.clone(),
+                unreflected: vec![self.gap.clone()],
+            }
+        }
+    }
+    fn run(active: bool) -> (Response, usize) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "# Fixture\n").unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.path().to_path_buf());
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: "test".into(),
+                semantic: None,
+                callgraph: crate::views::callgraph::PRODUCER.into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        let snapshot =
+            LiveDelta::new(Arc::new(OpenGeneration::new("test", manifest, None))).snapshot();
+        let waiter = Arc::new(Timeout {
+            snapshot,
+            gap: root.path().join("pending.ts"),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        if active {
+            let registry =
+                crate::views::registry::FamilyRegistry::open(storage.path(), "inspect-test")
+                    .unwrap();
+            let access = ViewAccess::Owner(registry.register_view("scope", root.path()).unwrap());
+            ctx.install_checkout_query_runtime(Arc::new(
+                crate::views::query_wait::CheckoutQueryRuntime {
+                    access,
+                    waiter: waiter.clone(),
+                    callgraph: Arc::new(crate::views::callgraph::CallgraphPlane::default()),
+                },
+            ));
+        }
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"deferred-checkout", "command":"inspect"}),
+        )
+        .unwrap();
+        let (started, release) = install_deferred_inspect_stat_gate_for_test();
+        let DispatchOutcome::Deferred(mut pending) = handle_inspect_deferred(&request, ctx.clone())
+        else {
+            panic!("expected deferred inspect");
+        };
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let response = loop {
+            if let Some(response) = (pending.poll)(&ctx) {
+                break response;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        (
+            response,
+            waiter.calls.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[test]
+    fn deferred_checkout_timeout_attaches_named_gaps_before_guard_drops() {
+        let _serial = deferred_inspect_test_lock();
+        let (response, calls) = run(true);
+        assert_eq!(calls, 1, "one wait budget per worker request");
+        assert_eq!(response.data["complete"], false);
+        let gaps = response.data["gaps"].as_array().unwrap();
+        assert!(gaps.iter().any(|gap| gap["kind"] == "view_pending"
+            && gap["path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("pending.ts"))));
+    }
+    #[test]
+    fn default_deferred_inspect_has_no_checkout_wait_or_gap_fields() {
+        let _serial = deferred_inspect_test_lock();
+        let (response, calls) = run(false);
+        assert_eq!(calls, 0);
+        assert_eq!(response.data["inspect_terminal"], "fresh");
+        assert!(response.data.get("complete").is_none());
+        assert!(response.data.get("gaps").is_none());
     }
 }

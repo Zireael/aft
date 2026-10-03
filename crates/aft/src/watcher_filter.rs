@@ -91,6 +91,10 @@ pub struct WatcherFilterConfig {
     pub project_root: PathBuf,
     pub git_common_dir: Option<PathBuf>,
     counters: Arc<crate::context::WatcherCounters>,
+    /// Raised when `<root>/.cortexkit/aft.jsonc` changes, so the root re-reads
+    /// its config. Checked before any ignore filtering: the file is config
+    /// whether or not the project ignores `.cortexkit`.
+    config_reload: Option<Arc<crate::config_live::ConfigReloadSignal>>,
 }
 
 impl WatcherFilterConfig {
@@ -100,6 +104,27 @@ impl WatcherFilterConfig {
             project_root,
             git_common_dir,
             counters,
+            config_reload: None,
+        }
+    }
+
+    pub fn with_config_reload_signal(
+        mut self,
+        signal: Arc<crate::config_live::ConfigReloadSignal>,
+    ) -> Self {
+        self.config_reload = Some(signal);
+        self
+    }
+
+    fn note_config_file_events<'a>(&self, raw_paths: impl IntoIterator<Item = &'a PathBuf>) {
+        let Some(signal) = self.config_reload.as_ref() else {
+            return;
+        };
+        if raw_paths
+            .into_iter()
+            .any(|path| crate::config_live::is_project_config_event_path(&self.project_root, path))
+        {
+            signal.request();
         }
     }
 
@@ -387,10 +412,9 @@ fn watcher_directory_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> boo
     })
 }
 
-/// True when `path` is an in-tree ignore rule file that the current matcher
-/// already excludes, either directly or through an ignored parent directory.
-/// Only in-tree rule files can satisfy this; the global excludes file and
-/// `.git/info/exclude` never do.
+/// True when `path` is an in-tree ignore rule file inside an ignored directory.
+/// A rule file that matches itself still supplies rules for its directory and
+/// must be reloaded when its contents change.
 fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
     if !watcher_path_is_ignore_file(path) {
         return false;
@@ -403,11 +427,10 @@ fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.as_deref().is_some_and(|matcher| {
         path.starts_with(matcher.path())
-            && (matcher.matched_path_or_any_parents(path, false).is_ignore()
-                || (parent != matcher.path()
-                    && matcher
-                        .matched_path_or_any_parents(parent, true)
-                        .is_ignore()))
+            && parent != matcher.path()
+            && matcher
+                .matched_path_or_any_parents(parent, true)
+                .is_ignore()
     })
 }
 
@@ -1492,6 +1515,11 @@ impl WatcherFilterThread {
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.flush_deadline = None;
+                        // Dropped events may include a config file edit; the
+                        // reload compares contents, so asking is cheap.
+                        if let Some(signal) = self.config.config_reload.as_ref() {
+                            signal.request();
+                        }
                         if !during_rescan
                             && !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason))
                         {
@@ -1499,6 +1527,11 @@ impl WatcherFilterThread {
                         }
                         continue;
                     }
+                    // Config file edits are recognised on the raw event, before
+                    // the corpus filters below: those drop paths under any
+                    // `target`/`node_modules`/... component (which may be an
+                    // ancestor of the root) and resolve symlinked file names.
+                    self.config.note_config_file_events(&event.paths);
                     self.record_recent_paths(&event.paths);
                     if watcher_event_invalidates(&event.kind) {
                         self.config.counters.note_invalidating_event();
@@ -1781,6 +1814,9 @@ impl WatcherFilterThread {
         }
         let paths = filtered.changed.into_iter().collect::<Vec<_>>();
         let path_count = paths.len();
+        // A parent folder session follows its child repositories through
+        // this watcher; it only queues the paths for its own worker.
+        crate::views::parent::note_changed_paths(&paths);
         if !self.send_dispatch(WatcherDispatchEvent::Paths(paths)) {
             return false;
         }
@@ -3642,7 +3678,7 @@ mod tests {
     }
 
     #[test]
-    fn self_ignored_nested_gitignore_rewrites_do_not_report_rule_changes() {
+    fn self_ignored_nested_gitignore_rewrites_still_report_rule_file_events() {
         const REWRITES: usize = 8;
 
         let tmp = TempDir::new().unwrap();
@@ -3665,8 +3701,11 @@ mod tests {
             std::fs::write(&ignore_path, b"*").unwrap();
             let filtered =
                 filter_watcher_raw_paths_for_test(&config, &matcher, [ignore_path.clone()]);
-            assert!(!filtered.ignore_file_changed);
-            assert!(filtered.ignore_file_paths.is_empty());
+            assert!(filtered.ignore_file_changed);
+            assert_eq!(
+                filtered.ignore_file_paths,
+                BTreeSet::from([ignore_path.clone()])
+            );
             assert!(filtered.changed.is_empty());
         }
     }

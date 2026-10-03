@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "typescript-sdk-cap",
+    "subc-build-provenance",
+    "plugin-test-discovery",
+    "rerank-slot-test-race"
+  ],
+  "note": "The only fenced file is commands/semantic_search/rerank/tests.rs, a test-only fix: a rerank build that finishes before read re-reads the slot may read as Ready. No search, ranking or embedding code changes, so every ranked row must stay byte-identical to the committed reference. Also caps the auto-installed TypeScript SDK to 5.x, names TypeScript 7 and typescript-language-server 6.x failures, declares wire_crate_version and build_git_sha in AFT's HELLO, and moves plugin tests into src/__tests__ where CI runs them."
+}

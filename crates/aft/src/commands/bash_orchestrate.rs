@@ -52,7 +52,17 @@ pub fn format_seconds(ms: u64) -> String {
     format!("{seconds}s")
 }
 
-fn format_background_handoff_tail(task_id: &str) -> String {
+/// What happens to a task once it runs in the background, worded for the
+/// caller's role. A primary session is woken by a completion reminder when the
+/// task finishes. A delegated worker (`worker_session`) never is: once its
+/// turn ends it has delivered its result, so it is told to wait for the task
+/// instead of being promised a reminder that would never reach it.
+fn format_background_handoff_tail(task_id: &str, worker_session: bool) -> String {
+    if worker_session {
+        return format!(
+            "{task_id}. It won't wake you when it finishes, so wait for it before you report a result; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
+        );
+    }
     format!(
         "{task_id}. A completion reminder will be delivered automatically; use bash_status({{ taskId: \"{task_id}\" }}) to inspect output or bash_kill({{ taskId: \"{task_id}\" }}) to terminate."
     )
@@ -63,6 +73,7 @@ pub fn format_promotion_message(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
 ) -> String {
     let waited = timeout
         .map(|timeout| timeout.min(wait_window_ms))
@@ -70,29 +81,40 @@ pub fn format_promotion_message(
     format!(
         "Foreground bash didn't finish within {} and was promoted to background: {}",
         format_seconds(waited),
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
-pub fn format_wait_detach_message(task_id: &str) -> String {
+pub fn format_wait_detach_message(task_id: &str, worker_session: bool) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because a user message arrived.",
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
-pub fn format_module_drain_detach_message(task_id: &str) -> String {
+pub fn format_module_drain_detach_message(task_id: &str, worker_session: bool) -> String {
     format!(
         "Foreground bash is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
-        format_background_handoff_tail(task_id)
+        format_background_handoff_tail(task_id, worker_session)
     )
 }
 
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatBackgroundLaunch` (lines 593-601).
-pub fn format_background_launch(task_id: &str, pty: bool) -> String {
+/// Worded per role like [`format_background_handoff_tail`].
+pub fn format_background_launch(task_id: &str, pty: bool, worker_session: bool) -> String {
     if pty {
+        let tail = if worker_session {
+            "It won't wake you when it exits."
+        } else {
+            "A completion reminder fires automatically when the task exits."
+        };
         return format!(
-            "PTY task started: {task_id}. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, bash_write({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. A completion reminder fires automatically when the task exits."
+            "PTY task started: {task_id}. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to see the visible terminal, bash_write({{ taskId: \"{task_id}\", input: ... }}) to send keystrokes. {tail}"
+        );
+    }
+    if worker_session {
+        return format!(
+            "Background task started: {task_id}. It won't wake you when it finishes, so wait for it before you report a result."
         );
     }
     format!(
@@ -106,6 +128,91 @@ pub fn foreground_orchestrate_enabled(req: &RawRequest) -> bool {
         .unwrap_or(false)
 }
 
+/// The repeat breaker's capture of a `bash` or `powershell` request that a
+/// plugin sent directly over the standalone protocol, as the Pi plugin and the
+/// OpenCode plugin in standalone mode do for every model bash call.
+///
+/// Those plugins show the model the response's `output` field, so this is
+/// where the breaker's reminder goes. Only the standalone request loop may
+/// build one: the shared tool-call runner and subc reach the same bash handler
+/// internally and already observe the call, so observing there too would count
+/// every call twice.
+pub struct RawBashRepeat(Option<crate::run_tool_call::RepeatObservation>);
+
+/// Captures a top-level `bash`/`powershell` request before it runs. The plugin
+/// nests the tool arguments under `params` because `command` would otherwise
+/// collide with the request's own `command` field.
+pub fn raw_bash_repeat(req: &RawRequest) -> RawBashRepeat {
+    let arguments = req.params.get("params").unwrap_or(&req.params);
+    RawBashRepeat(crate::run_tool_call::RepeatObservation::for_agent_call(
+        req.session(),
+        &req.command,
+        arguments,
+        false,
+        req.worker_session(),
+    ))
+}
+
+impl RawBashRepeat {
+    /// Observes the call once, on whichever response answers it: at once, or
+    /// from the deferred foreground wait when the command finishes or is
+    /// promoted to the background. A deferred call that never answers (the
+    /// connection closes or AFT shuts down) is not observed.
+    pub fn observe_outcome(self, ctx: &AppContext, outcome: DispatchOutcome) -> DispatchOutcome {
+        let Some(repeat) = self.0 else {
+            return outcome;
+        };
+        match outcome {
+            DispatchOutcome::Immediate(mut response) => {
+                observe_raw_bash_response(repeat, ctx, &mut response);
+                DispatchOutcome::Immediate(response)
+            }
+            DispatchOutcome::Deferred(mut pending) => {
+                let mut inner = pending.poll;
+                let mut repeat = Some(repeat);
+                pending.poll = Box::new(move |ctx| {
+                    let mut response = inner(ctx)?;
+                    if let Some(repeat) = repeat.take() {
+                        observe_raw_bash_response(repeat, ctx, &mut response);
+                    }
+                    Some(response)
+                });
+                DispatchOutcome::Deferred(pending)
+            }
+        }
+    }
+}
+
+/// Hashes and extends the text the plugins render: `output` on a result, or
+/// `message` on an error, which the plugins raise as the tool's error text.
+///
+/// A permission ask is not an answer. The plugin asks the user and resends the
+/// same request with the grant, still for one model call, so only the resent
+/// request's answer is observed.
+fn observe_raw_bash_response(
+    repeat: crate::run_tool_call::RepeatObservation,
+    ctx: &AppContext,
+    response: &mut Response,
+) {
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    let field = if response.success {
+        "output"
+    } else if data.get("code").and_then(Value::as_str)
+        == Some(crate::protocol::ERROR_PERMISSION_REQUIRED)
+    {
+        return;
+    } else {
+        "message"
+    };
+    let Some(mut text) = data.get(field).and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    repeat.observe(ctx, &mut text);
+    data.insert(field.to_string(), Value::String(text));
+}
+
 pub fn build_bash_outcome(
     req: &RawRequest,
     ctx: &AppContext,
@@ -116,6 +223,7 @@ pub fn build_bash_outcome(
     }
 
     let params = parse_params(req).unwrap_or_default();
+    let worker_session = req.worker_session();
     let Some(task_id) = spawn_response
         .data
         .get("task_id")
@@ -135,7 +243,12 @@ pub fn build_bash_outcome(
         .unwrap_or("pipes");
     let is_pty = mode == "pty" || params.pty;
     if is_pty || params.background {
-        return DispatchOutcome::Immediate(background_launch_response(&req.id, &task_id, is_pty));
+        return DispatchOutcome::Immediate(background_launch_response(
+            &req.id,
+            &task_id,
+            is_pty,
+            worker_session,
+        ));
     }
 
     let request_id = req.id.clone();
@@ -156,7 +269,7 @@ pub fn build_bash_outcome(
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
     let block_to_completion = params.block_to_completion || params.wait;
     let timeout = params.timeout;
-    let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let storage_dir = crate::bash_background::task_storage_dir(ctx);
     let project_root = ctx.config().project_root.clone();
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
@@ -186,6 +299,7 @@ pub fn build_bash_outcome(
                     &task_id_for_poll,
                     &session_id_for_poll,
                     &request_id_for_poll,
+                    worker_session,
                 ))
             } else {
                 match decide_bash_step(
@@ -203,6 +317,7 @@ pub fn build_bash_outcome(
                         timeout,
                         wait_window_ms,
                         &request_id_for_poll,
+                        worker_session,
                     )),
                     BashStep::Wait => None,
                 }
@@ -294,9 +409,10 @@ pub(crate) fn promote_bash(
     timeout: Option<u64>,
     wait_window_ms: u64,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms),
+        Ok(_) => promotion_response(request_id, task_id, timeout, wait_window_ms, worker_session),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -311,9 +427,10 @@ pub(crate) fn detach_wait_mode_bash(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => wait_detach_response(request_id, task_id),
+        Ok(_) => wait_detach_response(request_id, task_id, worker_session),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -331,16 +448,31 @@ pub(crate) fn detach_bash_for_module_drain(
     task_id: &str,
     session_id: &str,
     request_id: &str,
+    worker_session: bool,
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
-        Ok(_) => Response::success(
-            request_id,
-            json!({
-                "output": format_module_drain_detach_message(task_id),
-                "task_id": task_id,
-                "status": "running",
-            }),
-        ),
+        Ok(_) => {
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(task_id, session_id, 0);
+            let output_path = snapshot
+                .as_ref()
+                .and_then(|task| task.output_path.as_deref());
+            let stderr_path = snapshot
+                .as_ref()
+                .and_then(|task| task.stderr_path.as_deref());
+            crate::slog_info!("bash drain detach persisted: task_id={task_id} output={output_path:?} stderr={stderr_path:?}");
+            Response::success(
+                request_id,
+                json!({
+                    "output": format!("{}\nOutput: {}", format_module_drain_detach_message(task_id, worker_session), output_path.unwrap_or("unavailable")),
+                    "task_id": task_id,
+                    "status": "running",
+                    "output_path": output_path,
+                    "stderr_path": stderr_path,
+                }),
+            )
+        }
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",
@@ -365,11 +497,12 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             // timeout diagnostics still render before the final canonical trailer.
             foreground_snapshot.output_truncated = false;
             let mut output = format_foreground_result(&foreground_snapshot);
-            let envelope = crate::list_surfaces::bash::append_envelope_trailer(
-                &mut output,
-                envelope.total.value(),
-            );
-            (output, envelope)
+            // Formatting may add exit diagnostics, which are not command output lines.
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&trailer);
+            (output, Some(envelope.clone()))
         } else {
             (format_foreground_result(&snapshot), None)
         };
@@ -410,11 +543,16 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     Response::success(request_id, data)
 }
 
-fn background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
+fn background_launch_response(
+    request_id: &str,
+    task_id: &str,
+    is_pty: bool,
+    worker_session: bool,
+) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_background_launch(task_id, is_pty),
+            "output": format_background_launch(task_id, is_pty, worker_session),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -427,22 +565,23 @@ fn promotion_response(
     task_id: &str,
     timeout: Option<u64>,
     wait_window_ms: u64,
+    worker_session: bool,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_promotion_message(task_id, timeout, wait_window_ms),
+            "output": format_promotion_message(task_id, timeout, wait_window_ms, worker_session),
             "task_id": task_id,
             "status": "running",
         }),
     )
 }
 
-fn wait_detach_response(request_id: &str, task_id: &str) -> Response {
+fn wait_detach_response(request_id: &str, task_id: &str, worker_session: bool) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": format_wait_detach_message(task_id),
+            "output": format_wait_detach_message(task_id, worker_session),
             "task_id": task_id,
             "status": "running",
         }),
@@ -672,7 +811,7 @@ mod tests {
     #[test]
     fn promotion_message_matches_opencode_copy() {
         assert_eq!(
-            format_promotion_message("bash-123", Some(5_500), 8_000),
+            format_promotion_message("bash-123", Some(5_500), 8_000, false),
             "Foreground bash didn't finish within 5.5s and was promoted to background: bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate."
         );
     }
@@ -680,7 +819,7 @@ mod tests {
     #[test]
     fn wait_detach_message_mentions_user_message() {
         assert_eq!(
-            format_wait_detach_message("bash-123"),
+            format_wait_detach_message("bash-123", false),
             "Foreground bash is running in background as bash-123. A completion reminder will be delivered automatically; use bash_status({ taskId: \"bash-123\" }) to inspect output or bash_kill({ taskId: \"bash-123\" }) to terminate.\nDetached because a user message arrived."
         );
     }
@@ -688,12 +827,41 @@ mod tests {
     #[test]
     fn background_launch_messages_match_opencode_copy() {
         assert_eq!(
-            format_background_launch("bash-bg", false),
+            format_background_launch("bash-bg", false, false),
             "Background task started: bash-bg. A completion reminder will be delivered automatically; don't poll bash_status."
         );
         assert_eq!(
-            format_background_launch("bash-pty", true),
+            format_background_launch("bash-pty", true, false),
             "PTY task started: bash-pty. Use bash_status({ taskId: \"bash-pty\", outputMode: \"screen\" }) to see the visible terminal, bash_write({ taskId: \"bash-pty\", input: ... }) to send keystrokes. A completion reminder fires automatically when the task exits."
         );
+    }
+
+    /// A delegated worker is never woken by a completion reminder, so no
+    /// hand-off text it can receive may promise one; a primary's text is
+    /// unchanged.
+    #[test]
+    fn hand_off_texts_are_worded_per_role() {
+        let worker = [
+            format_background_launch("bash-bg", false, true),
+            format_background_launch("bash-pty", true, true),
+            format_promotion_message("bash-123", None, 8_000, true),
+            format_wait_detach_message("bash-123", true),
+            format_module_drain_detach_message("bash-123", true),
+        ];
+        for text in &worker {
+            assert!(!text.contains("completion reminder"), "{text}");
+            assert!(!text.contains("end the turn"), "{text}");
+            assert!(text.contains("won't wake you"), "{text}");
+        }
+        let primary = [
+            format_background_launch("bash-bg", false, false),
+            format_background_launch("bash-pty", true, false),
+            format_promotion_message("bash-123", None, 8_000, false),
+            format_wait_detach_message("bash-123", false),
+            format_module_drain_detach_message("bash-123", false),
+        ];
+        for text in &primary {
+            assert!(text.contains("completion reminder"), "{text}");
+        }
     }
 }

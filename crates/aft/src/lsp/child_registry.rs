@@ -16,8 +16,39 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::lsp::registry::ServerKind;
+
+/// How long a freshly spawned child may wait for its `LspClient` to claim it
+/// before the orphan sweep treats it as abandoned. Claiming normally takes
+/// microseconds; the window only has to outlast a slow fork under load while
+/// still letting the sweep collect a child whose client construction failed.
+const SPAWN_CLAIM_WINDOW: Duration = Duration::from_secs(10);
+
+/// Who owns a tracked child right now.
+#[derive(Clone, Copy, Debug, Default)]
+enum ClientOwnership {
+    /// Just spawned; its `LspClient` is still being built and will claim it.
+    Spawning { since: Instant },
+    /// A live `LspClient` owns the child.
+    Live,
+    /// No client owns the child: it was dropped without a kill, or the PID
+    /// was registered directly. This is the orphan the sweep reaps.
+    #[default]
+    Gone,
+}
+
+impl ClientOwnership {
+    /// Whether the orphan sweep may kill this child now.
+    fn is_orphan(self, now: Instant) -> bool {
+        match self {
+            Self::Spawning { since } => now.saturating_duration_since(since) >= SPAWN_CLAIM_WINDOW,
+            Self::Live => false,
+            Self::Gone => true,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LspChildRootHealth {
@@ -52,9 +83,10 @@ struct TrackedChild {
     root: Option<PathBuf>,
     server_root: Option<PathBuf>,
     kind: Option<ServerKind>,
-    /// Set once an `LspClient` owns this child. A tracked child with no live
-    /// client is the orphan signature the lifecycle census needs to expose.
-    client_live: bool,
+    /// Whether an `LspClient` owns this child. The orphan sweep and the health
+    /// snapshot treat a tracked child with no client as an orphan, except
+    /// while its client is still being constructed.
+    ownership: ClientOwnership,
 }
 
 #[derive(Clone, Default)]
@@ -106,7 +138,7 @@ impl LspChildRegistry {
                     root: root.map(Path::to_path_buf),
                     server_root: server_root.map(Path::to_path_buf),
                     kind: kind.cloned(),
-                    client_live: false,
+                    ownership: ClientOwnership::Gone,
                 },
             );
         }
@@ -143,13 +175,20 @@ impl LspChildRegistry {
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
         let child = command.spawn()?;
+        // The caller is about to wrap this child in an `LspClient`. Until it
+        // calls `mark_client_live`, the child must not look like an orphan:
+        // a maintenance sweep blocked on this lock during the fork would
+        // otherwise wake up, see a client-less child and SIGTERM it before
+        // the `initialize` request is even written.
         children.insert(
             child.id(),
             TrackedChild {
                 root: root.map(Path::to_path_buf),
                 server_root: server_root.map(Path::to_path_buf),
                 kind: kind.cloned(),
-                client_live: false,
+                ownership: ClientOwnership::Spawning {
+                    since: Instant::now(),
+                },
             },
         );
         Ok(child)
@@ -159,7 +198,7 @@ impl LspChildRegistry {
     pub(crate) fn mark_client_live(&self, pid: u32) {
         if let Ok(mut children) = self.inner.lock() {
             if let Some(child) = children.get_mut(&pid) {
-                child.client_live = true;
+                child.ownership = ClientOwnership::Live;
             }
         }
     }
@@ -170,7 +209,7 @@ impl LspChildRegistry {
     pub(crate) fn mark_client_gone(&self, pid: u32) {
         if let Ok(mut children) = self.inner.lock() {
             if let Some(child) = children.get_mut(&pid) {
-                child.client_live = false;
+                child.ownership = ClientOwnership::Gone;
             }
         }
     }
@@ -227,6 +266,23 @@ impl LspChildRegistry {
         reaped
     }
 
+    /// Force-kill the process groups of the given PIDs and untrack them,
+    /// without waiting for any of them to exit. Exit-time LSP shutdown uses
+    /// this once its graceful window has passed: the caller's deadline has to
+    /// cover both these kills and the wait for them to take effect, so a slow
+    /// termination of one server must not delay the kill of the next.
+    /// Returns how many groups were sent the kill (or were already gone).
+    pub fn force_kill_pids(&self, pids: &[u32]) -> usize {
+        let mut killed = 0;
+        for pid in pids {
+            if force_kill_child_process_group_nowait(*pid) {
+                self.untrack(*pid);
+                killed += 1;
+            }
+        }
+        killed
+    }
+
     /// Snapshot tracked children without holding the registry lock across CWD
     /// and RSS probes. The health rollup worker calls this off the reply path.
     pub fn health_snapshot(&self) -> LspChildHealth {
@@ -250,12 +306,35 @@ impl LspChildRegistry {
     /// The registry snapshot is copied before signal delivery so a slow process
     /// group does not block an LSP spawn or health observation.
     pub fn reap_children_without_client(&self) -> usize {
-        let pids = self
-            .tracked_children()
-            .into_iter()
-            .filter_map(|(pid, tracked)| (!tracked.client_live).then_some(pid))
-            .collect::<Vec<_>>();
-        self.reap_pids(&pids)
+        self.reap_children_without_client_using(kill_child_process_group)
+    }
+
+    fn reap_children_without_client_using<Terminate>(&self, mut terminate: Terminate) -> usize
+    where
+        Terminate: FnMut(u32) -> bool,
+    {
+        let now = Instant::now();
+        let mut reaped = 0;
+        for (pid, tracked) in self.tracked_children() {
+            if tracked.ownership.is_orphan(now) && terminate(pid) {
+                self.untrack(pid);
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    #[cfg(test)]
+    fn track_spawning_child_for_test(&self, pid: u32, since: Instant) {
+        if let Ok(mut children) = self.inner.lock() {
+            children.insert(
+                pid,
+                TrackedChild {
+                    ownership: ClientOwnership::Spawning { since },
+                    ..TrackedChild::default()
+                },
+            );
+        }
     }
 
     /// Kill and untrack every child whose working directory no longer exists.
@@ -379,11 +458,12 @@ fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
     let mut roots = BTreeMap::<String, RootAggregate>::new();
     let mut cwd_gone = 0;
     let mut without_client = 0;
+    let now = Instant::now();
     for (pid, tracked) in &children {
         if matches!(child_cwd_state(*pid), ChildCwdState::Gone) {
             cwd_gone += 1;
         }
-        if !tracked.client_live {
+        if tracked.ownership.is_orphan(now) {
             without_client += 1;
         }
         let root = tracked
@@ -684,6 +764,40 @@ fn kill_child_process_group(pid: u32) -> bool {
     result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// SIGKILL a child's process group. Unlike the maintenance sweep's SIGTERM,
+/// this cannot be ignored: it is only used at the end of a shutdown whose
+/// graceful request the server already failed to honour. `killpg` returns
+/// without waiting for the processes to die, so killing several groups in a
+/// row costs no more than a few system calls.
+#[cfg(unix)]
+fn force_kill_child_process_group_nowait(pid: u32) -> bool {
+    let Ok(pgid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: killpg does not dereference pointers.
+    let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Windows has no process groups to signal; `taskkill /F /T` forcibly ends
+/// the process tree instead. It is a separate program that can take a while
+/// to start and finish, so each one runs on its own detached thread: every
+/// kill starts at once and none of them holds up the caller's deadline.
+#[cfg(not(unix))]
+fn force_kill_child_process_group_nowait(pid: u32) -> bool {
+    std::thread::Builder::new()
+        .name("aft-lsp-force-kill".to_string())
+        .spawn(move || {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        })
+        .is_ok()
+}
+
 #[cfg(not(unix))]
 fn kill_child_process_group(pid: u32) -> bool {
     std::process::Command::new("taskkill")
@@ -929,6 +1043,70 @@ mod tests {
             wait_until_not_running(grandchild_pid, Duration::from_secs(5)),
             "grandchild must stop after killpg (this was the npm-wrapper orphan bug)"
         );
+    }
+
+    /// A child that `LspClient::spawn` has just started is not an orphan: its
+    /// client simply has not finished taking the pipes yet. The periodic
+    /// maintenance sweep used to block on the registry lock while the spawn
+    /// held it, then saw the new child as client-less and SIGTERMed it.
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_leaves_child_whose_client_is_still_being_built() {
+        use std::os::unix::process::CommandExt;
+
+        let reg = LspChildRegistry::new();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = reg
+            .spawn_tracked_child(&mut command, None, None, None)
+            .expect("spawn child");
+        let pid = child.id();
+
+        let reaped = reg.reap_children_with_gone_cwd_or_reclaimed_root();
+        let still_running = child.try_wait().expect("poll child").is_none();
+        let orphan_count = reg.health_snapshot().children_without_client;
+        let _ = child.kill();
+        let _ = child.wait();
+        reg.untrack(pid);
+
+        assert_eq!(
+            reaped, 0,
+            "a child still being handed to its client was reaped"
+        );
+        assert!(
+            still_running,
+            "the sweep signalled a child still being handed to its client"
+        );
+        assert_eq!(
+            orphan_count, 0,
+            "a child mid-spawn must not count as an orphan"
+        );
+    }
+
+    /// A child whose client never took ownership (for example because
+    /// `LspClient::spawn` failed after starting it) must not stay protected
+    /// forever: once the claim window has passed, the sweep reaps it.
+    #[test]
+    fn maintenance_reaps_spawning_child_that_was_never_claimed() {
+        let registry = LspChildRegistry::new();
+        registry.track_spawning_child_for_test(42, Instant::now() - SPAWN_CLAIM_WINDOW);
+        assert_eq!(registry.health_snapshot().children_without_client, 1);
+        let mut signals = Vec::new();
+        let reaped = registry.reap_children_without_client_using(|pid| {
+            signals.push(pid);
+            true
+        });
+        assert_eq!(reaped, 1);
+        assert_eq!(signals, vec![42]);
+        assert!(registry.pids().is_empty());
     }
 
     #[test]

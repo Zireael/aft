@@ -214,6 +214,26 @@ struct DeferredCheckpointJob {
 static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJob>>> =
     OnceLock::new();
 static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+#[cfg(test)]
+static CHECKPOINT_SETTLED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(test)]
+pub(crate) fn wait_for_derived_checkpoint_for_test(view_dir: &Path) {
+    let jobs = DEFERRED_CHECKPOINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (jobs, _) = CHECKPOINT_SETTLED
+        .wait_timeout_while(jobs, Duration::from_secs(60), |jobs| {
+            jobs.contains_key(view_dir)
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        !jobs.contains_key(view_dir),
+        "derived checkpoint did not settle"
+    );
+}
+
 const DEFERRED_CHECKPOINT_IDLE_DELAY: Duration = Duration::from_millis(250);
 const DERIVED_CHECKPOINT_SEAM: &str = "views::generation::checkpoint_derived";
 const DERIVED_CHECKPOINT_REASON: &str =
@@ -320,6 +340,12 @@ pub(super) fn schedule_derived_checkpoint(
         .name("aft-view-checkpoint".to_owned())
         .spawn(move || {
             std::thread::sleep(DEFERRED_CHECKPOINT_IDLE_DELAY);
+            #[cfg(test)]
+            if let Ok(delay) = std::env::var("AFT_TEST_TIMING_DELAY_MS") {
+                std::thread::sleep(Duration::from_millis(
+                    delay.parse().expect("checkpoint delay"),
+                ));
+            }
             let started = Instant::now();
             let mut io = super::io::Window::new();
             let skipped = cancelled.load(Ordering::Acquire);
@@ -360,6 +386,8 @@ pub(super) fn schedule_derived_checkpoint(
             {
                 jobs.remove(&key);
             }
+            #[cfg(test)]
+            CHECKPOINT_SETTLED.notify_all();
         });
     if let Err(error) = spawn {
         let mut jobs = DEFERRED_CHECKPOINTS

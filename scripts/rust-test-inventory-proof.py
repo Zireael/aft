@@ -56,15 +56,17 @@ class NextestEntry:
         return f"{self.kind}|{self.suite}|{self.name}"
 
 
-def run_command(command: list[str]) -> str:
+def run_command(command: list[str], merge_stderr: bool = True) -> str:
     completed = subprocess.run(
         command,
         cwd=ROOT,
         stdout=subprocess.PIPE,
         # Cargo writes each `Running ...` suite boundary to stderr but writes
         # that suite's test names to stdout. Merge the streams to preserve their
-        # ordering, then let the parser ignore ordinary compile progress.
-        stderr=subprocess.STDOUT,
+        # ordering, then let the parser ignore ordinary compile progress. JSON
+        # listings keep stderr apart, because replayed compiler warnings would
+        # otherwise precede the JSON document.
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         text=True,
         check=False,
         # ANSI color wraps cargo's output and silently breaks the line parsers
@@ -75,6 +77,7 @@ def run_command(command: list[str]) -> str:
     if completed.returncode != 0:
         sys.stderr.write(f"command failed ({completed.returncode}): {' '.join(command)}\n")
         sys.stderr.write(filtered_output)
+        sys.stderr.write(completed.stderr or "")
         sys.exit(completed.returncode)
     return filtered_output
 
@@ -95,6 +98,14 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         if not stripped or stripped.startswith(
             ("Compiling ", "Checking ", "Finished `", "Blocking waiting for file lock")
         ):
+            continue
+
+        # Compiler warnings (for example the macOS linker's `__eh_frame section too
+        # large` note once the lib test binary passes 16 MB of unwind data) print
+        # a `warning:` line plus `|` and `= note:` continuation lines before the
+        # listing. sccache prints its own `sccache: warning:` lines when its
+        # server restarts mid-build. None of them carry test entries.
+        if stripped.startswith(("warning:", "= note:", "= help:", "sccache: ")) or stripped == "|":
             continue
 
         if stripped.startswith("Doc-tests "):
@@ -173,7 +184,7 @@ unit_bin_output = run_command([
     "-T",
     "json",
     "--cargo-quiet",
-])
+], merge_stderr=False)
 unit_bin_entries = parse_nextest_list(unit_bin_output, {"lib", "bin"})
 
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
@@ -192,7 +203,7 @@ nextest_output = run_command([
     "-T",
     "json",
     "--cargo-quiet",
-])
+], merge_stderr=False)
 nextest_entries = parse_nextest_list(nextest_output)
 
 watcher_output = run_command([

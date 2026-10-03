@@ -137,6 +137,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       bash: tools.get("bash")!,
       bashStatus: tools.get("bash_status")!,
       bashKill: tools.get("bash_kill")!,
+      bashWatch: tools.get("bash_watch")!,
       bridgeCalls,
     };
   }
@@ -332,9 +333,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(response.success).toBe(true);
     expect(String(response.output)).toContain("lib.ts");
     expect(String(response.output)).toContain("needle");
-    // aft_search_registered defaults false here → footer points at the grep tool.
+    // The default tool surface includes aft_search, so the footer directs code searches there.
     expect(String(response.output)).toContain("DO NOT search code by running grep/rg in bash");
-    expect(String(response.output)).toContain("Use the `grep` tool instead");
+    expect(String(response.output)).toContain("Use the `aft_search` tool instead");
   }, 60_000);
 
   test("rewriter disabled runs cat as raw bash without footer", async () => {
@@ -420,12 +421,12 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     // Header: status line for the task. Don't anchor on exact format because
     // duration may or may not be present depending on timing on the runner.
     expect(status.output).toContain(`Task ${taskId}: running`);
-    // Anti-polling reminder must be appended for running tasks (parity with
-    // the OpenCode plugin). Same wording so agent behavior is consistent
-    // across both harnesses.
-    expect(status.output).toContain(
-      "A completion reminder will be delivered automatically; don't poll.",
-    );
+    // Anti-polling reminder must be appended for running tasks. The e2e
+    // harness runs headless (hasUI false), which Pi classifies as a worker
+    // session: a worker is never woken by a completion reminder, so it is told
+    // to wait with bash_watch instead.
+    expect(status.output).toContain("To wait for it, call bash_watch; don't poll.");
+    expect(status.output).not.toContain("completion reminder");
     expect(status.details.success).toBe(true);
     expect(status.details.status).toBe("running");
   });
@@ -521,6 +522,52 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(result.output).not.toContain("echo bg-done");
     expect(result.details.bg_completions).toBeUndefined();
   });
+
+  // A sync watch must report the time it really held the call. The wall clock
+  // is stepped forward 60 s shortly after the watch starts, as an NTP
+  // correction or a wake from sleep can do. A watch timed with Date.now()
+  // would end at that step and claim it waited 60 s; a monotonic watch keeps
+  // its 2 s limit and says so. The harness has no UI, so Pi classifies it as a
+  // worker session.
+  test("bash_watch on a still-running task reports about 2 s elapsed and the timeout reason", async () => {
+    const { h, bash, bashWatch, bashKill } = await pluginHarness({
+      experimental_bash_background: true,
+    });
+    const spawned = await callBash(bash, h, { command: "sleep 30", background: true });
+    const taskId = String(spawned.details.task_id);
+
+    const realNow = Date.now;
+    const stepAt = realNow() + 300;
+    Date.now = () => {
+      const now = realNow();
+      return now >= stepAt ? now + 60_000 : now;
+    };
+    const started = performance.now();
+    let result: Awaited<ReturnType<MockToolDef["execute"]>>;
+    try {
+      result = await bashWatch.execute(
+        `test-bash-watch-${realNow()}`,
+        { task_id: taskId, timeout_ms: 2_000 },
+        undefined,
+        undefined,
+        { cwd: h.tempDir, hasUI: false },
+      );
+    } finally {
+      Date.now = realNow;
+    }
+    const realElapsed = performance.now() - started;
+    await callTaskTool<BashKillDetails>(bashKill, h, taskId);
+
+    const text = h.text(result);
+    const waited = (result.details as { waited?: { reason?: string; elapsed_ms?: number } }).waited;
+    expect(waited?.reason).toBe("timeout");
+    expect(realElapsed).toBeGreaterThanOrEqual(1_900);
+    expect(realElapsed).toBeLessThan(10_000);
+    const reported = Number(/Waited (\d+)ms \(limit 2000ms\)/.exec(text)?.[1]);
+    expect(Math.abs(reported - realElapsed)).toBeLessThan(500);
+    expect(waited?.elapsed_ms).toBe(reported);
+    expect(text).toContain("timeout reached without match");
+  }, 20_000);
 });
 
 function toConfigureOverrides(config: Record<string, unknown>): Record<string, unknown> {

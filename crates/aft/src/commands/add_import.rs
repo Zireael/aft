@@ -462,15 +462,17 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         // Build the merged named-import list: union of existing + new, sorted.
         let merged_names = merge_named_import_specifiers(&existing.names, &names);
 
-        let merged_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-            lang,
-            &existing.module_path,
-            &merged_names,
-            existing.default_import.as_deref(),
-            existing.namespace_import.as_deref(),
-            type_only,
-            imports::es_import_attribute_clause(existing),
-        );
+        let merged_line =
+            imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                lang,
+                &existing.module_path,
+                &merged_names,
+                existing.default_import.as_deref(),
+                existing.namespace_import.as_deref(),
+                type_only,
+                imports::es_import_attribute_clause(existing),
+                Some(imports::quotes::statement_style(&existing.raw_text)),
+            );
         (
             existing.byte_range.start,
             existing.byte_range.end,
@@ -478,15 +480,17 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             true,
         )
     } else if let Some(existing) = namespace_merge_target {
-        let merged_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-            lang,
-            &existing.module_path,
-            &existing.names,
-            existing.default_import.as_deref(),
-            namespace.as_deref(),
-            type_only,
-            imports::es_import_attribute_clause(existing),
-        );
+        let merged_line =
+            imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                lang,
+                &existing.module_path,
+                &existing.names,
+                existing.default_import.as_deref(),
+                namespace.as_deref(),
+                type_only,
+                imports::es_import_attribute_clause(existing),
+                Some(imports::quotes::statement_style(&existing.raw_text)),
+            );
         (
             existing.byte_range.start,
             existing.byte_range.end,
@@ -568,7 +572,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             let inherited_clause = clauses
                 .next()
                 .filter(|first| clauses.all(|item| item == *first));
-            imports::generate_import_line_with_namespace_and_attribute_clause(
+            imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
                 lang,
                 module,
                 &names,
@@ -576,6 +580,13 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                 namespace.as_deref(),
                 type_only,
                 inherited_clause,
+                Some(imports::quotes::preferred_style(
+                    &source,
+                    &tree,
+                    lang,
+                    &path,
+                    ctx.callgraph_project_root().as_deref(),
+                )),
             )
         } else {
             imports::generate_import(lang, &import_request)

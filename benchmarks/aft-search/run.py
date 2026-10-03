@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import bench_rerank
 from ndjson_stream import NdjsonStream
 
 
@@ -57,6 +59,7 @@ class AftClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
+            env=bench_rerank.apply_to_env(os.environ.copy()),
         )
         if self.proc.stdout is None:
             raise AftProtocolError("aft stdout is closed")
@@ -85,10 +88,12 @@ class AftClient:
                         "tier": "user",
                         "source": "<aft-search-benchmark>",
                         "doc": json.dumps(
-                            {
-                                "search_index": True,
-                                "semantic_search": self.semantic_search_enabled,
-                            }
+                            bench_rerank.apply_to_config(
+                                {
+                                    "search_index": True,
+                                    "semantic_search": self.semantic_search_enabled,
+                                }
+                            )
                         ),
                     }
                 ],
@@ -129,6 +134,7 @@ class AftClient:
             timeout_secs=60.0,
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
+        bench_rerank.observe("semantic_search", {"query": query, "top_k": top_k}, response, latency_ms)
         return response, latency_ms
 
     def call(
@@ -137,6 +143,9 @@ class AftClient:
         params: Optional[JsonObject] = None,
         timeout_secs: float = 30.0,
     ) -> JsonObject:
+        # Dev-profile runs on contended hosts may need longer transport waits;
+        # this does not change the engine's query budget or ranking parameters.
+        timeout_secs = max(timeout_secs, float(os.environ.get("AFT_SEARCH_BENCH_RPC_TIMEOUT", "0")))
         self._next_id += 1
         request_id = str(self._next_id)
         request: JsonObject = {"id": request_id, "command": command}

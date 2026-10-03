@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "aft-delete-recursive-undo",
+    "e2e-harness-user-config",
+    "release-notes-0.58-rewrite"
+  ],
+  "note": "The only ranking-fence file touched is the subc tool-schema artifact: the aft_delete description now says which recursive entries are accepted and refused. aft_search ranking, fusion, lane admission and truncation are unchanged, so ranked rows should be byte-equal to the reference."
+}

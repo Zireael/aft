@@ -126,6 +126,10 @@ impl CanonicalLexicalLane {
         }
 
         let mut canonical = candidates;
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| {
+            counts.candidates_sorted += canonical.len()
+        });
         canonical.sort_by(|left, right| {
             right
                 .raw_score
@@ -253,14 +257,20 @@ pub fn depth_tier(depth: usize) -> Option<usize> {
         .position(|candidate| *candidate == depth)
 }
 
-/// Scores every file in the three-rarest-trigram discovery pool before sorting.
-///
-/// `SearchIndexSnapshot` exposes bounded rank operations rather than postings.
-/// Single-trigram passes recover each posting membership and cardinality without
-/// truncation; one all-trigram pass supplies the lane-intrinsic score. Filtering
-/// happens only after the canonical three trigrams have been selected from the
-/// unfiltered snapshot, matching index discovery semantics.
+/// Score the union of the three rarest nonempty query-trigram postings,
+/// materializing each query posting only once.
 fn score_complete_selected_pool(
+    snapshot: &SearchIndexSnapshot,
+    query_trigrams: &[u32],
+    candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+) -> Vec<(PathBuf, f32)> {
+    snapshot.lexical_selected_pool(query_trigrams, candidate_filter)
+}
+
+// Keep the previous implementation so tests can compare selected candidates
+// and scores independently of the optimized implementation.
+#[cfg(test)]
+fn reference_selected_pool(
     snapshot: &SearchIndexSnapshot,
     query_trigrams: &[u32],
     candidate_filter: Option<&dyn Fn(&Path) -> bool>,
@@ -304,4 +314,81 @@ fn score_complete_selected_pool(
         .into_iter()
         .filter(|(path, _)| selected_paths.contains(path))
         .collect()
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    use super::*;
+    use crate::search_index::{extract_trigrams, SearchIndex};
+
+    fn fixture() -> SearchIndexSnapshot {
+        let mut index = SearchIndex::new();
+        for ordinal in 0..128 {
+            let path = PathBuf::from(format!("/project/file_{ordinal}.rs"));
+            let text = if ordinal % 3 == 0 {
+                "alpha common rare gamma"
+            } else {
+                "alpha common beta delta"
+            };
+            index.index_file(&path, text.as_bytes());
+            if ordinal % 7 == 0 {
+                index.remove_file(&path);
+            } else if ordinal % 11 == 0 {
+                index.index_file(&path, b"alpha epsilon rare");
+            }
+        }
+        index.snapshot()
+    }
+
+    #[test]
+    fn selected_pool_matches_rank_to_discover_reference_bytes() {
+        let snapshot = fixture();
+        let include = |path: &Path| !path.to_string_lossy().contains("file_1");
+        for query in [
+            "",
+            "nonexistent",
+            "alpha",
+            "alpha common rare gamma",
+            "delta beta alpha rare epsilon",
+        ] {
+            let mut trigrams = extract_trigrams(query.as_bytes())
+                .into_iter()
+                .map(|(trigram, _, _)| trigram)
+                .collect::<Vec<_>>();
+            trigrams.extend(trigrams.clone());
+            for filter in [None, Some(&include as &dyn Fn(&Path) -> bool)] {
+                let expected = reference_selected_pool(&snapshot, &trigrams, filter);
+                let actual = score_complete_selected_pool(&snapshot, &trigrams, filter);
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&expected).unwrap(),
+                    "query={query}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn selected_pool_materializes_each_posting_once() {
+        let snapshot = fixture();
+        let trigrams = extract_trigrams(b"alpha common rare gamma beta delta epsilon")
+            .into_iter()
+            .map(|(trigram, _, _)| trigram)
+            .collect::<Vec<_>>();
+        let expected = reference_selected_pool(&snapshot, &trigrams, None);
+        crate::search_hot_path_measurements::reset();
+        crate::search_index::reset_postings_for_trigram_count_for_debug();
+        let actual = score_complete_selected_pool(&snapshot, &trigrams, None);
+        assert!(!actual.is_empty());
+        assert_eq!(actual, expected);
+        assert_eq!(
+            crate::search_index::postings_for_trigram_count_for_debug(),
+            trigrams.iter().collect::<HashSet<_>>().len()
+        );
+        assert_eq!(
+            crate::search_hot_path_measurements::counts().score_evaluations,
+            actual.len()
+        );
+    }
 }

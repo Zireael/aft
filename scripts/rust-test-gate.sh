@@ -430,8 +430,10 @@ if phase_enabled nextest; then
 fi
 
 if phase_enabled watcher; then
-  run_phase "cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1" \
-    cargo test -p agent-file-tools --test watcher_integration --quiet -- --test-threads=1
+  # test-timing-hooks compiles in the test-only gates the linked-worktree
+  # semantic quiet-window test holds; without the feature that test is not built.
+  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
+    cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies

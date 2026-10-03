@@ -32,6 +32,7 @@ const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024; // 50KB output cap
 const MAX_FILE_READ_BYTES: u64 = 50 * 1024 * 1024; // 50MB input guard
 const MAX_DIRECTORY_ENTRIES: usize = 1000;
+const MAX_DIRECTORY_SCAN: usize = 10_000;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const MEDIA_MAGIC_BYTES: usize = 16;
 const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded payload cap
@@ -292,19 +293,37 @@ fn image_attachment_response(id: &str, image: ProcessedImage) -> Response {
     )
 }
 
+static ACTIVE_IMAGE_DECODERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const MAX_IMAGE_DECODERS: usize = 2;
+
+struct ImageDecoderPermit;
+
+impl Drop for ImageDecoderPermit {
+    fn drop(&mut self) {
+        ACTIVE_IMAGE_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[allow(deprecated)] // fetch_update became try_update in Rust 1.99; the MSRV (1.92) lacks try_update
 fn process_image_with_timeout(
     raw_bytes: Vec<u8>,
     kind: ImageKind,
 ) -> Result<ProcessedImage, String> {
+    ACTIVE_IMAGE_DECODERS.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |active| (active < MAX_IMAGE_DECODERS).then_some(active + 1),
+    ).map_err(|active| format!("image decoder capacity reached ({active}/{MAX_IMAGE_DECODERS} active); retry after existing image reads finish"))?;
+    let permit = ImageDecoderPermit;
     let (tx, rx) = crossbeam_channel::bounded(1);
-    // One dedicated thread per request instead of a shared bounded pool: the
-    // timeout below must measure image processing itself. With a shared pool,
-    // queue wait counted against the budget, so unrelated parallel reads could
-    // time out an image that never started processing.
+    // The worker owns admission until decoding actually ends, including after a
+    // caller timeout. Reject overload rather than queueing retained image bytes.
     let spawned = std::thread::Builder::new()
         .name("aft-read-media".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            let _permit = permit;
             let _ = tx.send(process_image(raw_bytes, kind));
         });
     if let Err(error) = spawned {
@@ -582,6 +601,32 @@ fn webp_has_animation(bytes: &[u8]) -> bool {
     false
 }
 
+/// Refusal for a line window whose start comes after its end. Clamping such a
+/// window used to return an empty success, which reads exactly like "those
+/// lines exist and are empty"; agents drew wrong conclusions from it.
+fn inverted_range_error(id: &str, start_line: u64, end_line: u64) -> Response {
+    Response::error(
+        id,
+        "invalid_range",
+        format!(
+            "invalid_range: startLine {start_line} is after endLine {end_line}; no lines selected. Use a start line at or before the end line."
+        ),
+    )
+}
+
+/// Refusal for a window that starts after the last line of a non-empty file,
+/// for the same reason as [`inverted_range_error`]: zero lines must never
+/// look like a successful read.
+fn start_past_end_error(id: &str, start_line: u64, total_lines: u32) -> Response {
+    Response::error(
+        id,
+        "invalid_range",
+        format!(
+            "invalid_range: startLine {start_line} is past the end of the file ({total_lines} lines); no lines selected. Use a start line between 1 and {total_lines}."
+        ),
+    )
+}
+
 fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response {
     let byte_size = bytes.len();
     if let Some(media) = sniff_media(&bytes[..bytes.len().min(MEDIA_MAGIC_BYTES)]) {
@@ -627,6 +672,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         .params
         .get("limit")
         .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
         .map(|value| value as u32)
         .unwrap_or(DEFAULT_LIMIT);
     let start_line = req
@@ -635,10 +681,20 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
         .and_then(|value| value.as_u64())
         .map(|value| value.max(1) as u32)
         .unwrap_or(1);
-    let end_line = req
+    let explicit_end_line = req
         .params
         .get("end_line")
         .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0);
+    if let Some(end_line) = explicit_end_line {
+        if u64::from(start_line) > end_line {
+            return inverted_range_error(&req.id, u64::from(start_line), end_line);
+        }
+    }
+    if start_line > total_lines && total_lines > 0 {
+        return start_past_end_error(&req.id, u64::from(start_line), total_lines);
+    }
+    let end_line = explicit_end_line
         .map(|value| value as u32)
         .unwrap_or_else(|| {
             start_line
@@ -1177,12 +1233,17 @@ fn read_selection(
         .get("start_line")
         .and_then(Value::as_u64)
         .unwrap_or(1) as usize;
-    let explicit_end = req.params.get("end_line").and_then(Value::as_u64);
+    let explicit_end = req
+        .params
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
     if req.params.get("start_line").is_some() || explicit_end.is_some() {
         let limit = req
             .params
             .get("limit")
             .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_LIMIT as u64) as usize;
         let end = explicit_end
             .map(|value| value as usize)
@@ -1272,11 +1333,14 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         return handle_media_read(req, path.as_path(), metadata.len(), media);
     }
 
-    // Parse range parameters
+    // Parse range parameters. Zero is outside the 1-based domain of every
+    // range field, so a `0` placeholder counts as absent rather than selecting
+    // an empty window (a zero limit or end line would read no lines at all).
     let limit = req
         .params
         .get("limit")
         .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
         .map(|v| v as u32)
         .unwrap_or(DEFAULT_LIMIT);
 
@@ -1287,8 +1351,20 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|v| v.max(1) as u32)
         .unwrap_or(1);
 
-    let explicit_end_line = req.params.get("end_line").and_then(|v| v.as_u64());
-    let has_explicit_range = req.params.get("start_line").is_some() || explicit_end_line.is_some();
+    let explicit_end_line = req
+        .params
+        .get("end_line")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0);
+    let has_explicit_range = req.params.get("start_line").is_some()
+        || explicit_end_line.is_some()
+        || req.params.get("limit").is_some();
+
+    if let Some(end_line) = explicit_end_line {
+        if u64::from(start_line) > end_line {
+            return inverted_range_error(&req.id, u64::from(start_line), end_line);
+        }
+    }
 
     if has_explicit_range {
         return handle_streaming_range_read(
@@ -1359,22 +1435,16 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len() as u32;
 
-    let end_line = req
-        .params
-        .get("end_line")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or_else(|| {
-            start_line
-                .saturating_add(limit)
-                .saturating_sub(1)
-                .min(total_lines)
-        });
+    let end_line = explicit_end_line.map(|v| v as u32).unwrap_or_else(|| {
+        start_line
+            .saturating_add(limit)
+            .saturating_sub(1)
+            .min(total_lines)
+    });
 
-    // Clamp to actual line count. `.max(start_idx)` guards against agents
-    // sending inverted ranges (e.g. end_line < start_line) which would
-    // otherwise panic at `lines[start_idx..end_idx]` below. With this guard,
-    // inverted ranges yield an empty slice and return zero lines.
+    // Clamp to actual line count. `.max(start_idx)` keeps the slice below
+    // from panicking; inverted windows were already refused above, so it
+    // never turns a real request into an empty one.
     let start_idx = (start_line.saturating_sub(1) as usize).min(lines.len());
     let end_idx = (end_line as usize).min(lines.len()).max(start_idx);
 
@@ -1451,6 +1521,27 @@ fn handle_read_legacy(req: &RawRequest, ctx: &AppContext) -> Response {
     )
 }
 
+/// Discard a line using only the reader's fixed-size buffer. Skipped bytes count
+/// toward the 50 MiB input ceiling, not the much smaller rendered-response budget.
+fn skip_streamed_line(reader: &mut impl BufRead, budget: usize) -> std::io::Result<(usize, bool)> {
+    let mut consumed = 0;
+    while consumed < budget {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok((consumed, true));
+        }
+        let available = &buffer[..buffer.len().min(budget - consumed)];
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        reader.consume(count);
+        consumed += count;
+        if newline.is_some() {
+            return Ok((consumed, true));
+        }
+    }
+    Ok((consumed, false))
+}
+
 fn handle_streaming_range_read(
     req: &RawRequest,
     path: &Path,
@@ -1512,31 +1603,106 @@ fn handle_streaming_range_read(
     let mut observed_lines = 0u32;
     let mut invalid_utf8 = false;
     let mut has_more_after_range = false;
-    let reader = std::io::BufReader::new(file);
-
-    for (index, line_result) in reader.lines().enumerate() {
-        let line = match line_result {
-            Ok(line) => line,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                invalid_utf8 = true;
+    let mut reader = std::io::BufReader::new(file);
+    let mut scanned_bytes = 0usize;
+    let mut retained_bytes = 0usize;
+    let mut scan_gap = false;
+    let scan_ceiling = MAX_FILE_READ_BYTES as usize;
+    loop {
+        let index = observed_lines as usize;
+        if index >= requested_end_idx {
+            has_more_after_range = reader.fill_buf().map_or(true, |bytes| !bytes.is_empty());
+            break;
+        }
+        if index < requested_start_idx {
+            let (consumed, finished) =
+                match skip_streamed_line(&mut reader, scan_ceiling.saturating_sub(scanned_bytes)) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Response::error(
+                            &req.id,
+                            "io_error",
+                            format!("read: failed to skip prefix: {error}"),
+                        )
+                    }
+                };
+            scanned_bytes += consumed;
+            if !finished {
+                scan_gap = true;
                 break;
             }
-            Err(e) => {
+            if consumed == 0 {
+                break;
+            }
+            observed_lines = observed_lines.saturating_add(1);
+            continue;
+        }
+        let allowance = (MAX_LINE_LENGTH + 4).min(scan_ceiling.saturating_sub(scanned_bytes));
+        if allowance == 0 || retained_bytes >= MAX_BYTES {
+            scan_gap = true;
+            break;
+        }
+        let mut bytes = Vec::new();
+        let len = match reader
+            .by_ref()
+            .take(allowance as u64)
+            .read_until(b'\n', &mut bytes)
+        {
+            Ok(len) => len,
+            Err(error) => {
                 return Response::error(
                     &req.id,
                     "io_error",
-                    format!("read: failed to read file: {}", e),
-                );
+                    format!("read: failed to read file: {error}"),
+                )
             }
         };
-
-        observed_lines = observed_lines.saturating_add(1);
-        if index >= requested_start_idx && index < requested_end_idx {
-            selected_lines.push(line);
-        }
-        if index >= requested_end_idx {
-            has_more_after_range = true;
+        if len == 0 {
             break;
+        }
+        scanned_bytes += len;
+        let partial_line = bytes.last() != Some(&b'\n') && len == allowance;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        let line = match std::str::from_utf8(&bytes) {
+            Ok(line) => line,
+            Err(error) if partial_line && error.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix")
+            }
+            Err(_) => {
+                invalid_utf8 = true;
+                break;
+            }
+        };
+        observed_lines = observed_lines.saturating_add(1);
+        if index >= requested_start_idx {
+            retained_bytes += line.len() + 16;
+            selected_lines.push(line.to_string());
+        }
+        if partial_line {
+            scan_gap = true;
+            if observed_lines as usize >= requested_end_idx {
+                break;
+            }
+            let (consumed, finished) =
+                match skip_streamed_line(&mut reader, scan_ceiling.saturating_sub(scanned_bytes)) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Response::error(
+                            &req.id,
+                            "io_error",
+                            format!("read: failed to skip line suffix: {error}"),
+                        )
+                    }
+                };
+            scanned_bytes += consumed;
+            if !finished {
+                break;
+            }
         }
     }
 
@@ -1552,16 +1718,25 @@ fn handle_streaming_range_read(
         );
     }
 
-    let exact_total_lines = (!has_more_after_range).then_some(observed_lines);
+    let exact_total_lines = (!has_more_after_range && !scan_gap).then_some(observed_lines);
+
+    if selected_lines.is_empty() && !scan_gap && observed_lines > 0 {
+        // The whole file was scanned and the window still selected nothing,
+        // so the start lies past the last line. Saying so by name keeps the
+        // reader from taking an empty result as "those lines are blank".
+        return start_past_end_error(&req.id, u64::from(start_line), observed_lines);
+    }
 
     if selected_lines.is_empty() {
         let mut data = serde_json::json!({
-            "content": "",
-            "complete": true,
+            "content": if scan_gap { format!("shown 0 of at least {observed_lines} examined lines (scan budget before requested range; {scanned_bytes} bytes scanned) · narrow: earlier start_line or smaller file") } else { String::new() },
+            "complete": !scan_gap,
+            "scan_bytes_examined": scanned_bytes,
+            "scan_gap": scan_gap.then_some("line or response scan budget; narrow: earlier start_line, smaller range"),
             "lines_read": 0,
             "start_line": start_line,
             "end_line": start_line,
-            "truncated": false,
+            "truncated": scan_gap,
             "byte_size": byte_size as usize,
         });
         if let Some(total_lines) = exact_total_lines {
@@ -1608,11 +1783,16 @@ fn handle_streaming_range_read(
 
     let actual_end = start_line + lines_read - if lines_read > 0 { 1 } else { 0 };
     let has_more = requested_start_idx > 0 || has_more_after_range;
-    let truncated = has_more || truncated_by_size;
+    let truncated = has_more || truncated_by_size || scan_gap;
+    if scan_gap {
+        output.push_str(&format!("\nshown {lines_read} of at least {observed_lines} examined lines (line or response scan budget) · narrow: start_line/end_line; {scanned_bytes} bytes scanned\n"));
+    }
 
     let mut data = serde_json::json!({
         "content": output,
         "complete": !truncated,
+        "scan_bytes_examined": scanned_bytes,
+        "scan_gap": scan_gap.then_some("line or response scan budget"),
         "lines_read": lines_read,
         "start_line": start_line,
         "end_line": actual_end,
@@ -1650,7 +1830,14 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         }
     };
 
-    for entry_result in read_dir {
+    let mut examined = 0;
+    let mut enumeration_cut = false;
+    for entry_result in read_dir.take(MAX_DIRECTORY_SCAN + 1) {
+        examined += 1;
+        if examined > MAX_DIRECTORY_SCAN {
+            enumeration_cut = true;
+            break;
+        }
         let entry = match entry_result {
             Ok(e) => e,
             Err(_) => continue,
@@ -1671,24 +1858,72 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
     entries.sort();
 
+    // Hosts normalize ranges to snake_case; accept the public aliases too for
+    // direct protocol callers. Positions address the sorted, bounded listing.
+    let number = |key: &str| {
+        req.params.get(key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.parse::<u64>().ok())
+        })
+    };
+    let start = number("start_line")
+        .or_else(|| number("startLine"))
+        .or_else(|| number("offset"))
+        .unwrap_or(1)
+        .max(1);
+    let requested_limit = number("limit").unwrap_or(MAX_DIRECTORY_ENTRIES as u64);
+    let limit = requested_limit.min(MAX_DIRECTORY_ENTRIES as u64) as usize;
+    let end = number("end_line").or_else(|| number("endLine"));
+    let count = end
+        .map(|end| {
+            end.saturating_sub(start.saturating_sub(1))
+                .min(MAX_DIRECTORY_ENTRIES as u64) as usize
+        })
+        .unwrap_or(limit);
     let total = entries.len();
-    let truncated = total > MAX_DIRECTORY_ENTRIES;
-    if truncated {
-        entries.truncate(MAX_DIRECTORY_ENTRIES);
-        entries.push(format!(
-            "\n... and {} more entries (truncated, showing first 1000)",
-            total - MAX_DIRECTORY_ENTRIES
-        ));
+    let skip = start.saturating_sub(1).min(total as u64) as usize;
+    entries = entries.into_iter().skip(skip).take(count).collect();
+    let shown = entries.len();
+    let truncated = enumeration_cut || shown < total;
+    let envelope =
+        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_cut);
+    let offset_note = (start > total as u64 && !enumeration_cut && start > 1)
+        .then(|| format!("offset past end: offset {start} exceeds {total} entries"));
+    // Put the offset-past-end note before the trailer so the final line keeps its standard format.
+    let mut trailer_text = offset_note.clone().unwrap_or_default();
+    if let Some(envelope) = &envelope {
+        let trailer = crate::ndjson_text::build_ndjson_text(
+            "",
+            &serde_json::json!({"entries_list_envelope": envelope}),
+            Some("payload.entries"),
+            false,
+        );
+        if !trailer_text.is_empty() {
+            trailer_text.push('\n');
+        }
+        trailer_text.push_str(&trailer);
     }
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "entries": entries,
-            "complete": !truncated,
-            "truncated": truncated,
-            "total_entries": total,
-        }),
-    )
+    if !trailer_text.is_empty() {
+        entries.push(format!("\n{trailer_text}"));
+    }
+    let mut data = serde_json::json!({
+        "entries": entries,
+        "complete": !truncated,
+        "truncated": truncated,
+        "total_entries": total,
+        "entries_shown": shown,
+        "total_entries_exact": !enumeration_cut,
+        "entries_examined": examined,
+        "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
+    });
+    if let Some(note) = offset_note {
+        data["offset_note"] = note.into();
+    }
+    if let Some(envelope) = envelope {
+        data["entries_list_envelope"] = serde_json::to_value(envelope).expect("directory envelope");
+    }
+    Response::success(&req.id, data)
 }
 
 #[cfg(test)]

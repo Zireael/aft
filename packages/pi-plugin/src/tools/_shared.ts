@@ -16,6 +16,7 @@ import {
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
   timeoutForCommand,
+  WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -26,6 +27,7 @@ import { type Static, type TSchema, Type } from "typebox";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PiToolPresentation } from "../config.js";
 import type { PiHarness } from "../harness.js";
+import { isPiWorkerSession } from "../session-kind.js";
 import type { PluginContext } from "../types.js";
 
 type TextContent = { type: "text"; text: string; textSignature?: string };
@@ -171,6 +173,9 @@ export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport 
   if (!existsSync(cwd)) {
     throw new Error(`project directory no longer exists: ${cwd} (stale restored session?)`);
   }
+  // A tool call is a session using AFT: make sure the deferred startup (which
+  // hands cached LSP server paths to new bridges) has run before this spawn.
+  ctx.startSessionWork?.();
   return ctx.pool.getBridge(cwd);
 }
 
@@ -226,6 +231,11 @@ export async function callBridge(
   const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
   if (sessionId) {
     merged.session_id = sessionId;
+  }
+  // The caller's role travels with every request, beside the session; AFT
+  // words its replies by it (see WORKER_SESSION_FIELD).
+  if (isPiWorkerSession(extCtx)) {
+    merged[WORKER_SESSION_FIELD] = true;
   }
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -296,6 +306,8 @@ export async function callToolCallForSession(
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: extCtx,
+    // The caller's role travels in the tool_call envelope, beside the session.
+    ...(isPiWorkerSession(extCtx) ? { workerSession: true } : {}),
     ...options,
   };
   let response: ToolCallResult;

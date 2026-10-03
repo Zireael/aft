@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "per-checkout-indexes-slice-1"
+  ],
+  "note": "Derived from git diff --name-only origin/main: the only ranking fence hit is crates/aft/src/search_index.rs. Declared engine_unwired because search_index.rs only exposes its existing per-file posting fold as pub(crate) for per-checkout segment payloads; the index's own call sites are unchanged and the per-checkout view core is not wired into search. Ranked rows must remain byte-identical to the committed reference."
+}

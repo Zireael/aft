@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "ci-subc-core-public-token",
+    "release-notes-0.58"
+  ],
+  "note": "CI fetches the public subc-core release with the default token; 0.58.0 release notes updated. No ranking-fence file touched."
+}

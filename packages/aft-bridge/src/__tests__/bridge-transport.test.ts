@@ -327,7 +327,7 @@ process.stdin.on("data", (chunk) => {
     const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
     const testBridge = bridge as unknown as {
       process: ChildProcess | null;
-      stdoutBuffer: string;
+      stdoutPending: string[];
     };
 
     try {
@@ -340,9 +340,9 @@ process.stdin.on("data", (chunk) => {
       await closed;
       await bridge.send("ping");
 
-      testBridge.stdoutBuffer = '{"id":"replacement"';
+      testBridge.stdoutPending = ['{"id":"replacement"'];
       staleChild.stdout?.emit("end");
-      expect(testBridge.stdoutBuffer).toBe('{"id":"replacement"');
+      expect(testBridge.stdoutPending).toEqual(['{"id":"replacement"']);
     } finally {
       await bridge.shutdown();
     }

@@ -353,7 +353,8 @@ fn remove_name_from_imports(
                 .filter(|n| !imports::specifier_matches(n, target_name))
                 .cloned()
                 .collect();
-            let has_other = imp.default_import.is_some()
+            // Rust visibility is metadata, not a surviving import binding.
+            let has_other = (lang != LangId::Rust && imp.default_import.is_some())
                 || imp.namespace_import.is_some()
                 || !new_names.is_empty();
             if !has_other {
@@ -362,18 +363,20 @@ fn remove_name_from_imports(
                 edits.push((range, String::new()));
             } else {
                 // Other bindings remain — regenerate without target
-                let new_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-                    lang,
-                    &imp.module_path,
-                    &new_names,
-                    imp.default_import.as_deref(),
-                    imp.namespace_import.as_deref(),
-                    imp.kind == imports::ImportKind::Type,
-                    imports::es_import_attribute_clause(imp),
-                );
+                let new_line =
+                    imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                        lang,
+                        &imp.module_path,
+                        &new_names,
+                        imp.default_import.as_deref(),
+                        imp.namespace_import.as_deref(),
+                        imp.kind == imports::ImportKind::Type,
+                        imports::es_import_attribute_clause(imp),
+                        Some(imports::quotes::statement_style(&imp.raw_text)),
+                    );
                 edits.push((imp.byte_range.clone(), new_line));
             }
-        } else if imp.default_import.as_deref() == Some(target_name) {
+        } else if lang != LangId::Rust && imp.default_import.as_deref() == Some(target_name) {
             // Removing the default import
             if imp.names.is_empty() && imp.namespace_import.is_none() {
                 // Only default — remove entire statement
@@ -381,15 +384,17 @@ fn remove_name_from_imports(
                 edits.push((range, String::new()));
             } else {
                 // Has named or namespace imports too — regenerate without default
-                let new_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-                    lang,
-                    &imp.module_path,
-                    &imp.names,
-                    None,
-                    imp.namespace_import.as_deref(),
-                    imp.kind == imports::ImportKind::Type,
-                    imports::es_import_attribute_clause(imp),
-                );
+                let new_line =
+                    imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                        lang,
+                        &imp.module_path,
+                        &imp.names,
+                        None,
+                        imp.namespace_import.as_deref(),
+                        imp.kind == imports::ImportKind::Type,
+                        imports::es_import_attribute_clause(imp),
+                        Some(imports::quotes::statement_style(&imp.raw_text)),
+                    );
                 edits.push((imp.byte_range.clone(), new_line));
             }
         } else if imp.namespace_import.as_deref() == Some(target_name) {
@@ -400,15 +405,17 @@ fn remove_name_from_imports(
                 edits.push((range, String::new()));
             } else {
                 // Has default or named imports too — regenerate without namespace
-                let new_line = imports::generate_import_line_with_namespace_and_attribute_clause(
-                    lang,
-                    &imp.module_path,
-                    &imp.names,
-                    imp.default_import.as_deref(),
-                    None,
-                    imp.kind == imports::ImportKind::Type,
-                    imports::es_import_attribute_clause(imp),
-                );
+                let new_line =
+                    imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
+                        lang,
+                        &imp.module_path,
+                        &imp.names,
+                        imp.default_import.as_deref(),
+                        None,
+                        imp.kind == imports::ImportKind::Type,
+                        imports::es_import_attribute_clause(imp),
+                        Some(imports::quotes::statement_style(&imp.raw_text)),
+                    );
                 edits.push((imp.byte_range.clone(), new_line));
             }
         }

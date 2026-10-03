@@ -1,0 +1,8 @@
+{
+  "search": {
+    "rerank": {
+      "backend": "onnx",
+      "timeout_ms": 800
+    }
+  }
+}

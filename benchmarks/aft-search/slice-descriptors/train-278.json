@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "lsp-transient-start-retry",
+    "typescript-audit-boundaries",
+    "retention-skip-reason-identity"
+  ],
+  "note": "No ranking-fence file is touched: transient LSP start failures retry with backoff (#392); TypeScript platform and input-boundary fixes (Windows gh shim on PATH, RPC body validation, home-path and containment helpers, localized detach cleanup, update channels, CLI issue body and username redaction, grep hint operands); a retention sweep's skip reason stays with the connection that recorded it."
+}

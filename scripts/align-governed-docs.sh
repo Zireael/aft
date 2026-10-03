@@ -12,7 +12,9 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 bun scripts/audit-v049-agent-surface.ts --write-allowlist --write-prefix-capture --write-manifest >/dev/null
-git add docs/
+# Stage only files git already tracks: an untracked draft someone left in
+# docs/ must never be committed and pushed by this alignment step.
+git add -u docs/
 if ! git diff --cached --quiet; then
   git commit -qm "Align governed publication manifests"
 fi
@@ -41,7 +43,7 @@ d["source_commit"] = sys.argv[1]
 p.write_text(json.dumps(d, indent=2) + "\n")
 EOF
   node scripts/release-gate-v049.mjs --stage --evidence-output docs/v0.49-release-evidence.json >/dev/null
-  git add docs/
+  git add -u docs/
   git diff --cached --quiet || git commit -qm "Align release manifest and evidence"
 done
 

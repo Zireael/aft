@@ -299,6 +299,7 @@ describe("scenario isolation and liveness", () => {
     const isolated = await createScenarioIsolation({
       parent: join(parent, "runs"),
       scenarioId: "read/T1/happy",
+      scenarioEnv: { AFT_TEST_INSPECT_DELAY_MS: "30000", HOME: "/not-isolated" },
       fixture,
       pluginTarball: tarball,
       pluginDirectory,
@@ -328,6 +329,8 @@ describe("scenario isolation and liveness", () => {
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
     expect(isolated.env.OPENCODE_DB).toBe("opencode2.db");
     expect(isolated.env.AFT_BINARY_PATH).toBe("/native/aft");
+    expect(isolated.env.AFT_TEST_INSPECT_DELAY_MS).toBe("30000");
+    expect(process.env.AFT_TEST_INSPECT_DELAY_MS).not.toBe("30000");
     const aftConfig = JSON.parse(
       await readFile(join(isolated.project, ".cortexkit", "aft.jsonc"), "utf8"),
     );
@@ -1110,10 +1113,16 @@ describe("source-of-truth derivation", () => {
     expect(parity?.comparison).toEqual(t1.comparison);
   });
 
-  test("all eleven list surfaces and supported reasons come from the Rust registry", async () => {
+  test("all twelve list surfaces and supported reasons come from the Rust registry", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const surfaces = await deriveListSurfaces(repo);
-    expect(surfaces).toHaveLength(11);
+    expect(surfaces).toHaveLength(12);
+    expect(surfaces.find((surface) => surface.id === "read.directory.payload.entries")).toMatchObject({
+      owner: "read",
+      unit: "items",
+      reasons: ["walk", "cap"],
+      narrow: ["path", "offset", "limit"],
+    });
     expect(
       surfaces.find((surface) => surface.id === "callgraph.trace_data.payload.hops")?.reasons,
     ).toEqual(["depth"]);
@@ -1130,6 +1139,7 @@ describe("source-of-truth derivation", () => {
     const scenarios = materializeParityScenarios(
       await loadScenarios(join(repo, "tests/docker/opencode2/scenarios")),
     );
+    expect(() => validateT6(matrix, scenarios, surfaces)).not.toThrow();
     const incompatibleGlob = scenarios.find(
       (candidate) => candidate.id === "glob/T6/glob-payload-files/incomplete",
     );

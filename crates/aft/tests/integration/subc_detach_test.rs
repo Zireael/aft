@@ -119,6 +119,281 @@ fn subc_background_bash_survives_module_process_group_restart() {
     });
 }
 
+#[test]
+fn subc_foreground_drain_preserves_route_harness_across_restart() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let ready = project.path().join("foreground.ready");
+        let stop = project.path().join("foreground.stop");
+        let release = ReleaseOnDrop::new(stop.clone());
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        // Another consumer can configure the same root without owning this route.
+        bind_route_as(&mut stream, project.path(), 2, "runner").await;
+        send_tool_call(&mut stream, ROUTE_CHANNEL, 20, "bash", json!({
+            "command": sentinel_command(&ready, &stop), "wait": true,
+            "timeout": 60_000, "compressed": false,
+        })).await;
+        wait_for_path(&ready, "foreground ready");
+        send_module_draining(&mut stream).await;
+        let detached = read_tool_response(&mut stream, 20, "drain detach").await;
+        assert!(!tool_result_is_error(&detached), "{}", frame_body(&detached));
+        let task_id = extract_task_id(&detached);
+        let db = rusqlite::Connection::open(data_home.path().join("cortexkit/aft/aft.db")).unwrap();
+        let (harness, stdout, stderr, pgid, notify): (String, String, String, i64, bool) = db.query_row(
+            "SELECT harness, stdout_path, stderr_path, pgid, json_extract(metadata, '$.notify_on_completion') FROM bash_tasks WHERE task_id = ?1",
+            [&task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(harness, "opencode", "persisted owner must be the command route, not the last root configure");
+        assert!(pgid > 0 && notify);
+        assert!(Path::new(&stdout).is_file() && Path::new(&stderr).is_file());
+        assert!(frame_body(&detached).contains(&stdout), "detach must name its output: {}", frame_body(&detached));
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("drained module").success());
+        drop(stream);
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        let running = bash_status(&mut stream, 30, &task_id).await;
+        assert_eq!(running["status"], "running", "{running}");
+        assert_eq!(running["child_pid"].as_i64(), Some(pgid));
+        drop(release);
+        let completed = wait_for_status(&mut stream, 31, &task_id, "completed").await;
+        assert_eq!(completed["exit_code"], 0);
+        assert!(completed["output_preview"].as_str().unwrap().contains("sentinel-stopped"));
+        assert!(std::fs::read_to_string(&stdout).unwrap().contains("sentinel-stopped"));
+        send_tool_call(&mut stream, ROUTE_CHANNEL, 100, "bash_drain_completions", json!({})).await;
+        let completions = read_tool_response(&mut stream, 100, "restarted completion delivery").await;
+        assert!(tool_response_json(&completions)["bg_completions"].as_array().unwrap().iter().any(|item| item["task_id"] == task_id), "{}", frame_body(&completions));
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("restarted module").success());
+        let harnesses: String = db.query_row("SELECT group_concat(harness) FROM bash_tasks WHERE task_id = ?1", [&task_id], |row| row.get(0)).unwrap();
+        assert_eq!(harnesses, "opencode", "watchdog must not rewrite ownership");
+    });
+}
+
+/// A root context is shared by routes from several harnesses, and each bind
+/// reconfigures it with its own harness. An edit and a background command made
+/// through the opencode route after a runner route bound the same root must
+/// still be found by the opencode route after the module restarts, when only
+/// the opencode route binds again.
+#[test]
+fn subc_undo_and_background_task_survive_restart_after_mixed_harness_binds() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // Undo snapshots skip files under the system temp directory, so the
+        // edited project lives under the target directory instead.
+        // CI runs this binary from a nextest archive on another runner, where
+        // the compile-time CARGO_TARGET_TMPDIR path has not been created.
+        std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let project = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let target = project.path().join("undo-target.txt");
+        std::fs::write(&target, "original\n").unwrap();
+
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        // Another consumer configures the same root without owning this route.
+        bind_route_as(&mut stream, project.path(), 2, "runner").await;
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            20,
+            "write",
+            json!({ "filePath": target.to_string_lossy(), "content": "changed\n" }),
+        )
+        .await;
+        let written = read_tool_response(&mut stream, 20, "opencode write").await;
+        assert!(!tool_result_is_error(&written), "{}", frame_body(&written));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "changed\n");
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            21,
+            "bash",
+            json!({
+                "command": "echo mixed-harness-done", "background": true,
+                "timeout": 60_000, "compressed": false,
+            }),
+        )
+        .await;
+        let launch = read_tool_response(&mut stream, 21, "opencode background launch").await;
+        assert!(!tool_result_is_error(&launch), "{}", frame_body(&launch));
+        let task_id = extract_task_id(&launch);
+        wait_for_status(&mut stream, 22, &task_id, "completed").await;
+
+        send_module_draining(&mut stream).await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("mixed-harness module").success());
+        drop(stream);
+
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+
+        let replayed = bash_status(&mut stream, 40, &task_id).await;
+        assert_eq!(replayed["status"], "completed", "{replayed}");
+        assert!(
+            replayed["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mixed-harness-done"),
+            "{replayed}"
+        );
+
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            50,
+            "safety",
+            json!({ "op": "undo", "filePath": target.to_string_lossy() }),
+        )
+        .await;
+        let undo = read_tool_response(&mut stream, 50, "undo after restart").await;
+        assert!(
+            !tool_result_is_error(&undo),
+            "undo history written through the opencode route must survive the restart: {}",
+            frame_body(&undo)
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("restarted module").success());
+    });
+}
+
+#[test]
+fn subc_unadopted_task_reports_output_without_cross_harness_recovery() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let ready = project.path().join("foreign.ready");
+        let stop = project.path().join("foreign.stop");
+        let _release = ReleaseOnDrop::new(stop.clone());
+        let mut first = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route_as(&mut stream, project.path(), ROUTE_CHANNEL, "runner").await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            20,
+            "bash",
+            json!({
+                "command": sentinel_command(&ready, &stop), "background": true,
+                "timeout": 60_000, "compressed": false,
+            }),
+        )
+        .await;
+        let launch = read_tool_response(&mut stream, 20, "runner launch").await;
+        let task_id = extract_task_id(&launch);
+        wait_for_path(&ready, "runner task ready");
+        let running = bash_status(&mut stream, 21, &task_id).await;
+        let stdout = running["output_path"].as_str().unwrap();
+        let stderr = running["stderr_path"].as_str().unwrap();
+        send_module_draining(&mut stream).await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(first.wait_for_exit("runner module").success());
+        drop(stream);
+        let mut second = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            30,
+            "bash_status",
+            json!({ "task_id": task_id }),
+        )
+        .await;
+        let refused = read_tool_response(&mut stream, 30, "foreign task refusal").await;
+        assert!(
+            tool_result_is_error(&refused),
+            "must not adopt a foreign namespace"
+        );
+        let text = frame_body(&refused);
+        assert!(
+            text.contains("could not be adopted") && text.contains(stdout) && text.contains(stderr),
+            "{text}"
+        );
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            40,
+            "bash_notify",
+            json!({ "task_id": task_id, "pattern": "sentinel-stopped" }),
+        )
+        .await;
+        let refused_watch =
+            read_tool_response(&mut stream, 40, "foreign async watch refusal").await;
+        let text = frame_body(&refused_watch);
+        assert!(
+            tool_result_is_error(&refused_watch)
+                && text.contains("could not be adopted")
+                && text.contains(stdout)
+                && text.contains(stderr),
+            "{text}"
+        );
+        assert_process_alive(
+            running["child_pid"].as_u64().unwrap() as u32,
+            "unadopted child",
+        );
+        send_connection_goodbye(&mut stream).await;
+        assert!(second.wait_for_exit("refusal module").success());
+        drop(stream);
+        // Returning to the owning namespace restores normal process control.
+        let mut third = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route_as(&mut stream, project.path(), ROUTE_CHANNEL, "runner").await;
+        send_tool_call(
+            &mut stream,
+            ROUTE_CHANNEL,
+            31,
+            "bash_kill",
+            json!({ "task_id": task_id }),
+        )
+        .await;
+        let killed = read_tool_response(&mut stream, 31, "rehydrated kill").await;
+        assert!(!tool_result_is_error(&killed), "{}", frame_body(&killed));
+        wait_for_status(&mut stream, 32, &task_id, "killed").await;
+        send_connection_goodbye(&mut stream).await;
+        assert!(third.wait_for_exit("owning module").success());
+    });
+}
+
 /// The supervisor respawns a module only on a non-zero exit; exit 0 means
 /// "stopped on request" and leaves the module down with no respawn. So the
 /// two ways a daemon connection can end must map to different exit codes:
@@ -258,12 +533,244 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
     });
 }
 
+#[test]
+fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
+    drain_with_live_lsp_servers("", false, false);
+}
+
+/// Servers that ignore the Shutdown request and SIGTERM, and linger after
+/// their client leaves, stop only for a forced kill. With every CPU busy, as
+/// on a loaded CI runner, the LSP phase (kill and reap included) must still
+/// end within its ceiling, the whole exit within the drain budget, and no
+/// server may outlive the module.
+#[test]
+fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
+    drain_with_live_lsp_servers(
+        "AFT_FAKE_LSP_IGNORE_SIGTERM=1 AFT_FAKE_LSP_EXIT_DELAY_MS=30000",
+        true,
+        false,
+    );
+}
+
+#[test]
+fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
+    drain_with_live_lsp_servers("", false, true);
+}
+
+#[test]
+fn subc_drain_with_slow_writer_persists_terminal_line() {
+    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"));
+}
+
+/// Binds 34 roots that each start a fake rust-analyzer which never answers
+/// Shutdown, drains the module and checks that it exits within the drain
+/// budget with no language server left behind. `server_env` holds extra
+/// `NAME=value` assignments for the fake servers; `under_load` keeps every
+/// CPU busy from the drain until the module has exited.
+fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
+    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None);
+}
+
+fn drain_with_live_lsp_servers_and_writer(
+    server_env: &str,
+    under_load: bool,
+    active_ort: bool,
+    writer_delay: &str,
+    flush_hold: Option<&str>,
+) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let projects = (0..34)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let storage = tempfile::tempdir().unwrap();
+        let conn_dir = tempfile::tempdir().unwrap();
+        let config_home = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        let pids = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let stderr_path = logs.path().join("module.stderr");
+        let config_dir = config_home.path().join("cortexkit");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let fake = crate::test_helpers::fake_lsp::fake_server_binary();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let wrapper = bin_dir.path().join("rust-analyzer");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
+                pids.path().display(),
+                fake.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            config_dir.join("aft.jsonc"),
+            serde_json::to_vec(&json!({
+                "storage_dir": storage.path(), "search_index": false, "semantic_search": false,
+                "callgraph_store": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+        let mut module = ModuleProcess::spawn_with_exit_hooks(
+            &conn_path,
+            config_home.path(),
+            data_home.path(),
+            Some(&stderr_path),
+            Some(bin_dir.path()),
+            active_ort,
+            true,
+            writer_delay,
+            flush_hold,
+        );
+        let mut stream = accept_module(&listener).await;
+        for (index, project) in projects.iter().enumerate() {
+            std::fs::write(
+                project.path().join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(project.path().join("src")).unwrap();
+            let source = project.path().join("src/main.rs");
+            std::fs::write(&source, "source").unwrap();
+            bind_route_as(&mut stream, project.path(), (index + 1) as u16, "opencode").await;
+            let corr = 100 + index as u64;
+            send_tool_call(
+                &mut stream,
+                (index + 1) as u16,
+                corr,
+                "inspect",
+                json!({"scope": source}),
+            )
+            .await;
+            let result = read_frame_timeout(&mut stream, "spawn fake LSP").await;
+            assert_eq!(result.header.channel, (index + 1) as u16);
+            assert_eq!(result.header.corr, corr);
+            assert!(!tool_result_is_error(&result), "{}", frame_body(&result));
+        }
+        let children = std::fs::read_dir(pids.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 34, "34 roots must each own a live server");
+        let hog = under_load.then(super::helpers::CpuHog::start);
+        send_module_draining(&mut stream).await;
+        let drained = Instant::now();
+        send_connection_goodbye(&mut stream).await;
+        let exit = module.wait_for_exit("drained module with live LSP servers");
+        let elapsed = drained.elapsed();
+        drop(hog);
+        eprintln!(
+            "drain completion to process exit: {} ms",
+            elapsed.as_millis()
+        );
+        let log = std::fs::read_to_string(&stderr_path).unwrap();
+        if writer_delay == "1000" {
+            assert!(log.contains("phase=log_flush_done flushed=false"),
+                "slow writer must exhaust the async flush budget: {}", log_tail(&log));
+        }
+        // Print the `subc exit phase=` and LSP shutdown summary lines, so a run
+        // near the 2 s limit shows how long each exit phase took.
+        for line in log
+            .lines()
+            .filter(|line| line.contains("subc exit phase=") || line.contains("lsp shutdown_all:"))
+        {
+            eprintln!("{line}");
+        }
+        assert!(exit.success(), "{exit}; {}", log_tail(&log));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "exit took {elapsed:?}; {}",
+            log_tail(&log)
+        );
+        let durable_path = data_home.path().join("aft").join("logs").join(format!("aft-{}.log", module.child.id()));
+        let durable = std::fs::read_to_string(&durable_path)
+            .unwrap_or_else(|error| panic!("{}: {error}", durable_path.display()));
+        let mode = if active_ort { "skip_native_teardown" } else { "return" };
+        assert!(
+            durable.contains(&format!("subc exit phase=process_exit mode={mode}")),
+            "missing durable terminal marker; {}", log_tail(&durable)
+        );
+        if active_ort {
+            assert!(durable.contains("phase=ort_quiesce active=1 budget_ms=0"), "{}", log_tail(&durable));
+        }
+        // Draining roots may already have stopped some servers before the final
+        // sweep, so the summary's split depends on timing. What must hold is one
+        // summary, a bounded exit and no orphans.
+        let summaries: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("lsp shutdown_all: servers="))
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "expected one shutdown summary; {}",
+            log_tail(&log)
+        );
+        let lsp_elapsed_ms = summaries[0]
+            .rsplit("elapsed_ms=")
+            .next()
+            .and_then(|value| value.trim().parse::<u128>().ok())
+            .expect("shutdown summary reports elapsed_ms");
+        if !under_load {
+            // Compare the combined phase to its sequential cost, not the entire
+            // process exit to LSP time. Log persistence and observer scheduling
+            // are outside these phases and retain the separate two-second cap.
+            let combined_ms = log.lines()
+                .find(|line| line.contains("phase=lsp_done elapsed_ms="))
+                .and_then(|line| line.rsplit("elapsed_ms=").next())
+                .and_then(|value| value.parse::<u128>().ok())
+                .expect("combined shutdown elapsed time");
+            let sequential_ms = lsp_elapsed_ms + 450;
+            assert!(
+                combined_ms + 225 < sequential_ms,
+                "shutdown did not save half the index wait by overlapping: combined={combined_ms} ms, sequential={sequential_ms} ms; {}",
+                log_tail(&log)
+            );
+        }
+        let lsp_ceiling = aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150);
+        assert!(
+            lsp_elapsed_ms <= lsp_ceiling.as_millis(),
+            "the LSP phase took {lsp_elapsed_ms} ms, past its ceiling; {}",
+            log_tail(&log)
+        );
+        // A server killed too late to be reaped before the module exited is
+        // reaped by the system right after, so allow that a moment.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for pid in children {
+            while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                !aft::bash_background::process::is_process_alive(pid),
+                "orphaned LSP pid {pid}"
+            );
+        }
+    });
+}
+
 fn log_tail(log: &str) -> String {
     let lines = log.lines().collect::<Vec<_>>();
     lines[lines.len().saturating_sub(20)..].join("\n")
 }
 
-fn write_user_config(config_home: &Path, storage: &Path) {
+pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
     let config_dir = config_home.join("cortexkit");
     std::fs::create_dir_all(&config_dir).expect("create user config dir");
     std::fs::write(
@@ -280,7 +787,7 @@ fn write_user_config(config_home: &Path, storage: &Path) {
     .expect("write user config");
 }
 
-async fn write_connection_file(conn_dir: &Path) -> TcpListener {
+pub(super) async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
         .set_nonblocking(true)
@@ -303,8 +810,8 @@ async fn write_connection_file(conn_dir: &Path) -> TcpListener {
     TcpListener::from_std(std_listener).expect("tokio listener")
 }
 
-struct ModuleProcess {
-    child: Child,
+pub(super) struct ModuleProcess {
+    pub(super) child: Child,
 }
 
 impl ModuleProcess {
@@ -320,10 +827,46 @@ impl ModuleProcess {
         data_home: &Path,
         stderr_path: Option<&Path>,
     ) -> Self {
+        Self::spawn_with_stderr_and_path(conn_path, config_home, data_home, stderr_path, None)
+    }
+
+    fn spawn_with_stderr_and_path(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        stderr_path: Option<&Path>,
+        bin_dir: Option<&Path>,
+    ) -> Self {
+        Self::spawn_with_exit_hooks(
+            conn_path,
+            config_home,
+            data_home,
+            stderr_path,
+            bin_dir,
+            false,
+            false,
+            "40",
+            None,
+        )
+    }
+
+    fn spawn_with_exit_hooks(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        stderr_path: Option<&Path>,
+        bin_dir: Option<&Path>,
+        active_ort: bool,
+        busy_index: bool,
+        writer_delay: &str,
+        flush_hold: Option<&str>,
+    ) -> Self {
         use std::os::unix::process::CommandExt;
 
         let stderr = match stderr_path {
-            Some(path) => Stdio::from(std::fs::File::create(path).expect("create module stderr file")),
+            Some(path) => {
+                Stdio::from(std::fs::File::create(path).expect("create module stderr file"))
+            }
             None => Stdio::null(),
         };
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
@@ -341,6 +884,29 @@ impl ModuleProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr);
+        if active_ort {
+            command.env("AFT_TEST_HOLD_ORT_SECTION", "1");
+        }
+        if busy_index {
+            command.env("AFT_CACHE_DIR", data_home);
+            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
+            command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
+        }
+        if let Some(hold) = flush_hold {
+            // A writer this slow cannot acknowledge a flush inside the exit
+            // budget, wherever in its batch delay the request lands.
+            command.env("AFT_TEST_LOG_FLUSH_HOLD_MS", hold);
+        }
+        if let Some(bin_dir) = bin_dir {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -369,7 +935,7 @@ impl ModuleProcess {
         self.wait_for_exit("module process-group termination")
     }
 
-    fn wait_for_exit(&mut self, label: &str) -> ExitStatus {
+    pub(super) fn wait_for_exit(&mut self, label: &str) -> ExitStatus {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match self.child.try_wait() {
@@ -428,6 +994,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
                 subc_ops: Vec::new(),
                 subc_capabilities: Vec::new(),
                 storage: None,
+                machine_id: None,
             })
             .expect("hello ack body"),
         )
@@ -437,7 +1004,11 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
     stream
 }
 
-async fn bind_route(stream: &mut TcpStream, root: &Path) {
+pub(super) async fn bind_route(stream: &mut TcpStream, root: &Path) {
+    bind_route_as(stream, root, ROUTE_CHANNEL, "opencode").await;
+}
+
+async fn bind_route_as(stream: &mut TcpStream, root: &Path, channel: u16, harness: &str) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -453,19 +1024,21 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
     .expect("write project config");
 
     let request = ModuleControlRequest::RouteBind {
-        route_channel: ROUTE_CHANNEL,
+        route_channel: channel,
         epoch: 1,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
         identity: BindIdentity::new(
             root.to_path_buf(),
-            "opencode".to_string(),
+            harness.to_string(),
             SESSION_ID.to_string(),
         ),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
     };
     send_frame(
         stream,
@@ -489,7 +1062,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
     assert_eq!(body, ModuleControlResponse::RouteBindAck {});
 }
 
-async fn send_tool_call(
+pub(super) async fn send_tool_call(
     stream: &mut TcpStream,
     channel: u16,
     corr: u64,
@@ -530,7 +1103,7 @@ async fn bash_status(stream: &mut TcpStream, corr: u64, task_id: &str) -> Value 
     tool_response_json(&frame)
 }
 
-async fn wait_for_status(
+pub(super) async fn wait_for_status(
     stream: &mut TcpStream,
     start_corr: u64,
     task_id: &str,
@@ -552,7 +1125,7 @@ async fn wait_for_status(
     }
 }
 
-async fn send_connection_goodbye(stream: &mut TcpStream) {
+pub(super) async fn send_connection_goodbye(stream: &mut TcpStream) {
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
@@ -588,11 +1161,11 @@ async fn send_module_draining(stream: &mut TcpStream) {
     .await;
 }
 
-async fn send_frame(stream: &mut TcpStream, frame: Frame) {
+pub(super) async fn send_frame(stream: &mut TcpStream, frame: Frame) {
     write_frame(stream, &frame).await.expect("write frame");
 }
 
-async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
+pub(super) async fn read_any_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
     tokio::time::timeout(Duration::from_secs(30), read_frame(stream))
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
@@ -617,7 +1190,7 @@ async fn read_frame_timeout(stream: &mut TcpStream, label: &str) -> Frame {
     }
 }
 
-async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> Frame {
+pub(super) async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> Frame {
     let frame = read_frame_timeout(stream, label).await;
     assert_eq!(frame.header.ty, FrameType::Response, "{label} frame type");
     assert_eq!(frame.header.channel, ROUTE_CHANNEL, "{label} channel");
@@ -625,7 +1198,7 @@ async fn read_tool_response(stream: &mut TcpStream, corr: u64, label: &str) -> F
     frame
 }
 
-fn tool_response_json(frame: &Frame) -> Value {
+pub(super) fn tool_response_json(frame: &Frame) -> Value {
     let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
     let structured = &body["structuredContent"];
     assert!(
@@ -635,16 +1208,16 @@ fn tool_response_json(frame: &Frame) -> Value {
     structured.clone()
 }
 
-fn tool_result_is_error(frame: &Frame) -> bool {
+pub(super) fn tool_result_is_error(frame: &Frame) -> bool {
     let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
     body["isError"].as_bool().unwrap_or(false)
 }
 
-fn frame_body(frame: &Frame) -> String {
+pub(super) fn frame_body(frame: &Frame) -> String {
     String::from_utf8_lossy(&frame.body).into_owned()
 }
 
-fn extract_task_id(frame: &Frame) -> String {
+pub(super) fn extract_task_id(frame: &Frame) -> String {
     let structured = tool_response_json(frame);
     if let Some(task_id) = structured.get("task_id").and_then(Value::as_str) {
         return task_id.to_string();
@@ -692,6 +1265,6 @@ fn assert_process_alive(pid: u32, label: &str) {
     assert!(alive, "{label} should still be alive (pid {pid})");
 }
 
-fn control_flags() -> Flags {
+pub(super) fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }

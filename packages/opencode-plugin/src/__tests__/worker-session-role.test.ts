@@ -1,0 +1,90 @@
+/**
+ * The OpenCode plugin tells AFT the caller's role on every request: a
+ * delegated worker (subagent) session gets `worker_session: true` beside its
+ * `session_id`, a primary session gets nothing. AFT words its replies by it
+ * (no completion-reminder promise, no "end the turn" for a worker), so both
+ * shared bridge helpers must carry it.
+ */
+import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
+import type { BridgePool } from "@cortexkit/aft-bridge";
+import { _resetSubagentCacheForTest, LOOKUP_TIMEOUT_MS } from "../shared/subagent-detect.js";
+import { callBridge, callToolCall } from "../tools/_shared.js";
+import type { PluginContext } from "../types.js";
+
+const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
+
+function harness(parentID: string | undefined, hang = false) {
+  let lookups = 0;
+  const sends: Array<Record<string, unknown>> = [];
+  const toolCalls: Array<Record<string, unknown> | undefined> = [];
+  const bridge = {
+    send: async (_command: string, params: Record<string, unknown>) => {
+      sends.push(params);
+      return { success: true };
+    },
+    toolCall: async (
+      _sessionId: string | undefined,
+      _name: string,
+      _args: Record<string, unknown>,
+      options?: Record<string, unknown>,
+    ) => {
+      toolCalls.push(options);
+      return { success: true, text: "ok" };
+    },
+  };
+  const ctx = {
+    pool: { getBridge: () => bridge } as unknown as BridgePool,
+    client: {
+      session: {
+        // callBridge starts the role lookup first, alongside the directory
+        // lookup. Only the role lookup hangs; directory resolution still works.
+        get: async (input: { path: { id: string } }) =>
+          hang && ++lookups === 1
+            ? new Promise<never>(() => {})
+            : { data: { id: input.path.id, parentID, directory: PROJECT_CWD } },
+      },
+    },
+    config: {},
+    storageDir: "/tmp/aft-test",
+  } as unknown as PluginContext;
+  return { ctx, sends, toolCalls };
+}
+
+const runtime = (sessionID: string) => ({
+  sessionID,
+  directory: PROJECT_CWD,
+  worktree: PROJECT_CWD,
+});
+
+describe("caller role on every bridge request", () => {
+  test("a subagent's requests carry worker_session", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends, toolCalls } = harness("ses_parent");
+    await callBridge(ctx, runtime("ses_role_worker"), "bash_status", { task_id: "t" });
+    await callToolCall(ctx, runtime("ses_role_worker"), "read", { filePath: "a.ts" });
+    expect(sends[0]).toMatchObject({ session_id: "ses_role_worker", worker_session: true });
+    expect(toolCalls[0]?.workerSession).toBe(true);
+  });
+
+  test("a primary session's requests carry no role", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends, toolCalls } = harness(undefined);
+    await callBridge(ctx, runtime("ses_role_primary"), "bash_status", { task_id: "t" });
+    await callToolCall(ctx, runtime("ses_role_primary"), "read", { filePath: "a.ts" });
+    expect(sends[0]).not.toHaveProperty("worker_session");
+    expect(toolCalls[0]).not.toHaveProperty("workerSession");
+  });
+
+  // A slow host must not delay ordinary tool calls (each one asks for the
+  // role): the lookup is abandoned after LOOKUP_TIMEOUT_MS and the call goes
+  // ahead as a primary session.
+  test("a host that never answers delays a bridge call by at most the lookup timeout", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends } = harness("ses_parent", true);
+    const started = performance.now();
+    await callBridge(ctx, runtime("ses_role_hang"), "bash_status", { task_id: "t" });
+    expect(performance.now() - started).toBeLessThan(LOOKUP_TIMEOUT_MS + 500);
+    expect(sends[0]).not.toHaveProperty("worker_session");
+  });
+});

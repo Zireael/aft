@@ -277,10 +277,9 @@ fn run_watchdog(
 
 /// Starts one capture and describes the outcome for the log line.
 fn start_capture(config: &StallWatchdogConfig, children: &mut Vec<Child>) -> String {
-    let path = config.diagnostics_dir.join(capture_file_name(
-        SystemTime::now(),
-        config.pid,
-    ));
+    let path = config
+        .diagnostics_dir
+        .join(capture_file_name(SystemTime::now(), config.pid));
     if let Err(error) = std::fs::create_dir_all(&config.diagnostics_dir) {
         return format!("failed ({}: {error})", config.diagnostics_dir.display());
     }
@@ -392,7 +391,10 @@ impl LivenessMarker for DispatchLoopMarker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StallTransition {
     /// The marker has owed work without progress for `stalled_for`.
-    Began { marker: usize, stalled_for: Duration },
+    Began {
+        marker: usize,
+        stalled_for: Duration,
+    },
     /// The marker progressed again (or stopped owing work); `total` spans
     /// from its last progress before the stall to its first progress after.
     Ended { marker: usize, total: Duration },
@@ -705,7 +707,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("diagnostics dir");
         for second in 0..8 {
             std::fs::write(
-                dir.path().join(format!("stall-20260924T12000{second}Z-1.txt")),
+                dir.path()
+                    .join(format!("stall-20260924T12000{second}Z-1.txt")),
                 "x",
             )
             .unwrap();
@@ -757,7 +760,10 @@ mod tests {
             Ok(CaptureStarted::Written)
         ));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("stat: ") && text.contains("wchan: "), "{text}");
+        assert!(
+            text.contains("stat: ") && text.contains("wchan: "),
+            "{text}"
+        );
     }
 
     fn secs(value: u64) -> Duration {
@@ -835,7 +841,10 @@ mod tests {
             let dispatch = detector.observe(1, false, secs(second), now);
             assert_eq!(dispatch, None);
             if second == 15 {
-                assert!(matches!(frame, Some(StallTransition::Began { marker: 0, .. })));
+                assert!(matches!(
+                    frame,
+                    Some(StallTransition::Began { marker: 0, .. })
+                ));
             }
         }
     }

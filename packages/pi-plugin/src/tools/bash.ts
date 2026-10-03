@@ -5,16 +5,25 @@ import {
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  formatWatchWaited,
+  interruptedWatchTail,
   isBridgeTransportTimeout,
   isTerminalStatus,
+  LONGEST_TIMER_DELAY_MS,
+  maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
   runBashHostFallback,
-  sleep,
+  runningTaskStatusHint,
+  WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
+  watchClock,
+  watchPollDelayMs,
   watchTimeoutSteer,
+  watchUnavailableSteer,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -48,7 +57,6 @@ import {
 } from "./_shared.js";
 import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
-const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 /**
@@ -63,11 +71,17 @@ export function watchCallerRole(
   return isPiWorkerSession(extCtx, env) ? "worker" : "primary";
 }
 
-function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
+function coerceConfiguredWatchTimeout(
+  value: unknown,
+  role: WatchCallerRole,
+  cap: number,
+): number | undefined {
   try {
-    return coerceOptionalInt(value, "timeoutMs", 1, cap);
+    return coerceOptionalInt(value, "timeoutMs", 1, maxWatchTimeoutMs(role, cap));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // Only a primary's timeout is bounded by the configured cap.
+    if (role === "worker") throw error;
     throw new Error(`${message} (bash.watch_sync_max_ms)`);
   }
 }
@@ -99,7 +113,11 @@ function orchestratedTransportTimeoutMs(
   wait: boolean,
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
+  noHardKill = false,
 ): number {
+  // A command without a hard-kill timeout can hold the call open until it
+  // finishes, so the transport timeout must not expire first.
+  if (noHardKill) return LONGEST_TIMER_DELAY_MS;
   const waitBudget =
     blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
@@ -139,12 +157,18 @@ const BashBaseParams = {
         "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax.",
     }),
   ),
+};
+
+const BashWaitParam = {
   wait: Type.Optional(
     Type.Boolean({
       description:
         "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout; any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
     }),
   ),
+};
+
+const BashSandboxParam = {
   sandbox: Type.Optional(
     Type.Literal("host", {
       description:
@@ -182,19 +206,125 @@ const BashPtyParams = {
   ptyCols: optionalInt(1, 140, "PTY terminal width in columns (minimum 1, maximum 140)"),
 };
 
+/** The full argument set, used for the parameter types `execute` receives. */
 const BashParams = Type.Object({
   ...BashBaseParams,
+  ...BashWaitParam,
+  ...BashSandboxParam,
   ...BashBackgroundFlagParam,
   ...BashCompressionParam,
   ...BashPtyParams,
 });
-const BashForegroundOnlyParams = Type.Object({
-  ...BashBaseParams,
-  ...BashCompressionParam,
-});
 
-function bashParamsForConfig(backgroundEnabled: boolean): typeof BashParams {
-  return (backgroundEnabled ? BashParams : BashForegroundOnlyParams) as typeof BashParams;
+/**
+ * The argument set a model is shown: each optional argument exists only while
+ * the feature it controls is on, so no knob that does nothing is offered.
+ * `wait`, `background` and the PTY arguments need `bash.background`,
+ * `compressed` needs `bash.compress`, and `sandbox` needs `sandbox.enabled`.
+ * A stale call that still sends a removed argument is ignored in `execute`.
+ * Keys keep the order of the full set, so the all-on schema is unchanged.
+ */
+function bashParamsForConfig(
+  features: {
+    background: boolean;
+    compress: boolean;
+    sandbox: boolean;
+    subagentBackground: boolean;
+  },
+  companions: RegisteredCompanions,
+): typeof BashParams {
+  return Type.Object({
+    ...BashBaseParams,
+    ...(features.background ? BashWaitParam : {}),
+    ...(features.sandbox ? BashSandboxParam : {}),
+    ...(features.background
+      ? {
+          background: Type.Optional(
+            Type.Boolean({ description: backgroundParamDescription(companions) }),
+          ),
+        }
+      : {}),
+    ...(features.compress ? BashCompressionParam : {}),
+    ...(features.background
+      ? {
+          ...BashPtyParams,
+          pty: Type.Optional(
+            Type.Boolean({
+              description: ptyParamDescription(companions, features.subagentBackground),
+            }),
+          ),
+        }
+      : {}),
+  }) as unknown as typeof BashParams;
+}
+
+/** Which bash companions the model can call; descriptions name only these. */
+interface RegisteredCompanions {
+  status: boolean;
+  watch: boolean;
+  write: boolean;
+  kill: boolean;
+}
+
+/**
+ * Whether a bash companion tool is registered for this configuration: it
+ * needs `bash.background` and must not be in `disabled_tools`.
+ */
+export function bashCompanionRegistered(
+  config: PluginContext["config"],
+  companion: "bash_status" | "bash_watch" | "bash_write" | "bash_kill",
+): boolean {
+  return resolveBashConfig(config).background && toolEnabled(config, companion);
+}
+
+function registeredCompanions(config: PluginContext["config"]): RegisteredCompanions {
+  return {
+    status: bashCompanionRegistered(config, "bash_status"),
+    watch: bashCompanionRegistered(config, "bash_watch"),
+    write: bashCompanionRegistered(config, "bash_write"),
+    kill: bashCompanionRegistered(config, "bash_kill"),
+  };
+}
+
+function backgroundParamDescription(c: RegisteredCompanions): string {
+  let controls = "";
+  if (c.watch) {
+    controls += ` Use bash_watch to wait for completion or output patterns${c.status ? "; bash_status for a one-shot snapshot only." : "."}`;
+  } else if (c.status) {
+    controls += " Use bash_status for a one-shot snapshot.";
+  }
+  if (c.kill) controls += " Use bash_kill to terminate.";
+  return `Spawn command in background and return immediately with a task_id.${controls} Ideal for long-running tasks like builds or dev servers.`;
+}
+
+/**
+ * A PTY session only exists as a background task, so with
+ * `bash.subagent_background: false` worker sessions refuse `pty: true`; the
+ * description says so only in that configuration.
+ */
+function ptyParamDescription(c: RegisteredCompanions, subagentBackground: boolean): string {
+  let drive = "";
+  if (c.status && c.write) {
+    drive =
+      ' Inspect with bash_status({ task_id, output_mode: "screen" }) and send input with bash_write.';
+  } else if (c.status) {
+    drive = ' Inspect with bash_status({ task_id, output_mode: "screen" }).';
+  } else if (c.write) {
+    drive = " Send input with bash_write.";
+  }
+  const workers = subagentBackground
+    ? ""
+    : " Unavailable in worker sessions because bash.subagent_background is false.";
+  return `Spawn the command in a real PTY for interactive programs. Implies background: true automatically.${workers}${drive}`;
+}
+
+/**
+ * Whether the native bash sandbox is on for this configuration. The `sandbox`
+ * argument only asks to leave that sandbox for one command, so it is offered
+ * only when there is a sandbox to leave.
+ */
+export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
+  return config.sandbox?.enabled === true;
 }
 
 const BashTaskParams = Type.Object({
@@ -268,8 +398,11 @@ interface BashDetails {
 }
 
 interface BashStatusWaited {
-  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable";
+  reason: "matched" | "exited" | "timeout" | "user_message" | "unavailable" | "aborted";
+  /** Real time the watch held the call, measured on a monotonic clock. */
   elapsed_ms: number;
+  /** Longest time this watch was allowed to hold the call; absent when it had no deadline. */
+  limit_ms?: number;
   match?: string;
   match_offset?: number;
   match_stream?: "stdout" | "stderr";
@@ -463,6 +596,30 @@ function getBashSpawnHook(pi: ExtensionAPI): BashSpawnHook | undefined {
   return api.hooks?.bashSpawn;
 }
 
+/**
+ * How the description tells the agent to wait on a background task, naming
+ * `bash_watch` and `bash_status` only when they are registered.
+ */
+function backgroundWaitSentence(c: RegisteredCompanions): string {
+  if (c.watch) {
+    const noPolling = c.status ? ", and never loop `bash_status` to wait" : "";
+    return `then \`bash_watch\` handles only a short remaining wait (in a main session a watch defaults to 30s, max bash.watch_sync_max_ms, 120s by default; in a delegated session a watch without a timeout waits until the command finishes); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one)${noPolling}.`;
+  }
+  return c.status
+    ? "the task keeps running after the call returns, a completion reminder arrives when it exits, and `bash_status` reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else."
+    : "the task keeps running after the call returns and a completion reminder arrives when it exits. Use bash({wait:true}) instead when the result is needed before anything else.";
+}
+
+/** How a PTY session is driven, naming only the companions that exist. */
+function ptyDriveClause(c: RegisteredCompanions): string {
+  if (c.status && c.write) {
+    return ', and is driven with `bash_status({ output_mode: "screen" })` plus `bash_write`';
+  }
+  if (c.status) return ', and its screen is read with `bash_status({ output_mode: "screen" })`';
+  if (c.write) return ", and is driven with `bash_write`";
+  return "";
+}
+
 /** Register AFT's primary bash tool under either the host or aft_ name. */
 export function registerBashTool(
   pi: ExtensionAPI,
@@ -485,9 +642,16 @@ export function registerBashTool(
   // describe a no-op. Background/PTY/watch wording appears only when
   // `bash.background` is enabled.
   const zoomSteer = toolEnabled(ctx.config, "aft_zoom") ? ", or `aft_zoom`" : "";
-  const searchSteer = aftSearchRegistered
-    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`
-    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`;
+  const steerTools = [
+    aftSearchRegistered
+      ? "`aft_search` (concepts, identifiers, regex, literals)"
+      : `the \`${grepToolName}\` tool`,
+    `\`${readToolName}\``,
+    ...(toolEnabled(ctx.config, "aft_outline") ? ["`aft_outline`"] : []),
+  ].join(", ");
+  const searchSteer = `use ${steerTools}${zoomSteer} instead`;
+  // Companion names appear in this tool's text only when the model can call them.
+  const companions = registeredCompanions(ctx.config);
   const bashCfg = resolveBashConfig(ctx.config);
   // Every command probes the module before fallback. Retain only enough state to
   // clear fallback mode after the first successful module response.
@@ -495,11 +659,23 @@ export function registerBashTool(
   const compressionSentence = bashCfg.compress
     ? " Output is compressed by default; pass `compressed: false` for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without `| head`, `| tail`, or `| grep`."
     : "";
+  // The prompt snippet lists what the call supports, so each entry follows the
+  // feature that provides it.
+  const supported = bashCfg.background
+    ? [
+        "workdir",
+        "background tasks",
+        ...(bashCfg.compress ? ["compressed output"] : []),
+        "PTY mode",
+      ].join(", ")
+    : bashCfg.compress
+      ? "workdir and compressed output"
+      : "workdir";
   const detachSentence = bashCfg.detach_on_user_message
     ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
   const tasksSentence = bashCfg.background
-    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; then \`bash_watch\` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one), and never loop \`bash_status\` to wait. A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background, and is driven with \`bash_status({ output_mode: "screen" })\` plus \`bash_write\`.`
+    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: registeredName,
@@ -508,18 +684,26 @@ export function registerBashTool(
       ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
       : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
     promptSnippet: isPowerShell
-      ? "Run PowerShell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
-      : bashCfg.background
-        ? "Run shell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
-        : "Run shell commands (timeout in milliseconds; supports workdir and compressed output)",
+      ? `Run PowerShell commands (timeout in milliseconds; supports ${supported})`
+      : `Run shell commands (timeout in milliseconds; supports ${supported})`,
     promptGuidelines: isPowerShell
       ? ["Use PowerShell syntax. Every command requires explicit approval."]
       : [
           `DO NOT use bash for code search or exploration — ${searchSteer}.`,
-          "Set compressed: false when you need ANSI color codes in the output.",
+          ...(bashCfg.compress
+            ? ["Set compressed: false when you need ANSI color codes in the output."]
+            : []),
           "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
         ],
-    parameters: bashParamsForConfig(bashCfg.background),
+    parameters: bashParamsForConfig(
+      {
+        background: bashCfg.background,
+        compress: bashCfg.compress,
+        sandbox: nativeSandboxEnabled(ctx.config),
+        subagentBackground: bashCfg.subagent_background,
+      },
+      companions,
+    ),
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
@@ -546,7 +730,12 @@ export function registerBashTool(
         ? undefined
         : coerceOptionalInt(params.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(params.compressed, true);
-      const requestedWait = coerceBoolean(params.wait);
+      // With background off, `wait` is not in the schema and every command
+      // already runs to completion. A stale `wait: true` is ignored rather than
+      // forwarded: the engine would otherwise make the call detachable on the
+      // next user message, which would move it into a background task. The
+      // contradiction checks below therefore only fire while background is on.
+      const requestedWait = !backgroundDisabled && coerceBoolean(params.wait);
       const rawRequestedPty = coerceBoolean(params.pty);
       const rawRequestedBackground = coerceBoolean(params.background);
       if (requestedWait && rawRequestedPty) {
@@ -573,6 +762,14 @@ export function registerBashTool(
       }
       const blockToCompletion = backgroundDisabled || requestedWait || workerForcedForeground;
       const effectiveBackground = !blockToCompletion && (rawRequestedBackground || requestedPty);
+      const isWorker = isPiWorkerSession(extCtx);
+      // A worker that asks to wait for its command without a timeout has
+      // nothing else to do until the command finishes and can't be woken
+      // after its turn ends, so the engine skips its 30-minute default kill
+      // (it knows the role from the `worker_session` field callBridge adds to
+      // every request). A new message still detaches the wait and an abort
+      // still kills the command. The transport timeout must not undercut it.
+      const workerUnboundedWait = isWorker && requestedWait && timeout === undefined;
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {
@@ -625,6 +822,7 @@ export function registerBashTool(
               requestedWait,
               timeout,
               foregroundWaitMs,
+              workerUnboundedWait,
             ),
             onProgress: ({ text }) => {
               streamed += text;
@@ -638,10 +836,10 @@ export function registerBashTool(
       } catch (error) {
         const fallbackCause = classifyBashHostFallbackError(error);
         if (isPowerShell || !bashCfg.host_fallback || fallbackCause === undefined) throw error;
-        if (rawRequestedBackground) {
+        if (!backgroundDisabled && rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
-        if (rawRequestedPty) {
+        if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
         }
         if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
@@ -688,6 +886,8 @@ export function registerBashTool(
       const taskId = response.task_id as string | undefined;
       if (response.status === "running" && taskId) {
         trackBgTask(resolveSessionId(extCtx), taskId);
+        // The Rust engine words this hand-off text for the caller's role
+        // (worker_session, which callBridge adds to every request).
         return bashResult((response.output as string | undefined) ?? "", { task_id: taskId });
       }
 
@@ -722,8 +922,9 @@ export function registerBashTool(
 
 /**
  * Register controls for AFT-owned background task IDs. Each companion is an
- * independent registration controlled only by its own name in
- * `disabled_tools`; the bash runtime gate is enforced by the engine.
+ * independent registration controlled by its own name in `disabled_tools`;
+ * the bash runtime gate is enforced by the engine. All four only act on
+ * background tasks, so none is registered while `bash.background` is off.
  */
 export function registerBashCompanionTools(
   pi: ExtensionAPI,
@@ -735,6 +936,7 @@ export function registerBashCompanionTools(
     bashKill: boolean;
   } = { bashStatus: true, bashWatch: true, bashWrite: true, bashKill: true },
 ): void {
+  if (!resolveBashConfig(ctx.config).background) return;
   if (enabled.bashStatus) {
     pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
   }
@@ -774,8 +976,8 @@ export function createBashStatusTool(ctx: PluginContext) {
   return {
     name: "bash_status",
     label: "bash_status",
-    description:
-      "Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+    // Point at bash_watch for waiting only when the model can call it.
+    description: `Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(
@@ -806,14 +1008,14 @@ export function createBashWatchTool(ctx: PluginContext) {
   return {
     name: "bash_watch",
     label: "bash_watch",
-    description:
-      "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+    // The polling warning names bash_status only when the model can call it.
+    description: `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${bashCompanionRegistered(ctx.config, "bash_status") ? " Never loop bash_status to wait." : ""}`,
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(
       _toolCallId: string,
       params: Static<typeof BashWatchParams>,
-      _signal: AbortSignal | undefined,
+      signal: AbortSignal | undefined,
       _onUpdate: ((update: AgentToolResult<BashWatchDetails>) => void) | undefined,
       extCtx: ExtensionContext,
     ) {
@@ -821,7 +1023,8 @@ export function createBashWatchTool(ctx: PluginContext) {
       const waitFor = parseWaitPattern(params.pattern);
       const bashCfg = resolveBashConfig(ctx.config);
       // A worker that may not background also may not park an async watch it
-      // will never be woken by; the watch becomes a sync wait for the full cap.
+      // will never be woken by; the watch becomes a sync wait that lasts until
+      // the command finishes.
       const workerForcedSync =
         coerceBoolean(params.background) &&
         !bashCfg.subagent_background &&
@@ -862,9 +1065,9 @@ export function createBashWatchTool(ctx: PluginContext) {
       const syncWaitCap = bashCfg.watch_sync_max_ms;
       const role = watchCallerRole(extCtx);
       const effectiveWaitMs = workerForcedSync
-        ? syncWaitCap
+        ? undefined
         : resolveWatchTimeoutMs(
-            coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap),
+            coerceConfiguredWatchTimeout(params.timeout_ms, role, syncWaitCap),
             role,
             syncWaitCap,
           );
@@ -877,6 +1080,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         waitFor,
         true,
         effectiveWaitMs,
+        signal,
       );
       // User-message abort: the sync wait was interrupted because the user
       // sent a message. Auto-register the equivalent async watch so the
@@ -888,6 +1092,8 @@ export function createBashWatchTool(ctx: PluginContext) {
           params.task_id,
           waitFor,
           coerceBoolean(params.once, true),
+          data.waited.elapsed_ms,
+          role,
         );
         return textResult(convertedText, { waited: data.waited } as BashWatchDetails);
       }
@@ -916,14 +1122,25 @@ async function convertToAsyncWatchOnAbort(
   taskId: string,
   waitFor: BashWaitPattern | undefined,
   once: boolean,
+  elapsedMs: number,
+  role: WatchCallerRole,
 ): Promise<string> {
+  const interrupted = `Sync watch for task ${taskId} was interrupted because you sent a message after ${elapsedMs}ms of waiting. `;
+  const reminderFallback = interruptedWatchTail(
+    role,
+    `The task is still running in the background. A completion reminder will be ` +
+      `delivered automatically when the task exits.`,
+  );
   // No pattern: the auto-reminder system already handles exit notifications
   // for background tasks, so no explicit watch registration is needed.
   if (!waitFor) {
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
-      `The task is still running in the background. A completion reminder will be ` +
-      `delivered automatically when the task exits; don't poll bash_status.`
+      interrupted +
+      interruptedWatchTail(
+        role,
+        `The task is still running in the background. A completion reminder will be ` +
+          `delivered automatically when the task exits; don't poll bash_status.`,
+      )
     );
   }
   // Register the equivalent async watch so the pattern/exit notification
@@ -941,24 +1158,25 @@ async function convertToAsyncWatchOnAbort(
     if (registered.success === false) {
       unmarkExplicitControl(sessionId, taskId);
       return (
-        `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+        interrupted +
         `Auto-registering an async watch failed (${String(registered.message ?? "unknown error")}). ` +
-        `The task is still running in the background. A completion reminder will be ` +
-        `delivered automatically when the task exits.`
+        reminderFallback
       );
     }
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      interrupted +
       `The wait has been converted to an async watch (${registered.watch_id}). ` +
-      `A notification will fire when the pattern matches or the task exits.`
+      interruptedWatchTail(
+        role,
+        `A notification will fire when the pattern matches or the task exits.`,
+      )
     );
   } catch (err) {
     unmarkExplicitControl(sessionId, taskId);
     return (
-      `Sync watch for task ${taskId} was interrupted because you sent a message. ` +
+      interrupted +
       `Auto-registering an async watch failed (${err instanceof Error ? err.message : String(err)}). ` +
-      `The task is still running in the background. A completion reminder will be ` +
-      `delivered automatically when the task exits.`
+      reminderFallback
     );
   }
 }
@@ -968,7 +1186,8 @@ export function createBashWriteTool(ctx: PluginContext) {
     name: "bash_write",
     label: "bash_write",
     description:
-      'Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: "pty" first. ' +
+      // Suggest checking the task mode first only when bash_status is callable.
+      `Write input bytes to a running PTY bash task. PTY-only${bashCompanionRegistered(ctx.config, "bash_status") ? '; check bash_status reports mode: "pty" first.' : "."} ` +
       'Input is either a string (verbatim bytes) or an array mixing strings and { key: "esc" | "enter" | "up" | "ctrl-c" | ... } objects ' +
       'for atomic text+key sequences such as [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ]. ' +
       "Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. " +
@@ -1102,10 +1321,33 @@ async function waitForBashStatus(
   outputMode: string | undefined,
   waitFor: BashWaitPattern | undefined,
   waitForExit: boolean,
-  effectiveWaitMs: number,
+  effectiveWaitMs: number | undefined,
+  abortSignal?: AbortSignal,
 ): Promise<Record<string, unknown> & { waited: BashStatusWaited }> {
-  const startedAt = Date.now();
-  const deadline = startedAt + effectiveWaitMs;
+  // The deadline and the reported elapsed time both come from a monotonic
+  // clock, so a wall-clock step during the wait can neither end it early nor
+  // inflate the time the reply says it waited. An undefined wait has no
+  // deadline: it ends only on exit, a match, a new message, or an abort.
+  const startedAt = watchClock.now();
+  const deadline =
+    effectiveWaitMs === undefined ? Number.POSITIVE_INFINITY : startedAt + effectiveWaitMs;
+  const elapsedMs = () => Math.round(watchClock.now() - startedAt);
+  // Sleep until the next poll, never past the deadline. The poll interval
+  // grows with the time already waited (watchPollDelayMs).
+  const pause = () =>
+    watchClock.sleep(
+      Math.min(watchPollDelayMs(elapsedMs()), Math.max(0, deadline - watchClock.now())),
+      abortSignal,
+    );
+  const waited = (
+    reason: BashStatusWaited["reason"],
+    extra: Partial<BashStatusWaited> = {},
+  ): BashStatusWaited => ({
+    reason,
+    elapsed_ms: elapsedMs(),
+    ...(effectiveWaitMs === undefined ? {} : { limit_ms: effectiveWaitMs }),
+    ...extra,
+  });
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
   const scanState: OutputScanState = {
     output: { text: "", baseOffset: 0 },
@@ -1129,8 +1371,13 @@ async function waitForBashStatus(
   if (waitForExit) markTaskWaiting(sessionId, taskId);
   let sawTerminal = false;
   let lastData: Record<string, unknown> | undefined;
+  // Start of the current run of status polls that all timed out, if any.
+  let busySince: number | undefined;
   try {
     while (true) {
+      if (abortSignal?.aborted) {
+        return withWaited(lastData ?? unavailableSnapshot(), waited("aborted"));
+      }
       let data: Record<string, unknown>;
       try {
         data = await bashStatusSnapshot(
@@ -1148,21 +1395,22 @@ async function waitForBashStatus(
         // poll); honor abort/deadline and otherwise retry. A genuine
         // non-timeout error still propagates.
         if (!isBridgeTransportTimeout(err)) throw err;
+        busySince ??= watchClock.now();
         if (isSyncWatchAborted(sessionId)) {
-          return withWaited(lastData ?? unavailableSnapshot(), {
-            reason: "user_message",
-            elapsed_ms: Date.now() - startedAt,
-          });
+          return withWaited(lastData ?? unavailableSnapshot(), waited("user_message"));
         }
-        if (Date.now() >= deadline) {
-          return withWaited(lastData ?? unavailableSnapshot(), {
-            reason: "unavailable",
-            elapsed_ms: Date.now() - startedAt,
-          });
+        // A wait with no deadline still gives up on a bridge that has not
+        // answered for WATCH_UNAVAILABLE_GIVE_UP_MS, instead of retrying forever.
+        if (
+          watchClock.now() >= deadline ||
+          watchClock.now() - busySince >= WATCH_UNAVAILABLE_GIVE_UP_MS
+        ) {
+          return withWaited(lastData ?? unavailableSnapshot(), waited("unavailable"));
         }
-        await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+        await pause();
         continue;
       }
+      busySince = undefined;
       lastData = data;
       const terminal = isTerminalStatus(data.status);
 
@@ -1194,13 +1442,14 @@ async function waitForBashStatus(
               }
               const matchStream: "stdout" | "stderr" | undefined =
                 data.mode === "pty" ? undefined : chunk.stream === "output" ? "stdout" : "stderr";
-              return withWaited(data, {
-                reason: "matched",
-                elapsed_ms: Date.now() - startedAt,
-                match: match.text,
-                match_offset: state.baseOffset + match.byteOffset,
-                match_stream: matchStream,
-              });
+              return withWaited(
+                data,
+                waited("matched", {
+                  match: match.text,
+                  match_offset: state.baseOffset + match.byteOffset,
+                  match_stream: matchStream,
+                }),
+              );
             }
             if (waitFor.kind === "substring") {
               const trimmed = trimWaitScanBuffer(state.text, state.baseOffset, waitFor);
@@ -1220,20 +1469,20 @@ async function waitForBashStatus(
             taskId,
           );
         }
-        return withWaited(data, { reason: "exited", elapsed_ms: Date.now() - startedAt });
+        return withWaited(data, waited("exited"));
       }
 
       // User-message abort: if the user sent a message while we were
       // blocking, convert this sync wait to an async watch so the agent's
       // turn ends promptly. The match/exit checks above win over abort.
       if (isSyncWatchAborted(sessionId)) {
-        return withWaited(data, { reason: "user_message", elapsed_ms: Date.now() - startedAt });
+        return withWaited(data, waited("user_message"));
       }
 
-      if (Date.now() >= deadline) {
-        return withWaited(data, { reason: "timeout", elapsed_ms: Date.now() - startedAt });
+      if (watchClock.now() >= deadline) {
+        return withWaited(data, waited("timeout"));
       }
-      await sleep(Math.min(BASH_WAIT_POLL_INTERVAL_MS, Math.max(0, deadline - Date.now())));
+      await pause();
     }
   } finally {
     if (waitForExit && !sawTerminal) unmarkTaskWaiting(sessionId, taskId);
@@ -1411,20 +1660,29 @@ function formatWaitSummary(
   details: BashStatusDetails,
   watchRole: WatchRoleContext,
 ): string {
+  // Only a primary's watch is bounded by the configured cap.
+  const waitedText = formatWatchWaited(
+    waited.elapsed_ms,
+    waited.limit_ms,
+    watchRole.role === "primary" ? watchRole.capMs : undefined,
+  );
   if (waited.reason === "matched") {
     const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
-    return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
+    return `${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
   }
   if (waited.reason === "timeout") {
     // A watch deadline is not a failure of the command; the steer tells the
     // caller so, with the next move that fits its role.
-    return `Waited ${waited.elapsed_ms}ms; timeout reached without match. ${watchTimeoutSteer(watchRole.role, watchRole.capMs, "timeout_ms")}`;
+    return `${waitedText}; timeout reached without match. ${watchTimeoutSteer(watchRole.role, "timeout_ms")}`;
   }
   if (waited.reason === "unavailable") {
-    return `Waited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
+    return `${waitedText}; ${watchUnavailableSteer(watchRole.role)}`;
+  }
+  if (waited.reason === "aborted") {
+    return `${waitedText}; the watch was cancelled. The task keeps running.`;
   }
   const exit = typeof details.exit_code === "number" ? `, exit ${details.exit_code}` : "";
-  return `Waited ${waited.elapsed_ms}ms; task exited (${details.status}${exit}).`;
+  return `${waitedText}; task exited (${details.status}${exit}).`;
 }
 
 /** Role and resolved sync cap used to word a bash_watch timeout reply. */
@@ -1456,11 +1714,12 @@ ${formatWaitSummary(details.waited, details, watchRole)}`;
       text += `
 ${details.output_preview}`;
     }
-    // A worker told to watch again must not also be told not to poll.
-    const workerWatchTimeout = watchRole.role === "worker" && details.waited?.reason === "timeout";
-    if (!isTerminalStatus(details.status) && !workerWatchTimeout) {
+    // A worker whose watch returned while the task still runs has already
+    // been told to watch again; adding "don't poll" would contradict it.
+    const workerWatchReturned = watchRole.role === "worker" && details.waited !== undefined;
+    if (!isTerminalStatus(details.status) && !workerWatchReturned) {
       text += `
-A completion reminder will be delivered automatically; don't poll.`;
+${runningTaskStatusHint(watchRole.role)}`;
     }
   }
   return text;

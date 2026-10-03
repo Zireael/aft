@@ -532,6 +532,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
       cached,
       latest: getSelfVersion(),
       exists: existsSync(path),
+      configuredEntry,
     };
   }
 

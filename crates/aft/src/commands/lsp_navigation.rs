@@ -49,6 +49,27 @@ pub(crate) fn install_deferred_navigation_gate_for_test(
 }
 
 #[cfg(test)]
+static DEFERRED_NAVIGATION_SEEN_RESTRICT: Mutex<Option<bool>> = Mutex::new(None);
+
+/// What `restrict_to_project_root` the last deferred navigation worker saw
+/// once past its test gate.
+#[cfg(test)]
+pub(crate) fn take_deferred_navigation_seen_restrict_for_test() -> Option<bool> {
+    DEFERRED_NAVIGATION_SEEN_RESTRICT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+#[cfg(test)]
+fn record_deferred_navigation_config_for_test(ctx: &AppContext) {
+    *DEFERRED_NAVIGATION_SEEN_RESTRICT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(ctx.config().restrict_to_project_root);
+}
+
+#[cfg(test)]
 pub(crate) fn deferred_navigation_worker_count_for_test() -> usize {
     DEFERRED_NAVIGATION_WORKERS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -177,15 +198,20 @@ fn defer_lsp_navigation(
     let worker_cancellation = cancellation.clone();
     let timeout_cancellation = cancellation.clone();
     let (tx, rx) = mpsc::sync_channel(1);
+    // The request's admitted config, installed on the worker below.
+    let admitted_config = ctx.config();
 
     // Cold initialization and its first query run after the scheduler job returns,
     // so an LSP handshake cannot serialize unrelated work on the same root.
     std::thread::spawn(move || {
         #[cfg(test)]
         let _worker = DeferredNavigationWorkerGuard::new();
+        let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
         wait_at_deferred_navigation_gate_for_test();
+        #[cfg(test)]
+        record_deferred_navigation_config_for_test(&ctx);
         let response = if crate::executor::current_job_cancelled() {
             navigation_cancelled_response(&request.id, &request.command)
         } else {

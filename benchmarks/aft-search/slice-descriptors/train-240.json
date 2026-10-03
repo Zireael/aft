@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "search-index-parallel-warm-verify-377"
+  ],
+  "note": "Derived from git diff --name-only origin/main: the ranking fence hit is crates/aft/src/search_index.rs. Declared engine_unwired because the change only moves the search index's warm freshness verify onto the existing bounded parallel verifier and stats each file once; verdicts and the resulting index are unchanged. Ranked rows must remain byte-identical to the committed reference."
+}

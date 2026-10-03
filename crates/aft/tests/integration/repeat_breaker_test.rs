@@ -20,6 +20,98 @@ pub(super) fn transport_fixture_arguments(root: &Path, description: &str) -> Val
     })
 }
 
+/// File the rewritten-grep fixtures search; one line matches the needle.
+pub(super) const REWRITE_FIXTURE_FILE: &str = "historian.repeat-fixture";
+
+pub(super) fn write_rewritten_grep_fixture(root: &Path) {
+    std::fs::write(
+        root.join(REWRITE_FIXTURE_FILE),
+        "historian response dumped\n",
+    )
+    .expect("write rewritten grep fixture");
+}
+
+/// A bash call that AFT answers with its grep tool instead of running a shell
+/// (the bash rewrite), so these fixtures exercise the path where the reply is
+/// produced without a spawned process. Only the description varies, as it does
+/// when a model repeats a command.
+pub(super) fn rewritten_bash_grep_arguments(description: &str) -> Value {
+    json!({
+        "command": format!("grep -rn \"historian response dumped\" {REWRITE_FIXTURE_FILE}"),
+        "description": description,
+    })
+}
+
+/// The rewritten grep renders a match summary; a native shell grep does not.
+pub(super) fn assert_answered_by_rewrite(text: &str) {
+    assert!(
+        text.contains("Found 1 match"),
+        "bash grep must be answered by the rewrite: {text:?}"
+    );
+}
+
+/// Foreground wait window for the fixtures below: long enough for the quick
+/// command to finish inside it, short enough for the slow one to outlive it.
+/// A loaded Windows runner has taken longer than 1.5 s just to start the
+/// shell for the 0.2 s command, so the window leaves room for that; the slow
+/// command sleeps well past it.
+pub(super) const REPEAT_FOREGROUND_WAIT_MS: u64 = 4_000;
+pub(super) const FINISHED_MARKER: &str = "repeat-native-finished";
+
+/// A native command that finishes inside the foreground wait, so the wait
+/// answers it with the command's result.
+pub(super) fn finished_bash_arguments(description: &str) -> Value {
+    json!({
+        "command": format!("sleep 0.2; echo {FINISHED_MARKER}"),
+        "description": description,
+    })
+}
+
+/// A native command that outlives the foreground wait, so the call is answered
+/// by promoting the command to a background task.
+pub(super) fn promoted_bash_arguments(description: &str) -> Value {
+    json!({
+        "command": "sleep 10; echo repeat-native-promoted",
+        "description": description,
+    })
+}
+
+/// Rounds 1 and 2 carry no reminder and round 3 names the 3rd call. Counting
+/// any call twice would make round 3 the 6th instead.
+pub(super) fn assert_third_call_steers(label: &str, texts: &[String], identical: bool) {
+    assert_eq!(texts.len(), 3, "{label}: {texts:?}");
+    for (index, text) in texts.iter().take(2).enumerate() {
+        assert!(
+            !text.contains("<system-reminder>"),
+            "{label} call {index} must not steer: {text:?}"
+        );
+    }
+    let expected = if identical {
+        "This is the 3rd identical call"
+    } else {
+        "This is the 3rd call with the same arguments"
+    };
+    assert!(
+        texts[2].contains(expected),
+        "{label} third call must steer with {expected:?}: {:?}",
+        texts[2]
+    );
+}
+
+pub(super) fn assert_finished_in_foreground(text: &str) {
+    assert!(
+        text.contains(FINISHED_MARKER) && !text.contains("promoted to background"),
+        "quick bash must finish inside the foreground wait: {text:?}"
+    );
+}
+
+pub(super) fn assert_promoted(text: &str) {
+    assert!(
+        text.contains("promoted to background"),
+        "slow bash must be promoted to the background: {text:?}"
+    );
+}
+
 pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
     assert_eq!(texts.len(), 3);
     assert!(
@@ -48,6 +140,19 @@ fn observe_tool(
     output: &str,
     now: Instant,
 ) -> Option<String> {
+    observe_tool_as(breaker, tool, input, output, now, false)
+}
+
+/// `worker_session` is the caller's role: a delegated worker gets its own
+/// wording.
+fn observe_tool_as(
+    breaker: &RepeatBreaker,
+    tool: &str,
+    input: &Value,
+    output: &str,
+    now: Instant,
+    worker_session: bool,
+) -> Option<String> {
     let intervention = breaker.observe_at(
         SESSION,
         tool,
@@ -56,12 +161,113 @@ fn observe_tool(
         now,
     )?;
     let mut text = output.to_string();
-    append_repeat_breaker_reminder(&mut text, SESSION, &intervention);
+    append_repeat_breaker_reminder(&mut text, SESSION, &intervention, worker_session);
     Some(text)
 }
 
 fn observe(breaker: &RepeatBreaker, input: &Value, output: &str, now: Instant) -> Option<String> {
     observe_tool(breaker, TOOL, input, output, now)
+}
+
+/// What a delegated worker must be told instead of ending its turn: a worker
+/// that ends its turn has delivered its result and cannot be woken when the
+/// task it waits on finishes.
+fn assert_worker_wording(text: &str) {
+    assert!(
+        text.contains("wait with a watch on its background task"),
+        "worker reminder must say to wait on the task: {text:?}"
+    );
+    assert!(
+        !text.contains("end the turn") && !text.contains("turn must end"),
+        "worker reminder must not tell it to end its turn: {text:?}"
+    );
+}
+
+#[test]
+fn repeat_breaker_words_its_reminder_for_a_worker() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let input = json!({ "command": "ci status" });
+    let mut texts = Vec::new();
+    for index in 0..6 {
+        texts.push(observe_tool_as(
+            &breaker,
+            TOOL,
+            &input,
+            STABLE_OUTPUT,
+            start + Duration::from_secs(index * 16),
+            true,
+        ));
+    }
+    let third = texts[2].clone().expect("third identical call must steer");
+    assert!(third.contains("This is the 3rd identical call"));
+    assert_worker_wording(&third);
+    let sixth = texts[5]
+        .clone()
+        .expect("sixth identical call must escalate");
+    assert!(sixth.contains("Stop now: make no further call with these arguments"));
+    assert_worker_wording(&sixth);
+}
+
+#[test]
+fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
+    // The plugins attach `worker_session: true` next to `session_id` on every
+    // request from a delegated worker: inside the `tool_call` envelope, and at
+    // the top level of a raw `bash` request (whose own arguments are nested
+    // under `params`).
+    let project = tempfile::tempdir().expect("worker repeat project");
+    std::fs::write(project.path().join("stable.repeat-fixture"), "stable")
+        .expect("write repeat fixture");
+    let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_FOREGROUND_WAIT_MS",
+        std::ffi::OsStr::new(&wait_ms),
+    )]);
+    aft.configure(project.path());
+    let mut tool_texts = Vec::new();
+    let mut bash_texts = Vec::new();
+
+    for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
+        let response = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": format!("worker-tool-call-{index}"),
+                "command": "tool_call",
+                "session_id": SESSION,
+                "worker_session": true,
+                "name": "glob",
+                "arguments": transport_fixture_arguments(project.path(), description),
+            }))
+            .expect("serialize worker tool call"),
+            Duration::from_secs(5),
+        );
+        tool_texts.push(response["text"].as_str().unwrap_or_default().to_string());
+
+        let mut params = finished_bash_arguments(description);
+        let object = params.as_object_mut().expect("bash arguments object");
+        object.insert("workdir".to_string(), json!(project.path()));
+        object.insert("foreground_orchestrate".to_string(), json!(true));
+        let response = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": format!("worker-raw-bash-{index}"),
+                "command": "bash",
+                "session_id": SESSION,
+                "worker_session": true,
+                "params": params,
+            }))
+            .expect("serialize worker raw bash"),
+            Duration::from_secs(20),
+        );
+        bash_texts.push(response["output"].as_str().unwrap_or_default().to_string());
+        if index < 2 {
+            std::thread::sleep(Duration::from_secs(16));
+        }
+    }
+
+    assert_third_call_steers("worker tool_call", &tool_texts, true);
+    assert_worker_wording(&tool_texts[2]);
+    assert_third_call_steers("worker raw bash", &bash_texts, true);
+    assert_worker_wording(&bash_texts[2]);
+    assert!(aft.shutdown().success());
 }
 
 #[test]
@@ -527,6 +733,145 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
 }
 
 #[test]
+fn repeat_breaker_ndjson_tool_call_steers_a_rewritten_bash_grep() {
+    let project = tempfile::tempdir().expect("rewritten bash repeat project");
+    write_rewritten_grep_fixture(project.path());
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "config": crate::test_helpers::user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "configure: {configured:?}");
+    let mut texts = Vec::new();
+
+    for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
+        let response = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": format!("repeat-ndjson-bash-{index}"),
+                "command": "tool_call",
+                "session_id": SESSION,
+                "name": "bash",
+                "arguments": rewritten_bash_grep_arguments(description),
+            }))
+            .expect("serialize rewritten bash request"),
+            Duration::from_secs(10),
+        );
+        let text = response["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tool response missing text: {response:?}"))
+            .to_string();
+        assert_answered_by_rewrite(&text);
+        texts.push(text);
+        if index < 2 {
+            std::thread::sleep(Duration::from_secs(16));
+        }
+    }
+
+    assert_transport_repeat_sequence(&texts);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
+    // The Pi plugin and the OpenCode plugin in standalone mode send each model
+    // bash call as a top-level `bash` request, arguments nested under `params`,
+    // and show the model the response's `output`.
+    let project = tempfile::tempdir().expect("raw bash repeat project");
+    write_rewritten_grep_fixture(project.path());
+    let wait_ms = REPEAT_FOREGROUND_WAIT_MS.to_string();
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_FOREGROUND_WAIT_MS",
+        std::ffi::OsStr::new(&wait_ms),
+    )]);
+    let configured = aft.send(
+        &json!({
+            "id": "cfg",
+            "command": "configure",
+            "harness": "pi",
+            "project_root": project.path(),
+            "config": crate::test_helpers::user_config(json!({
+                "bash": { "rewrite": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "configure: {configured:?}");
+    let mut rewritten = Vec::new();
+    let mut finished = Vec::new();
+    let mut promoted = Vec::new();
+
+    for (index, description) in DESCRIPTIONS.into_iter().enumerate() {
+        for (kind, arguments) in [
+            ("rewritten", rewritten_bash_grep_arguments(description)),
+            ("finished", finished_bash_arguments(description)),
+            ("promoted", promoted_bash_arguments(description)),
+        ] {
+            let mut params = arguments;
+            let object = params.as_object_mut().expect("bash arguments object");
+            object.insert("workdir".to_string(), json!(project.path()));
+            object.insert("background".to_string(), json!(false));
+            object.insert("notify_on_completion".to_string(), json!(false));
+            object.insert("pty".to_string(), json!(false));
+            object.insert("foreground_orchestrate".to_string(), json!(true));
+            object.insert("block_to_completion".to_string(), json!(false));
+            object.insert("wait".to_string(), json!(false));
+            let response = aft.send_with_timeout(
+                &serde_json::to_string(&json!({
+                    "id": format!("repeat-raw-bash-{kind}-{index}"),
+                    "command": "bash",
+                    "session_id": SESSION,
+                    "params": params,
+                }))
+                .expect("serialize raw bash request"),
+                Duration::from_secs(20),
+            );
+            assert_eq!(response["success"], true, "{kind} raw bash: {response:?}");
+            let output = response["output"]
+                .as_str()
+                .unwrap_or_else(|| panic!("raw bash response missing output: {response:?}"))
+                .to_string();
+            match kind {
+                "rewritten" => {
+                    assert_answered_by_rewrite(&output);
+                    rewritten.push(output);
+                }
+                "finished" => {
+                    assert_finished_in_foreground(&output);
+                    finished.push(output);
+                }
+                _ => {
+                    assert_promoted(&output);
+                    promoted.push(output);
+                }
+            }
+        }
+        if index < 2 {
+            std::thread::sleep(Duration::from_secs(16));
+        }
+    }
+
+    assert_third_call_steers("rewritten grep", &rewritten, true);
+    assert_third_call_steers("foreground-finished bash", &finished, true);
+    // Each promotion names a new task, so the output drifts.
+    assert_third_call_steers("promoted bash", &promoted, false);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn repeat_breaker_counts_a_previewed_mutation_once() {
     // Hoisted mutations send a preview and then the apply for one model call.
     // Two genuine identical writes 31 s apart are two occurrences, below the
@@ -561,6 +906,9 @@ fn repeat_breaker_counts_a_previewed_mutation_once() {
             texts.push(response["text"].as_str().unwrap_or_default().to_string());
         }
         if cycle == 0 {
+            // Remove the file so the second identical write creates it again;
+            // writing unchanged content is refused as `no_change`.
+            std::fs::remove_file(&target).expect("remove written file");
             std::thread::sleep(Duration::from_secs(31));
         }
     }

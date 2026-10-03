@@ -15,13 +15,13 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
-    WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
-    MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectConfig, OpenCodeHostConfig, RerankBackendKind, RerankConfig, SandboxConfig,
+    SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
+    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
+    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config::{self, PolicyPhase};
 use crate::harness::Harness;
@@ -44,6 +44,8 @@ const PROTECTED_TOOL_REASON: &str =
     "security: a project config cannot disable aft_safety or a host tool slot (read, write, edit, apply_patch, grep, glob, bash)";
 const LSP_USER_ONLY_REASON: &str =
     "security: LSP executable-origin and diagnostic-suppression settings must come from user-level config";
+const RERANK_PROJECT_REASON: &str =
+    "security: a project config may only turn search.rerank off; every other rerank setting must come from user-level config";
 
 /// One raw config document supplied by the host plugin.
 ///
@@ -137,9 +139,11 @@ pub struct RawAftConfig {
     pub lsp: Option<RawLsp>,
     pub url_fetch_allow_private: Option<bool>,
     pub semantic: Option<RawSemantic>,
+    pub search: Option<RawSearch>,
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
     pub subc: Option<RawSubc>,
+    pub opencode: Option<RawOpenCode>,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
@@ -303,6 +307,30 @@ impl RawSemantic {
             && self.max_input_tokens.is_none()
             && self.max_files.is_none()
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawSearch {
+    pub rerank: Option<RawRerank>,
+}
+
+/// Raw `search.rerank`. Parsing only: defaults and clamps belong to the search
+/// engine, which owns every setting that can change result order.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawRerank {
+    pub backend: Option<RerankBackendKind>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub model: Option<String>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub endpoint: Option<String>,
+    #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub api_key_env: Option<String>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub top_n: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -499,6 +527,17 @@ pub struct RawBridge {
 pub struct RawSubc {
     pub connection_file: Option<String>,
     pub client_reaper: Option<bool>,
+}
+
+/// The OpenCode plugin's permission-prompt server. User-tier only: a project
+/// naming a server could route this machine's permission prompts to a server
+/// the repository controls, so `record_project_drops` reports it and
+/// `merge_project_config` never copies it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawOpenCode {
+    pub server_url: Option<String>,
+    pub server_password_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -882,6 +921,69 @@ fn parse_tier(
     Some((raw, translation))
 }
 
+/// Return why a tier would be accepted only by the lenient resolver, or
+/// `None` when it passes strict validation.
+///
+/// [`resolve_config_for_harness`] skips a tier whose text does not parse,
+/// resolves a tier with one bad value by dropping that key to its default,
+/// and ignores an invalid block for the active harness with only a warning.
+/// A connect keeps that behaviour. A live reload must not: a typo would reset
+/// a key (possibly a security key the harness block set) to its default while
+/// the root stays bound, so the reload calls this first and keeps the last
+/// valid configuration instead. Retired keys are left to the resolver, which
+/// rejects them with its own errors.
+pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option<String> {
+    let stripped = strip_jsonc(&tier.doc);
+    let value = match serde_json::from_str::<Value>(&stripped) {
+        Ok(value) => value,
+        Err(error) => return Some(format!("{} does not parse: {error}", tier.source)),
+    };
+    let Value::Object(mut map) = value else {
+        return Some(format!("{} is not a JSON object", tier.source));
+    };
+    let document_tier = if tier.tier == "user" {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    let translation = feature_config::translate_document(
+        &mut map,
+        feature_config::current_policy_phase(),
+        document_tier,
+    );
+    if !translation.errors.is_empty() {
+        return None;
+    }
+    let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map)) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Some(format!("{} has an invalid setting: {error}", tier.source));
+        }
+    };
+    // The block for the active harness is applied on top of this tier, so it
+    // must be as valid as the tier itself. Blocks for other harnesses are
+    // never applied here and stay unchecked, as at connect.
+    let label = harness?.wire_label();
+    let block = raw.harnesses.as_ref()?.get(&label)?;
+    let Value::Object(block) = block else {
+        return Some(format!(
+            "{} has an invalid harnesses.{label} block: it must be an object",
+            tier.source
+        ));
+    };
+    let mut block = block.clone();
+    // A nested `harnesses` key is ignored with a warning at connect as well.
+    block.remove("harnesses");
+    serde_json::from_value::<RawAftConfig>(Value::Object(block))
+        .err()
+        .map(|error| {
+            format!(
+                "{} has an invalid setting in harnesses.{label}: {error}",
+                tier.source
+            )
+        })
+}
+
 fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
     let mut partial = RawAftConfig::default();
 
@@ -1045,6 +1147,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.semantic.is_some() {
         base.semantic = override_config.semantic;
     }
+    if override_config.search.is_some() {
+        base.search = override_config.search;
+    }
     if override_config.auto_update.is_some() {
         base.auto_update = override_config.auto_update;
     }
@@ -1053,6 +1158,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.subc.is_some() {
         base.subc = override_config.subc;
+    }
+    if override_config.opencode.is_some() {
+        base.opencode = override_config.opencode;
     }
 }
 
@@ -1083,6 +1191,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     merge_checker_map(&mut base.checker, project.checker);
     merge_disabled_tools(&mut base.disabled_tools, project.disabled_tools);
     base.semantic = merge_semantic_config(base.semantic.clone(), project.semantic);
+    base.search = merge_project_search(base.search.clone(), project.search);
     base.lsp = merge_lsp_config(base.lsp.clone(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project_safe_bash(project.bash));
@@ -1095,6 +1204,39 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     base.pi = merge_pi_config(base.pi.clone(), project.pi);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+}
+
+/// A project may set `search.rerank.backend` to `"off"` and nothing else;
+/// `record_project_drops` reports every other value it supplied.
+fn merge_project_search(base: Option<RawSearch>, project: Option<RawSearch>) -> Option<RawSearch> {
+    let disables = project
+        .and_then(|search| search.rerank)
+        .is_some_and(|rerank| rerank.backend == Some(RerankBackendKind::Off));
+    if !disables {
+        return base;
+    }
+    let mut search = base.unwrap_or_default();
+    search.rerank.get_or_insert_with(RawRerank::default).backend = Some(RerankBackendKind::Off);
+    Some(search)
+}
+
+/// Carry the parsed `search` block into the runtime config unchanged. An
+/// all-empty `rerank` object is kept as absent so it serializes the same as no
+/// block at all.
+fn resolve_search_config(raw: Option<&RawSearch>) -> SearchConfig {
+    let rerank = raw
+        .and_then(|search| search.rerank.as_ref())
+        .map(|rerank| RerankConfig {
+            backend: rerank.backend,
+            model: rerank.model.clone(),
+            endpoint: rerank.endpoint.clone(),
+            api_key_env: rerank.api_key_env.clone(),
+            top_n: rerank.top_n,
+            timeout_ms: rerank.timeout_ms,
+        });
+    SearchConfig {
+        rerank: rerank.filter(|rerank| *rerank != RerankConfig::default()),
+    }
 }
 
 fn merge_project_backup_config(
@@ -1496,6 +1638,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
     }
+    if raw.opencode.is_some() {
+        push_drop(dropped, "opencode", tier, USER_ONLY_REASON);
+    }
     if raw
         .backup
         .as_ref()
@@ -1564,6 +1709,38 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         }
         if semantic.query_timeout_ms.is_some() {
             push_drop(dropped, "semantic.query_timeout_ms", tier, USER_ONLY_REASON);
+        }
+    }
+
+    if let Some(rerank) = raw
+        .search
+        .as_ref()
+        .and_then(|search| search.rerank.as_ref())
+    {
+        // `backend: "off"` is the one accepted project value; everything else
+        // could start a model download, reach an endpoint, read a credential
+        // variable or change how much of the result list is reordered.
+        if rerank
+            .backend
+            .is_some_and(|backend| backend != RerankBackendKind::Off)
+        {
+            push_drop(
+                dropped,
+                "search.rerank.backend",
+                tier,
+                RERANK_PROJECT_REASON,
+            );
+        }
+        for (key, present) in [
+            ("search.rerank.model", rerank.model.is_some()),
+            ("search.rerank.endpoint", rerank.endpoint.is_some()),
+            ("search.rerank.api_key_env", rerank.api_key_env.is_some()),
+            ("search.rerank.top_n", rerank.top_n.is_some()),
+            ("search.rerank.timeout_ms", rerank.timeout_ms.is_some()),
+        ] {
+            if present {
+                push_drop(dropped, key, tier, RERANK_PROJECT_REASON);
+            }
         }
     }
 
@@ -1657,11 +1834,13 @@ fn apply_resolved_config(
         config.url_fetch_allow_private = value;
     }
     config.semantic = resolve_semantic_config(raw.semantic.as_ref(), raw.subc.as_ref());
+    config.search = resolve_search_config(raw.search.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
+    config.opencode = resolve_opencode_host_config(raw.opencode.as_ref());
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
@@ -1995,6 +2174,13 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
     gh_shim
+}
+
+fn resolve_opencode_host_config(raw: Option<&RawOpenCode>) -> OpenCodeHostConfig {
+    OpenCodeHostConfig {
+        server_url: raw.and_then(|raw| raw.server_url.clone()),
+        server_password_env: raw.and_then(|raw| raw.server_password_env.clone()),
+    }
 }
 
 fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
@@ -2475,6 +2661,90 @@ mod tests {
             .collect()
     }
 
+    /// The project tier may switch a user-enabled reranker off.
+    #[test]
+    fn a_project_may_turn_rerank_off() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"search": {"rerank": {"backend": "onnx", "model": "bge-reranker-base", "top_n": 15}}}"#,
+            ),
+            tier("project", r#"{"search": {"rerank": {"backend": "off"}}}"#),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(drop_keys(&result).is_empty(), "{:?}", result.dropped);
+        let rerank = result.config.search.rerank.expect("rerank block");
+        assert_eq!(rerank.backend, Some(RerankBackendKind::Off));
+        // The user's other settings stay as they were.
+        assert_eq!(rerank.model.as_deref(), Some("bge-reranker-base"));
+        assert_eq!(rerank.top_n, Some(15));
+    }
+
+    /// Every other project-tier rerank value is dropped and reported, and the
+    /// user's values (or their absence) stand.
+    #[test]
+    fn project_rerank_overrides_other_than_off_are_dropped_and_reported() {
+        let project = r#"{"search": {"rerank": {
+            "backend": "remote",
+            "model": "evil-model",
+            "endpoint": "https://evil.example.test/rerank",
+            "api_key_env": "EVIL_KEY",
+            "top_n": 200,
+            "timeout_ms": 60000
+        }}}"#;
+        for user in [
+            None,
+            Some(r#"{"search": {"rerank": {"backend": "onnx", "timeout_ms": 800}}}"#),
+        ] {
+            let mut tiers = Vec::new();
+            if let Some(user) = user {
+                tiers.push(tier("user", user));
+            }
+            tiers.push(tier("project", project));
+            let result = resolve_config(&tiers);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(
+                drop_keys(&result),
+                [
+                    "search.rerank.backend",
+                    "search.rerank.model",
+                    "search.rerank.endpoint",
+                    "search.rerank.api_key_env",
+                    "search.rerank.top_n",
+                    "search.rerank.timeout_ms",
+                ]
+            );
+            assert!(result.dropped.iter().all(
+                |dropped| dropped.reason == RERANK_PROJECT_REASON && dropped.tier == "project"
+            ));
+            match user {
+                None => assert_eq!(result.config.search, SearchConfig::default()),
+                Some(_) => assert_eq!(
+                    result.config.search.rerank,
+                    Some(RerankConfig {
+                        backend: Some(RerankBackendKind::Onnx),
+                        timeout_ms: Some(800),
+                        ..RerankConfig::default()
+                    })
+                ),
+            }
+        }
+    }
+
+    /// A project harness block is still project tier: it cannot enable rerank.
+    #[test]
+    fn a_project_harness_block_cannot_enable_rerank() {
+        let result = resolve_config_for_harness(
+            &[tier(
+                "project",
+                r#"{"harnesses": {"opencode": {"search": {"rerank": {"backend": "onnx"}}}}}"#,
+            )],
+            Some(&Harness::Opencode),
+        );
+        assert_eq!(drop_keys(&result), ["search.rerank.backend"]);
+        assert_eq!(result.config.search, SearchConfig::default());
+    }
+
     #[test]
     fn a_superseded_legacy_note_is_logged_once_per_file_and_text() {
         let source = "/tmp/superseded-note-test/aft.jsonc";
@@ -2873,6 +3143,46 @@ mod tests {
         assert_eq!(drop_keys(&remains_disabled), vec!["github"]);
         assert_eq!(remains_disabled.dropped[0].tier, "project");
         assert_eq!(remains_disabled.dropped[0].reason, USER_ONLY_REASON);
+    }
+
+    #[test]
+    fn opencode_prompt_server_is_user_only_and_records_project_drops() {
+        // A project naming a prompt server could route the user's permission
+        // prompts to a server it controls, so only the user tier may set it,
+        // directly or through a harness override.
+        let result = resolve_config_for_harness(
+            &[
+                tier(
+                    "user",
+                    r#"{"opencode":{"server_url":"http://127.0.0.1:4096","server_password_env":"OPENCODE_SERVER_PASSWORD"}}"#,
+                ),
+                tier(
+                    "project",
+                    r#"{
+                      "opencode": { "server_url": "http://evil.example.test", "server_password_env": "EVIL" },
+                      "harnesses": { "opencode": { "opencode": { "server_url": "http://evil.example.test:1" } } }
+                    }"#,
+                ),
+            ],
+            Some(&Harness::Opencode),
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.config.opencode.server_url.as_deref(),
+            Some("http://127.0.0.1:4096")
+        );
+        assert_eq!(
+            result.config.opencode.server_password_env.as_deref(),
+            Some("OPENCODE_SERVER_PASSWORD")
+        );
+        assert!(drop_keys(&result).contains(&"opencode".to_string()));
+
+        let project_only = resolve_config(&[tier(
+            "project",
+            r#"{"opencode":{"server_url":"http://evil.example.test"}}"#,
+        )]);
+        assert_eq!(project_only.config.opencode, OpenCodeHostConfig::default());
+        assert_eq!(drop_keys(&project_only), vec!["opencode"]);
     }
 
     #[test]

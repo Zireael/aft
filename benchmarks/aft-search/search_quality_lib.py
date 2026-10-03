@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 EVIDENCE_SHA = "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17"
 PAGE_SIZE = 50
@@ -42,6 +42,7 @@ MECHANISMS = {
     "scope_mismatch": (475, 0.0734, (4885, 2893, 9536)),
     "other": (284, 0.0438, (17004, 10672, 18091)),
     "identifier_not_definition_first": (101, 0.0156, (14708, 17879, 20043)),
+    "split_query_pattern_fusion": (0, 0.0, ()),
 }
 FIXTURE_IDS = tuple(f"followup-census:{number}" for _, _, suffixes in MECHANISMS.values() for number in suffixes)
 EXCLUSION_REASONS = {
@@ -77,6 +78,24 @@ RANKING_FENCE_PREFIXES = (
 # count as parity fixture differences.
 TOOL_CALL_PARITY_FIXTURE_SOURCE = "crates/aft/tests/integration/tool_call_parity_test.rs"
 TOOL_CALL_PARITY_FIXTURE_PREFIX = "crates/aft/tests/fixtures/tool_call_parity/"
+# Manifest field excusing one row's page-invariance failure in the reference
+# only. The paged replay faults on any row whose ranking changes with page
+# size. A row carrying this field (a non-empty reason naming the engine defect)
+# is recorded instead as a miss with PAGE_INVARIANCE_FAILED_FIELD set, so a
+# reference can be taken on an engine that has the defect. It never excuses a
+# changed engine: under a ranking descriptor total_gate faults on any evaluated
+# row that failed page invariance, flagged or not. Under any other descriptor
+# the engine is unchanged, so a flagged row must reproduce the reference's
+# recorded miss exactly. Set it only on rows added to measure that defect,
+# never to quiet a row that used to pass.
+REFERENCE_NOT_PAGE_INVARIANT_FIELD = "reference_not_page_invariant"
+PAGE_INVARIANCE_FAILED_FIELD = "page_invariance_failed"
+
+
+def excused_page_invariance(row: Mapping[str, Any]) -> bool:
+    """True when a manifest row may be recorded despite failing page invariance."""
+    reason = row.get(REFERENCE_NOT_PAGE_INVARIANT_FIELD)
+    return isinstance(reason, str) and bool(reason.strip())
 
 class InputFault(ValueError):
     """An input or harness fault which must take P1/exit 2."""
@@ -450,6 +469,7 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
         if any(
             request.get("includeTests") is not row.get("request", {}).get("includeTests")
             or request.get("query") != row.get("request", {}).get("query")
+            or request.get("pattern") != row.get("request", {}).get("pattern")
             for request in all_requests
         ):
             raise InputFault(f"replay_input_mismatch:{row.get('episode_id')}:request_set")
@@ -528,6 +548,8 @@ def validate_manifest_maintenance_scores(
 
 
 def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
+    if manifest.get("tuning_only"):
+        raise InputFault("tuning_only_manifest_not_gate_eligible")
     rows = manifest.get("rows")
     if not isinstance(rows, list):
         raise InputFault("malformed_schema:manifest_rows")
@@ -551,6 +573,8 @@ def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
 
 
 def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, Any]) -> None:
+    if score.get("tuning_only"):
+        raise InputFault("tuning_only_score_not_gate_eligible")
     expected = included_manifest_ids(manifest)
     score_rows = score.get("rows")
     if not isinstance(score_rows, list):
@@ -571,9 +595,30 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
                 f"replay_input_mismatch:{expected_id}:expected={manifest_row.get('include_tests')}/"
                 f"{manifest_row.get('include_tests_source')}:sent={sent}"
             )
+        if "pattern" in manifest_row:
+            form = row.get("input_form")
+            request = row.get("request", {})
+            if form == "split":
+                valid = score.get("capability", {}).get("pattern_declared") is True and request.get("query") == manifest_row["query"] and request.get("pattern") == manifest_row["pattern"]
+            elif form == "joined":
+                joined = manifest_row["query"] + (" " + manifest_row["pattern"] if manifest_row["pattern"].strip() else "")
+                valid = score.get("capability", {}).get("pattern_declared") is False and request.get("query") == joined and "pattern" not in request
+            else:
+                valid = False
+            if not valid or row.get("answer_kind") != manifest_row.get("answer_kind") or row.get("split_kind") != manifest_row.get("split_kind"):
+                raise InputFault(f"split_input_form_mismatch:{expected_id}")
+            if row.get("metrics") != row_metrics(row.get("ranked_paths", []), manifest_row["opened_file"]):
+                raise InputFault(f"split_metric_mismatch:{expected_id}")
+            paired = row.get("prose_only", {})
+            paired_requests = paired.get("requests", [])
+            expected_requests = [{key: value for key, value in item.items() if key != "pattern"} | {"query": manifest_row["query"]} for item in row.get("requests", [])]
+            if paired_requests != expected_requests or paired.get("metrics") != row_metrics(paired.get("ranked_paths", []), manifest_row["opened_file"]):
+                raise InputFault(f"split_prose_pair_mismatch:{expected_id}")
         stop = row.get("collapse_stop_reason")
         if stop not in STOP_REASONS:
             raise InputFault(f"invalid_stop_fields:{expected_id}:{stop}")
+        if PAGE_INVARIANCE_FAILED_FIELD in row and not excused_page_invariance(manifest_row):
+            raise InputFault(f"page_invariance_failed:{expected_id}:not_excused_by_manifest")
         if not isinstance(row.get("pages_fetched"), int) or row["pages_fetched"] < 1:
             raise InputFault(f"invalid_stop_fields:{expected_id}:pages_fetched")
 
@@ -594,6 +639,8 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
         if derived != "ranking":
             raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
         fixtures = descriptor.get("fixtures")
+        if UNREACHABLE_SPLIT_ROWS_FIELD in descriptor:
+            raise InputFault(f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:ranking_only")
         if (
             descriptor.get("targeted_mechanism") != "none"
             or descriptor.get("kind") != "harness"
@@ -604,6 +651,7 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
         return dict(descriptor), missing_ranking
     if declared != derived:
         raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
+    validate_unreachable_split_rows(descriptor)
     target = descriptor.get("targeted_mechanism")
     if derived == "ranking":
         if target == "none":
@@ -663,7 +711,9 @@ def _real_query_score_document(document: Mapping[str, Any]) -> dict[str, Any]:
     from their derived summaries without weakening row-level comparisons.
     """
     score = dict(document)
-    for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows"):
+    # split_rows_not_applicable is derived from the capability probe and the
+    # rows, which are compared themselves; it is a reader-facing annotation.
+    for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows", "split_rows_not_applicable"):
         score.pop(key, None)
     families = document.get("families", {})
     real_query = families.get("real_query") if isinstance(families, Mapping) else None
@@ -751,6 +801,214 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
     return None
 
 
+SPLIT_ROWS_NOT_APPLICABLE_REASON = (
+    "engine ignores the pattern parameter (pattern_probe ignored_pattern): "
+    "its split rows were replayed joined into one query, which measures the "
+    "single-query surface, not query/pattern fusion"
+)
+
+
+def split_rows_not_applicable(score: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Name the split rows the split predicates cannot judge on this engine.
+
+    The replay sends a split row's query and pattern separately only when the
+    capability probe shows the engine honours `pattern`; otherwise it joins
+    them into one query. A joined row says nothing about split fusion, so
+    holding it to the split predicates would refuse every ranking change on
+    an engine that has no split support yet. Such rows are recorded here as
+    not applicable, with the reason, and skipped. Only an explicit
+    `ignored_pattern` probe result skips them: an engine that honours
+    `pattern`, or a score without a probe result, is judged in full.
+    """
+    capability = score.get("capability", {})
+    if (
+        not isinstance(capability, Mapping)
+        or capability.get("pattern_probe") != "ignored_pattern"
+        or capability.get("pattern_declared") is not False
+    ):
+        return None
+    rows = sorted(
+        (
+            str(row.get("episode_id"))
+            for row in score.get("rows", [])
+            if isinstance(row, Mapping) and row.get("input_form") == "joined"
+        ),
+        key=episode_number,
+    )
+    if not rows:
+        return None
+    return {"reason": SPLIT_ROWS_NOT_APPLICABLE_REASON, "rows": rows}
+
+
+UNREACHABLE_SPLIT_ROWS_FIELD = "unreachable_split_rows"
+# The absolute split predicates a descriptor may waive for a row no pattern
+# design can satisfy, with the split kind each one judges. split_paired_harm
+# and every non-split predicate are never waivable.
+WAIVABLE_SPLIT_PREDICATES = {
+    "split_rank1_required": "R1",
+    "split_hit5_required": "R3",
+    "split_hit3_required": "R4",
+    "split_partial_hit_required": "R6",
+}
+EVIDENCE_TREE = Path(__file__).resolve().parent / ".bench" / "repos" / f"aft-evidence-{EVIDENCE_SHA}"
+
+
+def validate_unreachable_split_rows(descriptor: Mapping[str, Any]) -> None:
+    """Refuse a malformed `unreachable_split_rows` entry before anything runs.
+
+    Each entry is exactly {episode_id, predicate, reason}: a valid episode id,
+    one of the absolute split predicates in WAIVABLE_SPLIT_PREDICATES, and a
+    non-empty reason. Only a ranking descriptor runs the split predicates, so
+    only a ranking descriptor may carry the field.
+    """
+    if UNREACHABLE_SPLIT_ROWS_FIELD not in descriptor:
+        return
+    field = UNREACHABLE_SPLIT_ROWS_FIELD
+    if descriptor.get("slice_class") != "ranking":
+        raise InputFault(f"malformed_descriptor:{field}:ranking_only")
+    entries = descriptor[field]
+    if not isinstance(entries, list) or not entries:
+        raise InputFault(f"malformed_descriptor:{field}:not_a_nonempty_list")
+    seen = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping) or set(entry) != {"episode_id", "predicate", "reason"}:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:keys_must_be_episode_id_predicate_reason")
+        episode_id, predicate, reason = entry["episode_id"], entry["predicate"], entry["reason"]
+        if not isinstance(episode_id, str):
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:episode_id")
+        episode_number(episode_id)
+        if predicate not in WAIVABLE_SPLIT_PREDICATES:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:predicate_not_waivable:{predicate}")
+        if not isinstance(reason, str) or not reason.strip():
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:reason")
+        if (episode_id, predicate) in seen:
+            raise InputFault(f"malformed_descriptor:{field}[{index}]:duplicate:{episode_id}:{predicate}")
+        seen.add((episode_id, predicate))
+
+
+def read_pinned_answer(path: str) -> str | None:
+    """The gold answer file's text at the evidence pin, or None if absent."""
+    target = EVIDENCE_TREE / path
+    try:
+        return target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _rank_within_ten(paths: Sequence[Any], answer: str) -> int | None:
+    collapsed = collapse_paths(paths)
+    return collapsed.index(answer) + 1 if answer in collapsed else None
+
+
+def _pattern_line_in(pattern: str, text: str) -> tuple[int | None, str | None]:
+    """The first 1-based line of `text` the pattern matches, or a reason the
+    check cannot be made. The pattern is grep syntax; one Python cannot
+    compile is not checkable, so it is never waived."""
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        return None, f"pattern_not_checkable:{error}"
+    for number, line in enumerate(text.splitlines(), start=1):
+        if compiled.search(line):
+            return number, None
+    return None, None
+
+
+def apply_unreachable_split_rows(
+    failures: Sequence[str],
+    score: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    descriptor: Mapping[str, Any],
+    read_answer: Callable[[str], str | None] = read_pinned_answer,
+) -> tuple[list[str], list[str]]:
+    """Waive an absolute split failure for a row no pattern design can satisfy.
+
+    A waiver is honoured only when the run's own data show that (a) the
+    row's split rank equals its prose-only rank, so the pattern did not move
+    the answer, and (b) the row's pattern matches no line of the gold answer
+    file at the evidence pin, so no pattern design could lift it. Otherwise
+    the failure stands and a refusal line says which check failed. Returns
+    the remaining failures and one line per waiver to print.
+    """
+    entries = descriptor.get(UNREACHABLE_SPLIT_ROWS_FIELD) or []
+    if not entries:
+        return list(failures), []
+    manifest_rows = {row.get("episode_id"): row for row in manifest.get("rows", [])}
+    score_rows = {row.get("episode_id"): row for row in score.get("rows", [])}
+    remaining = list(failures)
+    notes: list[str] = []
+    for entry in entries:
+        episode_id, predicate, reason = entry["episode_id"], entry["predicate"], entry["reason"]
+        manifest_row = manifest_rows.get(episode_id)
+        row = score_rows.get(episode_id)
+        if manifest_row is None or row is None or "pattern" not in manifest_row:
+            raise InputFault(f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:not_a_split_row:{episode_id}")
+        if manifest_row.get("split_kind") != WAIVABLE_SPLIT_PREDICATES[predicate]:
+            raise InputFault(
+                f"malformed_descriptor:{UNREACHABLE_SPLIT_ROWS_FIELD}:predicate_does_not_judge_row:"
+                f"{episode_id}:{predicate}:split_kind={manifest_row.get('split_kind')}"
+            )
+        failure = f"{predicate}:{episode_id}"
+        if failure not in remaining:
+            notes.append(f"unreachable_split_row_unused:{episode_id}:{predicate}:the row passes")
+            continue
+        answer = manifest_row["opened_file"]
+        split_rank = _rank_within_ten(row.get("ranked_paths", []), answer)
+        prose_rank = _rank_within_ten(row.get("prose_only", {}).get("ranked_paths", []), answer)
+        ranks = f"split_rank={split_rank or '-'}:prose_rank={prose_rank or '-'}"
+        text = read_answer(answer)
+        if text is None:
+            line, problem = None, f"answer_file_unreadable_at_pin:{answer}"
+        else:
+            line, problem = _pattern_line_in(str(manifest_row["pattern"]), text)
+        refusal = None
+        if row.get("input_form") != "split":
+            refusal = "not_replayed_in_split_form"
+        elif split_rank != prose_rank:
+            refusal = f"ranks_differ:{ranks}"
+        elif problem is not None:
+            refusal = problem
+        elif line is not None:
+            refusal = f"pattern_matches_answer_file:{answer}:{line}"
+        if refusal is not None:
+            remaining.append(f"unreachable_split_row_refused:{episode_id}:{predicate}:{refusal}")
+            continue
+        remaining.remove(failure)
+        notes.append(
+            f"unreachable_split_row_waived:{episode_id}:{predicate}:{ranks}:"
+            f"pattern_in_answer_file=none:reason={reason}"
+        )
+    return remaining, notes
+
+
+def split_paired_failures(score: Mapping[str, Any]) -> list[str]:
+    """Do not let aggregate gains hide harm to an individual concept answer."""
+    failures = []
+    not_applicable = split_rows_not_applicable(score)
+    skipped = set(not_applicable["rows"]) if not_applicable else set()
+    for row in score.get("rows", []):
+        if "input_form" not in row:
+            continue
+        if row["input_form"] == "joined" and row["episode_id"] in skipped:
+            continue
+        if row["input_form"] != "split":
+            raise InputFault(f"split_candidate_required:{row['episode_id']}:joined")
+        prose = _metric_block(row.get("prose_only", {}).get("metrics"), f"prose_only:{row['episode_id']}")
+        combined = _metric_block(row.get("metrics"), f"split:{row['episode_id']}")
+        if row.get("answer_kind") == "concept" and combined["mrr_at_10"] < prose["mrr_at_10"]:
+            failures.append(f"split_paired_harm:{row['episode_id']}:mrr_delta={combined['mrr_at_10'] - prose['mrr_at_10']:.6f}")
+        kind = row.get("split_kind")
+        if kind == "R1" and combined["hit_at_1"] != 1.0:
+            failures.append(f"split_rank1_required:{row['episode_id']}")
+        if kind == "R3" and combined["hit_at_5"] != 1.0:
+            failures.append(f"split_hit5_required:{row['episode_id']}")
+        if kind == "R4" and combined["mrr_at_10"] < 1.0 / 3:
+            failures.append(f"split_hit3_required:{row['episode_id']}")
+        if kind == "R6" and (row.get("envelope_complete") is not False or combined["mrr_at_10"] == 0):
+            failures.append(f"split_partial_hit_required:{row['episode_id']}")
+    return failures
+
+
 def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], descriptor: Mapping[str, Any], *, missing_ranking_descriptor: bool = False) -> list[str]:
     failures: list[str] = []
     for family in ("exact_recall", "concept_recall"):
@@ -784,6 +1042,7 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
         if new["hit_at_5"] < old["hit_at_5"]:
             failures.append(f"shape {shape} hit_at_5 below reference")
     if descriptor["slice_class"] == "ranking" and not missing_ranking_descriptor:
+        failures.extend(split_paired_failures(score))
         target = descriptor["targeted_mechanism"]
         if target != "none":
             old = _metric_block(reference.get("mechanisms", {}).get(target), f"reference.mechanism.{target}")
@@ -806,11 +1065,52 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
 class GateResult:
     exit_code: int
     reasons: tuple[str, ...]
+    # Lines the gate prints on success too: waived unreachable split rows.
+    notes: tuple[str, ...] = ()
 
 
-def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> GateResult:
+def validate_candidate_page_invariance(
+    reference: Mapping[str, Any], score: Mapping[str, Any], slice_class: str
+) -> None:
+    """Check evaluated rows that failed page invariance against the slice class.
+
+    A ranking slice changes the engine, so every row must be page-invariant,
+    whatever REFERENCE_NOT_PAGE_INVARIANT_FIELD says: the field excuses only
+    the reference. Any other slice leaves the engine alone, so a row must
+    reproduce the reference exactly: a recorded miss must fail invariance
+    with the same record and zero metrics again, and a row the reference
+    scored normally must not fail.
+    """
+    recorded = {
+        row.get("episode_id"): row
+        for row in reference.get("rows", [])
+        if isinstance(row, Mapping)
+    }
+    for row in score.get("rows", []):
+        if not isinstance(row, Mapping):
+            continue
+        failure = row.get(PAGE_INVARIANCE_FAILED_FIELD)
+        if slice_class == "ranking":
+            if failure:
+                raise InputFault(f"{failure}:candidate")
+            continue
+        reference_row = recorded.get(row.get("episode_id"), {})
+        reference_failure = reference_row.get(PAGE_INVARIANCE_FAILED_FIELD)
+        if not failure and not reference_failure:
+            continue
+        misses = all(
+            float(candidate.get("metrics", {}).get(metric, 1.0)) == 0.0
+            for candidate in (row, reference_row)
+            for metric in METRICS
+        )
+        if failure != reference_failure or not misses:
+            raise InputFault(f"page_invariance_failed:{row.get('episode_id')}:reference_miss_not_reproduced")
+
+
+def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], read_answer: Callable[[str], str | None] = read_pinned_answer) -> GateResult:
     try:
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
+        validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths)
             if difference:
@@ -822,9 +1122,12 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
         validate_scored_population(manifest, score)
         validate_profile_score(score)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
+        notes: list[str] = []
+        if resolved["slice_class"] == "ranking" and not missing:
+            reasons, notes = apply_unreachable_split_rows(reasons, score, manifest, resolved, read_answer)
     except InputFault as error:
         return GateResult(2, (str(error),))
-    return GateResult(1 if reasons else 0, tuple(reasons))
+    return GateResult(1 if reasons else 0, tuple(reasons), tuple(notes))
 
 
 def quantize6(value: float) -> str:

@@ -292,7 +292,10 @@ describe("Hoisted tool execute handlers", () => {
     };
     const artifactPath = resolve(tmpDir, "../bash-task.stdout");
     const { calls, tools } = createMockHoistedHarness(
-      () => ({ success: true, text: "1: full bash output\n" }),
+      (command) =>
+        command === "bash_artifact_owned"
+          ? { success: true, owned: true }
+          : { success: true, text: "1: full bash output\n" },
       { restrict_to_project_root: true } as PluginContext["config"],
     );
 
@@ -300,8 +303,12 @@ describe("Hoisted tool execute handlers", () => {
 
     expect(text(result)).toContain("full bash output");
     expect(askCalls.map((call) => call.permission)).toEqual(["read"]);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
+      command: "bash_artifact_owned",
+      params: { path: artifactPath },
+    });
+    expect(calls[1]).toMatchObject({
       command: "read",
       params: { filePath: artifactPath },
     });
@@ -1640,9 +1647,11 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
     expect(result).toBe("10: ...\n29: ...");
     expect(result).not.toContain("Use startLine/endLine");
     expect(result).not.toContain("(Lines");
+    // offset/limit are forwarded unchanged: the server converts them to
+    // lines 10-29 (for every host alike), so the plugin must not convert them.
     expect(calls[0]).toEqual({
       command: "read",
-      params: { filePath: "small.ts", startLine: 10, endLine: 29 },
+      params: { filePath: "small.ts", offset: 10, limit: 20 },
     });
   });
 
@@ -1778,12 +1787,14 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
 });
 
 /**
- * Registration of `bash` and its companions never depends on the bash runtime
- * configuration: `bash: false`, `bash.enabled: false` or `bash.background:
- * false` change runtime behavior (the engine answers `bash_disabled`), while
- * only `disabled_tools` removes a registration.
+ * Registration of `bash` never depends on the bash runtime configuration:
+ * `bash: false` or `bash.enabled: false` change runtime behavior (the engine
+ * answers `bash_disabled`). The companions are registered exactly when the
+ * resolved `bash.background` is on, because they only act on background
+ * tasks; with background off, no background task can exist and a model would
+ * be offered four tools with nothing to act on.
  */
-describe("Hoisted bash registration is independent of runtime bash config", () => {
+describe("Hoisted bash registration follows only bash.background", () => {
   function toolsWithConfig(cfg: Partial<PluginContext["config"]>): Record<string, unknown> {
     const pool = { getBridge: () => ({ send: async () => ({}) }) } as unknown as BridgePool;
     const ctx: PluginContext = {
@@ -1795,18 +1806,21 @@ describe("Hoisted bash registration is independent of runtime bash config", () =
     return hoistedTools(ctx);
   }
 
-  for (const [label, cfg] of [
-    ["no bash config", {}],
-    ["bash: true", { bash: true }],
-    ["bash: false", { bash: false }],
-    ["bash.enabled: false", { bash: { enabled: false } }],
-    ["bash.background: false", { bash: { background: false } }],
-    ["legacy rewrite only", { experimental: { bash: { rewrite: true } } }],
+  for (const [label, cfg, background] of [
+    ["no bash config", {}, true],
+    ["bash: true", { bash: true }, true],
+    ["bash: false", { bash: false }, false],
+    ["bash.enabled: false", { bash: { enabled: false } }, true],
+    ["bash.background: false", { bash: { background: false } }, false],
+    // The legacy block is opt-in: a flag it does not set resolves to off.
+    ["legacy rewrite only", { experimental: { bash: { rewrite: true } } }, false],
+    ["legacy background", { experimental: { bash: { background: true } } }, true],
   ] as const) {
-    test(`${label} → bash and every companion registered`, () => {
+    test(`${label} → bash registered, companions ${background ? "registered" : "absent"}`, () => {
       const tools = toolsWithConfig(cfg as Partial<PluginContext["config"]>);
-      for (const name of ["bash", "bash_status", "bash_write", "bash_watch", "bash_kill"]) {
-        expect(tools[name], name).toBeDefined();
+      expect(tools.bash).toBeDefined();
+      for (const name of ["bash_status", "bash_write", "bash_watch", "bash_kill"]) {
+        expect(tools[name] !== undefined, name).toBe(background);
       }
       expect(tools.read).toBeDefined();
       expect(tools.edit).toBeDefined();

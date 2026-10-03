@@ -361,14 +361,14 @@ describe("v0.49 production registration profiles", () => {
     });
   }
 
-  test("index switches and runtime gates never change the registered set", () => {
+  test("index switches and runtime gates other than bash.background never change the registered set", () => {
     // Descriptions may reflect runtime settings (for example, disabled
     // backups); the set of registered names must not.
     const base = { disabled_tools: [] };
     const gated = {
       disabled_tools: [],
       indexes: { trigram: false, semantic: false, callgraph: false },
-      bash: { enabled: false, background: false },
+      bash: { enabled: false },
       inspect: { enabled: false },
       backup: { enabled: false },
     };
@@ -376,6 +376,21 @@ describe("v0.49 production registration profiles", () => {
     expect(sorted(Object.keys(openCodeTools(gated)))).toEqual(
       sorted(Object.keys(openCodeTools(base))),
     );
+  });
+
+  test("bash.background off removes exactly the four bash companions on both hosts", () => {
+    // The companions only inspect, wait on, feed and stop background tasks,
+    // so with background off they would be tools with nothing to act on.
+    const base = { disabled_tools: [] };
+    const foreground = { disabled_tools: [], bash: { background: false } };
+    const companions = ["bash_kill", "bash_status", "bash_watch", "bash_write"];
+    for (const [on, off] of [
+      [new Set(capturePiTools(base).keys()), new Set(capturePiTools(foreground).keys())],
+      [new Set(Object.keys(openCodeTools(base))), new Set(Object.keys(openCodeTools(foreground)))],
+    ]) {
+      expect(sorted([...on].filter((name) => !off.has(name)))).toEqual(companions);
+      expect([...off].filter((name) => !on.has(name))).toEqual([]);
+    }
   });
 
   test("legacy hoist_builtin_tools:false leaves host slots native and registers no prefixed names", () => {

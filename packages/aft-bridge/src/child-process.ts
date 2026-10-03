@@ -17,6 +17,7 @@
 
 import type * as childProcess from "node:child_process";
 import {
+  execFile as nodeExecFile,
   execFileSync as nodeExecFileSync,
   execSync as nodeExecSync,
   spawn as nodeSpawn,
@@ -76,6 +77,9 @@ export const spawn: typeof childProcess.spawn = hidden(() => nodeSpawn, true);
 
 /** `child_process.spawnSync` with `windowsHide: true` forced. */
 export const spawnSync: typeof childProcess.spawnSync = hidden(() => nodeSpawnSync, true);
+
+/** `child_process.execFile` with `windowsHide: true` forced. */
+export const execFile: typeof childProcess.execFile = hidden(() => nodeExecFile, true);
 
 /** `child_process.execFileSync` with `windowsHide: true` forced. */
 export const execFileSync: typeof childProcess.execFileSync = hidden(() => nodeExecFileSync, true);

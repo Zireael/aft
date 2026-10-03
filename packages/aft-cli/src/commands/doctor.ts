@@ -57,6 +57,7 @@ import {
   type DiagnosticReport,
   findPluginCliVersionSkews,
   formatDiagnosticIssuesSection,
+  pluginVersionSkewFor,
   renderDiagnosticsMarkdown,
   tailLogFile,
 } from "../lib/diagnostics.js";
@@ -72,11 +73,7 @@ import { formatFsError } from "../lib/fs-errors.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
-import {
-  capBodyToGithubLimit,
-  extractRecentErrors,
-  filterLogToSession,
-} from "../lib/issue-body.js";
+import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import {
   AFT_SCHEMA_URL,
   ensureAftSchemaUrl,
@@ -89,6 +86,7 @@ import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import { readSessionLog } from "../lib/session-log.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
   checkGhStatus,
@@ -101,7 +99,12 @@ import {
   formatHostGenerations,
   type OpenCodeHostDetection,
 } from "../setup/host-generation.js";
-import { OPENCODE_HOST_SHELL_DISABLE_ENTRY } from "../setup/opencode-config.js";
+import {
+  AFT_OPENCODE_PACKAGE,
+  exactPinnedVersion,
+  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+  pinnedPluginEntry,
+} from "../setup/opencode-config.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -143,6 +146,8 @@ export interface DoctorOptions {
   features?: FeatureSetupDeps;
   /** Binary downloader for --fix (tests stub it). */
   downloadBinary?: BinaryDownloader;
+  /** `npm install` runner for the --fix plugin update (tests stub it). */
+  runNpmInstall?: PluginNpmInstaller;
   /** GitHub CLI check for the GitHub read/write report (tests stub it). */
   checkGh?: () => GhStatus;
 }
@@ -273,6 +278,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       options.applyOnnxFix,
       options.runNative,
       options.downloadBinary,
+      options.runNpmInstall,
     );
   }
 
@@ -307,6 +313,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
       : null;
+  const opencodeSkew = opencodeHarness ? pluginVersionSkewFor(report, opencodeHarness) : null;
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
@@ -378,7 +385,14 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       ) {
         log.error(`  expected load path: ${opencodeDoctor.expectedLoadPath}`);
       }
-      for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
+      for (const problem of opencodeDoctor?.problems ?? []) {
+        // An entry that needs pinning beside a plugin older than this CLI is
+        // one problem with one fix; the version-skew line below names both.
+        if (opencodeSkew && problem === opencodeDoctor?.pinProblem) continue;
+        log.error(`  ${problem}`);
+      }
+      // Same text as the "Issues found" entry, so the two never disagree.
+      if (opencodeSkew) log.error(`  ${opencodeSkew.message} ${opencodeSkew.remediation}`);
       const hostShell = hostShellDoctorLine(opencodeAdapter);
       if (hostShell) log[hostShell.level](`  ${hostShell.text}`);
     }
@@ -858,13 +872,21 @@ export interface DoctorFixPlanItem {
  * `plugin_cli_version_skew` diagnostic). This is the case where the plugin's own
  * auto-updater couldn't run `npm install` (commonly because a GUI/Desktop launch
  * had no npm on PATH), so the user is stuck on the old plugin. `doctor --fix`
- * can reinstall the latest plugin via the npm we resolve beyond PATH.
+ * can reinstall the plugin via the npm we resolve beyond PATH.
  */
 interface PluginUpdateTarget {
   adapter: HarnessAdapter;
   installDir: string;
   cached: string;
   latest: string;
+  /**
+   * The older exact version the config entry pins, when it pins one. OpenCode
+   * keeps one cache directory per entry, and that directory's package.json asks
+   * for exactly this version, so `npm install` there can never move past it.
+   * Such a target is not installed by doctor: the registration fix re-pins the
+   * entry to this CLI's version and OpenCode installs that on its next start.
+   */
+  oldPin: string | null;
 }
 
 function findPluginUpdateTargets(
@@ -884,11 +906,13 @@ function findPluginUpdateTargets(
     if (cache.cached === cache.latest) continue;
     const adapter = adaptersByKind.get(harness.kind);
     if (!adapter) continue;
+    const pin = cache.configuredEntry ? exactPinnedVersion(cache.configuredEntry) : null;
     targets.push({
       adapter,
       installDir: cache.path,
       cached: cache.cached,
       latest: cache.latest,
+      oldPin: pin !== null && pin !== cache.latest ? pin : null,
     });
   }
   return targets;
@@ -981,39 +1005,118 @@ async function runDoctorNpmInstall(npm: ResolvedNpm, installDir: string): Promis
   });
 }
 
+/** Runs `npm install` in a plugin cache directory; tests stub it. */
+export type PluginNpmInstaller = (installDir: string) => Promise<void>;
+
+interface PluginUpdateSummary {
+  /** npm ran and the plugin in the cache directory is now this CLI's version. */
+  updated: number;
+  /** The plugin is still not this CLI's version; reported as a warning. */
+  notUpdated: number;
+  errors: number;
+}
+
+/** The plugin version `npm install` left in a cache directory, or null when unreadable. */
+function installedPluginVersion(installDir: string): string | null {
+  const manifest = join(
+    installDir,
+    "node_modules",
+    ...AFT_OPENCODE_PACKAGE.split("/"),
+    "package.json",
+  );
+  try {
+    const pkg = JSON.parse(readFileSync(manifest, "utf-8")) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Report a target whose entry pins an older exact version. npm is not run in
+ * its cache directory, whose package.json asks for that old version, so the
+ * install would change nothing. The update happens when OpenCode starts with
+ * the entry re-pinned to this CLI's version, which the registration fix earlier
+ * in this run should have written; this checks the config really says so.
+ */
+function reportNextStartInstall(
+  target: PluginUpdateTarget,
+  oldPin: string,
+  summary: PluginUpdateSummary,
+): void {
+  const name = target.adapter.displayName;
+  const wanted = pinnedPluginEntry(target.latest);
+  const configured = target.adapter.getPluginCacheInfo().configuredEntry;
+  if (configured === wanted) {
+    log.info(
+      `${name} will install ${wanted} on its next start (restart ${name} to apply). npm was not run in ${target.installDir}: that cache pins ${oldPin}, so npm cannot update it.`,
+    );
+    return;
+  }
+  summary.notUpdated += 1;
+  log.warn(
+    `${name}: plugin not updated; it stays on ${target.cached}. The plugin entry is ${configured ?? "missing"}, not ${wanted}, and npm cannot update ${target.installDir} because that cache pins ${oldPin}. Pin the entry to ${wanted}, then restart ${name}.`,
+  );
+}
+
 async function applyPluginUpdates(
   targets: PluginUpdateTarget[],
-): Promise<{ updated: number; errors: number }> {
-  let updated = 0;
-  let errors = 0;
-  if (targets.length === 0) return { updated, errors };
-
-  const npm = resolveNpm();
-  if (!npm) {
-    errors += targets.length;
-    log.error(
-      "Could not find npm on PATH or in known version-manager locations, so the plugin cannot be updated automatically. Install Node/npm, or launch your editor from a shell where npm is available.",
-    );
-    return { updated, errors };
-  }
-
+  runNpmInstall?: PluginNpmInstaller,
+): Promise<PluginUpdateSummary> {
+  const summary: PluginUpdateSummary = { updated: 0, notUpdated: 0, errors: 0 };
+  const npmTargets: PluginUpdateTarget[] = [];
   for (const target of targets) {
-    try {
-      // `npm install` in the plugin's cache dir reinstalls against the
-      // package.json dependency spec OpenCode wrote (pinned to @latest), pulling
-      // the newest plugin. Mirrors the plugin auto-updater's install flags.
-      await runDoctorNpmInstall(npm, target.installDir);
-      updated += 1;
-      log.success(
-        `${target.adapter.displayName}: plugin updated ${target.cached} → ${target.latest} (restart ${target.adapter.displayName} to apply)`,
-      );
-    } catch (err) {
-      errors += 1;
-      const message = err instanceof Error ? err.message : String(err);
-      log.error(`${target.adapter.displayName}: plugin update failed: ${message}`);
+    if (target.oldPin !== null) {
+      reportNextStartInstall(target, target.oldPin, summary);
+    } else {
+      npmTargets.push(target);
     }
   }
-  return { updated, errors };
+  if (npmTargets.length === 0) return summary;
+
+  let install = runNpmInstall;
+  if (!install) {
+    const npm = resolveNpm();
+    if (!npm) {
+      summary.errors += npmTargets.length;
+      log.error(
+        "Could not find npm on PATH or in known version-manager locations, so the plugin cannot be updated automatically. Install Node/npm, or launch your editor from a shell where npm is available.",
+      );
+      return summary;
+    }
+    install = (installDir) => runDoctorNpmInstall(npm, installDir);
+  }
+
+  for (const target of npmTargets) {
+    const name = target.adapter.displayName;
+    try {
+      // `npm install` in the plugin's cache dir reinstalls against the
+      // package.json dependency spec OpenCode wrote for the configured entry
+      // (a dist-tag such as `latest`, or no version). Mirrors the plugin
+      // auto-updater's install flags.
+      await install(target.installDir);
+    } catch (err) {
+      summary.errors += 1;
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`${name}: plugin update failed: ${message}`);
+      continue;
+    }
+    // A clean npm exit says nothing about which version it resolved, so the
+    // report names the version that is actually installed now.
+    const installed = installedPluginVersion(target.installDir);
+    if (installed === target.latest) {
+      summary.updated += 1;
+      log.success(
+        `${name}: plugin updated ${target.cached} → ${installed} in ${target.installDir} (restart ${name} to apply)`,
+      );
+    } else {
+      summary.notUpdated += 1;
+      log.warn(
+        `${name}: npm install finished in ${target.installDir}, but the installed plugin is ${installed ?? "unreadable"}, not ${target.latest}; the plugin was not updated.`,
+      );
+    }
+  }
+  return summary;
 }
 
 function applySchemaFixes(targets: SchemaFixTarget[]): { changed: number; errors: number } {
@@ -1095,9 +1198,20 @@ export function buildDoctorFixPlan(
   }
 
   for (const target of findPluginUpdateTargets(adapters, report)) {
+    const name = target.adapter.displayName;
+    if (target.oldPin !== null) {
+      // This outcome depends on the registration write that re-pins the entry,
+      // so it is a "plugin" item: withheld along with that write when config
+      // writes are refused.
+      items.push({
+        kind: "plugin",
+        message: `Will not run npm for ${name} plugin ${target.cached}: its cache ${target.installDir} pins ${target.oldPin}. With the entry pinned to ${pinnedPluginEntry(target.latest)}, ${name} will install ${target.latest} on its next start`,
+      });
+      continue;
+    }
     items.push({
       kind: "plugin-update",
-      message: `Will update ${target.adapter.displayName} plugin ${target.cached} → ${target.latest} via npm (the plugin's own auto-update could not run, often no npm on PATH)`,
+      message: `Will update ${name} plugin ${target.cached} → ${target.latest} via npm install in ${target.installDir} (the plugin's own auto-update could not run, often no npm on PATH)`,
     });
   }
 
@@ -1225,6 +1339,7 @@ async function runFixFlow(
   applyOnnxFix: typeof runOnnxFix = runOnnxFix,
   runNativeFn: NativeRunner = runNative,
   downloadBinaryFn?: BinaryDownloader,
+  runNpmInstall?: PluginNpmInstaller,
 ): Promise<number> {
   const adapters = await resolveAdapters(argv, {
     allowMulti: false,
@@ -1292,7 +1407,10 @@ async function runFixFlow(
       pluginEntrySummary.errors += 1;
     }
   }
-  const pluginUpdateSummary = await applyPluginUpdates(findPluginUpdateTargets(adapters, report));
+  const pluginUpdateSummary = await applyPluginUpdates(
+    findPluginUpdateTargets(adapters, report),
+    runNpmInstall,
+  );
   const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
 
   // Ensure aft.jsonc carries the $schema URL (editor autocomplete + validation).
@@ -1385,6 +1503,7 @@ async function runFixFlow(
     pluginEntrySummary.changed === 0 &&
     pluginEntrySummary.errors === 0 &&
     pluginUpdateSummary.updated === 0 &&
+    pluginUpdateSummary.notUpdated === 0 &&
     pluginUpdateSummary.errors === 0;
   if (nothingAttempted && skipped.length === 0) {
     log.info("No auto-fixable issues detected.");
@@ -1583,7 +1702,7 @@ async function confirmBinaryDownloadDespitePluginSkew(
   }
   if (decision === "skip") {
     log.info(
-      `Skipped binary download. Update the plugin to @latest, then rerun \`${CLI} doctor --fix\`.`,
+      `Skipped binary download. Update the plugin to ${report.cliVersion} as described above, then rerun \`${CLI} doctor --fix\`.`,
     );
     return false;
   }
@@ -1868,6 +1987,29 @@ function shortSessionId(id: string): string {
   return bareId.length <= 12 ? bareId : bareId.slice(0, 12);
 }
 
+/** Select matching lines across log history; the most recent lines may belong to other sessions. */
+export function collectIssueLog(
+  path: string,
+  selectedSession: RecentSession | null,
+): {
+  logText: string;
+  errors: string;
+  notice: string;
+} {
+  if (!selectedSession) {
+    return { logText: tailLogFile(path, 200), errors: tailLogFile(path, 4000), notice: "" };
+  }
+  const scoped = readSessionLog(path, selectedSession);
+  return {
+    logText: scoped.lines.join("\n"),
+    errors: scoped.errors.join("\n"),
+    notice: [
+      ...(scoped.boundHit ? ["[scan limit reached; older session lines may be missing]"] : []),
+      ...(scoped.lines.length === 0 ? ["[no lines found for selected session]"] : []),
+    ].join("\n"),
+  };
+}
+
 /**
  * `aft doctor --issue` flow — collect diagnostics, sanitize user paths,
  * prompt for an issue description, optionally file via `gh`.
@@ -1900,37 +2042,19 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const report = await collectDiagnostics(adapters);
 
-  // Build per-harness log sections (last 200 lines each) AND scan a wider
-  // window (last 4000 lines per harness, deduped/sanitized) for error-
-  // shaped lines that survive even when the main log tail needs heavy
-  // truncation to fit GitHub's 64KB body limit.
-  const logSections = adapters
-    .map((adapter) => {
-      const path = adapter.getLogFile();
-      const tail = tailLogFile(path, 200);
-      const scopedTail = selectedBareSessionId
-        ? filterLogToSession(tail, selectedBareSessionId)
-        : tail;
-      return `#### ${adapter.displayName} log (${path})\n\n\`\`\`\n${scopedTail || "<no log output>"}\n\`\`\`\n`;
-    })
-    .join("\n");
-
-  // Wider scan (4000 lines per harness) so a flood of recent debug noise
-  // doesn't push the actual error out of view. Each harness's wide tail
-  // is sanitized independently (sanitizeContent walks the whole string;
-  // running it twice on the same content is a no-op), then we extract
-  // the 20 most-recent ERROR-shaped lines from the merged result.
-  const errorScanWindow = adapters
-    .map((adapter) => {
-      const path = adapter.getLogFile();
-      const tail = tailLogFile(path, 4000);
-      const scopedTail = selectedBareSessionId
-        ? filterLogToSession(tail, selectedBareSessionId)
-        : tail;
-      return sanitizeContent(scopedTail);
-    })
-    .join("\n");
-  const recentErrorLines = extractRecentErrors(errorScanWindow, 20);
+  const logResults = adapters.map((adapter) => {
+    const path = adapter.getLogFile();
+    const { logText, errors, notice } = collectIssueLog(path, selectedSession);
+    return {
+      section: `#### ${adapter.displayName} log (${path})\n\n${notice}\n\`\`\`\n${logText || "<no log output>"}\n\`\`\`\n`,
+      errors,
+    };
+  });
+  const logSections = logResults.map((result) => result.section).join("\n");
+  const recentErrorLines = extractRecentErrors(
+    logResults.map((result) => sanitizeContent(result.errors)).join("\n"),
+    20,
+  );
   const recentErrorsSection =
     recentErrorLines.length === 0
       ? "_No error-shaped log lines found in recent history._"
@@ -1959,7 +2083,9 @@ async function runIssueFlow(argv: string[]): Promise<number> {
     "",
     toolFailuresSection,
     "",
-    "## Logs (last 200 lines per harness)",
+    selectedSession
+      ? `## Logs (last 200 lines for session ${selectedSession.id}; project ${selectedSession.projectRoot ?? "unknown"}, ${selectedSession.startedAt !== undefined ? new Date(selectedSession.startedAt).toISOString() : "unknown start"}–${new Date(selectedSession.lastActivity).toISOString()})`
+      : "## Logs (last 200 lines per harness)",
     logSections,
     "_Usernames and home paths have been stripped from this report._",
   ].join("\n");

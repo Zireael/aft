@@ -14,17 +14,32 @@ export {
   formatForegroundResult,
   formatSeconds,
   isTerminalStatus,
+  monotonicNowMs,
   sleep,
 } from "./bash-format.js";
 export {
+  abortableSleep,
   commandInvokesCodeSearch,
   DEFAULT_PRIMARY_WATCH_TIMEOUT_MS,
+  formatWatchWaited,
+  interruptedWatchTail,
+  LONGEST_TIMER_DELAY_MS,
+  MAX_WATCH_TIMEOUT_MS,
+  maxWatchTimeoutMs,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
+  runningTaskStatusHint,
+  WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
+  WORKER_KEEP_WAITING,
+  watchClock,
+  watchPollDelayMs,
   watchTimeoutSteer,
+  watchUnavailableSteer,
+  workerBackgroundTaskNote,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,
@@ -87,14 +102,25 @@ export type {
   SpawnSyncOptions,
   SpawnSyncReturns,
 } from "./child-process.js";
-export { execFileSync, execSync, spawn, spawnSync, withWindowsHidden } from "./child-process.js";
+export {
+  execFile,
+  execFileSync,
+  execSync,
+  spawn,
+  spawnSync,
+  withWindowsHidden,
+} from "./child-process.js";
 export {
   coerceAliasedStringParam,
   coerceBoolean,
+  coerceJsonCollectionParam,
   coerceOptionalInt,
   coerceStringArray,
   coerceTargetParam,
+  isBlankParam,
   isEmptyParam,
+  isFindReplaceOnlyEdit,
+  usableZoomTargets,
 } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
 // --- config error state (a plugin that loads but fails every tool call) ---
@@ -119,6 +145,24 @@ export {
 // --- config tiers ---
 export type { ConfigTier } from "./config-tiers.js";
 export { formatDroppedKeyWarnings, inlineUserConfigTier, readConfigTiers } from "./config-tiers.js";
+export {
+  aftLiveConfigKeys,
+  aftLiveSecurityKeys,
+  applyLiveConfigKeys,
+  CONFIG_LIVE_KEEP_NOTE,
+  CONFIG_WATCH_DEBOUNCE_MS,
+  type LiveConfigApply,
+  type LiveConfigKey,
+  type LiveConfigLoad,
+  type LiveConfigReload,
+  type LiveConfigReloadOptions,
+  type LiveSecurityKey,
+  liveConfigReloadLogLine,
+  type ResolvedBashForLiveReload,
+  startLiveConfigReload,
+  type WatchAftConfigFilesOptions,
+  watchAftConfigFiles,
+} from "./config-watch.js";
 export {
   downloadBinary,
   ensureBinary,
@@ -145,6 +189,7 @@ export {
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
+  SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
   toolErrorFromResponse,
 } from "./error-contract.js";
 // --- feature-based configuration policy (shared with crates/aft feature_config.rs) ---
@@ -171,7 +216,10 @@ export type { Logger, LogMeta } from "./logger.js";
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
   containsStandaloneDetachKeyword,
+  detachStripEdits,
   shouldInterruptWaitsForMessage,
+  standaloneDetachKeywordRanges,
+  stripDetachKeywordsAndTidyGap,
   stripStandaloneDetachKeywords,
 } from "./message-detach.js";
 export type {
@@ -222,6 +270,7 @@ export {
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
 } from "./path-aliases.js";
+export { relativePathEscapesRoot, shortenHomePath } from "./path-display.js";
 export { withPathPrepended } from "./path-env.js";
 export {
   findExecutableOnPath,
@@ -282,6 +331,8 @@ export {
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,
+  type SubcLocalRouteCloseReason,
+  SubcRouteClosedMidCallError,
   SubcTransportPool,
   type SubcTransportPoolOptions,
   SubcTransportShuttingDownError,
@@ -299,6 +350,7 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+export { WORKER_SESSION_FIELD } from "./transport.js";
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,

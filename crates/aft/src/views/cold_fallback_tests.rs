@@ -61,6 +61,7 @@ fn request(project: &Path, storage: &Path, head: &str, changed: &[String]) -> As
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put: true,
+        callgraph: true,
     }
 }
 

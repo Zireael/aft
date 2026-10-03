@@ -112,6 +112,9 @@
       "trajectory": "T4",
       "execution": "shared-server",
       "prompt": "Start and abort the deferred inspect call.",
+      "env": {
+        "AFT_TEST_INSPECT_DELAY_MS": "30000"
+      },
       "fixture": "./fixture",
       "turns": [
         {

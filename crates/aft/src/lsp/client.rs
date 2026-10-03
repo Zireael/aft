@@ -1,14 +1,12 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
@@ -25,14 +23,331 @@ use crate::lsp::{transport, LspError};
 /// Default timeout for interactive LSP requests (hover, goto-def, references, rename).
 const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Longer budget for one-shot handshake requests (initialize, shutdown).
-const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STDERR_TAIL_LINES: usize = 64;
 const STDERR_LINE_BYTES: usize = 4 * 1024;
+/// How long an exit report waits for the stderr reader to hit end-of-file,
+/// so the last lines a dying server printed are in the report.
+const STDERR_EOF_WAIT: Duration = Duration::from_millis(250);
+/// Longest stderr excerpt, in bytes, carried by a single server-exit log line.
+const EXIT_LOG_STDERR_BYTES: usize = 2 * 1024;
+/// Longest first-stderr-line excerpt quoted in a short failure cause.
+const CAUSE_STDERR_LINE_BYTES: usize = 200;
+/// Longest command line quoted in exit reports.
+const COMMAND_DISPLAY_BYTES: usize = 512;
+
+/// rust-analyzer starts a `cargo check` of the whole workspace each time it
+/// becomes quiescent after loading the workspace; 1.98 announces it about
+/// 200 ms later, but a server short of CPU has taken over a second. Until it
+/// begins, the published diagnostics lack every compiler error, so callers
+/// that need them wait for it. When none has begun this long after
+/// quiescence, the results stay unknown (never clean) until a check runs.
+const WORKSPACE_CHECK_START_DEADLINE: Duration = Duration::from_secs(10);
+
+/// rust-analyzer can report the end of a check run just before it publishes
+/// the run's last diagnostics; callers keep reading events this long after
+/// the end.
+pub(crate) const FLYCHECK_PUBLISH_SETTLE: Duration = Duration::from_millis(300);
+
+/// How long after a `textDocument/didSave` a rust-analyzer check run is
+/// expected to begin. rust-analyzer 1.98 announces the run about 150 ms after
+/// the save; the margin covers a busy server. When no run has begun this long
+/// after the last of [`MAX_SAVE_SENDS`] sends, callers stop waiting and report
+/// the compiler results as unknown: they still describe the files before the
+/// save.
+const SAVE_CHECK_START_GRACE: Duration = Duration::from_secs(3);
+
+/// A save that started no check run within this long is sent again: a
+/// watched-file change reaching rust-analyzer just before or after the save
+/// makes it drop the check.
+const SAVE_RESEND_AFTER: Duration = Duration::from_millis(1500);
+
+/// How many times one save is sent before AFT stops waiting for its check.
+const MAX_SAVE_SENDS: u8 = 3;
+
+/// How long after the file watcher reports a Rust source change the save
+/// for it is sent (see [`LspClient::owe_rust_save`]).
+const EXTERNAL_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// A save AFT asked rust-analyzer to check.
+#[derive(Debug, Clone)]
+struct RustSaveRequest {
+    /// The saved document.
+    uri: lsp_types::Uri,
+    /// Set while the save has not been sent: send it once this passes.
+    due_at: Option<Instant>,
+    /// When the save was last sent.
+    last_sent_at: Option<Instant>,
+    /// How many times it has been sent.
+    sends: u8,
+    /// The reader's check-begin count when the save was first sent (see
+    /// `LspClient::rust_check_begins_read`); `None` until then. Only a begin
+    /// read after that send is a run of the saved contents.
+    begins_read_at_send: Option<u64>,
+}
+
+/// How a server asked to be told about saved documents
+/// (`textDocumentSync.save` in its initialize response).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveNotification {
+    /// Send `textDocument/didSave` without the document text.
+    WithoutText,
+    /// Send `textDocument/didSave` carrying the saved text.
+    IncludeText,
+}
+
+/// Read `textDocumentSync.save` from an initialize response's capabilities.
+/// A bare sync kind (a number) or a missing or `false` `save` means the
+/// server does not want save notifications.
+fn parse_save_notification(capabilities: &Value) -> Option<SaveNotification> {
+    match capabilities.pointer("/textDocumentSync/save")? {
+        Value::Bool(true) => Some(SaveNotification::WithoutText),
+        Value::Object(options) => Some(
+            if options.get("includeText").and_then(Value::as_bool) == Some(true) {
+                SaveNotification::IncludeText
+            } else {
+                SaveNotification::WithoutText
+            },
+        ),
+        _ => None,
+    }
+}
+
+/// Whether a rust-analyzer `$/progress` notification is about a check run:
+/// rust-analyzer names their token `rust-analyzer/flycheck/N` and titles them
+/// with the check command (`cargo check`, `cargo clippy`).
+fn is_rust_check_progress(token: &str, title: Option<&str>) -> bool {
+    token.contains("flycheck")
+        || title.is_some_and(|title| {
+            title.starts_with("cargo check")
+                || title.starts_with("cargo clippy")
+                || title.contains("flycheck")
+        })
+}
+
+/// Whether `$/progress` parameters announce the beginning of a check run.
+fn is_rust_check_begin(params: Option<&Value>) -> bool {
+    let Some(params) = params else {
+        return false;
+    };
+    let token = match params.get("token") {
+        Some(Value::String(token)) => token.clone(),
+        Some(Value::Number(token)) => token.to_string(),
+        _ => return false,
+    };
+    params.pointer("/value/kind").and_then(Value::as_str) == Some("begin")
+        && is_rust_check_progress(
+            &token,
+            params.pointer("/value/title").and_then(Value::as_str),
+        )
+}
+
+/// Which `cargo check` runs rust-analyzer will make, read from the
+/// initialization options AFT starts it with. Returns `(on_save, on_load)`:
+/// whether a save starts a check (`checkOnSave`, on unless set to `false`),
+/// and whether a check of the whole workspace also runs each time the
+/// workspace finishes loading (additionally needs `check.workspace`, on
+/// unless `false`). Measured with rust-analyzer 1.98: with `checkOnSave`
+/// off neither runs, and with `check.workspace` off only the on-save check
+/// does. Both also need the server to accept save notifications.
+fn rust_check_triggers(initialization_options: Option<&Value>) -> (bool, bool) {
+    let disabled = |value: Option<&Value>| match value {
+        Some(Value::Bool(enabled)) => !enabled,
+        // Older rust-analyzer configurations spell it as an object:
+        // `checkOnSave: { enable: false }`.
+        Some(Value::Object(options)) => options.get("enable") == Some(&Value::Bool(false)),
+        _ => false,
+    };
+    let on_save = !disabled(initialization_options.and_then(|options| options.get("checkOnSave")));
+    let on_load = on_save
+        && !disabled(
+            initialization_options.and_then(|options| options.pointer("/check/workspace")),
+        );
+    (on_save, on_load)
+}
+
+/// Whether rust-analyzer's published diagnostics carry the compiler's
+/// results for the files as they are now. See
+/// [`LspClient::rust_check_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustCheckState {
+    /// No check is running or expected: the published compiler results are
+    /// current.
+    Current,
+    /// A check is running, has just ended, or is expected to begin soon:
+    /// wait for it.
+    Running,
+    /// A check was expected and has not begun within its deadline. The
+    /// published compiler results may describe older files, so they are
+    /// unknown; waiting longer is unlikely to help.
+    Unreported,
+}
+
+/// rust-analyzer's own notification (not part of the LSP specification)
+/// that starts a `cargo check`; with no document it checks the workspace.
+pub(crate) enum RustAnalyzerRunFlycheck {}
+
+impl lsp_types::notification::Notification for RustAnalyzerRunFlycheck {
+    type Params = Value;
+    const METHOD: &'static str = "rust-analyzer/runFlycheck";
+}
+
+/// Spawn on a process-lifetime thread on Linux: PR_SET_PDEATHSIG observes the
+/// creating thread's death, even when the rest of the parent process is alive.
+/// Keep initialization outside this queue so slow handshakes do not serialize
+/// other servers' starts. Registry locking still covers spawn and registration.
+fn spawn_lsp_child(
+    mut command: Command,
+    registry: &LspChildRegistry,
+    reclaim_root: Option<&Path>,
+    root: &Path,
+    kind: &ServerKind,
+) -> io::Result<Child> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        registry.spawn_tracked_child(&mut command, reclaim_root, Some(root), Some(kind))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        type SpawnJob = Box<dyn FnOnce() + Send>;
+        static SPAWNER: std::sync::OnceLock<io::Result<std::sync::mpsc::Sender<SpawnJob>>> =
+            std::sync::OnceLock::new();
+        let spawner = SPAWNER
+            .get_or_init(|| {
+                let (tx, rx) = std::sync::mpsc::channel::<SpawnJob>();
+                thread::Builder::new()
+                    .name("aft-lsp-spawn".into())
+                    .spawn(move || {
+                        for spawn in rx {
+                            spawn();
+                        }
+                    })?;
+                // This static sender is never dropped, retaining the spawning
+                // thread until process exit, independently of any LSP manager.
+                Ok(tx)
+            })
+            .as_ref()
+            .map_err(|err| io::Error::other(format!("cannot start LSP spawn thread: {err}")))?;
+        let registry = registry.clone();
+        let reclaim_root = reclaim_root.map(Path::to_path_buf);
+        let root = root.to_path_buf();
+        let kind = kind.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        spawner
+            .send(Box::new(move || {
+                let result = registry.spawn_tracked_child(
+                    &mut command,
+                    reclaim_root.as_deref(),
+                    Some(&root),
+                    Some(&kind),
+                );
+                let _ = tx.send(result);
+            }))
+            .map_err(|_| io::Error::other("LSP spawn thread stopped"))?;
+        rx.recv()
+            .map_err(|_| io::Error::other("LSP spawn thread dropped its result"))?
+    }
+}
 
 type PendingMap = HashMap<RequestId, Sender<JsonRpcResponse>>;
-type WatchedFileRegistrations = Arc<Mutex<HashSet<String>>>;
+/// Dynamic `workspace/didChangeWatchedFiles` registrations by registration
+/// id. A registration whose watchers could not be parsed still counts as a
+/// registration: the server asked for watched-file notifications, it just did
+/// not say for which files in a form this client understands.
+type WatchedFileRegistrations = Arc<Mutex<HashMap<String, Vec<RegisteredFileWatcher>>>>;
+
+/// LSP `WatchKind` bits. A watcher that omits `kind` wants all three.
+const WATCH_KIND_CREATE: u32 = 1;
+const WATCH_KIND_CHANGE: u32 = 2;
+const WATCH_KIND_DELETE: u32 = 4;
+const WATCH_KIND_ALL: u32 = WATCH_KIND_CREATE | WATCH_KIND_CHANGE | WATCH_KIND_DELETE;
+
+/// One file-system watcher a server registered through
+/// `client/registerCapability`: the glob it wants changes for, the optional
+/// base directory the glob is relative to, and which change kinds it wants.
+#[derive(Debug, Clone)]
+pub(crate) struct RegisteredFileWatcher {
+    base: Option<PathBuf>,
+    matcher: globset::GlobMatcher,
+    kind: u32,
+}
+
+impl RegisteredFileWatcher {
+    /// Parse one entry of `registerOptions.watchers`. Returns `None` for a
+    /// shape this client does not understand, such as an invalid glob.
+    fn parse(watcher: &Value) -> Option<Self> {
+        let kind = watcher
+            .get("kind")
+            .and_then(Value::as_u64)
+            .and_then(|kind| u32::try_from(kind).ok())
+            .unwrap_or(WATCH_KIND_ALL);
+        let glob_pattern = watcher.get("globPattern")?;
+        let (base, pattern) = match glob_pattern {
+            Value::String(pattern) => (None, pattern.as_str()),
+            Value::Object(relative) => {
+                // RelativePattern: `baseUri` is either a URI string or a
+                // WorkspaceFolder object carrying one.
+                let base_uri = relative.get("baseUri")?;
+                let base_uri = base_uri
+                    .as_str()
+                    .or_else(|| base_uri.get("uri").and_then(Value::as_str))?;
+                let base = url::Url::parse(base_uri).ok()?.to_file_path().ok()?;
+                (Some(base), relative.get("pattern")?.as_str()?)
+            }
+            _ => return None,
+        };
+        // Globs are matched with `/` separators. Servers on Windows build
+        // absolute globs from native paths, whose backslashes would otherwise
+        // be read as escapes or literals that never match.
+        #[cfg(windows)]
+        let pattern = pattern.replace('\\', "/");
+        let matcher = globset::GlobBuilder::new(pattern.as_ref())
+            .literal_separator(true)
+            .build()
+            .ok()?
+            .compile_matcher();
+        Some(Self {
+            base,
+            matcher,
+            kind,
+        })
+    }
+
+    fn matches(&self, path: &Path, typ: lsp_types::FileChangeType) -> bool {
+        let wanted = match typ {
+            lsp_types::FileChangeType::CREATED => WATCH_KIND_CREATE,
+            lsp_types::FileChangeType::DELETED => WATCH_KIND_DELETE,
+            _ => WATCH_KIND_CHANGE,
+        };
+        if self.kind & wanted == 0 {
+            return false;
+        }
+        match &self.base {
+            Some(base) => path
+                .strip_prefix(base)
+                .is_ok_and(|relative| self.matcher.is_match(relative)),
+            None => self.matcher.is_match(path),
+        }
+    }
+}
+
+/// A snapshot of every watcher a server has registered, for filtering a batch
+/// of file-system events without holding the registration lock per event.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegisteredFileWatchers {
+    watchers: Vec<RegisteredFileWatcher>,
+}
+
+impl RegisteredFileWatchers {
+    /// Whether any registered watcher wants this change to `path`.
+    pub(crate) fn matches(&self, path: &Path, typ: lsp_types::FileChangeType) -> bool {
+        self.watchers
+            .iter()
+            .any(|watcher| watcher.matches(path, typ))
+    }
+}
 
 /// Lifecycle state of a language server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +360,7 @@ pub enum ServerState {
 }
 
 /// Events sent from background reader threads into the main loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LspEvent {
     /// Server sent a notification (e.g. publishDiagnostics).
     Notification {
@@ -66,6 +381,9 @@ pub enum LspEvent {
     ServerExited {
         server_kind: ServerKind,
         root: PathBuf,
+        /// PID of the process whose output stream ended. The manager uses it
+        /// to tell a dead server apart from a newer one for the same root.
+        pid: u32,
         reason: ServerExitReason,
     },
 }
@@ -120,6 +438,186 @@ pub(crate) enum ReaderExitReap {
     KilledWhileAlive,
 }
 
+/// The part of a language server's life it was in when it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPhase {
+    /// The process never started, or stopped before `initialize` was sent.
+    Spawn,
+    /// The `initialize` handshake was in flight.
+    Initialize,
+    /// The server had completed `initialize` and was serving requests.
+    Running,
+}
+
+impl std::fmt::Display for ServerPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Spawn => "spawn",
+            Self::Initialize => "initialize",
+            Self::Running => "running",
+        })
+    }
+}
+
+/// Everything AFT knows about why one language-server process stopped: which
+/// process it was, how far it got, how it ended, and what it last printed.
+#[derive(Debug, Clone)]
+pub struct ServerExitReport {
+    pub kind: ServerKind,
+    pub root: PathBuf,
+    pub pid: u32,
+    pub phase: ServerPhase,
+    /// How the process ended; `None` when that could not be observed.
+    pub status: Option<std::process::ExitStatus>,
+    /// True when AFT killed a server that was still running (its output
+    /// closed, or its handshake failed), so `status` reflects AFT's kill, not
+    /// the server's own exit.
+    pub killed_by_aft: bool,
+    /// Time from spawn until the exit was observed.
+    pub elapsed: Duration,
+    /// Resolved executable path plus arguments.
+    pub command: String,
+    /// Last lines the server wrote to stderr, newline-separated.
+    pub stderr_tail: String,
+}
+
+impl ServerExitReport {
+    /// Human-readable exit status: `exit 3`, `signal 15 (SIGTERM)`, or
+    /// `status unavailable` when the process state could not be read.
+    pub fn status_text(&self) -> String {
+        let status = describe_exit_status(self.status);
+        if self.killed_by_aft {
+            format!("killed by aft ({status})")
+        } else {
+            status
+        }
+    }
+
+    /// The first non-empty stderr line, trimmed to a short excerpt.
+    pub fn first_stderr_line(&self) -> Option<String> {
+        self.stderr_tail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| truncate_to_bytes(line, CAUSE_STDERR_LINE_BYTES))
+    }
+
+    /// Compact cause for error messages, e.g.
+    /// `exit 101 after 0.4 s: error: could not load workspace`.
+    pub fn short_cause(&self) -> String {
+        let mut cause = format!(
+            "{} after {:.1} s",
+            self.status_text(),
+            self.elapsed.as_secs_f64()
+        );
+        if let Some(line) = self.first_stderr_line() {
+            cause.push_str(": ");
+            cause.push_str(&line);
+        }
+        cause
+    }
+
+    /// The single log line recording this exit. `reason` says how AFT noticed
+    /// (for example `eof` when the server's stdout closed).
+    pub fn log_line(&self, reason: &str) -> String {
+        format!(
+            "exited {:?} {} ({reason}): pid={} phase={} status={} elapsed={:.1}s command={:?} stderr_tail={}",
+            self.kind,
+            self.root.display(),
+            self.pid,
+            self.phase,
+            self.status_text(),
+            self.elapsed.as_secs_f64(),
+            self.command,
+            stderr_tail_for_log(&self.stderr_tail),
+        )
+    }
+}
+
+/// Describe how a process ended, naming the signal when it was killed by one.
+pub fn describe_exit_status(status: Option<std::process::ExitStatus>) -> String {
+    let Some(status) = status else {
+        return "status unavailable".to_string();
+    };
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let mut text = match signal_name(signal) {
+                Some(name) => format!("signal {signal} ({name})"),
+                None => format!("signal {signal}"),
+            };
+            if status.core_dumped() {
+                text.push_str(", core dumped");
+            }
+            return text;
+        }
+    }
+    format!("status {status}")
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<&'static str> {
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGXCPU => "SIGXCPU",
+        libc::SIGXFSZ => "SIGXFSZ",
+        _ => return None,
+    };
+    Some(name)
+}
+
+/// Keep at most `max_bytes` of `text` from its start, on a char boundary.
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// Render a stderr tail as one quoted log field: lines joined by ` | `, and
+/// only the last `EXIT_LOG_STDERR_BYTES` kept.
+fn stderr_tail_for_log(stderr_tail: &str) -> String {
+    let joined = stderr_tail
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        return "<empty>".to_string();
+    }
+    if joined.len() <= EXIT_LOG_STDERR_BYTES {
+        return format!("{joined:?}");
+    }
+    let mut start = joined.len() - EXIT_LOG_STDERR_BYTES;
+    while start < joined.len() && !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{:?}", format!("...{}", &joined[start..]))
+}
+
 /// What this server told us it can do during the LSP `initialize` handshake.
 ///
 /// We capture this once and use it to route diagnostic requests:
@@ -142,8 +640,21 @@ pub struct ServerDiagnosticCapabilities {
     pub refresh_support: bool,
 }
 
+/// rust-analyzer analysis state saved when AFT requests a workspace reload,
+/// so it can be put back if the server rejects the request.
+#[derive(Debug)]
+pub(crate) struct RustWorkspaceState {
+    quiescent: bool,
+    workspace_check_owed_since: Option<Instant>,
+    failure: Option<String>,
+    warning: Option<String>,
+    loaded_at: SystemTime,
+    check_begins_at_load: u64,
+}
+
 /// A client connected to one language server process.
 pub struct LspClient {
+    pub(crate) runtime_note: Option<String>,
     kind: ServerKind,
     root: PathBuf,
     state: ServerState,
@@ -166,6 +677,67 @@ pub struct LspClient {
     /// kinds do not use the experimental server-status signal and start
     /// authoritative by default.
     rust_analyzer_quiescent: bool,
+    /// Workspace-load or check failure reported by rust-analyzer itself.
+    rust_analyzer_failure: Option<String>,
+    /// Non-fatal analyzer health warning; published diagnostics remain usable.
+    pub(crate) rust_analyzer_warning: Option<String>,
+    /// Since when AFT has been expecting rust-analyzer to begin a `cargo
+    /// check` of the whole workspace: the one it starts on becoming
+    /// quiescent after loading the workspace, or one AFT asked for again with
+    /// `rust-analyzer/runFlycheck` (see
+    /// [`LspClient::rearm_unreported_rust_check`]). Cleared when any check
+    /// begins. While set, the published diagnostics lack the compiler's
+    /// errors.
+    rust_workspace_check_owed_since: Option<Instant>,
+    /// `$/progress` tokens of rust-analyzer check runs (`cargo check`,
+    /// "flycheck") that have begun and not yet ended. Compiler errors reach
+    /// the diagnostics store only when such a run finishes, so while one is
+    /// running the published Rust diagnostics are missing those errors.
+    rust_flycheck_running: HashMap<String, u64>,
+    /// Begin ordinal of the latest completed check. A matching begin/end is
+    /// evidence even when a clean compiler run publishes no diagnostic rows.
+    rust_completed_check_begin: Option<u64>,
+    /// A check begun before reloading the Cargo workspace cannot certify the
+    /// reloaded manifests, even if its queued notification is processed later.
+    rust_check_begins_at_load: u64,
+    /// When the most recent rust-analyzer check run ended.
+    rust_flycheck_finished_at: Option<Instant>,
+    /// When the most recent rust-analyzer check run began.
+    rust_flycheck_started_at: Option<Instant>,
+    /// The latest save AFT asked rust-analyzer to check, until a check run
+    /// begins for it. rust-analyzer re-runs `cargo check` only on a save, so
+    /// while this is set the published compiler errors describe the files as
+    /// they were before the save.
+    rust_save: Option<RustSaveRequest>,
+    /// How many check-run begin notifications the reader thread has read from
+    /// the server so far, counted as they arrive rather than when events are
+    /// drained. Events wait in the channel until a caller drains them, so a
+    /// begin drained after a save was sent may have been sent by the server
+    /// before the save, for a run of the files before the edit; comparing
+    /// this count, taken when the save is sent, with
+    /// `rust_check_begins_drained` tells the two apart.
+    rust_check_begins_read: Arc<AtomicU64>,
+    /// How many check-run begin notifications have been drained (see
+    /// [`LspClient::record_rust_progress`]).
+    rust_check_begins_drained: u64,
+    /// How the server asked to hear about saves (`textDocumentSync.save` in
+    /// its initialize response). `None` until `initialize` succeeds, and when
+    /// the server did not ask.
+    save_notification: Option<SaveNotification>,
+    /// Whether rust-analyzer runs `cargo check` when told of a save, and
+    /// whether it checks the whole workspace each time it finishes loading
+    /// it (see [`rust_check_triggers`]). Both false until `initialize`
+    /// succeeds, and for other servers.
+    rust_checks_on_save: bool,
+    rust_checks_on_load: bool,
+    /// Wall-clock time at which this server last started reading the
+    /// workspace's Cargo manifests: the spawn, or the latest workspace reload
+    /// AFT requested. A manifest or lockfile modified after this moment is
+    /// newer than what rust-analyzer loaded, so its workspace view (including
+    /// a load that failed because `Cargo.lock` was stale) is out of date.
+    /// Wall-clock rather than `Instant` because it is compared with file
+    /// modification times.
+    workspace_loaded_at: SystemTime,
     /// Whether the server advertised static `workspace.didChangeWatchedFiles`
     /// support during `initialize`. Dynamic registration is tracked separately
     /// in `watched_file_registrations`; either path permits notifications.
@@ -181,6 +753,13 @@ pub struct LspClient {
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
     child_registry: LspChildRegistry,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the stderr reader when the pipe reaches end-of-file, meaning
+    /// every line the server (and its descendants) wrote is in the tail.
+    stderr_closed: Arc<AtomicBool>,
+    /// When the process was spawned, for the elapsed time in exit reports.
+    spawned_at: Instant,
+    /// Resolved executable path and arguments, for exit reports.
+    command_display: String,
     /// When true, `Drop` untracks but does not kill. Tests use this so a
     /// `ServerExited` handler's kill is the only thing that can reap the child.
     #[cfg(test)]
@@ -270,11 +849,11 @@ impl LspClient {
             command.pre_exec(|| {
                 #[cfg(target_os = "linux")]
                 {
-                    // If aft is killed with SIGKILL, Rust cleanup and our
-                    // signal-handler thread never run. Ask the kernel to kill
-                    // the LSP process group as soon as the parent dies. This is
-                    // best-effort Linux coverage for the otherwise unhandleable
-                    // parent-death path.
+                    // SIGKILL bypasses Rust cleanup. Linux ties this signal to
+                    // the spawning thread, so spawn_lsp_child uses a process-
+                    // lifetime thread rather than the short-lived caller. The
+                    // kernel kills the direct child when that thread dies;
+                    // normal shutdown separately kills the whole process group.
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                         return Err(io::Error::last_os_error());
                     }
@@ -289,37 +868,55 @@ impl LspClient {
             });
         }
 
-        let mut child = child_registry.spawn_tracked_child(
-            &mut command,
-            reclaim_root,
-            Some(&root),
-            Some(&kind),
-        )?;
+        let spawned_at = Instant::now();
+        let workspace_loaded_at = SystemTime::now();
+        let command_display = truncate_to_bytes(
+            &std::iter::once(binary.display().to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            COMMAND_DISPLAY_BYTES,
+        );
+        let mut child = spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind)
+            .map_err(|err| {
+                // A spawn error from the OS names neither the program nor the
+                // directory; both are what a reader needs to fix it.
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to start `{command_display}` in {}: {err}",
+                        root.display()
+                    ),
+                )
+            })?;
         let child_pid = child.id();
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stdout pipe"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stdin pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| io::Error::other("language server missing stderr pipe"))?;
+        let (stdout, stdin, stderr) =
+            match (child.stdout.take(), child.stdin.take(), child.stderr.take()) {
+                (Some(stdout), Some(stdin), Some(stderr)) => (stdout, stdin, stderr),
+                _ => {
+                    // No client will own this child, so stop it here rather
+                    // than leave an untracked process behind.
+                    kill_lsp_child_group(&mut child);
+                    let _ = child.wait();
+                    child_registry.untrack(child_pid);
+                    return Err(io::Error::other("language server is missing a stdio pipe"));
+                }
+            };
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail));
+        let stderr_closed = Arc::new(AtomicBool::new(false));
+        spawn_stderr_drain_thread(stderr, Arc::clone(&stderr_tail), Arc::clone(&stderr_closed));
 
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         let pending = Arc::new(Mutex::new(PendingMap::new()));
-        let watched_file_registrations = Arc::new(Mutex::new(HashSet::new()));
+        let watched_file_registrations = Arc::new(Mutex::new(HashMap::new()));
         let reader_pending = Arc::clone(&pending);
         let reader_writer = Arc::clone(&writer);
         let reader_watched_file_registrations = Arc::clone(&watched_file_registrations);
         let reader_kind = kind.clone();
         let reader_root = root.clone();
+        let rust_check_begins_read = Arc::new(AtomicU64::new(0));
+        let reader_check_begins = Arc::clone(&rust_check_begins_read);
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -336,12 +933,16 @@ impl LspClient {
                             let _ = event_tx.send(LspEvent::ServerExited {
                                 server_kind: reader_kind.clone(),
                                 root: reader_root.clone(),
+                                pid: child_pid,
                                 reason: ServerExitReason::PendingLockPoisoned,
                             });
                             break;
                         }
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
+                        if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
+                            reader_check_begins.fetch_add(1, Ordering::SeqCst);
+                        }
                         let _ = event_tx.send(LspEvent::Notification {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
@@ -396,6 +997,7 @@ impl LspClient {
                         let _ = event_tx.send(LspEvent::ServerExited {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
+                            pid: child_pid,
                             reason: ServerExitReason::from_read_result(terminal),
                         });
                         break;
@@ -407,6 +1009,7 @@ impl LspClient {
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         child_registry.mark_client_live(child_pid);
         Ok(Self {
+            runtime_note: None,
             kind,
             root,
             state: ServerState::Starting,
@@ -417,10 +1020,28 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             diagnostic_caps: None,
             rust_analyzer_quiescent,
+            rust_analyzer_failure: None,
+            rust_analyzer_warning: None,
+            rust_workspace_check_owed_since: None,
+            rust_flycheck_running: HashMap::new(),
+            rust_completed_check_begin: None,
+            rust_check_begins_at_load: 0,
+            rust_flycheck_finished_at: None,
+            rust_flycheck_started_at: None,
+            rust_save: None,
+            rust_check_begins_read,
+            rust_check_begins_drained: 0,
+            save_notification: None,
+            rust_checks_on_save: false,
+            rust_checks_on_load: false,
+            workspace_loaded_at,
             supports_watched_files: false,
             watched_file_registrations,
             child_registry,
             stderr_tail,
+            stderr_closed,
+            spawned_at,
+            command_display,
             #[cfg(test)]
             suppress_kill_on_drop: false,
         })
@@ -516,8 +1137,15 @@ impl LspClient {
                 }
             ]
         });
+        let (checks_on_save, checks_on_load) = rust_check_triggers(initialization_options.as_ref());
         if let Some(initialization_options) = initialization_options {
             params_value["initializationOptions"] = initialization_options;
+        }
+        if matches!(&self.kind, ServerKind::Rust) {
+            // rust-analyzer reports its `cargo check` runs only to clients that
+            // accept server-initiated progress. Inspect needs those begin/end
+            // events to know when compiler errors have been published.
+            params_value["capabilities"]["window"] = json!({ "workDoneProgress": true });
         }
 
         let params = serde_json::from_value::<lsp_types::InitializeParams>(params_value)?;
@@ -538,6 +1166,13 @@ impl LspClient {
             .cloned()
             .unwrap_or_else(|| serde_json::to_value(&result.capabilities).unwrap_or(Value::Null));
         self.diagnostic_caps = Some(parse_diagnostic_capabilities(&caps_value));
+        self.save_notification = parse_save_notification(&caps_value);
+        // rust-analyzer checks on save only when it hears of saves. Another
+        // server run for Rust that does not ask for them runs no checks AFT
+        // could wait for.
+        let checks = matches!(&self.kind, ServerKind::Rust) && self.save_notification.is_some();
+        self.rust_checks_on_save = checks && checks_on_save;
+        self.rust_checks_on_load = checks && checks_on_load;
 
         // Capture initialize-time (static) workspace/didChangeWatchedFiles
         // support. Runtime client/registerCapability subscriptions are recorded
@@ -568,19 +1203,319 @@ impl LspClient {
     }
 
     /// Whether diagnostics from this server instance should be treated as
-    /// provisional because rust-analyzer has not reached quiescence.
+    /// provisional because rust-analyzer is warming or reported failed analysis.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        matches!(&self.kind, ServerKind::Rust) && !self.rust_analyzer_quiescent
+        matches!(&self.kind, ServerKind::Rust)
+            && (!self.rust_analyzer_quiescent || self.rust_analyzer_failure.is_some())
+    }
+
+    pub(crate) fn diagnostic_failure(&self) -> Option<&str> {
+        self.rust_analyzer_failure.as_deref()
+    }
+
+    /// Recovery must reach healthy quiescence before reports regain authority.
+    pub(crate) fn set_diagnostic_failure(&mut self, failure: Option<String>) {
+        if failure.is_some() || self.rust_analyzer_failure.is_some() {
+            self.rust_analyzer_quiescent = false;
+        }
+        self.rust_analyzer_failure = failure;
+    }
+
+    /// When this server last started loading the workspace manifests.
+    pub(crate) fn workspace_loaded_at(&self) -> SystemTime {
+        self.workspace_loaded_at
+    }
+
+    /// Enter the state of a workspace reload that was just requested at
+    /// `requested_at`: the previous analysis result (a failure or warning, and
+    /// quiescence) describes the old manifests, so it is dropped and the
+    /// server counts as warming until rust-analyzer reports quiescence for the
+    /// new load. Returns the dropped state so a reload the server refused can
+    /// be undone with [`Self::restore_rust_workspace_state`].
+    pub(crate) fn begin_rust_workspace_reload(
+        &mut self,
+        requested_at: SystemTime,
+    ) -> RustWorkspaceState {
+        let previous = RustWorkspaceState {
+            quiescent: self.rust_analyzer_quiescent,
+            workspace_check_owed_since: self.rust_workspace_check_owed_since,
+            failure: self.rust_analyzer_failure.take(),
+            warning: self.rust_analyzer_warning.take(),
+            loaded_at: self.workspace_loaded_at,
+            check_begins_at_load: self.rust_check_begins_at_load,
+        };
+        self.rust_analyzer_quiescent = false;
+        // rust-analyzer checks the reloaded workspace once it is quiescent
+        // again; that check is expected from then on.
+        self.rust_workspace_check_owed_since = None;
+        self.workspace_loaded_at = requested_at;
+        self.rust_check_begins_at_load = self.rust_check_begins_read.load(Ordering::Acquire);
+        previous
+    }
+
+    /// Put back the analysis state saved by
+    /// [`Self::begin_rust_workspace_reload`] when the server rejected the
+    /// reload request: no new load is running, so no quiescence report would
+    /// ever end the warming state.
+    pub(crate) fn restore_rust_workspace_state(&mut self, previous: RustWorkspaceState) {
+        self.rust_analyzer_quiescent = previous.quiescent;
+        self.rust_workspace_check_owed_since = previous.workspace_check_owed_since;
+        self.rust_analyzer_failure = previous.failure;
+        self.rust_analyzer_warning = previous.warning;
+        self.workspace_loaded_at = previous.loaded_at;
+        self.rust_check_begins_at_load = previous.check_begins_at_load;
     }
 
     /// Record a rust-analyzer server-status transition. Returns true only for
-    /// the first transition to quiescent, which is the completion boundary that
+    /// first transition to quiescent after startup or failure, the boundary that
     /// makes each latest warming report authoritative.
     pub fn set_rust_analyzer_quiescent(&mut self, quiescent: bool) -> bool {
         if !matches!(&self.kind, ServerKind::Rust) || !quiescent || self.rust_analyzer_quiescent {
             return false;
         }
         self.rust_analyzer_quiescent = true;
+        // rust-analyzer starts a check of the whole workspace on becoming
+        // quiescent, after any check a save started during the load.
+        if self.rust_checks_on_load {
+            self.rust_workspace_check_owed_since = Some(Instant::now());
+        }
+        true
+    }
+
+    /// Record one rust-analyzer `$/progress` notification. Only check runs
+    /// are tracked: rust-analyzer names their token `rust-analyzer/flycheck/N`
+    /// and titles them with the check command (`cargo check`, `cargo clippy`).
+    pub(crate) fn record_rust_progress(&mut self, token: &str, kind: &str, title: Option<&str>) {
+        if !matches!(&self.kind, ServerKind::Rust) {
+            return;
+        }
+        match kind {
+            "begin" => {
+                if is_rust_check_progress(token, title) {
+                    self.rust_check_begins_drained += 1;
+                    let ordinal = self.rust_check_begins_drained;
+                    self.rust_flycheck_running
+                        .insert(token.to_string(), ordinal);
+                    self.rust_flycheck_started_at = Some(Instant::now());
+                    // A check run reads the files from disk as they are now,
+                    // so it gives the results the expected workspace check
+                    // would have, whatever started it.
+                    if ordinal > self.rust_check_begins_at_load {
+                        self.rust_workspace_check_owed_since = None;
+                    }
+                    // For the same reason a run the server announced after a
+                    // save was sent covers the saved contents, whatever
+                    // started it. Order is judged by when the reader read the
+                    // announcement, not by when it is drained here: a run
+                    // announced before the save sits in the event channel
+                    // until a caller drains it, and checked the files before
+                    // the edit. A save deferred and not sent yet is still
+                    // expected: this run may have begun before rust-analyzer
+                    // received the watcher's change.
+                    if self
+                        .rust_save
+                        .as_ref()
+                        .and_then(|save| save.begins_read_at_send)
+                        .is_some_and(|read_at_send| ordinal > read_at_send)
+                    {
+                        self.rust_save = None;
+                    }
+                }
+            }
+            "end" => {
+                if let Some(begin) = self.rust_flycheck_running.remove(token) {
+                    self.rust_flycheck_finished_at = Some(Instant::now());
+                    self.rust_completed_check_begin = Some(
+                        self.rust_completed_check_begin
+                            .map_or(begin, |previous| previous.max(begin)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How this server wants to be told that a document was saved, or `None`
+    /// when it did not ask to hear about saves.
+    pub(crate) fn save_notification(&self) -> Option<SaveNotification> {
+        self.save_notification
+    }
+
+    /// Whether rust-analyzer has begun at least one check run. Before that,
+    /// nothing it pushed carries compiler results.
+    pub(crate) fn rust_check_seen(&self) -> bool {
+        self.rust_flycheck_started_at.is_some()
+    }
+
+    /// Record that a `textDocument/didSave` for `uri` was just sent. For
+    /// rust-analyzer this starts a new `cargo check`, and the check results
+    /// published so far describe the files before the save; see
+    /// [`Self::rust_check_state`].
+    pub(crate) fn record_save_sent(&mut self, uri: &lsp_types::Uri) {
+        if self.rust_checks_on_save {
+            let now = Instant::now();
+            self.rust_save = Some(RustSaveRequest {
+                uri: uri.clone(),
+                due_at: None,
+                last_sent_at: Some(now),
+                sends: 1,
+                begins_read_at_send: Some(self.rust_check_begins_read.load(Ordering::SeqCst)),
+            });
+        }
+    }
+
+    /// Ask for a `textDocument/didSave` of `uri` to be sent to rust-analyzer
+    /// a little later instead of now, for a change reported by the file
+    /// watcher. rust-analyzer 1.98 drops the check a save asks for when the
+    /// save arrives right after a `workspace/didChangeWatchedFiles` for the
+    /// same file (measured: at once, no check; one second later, a check), so
+    /// the save is sent from [`Self::take_rust_save_to_send`] once
+    /// [`EXTERNAL_SAVE_DELAY`] has passed. The check counts as requested from
+    /// now on.
+    pub(crate) fn owe_rust_save(&mut self, uri: &lsp_types::Uri) {
+        if self.rust_checks_on_save {
+            let now = Instant::now();
+            self.rust_save = Some(RustSaveRequest {
+                uri: uri.clone(),
+                due_at: Some(now + EXTERNAL_SAVE_DELAY),
+                last_sent_at: None,
+                sends: 0,
+                begins_read_at_send: None,
+            });
+        }
+    }
+
+    /// The document to send a `textDocument/didSave` for now, if any: a save
+    /// that was deferred (see [`Self::owe_rust_save`]) and is due, or a save
+    /// that started no check run within [`SAVE_RESEND_AFTER`] and may be sent
+    /// again (at most [`MAX_SAVE_SENDS`] times in all). The caller sends it
+    /// and then calls [`Self::mark_rust_save_sent`].
+    pub(crate) fn take_rust_save_to_send(&self, now: Instant) -> Option<lsp_types::Uri> {
+        let save = self.rust_save.as_ref()?;
+        let due = match (save.due_at, save.last_sent_at) {
+            (Some(due_at), _) => now >= due_at,
+            (None, Some(sent)) => {
+                save.sends < MAX_SAVE_SENDS
+                    && now.saturating_duration_since(sent) >= SAVE_RESEND_AFTER
+            }
+            (None, None) => false,
+        };
+        due.then(|| save.uri.clone())
+    }
+
+    /// Record that the save returned by [`Self::take_rust_save_to_send`]
+    /// was sent.
+    pub(crate) fn mark_rust_save_sent(&mut self, now: Instant) {
+        let begins_read = self.rust_check_begins_read.load(Ordering::SeqCst);
+        if let Some(save) = self.rust_save.as_mut() {
+            save.due_at = None;
+            save.last_sent_at = Some(now);
+            save.sends = save.sends.saturating_add(1);
+            save.begins_read_at_send.get_or_insert(begins_read);
+        }
+    }
+
+    /// Whether rust-analyzer's published diagnostics carry the compiler's
+    /// results for the files as they are now.
+    ///
+    /// [`RustCheckState::Running`] while a check run is in progress, ended
+    /// less than `publish_settle` ago (rust-analyzer can announce the end
+    /// before it publishes the final batch), or is expected and still within
+    /// its deadline: a save asked for one (until it begins, the published
+    /// compiler errors describe the files before the save, including errors
+    /// already fixed), or the server became quiescent and has not begun the
+    /// workspace check it starts then.
+    ///
+    /// [`RustCheckState::Unreported`] once an expected check has not begun by
+    /// its deadline: [`SAVE_CHECK_START_GRACE`] after the last of
+    /// [`MAX_SAVE_SENDS`] sends of a save, or
+    /// [`WORKSPACE_CHECK_START_DEADLINE`] after quiescence. A late start and
+    /// a check that never comes look the same from here, and in neither case
+    /// do the published results describe the current files, so they are
+    /// never reported as current.
+    ///
+    /// [`RustCheckState::Current`] otherwise, for other servers, for a server
+    /// still warming (that state is tracked separately), and when the
+    /// server's settings run no check that would be expected (see
+    /// [`rust_check_triggers`]).
+    pub(crate) fn rust_check_state(
+        &self,
+        now: Instant,
+        publish_settle: Duration,
+    ) -> RustCheckState {
+        if !matches!(&self.kind, ServerKind::Rust) || !self.rust_analyzer_quiescent {
+            return RustCheckState::Current;
+        }
+        if !self.rust_flycheck_running.is_empty() {
+            return RustCheckState::Running;
+        }
+        if let Some(save) = &self.rust_save {
+            let awaiting = match save.last_sent_at {
+                None => true,
+                Some(sent) => {
+                    save.sends < MAX_SAVE_SENDS
+                        || now.saturating_duration_since(sent) < SAVE_CHECK_START_GRACE
+                }
+            };
+            return if awaiting {
+                RustCheckState::Running
+            } else {
+                RustCheckState::Unreported
+            };
+        }
+        if let Some(owed_since) = self.rust_workspace_check_owed_since {
+            return if now.saturating_duration_since(owed_since) < WORKSPACE_CHECK_START_DEADLINE {
+                RustCheckState::Running
+            } else {
+                RustCheckState::Unreported
+            };
+        }
+        match self.rust_flycheck_finished_at {
+            Some(finished) if now.saturating_duration_since(finished) < publish_settle => {
+                RustCheckState::Running
+            }
+            _ => RustCheckState::Current,
+        }
+    }
+
+    /// Authority for a clean whole-workspace compiler result without reports.
+    /// Current alone also describes absence of progress, so require a real
+    /// matching begin/end after the latest load. Current additionally proves
+    /// no save is owed, no check is running, and final publishes have settled;
+    /// save begin ordinals reject a check announced before that save.
+    pub(crate) fn rust_check_completed_current(
+        &self,
+        now: Instant,
+        publish_settle: Duration,
+    ) -> bool {
+        matches!(&self.kind, ServerKind::Rust)
+            && self.rust_analyzer_quiescent
+            && self.rust_analyzer_failure.is_none()
+            && self
+                .rust_completed_check_begin
+                .is_some_and(|begin| begin > self.rust_check_begins_at_load)
+            && self.rust_check_state(now, publish_settle) == RustCheckState::Current
+    }
+
+    /// When a check was expected and did not begin by its deadline
+    /// ([`Self::rust_check_state`] reports [`RustCheckState::Unreported`]),
+    /// ask rust-analyzer for it again, so a new caller waits with a fresh
+    /// deadline. Without this, a check that never began would leave every
+    /// later request unknown, and the "retry" each of them suggests could
+    /// never succeed. A save is queued to be sent again by
+    /// [`Self::take_rust_save_to_send`]. For the workspace check this returns
+    /// true: the caller sends [`RustAnalyzerRunFlycheck`], which starts one.
+    pub(crate) fn rearm_unreported_rust_check(&mut self, now: Instant) -> bool {
+        if self.rust_check_state(now, Duration::ZERO) != RustCheckState::Unreported {
+            return false;
+        }
+        if let Some(save) = self.rust_save.as_mut() {
+            save.due_at = Some(now);
+            save.last_sent_at = None;
+            save.sends = 0;
+            return false;
+        }
+        self.rust_workspace_check_owed_since = Some(now);
         true
     }
 
@@ -599,6 +1534,20 @@ impl LspClient {
             .lock()
             .map(|registrations| !registrations.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Every watcher from the server's current dynamic registrations, or
+    /// `None` when it holds none. `None` is different from an empty set: a
+    /// server that only advertised initialize-time support never said which
+    /// files it cares about, so the caller chooses a filter for it.
+    pub(crate) fn registered_file_watchers(&self) -> Option<RegisteredFileWatchers> {
+        let registrations = self.watched_file_registrations.lock().ok()?;
+        if registrations.is_empty() {
+            return None;
+        }
+        Some(RegisteredFileWatchers {
+            watchers: registrations.values().flatten().cloned().collect(),
+        })
     }
 
     /// Send a request and wait for the response.
@@ -649,6 +1598,32 @@ impl LspClient {
     where
         P: serde::Serialize,
     {
+        self.start_request_value(method, params)?.wait(timeout)
+    }
+
+    /// Write a request to the server and return a handle for its response.
+    /// Waiting on the handle needs no access to the client, so a caller that
+    /// reached the client through the language-server manager lock can
+    /// release that lock while the server works on the request.
+    pub(crate) fn start_request<R>(
+        &mut self,
+        params: R::Params,
+    ) -> Result<PendingLspRequest, LspError>
+    where
+        R: lsp_types::request::Request,
+        R::Params: serde::Serialize,
+    {
+        self.start_request_value(R::METHOD, params)
+    }
+
+    fn start_request_value<P>(
+        &mut self,
+        method: &'static str,
+        params: P,
+    ) -> Result<PendingLspRequest, LspError>
+    where
+        P: serde::Serialize,
+    {
         self.ensure_can_send()?;
 
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -669,34 +1644,14 @@ impl LspClient {
                 return Err(err.into());
             }
         }
-
-        let response = match rx.recv_timeout(timeout) {
-            Ok(response) => response,
-            Err(RecvTimeoutError::Timeout) => {
-                self.remove_pending(&id);
-                self.send_cancel_request(&id)?;
-                return Err(LspError::Timeout(format!(
-                    "timed out waiting for '{}' response from {:?}",
-                    method, self.kind
-                )));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.remove_pending(&id);
-                return Err(LspError::ServerNotReady(format!(
-                    "language server {:?} disconnected while waiting for '{}'",
-                    self.kind, method
-                )));
-            }
-        };
-
-        if let Some(error) = response.error {
-            return Err(LspError::ServerError {
-                code: error.code,
-                message: error.message,
-            });
-        }
-
-        Ok(response.result.unwrap_or(Value::Null))
+        Ok(PendingLspRequest {
+            id,
+            method,
+            kind: self.kind.clone(),
+            rx,
+            pending: Arc::clone(&self.pending),
+            writer: Arc::clone(&self.writer),
+        })
     }
 
     /// Send a notification (fire-and-forget).
@@ -792,6 +1747,75 @@ impl LspClient {
         self.child_pid
     }
 
+    /// Which part of its life this server is in, for exit reports.
+    pub fn phase(&self) -> ServerPhase {
+        match self.state {
+            ServerState::Starting => ServerPhase::Spawn,
+            ServerState::Initializing => ServerPhase::Initialize,
+            ServerState::Ready | ServerState::ShuttingDown | ServerState::Exited => {
+                ServerPhase::Running
+            }
+        }
+    }
+
+    /// Poll for the child's exit for up to `timeout`, returning its status if
+    /// it exited in that time. Does not kill the child.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Build the exit report for this process. Waits briefly for the stderr
+    /// reader to reach end-of-file so the server's last words are included.
+    pub fn exit_report(
+        &self,
+        phase: ServerPhase,
+        status: Option<std::process::ExitStatus>,
+        killed_by_aft: bool,
+    ) -> ServerExitReport {
+        let elapsed = self.spawned_at.elapsed();
+        let deadline = Instant::now() + STDERR_EOF_WAIT;
+        while !self.stderr_closed.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        ServerExitReport {
+            kind: self.kind.clone(),
+            root: self.root.clone(),
+            pid: self.child_pid,
+            phase,
+            status,
+            killed_by_aft,
+            elapsed,
+            command: self.command_display.clone(),
+            stderr_tail: self.stderr_tail(),
+        }
+    }
+
+    /// Reap a client whose reader stopped and describe how the process ended.
+    /// After a clean end-of-file the process is normally already exiting, so
+    /// give it a moment to report its own status before killing it.
+    pub(crate) fn reap_with_report(&mut self, reason: &ServerExitReason) -> ServerExitReport {
+        let phase = self.phase();
+        if matches!(reason, ServerExitReason::Eof) {
+            let _ = self.wait_for_exit(STDERR_EOF_WAIT);
+        }
+        match self.reap_after_reader_exit(reason) {
+            ReaderExitReap::AlreadyExited(status) => self.exit_report(phase, Some(status), false),
+            ReaderExitReap::KilledWhileAlive => {
+                let killed_status = self.child.try_wait().ok().flatten();
+                self.exit_report(phase, killed_status, true)
+            }
+        }
+    }
+
     /// If the child is still running, kill its process group and wait bounded.
     /// Always untrack. The caller logs whether this was a real exit or a reader
     /// death that left the child alive.
@@ -885,15 +1909,63 @@ impl LspClient {
             pending.remove(id);
         }
     }
+}
 
-    fn send_cancel_request(&mut self, id: &RequestId) -> Result<(), LspError> {
-        let notification = Notification::new("$/cancelRequest", Some(json!({ "id": id })));
-        let mut writer = self
-            .writer
-            .lock()
-            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
-        transport::write_notification(&mut *writer, &notification)?;
-        Ok(())
+/// A request written to a language server whose response has not been read
+/// yet (see [`LspClient::start_request`]).
+pub(crate) struct PendingLspRequest {
+    id: RequestId,
+    method: &'static str,
+    kind: ServerKind,
+    rx: crossbeam_channel::Receiver<JsonRpcResponse>,
+    pending: Arc<Mutex<PendingMap>>,
+    writer: Arc<Mutex<BufWriter<std::process::ChildStdin>>>,
+}
+
+impl PendingLspRequest {
+    /// Wait up to `timeout` for the response. If the local deadline expires,
+    /// remove the pending response handler and notify the server with
+    /// `$/cancelRequest` so it can stop work.
+    pub(crate) fn wait(self, timeout: Duration) -> Result<Value, LspError> {
+        let response = match self.rx.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                self.remove_pending();
+                let notification =
+                    Notification::new("$/cancelRequest", Some(json!({ "id": self.id })));
+                let mut writer = self
+                    .writer
+                    .lock()
+                    .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
+                transport::write_notification(&mut *writer, &notification)?;
+                return Err(LspError::Timeout(format!(
+                    "timed out waiting for '{}' response from {:?}",
+                    self.method, self.kind
+                )));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.remove_pending();
+                return Err(LspError::ServerNotReady(format!(
+                    "language server {:?} disconnected while waiting for '{}'",
+                    self.kind, self.method
+                )));
+            }
+        };
+
+        if let Some(error) = response.error {
+            return Err(LspError::ServerError {
+                code: error.code,
+                message: error.message,
+            });
+        }
+
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    fn remove_pending(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
     }
 }
 
@@ -921,6 +1993,7 @@ impl Drop for LspClient {
 fn spawn_stderr_drain_thread(
     stderr: std::process::ChildStderr,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_closed: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
@@ -940,6 +2013,7 @@ fn spawn_stderr_drain_thread(
                 Err(_) => break,
             }
         }
+        stderr_closed.store(true, Ordering::Release);
     });
 }
 
@@ -1009,7 +2083,21 @@ fn record_watched_file_registration(
                         == Some("workspace/didChangeWatchedFiles")
                     {
                         if let Some(id) = item.get("id").and_then(Value::as_str) {
-                            guard.insert(id.to_string());
+                            let watchers = item
+                                .pointer("/registerOptions/watchers")
+                                .and_then(Value::as_array)
+                                .map(|watchers| {
+                                    watchers
+                                        .iter()
+                                        .filter_map(RegisteredFileWatcher::parse)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            log::debug!(
+                                "server registered watched files id={id} watchers={:?}",
+                                item.pointer("/registerOptions/watchers")
+                            );
+                            guard.insert(id.to_string(), watchers);
                         }
                     }
                 }
@@ -1305,6 +2393,65 @@ mod tests {
             registry,
         )
         .expect("spawn long-lived LSP stand-in")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_check_authority_requires_a_begin_after_the_latest_load_and_save() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = spawn_long_lived_client(
+            "exec sleep 60",
+            tx,
+            LspChildRegistry::new(),
+            tmp.path().to_path_buf(),
+        );
+        client.kind = ServerKind::Rust;
+        client.rust_analyzer_quiescent = true;
+        client.rust_checks_on_save = true;
+        assert_eq!(
+            client.rust_check_state(Instant::now(), Duration::ZERO),
+            RustCheckState::Current
+        );
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.rust_check_begins_read.store(1, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/0", "begin", Some("cargo check"));
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.record_rust_progress("rust-analyzer/flycheck/0", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::from_secs(1)));
+
+        // A begin read before the save must not become its authority merely
+        // because the event channel is drained after sending the save.
+        let uri = "file:///test/lib.rs".parse().unwrap();
+        client.rust_check_begins_read.store(2, Ordering::SeqCst);
+        client.record_save_sent(&uri);
+        client.record_rust_progress("rust-analyzer/flycheck/1", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/1", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.rust_check_begins_read.store(3, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/2", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/2", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+
+        // Reloading the workspace requires a check begun after the reload;
+        // an earlier completed check no longer certifies the new manifests.
+        client.rust_check_begins_read.store(4, Ordering::SeqCst);
+        let previous = client.begin_rust_workspace_reload(SystemTime::now());
+        client.set_rust_analyzer_quiescent(true);
+        client.record_rust_progress("rust-analyzer/flycheck/3", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/3", "end", None);
+        assert!(!client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.restore_rust_workspace_state(previous);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
+        client.begin_rust_workspace_reload(SystemTime::now());
+        client.set_rust_analyzer_quiescent(true);
+        client.rust_check_begins_read.store(5, Ordering::SeqCst);
+        client.record_rust_progress("rust-analyzer/flycheck/4", "begin", Some("cargo check"));
+        client.record_rust_progress("rust-analyzer/flycheck/4", "end", None);
+        assert!(client.rust_check_completed_current(Instant::now(), Duration::ZERO));
     }
 
     #[cfg(unix)]

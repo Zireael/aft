@@ -73,6 +73,7 @@ pub(crate) fn handle_comment_write(
             serde_json::json!({
                 "resource": resource.base_spelling(),
                 "preview_diff": body,
+                "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, "", body) },
                 "text": body,
             }),
         );
@@ -127,6 +128,7 @@ pub(crate) fn handle_comment_write(
             "comment_url": comment_url,
             "ordinal": ordinal,
             "text": text,
+            "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, "", body) },
         }),
     )
 }
@@ -237,9 +239,13 @@ pub(crate) fn handle_comment_edit(
                 "ordinal": ordinal,
                 "replacements": replacements,
                 "preview_diff": edited_body,
+                "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, &comment.body, &edited_body) },
                 "text": edited_body,
             }),
         );
+    }
+    if comment.body == edited_body {
+        return crate::edit::no_change_response(&req.id);
     }
     let patch_body = serde_json::json!({ "body": edited_body }).to_string();
     let args = vec![
@@ -266,6 +272,7 @@ pub(crate) fn handle_comment_edit(
             "ordinal": ordinal,
             "replacements": replacements,
             "text": format!("{comment_url}\nComment ordinal: {ordinal}\n{SAFETY_NOTICE}"),
+            "metadata": { "diff": crate::edit::build_unified_diff(resource_spelling, &comment.body, &edited_body) },
         }),
     )
 }

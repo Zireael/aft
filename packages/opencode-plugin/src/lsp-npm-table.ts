@@ -13,7 +13,7 @@
  */
 
 export interface NpmServerSpec {
-  /** AFT server-kind id (matches `crates/aft/src/lsp/registry.rs::ServerKind::id_str`). */
+  /** Server ID, or a separate ID for a runtime installed alongside a server (e.g. `typescript-sdk`). */
   readonly id: string;
   /** npm package name. */
   readonly npm: string;
@@ -37,6 +37,12 @@ export interface NpmServerSpec {
    * user sees a recurring `lsp_binary_missing` warning.
    */
   readonly packageJsonDeps?: readonly string[];
+  /**
+   * Install only releases of this major version. Registry versions and cached
+   * version decisions outside it are ignored, and a cached install of another
+   * major counts as out of date. Omit it to track the newest release.
+   */
+  readonly supportedMajor?: number;
 }
 
 export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
@@ -46,6 +52,20 @@ export const NPM_LSP_TABLE: readonly NpmServerSpec[] = [
     binary: "typescript-language-server",
     extensions: ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],
     rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
+  },
+  // The language server does not bundle its TypeScript SDK. Keep a separate
+  // cache install so dependency-free worktrees can use an explicit fallback.
+  // The fallback exists only to supply `lib/tsserver.js`. TypeScript 7 and
+  // later are the native (Go) compiler and ship no tsserver.js, so an
+  // uncapped install silently breaks the fallback for every project. Hold it
+  // on the 5.x line.
+  {
+    id: "typescript-sdk",
+    npm: "typescript",
+    binary: "tsserver",
+    extensions: ["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],
+    rootMarkers: ["tsconfig.json", "jsconfig.json", "package.json"],
+    supportedMajor: 5,
   },
   {
     id: "python",
@@ -133,4 +153,16 @@ export function findNpmServerById(id: string): NpmServerSpec | undefined {
 /** Find an entry by binary name. */
 export function findNpmServerByBinary(binary: string): NpmServerSpec | undefined {
   return NPM_LSP_TABLE.find((entry) => entry.binary === binary);
+}
+
+/** Leading major version of a version string such as `5.9.3`, or null. */
+export function majorVersionOf(version: string): number | null {
+  const match = /^v?(\d+)(?:\.|$)/.exec(version.trim());
+  return match ? Number(match[1]) : null;
+}
+
+/** True when `version` is a release `spec` may install or keep. */
+export function isVersionSupported(spec: NpmServerSpec, version: string): boolean {
+  if (spec.supportedMajor === undefined) return true;
+  return majorVersionOf(version) === spec.supportedMajor;
 }

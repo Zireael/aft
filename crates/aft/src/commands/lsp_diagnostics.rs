@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::context::AppContext;
+use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{
     EnsureServerOutcomes, PullFileOutcome, PullFileResult, ServerAttemptResult,
 };
+use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 
@@ -171,11 +173,33 @@ fn handle_file_mode(
         lsp.snapshot_pre_edit_state(&canonical)
     };
 
+    // rust-analyzer's pulled report holds only its own analysis, and while it
+    // is still loading the workspace that analysis is not ready. The
+    // compiler's errors arrive separately, when a `cargo check` finishes, and
+    // an edit's save starts a new one; until then the stored errors describe
+    // the files before the edit. Wait for both within `wait_ms`, before the
+    // pull so the pull sees the loaded workspace. A server still busy after
+    // the wait makes the answer incomplete.
+    let wait_deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let rust_servers: Vec<ServerKey> = outcomes
+        .successful
+        .iter()
+        .filter(|key| key.kind == ServerKind::Rust)
+        .cloned()
+        .collect();
+    let still_checking = wait_for_rust_check(ctx, &rust_servers, wait_deadline);
+
     // Step 3: pull diagnostics from every server that supports it. Track
-    // which servers we got a fresh result for.
+    // which servers we got a fresh result for. The manager lock is released
+    // while servers work on the requests.
     let pull_results = {
-        let mut lsp = ctx.lsp();
-        match lsp.pull_file_diagnostics(&canonical, &ctx.config()) {
+        let config = ctx.config();
+        match crate::lsp::manager::pull_file_diagnostics_with_cargo_check_unlocked(
+            || ctx.lsp(),
+            &canonical,
+            &config,
+            None,
+        ) {
             Ok(results) => results,
             Err(err) => {
                 crate::slog_warn!("[lsp_diagnostics] pull_file_diagnostics failed: {err}");
@@ -258,9 +282,16 @@ fn handle_file_mode(
             _ => complete = false,
         }
     }
+    for (key, _) in &still_checking {
+        complete = false;
+        let id = key.kind.id_str().to_string();
+        if !pending_servers.contains(&id) {
+            pending_servers.push(id);
+        }
+    }
     let diagnostics =
         collect_file_diagnostics_for_servers(ctx, &canonical, severity_filter, &proven_servers);
-    let response = build_response(
+    let mut response = build_response(
         &diagnostics,
         server_status,
         complete,
@@ -268,6 +299,9 @@ fn handle_file_mode(
         None,
         pending_servers,
     );
+    if let Some((_, reason)) = still_checking.first() {
+        response["note"] = serde_json::Value::from(*reason);
+    }
     Response::success(&req.id, response)
 }
 
@@ -301,10 +335,8 @@ fn handle_directory_mode(
     };
 
     for key in &server_keys_to_pull {
-        let pull_result = {
-            let mut lsp = ctx.lsp();
-            lsp.pull_workspace_diagnostics(key, None)
-        };
+        let pull_result =
+            crate::lsp::manager::pull_workspace_diagnostics_unlocked(|| ctx.lsp(), key, None);
         match pull_result {
             Ok(result) => {
                 let status = if !result.supports_workspace {
@@ -410,6 +442,72 @@ fn collect_directory_diagnostics(
         .cloned()
         .collect()
 }
+
+/// Wait, until `deadline`, for the given rust-analyzer servers to finish
+/// loading the workspace and then a running or expected `cargo check`: one a
+/// save asked for, or the one rust-analyzer starts on becoming quiescent
+/// (until it reports, the published diagnostics lack every compiler error,
+/// and an edit made meanwhile races with it).
+/// While either is under way their published diagnostics describe an older
+/// state of the files. A check that was expected and did not begin in time is
+/// not waited for but still returned as busy: its results are unknown. The
+/// manager lock is held only to drain events and read the state, never across
+/// a sleep. Returns the servers still busy when the wait ended, each with the
+/// reason to report.
+fn wait_for_rust_check(
+    ctx: &AppContext,
+    servers: &[ServerKey],
+    deadline: Instant,
+) -> Vec<(ServerKey, &'static str)> {
+    {
+        let mut lsp = ctx.lsp();
+        for key in servers {
+            lsp.rearm_unreported_rust_check(key);
+        }
+    }
+    loop {
+        let (busy, waiting) = {
+            let mut lsp = ctx.lsp();
+            lsp.drain_events();
+            let mut busy = Vec::new();
+            let mut waiting = false;
+            for key in servers {
+                // A server that reported a failed load is not loading;
+                // its failure is reported through its status instead.
+                if lsp.producer_failure(key).is_none() && lsp.server_is_warming(key) {
+                    busy.push((key.clone(), RUST_INDEXING_REASON));
+                    waiting = true;
+                    continue;
+                }
+                match lsp.rust_check_state(key) {
+                    RustCheckState::Current => {}
+                    state => {
+                        busy.push((
+                            key.clone(),
+                            crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON,
+                        ));
+                        waiting |= state == RustCheckState::Running;
+                    }
+                }
+            }
+            (busy, waiting)
+        };
+        let now = Instant::now();
+        if !waiting || now >= deadline {
+            return busy;
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(50)),
+        );
+    }
+}
+
+/// Why a Rust result is incomplete while rust-analyzer is still loading the
+/// workspace: until it finishes, its analysis and its first `cargo check`
+/// have not covered the files.
+const RUST_INDEXING_REASON: &str = "rust-analyzer: still indexing; retry";
 
 fn wait_for_push(ctx: &AppContext, wait_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(wait_ms);

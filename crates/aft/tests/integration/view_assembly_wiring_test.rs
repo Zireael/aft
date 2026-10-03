@@ -54,6 +54,7 @@ fn request(
         semantic_keys: Default::default(),
         require_semantic: false,
         allow_blob_put,
+        callgraph: true,
     }
 }
 
@@ -504,4 +505,149 @@ fn killed_off_barrier_build_preserves_pointer_and_sweeps_generation() {
     }
     assert!(view.derived_path(&initial).unwrap().is_file());
     assert!(view.load_manifest(&initial).is_ok());
+}
+
+/// With the call graph off, a publication extracts no callgraph payload and
+/// its source entries carry no callgraph key; once the call graph is turned
+/// on, a later publication that changes other files still extracts the
+/// unchanged ones it never extracted.
+#[test]
+fn callgraph_off_publication_extracts_nothing_and_on_fills_it_in() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    for index in 0..5 {
+        fs::write(
+            project.path().join(format!("file_{index}.rs")),
+            format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    commit(project.path(), "base");
+    let family = "callgraph-off-family";
+    let mut off = request(
+        storage.path(),
+        project.path(),
+        family,
+        "off-view",
+        BTreeSet::new(),
+        true,
+    );
+    off.callgraph = false;
+    let report = publish_checkout(&off).unwrap();
+    assert!(report.published);
+    assert_eq!(report.blob_puts, 0, "no callgraph payload is extracted");
+    let manifest = report.manifest.unwrap();
+    let callgraph_keys = |manifest: &aft::views::Manifest| {
+        manifest
+            .entries()
+            .filter(|(_, entry)| {
+                matches!(entry, ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
+            })
+            .count()
+    };
+    assert_eq!(callgraph_keys(&manifest), 0);
+
+    fs::write(
+        project.path().join("file_0.rs"),
+        "pub fn value_0() -> usize { 100 }\n",
+    )
+    .unwrap();
+    commit(project.path(), "edit");
+    let on = request(
+        storage.path(),
+        project.path(),
+        family,
+        "off-view",
+        BTreeSet::from([b"file_0.rs".to_vec()]),
+        true,
+    );
+    let report = publish_checkout(&on).unwrap();
+    assert!(report.published);
+    assert_eq!(
+        report.blob_puts, 5,
+        "the four unchanged files are extracted too"
+    );
+    assert_eq!(callgraph_keys(&report.manifest.unwrap()), 5);
+}
+
+#[test]
+#[ignore = "publication profile over a complete worker checkout; run explicitly"]
+fn worker_checkout_publication_reuses_blobs_across_linked_worktrees() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Instant;
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    let linked = tempdir().unwrap();
+    let archive = Command::new("git")
+        .args(["archive", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(archive.status.success());
+    let mut unpack = Command::new("tar")
+        .arg("-x")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    unpack
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&archive.stdout)
+        .unwrap();
+    assert!(unpack.wait().unwrap().success());
+    git(project.path(), &["init", "--quiet"]);
+    commit(project.path(), "worker checkout profile");
+    git(
+        project.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let family_a = aft::search_index::artifact_cache_key(project.path());
+    let family_b = aft::search_index::artifact_cache_key(linked.path());
+    assert_eq!(
+        family_a, family_b,
+        "linked checkouts must share the repository family"
+    );
+    let started = Instant::now();
+    let first = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        &family_a,
+        "profile-first",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    let first_elapsed = started.elapsed();
+    let started = Instant::now();
+    let second = publish_checkout(&request(
+        storage.path(),
+        linked.path(),
+        &family_b,
+        "profile-second",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    eprintln!(
+        "worker publication: first={first_elapsed:?} puts={} second={:?} puts={}",
+        first.blob_puts,
+        started.elapsed(),
+        second.blob_puts
+    );
+    assert!(first.published && second.published);
+    assert!(first.blob_puts > 0);
+    assert_eq!(
+        second.blob_puts, 0,
+        "same-commit linked checkout must build no new payloads"
+    );
 }

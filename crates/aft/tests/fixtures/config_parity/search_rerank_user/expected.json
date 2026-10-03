@@ -1,0 +1,26 @@
+{
+  "aft_search_registered": true,
+  "disabled_tools": [
+    "aft_delete",
+    "aft_move"
+  ],
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "indexes": {
+    "callgraph": true,
+    "semantic": true,
+    "trigram": true
+  },
+  "restrict_to_project_root": false,
+  "search": {
+    "rerank": {
+      "api_key_env": "RERANK_KEY",
+      "backend": "remote",
+      "endpoint": "http://localhost:8080/rerank",
+      "model": "bge-reranker-v2-m3",
+      "timeout_ms": 900,
+      "top_n": 15
+    }
+  }
+}

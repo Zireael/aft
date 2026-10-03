@@ -81,7 +81,7 @@ See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`,
 
 1. Stop or finish running AFT background tasks. If you want to review what removal leaves behind first, run `npx @cortexkit/aft@latest doctor`; it prints an **If you remove AFT** section with last-seven-day usage, running tasks that would orphan, and undo history that would become unreachable.
 2. Remove the harness registration:
-   - **OpenCode:** In `~/.config/opencode/opencode.jsonc` (or `opencode.json`; `OPENCODE_CONFIG_DIR` can override the directory), remove `"@cortexkit/aft-opencode@latest"` from the top-level `"plugin"` array. If setup added the same entry to `tui.jsonc` or `tui.json`, remove it there too.
+   - **OpenCode:** In `~/.config/opencode/opencode.jsonc` (or `opencode.json`; `OPENCODE_CONFIG_DIR` can override the directory), remove the `@cortexkit/aft-opencode` entry (setup writes it pinned to a version, such as `"@cortexkit/aft-opencode@0.58.0"`) from the top-level `"plugin"` array. If setup added the same entry to `tui.jsonc` or `tui.json`, remove it there too.
    - **Pi:** Run `pi remove npm:@cortexkit/aft-pi` (`pi uninstall` is an alias). This removes AFT from Pi's package list in `~/.pi/agent/settings.json` (`PI_CODING_AGENT_DIR` can override the directory).
 
    AFT has no uninstall CLI verb. `npx @cortexkit/aft@latest doctor --clear` only clears selected caches; it does not remove registration, config, or shared storage.

@@ -12,6 +12,8 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
 mod generation;
+#[cfg(test)]
+pub(crate) use generation::wait_for_derived_checkpoint_for_test;
 pub(crate) mod io;
 #[cfg(aft_views_lazy_benchmark)]
 pub mod lazy_read_benchmark;
@@ -19,8 +21,35 @@ pub mod materialization;
 mod profile;
 pub(crate) mod read;
 
+// Per-checkout (v2) view core: registry, manifests, snapshots, readiness,
+// trigram segments, the plane contracts and the parity harness.
+pub mod contracts;
+pub mod eviction;
+pub mod manifest_v2;
+pub mod parity_harness;
+pub mod readiness;
+pub mod registry;
+pub mod segment_store;
+pub mod snapshot;
+
+// Plane and runtime modules of the per-checkout views. Each starts as a
+// documented empty module that its plane fills in.
+pub mod callgraph;
+pub mod first_load;
+pub mod intent;
+pub mod live_delta;
+/// Multi-repo parent folders served from their children's views.
+pub mod parent;
+pub mod query_wait;
+pub mod semantic;
+pub mod semantic_arena;
+pub mod semantic_runtime;
+pub mod trigram;
+
 #[cfg(test)]
 mod dispatch_parity_probe;
+#[cfg(test)]
+mod per_checkout_core_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -60,6 +89,14 @@ pub(crate) fn generation_matches_head(generation: &str, head_fingerprint: &str) 
     !head_fingerprint.is_empty() && generation.ends_with(head_fingerprint)
 }
 
+pub fn callgraph_paths_match_v2(
+    manifest: &manifest_v2::ManifestV2,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<bool> {
+    read::callgraph_paths_match_v2(manifest, root, paths)
+}
+
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {
         view_dir: view_dir.to_path_buf(),
@@ -75,9 +112,18 @@ pub enum ViewError {
     Json(serde_json::Error),
     InvalidManifest(String),
     ManifestAlreadyExists(String),
-    MissingBlob { plane: ArtifactPlane, key: String },
+    MissingBlob {
+        plane: ArtifactPlane,
+        key: String,
+    },
     MissingTrigram,
     MissingAlias(String),
+    /// A manifest or completion was produced by a different producer (model,
+    /// extractor or trigram policy) than the one the reader requires.
+    ProducerMismatch(String),
+    /// A generation's name does not match the content fingerprint of its
+    /// manifest.
+    GenerationMismatch(String),
 }
 
 impl fmt::Display for ViewError {
@@ -107,6 +153,12 @@ impl fmt::Display for ViewError {
                 formatter,
                 "published generation references missing alias {oid}"
             ),
+            Self::ProducerMismatch(message) => {
+                write!(formatter, "view producer mismatch: {message}")
+            }
+            Self::GenerationMismatch(message) => {
+                write!(formatter, "view generation mismatch: {message}")
+            }
         }
     }
 }
@@ -145,7 +197,7 @@ pub type Result<T> = std::result::Result<T, ViewError>;
 
 /// A byte-exact manifest value. JSON uses a UTF-8 string when possible and a
 /// `{"b64": ...}` object otherwise, so no path bytes are lost at the boundary.
-#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ByteString(Vec<u8>);
 
 impl ByteString {
@@ -218,7 +270,7 @@ impl<'de> Deserialize<'de> for ByteString {
 }
 
 /// A relative path key stored as exact bytes in bytewise canonical order.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RelPath(ByteString);
 
 impl RelPath {
@@ -667,6 +719,25 @@ impl ViewStore {
         Ok(store)
     }
 
+    /// Opens (creating when absent) a view directory at an explicit path. The
+    /// per-checkout (v2) layout keeps views under `views/v2/<scope>` and
+    /// reaches this only through a registered view.
+    pub(crate) fn open_dir(view_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&view_dir)?;
+        let store = Self { view_dir };
+        store.initialize_pointer()?;
+        Ok(store)
+    }
+
+    /// A view directory that already has a pointer database, without creating
+    /// or initializing anything. Registry readers use this.
+    pub(crate) fn existing_dir(view_dir: PathBuf) -> Option<Self> {
+        view_dir
+            .join(POINTER_DATABASE)
+            .is_file()
+            .then_some(Self { view_dir })
+    }
+
     pub fn view_dir(&self) -> &Path {
         &self.view_dir
     }
@@ -678,6 +749,22 @@ impl ViewStore {
     pub fn manifest_path(&self, generation: &str) -> Result<PathBuf> {
         validate_generation(generation)?;
         Ok(self.view_dir.join(format!("manifest-{generation}.json")))
+    }
+
+    /// Reads a foreign pointer without creating, initializing or repairing it.
+    /// Missing or malformed pointer state is an error for named-gap reporting.
+    pub fn current_generation_read_only(&self) -> Result<Option<String>> {
+        let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
+            self.pointer_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            "views::ViewStore::current_generation_read_only",
+        )?;
+        let generation: String = connection.query_row(
+            "SELECT generation FROM pointer WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((!generation.is_empty()).then_some(generation))
     }
 
     pub fn current_generation(&self) -> Result<Option<String>> {

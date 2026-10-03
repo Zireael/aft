@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "rollback-safety",
+    "gh-relay-stamp-path"
+  ],
+  "note": "The fenced files (lib.rs, search_index.rs, semantic_index.rs) only gain the named refusal of newer on-disk formats and the reader-floor module; loading, ranking, chunking and embedding of current-format artifacts are unchanged, so every ranked row must stay byte-identical to the committed reference. Also adds the gh relay's scope-stamp path for bot writes, inert until the subc SDK can open scoped routes."
+}

@@ -90,13 +90,15 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    if std::fs::symlink_metadata(&dst_path).is_ok() {
+    if std::fs::symlink_metadata(&dst_path).is_ok() && !is_case_only_alias(&src_path, &dst_path) {
         return Response::error(
             &req.id,
             "invalid_request",
             format!("move_file: destination already exists: {}", destination),
         );
     }
+
+    let _view_intent = crate::views::intent::record_paths([src_path.as_path(), dst_path.as_path()]);
 
     // Backup source before moving
     let backup_id = match edit::auto_backup(
@@ -141,7 +143,11 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Move the file
-    let move_outcome = match move_file_on_disk(&src_path, &dst_path) {
+    let move_outcome = match if is_case_only_alias(&src_path, &dst_path) {
+        rename_case_only(&src_path, &dst_path)
+    } else {
+        move_file_on_disk(&src_path, &dst_path)
+    } {
         MoveOutcome::Moved => MoveOutcome::Moved,
         MoveOutcome::CopiedSourceDeleteFailed(message) => {
             crate::slog_warn!("move_file: copied but failed to remove source: {}", message);
@@ -415,5 +421,79 @@ mod tests {
             std::fs::read_link(&destination).expect("link target"),
             target
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn case_only_rename_preserves_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Foo.txt");
+        let destination = dir.path().join("foo.txt");
+        std::fs::write(&source, "contents").unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let req = serde_json::from_value(serde_json::json!({"id":"case-rename", "command":"move_file", "file":source, "destination":destination})).unwrap();
+        let response = serde_json::to_value(super::handle_move_file(&req, &ctx)).unwrap();
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "contents");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(names.contains(&std::ffi::OsString::from("foo.txt")));
+        assert!(!names.contains(&std::ffi::OsString::from("Foo.txt")));
+    }
+}
+
+fn is_case_only_alias(source: &Path, destination: &Path) -> bool {
+    source.file_name() != destination.file_name()
+        && source
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&destination.to_string_lossy())
+        && std::fs::symlink_metadata(source)
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        && std::fs::canonicalize(source)
+            .ok()
+            .zip(std::fs::canonicalize(destination).ok())
+            .is_some_and(|(source, destination)| source == destination)
+}
+
+fn rename_case_only(source: &Path, destination: &Path) -> MoveOutcome {
+    // A private temporary directory avoids collisions and forces the filesystem
+    // to store the requested spelling even if a direct rename is a no-op.
+    let result = (|| -> std::io::Result<()> {
+        let temporary = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".aft-case-rename-{}", crate::backup::new_op_id()));
+        std::fs::create_dir(&temporary)?;
+        let intermediate = temporary.join("file");
+        if let Err(error) = std::fs::rename(source, &intermediate) {
+            let _ = std::fs::remove_dir(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&intermediate, destination) {
+            if let Err(restore_error) = std::fs::rename(&intermediate, source) {
+                return Err(std::io::Error::other(format!(
+                    "{error}; restore failed: {restore_error}; source retained at {}",
+                    intermediate.display()
+                )));
+            }
+            let _ = std::fs::remove_dir(&temporary);
+            return Err(error);
+        }
+        let _ = std::fs::remove_dir(&temporary);
+        Ok(())
+    })();
+    match result {
+        Ok(()) => MoveOutcome::Moved,
+        Err(error) => MoveOutcome::Failed(error.to_string()),
     }
 }

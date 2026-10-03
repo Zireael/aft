@@ -190,7 +190,8 @@ maybeDescribe("aft_safety (real bridge)", () => {
     const undoResult = await harness.callTool("aft_safety", { op: "undo" });
     const undoText = harness.text(undoResult);
     expect(undoText).toContain("restored operation");
-    expect(undoText).toContain("files 2");
+    // Two files and the two directories holding them.
+    expect(undoText).toContain("files 4");
     // Files AND their parent directories must be restored.
     expect(await readFile(harness.path("op-undo-tree/top.txt"), "utf8")).toBe("top-content\n");
     expect(await readFile(harness.path("op-undo-tree/nested/inner.txt"), "utf8")).toBe(
@@ -198,10 +199,12 @@ maybeDescribe("aft_safety (real bridge)", () => {
     );
   });
 
-  test("recursive delete rejects symlinks before touching the filesystem", async () => {
-    // Regression: v0.25 guards recursive delete against symlinks (whose
-    // canonical target could be outside the tree) and empty directories.
-    const { mkdir, symlink } = await import("node:fs/promises");
+  test("recursive delete removes symlinks without touching their targets, and undo recreates them", async () => {
+    // Symlinks inside a deleted tree are removed as links: the file they point
+    // at is never followed or deleted, and undo recreates the link with its
+    // exact target. (Before undo could restore symlinks, this test asserted
+    // the delete was refused.)
+    const { mkdir, symlink, readlink } = await import("node:fs/promises");
     const { existsSync } = await import("node:fs");
     await mkdir(harness.path("symlink-guard"), { recursive: true });
     await harness.callTool("write", {
@@ -214,17 +217,18 @@ maybeDescribe("aft_safety (real bridge)", () => {
     });
     await symlink(harness.path("symlink-target.txt"), harness.path("symlink-guard/link.txt"));
 
-    // aft_delete with recursive: true should throw a permission-style error
-    // (the plugin tool wraps a success: false response). Match the error message.
-    await expect(
-      harness.callTool("aft_delete", {
-        files: ["symlink-guard"],
-        recursive: true,
-      }),
-    ).rejects.toThrow(/unsupported_directory_contents|link\.txt|symlink/);
-    expect(existsSync(harness.path("symlink-guard"))).toBe(true);
-    expect(existsSync(harness.path("symlink-guard/real.txt"))).toBe(true);
-    expect(existsSync(harness.path("symlink-guard/link.txt"))).toBe(true);
+    await harness.callTool("aft_delete", {
+      files: ["symlink-guard"],
+      recursive: true,
+    });
+    expect(existsSync(harness.path("symlink-guard"))).toBe(false);
+    expect(await readFile(harness.path("symlink-target.txt"), "utf8")).toBe("outside\n");
+
+    await harness.callTool("aft_safety", { op: "undo" });
+    expect(await readlink(harness.path("symlink-guard/link.txt"))).toBe(
+      harness.path("symlink-target.txt"),
+    );
+    expect(await readFile(harness.path("symlink-guard/real.txt"), "utf8")).toBe("inside\n");
     expect(await readFile(harness.path("symlink-target.txt"), "utf8")).toBe("outside\n");
   });
 });

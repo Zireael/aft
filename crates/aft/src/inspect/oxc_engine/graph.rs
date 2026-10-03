@@ -19,7 +19,16 @@ struct ExportState {
     status: ExportStatus,
     also_reexported: Vec<ReExportContextRef>,
     reference_origins: ReferenceOrigins,
+    /// Whether anything other than a reference inside the declaring file kept
+    /// this export alive or uncertain (an import, a re-export, an entry
+    /// point). When false, a `Used` export is used only by its own file: the
+    /// symbol is live, but the `export` keyword serves nobody.
+    used_through_export: bool,
 }
+
+/// Reason recorded when an export is kept alive by a reference inside its own
+/// file.
+const SAME_FILE_VALUE_REFERENCE_REASON: &str = "same_file_value_reference";
 
 #[derive(Debug, Clone, Default)]
 struct ReferenceOrigins {
@@ -289,6 +298,7 @@ impl<'a> GraphBuilder<'a> {
                         status: ExportStatus::Unused,
                         also_reexported: Vec::new(),
                         reference_origins: ReferenceOrigins::default(),
+                        used_through_export: false,
                     })
                     .collect::<Vec<_>>();
 
@@ -474,7 +484,7 @@ impl<'a> GraphBuilder<'a> {
                 continue;
             };
             if module.facts.same_file_value_references.contains(local_name)
-                && mark_used(export, "same_file_value_reference", &origin)
+                && mark_used(export, SAME_FILE_VALUE_REFERENCE_REASON, &origin)
             {
                 newly_live_modules.insert(idx);
             }
@@ -1025,6 +1035,13 @@ impl<'a> GraphBuilder<'a> {
                     .filter(|export| seen.insert(export.fact.name.as_symbol()))
                     .map(|export| {
                         let (verdict, reason) = export.status.verdict();
+                        // Type-only exports are left out: a type used in its own
+                        // file usually appears in an exported signature, where
+                        // it must stay exported for callers to name it (unused-
+                        // export checkers such as fallow keep those too).
+                        let only_same_file_references = verdict == LivenessVerdict::Used
+                            && !export.used_through_export
+                            && !matches!(export.fact.kind.as_str(), "type" | "interface");
                         OxcExportVerdict {
                             symbol: export.fact.name.as_symbol(),
                             kind: export.fact.kind,
@@ -1034,6 +1051,7 @@ impl<'a> GraphBuilder<'a> {
                             provenance: OXC_PROVENANCE.to_string(),
                             has_references: export.reference_origins.has_references(),
                             test_only_reference_files: export.reference_origins.test_only_files(),
+                            only_same_file_references,
                             also_reexported: export
                                 .also_reexported
                                 .into_iter()
@@ -1218,6 +1236,9 @@ impl DecoratorFrameworkCache {
 
 fn mark_used(export: &mut ExportState, reason: &str, origin: &ReferenceOrigin) -> bool {
     export.reference_origins.record(origin);
+    if reason != SAME_FILE_VALUE_REFERENCE_REASON {
+        export.used_through_export = true;
+    }
     match export.status {
         ExportStatus::Used(_) => false,
         ExportStatus::Uncertain(_) => {
@@ -1232,6 +1253,9 @@ fn mark_used(export: &mut ExportState, reason: &str, origin: &ReferenceOrigin) -
 }
 
 fn mark_uncertain(export: &mut ExportState, reason: &str) -> bool {
+    // Uncertainty comes from another module (a wildcard or namespace use), so
+    // the export binding itself may be in use.
+    export.used_through_export = true;
     if matches!(export.status, ExportStatus::Unused) {
         export.status = ExportStatus::Uncertain(reason.to_string());
         true

@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 static CAMEL_CASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-z][A-Z]").unwrap());
@@ -176,6 +176,8 @@ pub fn extract_content_tokens(text: &str) -> Vec<String> {
 /// text slice. Exact-tier fusion supplies at most three consecutive source lines
 /// and exits as soon as every requested token has been observed.
 pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
+    #[cfg(test)]
+    crate::search_hot_path_measurements::record(|counts| counts.token_scans += 1);
     if tokens.is_empty() {
         return false;
     }
@@ -188,6 +190,48 @@ pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Find the narrowest all-token window of at most three source lines. Tracking
+/// the most recent line for each token avoids rejoining overlapping windows;
+/// identifier matches cannot span the newline separators used by those windows.
+pub(crate) fn minimum_content_token_window(text: &str, tokens: &[String]) -> Option<usize> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut last_seen = tokens
+        .iter()
+        .map(|token| (token.as_str(), None::<usize>))
+        .collect::<HashMap<_, _>>();
+    let mut best = None;
+    for (line_index, line) in text.lines().enumerate() {
+        #[cfg(test)]
+        crate::search_hot_path_measurements::record(|counts| counts.token_lines_scanned += 1);
+        for found in IDENTIFIER_TOKEN_RE.find_iter(line) {
+            let word = found.as_str();
+            let lower = if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(word.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(word)
+            };
+            if let Some(position) = last_seen.get_mut(lower.as_ref()) {
+                *position = Some(line_index);
+            }
+        }
+        let oldest = last_seen.values().try_fold(usize::MAX, |oldest, position| {
+            position.map(|position| oldest.min(position))
+        });
+        if let Some(oldest) = oldest {
+            let width = line_index - oldest + 1;
+            if width <= 3 && best.is_none_or(|previous| width < previous) {
+                best = Some(width);
+                if width == 1 {
+                    return best;
+                }
+            }
+        }
+    }
+    best
 }
 
 pub(crate) fn is_type_concept_identifier_query(query: &str, shape: &QueryShape) -> bool {
@@ -1150,5 +1194,91 @@ mod tests {
         ] {
             assert_ne!(kind(query), QueryKind::Regex, "{query}");
         }
+    }
+}
+
+#[cfg(test)]
+mod hot_path_tests {
+    use super::*;
+
+    pub(super) fn reference_window(text: &str, tokens: &[String]) -> Option<usize> {
+        let lines = text.lines().collect::<Vec<_>>();
+        (1..=3).find(|width| {
+            lines.len() >= *width
+                && lines
+                    .windows(*width)
+                    .any(|window| contains_all_content_tokens(&window.join("\n"), tokens))
+        })
+    }
+
+    #[test]
+    fn minimum_window_matches_joined_window_reference() {
+        let token_sets = [
+            vec![],
+            vec!["alpha".to_string()],
+            vec!["alpha".to_string(), "beta".to_string()],
+            vec![
+                "alpha".to_string(),
+                "alpha".to_string(),
+                "gamma".to_string(),
+            ],
+            vec!["ALPHA".to_string()],
+            vec!["alpha.beta".to_string(), "$value".to_string()],
+        ];
+        for text in [
+            "",
+            "ALPHA\nbeta",
+            "alpha\n\n\nbeta",
+            "alpha\nbeta\nalpha beta",
+            "αalpha\nbeta",
+            "alpha\r\nbeta\rgamma",
+            "alpha.beta\n$value",
+            "alpha\nbeta\ngamma\nalpha gamma",
+        ] {
+            for tokens in &token_sets {
+                assert_eq!(
+                    minimum_content_token_window(text, tokens),
+                    reference_window(text, tokens),
+                    "text={text:?}, tokens={tokens:?}"
+                );
+            }
+        }
+        let tokens = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        for seed in 0u64..100 {
+            let mut state = seed + 1;
+            let mut text = String::new();
+            for _ in 0..80 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push_str(
+                    [
+                        "alpha\n",
+                        "BETA\r\n",
+                        "gamma\n",
+                        "other\n",
+                        "alpha beta gamma\n",
+                        "\n",
+                    ][(state >> 32) as usize % 6],
+                );
+            }
+            assert_eq!(
+                minimum_content_token_window(&text, &tokens),
+                reference_window(&text, &tokens),
+                "seed={seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_window_does_not_allocate_per_overlapping_window() {
+        let tokens = vec!["alpha".to_string(), "beta".to_string()];
+        let text = format!("alpha\n{}beta\n", "unrelated\n".repeat(1000));
+        minimum_content_token_window("warmup", &tokens);
+        let (actual, allocations) =
+            crate::test_allocations::count(|| minimum_content_token_window(&text, &tokens));
+        assert_eq!(actual, None);
+        assert!(
+            allocations < 64,
+            "unexpected per-window allocations: {allocations}"
+        );
     }
 }

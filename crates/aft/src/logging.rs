@@ -13,7 +13,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -660,12 +660,15 @@ pub fn init() {
         Ok((sink, summary)) => {
             startup_sweep = Some(summary);
             let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
+            let sink = Arc::new(Mutex::new(Some(sink)));
+            let worker_sink = Arc::clone(&sink);
             thread::Builder::new()
                 .name("aft-log-writer".to_string())
-                .spawn(move || run_file_writer(sink, rx))
+                .spawn(move || run_file_writer(worker_sink, rx))
                 .map(|_| {
                     if let Ok(mut control) = FILE_CONTROL.lock() {
                         control.tx = Some(tx.clone());
+                        control.sink = Some(sink);
                         control.storage_root = Some(storage_root.clone());
                     }
                     Some(tx)
@@ -736,11 +739,15 @@ fn write_log_line<W: Write + ?Sized>(
 /// Civil-date math uses the days-from-epoch algorithm (Howard Hinnant's
 /// `civil_from_days`); u64 seconds keep it valid far past 2100.
 fn format_utc_timestamp() -> String {
-    let secs = SystemTime::now()
+    let since_epoch = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_epoch_secs(secs)
+        .unwrap_or_default();
+    let seconds = format_epoch_secs(since_epoch.as_secs());
+    format!(
+        "{}.{:03}Z",
+        seconds.trim_end_matches('Z'),
+        since_epoch.subsec_millis()
+    )
 }
 
 fn format_epoch_secs(secs: u64) -> String {
@@ -790,10 +797,13 @@ enum LogMessage {
     Flush(SyncSender<()>),
 }
 
+type SharedFileSink = Arc<Mutex<Option<RotatingFile>>>;
+
 #[derive(Default)]
 struct FileControl {
     tx: Option<SyncSender<LogMessage>>,
     storage_root: Option<PathBuf>,
+    sink: Option<SharedFileSink>,
 }
 
 static FILE_CONTROL: LazyLock<Mutex<FileControl>> =
@@ -833,11 +843,20 @@ impl Write for TeeWriter {
     }
 }
 
-fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
+fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) {
     // Test-only: hold each batch so a test can prove exit paths wait for the
     // writer instead of racing it. Debug builds only; release ignores it.
     #[cfg(debug_assertions)]
     let test_delay = std::env::var("AFT_TEST_LOG_WRITER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
+    // Test-only: acknowledge each flush request no sooner than this long after
+    // the writer collects it. The batch delay above does not bound that: a
+    // flush queued near the end of a delayed batch is collected and
+    // acknowledged with it almost at once. Debug builds only.
+    #[cfg(debug_assertions)]
+    let test_flush_hold = std::env::var("AFT_TEST_LOG_FLUSH_HOLD_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_millis);
@@ -870,6 +889,12 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
             LogMessage::Reconfigure(storage_root) => reconfigure = Some(storage_root),
             LogMessage::Flush(done) => flushed = Some(done),
         }
+        // Exit can take the sink while the worker is delayed. Serialize terminal
+        // writes with rotation and reconfiguration, but not with queue waits.
+        let mut slot = shared_sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sink) = slot.as_mut() else { break };
         if !lines.is_empty() {
             if let Err(error) = sink.write_batch(&lines) {
                 write_stderr_once(&format!(
@@ -882,6 +907,15 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
         // The channel is FIFO, so every line queued before the flush request
         // has been written by now.
         if let Some(done) = flushed {
+            #[cfg(debug_assertions)]
+            if let Some(hold) = test_flush_hold {
+                // Release the sink first: the exit path takes it to write its
+                // terminal line, and must not wait out this hold.
+                drop(slot);
+                thread::sleep(hold);
+                let _ = done.try_send(());
+                continue;
+            }
             let _ = done.try_send(());
         }
         if let Some(storage_root) = reconfigure {
@@ -889,7 +923,7 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
             let path = logs_dir.join(format!("aft-{}.log", std::process::id()));
             match prepare_file_sink(&logs_dir, &path) {
                 Ok((new_sink, summary)) => {
-                    sink = new_sink;
+                    *sink = new_sink;
                     log_sweep_summary(summary);
                 }
                 Err(error) => write_stderr_once(&format!(
@@ -929,6 +963,42 @@ pub fn flush_durable_log(timeout: std::time::Duration) -> bool {
         return false;
     }
     done_rx.recv_timeout(timeout).is_ok()
+}
+
+/// Persist the last process-exit line without depending on the async writer.
+/// Taking its active sink prevents later rotation or reconfiguration from
+/// moving the marker. Queued diagnostics may be abandoned once their bounded
+/// flush expires, but this line is appended and synced before exit proceeds.
+pub fn write_terminal_log_sync(message: &str) -> io::Result<()> {
+    let shared = FILE_CONTROL
+        .lock()
+        .map_err(|_| io::Error::other("log control poisoned"))?
+        .sink
+        .clone()
+        .ok_or_else(|| io::Error::other("durable log disabled"))?;
+    let mut slot = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut sink = slot
+        .take()
+        .ok_or_else(|| io::Error::other("log sink already stopped"))?;
+    if let Some(mut writer) = sink.writer.take() {
+        writer.flush()?;
+    }
+    let mut line = Vec::new();
+    write_log_line(
+        &mut line,
+        &format_utc_timestamp(),
+        log::Level::Info,
+        "aft",
+        &format_args!("{message}"),
+    )?;
+    let _ = io::stderr().write_all(&line);
+    let mut file = open_private_log_file(&sink.path, false)?;
+    file.write_all(&line)?;
+    file.sync_all()?;
+    sink.write_counter.credit_logical(line.len() as u64);
+    Ok(())
 }
 
 struct RotatingFile {
@@ -1348,6 +1418,8 @@ fn mark_log_sweep_ran() {
 }
 
 /// Run log maintenance from an existing idle/maintenance tick at most hourly.
+/// The sweep walks and deletes files, so it runs on its own thread: callers
+/// include the subc frame loop, which must not wait on the filesystem.
 pub fn maybe_sweep_logs() {
     let now = Instant::now();
     let should_run = LAST_LOG_SWEEP
@@ -1365,6 +1437,15 @@ pub fn maybe_sweep_logs() {
         return;
     }
 
+    let spawned = std::thread::Builder::new()
+        .name("aft-log-sweep".to_owned())
+        .spawn(sweep_logs_now);
+    if let Err(error) = spawned {
+        crate::slog_warn!("log retention sweep could not start: {}", error);
+    }
+}
+
+fn sweep_logs_now() {
     let storage_root = FILE_CONTROL
         .lock()
         .ok()
@@ -1974,6 +2055,7 @@ mod tests {
         let path = temp.path().join("aft-777.log");
         let sink = RotatingFile::open(path.clone(), LOG_FILE_BYTES, 1, 1).unwrap();
         let (tx, rx) = mpsc::sync_channel(8);
+        let sink = Arc::new(Mutex::new(Some(sink)));
         let writer = thread::spawn(move || run_file_writer(sink, rx));
         let mut tee = TeeWriter { file_tx: Some(tx) };
         let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";

@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "pi-host-provided-peers"
+  ],
+  "note": "The Pi plugin declares Pi's host-provided packages (typebox, pi-ai, pi-coding-agent, pi-tui) as \"*\" peers instead of installing typebox as a dependency, which Pi 0.99 warns about at startup; with a manifest guard test. No ranking-fence files."
+}

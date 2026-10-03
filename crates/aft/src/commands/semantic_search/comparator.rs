@@ -121,6 +121,18 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
                     Ordering::Equal => {}
                     ord => return ord,
                 }
+                // Two declarations of the member a `receiver.member` query
+                // names: the one in a file whose path names the receiver
+                // (`ctx.set_harness` -> `context.rs`) is more likely to be on
+                // the receiver's type, so it sorts first.
+                match b
+                    .evidence
+                    .receiver_in_path
+                    .cmp(&a.evidence.receiver_in_path)
+                {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
             }
         }
         ord => return ord,
@@ -206,11 +218,23 @@ fn source_before_data(a: &CandidateResult, b: &CandidateResult) -> Ordering {
 }
 
 /// Compare score-free tail fields (9)-(11):
-/// (9) path, byte-wise ascending
+/// (9) source code before any other file, then path, byte-wise ascending
 /// (10) result granularity: file-level (range == None) sorts before symbol-level (range == Some)
 /// (11) symbol range start offset ascending, then end offset ascending
+///
+/// The source-first step keeps a path sort from deciding between source and a
+/// document: without it `.gsd/notes.md` sorted before `crates/x.rs` on equal
+/// evidence only because `.` is a smaller byte than `c`.
 pub fn compare_fields_9_to_11(a: &CandidateResult, b: &CandidateResult) -> Ordering {
-    // (9) path byte-wise ascending
+    // (9a) source code before documents, data and unrecognised files
+    let a_source = super::exact_lane::is_definition_source(&a.path);
+    let b_source = super::exact_lane::is_definition_source(&b.path);
+    match b_source.cmp(&a_source) {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
+
+    // (9b) path byte-wise ascending
     match a
         .path
         .to_string_lossy()
@@ -523,7 +547,40 @@ mod tests {
     fn source_file_descriptor_serializes_without_data_flag() {
         let json = serde_json::to_value(EvidenceDescriptor::for_e1(1, true, false)).unwrap();
         assert!(json.get("data_file").is_none());
+        assert!(json.get("receiver_in_path").is_none());
         let parsed: EvidenceDescriptor = serde_json::from_value(json).unwrap();
         assert!(!parsed.data_file);
+        assert!(!parsed.receiver_in_path);
+    }
+
+    #[test]
+    fn source_code_wins_a_tie_that_the_path_sort_would_give_a_document() {
+        // Same evidence, and `.gsd/...` is the smaller path. Before the tail
+        // ordered source first, the note ranked above the declaring file.
+        for evidence in [
+            EvidenceDescriptor::for_e1(1, true, false),
+            EvidenceDescriptor::for_e2(2, true, false),
+        ] {
+            let note = exact_candidate(".gsd/S05-RESEARCH.md", evidence.clone(), false);
+            let source = exact_candidate("crates/aft/src/edit.rs", evidence, false);
+            let mut results = vec![note.clone(), source.clone()];
+            sort_r3(&mut results);
+            assert_eq!(results, vec![source, note]);
+        }
+    }
+
+    #[test]
+    fn definition_in_a_file_naming_the_receiver_sorts_first() {
+        let other = exact_candidate(
+            "crates/aft/src/bash_background/registry.rs",
+            EvidenceDescriptor::for_definition(true, false),
+            false,
+        );
+        let mut named = EvidenceDescriptor::for_definition(true, false);
+        named.receiver_in_path = true;
+        let receiver = exact_candidate("crates/aft/src/context.rs", named, false);
+        let mut results = vec![other.clone(), receiver.clone()];
+        sort_r3(&mut results);
+        assert_eq!(results, vec![receiver, other]);
     }
 }

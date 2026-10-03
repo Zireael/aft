@@ -105,6 +105,10 @@ pub mod cause {
     /// A read-only checkout (a linked worktree) shares a callgraph store that
     /// the main checkout has not built yet.
     pub const READ_ONLY_STORE_NOT_BUILT: &str = "read_only_store_not_built";
+    /// The index's on-disk artifact (or the storage root's reader floor)
+    /// needs a newer AFT build. The reported reason is the full refusal text,
+    /// which starts with this code and names the artifact and versions.
+    pub const STORAGE_REQUIRES_NEWER_READER: &str = crate::persisted_format::CODE;
 }
 
 /// Observed state of one index plane: the effective state plus, only when
@@ -187,11 +191,54 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     if !plane.enabled_in(&ctx.config()) {
         return IndexObservation::off();
     }
+    // A newer build's artifact is refused rather than rebuilt, so nothing
+    // will ever make the index usable in this build: name that as the cause
+    // instead of whatever state the refused load left behind.
+    if let Some(refusal) = storage_refusal(ctx, plane) {
+        return IndexObservation::unavailable(refusal.to_string());
+    }
     match plane {
         IndexPlane::Trigram => observe_trigram(ctx),
         IndexPlane::Semantic => observe_semantic(ctx),
         IndexPlane::Callgraph => observe_callgraph(ctx),
     }
+}
+
+/// The recorded refusal, if any, of this root's artifact for `plane`: its own
+/// file written by a newer build, or the storage root's reader floor. Passive:
+/// consults only what readers and the startup floor check already recorded.
+pub fn storage_refusal(
+    ctx: &AppContext,
+    plane: IndexPlane,
+) -> Option<crate::persisted_format::UnsupportedPersistedFormat> {
+    use crate::persisted_format::{refusal_covering, PersistedStore};
+    let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+    let key = ctx
+        .canonical_cache_root_opt()
+        .and_then(|root| ctx.cached_artifact_cache_key(&root));
+    // Without a key only a floor refusal (scoped to the whole storage root)
+    // can match the plane's directory.
+    let under = |dir: &str| match key.as_deref() {
+        Some(key) => storage.join(dir).join(key),
+        None => storage.join(dir),
+    };
+    let candidates = match plane {
+        IndexPlane::Trigram => vec![(
+            PersistedStore::SearchIndex,
+            under("index").join("cache.bin"),
+        )],
+        IndexPlane::Semantic => {
+            let path = under("semantic").join("semantic.bin");
+            vec![
+                (PersistedStore::SemanticIndex, path.clone()),
+                (PersistedStore::SemanticSegment, path),
+            ]
+        }
+        IndexPlane::Callgraph => vec![(PersistedStore::CallgraphStore, under("callgraph"))],
+    };
+    candidates
+        .into_iter()
+        .find_map(|(store, path)| refusal_covering(store, &path))
 }
 
 // Observation takes locks with `try_*` only: a caller may already hold an
@@ -264,7 +311,7 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
         Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
+    } || ctx.checkout_semantic_runtime().is_some();
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),

@@ -7,6 +7,8 @@ use std::time::Duration;
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 
+pub mod dispatch;
+
 use self::profile::{PhaseProbe, WritePhase};
 use crate::callgraph_store::{
     initialize_schema, join, set_meta_ready, CallGraphStoreError, Result, PROVENANCE_TREESITTER,
@@ -98,7 +100,7 @@ pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
 
-const MATERIALIZATION_VERSION: &str = "6";
+const MATERIALIZATION_VERSION: &str = "7";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
@@ -211,7 +213,38 @@ fn materialize(
     database_path: &Path,
     callgraph_blob_database: &Path,
     manifest: &crate::views::Manifest,
+    base: Option<&crate::views::Manifest>,
+) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    let blob_connection = crate::db::file_identity::IdentityConnection::open(
+        callgraph_blob_database,
+        "views::materialization::blob_reader",
+    )?;
+    let reader = ManifestViewBlobReader::new(&blob_connection);
+    materialize_reading(
+        database_path,
+        manifest,
+        base,
+        &reader,
+        Some(&blob_connection),
+    )
+}
+
+/// Cold construction from an immutable blob reader, including v2 family stores.
+/// The caller supplies a private derived path and owns publication and pinning.
+pub fn materialize_from_blob_reader(
+    database_path: &Path,
+    manifest: &crate::views::Manifest,
+    reader: &impl join::ManifestBlobReader,
+) -> Result<()> {
+    materialize_reading(database_path, manifest, None, reader, None).map(|_| ())
+}
+
+fn materialize_reading(
+    database_path: &Path,
+    manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
+    reader: &impl join::ManifestBlobReader,
+    blob_connection: Option<&Connection>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
     let write_probe = profile::WriteProbe::start(database_path);
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
@@ -290,17 +323,19 @@ fn materialize(
             .map(|(path, _)| path.as_bytes().to_vec())
             .collect::<BTreeSet<_>>()
     });
-    let blob_connection = crate::db::file_identity::IdentityConnection::open(
-        callgraph_blob_database,
-        "views::materialization::blob_reader",
-    )?;
-    let reader = ManifestViewBlobReader::new(&blob_connection);
     let mut cached_for_invalidation = None;
     let mut fact_invalidated = BTreeSet::new();
     let mut fallback_count = 0;
     let selected = match (&changed, base) {
-        (Some(changed), Some(base)) if !requires_full_resolution(base, manifest, changed) => {
-            let diff = resolution_facts::diff_inputs(base, manifest, changed, &blob_connection)?;
+        (Some(changed), Some(base))
+            if blob_connection.is_some() && !requires_full_resolution(base, manifest, changed) =>
+        {
+            let diff = resolution_facts::diff_inputs(
+                base,
+                manifest,
+                changed,
+                blob_connection.expect("legacy incremental blob connection"),
+            )?;
             if diff.unknown == 0 && (!diff.changed.is_empty() || diff.inputs_changed) {
                 let cached = load_bindings(&transaction)?;
                 for (caller, binding) in &cached {
@@ -452,7 +487,7 @@ fn materialize(
             continue;
         };
         let blob = reader
-            .read_decoded(key)
+            .read_callgraph_blob_decoded(key)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             .ok_or_else(|| {
                 CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
@@ -570,7 +605,7 @@ fn materialize(
     let selected_join_probe = PhaseProbe::start(&transaction);
     let joined = join::join_selected_manifest_reusing_surfaces(
         manifest,
-        &reader,
+        reader,
         selected.as_ref(),
         &cached,
         &changed_strings,
@@ -796,7 +831,7 @@ fn materialize(
         ensure_manifest_path(
             &caller_path,
             manifest,
-            &reader,
+            reader,
             &mut loaded_paths,
             &mut parsed,
             &mut nodes,
@@ -808,7 +843,7 @@ fn materialize(
             ensure_manifest_path(
                 target,
                 manifest,
-                &reader,
+                reader,
                 &mut loaded_paths,
                 &mut parsed,
                 &mut nodes,
@@ -1045,6 +1080,7 @@ fn materialize(
     // Secondary indexes remain live because updating them as rows change is cheaper
     // than rebuilding them; that maintenance cost is included in row-phase timings.
     profile.observe_empty(WritePhase::IndexMaintenance);
+    dispatch::emit(&transaction, manifest, reader)?;
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
@@ -1061,10 +1097,10 @@ fn materialize(
     }
     // Include destruction in the bracket: freeing decoded blobs and closing
     // SQLite handles happens before the caller observes materialization complete.
-    drop((reader, parsed, nodes, cached));
+    drop((parsed, nodes, cached));
     drop(joined.bindings);
     profile.finish("cleanup_memory");
-    drop((blob_connection, connection));
+    drop(connection);
     profile.finish("cleanup_connections");
     Ok((stats, profile.into_timings()))
 }
@@ -1440,7 +1476,7 @@ impl EmissionParse {
 fn ensure_manifest_path(
     path: &str,
     manifest: &crate::views::Manifest,
-    blobs: &ManifestViewBlobReader<'_>,
+    blobs: &impl join::ManifestBlobReader,
     loaded: &mut BTreeSet<String>,
     parsed: &mut BTreeMap<String, EmissionParse>,
     nodes: &mut HashMap<String, HashMap<String, String>>,
@@ -1463,7 +1499,7 @@ fn ensure_manifest_path(
         return Ok(());
     };
     let blob = blobs
-        .read_decoded(key)
+        .read_callgraph_blob_decoded(key)
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
         .ok_or_else(|| {
             CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
@@ -1482,3 +1518,7 @@ fn ensure_manifest_path(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "materialization/dispatch_proofs.rs"]
+mod dispatch_proofs;

@@ -16,13 +16,22 @@
  * spawned after shutdown keeps this process running just like the reported
  * hang.
  *
+ * Every mode except "plugin-validate" fires `session_start` right after the
+ * factory returns, as Pi and OMP do as soon as a session exists.
+ *
  * Environment (set by the parent test):
  *   HARNESS_NPM_MARKER  file the fake `npm` writes its pid to once it starts
  *   HARNESS_PLUGIN      absolute path of the plugin entry (src/index.ts)
  *   HARNESS_MODE        "sigterm": skip session_shutdown, add a second SIGTERM
  *                       listener that never exits, and wait for the parent to
  *                       send SIGTERM; "subagent": expect MAGIC_CONTEXT_PI_SUBAGENT=1,
- *                       watch startup stay quiet, then call aft_outline
+ *                       watch startup stay quiet, then call aft_outline;
+ *                       "plugin-validate": load the extension the way OMP's
+ *                       `plugin install` / `plugin upgrade` validates it (call
+ *                       the factory, fire no session event at all), with the
+ *                       ONNX Runtime ready at once, then let the script end;
+ *                       "session-warmup": ONNX Runtime ready at once, fire
+ *                       session_start, wait for the warmup bridge, shut down
  *
  * Stdout protocol, one line each: `EVENT <name> <detail>`.
  */
@@ -95,10 +104,15 @@ function makeFakeInnerPool() {
   };
 }
 
+const mode = process.env.HARNESS_MODE;
 let resolveOnnx: (dir: string | null) => void = () => undefined;
 const onnxReady = new Promise<string | null>((resolve) => {
   resolveOnnx = resolve;
 });
+// The ONNX Runtime is available at once (as with a system install), so in
+// these modes nothing but the plugin's own startup decisions can hold back a
+// warmup.
+if (mode === "plugin-validate" || mode === "session-warmup") resolveOnnx("/fake/onnxruntime");
 
 Bun.plugin({
   name: "headless-exit-bridge-seams",
@@ -111,8 +125,9 @@ Bun.plugin({
         findBinary: async () => "/fake/aft",
         ensureBinary: async () => "/fake/aft",
         ensureStorageMigrated: async () => undefined,
-        // Resolves only after shutdown, so the eager warmup is still waiting
-        // on it when the host tears the session down.
+        // Outside plugin-validate mode this resolves only after shutdown, so
+        // the eager warmup is still waiting on it when the host tears the
+        // session down.
         ensureOnnxRuntime: () => {
           emit("onnx-prepare");
           return onnxReady;
@@ -149,7 +164,41 @@ const plugin = (await import(pluginPath)).default as (api: unknown) => Promise<v
 await plugin(pi);
 emit("plugin-ready");
 
-if (process.env.HARNESS_MODE === "subagent") {
+const sessionCtx = (sessionId: string) => ({
+  cwd: process.cwd(),
+  hasUI: false,
+  sessionManager: { getSessionId: () => sessionId },
+});
+
+if (mode === "plugin-validate") {
+  // OMP's PluginManager.install() calls loadExtensions() on the installed entry
+  // and returns; the CLI then prints "Installed ..." and its main() returns.
+  // There is no session, so no session_start and no session_shutdown. The
+  // parent measures how long this process lives after the next line.
+  emit("validate-done", `bridges=${bridgesSpawned}`);
+} else {
+  emit("session-start-fired");
+  for (const handler of handlers.get("session_start") ?? []) {
+    await handler({ type: "session_start", reason: "startup" }, sessionCtx("harness-session"));
+  }
+  emit("session-started");
+}
+
+if (mode === "plugin-validate") {
+  // Nothing more: the script ends here, like the OMP CLI command does.
+} else if (mode === "session-warmup") {
+  // A real session still gets its warmup bridge at session start, before any
+  // tool call, so deferring it out of the factory costs no first-call latency.
+  const deadline = Date.now() + 5_000;
+  while (bridgesSpawned === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  emit("warmup-observed", `bridges=${bridgesSpawned}`);
+  for (const handler of handlers.get("session_shutdown") ?? []) {
+    await handler({}, {});
+  }
+  emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
+} else if (mode === "subagent") {
   // Give any eager startup work time to show itself: an npm spawn, an ONNX
   // Runtime preparation, or a warmup bridge would all land well within this.
   await new Promise((resolve) => setTimeout(resolve, 1_500));
@@ -157,11 +206,7 @@ if (process.env.HARNESS_MODE === "subagent") {
   emit("startup-quiet", `bridges=${bridgesSpawned}`);
   const outline = tools.get("aft_outline");
   if (!outline) throw new Error("aft_outline was not registered");
-  const extCtx = {
-    cwd: process.cwd(),
-    hasUI: false,
-    sessionManager: { getSessionId: () => "subagent-session" },
-  };
+  const extCtx = sessionCtx("subagent-session");
   const result = await outline.execute("call-1", { target: "a.ts" }, undefined, undefined, extCtx);
   emit("tool-result", JSON.stringify(result).slice(0, 200));
   for (const handler of handlers.get("session_shutdown") ?? []) {
@@ -176,7 +221,7 @@ if (process.env.HARNESS_MODE === "subagent") {
   }
   emit(existsSync(npmMarker) ? "npm-started" : "npm-never-started");
 
-  if (process.env.HARNESS_MODE === "sigterm") {
+  if (mode === "sigterm") {
     // Stand in for a host that also listens for SIGTERM but never exits from it
     // (Pi's signal-exit listener stands aside while another listener exists),
     // and that keeps running on its own, like an interactive host would.

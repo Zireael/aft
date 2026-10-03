@@ -46,7 +46,9 @@ fn test_fallback_three_fixtures_name_specific_limits() {
     assert_eq!(res_file.files_visited, 12);
     assert_eq!(res_file.bound_reason.as_deref(), Some("file limit"));
     let disc_file = res_file.verified_set.bound_disclosure.unwrap();
-    assert_eq!(disc_file, "exact pass: bounded (12 files, file limit)");
+    assert!(disc_file.starts_with("exact pass: bounded (12 files, file limit)"));
+    assert!(disc_file.contains("checked 12 of 30 discovered files"));
+    assert!(disc_file.contains("not fully searched; use grep for an exhaustive check"));
 
     // 2. result limit fixture
     let opts_res = FallbackExactOptions {
@@ -60,13 +62,12 @@ fn test_fallback_three_fixtures_name_specific_limits() {
     assert_eq!(res_result.verified_set.results.len(), 5);
     assert_eq!(res_result.bound_reason.as_deref(), Some("result limit"));
     let disc_result = res_result.verified_set.bound_disclosure.unwrap();
-    assert_eq!(
-        disc_result,
-        format!(
-            "exact pass: bounded ({} files, result limit)",
-            res_result.files_visited
-        )
-    );
+    assert!(disc_result.starts_with(&format!(
+        "exact pass: bounded ({} files, result limit)",
+        res_result.files_visited
+    )));
+    assert!(disc_result.contains("checked 5 of 30 discovered files"));
+    assert!(disc_result.contains("not fully searched; use grep for an exhaustive check"));
 
     // 3. index not ready fixture (walk completes without hitting limits)
     let opts_ready = FallbackExactOptions {
@@ -79,11 +80,9 @@ fn test_fallback_three_fixtures_name_specific_limits() {
     let res_ready = lane.execute_fallback_mode(dir.path(), "target phrase", false, &opts_ready);
     assert_eq!(res_ready.files_visited, 30);
     assert!(res_ready.bound_reason.is_none());
-    let disc_ready = res_ready.verified_set.bound_disclosure.unwrap();
-    assert_eq!(
-        disc_ready,
-        "exact pass: bounded (30 files, index not ready)"
-    );
+    // A walk that finished without hitting a limit withheld nothing, so it
+    // carries no bound disclosure and cannot mark the response incomplete.
+    assert_eq!(res_ready.verified_set.bound_disclosure, None);
 }
 
 #[test]
@@ -180,10 +179,14 @@ fn test_fallback_determinism_with_injected_delays() {
         first_p20.bound_disclosure,
         first_direct_p20.bound_disclosure
     );
-    assert_eq!(
-        first_p20.bound_disclosure.as_deref(),
-        Some("exact pass: bounded (25 files, file limit)")
-    );
+    let disclosure = first_p20
+        .bound_disclosure
+        .as_deref()
+        .expect("bounded disclosure");
+    assert!(disclosure.starts_with("exact pass: bounded (25 files, file limit)"));
+    assert!(disclosure.contains("checked 25 of 35 discovered files"));
+    assert!(disclosure.contains("not fully searched; use grep for an exhaustive check"));
+    assert!(disclosure.ends_with("; examined 37 directory entries; narrow: path or query"));
 
     for (p0, p10, p20, direct_p20) in &run_outcomes[1..] {
         // Same N and same reason string
@@ -289,7 +292,9 @@ fn test_bounded_exhaustion_c4() {
     let res = lane.execute_fallback_mode(dir.path(), "target phrase", false, &opts);
     assert_eq!(res.files_visited, 15);
     let bounded_line = res.verified_set.bound_disclosure.unwrap();
-    assert_eq!(bounded_line, "exact pass: bounded (15 files, file limit)");
+    assert!(bounded_line.starts_with("exact pass: bounded (15 files, file limit)"));
+    assert!(bounded_line.contains("checked 15 of 30 discovered files"));
+    assert!(bounded_line.contains("not fully searched; use grep for an exhaustive check"));
 
     // Simulated stop condition C4: depth 400, all lanes exhausted over the bounded universe
     let m = res.verified_set.results.len();
@@ -320,5 +325,58 @@ fn test_mutation_red_c4_omit_bounded_line() {
     assert!(
         !has_bounded_line,
         "mutant reply omitting bounded line must fail assertion"
+    );
+}
+
+#[test]
+fn fallback_bounds_enumeration_of_ineligible_files() {
+    let (dir, paths) = create_temp_corpus_with_files(2000);
+    for name in &paths {
+        fs::write(dir.path().join("src").join(name), [0u8; 32]).unwrap();
+    }
+    let started = std::time::Instant::now();
+    let result = ExactLane::new().execute_fallback_mode(
+        dir.path(),
+        "target phrase",
+        true,
+        &FallbackExactOptions {
+            file_limit: Some(8),
+            ..Default::default()
+        },
+    );
+    eprintln!(
+        "fallback: 2000 binary files, {:?}, entries={}, bound={:?}",
+        started.elapsed(),
+        result.entries_examined,
+        result.bound_reason
+    );
+    assert!(result.entries_examined < 2000);
+    assert!(
+        result.bound_reason.is_some(),
+        "enumeration must stop even when no file is eligible"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fallback_does_not_follow_directory_aliases() {
+    let (dir, _) = create_temp_corpus_with_files(1);
+    std::os::unix::fs::symlink(dir.path().join("src"), dir.path().join("alias")).unwrap();
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("src/cycle")).unwrap();
+    let started = std::time::Instant::now();
+    let result = ExactLane::new().execute_fallback_mode(
+        dir.path(),
+        "target phrase",
+        true,
+        &Default::default(),
+    );
+    eprintln!(
+        "fallback cycle: {:?}, verified={}",
+        started.elapsed(),
+        result.files_visited
+    );
+    assert_eq!(
+        result.files_visited, 1,
+        "directory aliases must not repeat verification"
     );
 }

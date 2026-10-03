@@ -139,6 +139,28 @@ describe("formatCallgraphSections", () => {
     expect(text).not.toContain("line ");
   });
 
+  test("callers marks macro invocation sites and prints the unanalyzed macro note", () => {
+    const text = formatCallgraphSections("callers", {
+      total_callers: 2,
+      callers: [
+        {
+          file: "src/callers.rs",
+          callers: [
+            { symbol: "run_template!", line: 5, resolved_by: "name_match" },
+            { symbol: "caller_one", line: 27, resolved_by: "name_match", via: "run_template!" },
+          ],
+        },
+      ],
+      macro_note: {
+        message:
+          "1 mention of `dsl_target` inside macros could not be analyzed (one location per file): src/callers.rs:35",
+      },
+    }).join("\n");
+    expect(text).toContain("↳ run_template!:5 ~");
+    expect(text).toContain("↳ caller_one:27 ~ via run_template!");
+    expect(text).toContain("could not be analyzed (one location per file): src/callers.rs:35");
+  });
+
   test("callers renders hub-summary hidden-test guidance", () => {
     const text = formatCallgraphSections("callers", {
       total_callers: 49,

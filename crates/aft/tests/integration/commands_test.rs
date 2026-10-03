@@ -552,10 +552,11 @@ fn test_read_rejects_files_larger_than_50mb() {
 }
 
 #[test]
-fn test_read_handles_inverted_line_range() {
-    // Regression for audit #1: read with start_line > end_line previously
-    // panicked at `lines[start_idx..end_idx]` because end_idx was clamped
-    // independently of start_idx. Must now return success with zero lines.
+fn test_read_refuses_inverted_line_range() {
+    // An inverted window once panicked at `lines[start_idx..end_idx]`; the
+    // clamp that fixed the panic then returned an empty SUCCESS, which a
+    // reader cannot tell apart from "those lines are blank". It must now be
+    // refused by name, and the process must stay alive.
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let file = temp_dir.path().join("sample.txt");
     std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").expect("write sample");
@@ -570,15 +571,71 @@ fn test_read_handles_inverted_line_range() {
     ));
 
     assert_eq!(
-        resp["success"], true,
-        "inverted range should not crash: {:?}",
-        resp
+        resp["success"], false,
+        "inverted range must refuse: {resp:?}"
     );
-    assert_eq!(resp["lines_read"], 0);
+    assert_eq!(resp["code"], "invalid_range", "{resp:?}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("startLine 8 is after endLine 3")),
+        "{resp:?}"
+    );
 
     // Process must still be alive (would be dead on the old panic path).
     let ping = aft.send(r#"{"id":"alive","command":"ping"}"#);
     assert_eq!(ping["success"], true);
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
+fn test_read_refuses_start_past_end_of_non_empty_file() {
+    // A window that starts after the last line selects nothing; it must be
+    // refused by name instead of returning an empty success.
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let file = temp_dir.path().join("sample.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write sample");
+    let empty = temp_dir.path().join("empty.txt");
+    std::fs::write(&empty, "").expect("write empty");
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.configure(temp_dir.path());
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"read-past","command":"read","file":{},"start_line":10,"end_line":20}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(
+        resp["success"], false,
+        "past-end start must refuse: {resp:?}"
+    );
+    assert_eq!(resp["code"], "invalid_range", "{resp:?}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("startLine 10 is past the end of the file (3 lines)")),
+        "{resp:?}"
+    );
+
+    // Zero placeholders select no window at all, so they read the default
+    // window instead of zero lines.
+    let resp = aft.send(&format!(
+        r#"{{"id":"read-zero","command":"read","file":{},"start_line":0,"end_line":0,"limit":0}}"#,
+        crate::helpers::json_string(&file.display())
+    ));
+    assert_eq!(resp["success"], true, "{resp:?}");
+    assert_eq!(resp["lines_read"], 3, "{resp:?}");
+
+    // Reading an empty file is still an honest, successful empty read.
+    let resp = aft.send(&format!(
+        r#"{{"id":"read-empty","command":"read","file":{},"start_line":1,"end_line":5}}"#,
+        crate::helpers::json_string(&empty.display())
+    ));
+    assert_eq!(resp["success"], true, "{resp:?}");
+    assert_eq!(resp["lines_read"], 0, "{resp:?}");
 
     let status = aft.shutdown();
     assert!(status.success());
@@ -610,9 +667,10 @@ fn test_read_directory_caps_entries_at_one_thousand() {
     assert_eq!(entries.len(), 1001);
     assert_eq!(entries[0], "entry_0000.txt");
     assert_eq!(entries[999], "entry_0999.txt");
+    // The directory listing now renders the shared list-envelope trailer.
     assert_eq!(
         entries[1000],
-        "\n... and 5 more entries (truncated, showing first 1000)"
+        "\nshown 1000 of 1005 items (cap) · narrow: path, offset, limit"
     );
 
     let status = aft.shutdown();
@@ -840,4 +898,31 @@ fn test_zoom_supports_csharp_symbols() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn read_directory_pages_through_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..2620 {
+        fs::write(dir.path().join(format!("entry-{n:04}")), "").unwrap();
+    }
+    let mut aft = AftProcess::spawn();
+    for args in [
+        serde_json::json!({"offset": 11, "limit": 10}),
+        serde_json::json!({"offset": "11", "limit": "10"}),
+        serde_json::json!({"start_line": 11, "end_line": 20}),
+    ] {
+        let mut request = args;
+        request["id"] = "directory-window".into();
+        request["command"] = "read".into();
+        request["file"] = serde_json::json!(dir.path());
+        let response = aft.send(&request.to_string());
+        assert_eq!(response["success"], true);
+        assert_eq!(response["entries"].as_array().unwrap().len(), 11);
+        assert_eq!(response["entries"][0], "entry-0010");
+        assert_eq!(response["entries"][9], "entry-0019");
+        assert_eq!(response["entries_shown"], 10);
+        assert_eq!(response["complete"], false);
+    }
+    assert!(aft.shutdown().success());
 }

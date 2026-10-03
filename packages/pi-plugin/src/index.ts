@@ -93,6 +93,7 @@ setActiveLogger(bridgeLogger);
 
 import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
+import { startPiLiveConfigReload } from "./config-live-reload.js";
 import { recordActiveExtensionApi } from "./harness.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
@@ -363,7 +364,10 @@ async function handleConfigureWarningsForSession(context: {
 /**
  * Pi extension default export.
  *
- * Called once per session. Registers tools, commands, and session shutdown hooks.
+ * Called once per session runtime. Registers tools, commands, and session
+ * shutdown hooks. A host may also call it with no session at all (OMP's
+ * `plugin install` and `plugin upgrade` do, to validate the extension), so
+ * nothing that outlives the call starts here; see `startSessionWork`.
  */
 export default async function (pi: ExtensionAPI): Promise<void> {
   recordActiveExtensionApi(pi);
@@ -467,21 +471,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   const storageDir = resolveCortexKitStorageRoot();
 
-  // ONNX runtime for semantic search (optional, best-effort).
-  //
-  // We deliberately do NOT block plugin load on this. The ONNX runtime archive
-  // is 60–80 MB and on a slow connection this can take 30–120 seconds.
-  // Awaiting it inline used to make Pi appear to hang during plugin load, and
-  // SIGKILL'ing the host mid-download left partial state on disk that the
-  // next launch had to recover from.
-  //
-  // Instead: kick off the download as a background promise and patch
-  // `_ort_dylib_dir` into the pool's configure overrides as soon as it
-  // settles. Bridges spawned AFTER the download finishes get it in their
-  // environment; a bridge spawned during the download waits for it and loads
-  // it without a restart. `ensureOnnxRuntime` returns null on unsupported
-  // platforms.
-  let onnxRuntimePromise: Promise<string | null> | null = null;
   // Which sessions skip, and why a plain headless run does not, is decided in
   // session-kind.ts next to the worker signal bash and bash_watch use.
   const skipEagerStartup = skipsEagerStartup();
@@ -489,12 +478,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     log(
       `${MAGIC_CONTEXT_SUBAGENT_ENV}=1: running as a pi-magic-context subagent, so skipping eager warmup, ONNX Runtime preparation and LSP auto-install; the bridge starts on the first AFT tool call`,
     );
-  }
-  if (!skipEagerStartup && shouldPrepareOnnxRuntime(config)) {
-    onnxRuntimePromise = ensureOnnxRuntime(storageDir).catch((err) => {
-      warn(`Failed to prepare ONNX Runtime: ${err instanceof Error ? err.message : String(err)}`);
-      return null;
-    });
   }
 
   // Build configure-time params forwarded to every bridge on spawn.
@@ -504,136 +487,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const configOverrides = buildConfigTierConfigureParams(projectRoot, {
     storage_dir: storageDir,
   });
-  let lspInstallCompletion: Promise<string[] | null> | null = null;
   // Set once the host's session_shutdown (or a process signal) begins tearing
   // the pool down. Startup work that is still pending at that point must not
   // call into the pool afterwards: the pool revives on demand, and a bridge
   // spawned after shutdown has no owner left to stop it, so a headless
   // `pi -p` run would never exit.
   let hostShutdownStarted = false;
-  // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
-  // settles. A bridge spawned before that reports its semantic index as
-  // waiting for the download and builds it once the runtime is published.
-
-  // ─────────────────────────── LSP auto-install ───────────────────────────
-  // Mirrors the OpenCode plugin: discover relevant LSPs, surface cached bin
-  // dirs to Rust as `lsp_paths_extra`, kick off background installs for
-  // anything missing. The 7-day grace defends against newly-published
-  // malicious versions. Best-effort — failures never block plugin startup.
+  const lspAutoInstall = !skipEagerStartup && (config.lsp?.auto_install ?? true);
+  // When `lsp.auto_install: false`, leave the list empty so the Rust-side
+  // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
+  // server walk entirely. Without this gate, users who opted out of
+  // auto-install still received `lsp_binary_missing` toasts/log warnings
+  // on every configure. Explicit `lsp.servers` entries are unaffected.
+  configOverrides.lsp_auto_install_binaries = lspAutoInstall
+    ? [...new Set([...NPM_LSP_TABLE, ...GITHUB_LSP_TABLE].map((spec) => spec.binary))]
+    : [];
   let lspAutoInstallPassLease: AutoInstallPassLease | null = null;
-  try {
-    const lspAutoInstall = !skipEagerStartup && (config.lsp?.auto_install ?? true);
-    const lspGraceDays = config.lsp?.grace_days ?? 7;
-    const lspVersions = config.lsp?.versions ?? {};
-    const lspDisabled = new Set(config.lsp?.disabled ?? []);
-    lspAutoInstallPassLease = lspAutoInstall ? claimLspAutoInstallPass() : null;
-    const skippedByRecentAutoInstall = lspAutoInstall && lspAutoInstallPassLease === null;
-    if (skippedByRecentAutoInstall) {
-      log("[lsp] skipping auto-install (another instance ran one recently)");
-    }
-    const runSharedAutoInstall = lspAutoInstall && !skippedByRecentAutoInstall;
-    // When `lsp.auto_install: false`, leave the list empty so the Rust-side
-    // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
-    // server walk entirely. Without this gate, users who opted out of
-    // auto-install still received `lsp_binary_missing` toasts/log warnings
-    // on every configure. Explicit `lsp.servers` entries are unaffected.
-    configOverrides.lsp_auto_install_binaries = lspAutoInstall
-      ? [...new Set([...NPM_LSP_TABLE, ...GITHUB_LSP_TABLE].map((spec) => spec.binary))]
-      : [];
-
-    const npmResult = runAutoInstall(projectRoot, {
-      autoInstall: runSharedAutoInstall,
-      graceDays: lspGraceDays,
-      versions: lspVersions,
-      disabled: lspDisabled,
-    });
-    // The relevance scan only feeds install decisions, so skip the walk when
-    // no install can start.
-    const relevantGithub = runSharedAutoInstall
-      ? discoverRelevantGithubServers(projectRoot)
-      : new Set<string>();
-    const ghResult = runGithubAutoInstall(relevantGithub, {
-      autoInstall: runSharedAutoInstall,
-      graceDays: lspGraceDays,
-      versions: lspVersions,
-      disabled: lspDisabled,
-    });
-    const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];
-    if (mergedBinDirs.length > 0) {
-      configOverrides.lsp_paths_extra = mergedBinDirs;
-    }
-    const lspInflightInstalls = [
-      ...new Set([...npmResult.installingBinaries, ...ghResult.installingBinaries]),
-    ];
-    if (lspInflightInstalls.length > 0) {
-      configOverrides.lsp_inflight_installs = lspInflightInstalls;
-    }
-    const installsWereStarted = npmResult.installsStarted > 0 || ghResult.installsStarted > 0;
-    if (installsWereStarted) {
-      log(
-        `[lsp] auto-install: ${npmResult.installsStarted} npm + ${ghResult.installsStarted} github install(s) running in background`,
-      );
-    }
-
-    // ─── Surface install outcomes once installs settle ───
-    //
-    // Pi loads this extension once at startup, before any session exists, so
-    // we can't send an ignored session message the way the OpenCode plugin
-    // does. Instead we promote actionable skips from `log()` (verbose) to
-    // `warn()` (visible at WARN level) so users running with default logging
-    // see them. Routine skips (already-installed, not-relevant, disabled)
-    // stay out of the warning summary.
-    const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-      .then(() => {
-        if (installsWereStarted || skippedByRecentAutoInstall) {
-          const updatedPaths = [
-            ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
-          ];
-          if (updatedPaths.length > 0) {
-            configOverrides.lsp_paths_extra = updatedPaths;
-          } else {
-            delete configOverrides.lsp_paths_extra;
-          }
-          return updatedPaths;
-        }
-        return null;
-      })
-      .then((updatedPaths) => {
-        const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
-          const r = s.reason.toLowerCase();
-          if (r === "auto_install: false") return false;
-          if (r === "disabled by config") return false;
-          if (r === "not relevant to project") return false;
-          if (r === "already installed") return false;
-          if (r === "another install in progress") return false;
-          return true;
-        });
-        if (actionable.length > 0) {
-          const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
-          warn(
-            `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
-              'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-              "or set `lsp.auto_install: false` to suppress.",
-          );
-        }
-        return updatedPaths;
-      })
-      .catch((err) => {
-        warn(`[lsp] install-summary aggregation failed: ${err}`);
-        return null;
-      })
-      .finally(() => {
-        lspAutoInstallPassLease?.release();
-        lspAutoInstallPassLease = null;
-      });
-    if (installsWereStarted || skippedByRecentAutoInstall) {
-      lspInstallCompletion = installCompletion;
-    }
-  } catch (err) {
-    lspAutoInstallPassLease?.release();
-    lspAutoInstallPassLease = null;
-    warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
 
   let pool: AftTransportPool;
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
@@ -735,20 +604,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       });
     },
   });
-  if (lspInstallCompletion) {
-    lspInstallCompletion.then((updatedPaths) => {
-      if (!updatedPaths) return;
-      void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
-        .then(() => {
-          log(
-            `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
-          );
-        })
-        .catch((err) => {
-          warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
-        });
-    });
-  }
   pool.setConfigureOverride("harness", "pi");
   const surface = resolvePiToolSurface(config, pi);
   // Hashline needs the tagged read slot as well as the edit slot: without it
@@ -774,20 +629,160 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     hashlineEffective: hashlineEditRegistered,
     storageDir,
   };
+  // Keep the live keys of `ctx.config` current when either config file
+  // changes. Tool handlers read `ctx.config` per call; the tool set and its
+  // descriptions stay as loaded and follow the next restart.
+  const liveConfigReload = startPiLiveConfigReload({
+    directory: projectRoot,
+    initialSources: bootstrap.sources ?? [],
+    initialSourceTexts: bootstrap.sourceTexts,
+    getConfig: () => ctx.config,
+    setConfig: (next) => {
+      ctx.config = next;
+    },
+    notify: (message) => deliverConfigMigrationWarnings([message]),
+  });
 
   // Cross-extension status observability producer (cortexkit:aft:status).
   // Registered here — only `pi` and `ctx` are required — so the eager-warmup
   // closure below can re-activate it once the warm bridge exists.
   const statusObservability = registerAftStatusObservability(pi, ctx);
 
-  // Settle the ONNX runtime download promise (started above) and patch the
-  // resolved path into the pool's configure overrides so bridges spawned
-  // after this point get it in their environment. Bridges already running are
-  // not restarted (that would discard warm trigram/semantic/LSP state); one
-  // that started during the download has been waiting on the installer's lock
-  // file and loads the published runtime itself
+  // ──────────────────────── Session-scoped startup ────────────────────────
+  // LSP discovery and auto-install, ONNX Runtime preparation and the warmup
+  // bridge all wait for the first sign of a real session: Pi's `session_start`,
+  // `before_agent_start`, or a tool asking for a bridge (`bridgeFor`), whichever
+  // comes first. Hosts also run this factory with no session at all: OMP's
+  // `plugin install` and `plugin upgrade` call it to validate the extension and
+  // then simply return, without `session_start` or `session_shutdown`. A bridge
+  // spawned there has no session to shut it down, and its child-process pipes
+  // keep the host's event loop alive, so the command never exits (issue #389).
+  // Pi and OMP emit `session_start` as soon as a session exists, before the
+  // first prompt, so a real session still starts warming at load time.
+
+  // ─────────────────────────── LSP auto-install ───────────────────────────
+  // Mirrors the OpenCode plugin: discover relevant LSPs, surface cached bin
+  // dirs to Rust as `lsp_paths_extra`, kick off background installs for
+  // anything missing. The 7-day grace defends against newly-published
+  // malicious versions. Best-effort — failures never block plugin startup.
+  const startLspDiscovery = (): void => {
+    try {
+      const lspGraceDays = config.lsp?.grace_days ?? 7;
+      const lspVersions = config.lsp?.versions ?? {};
+      const lspDisabled = new Set(config.lsp?.disabled ?? []);
+      lspAutoInstallPassLease = lspAutoInstall ? claimLspAutoInstallPass() : null;
+      const skippedByRecentAutoInstall = lspAutoInstall && lspAutoInstallPassLease === null;
+      if (skippedByRecentAutoInstall) {
+        log("[lsp] skipping auto-install (another instance ran one recently)");
+      }
+      const runSharedAutoInstall = lspAutoInstall && !skippedByRecentAutoInstall;
+
+      const npmResult = runAutoInstall(projectRoot, {
+        autoInstall: runSharedAutoInstall,
+        graceDays: lspGraceDays,
+        versions: lspVersions,
+        disabled: lspDisabled,
+      });
+      // The relevance scan only feeds install decisions, so skip the walk when
+      // no install can start.
+      const relevantGithub = runSharedAutoInstall
+        ? discoverRelevantGithubServers(projectRoot)
+        : new Set<string>();
+      const ghResult = runGithubAutoInstall(relevantGithub, {
+        autoInstall: runSharedAutoInstall,
+        graceDays: lspGraceDays,
+        versions: lspVersions,
+        disabled: lspDisabled,
+      });
+      // The pool copied `configOverrides` when it was created, so the paths
+      // found here reach new bridges through the pool's own overrides.
+      const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];
+      if (mergedBinDirs.length > 0) {
+        pool.setConfigureOverride("lsp_paths_extra", mergedBinDirs);
+      }
+      const lspInflightInstalls = [
+        ...new Set([...npmResult.installingBinaries, ...ghResult.installingBinaries]),
+      ];
+      if (lspInflightInstalls.length > 0) {
+        pool.setConfigureOverride("lsp_inflight_installs", lspInflightInstalls);
+      }
+      const installsWereStarted = npmResult.installsStarted > 0 || ghResult.installsStarted > 0;
+      if (installsWereStarted) {
+        log(
+          `[lsp] auto-install: ${npmResult.installsStarted} npm + ${ghResult.installsStarted} github install(s) running in background`,
+        );
+      }
+
+      // ─── Surface install outcomes once installs settle ───
+      //
+      // There is no session to send an ignored message to the way the
+      // OpenCode plugin does, so we promote actionable skips from `log()`
+      // (verbose) to `warn()` (visible at WARN level) so users running with
+      // default logging see them. Routine skips (already-installed,
+      // not-relevant, disabled) stay out of the warning summary.
+      const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
+        .then(() => {
+          if (installsWereStarted || skippedByRecentAutoInstall) {
+            return [...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()])];
+          }
+          return null;
+        })
+        .then((updatedPaths) => {
+          const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
+            const r = s.reason.toLowerCase();
+            if (r === "auto_install: false") return false;
+            if (r === "disabled by config") return false;
+            if (r === "not relevant to project") return false;
+            if (r === "already installed") return false;
+            if (r === "another install in progress") return false;
+            return true;
+          });
+          if (actionable.length > 0) {
+            const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
+            warn(
+              `[lsp] skipped or failed to install ${actionable.length} server(s):\n${lines}\n` +
+                'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
+                "or set `lsp.auto_install: false` to suppress.",
+            );
+          }
+          return updatedPaths;
+        })
+        .catch((err) => {
+          warn(`[lsp] install-summary aggregation failed: ${err}`);
+          return null;
+        })
+        .finally(() => {
+          lspAutoInstallPassLease?.release();
+          lspAutoInstallPassLease = null;
+        });
+      if (installsWereStarted || skippedByRecentAutoInstall) {
+        installCompletion.then((updatedPaths) => {
+          if (!updatedPaths) return;
+          void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
+            .then(() => {
+              log(
+                `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
+              );
+            })
+            .catch((err) => {
+              warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+            });
+        });
+      }
+    } catch (err) {
+      lspAutoInstallPassLease?.release();
+      lspAutoInstallPassLease = null;
+      warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  // Patch the resolved ONNX Runtime path into the pool's configure overrides
+  // so bridges spawned after this point get it in their environment. Bridges
+  // already running are not restarted (that would discard warm
+  // trigram/semantic/LSP state); one that started during the download has been
+  // waiting on the installer's lock file and loads the published runtime itself
   // (`late_onnx_runtime` in crates/aft/src/semantic_index.rs).
-  if (onnxRuntimePromise) {
+  const settleOnnxRuntime = (onnxRuntimePromise: Promise<string | null>): void => {
     onnxRuntimePromise.then(
       (ortDylibDir) => {
         if (ortDylibDir) {
@@ -814,7 +809,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         warn(`ONNX Runtime resolution rejected unexpectedly: ${err}`);
       },
     );
-  }
+  };
 
   // Eager async configure: warm the bridge for `process.cwd()` so the first
   // tool call doesn't pay the spawn + configure latency. Errors are swallowed —
@@ -827,12 +822,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // OpenCode went lazy (avoid spawning N bridges for N sidebar projects at
   // startup) does not apply here, so eager warmup is the correct trade for Pi:
   // it removes first-tool-call latency without the bridge-storm downside.
-  // The $HOME guard below is the only case we skip. See the home-dir note.
+  // "Eager" means at session start, not at extension load: a load with no
+  // session (see the session-scoped startup note above) must not spawn one.
+  // The $HOME guard below is the only other case we skip. See the home-dir note.
   // pi-magic-context children also skip eager warmup because they are
   // short-lived and rarely call an AFT tool; see skipsEagerStartup.
-  void (async () => {
+  const warmBridge = async (onnxRuntimePromise: Promise<string | null> | null): Promise<void> => {
     try {
-      if (skipEagerStartup) return;
       // Note #65: skip eager configure when Pi was launched from the user's
       // home directory. Configuring on `$HOME` walks the entire user home
       // tree (100k–10M files), times out the 30s configure budget, gets
@@ -868,8 +864,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         return;
       }
       const bridge = pool.getBridge(cwd);
-      // No session_id: runs before any user session exists; configure
-      // threads spawned by this warmup will log with no [ses_xxx] prefix.
+      // No session_id: the warmup is not tied to one session; configure
+      // threads spawned by it will log with no [ses_xxx] prefix.
       const response = await bridge.send("status", {});
       // Seed the plugin-side cache so the /aft-status overlay's first poll
       // after spawn finds a warm snapshot instead of racing into bridge.send
@@ -886,7 +882,41 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     } catch (err) {
       log(`eager configure failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  })();
+  };
+
+  let sessionStartupBegun = false;
+  const startSessionWork = (): void => {
+    if (sessionStartupBegun || hostShutdownStarted) return;
+    sessionStartupBegun = true;
+    // ONNX runtime for semantic search (optional, best-effort).
+    //
+    // We deliberately do NOT block on this. The ONNX runtime archive is
+    // 60–80 MB and on a slow connection this can take 30–120 seconds.
+    // Awaiting it inline used to make Pi appear to hang during plugin load,
+    // and SIGKILL'ing the host mid-download left partial state on disk that
+    // the next launch had to recover from.
+    //
+    // Instead: kick off the download as a background promise and patch
+    // `_ort_dylib_dir` into the pool's configure overrides as soon as it
+    // settles. A bridge spawned before that reports its semantic index as
+    // waiting for the download and builds it once the runtime is published.
+    // `ensureOnnxRuntime` returns null on unsupported platforms.
+    const onnxRuntimePromise =
+      !skipEagerStartup && shouldPrepareOnnxRuntime(config)
+        ? ensureOnnxRuntime(storageDir).catch((err) => {
+            warn(
+              `Failed to prepare ONNX Runtime: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            return null;
+          })
+        : null;
+    // Runs even when installs are off (subagents, `lsp.auto_install: false`):
+    // the cached server directories still have to reach the bridge.
+    startLspDiscovery();
+    if (onnxRuntimePromise) settleOnnxRuntime(onnxRuntimePromise);
+    if (!skipEagerStartup) void warmBridge(onnxRuntimePromise);
+  };
+  ctx.startSessionWork = startSessionWork;
 
   if (ANNOUNCEMENT_VERSION && ANNOUNCEMENT_FEATURES.length > 0) {
     sendFeatureAnnouncement(
@@ -911,6 +941,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   )("session_start", (_event, extCtx) => {
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
     setActiveSessionId(sessionID);
+    startSessionWork();
     if (powershellRegistered) return;
     const liveSurface = resolvePiToolSurface(config, pi);
     if (!liveSurface.hoistPowershell) return;
@@ -920,10 +951,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     powershellRegistered = true;
   });
 
+  // A host that runs an agent turn without having emitted `session_start`
+  // still gets the session-scoped startup before the turn's first tool call.
+  (pi.on as (event: "before_agent_start", handler: () => undefined) => void)(
+    "before_agent_start",
+    () => {
+      startSessionWork();
+      return undefined;
+    },
+  );
+
   // Workflow hints: short system-prompt block teaching token-efficient
-  // AFT workflows. Hooked into Pi's `before_agent_start` event with
-  // systemPrompt extension. Always-on; conditional on the registered
-  // tool surface so absent tools aren't advertised.
+  // AFT workflows. Hooked into Pi's `before_agent_start` event as a prompt
+  // section where the host supports one. Always-on; conditional on the
+  // registered tool surface so absent tools aren't advertised.
   registerWorkflowHints(pi, config, surface);
 
   // Slash command: /aft-status
@@ -1014,6 +1055,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
   const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
     hostShutdownStarted = true;
+    liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();
@@ -1026,6 +1068,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Clean up bridges on session shutdown.
   pi.on("session_shutdown", async () => {
     hostShutdownStarted = true;
+    liveConfigReload.stop();
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();

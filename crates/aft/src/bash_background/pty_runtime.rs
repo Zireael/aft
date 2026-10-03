@@ -19,6 +19,10 @@ pub struct CompletionCoordinator {
     pub session_id: String,
     pub(crate) remaining: AtomicU8,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
+    /// Set once the watchdog wake for this task has been sent (both the
+    /// reader and the waiter are done). Until then a periodic watchdog pass
+    /// leaves an exited task to that wake.
+    pub(crate) woken: AtomicBool,
 }
 
 impl CompletionCoordinator {
@@ -32,12 +36,14 @@ impl CompletionCoordinator {
             session_id,
             remaining: AtomicU8::new(2),
             wake_tx,
+            woken: AtomicBool::new(false),
         }
     }
 
     pub fn signal_one_done(&self) {
         if self.remaining.fetch_sub(1, Ordering::SeqCst) == 1 {
             let _ = self.wake_tx.try_send(());
+            self.woken.store(true, Ordering::SeqCst);
         }
     }
 }

@@ -2,6 +2,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
 import { callBashBridge } from "./_shared.js";
+import { bashCompanionRegistered } from "./bash.js";
 
 const z = tool.schema;
 
@@ -40,9 +41,13 @@ const z = tool.schema;
  * `mode: "pty"`.
  */
 export function createBashWriteTool(ctx: PluginContext): ToolDefinition {
+  // Suggest checking the task mode first only when bash_status is callable.
+  const modeCheck = bashCompanionRegistered(ctx.config, "bash_status")
+    ? '; check bash_status reports mode: "pty" first.'
+    : ".";
   return {
     description:
-      'Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: "pty" first. ' +
+      `Write input bytes to a running PTY bash task. PTY-only${modeCheck} ` +
       'Input is either a string (verbatim bytes) or an array mixing strings and { key: "esc" | "enter" | "up" | "ctrl-c" | ... } objects ' +
       'for atomic text+key sequences such as [ "iHello", { key: "esc" }, ":wq", { key: "enter" } ]. ' +
       "Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. " +

@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "module-loop-stall",
+    "per-checkout-slice6-disk-limits",
+    "rust-1.99-deprecation-allow"
+  ],
+  "note": "Frame-loop probes stop waiting on locks; bash kill signals without holding task state and bash_status settles in-flight kills; views disk limits and eviction (views stay opt-in); allow Rust 1.99's fetch_update deprecation under the 1.92 MSRV. No ranking-fence files."
+}

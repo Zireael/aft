@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod fake_lsp;
+
 #[path = "../../src/test_env.rs"]
 mod shared_test_env;
 
@@ -89,6 +91,26 @@ pub fn disable_in_process_file_watcher() {
     DISABLE_IN_PROCESS_FILE_WATCHER.call_once(|| unsafe {
         std::env::set_var("AFT_TEST_DISABLE_FILE_WATCHER", "1");
     });
+}
+
+/// Whether a real `rust-analyzer` can run here. Tests that need one print
+/// `SKIP <test>` and return when it cannot. A CI job that installs
+/// rust-analyzer sets `AFT_TEST_REQUIRE_RUST_ANALYZER=1`, and then a missing
+/// server fails the test instead: a skip there would hide lost coverage.
+#[allow(dead_code)]
+pub fn real_rust_analyzer_available(test: &str) -> bool {
+    let available = std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !available {
+        assert!(
+            std::env::var_os("AFT_TEST_REQUIRE_RUST_ANALYZER").is_none(),
+            "{test}: AFT_TEST_REQUIRE_RUST_ANALYZER is set but rust-analyzer does not run"
+        );
+        eprintln!("SKIP {test}: rust-analyzer is not installed (or rustup component unavailable)");
+    }
+    available
 }
 
 /// Pay macOS's first-exec assessment while a test fixture is still in setup.
@@ -371,13 +393,7 @@ impl AftProcess {
     }
 
     fn spawn_inner_without(envs: &[(&str, &std::ffi::OsStr)], removed: &[&str]) -> Self {
-        // Nextest remaps archive binaries into its extraction directory, so its
-        // runtime variable must win over Cargo's compile-time binary path.
-        let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
-            .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
-            .or_else(|| std::env::var_os("CARGO_BIN_EXE_aft"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_BIN_EXE_aft")));
+        let binary = aft_binary::aft_binary();
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
@@ -1472,3 +1488,5 @@ pub fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
     }
     std::path::PathBuf::from(display)
 }
+
+mod aft_binary;

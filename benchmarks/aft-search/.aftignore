@@ -18,6 +18,7 @@
 baseline.json
 external-fixtures.json
 fixtures.json
+hot-path-recall-parity.json
 identifier-fusion-fixtures.json
 named-case-fixtures.json
 prefrontal-search-fixtures.json

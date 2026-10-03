@@ -60,7 +60,7 @@ impl fmt::Display for SynapseEmbeddingError {
         match self {
             Self::MissingConnectionFile => write!(
                 formatter,
-                "synapse_missing_connection_file: semantic.backend=synapse requires user config subc.connection_file"
+                "synapse_missing_connection_file: Synapse is daemon-only; run AFT under subc with Synapse registered and set user config subc.connection_file"
             ),
             Self::InvalidConnectionFile(path) => write!(
                 formatter,
@@ -172,6 +172,7 @@ struct SynapseState {
     route_harness: String,
     model: String,
     call_timeout: Duration,
+    required_operations: &'static [&'static str],
     consumer: Option<SubcConsumer>,
     route: Option<RouteHandle>,
     consecutive_timeouts: usize,
@@ -213,6 +214,7 @@ impl SynapseEmbeddingClient {
                 .unwrap_or_else(|| "aft".to_string()),
             model: model.to_string(),
             call_timeout: Duration::from_millis(config.timeout_ms.max(1)),
+            required_operations: &[MODELS_LIST_OPERATION, QUERY_OPERATION, BATCH_OPERATION],
             consumer: None,
             route: None,
             consecutive_timeouts: 0,
@@ -573,11 +575,11 @@ impl SynapseState {
             .catalog_list()
             .await
             .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
-        if !catalog_advertises_synapse(&catalog.modules) {
-            return Err(SynapseEmbeddingError::CapabilityUnavailable(
-                "synapse management surface does not advertise models.list, embed.query, and embed.batch"
-                    .to_string(),
-            ));
+        if !catalog_advertises_operations(&catalog.modules, self.required_operations) {
+            return Err(SynapseEmbeddingError::CapabilityUnavailable(format!(
+                "Synapse is not registered with required operations: {}",
+                self.required_operations.join(", ")
+            )));
         }
         let route = consumer
             .open_route(
@@ -589,7 +591,10 @@ impl SynapseState {
                     self.route_harness.clone(),
                     format!("aft-semantic-{}", std::process::id()),
                 ),
-                CallOptions::default(),
+                CallOptions {
+                    consumer_identity: crate::launch_nonce::consumer_identity(),
+                    ..CallOptions::default()
+                },
             )
             .await
             .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
@@ -640,15 +645,17 @@ fn validate_connection_file(path: &Path) -> Result<(), SynapseEmbeddingError> {
     Ok(())
 }
 
-fn catalog_advertises_synapse(entries: &[subc_client_rs::CatalogEntry]) -> bool {
+fn catalog_advertises_operations(
+    entries: &[subc_client_rs::CatalogEntry],
+    required_operations: &[&str],
+) -> bool {
     entries.iter().any(|entry| {
         entry.module_id == SYNAPSE_MODULE_ID
             && entry.roles.iter().any(|role| {
                 matches!(
                     role,
                     ProviderRole::ManagementSurface { operations, .. }
-                        if [MODELS_LIST_OPERATION, QUERY_OPERATION, BATCH_OPERATION]
-                            .iter()
+                        if required_operations.iter()
                             .all(|required| operations.iter().any(|operation| operation.name == *required))
                 )
             })
@@ -1092,5 +1099,97 @@ mod tests {
             batch_request_key("configured-model", &identity, &items),
             batch_request_key("configured-model", &identity, &items)
         );
+    }
+}
+
+/// Uses the embedding transport's daemon connection and management-route identity,
+/// but does not require embedding capabilities or retry an interactive rerank call.
+pub(crate) struct SynapseRerankTransport {
+    runtime: tokio::runtime::Runtime,
+    state: SynapseState,
+}
+
+impl SynapseRerankTransport {
+    pub(crate) fn new(config: &SemanticBackendConfig) -> Result<Self, SynapseEmbeddingError> {
+        let connection_file = config
+            .subc_connection_file
+            .clone()
+            .ok_or(SynapseEmbeddingError::MissingConnectionFile)?;
+        validate_connection_file(&connection_file)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+        Ok(Self {
+            runtime,
+            state: SynapseState {
+                connection_file,
+                route_project_root: config
+                    .route_project_root
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from(".")),
+                route_harness: config.route_harness.clone().unwrap_or_else(|| "aft".into()),
+                model: config.model.clone(),
+                call_timeout: Duration::from_millis(config.timeout_ms.max(1)),
+                required_operations: &[MODELS_LIST_OPERATION, "rerank.score"],
+                consumer: None,
+                route: None,
+                consecutive_timeouts: 0,
+                circuit_open_until: None,
+            },
+        })
+    }
+
+    pub(crate) fn call(
+        &mut self,
+        operation: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, SynapseEmbeddingError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|time| !time.is_zero())
+            .ok_or_else(|| SynapseEmbeddingError::Timeout(operation.into()))?;
+        self.runtime.block_on(async {
+            // Include connect, catalog lookup, and route opening in the total budget.
+            let result = tokio::time::timeout(remaining, async {
+                self.state.ensure_route().await?;
+                let body = serde_json::to_vec(&json!({"method":operation, "params":params}))
+                    .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
+                let response = self
+                    .state
+                    .consumer
+                    .as_ref()
+                    .expect("route ensured")
+                    .request(
+                        self.state.route.as_ref().expect("route ensured"),
+                        body,
+                        CallOptions::default(),
+                    )
+                    .await
+                    .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+                if response.len() > MAX_RESULT_PAGE_BYTES {
+                    return Err(SynapseEmbeddingError::InvalidEnvelope(
+                        "rerank.score response exceeded 512KiB".into(),
+                    ));
+                }
+                serde_json::from_slice(&response)
+                    .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))
+            })
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.is_err() {
+                        self.state.reset_connection();
+                    }
+                    result
+                }
+                Err(_) => {
+                    self.state.reset_connection();
+                    Err(SynapseEmbeddingError::Timeout(operation.into()))
+                }
+            }
+        })
     }
 }

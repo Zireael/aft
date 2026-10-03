@@ -71,7 +71,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .string()
           .optional()
           .describe(
-            "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
+            "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
           ),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z

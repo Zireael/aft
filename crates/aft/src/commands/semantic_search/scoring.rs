@@ -85,6 +85,18 @@ impl ScoringPolicy {
         self.rules.get(&lane).copied()
     }
 
+    /// Adds or replaces one lane's rule. Used for a policy that is not a
+    /// plan-table shape row, such as the split-query policy in `split_query`.
+    pub fn with_rule(
+        mut self,
+        lane: SearchLaneKind,
+        rule: LaneScoringRule,
+    ) -> Result<Self, ScoringError> {
+        self.rules.insert(lane, rule);
+        self.validate()?;
+        Ok(self)
+    }
+
     fn validate(&self) -> Result<(), ScoringError> {
         for (lane, rule) in &self.rules {
             if *lane == SearchLaneKind::Exact {

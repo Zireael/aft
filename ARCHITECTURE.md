@@ -39,7 +39,9 @@ List-shaped results carry a truncation envelope (`list_envelope.rs`,
 
 **Executor.** `executor/` schedules work per project root (an "actor").
 Jobs run on lanes: `PureRead`, `SerialLspStatus`, `HeavyInit`, `Mutating`
-(a writer barrier reserved for configure and user mutations), and
+(a writer barrier reserved for configure and user mutations; a route bind
+starts with only a shared hold beside readers and maintenance, and takes the
+barrier only if it must change the root), and
 `MaintenanceCommit` (background drains that must never block reads). Jobs are
 classed `Interactive` or `Maintenance` so maintenance cannot starve tool calls;
 the maintenance queue is bounded and idempotent drains coalesce. Long work

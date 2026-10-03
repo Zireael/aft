@@ -17,10 +17,11 @@
  * published plugin dist; it is never a published runtime dependency.
  */
 
-import { existsSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 
 import type { RouteHandle } from "@cortexkit/subc-client";
 import {
+  AuthError,
   type BindIdentity,
   type ConsumerIdentity,
   connectionFileExists,
@@ -56,12 +57,89 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
+import { WORKER_SESSION_FIELD } from "./transport.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
   constructor() {
     super("terminal", "subc transport is shutting down", "transport_shutting_down");
     this.name = "SubcTransportShuttingDownError";
+  }
+}
+
+/**
+ * Why the plugin itself closed a route that still carried a request. Each value
+ * is shown to the agent, so it names the plugin-side event in plain words.
+ */
+export type SubcLocalRouteCloseReason =
+  | "transport shutting down"
+  | "session closed"
+  | "project root closed"
+  | "route replaced"
+  | "route closed by the plugin";
+
+/**
+ * The plugin closed one of its own routes (pool shutdown, session close,
+ * project-root close, or a sibling call on the same session discarding the
+ * shared route) while this call's request was already in flight on it.
+ *
+ * subc-client records a request as pending and starts writing its frame in the
+ * same synchronous step, and its `closeRoute` rejects exactly those pending
+ * requests. So a request rejected that way was written, or queued to be
+ * written, and the daemon may have run it: the outcome is unknown. The call
+ * must not be blind-retried, and bash must not re-run it on the host.
+ */
+export class SubcRouteClosedMidCallError extends SubcCallError {
+  readonly reason: SubcLocalRouteCloseReason;
+
+  constructor(reason: SubcLocalRouteCloseReason, cause: unknown) {
+    super(
+      "outcome_unknown",
+      `the command may have run; the route closed mid-call: ${reason}`,
+      "route_closed",
+      cause,
+    );
+    this.name = "SubcRouteClosedMidCallError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * subc-client's rejection of a request that was pending when the client itself
+ * closed the route: `closeRoute` tearing that route down, or the client closing
+ * its connection. The client types both with `closeReason: "closed_by_caller"`;
+ * a daemon GOODBYE carries the daemon's reason and a lost connection carries
+ * `"connection_lost"`. A route closed with no request pending produces no error
+ * at all, and a request started on an already-closed route fails with
+ * `StaleRouteHandleError`. A route closed while still opening is reported as a
+ * not-sent `SubcCallError`, which is not a `SubcError` and so never matches.
+ */
+export function isLocalRouteCloseRejection(error: unknown): error is SubcError {
+  return error instanceof SubcError && error.closeReason === "closed_by_caller";
+}
+
+/** The route-close reason that matches a session's teardown, if it was torn down. */
+function teardownCloseReason(
+  teardown: SessionRecord["teardownReason"],
+): SubcLocalRouteCloseReason | null {
+  switch (teardown) {
+    case "shutdown":
+      return "transport shutting down";
+    case "session_closed":
+      return "session closed";
+    case "root_reaped":
+      return "project root closed";
+    default:
+      return null;
+  }
+}
+
+class ReconnectKeyChangedError extends Error {
+  constructor() {
+    super(
+      "the subc daemon restarted and its connection key changed; the reconnect did not complete within the deadline, retry",
+    );
+    this.name = "ReconnectKeyChangedError";
   }
 }
 
@@ -241,6 +319,9 @@ const SUBC_DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
  * example bash host fallback) promptly instead of after a long transport timeout.
  */
 const ROUTE_OPEN_RELOAD_WAIT_CEILING_MS = 45_000;
+
+/** Resolution of the timer a call races its route.open against when its deadline passes first. */
+const CALL_DEADLINE_EXPIRED: unique symbol = Symbol("call deadline expired");
 
 function reloadWaitExhaustedSuffix(callDeadlineMs: number): string {
   if (callDeadlineMs > ROUTE_OPEN_RELOAD_WAIT_CEILING_MS) {
@@ -799,7 +880,27 @@ function absentRootError(root: CanonicalRootPath): SubcError {
 
 /** Preserve the daemon's final refusal while making the reload timeout actionable. */
 function reloadWindowExhaustedError(error: unknown, callDeadlineMs: number): unknown {
-  const suffix = reloadWaitExhaustedSuffix(callDeadlineMs);
+  return withDeadlineSuffix(error, reloadWaitExhaustedSuffix(callDeadlineMs));
+}
+
+/**
+ * The error a call surfaces once its own deadline has passed before a reply.
+ * `lastError` is the most recent route refusal the call saw (it keeps its code,
+ * so a reload refusal still lets bash take its host fallback); with none, the
+ * error carries subc-client's own `request_deadline` code, the same one a
+ * route.open or request that ran out of time inside the client would carry.
+ */
+function callDeadlinePassedError(lastError: unknown, callDeadlineMs: number): unknown {
+  const seconds = Math.round(callDeadlineMs / 100) / 10;
+  const suffix = ` The AFT daemon module did not return within this call's ${seconds}s deadline.`;
+  if (lastError !== undefined) return withDeadlineSuffix(lastError, suffix);
+  return new SubcError(
+    `route to module '${AFT_MODULE_ID}' was not ready before the call ran out of time.${suffix}`,
+    REQUEST_DEADLINE_CODE,
+  );
+}
+
+function withDeadlineSuffix(error: unknown, suffix: string): unknown {
   if (error instanceof Error) {
     try {
       error.message += suffix;
@@ -875,6 +976,13 @@ interface RouteEntry {
   handle: RouteHandle | null;
   /** Tombstone: a teardown raced the open — the resolving open must self-close. */
   closed: boolean;
+  /**
+   * Set when a call on this session gives up on the shared route after its own
+   * failure or cancellation and closes it, while other calls on the session may
+   * still have requests in flight on it. A session teardown leaves it null,
+   * because the session record's teardown reason already names that close.
+   */
+  closedBy: SubcLocalRouteCloseReason | null;
 }
 
 /**
@@ -884,6 +992,31 @@ interface RouteEntry {
  * or count toward the half-open-socket failure budget (B-#3/B-#4).
  */
 class RouteTornDownError extends Error {}
+
+/**
+ * True when a call stopped at a teardown before its request was handed to the
+ * client (a closed session, or a route that opened after the teardown), so the
+ * request provably never reached AFT.
+ */
+export function isSubcRouteTornDownError(error: unknown): boolean {
+  return error instanceof RouteTornDownError;
+}
+
+/**
+ * Turn subc-client's bare rejection of a request that was in flight on a route
+ * the plugin closed into an outcome-unknown error that names the close reason.
+ * Any other error passes through unchanged.
+ */
+function routeClosedMidCallError(
+  error: unknown,
+  entry: RouteEntry,
+  record: SessionRecord,
+): unknown {
+  if (!isLocalRouteCloseRejection(error)) return error;
+  const reason =
+    entry.closedBy ?? teardownCloseReason(record.teardownReason) ?? "route closed by the plugin";
+  return new SubcRouteClosedMidCallError(reason, error);
+}
 
 /**
  * Re-lift the route reply into the flat {@link ToolCallResult} shape the standalone
@@ -990,6 +1123,7 @@ class SubcTransport implements AftProjectTransport {
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
+    if (options?.workerSession === true) body[WORKER_SESSION_FIELD] = true;
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
       body,
@@ -1022,7 +1156,12 @@ class SubcTransport implements AftProjectTransport {
     }
     const { timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const session = typeof params.session_id === "string" ? params.session_id : undefined;
-    const body: Record<string, unknown> = { name: command, arguments: params };
+    // The caller's role travels beside the call, like the session (which the
+    // route bind carries), not inside the command's arguments: the module
+    // reads it from the call body.
+    const { [WORKER_SESSION_FIELD]: workerSession, ...args } = params;
+    const body: Record<string, unknown> = { name: command, arguments: args };
+    if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     const reply = await this.pool.routeRequest(
@@ -1088,6 +1227,7 @@ export class SubcTransportPool implements AftTransportPool {
   private outerFacadeEvictor: (root: CanonicalRootPath, generation: RootGeneration) => void;
 
   private client: SubcClientLike | null = null;
+  private hadWorkingClient = false;
   /** Single-flight guard so concurrent first calls share one connect. */
   private connecting: Promise<SubcClientLike> | null = null;
   /** The growing delay for a safe, once-only route resend after route closure. */
@@ -1242,9 +1382,10 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   /**
-   * Check a root immediately before opening a route. The reclaim marker is only
-   * an existence hint; a directory that has already returned wins over a stale
-   * sibling marker, so the marker contents are never parsed.
+   * Check a root immediately before opening a route. Only the directory's
+   * existence decides: a reclaim marker beside it (`<root>.reclaimed`) needs
+   * no check, since an absent directory suspends the bind either way and a
+   * directory that has returned wins over a stale marker.
    */
   private rootCanAttach(root: CanonicalRootPath): boolean {
     let directoryExists = false;
@@ -1256,14 +1397,6 @@ export class SubcTransportPool implements AftTransportPool {
     if (directoryExists) {
       this.dormantRoots.delete(root);
       return true;
-    }
-
-    // Read the marker only as a latency hint. Directory absence is sufficient
-    // to suspend the bind, and the marker's JSON is intentionally irrelevant.
-    const reclaimedMarkerPresent = existsSync(`${root}.reclaimed`);
-    if (reclaimedMarkerPresent) {
-      this.markRootDormant(root);
-      return false;
     }
     this.markRootDormant(root);
     return false;
@@ -1685,6 +1818,12 @@ export class SubcTransportPool implements AftTransportPool {
     expectedGeneration?: RootGeneration,
     abortSignal?: AbortSignal,
   ): Promise<unknown> {
+    const callStartedAt = performance.now();
+    const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+    // Charge shared backoff delays even when an injected sleeper advances no real time.
+    let scheduledDelayMs = 0;
+    const spentMs = (): number => Math.max(performance.now() - callStartedAt, scheduledDelayMs);
+    const remainingMs = (): number => callDeadlineMs - spentMs();
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -1700,7 +1839,51 @@ export class SubcTransportPool implements AftTransportPool {
     try {
       let client: SubcClientLike;
       try {
-        client = await this.ensureClient();
+        let keyChanged: ReconnectKeyChangedError | undefined;
+        while (true) {
+          const remaining = remainingMs();
+          if (remaining <= 0)
+            throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            // Each attempt calls SubcClient.connect anew, which re-reads the connection file.
+            const acquired = await Promise.race([
+              this.ensureClient(),
+              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+              }),
+            ]);
+            if (acquired === CALL_DEADLINE_EXPIRED) {
+              throw keyChanged ?? callDeadlinePassedError(undefined, callDeadlineMs);
+            }
+            client = acquired;
+            break;
+          } catch (error) {
+            if (!(error instanceof ReconnectKeyChangedError)) throw error;
+            keyChanged = error;
+            if (spentMs() + this.nextRouteReopenDelayMs() >= callDeadlineMs) throw error;
+          } finally {
+            clearTimeout(timer);
+          }
+          const { delayMs, wait } = this.waitForRouteReopenBackoff();
+          scheduledDelayMs = spentMs() + delayMs;
+          // A shared retry sleeper may outlive this caller's remaining budget.
+          let retryTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const waited = await Promise.race([
+              wait,
+              new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+                retryTimer = setTimeout(
+                  () => resolve(CALL_DEADLINE_EXPIRED),
+                  callDeadlineMs - (performance.now() - callStartedAt),
+                );
+              }),
+            ]);
+            if (waited === CALL_DEADLINE_EXPIRED) throw keyChanged;
+          } finally {
+            clearTimeout(retryTimer);
+          }
+        }
         this.assertRecordLive(record);
       } catch (error) {
         throw this.annotateReapError(error, record);
@@ -1740,28 +1923,60 @@ export class SubcTransportPool implements AftTransportPool {
       // A module reload (drain, restart, warm-up) refuses route.open for as long
       // as it lasts. The call waits it out for as long as its own deadline allows,
       // but never longer than ROUTE_OPEN_RELOAD_WAIT_CEILING_MS, and then surfaces
-      // the refusal (which lets a caller such as bash fall back). Time spent
-      // waiting comes out of the request's budget, so the call never outlives the
-      // deadline it was given.
-      const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+      // the refusal (which lets a caller such as bash fall back).
+      //
+      // Everything the call does counts against its deadline: route opens
+      // (a bind relay can hold one for about 12 s), retry sleeps, and the
+      // request itself, which is sent with only the time that is left. So the
+      // call never outlives the deadline it was given, whichever path it takes.
       const reloadWaitBudgetMs = Math.min(callDeadlineMs, ROUTE_OPEN_RELOAD_WAIT_CEILING_MS);
-      let reloadWaitedMs = 0;
+      // The most recent route refusal, so a deadline that passes mid-open still
+      // names the daemon's reason instead of a bare timeout.
+      let lastRefusal: unknown;
+
+      // subc-client's routeOpen takes no deadline of its own (only its fixed
+      // channel-0 default), so the call stops waiting for the open once its
+      // own time is up. An open that completes later still lands in the
+      // session's route entry, where the next call reuses it or teardown
+      // closes it.
+      const openRouteWithinDeadline = async (): Promise<{
+        route: RouteHandle;
+        entry: RouteEntry;
+      }> => {
+        const remaining = remainingMs();
+        if (remaining <= 0) throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const expired = new Promise<typeof CALL_DEADLINE_EXPIRED>((resolve) => {
+          timer = setTimeout(() => resolve(CALL_DEADLINE_EXPIRED), remaining);
+        });
+        try {
+          const opened = await Promise.race([openRoute(), expired]);
+          if (opened === CALL_DEADLINE_EXPIRED) {
+            throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
+          }
+          return opened;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
       const openRouteAfterReloadWindow = async (): Promise<{
         route: RouteHandle;
         entry: RouteEntry;
       }> => {
         while (true) {
           try {
-            return await openRoute();
+            return await openRouteWithinDeadline();
           } catch (error) {
             if (!isRouteOpenReloadWindowError(error)) throw error;
+            lastRefusal = error;
             // Check the budget before starting (or joining) the shared retry
             // timer, so a call that gives up leaves no orphan timer behind.
-            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
-            reloadWaitedMs += delayMs;
+            scheduledDelayMs = spentMs() + delayMs;
             await wait;
           }
         }
@@ -1770,6 +1985,9 @@ export class SubcTransportPool implements AftTransportPool {
       const clearRouteEntry = (entry: RouteEntry): void => {
         if (record.routeEntry !== entry) return;
         entry.closed = true;
+        // Other calls on this session may still have requests in flight on
+        // the shared route; they learn that it was discarded, not torn down.
+        entry.closedBy ??= "route replaced";
         record.routeEntry = null;
         if (entry.handle != null) safeCloseRoute(entry.client, entry.handle);
       };
@@ -1803,7 +2021,11 @@ export class SubcTransportPool implements AftTransportPool {
         });
       };
 
-      const requestOnRoute = async (route: RouteHandle, entry: RouteEntry): Promise<unknown> => {
+      const requestOnRoute = async (
+        route: RouteHandle,
+        entry: RouteEntry,
+        requestTimeoutMs: number,
+      ): Promise<unknown> => {
         this.assertRecordLive(record);
         if (abortSignal?.aborted) {
           clearRouteEntry(entry);
@@ -1820,8 +2042,10 @@ export class SubcTransportPool implements AftTransportPool {
         };
         abortSignal?.addEventListener("abort", onAbort, { once: true });
         try {
-          const requestTimeoutMs = reloadWaitedMs > 0 ? callDeadlineMs - reloadWaitedMs : timeoutMs;
-          const request = client.request(route, body, { timeoutMs: requestTimeoutMs, onProgress });
+          const request = client.request(route, body, {
+            timeoutMs: Math.ceil(requestTimeoutMs),
+            onProgress,
+          });
           const reply = abortSignal ? await Promise.race([request, aborted]) : await request;
           // A legacy closeSession may intentionally let an already-delivered reply
           // settle. It must not mutate shared state or recreate a subscription.
@@ -1843,11 +2067,20 @@ export class SubcTransportPool implements AftTransportPool {
       let reopened = false;
       let retriedAbsentRoute = false;
       while (true) {
+        // Checked outside the try below so the retry branches never mistake
+        // this call's own expiry for a daemon refusal worth retrying.
+        const requestTimeoutMs = remainingMs();
+        if (requestTimeoutMs <= 0) throw callDeadlinePassedError(lastRefusal, callDeadlineMs);
         try {
-          const reply = await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
+          const reply = await requestOnRoute(
+            routeAndEntry.route,
+            routeAndEntry.entry,
+            requestTimeoutMs,
+          );
           if (reopened) this.resetRouteReopenBackoff();
           return reply;
-        } catch (error) {
+        } catch (requestError) {
+          const error = routeClosedMidCallError(requestError, routeAndEntry.entry, record);
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;
           // A route that was bound before a module reload started gets its
@@ -1860,11 +2093,12 @@ export class SubcTransportPool implements AftTransportPool {
           // failure.
           if (ownsRoute && isRouteRequestReloadRefusal(error)) {
             clearRouteEntry(routeAndEntry.entry);
-            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+            lastRefusal = error;
+            if (spentMs() + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();
-            reloadWaitedMs += delayMs;
+            scheduledDelayMs = spentMs() + delayMs;
             await wait;
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
@@ -1873,7 +2107,15 @@ export class SubcTransportPool implements AftTransportPool {
           if (ownsRoute && !retriedAbsentRoute && isRouteProvenAbsentError(error)) {
             retriedAbsentRoute = true;
             clearRouteEntry(routeAndEntry.entry);
-            await this.waitForRouteReopenBackoff().wait;
+            // The one resend after a vanished route is still bounded by the
+            // call's deadline: its delay is charged like any other, and a
+            // delay that would run past the deadline is not taken.
+            if (spentMs() + this.nextRouteReopenDelayMs() >= callDeadlineMs) {
+              throw callDeadlinePassedError(error, callDeadlineMs);
+            }
+            const { delayMs, wait } = this.waitForRouteReopenBackoff();
+            scheduledDelayMs = spentMs() + delayMs;
+            await wait;
             routeAndEntry = await openRouteAfterReloadWindow();
             reopened = true;
             continue;
@@ -1946,11 +2188,18 @@ export class SubcTransportPool implements AftTransportPool {
           throw new SubcTransportShuttingDownError();
         }
         this.client = client;
+        this.hadWorkingClient = true;
         this.transportFailures = 0;
         return client;
       })
       .catch((error) => {
         this.connecting = null;
+        // A previously authenticated transport can race the daemon's key rotation.
+        // Without a prior authenticated client, a proof mismatch can mean an impostor
+        // or misconfiguration, so preserve the SDK's permanent authentication error.
+        if (this.hadWorkingClient && error instanceof AuthError) {
+          throw new ReconnectKeyChangedError();
+        }
         throw error;
       });
     return this.connecting;
@@ -1974,6 +2223,7 @@ export class SubcTransportPool implements AftTransportPool {
       opening: null,
       handle: null,
       closed: false,
+      closedBy: null,
     };
     this.assertRootCanAttach(record.canonicalRoot);
     const opening = client
