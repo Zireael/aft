@@ -201,15 +201,23 @@ impl PatternList {
     /// Rank a collection of matched files. The data-file classifier sees the
     /// pattern: a pattern that names a JSON file or asks for JSON keeps JSON
     /// files from being demoted, as it does for a pattern-only search.
-    pub(crate) fn from_collection(collection: GrepFileCollection, pattern: &str) -> Self {
+    pub(crate) fn from_collection(
+        collection: GrepFileCollection,
+        project_root: &Path,
+        pattern: &str,
+    ) -> Self {
         let examination = PatternExamination {
             capped: collection.examination_capped,
             files_examined: collection.files_examined,
             candidate_files: collection.candidate_files,
         };
         let alternatives = judge_alternatives(&collection.files, pattern);
-        let ranked =
-            regex_route::rank_collection(collection, pattern, regex_route::RecencyTiebreak::None);
+        let ranked = regex_route::rank_collection(
+            collection,
+            project_root,
+            pattern,
+            regex_route::RecencyTiebreak::None,
+        );
         let files = ranked
             .files
             .into_iter()
@@ -278,7 +286,11 @@ impl PatternList {
     /// Build the list from a bounded grep scan, used when no ready trigram
     /// index can be read. The scan reports no candidate count, so the files it
     /// searched stand in for it; `truncated` marks a scan stopped by its bound.
-    pub(crate) fn from_bounded_scan(result: GrepResult, pattern: &str) -> Self {
+    pub(crate) fn from_bounded_scan(
+        result: GrepResult,
+        project_root: &Path,
+        pattern: &str,
+    ) -> Self {
         let mut files: Vec<GrepFileMatches> = Vec::new();
         for grep_match in result.matches {
             match files.iter_mut().find(|file| file.path == grep_match.file) {
@@ -310,6 +322,7 @@ impl PatternList {
                 index_status: result.index_status,
                 missing_on_disk: result.missing_on_disk,
             },
+            project_root,
             pattern,
         )
     }
@@ -1044,10 +1057,12 @@ mod tests {
         // `b.rs` is newest in the first run and oldest in the second.
         let first = PatternList::from_collection(
             collection(files("/p/src/b.rs", "/p/src/a.rs"), false),
+            Path::new("/p"),
             "load",
         );
         let second = PatternList::from_collection(
             collection(files("/p/src/a.rs", "/p/src/b.rs"), false),
+            Path::new("/p"),
             "load",
         );
         let order = |list: &PatternList| {
@@ -1061,6 +1076,7 @@ mod tests {
         // The pattern-only route keeps its newest-first tie-break.
         let recency = regex_route::rank_collection(
             collection(files("/p/src/b.rs", "/p/src/a.rs"), false),
+            Path::new("/p"),
             "load",
             regex_route::RecencyTiebreak::NewestFirst,
         );
@@ -1134,7 +1150,11 @@ mod tests {
         for index in 0..5 {
             files.push(declares(&format!("/p/src/err{index}.rs"), "Error"));
         }
-        let list = PatternList::from_collection(collection(files, false), "tracked_files|Error");
+        let list = PatternList::from_collection(
+            collection(files, false),
+            Path::new("/p"),
+            "tracked_files|Error",
+        );
         let [tracked, error] = &list.alternatives[..] else {
             panic!("two alternatives: {:?}", list.alternatives);
         };
@@ -1530,6 +1550,7 @@ mod tests {
                 vec![line("/p/a.rs", "Alpha"), line("/p/b.rs", "Beta")],
                 false,
             ),
+            Path::new("/p"),
             pattern,
         );
         assert_eq!(list.alternatives.len(), 2, "{:?}", list.alternatives);
@@ -1568,6 +1589,7 @@ mod tests {
                 ],
                 false,
             ),
+            Path::new("/p"),
             "load",
         );
         let prose = [PathBuf::from("/p/src/e.rs"), PathBuf::from("/p/src/a.rs")]
@@ -1583,6 +1605,7 @@ mod tests {
     fn summary_line_reports_no_definition_and_capped_examination() {
         let list = PatternList::from_collection(
             collection(vec![mention("/p/src/e.rs")], true),
+            Path::new("/p"),
             "old_name",
         );
         assert_eq!(
@@ -1593,8 +1616,10 @@ mod tests {
 
     #[test]
     fn capped_zero_match_is_reported_distinctly_from_a_complete_zero_match() {
-        let complete = PatternList::from_collection(collection(Vec::new(), false), "nope");
-        let capped = PatternList::from_collection(collection(Vec::new(), true), "nope");
+        let complete =
+            PatternList::from_collection(collection(Vec::new(), false), Path::new("/p"), "nope");
+        let capped =
+            PatternList::from_collection(collection(Vec::new(), true), Path::new("/p"), "nope");
         assert_eq!(
             complete.summary_line(&HashSet::new(), Path::new("/p")),
             "[pattern `nope`: no match]"
@@ -1664,7 +1689,7 @@ mod tests {
             files_read_directly: 4,
             walk_bound: None,
         };
-        let list = PatternList::from_bounded_scan(result, "load");
+        let list = PatternList::from_bounded_scan(result, Path::new("/p"), "load");
         assert_eq!(list.len(), 2);
         assert!(list.examination.capped);
         assert!(list.files[0].definition);

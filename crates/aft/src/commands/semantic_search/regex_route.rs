@@ -292,10 +292,11 @@ pub(crate) enum RecencyTiebreak {
 /// `truncated` and `engine_capped` are set when a bound left files unexamined.
 pub(crate) fn rank_collection(
     collection: GrepFileCollection,
+    project_root: &Path,
     query: &str,
     recency: RecencyTiebreak,
 ) -> RankedFiles {
-    let mut data_files = DataFileClassifier::new(query);
+    let mut data_files = DataFileClassifier::new(project_root, query);
     let mut keyed: Vec<((FileClass, Option<Declaration>), GrepFileMatches)> = collection
         .files
         .into_iter()
@@ -640,6 +641,7 @@ mod tests {
                 ],
                 false,
             ),
+            Path::new("/nonexistent"),
             "addToCart",
             RecencyTiebreak::NewestFirst,
         );
@@ -706,6 +708,7 @@ mod tests {
                 ],
                 false,
             ),
+            Path::new("/nonexistent"),
             "validate_read_path|restrict_to_project_root",
             RecencyTiebreak::NewestFirst,
         );
@@ -767,6 +770,7 @@ mod tests {
 
         let summary = rank_collection(
             collection(Vec::new(), false),
+            Path::new("/nonexistent"),
             "addToCart",
             RecencyTiebreak::NewestFirst,
         )
@@ -863,6 +867,7 @@ mod tests {
                 )],
                 true,
             ),
+            Path::new("/nonexistent"),
             "x",
             RecencyTiebreak::NewestFirst,
         );
@@ -883,6 +888,7 @@ mod tests {
                 )],
                 false,
             ),
+            Path::new("/nonexistent"),
             "load",
             RecencyTiebreak::NewestFirst,
         );

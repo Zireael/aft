@@ -72,7 +72,7 @@ fn has_data_extension(path: &Path) -> bool {
 
 /// Return true when `path` names a JSON-family file whose name or content
 /// shape marks it as data rather than source or configuration.
-pub fn is_data_file(path: &Path) -> bool {
+pub fn is_data_file(project_root: &Path, path: &Path) -> bool {
     if !has_data_extension(path) {
         return false;
     }
@@ -83,7 +83,10 @@ pub fn is_data_file(path: &Path) -> bool {
     if is_hand_edited_manifest(&file_name) {
         return false;
     }
-    if crate::inspect::path_has_generated_shape(path) {
+    // Only the part of the path inside the project decides a generated shape:
+    // a checkout under a folder named gen or generated must not make every
+    // small JSON file in it look generated.
+    if crate::inspect::relative_shape_is_generated(project_root, path) {
         return true;
     }
     let Ok(metadata) = std::fs::metadata(path) else {
@@ -133,14 +136,16 @@ pub fn query_asks_for_file(query: &str, path: &Path) -> bool {
 
 /// Per-query classifier with a cache, so a file seen in several lanes is
 /// examined on disk once.
-pub struct DataFileClassifier<'q> {
-    query: &'q str,
+pub struct DataFileClassifier<'a> {
+    project_root: &'a Path,
+    query: &'a str,
     cache: HashMap<PathBuf, bool>,
 }
 
-impl<'q> DataFileClassifier<'q> {
-    pub fn new(query: &'q str) -> Self {
+impl<'a> DataFileClassifier<'a> {
+    pub fn new(project_root: &'a Path, query: &'a str) -> Self {
         Self {
+            project_root,
             query,
             cache: HashMap::new(),
         }
@@ -151,7 +156,8 @@ impl<'q> DataFileClassifier<'q> {
         if let Some(known) = self.cache.get(path) {
             return *known;
         }
-        let demote = is_data_file(path) && !query_asks_for_file(self.query, path);
+        let demote =
+            is_data_file(self.project_root, path) && !query_asks_for_file(self.query, path);
         self.cache.insert(path.to_path_buf(), demote);
         demote
     }
@@ -210,9 +216,9 @@ mod tests {
             &format!("{{\n  \"body\": \"{}\"\n}}\n", "x".repeat(500)),
         );
         let generated = write(dir.path(), "src/op-kinds.generated.json", "{\"a\": 1}\n");
-        assert!(is_data_file(&large));
-        assert!(is_data_file(&long_line));
-        assert!(is_data_file(&generated));
+        assert!(is_data_file(dir.path(), &large));
+        assert!(is_data_file(dir.path(), &long_line));
+        assert!(is_data_file(dir.path(), &generated));
     }
 
     #[test]
@@ -236,7 +242,11 @@ mod tests {
         let dotfile = write(dir.path(), ".eslintrc.json", &"{}\n".repeat(5000));
         let jsonc = write(dir.path(), ".cortexkit/aft.jsonc", &"{}\n".repeat(5000));
         for path in [source, small, manifest, tsconfig, dotfile, jsonc] {
-            assert!(!is_data_file(&path), "{} must not be data", path.display());
+            assert!(
+                !is_data_file(dir.path(), &path),
+                "{} must not be data",
+                path.display()
+            );
         }
     }
 
@@ -279,6 +289,37 @@ mod tests {
             .unwrap();
         assert_eq!(position, DATA_FILE_LANE_DEMOTION);
         assert_eq!(demoted[0].path, Path::new("src/file0.rs"));
+    }
+
+    #[test]
+    fn ancestor_folder_named_gen_does_not_demote_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gen/myapp");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        let small_json = root.join("data.json");
+        std::fs::write(&small_json, "{\"k\": 1}\n").unwrap();
+        let source = root.join("src/lib.rs");
+        std::fs::write(&source, "pub fn run() {}\n").unwrap();
+        let generated_json = root.join("src/generated/x.json");
+        std::fs::write(&generated_json, "{\"k\": 1}\n").unwrap();
+
+        assert!(
+            !is_data_file(&root, &small_json),
+            "small json file under ancestor named gen must not be classified as data"
+        );
+        assert!(
+            is_data_file(&root, &generated_json),
+            "json file in src/generated must still be classified as data"
+        );
+        let mut classifier = DataFileClassifier::new(&root, "general search");
+        assert!(
+            !classifier.demote(&small_json),
+            "classifier must not demote small json under ancestor named gen"
+        );
+        assert!(
+            classifier.demote(&generated_json),
+            "classifier must demote generated json in project"
+        );
     }
 
     #[test]

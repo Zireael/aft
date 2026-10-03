@@ -1074,13 +1074,16 @@ fn split_query_plan<'a>(
 fn collect_pattern_list(
     req: &RawRequest,
     ctx: &AppContext,
+    project_root: &Path,
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
     pattern: &str,
 ) -> Result<split_query::PatternList, Response> {
     if let Some(collection) = regex_route_collection(ctx, compiled, include_tests) {
         return Ok(split_query::PatternList::from_collection(
-            collection, pattern,
+            collection,
+            project_root,
+            pattern,
         ));
     }
     let scope = grep_executor::resolve_grep_scope(
@@ -1097,6 +1100,7 @@ fn collect_pattern_list(
     };
     Ok(split_query::PatternList::from_bounded_scan(
         grep_executor::execute(ctx, compiled, &scope, &params),
+        project_root,
         pattern,
     ))
 }
@@ -1318,12 +1322,15 @@ fn handle_split_search<'a>(
     let patterns = match external {
         Some(corpus) => split_query::PatternList::from_collection(
             corpus.collect(compiled, include_tests),
+            project_root,
             pattern,
         ),
-        None => match collect_pattern_list(req, ctx, compiled, include_tests, pattern) {
-            Ok(patterns) => patterns,
-            Err(response) => return (plan, response),
-        },
+        None => {
+            match collect_pattern_list(req, ctx, project_root, compiled, include_tests, pattern) {
+                Ok(patterns) => patterns,
+                Err(response) => return (plan, response),
+            }
+        }
     };
     if search_cancellation_requested() {
         return (plan, cancelled_search_response(req));
@@ -3360,9 +3367,10 @@ fn handle_grep_search(
     let ranked = match external {
         Some(corpus) => Some(rank_regex_collection(
             corpus.collect(&compiled, include_tests),
+            project_root,
             query,
         )),
-        None => ranked_regex_route_result(ctx, &compiled, include_tests, query),
+        None => ranked_regex_route_result(ctx, project_root, &compiled, include_tests, query),
     };
     let (mut result, ranked_files, examination_note) = if let Some((ranked, note)) = ranked {
         (ranked.summary, Some(ranked.files), note)
@@ -3518,23 +3526,30 @@ fn handle_grep_search(
 /// budget; the caller then runs the bounded grep scan instead.
 fn ranked_regex_route_result(
     ctx: &AppContext,
+    project_root: &Path,
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
     query: &str,
 ) -> Option<(regex_route::RankedFiles, Option<String>)> {
     let collection = regex_route_collection(ctx, compiled, include_tests)?;
-    Some(rank_regex_collection(collection, query))
+    Some(rank_regex_collection(collection, project_root, query))
 }
 
 fn rank_regex_collection(
     collection: crate::search_index::GrepFileCollection,
+    project_root: &Path,
     query: &str,
 ) -> (regex_route::RankedFiles, Option<String>) {
     let note = collection.examination_capped.then(|| {
         regex_route::examination_disclosure(collection.files_examined, collection.candidate_files)
     });
     (
-        regex_route::rank_collection(collection, query, regex_route::RecencyTiebreak::NewestFirst),
+        regex_route::rank_collection(
+            collection,
+            project_root,
+            query,
+            regex_route::RecencyTiebreak::NewestFirst,
+        ),
         note,
     )
 }
@@ -4541,7 +4556,7 @@ fn run_engine_ranking(
             .or_insert((candidate.evidence.exact_form, candidate.evidence.generated));
     }
 
-    let mut data_files = data_file::DataFileClassifier::new(query);
+    let mut data_files = data_file::DataFileClassifier::new(project_root, query);
     let mut lanes = Vec::new();
     for execution in executions {
         let candidates = execution
@@ -10058,9 +10073,14 @@ mod tests {
             _ => panic!("pattern compiles"),
         };
         let files = |literal: bool| {
-            let (result, note) =
-                ranked_regex_route_result(&ctx, &compile(literal), false, "alpha|omega")
-                    .expect("ready index");
+            let (result, note) = ranked_regex_route_result(
+                &ctx,
+                project.path(),
+                &compile(literal),
+                false,
+                "alpha|omega",
+            )
+            .expect("ready index");
             assert!(note.is_none());
             result
                 .summary
@@ -12949,6 +12969,7 @@ mod split_request_tests {
         };
         let patterns = split_query::PatternList::from_collection(
             regex_route_collection(&ctx, &compiled, false).expect("ready index"),
+            &root,
             r"load_\d+",
         );
         assert_eq!(patterns.len(), 60);
@@ -13028,13 +13049,14 @@ mod split_request_tests {
         }
     }
 
-    fn collect_patterns(ctx: &AppContext, pattern: &str) -> split_query::PatternList {
+    fn collect_patterns(ctx: &AppContext, root: &Path, pattern: &str) -> split_query::PatternList {
         let compiled = match pattern_compile::compile(pattern, CompileOpts::default()) {
             CompileResult::Ok(compiled) => compiled,
             _ => panic!("pattern compiles"),
         };
         split_query::PatternList::from_collection(
             regex_route_collection(ctx, &compiled, false).expect("ready index"),
+            root,
             pattern,
         )
     }
@@ -13118,7 +13140,7 @@ mod split_request_tests {
                 .all(|path| path.ends_with("f04.rs") || path.ends_with("f09.rs")),
             "{query_only:?}"
         );
-        let patterns = collect_patterns(&ctx, "no_such_name_anywhere");
+        let patterns = collect_patterns(&ctx, &root, "no_such_name_anywhere");
         let input = split_input(&patterns, HashMap::new(), None);
         assert_eq!(
             ranked_files(&ctx, &root, prose, &semantic, Some(&input), 0, 50),
@@ -13160,7 +13182,7 @@ mod split_request_tests {
         )
         .expect("write");
         let ctx = context(&root);
-        let patterns = collect_patterns(&ctx, "load_unique_marker");
+        let patterns = collect_patterns(&ctx, &root, "load_unique_marker");
         let defines = root.join("src/zz_defines.rs");
         let input = split_input(&patterns, HashMap::new(), Some(0.9));
         let semantic = (0..70)

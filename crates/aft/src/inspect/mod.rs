@@ -7,7 +7,7 @@ mod frameworks;
 pub mod freshness;
 mod generated;
 pub(crate) mod scoped_diagnostics_sweep;
-pub(crate) use generated::{is_generated_file, path_has_generated_shape};
+pub(crate) use generated::{is_generated_file, relative_shape_is_generated};
 pub mod job;
 mod manager;
 pub mod oxc_engine;
