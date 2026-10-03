@@ -173,7 +173,8 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
 
 /// Spawn a subprocess and wait for completion with timeout protection.
 ///
-/// Polls `try_wait()` at 50ms intervals. On timeout, kills the child process
+/// Wakes when the tool closes its output pipes, then checks for its exit. On
+/// timeout, kills the child process
 /// and waits for it to exit. Returns `FormatError::NotFound` when the binary
 /// isn't on PATH.
 pub fn run_external_tool(
@@ -232,11 +233,27 @@ fn wait_with_timeout(
 ) -> Result<SubprocessOutcome, FormatError> {
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_thread =
-        thread::spawn(move || read_bounded_to_string(stdout_pipe, MAX_CAPTURE_BYTES));
-    let stderr_thread =
-        thread::spawn(move || read_bounded_to_string(stderr_pipe, MAX_CAPTURE_BYTES));
+    // Each reader reports when its pipe reaches end of file. A tool closes
+    // both pipes when it exits, so waiting on these reports wakes the loop
+    // below as soon as the tool is done, instead of a fixed 50 ms sleep that
+    // added up to 50 ms to every format and tool run.
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let stdout_closed = closed_tx.clone();
+    let stdout_thread = thread::spawn(move || {
+        let output = read_bounded_to_string(stdout_pipe, MAX_CAPTURE_BYTES);
+        let _ = stdout_closed.send(());
+        output
+    });
+    let stderr_thread = thread::spawn(move || {
+        let output = read_bounded_to_string(stderr_pipe, MAX_CAPTURE_BYTES);
+        let _ = closed_tx.send(());
+        output
+    });
     let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
+    let mut open_pipes = 2u8;
+    // Once both pipes are closed the tool is exiting; its exit status can lag
+    // the close by a moment, so poll with a short, growing interval.
+    let mut exit_poll = Duration::from_millis(1);
 
     loop {
         match child.try_wait() {
@@ -251,7 +268,8 @@ fn wait_with_timeout(
                 });
             }
             Ok(None) => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if now >= deadline {
                     kill_process_tree(&mut child);
                     let _ = child.wait();
                     // Do NOT block joining the reader threads — orphaned
@@ -263,7 +281,27 @@ fn wait_with_timeout(
                         timeout_secs,
                     });
                 }
-                thread::sleep(Duration::from_millis(50));
+                let remaining = deadline - now;
+                if open_pipes > 0 {
+                    // Wait for a pipe to close, or for the deadline. Joining
+                    // the readers after exit already waits for the pipes, so
+                    // waiting for them here first delays nothing.
+                    match closed_rx.recv_timeout(remaining) {
+                        Ok(()) => open_pipes -= 1,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open_pipes = 0,
+                    }
+                } else {
+                    let pause = exit_poll.min(remaining);
+                    #[cfg(test)]
+                    {
+                        if pause >= EXIT_POLL_MAX {
+                            FULL_POLL_SLEEPS.with(|count| count.set(count.get() + 1));
+                        }
+                    }
+                    thread::sleep(pause);
+                    exit_poll = (exit_poll * 2).min(EXIT_POLL_MAX);
+                }
             }
             Err(e) => {
                 kill_process_tree(&mut child);
@@ -276,6 +314,16 @@ fn wait_with_timeout(
             }
         }
     }
+}
+
+/// Longest pause between exit checks once a tool has closed its pipes; a
+/// tool that closes them and keeps running is checked this often.
+const EXIT_POLL_MAX: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    /// Exit-check pauses of the full poll interval on this thread.
+    static FULL_POLL_SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn read_bounded_to_string<R: Read>(mut reader: R, limit: usize) -> (String, bool) {
@@ -2412,6 +2460,30 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    /// A tool that exits at once must be noticed when it closes its pipes,
+    /// not after a fixed 50 ms sleep.
+    #[cfg(unix)]
+    #[test]
+    fn run_external_tool_wakes_when_the_tool_exits() {
+        let before = FULL_POLL_SLEEPS.with(|count| count.get());
+        for _ in 0..5 {
+            let result = run_external_tool("sh", &["-c", "echo done"], None, 30).unwrap();
+            assert_eq!(result.stdout.trim(), "done");
+        }
+        assert_eq!(FULL_POLL_SLEEPS.with(|count| count.get()) - before, 0);
+    }
+
+    /// A tool that closes its pipes and keeps running is still waited for.
+    #[cfg(unix)]
+    #[test]
+    fn run_external_tool_waits_for_exit_after_pipes_close() {
+        let started = Instant::now();
+        let result =
+            run_external_tool("sh", &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"], None, 30).unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]
