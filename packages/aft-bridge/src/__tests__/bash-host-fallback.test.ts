@@ -10,6 +10,7 @@ import {
   BASH_HOST_FALLBACK_BANNER,
   bashHostFallbackAskPattern,
   hostFallbackPathWithShims,
+  OutputTail,
   runBashHostFallback,
 } from "../bash-host-fallback.js";
 import { classifyBashHostFallbackError } from "../error-contract.js";
@@ -200,5 +201,39 @@ describe("hostFallbackPathWithShims", () => {
     };
 
     expect(hostFallbackPathWithShims(env, "win32")).toBe("C:\\Windows\\System32;C:\\Git\\cmd");
+  });
+});
+
+describe("OutputTail", () => {
+  // Concatenating the whole kept tail on every chunk copied up to the 100 KB
+  // cap per chunk. The tail is now copied once, when the command finishes.
+  test("keeps the exact last bytes and copies them once", () => {
+    const tail = new OutputTail(10);
+    const chunks = ["abc", "defg", "hij", "klmnopq", "r", "stuvwxyz"].map((c) => Buffer.from(c));
+    for (const chunk of chunks) tail.push(chunk);
+
+    expect(tail.truncated).toBe(true);
+    expect(tail.bytes().toString()).toBe("qrstuvwxyz");
+    expect(tail.copiedBytes).toBe(10);
+  });
+
+  test("a large stream copies only the final tail", () => {
+    const tail = new OutputTail(100 * 1024);
+    const chunk = Buffer.alloc(64 * 1024, "x");
+    for (let i = 0; i < 100; i++) tail.push(chunk);
+    tail.push(Buffer.from("TAIL"));
+
+    const out = tail.bytes();
+    expect(out.byteLength).toBe(100 * 1024);
+    expect(out.subarray(-4).toString()).toBe("TAIL");
+    expect(tail.copiedBytes).toBe(100 * 1024);
+  });
+
+  test("output under the cap is kept whole and not marked truncated", () => {
+    const tail = new OutputTail(10);
+    tail.push(Buffer.from("abc"));
+    tail.push(Buffer.from("defghij"));
+    expect(tail.truncated).toBe(false);
+    expect(tail.bytes().toString()).toBe("abcdefghij");
   });
 });

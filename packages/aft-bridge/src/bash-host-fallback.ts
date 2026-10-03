@@ -101,15 +101,47 @@ export function bashHostFallbackAskPattern(
   return `AFT UNAVAILABLE (${cause}) - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`;
 }
 
-function appendTail(chunks: Buffer[], chunk: Buffer): { chunks: Buffer[]; truncated: boolean } {
-  const combined = Buffer.concat([...chunks, chunk]);
-  if (combined.byteLength <= BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES) {
-    return { chunks: [combined], truncated: false };
+/**
+ * The last `BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES` of a command's combined
+ * output. Chunks are kept as received and the oldest are dropped or sliced
+ * (without copying) once the cap is exceeded; the tail is copied into one
+ * buffer only when the command finishes. Concatenating the whole tail on every
+ * chunk copied up to the cap per chunk.
+ */
+export class OutputTail {
+  private chunks: Buffer[] = [];
+  private length = 0;
+  /** Some output was dropped from the front to honour the cap. */
+  truncated = false;
+  /** Bytes copied while assembling output; tests use it to pin the cost. */
+  copiedBytes = 0;
+
+  constructor(private readonly maxBytes = BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES) {}
+
+  push(chunk: Buffer): void {
+    this.chunks.push(chunk);
+    this.length += chunk.byteLength;
+    let excess = this.length - this.maxBytes;
+    if (excess <= 0) return;
+    this.truncated = true;
+    while (excess > 0) {
+      const first = this.chunks[0];
+      if (first.byteLength <= excess) {
+        this.chunks.shift();
+        this.length -= first.byteLength;
+        excess -= first.byteLength;
+      } else {
+        this.chunks[0] = first.subarray(excess);
+        this.length -= excess;
+        excess = 0;
+      }
+    }
   }
-  return {
-    chunks: [combined.subarray(combined.byteLength - BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES)],
-    truncated: true,
-  };
+
+  bytes(): Buffer {
+    this.copiedBytes += this.length;
+    return Buffer.concat(this.chunks, this.length);
+  }
 }
 
 function renderOutput(output: Buffer, exitCode: number): string {
@@ -144,17 +176,14 @@ export async function runBashHostFallback(
       windowsHide: true,
     });
 
-    let chunks: Buffer[] = [];
-    let truncated = false;
+    const output = new OutputTail();
     let timedOut = false;
     let aborted = false;
     let settled = false;
     let abortForceTimer: ReturnType<typeof setTimeout> | undefined;
 
     const capture = (chunk: Buffer | string) => {
-      const next = appendTail(chunks, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      chunks = next.chunks;
-      truncated ||= next.truncated;
+      output.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     };
     child.stdout?.on("data", capture);
     child.stderr?.on("data", capture);
@@ -207,9 +236,9 @@ export async function runBashHostFallback(
       const exitCode = timedOut ? 124 : (code ?? 1);
       resolve({
         success: true,
-        output: renderOutput(Buffer.concat(chunks), exitCode),
+        output: renderOutput(output.bytes(), exitCode),
         exit_code: exitCode,
-        truncated,
+        truncated: output.truncated,
       });
     });
   });
