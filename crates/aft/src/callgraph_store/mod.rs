@@ -3688,7 +3688,12 @@ struct DiskProjectIndex<'a> {
 #[derive(Default)]
 struct DiskIndexMemos {
     file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
-    module_parents: RefCell<HashMap<String, Option<(String, String)>>>,
+    /// Target file -> first `(declaring file, module path)` naming it, in
+    /// `(caller_file, module_path)` order, built by one scan of the module
+    /// references on first use.
+    module_parents: RefCell<Option<Rc<HashMap<String, (String, String)>>>>,
+    /// Every stored Rust file, in path order.
+    rust_files: RefCell<Option<Rc<Vec<String>>>>,
 }
 
 impl DiskProjectIndex<'_> {
@@ -3794,26 +3799,61 @@ impl DiskProjectIndex<'_> {
         Some(index)
     }
 
+    fn module_refs(&self) -> Vec<(String, String)> {
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT caller_file, module_path FROM refs
+             WHERE kind = 'module' AND module_path IS NOT NULL
+             ORDER BY caller_file, module_path",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
     fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT caller_file, module_path FROM refs
-                 WHERE kind = 'module' AND module_path IS NOT NULL
-                 ORDER BY caller_file, module_path",
-            )
-            .ok()?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()?;
-        for row in rows.flatten() {
-            if self.module_target(&row.0, &row.1).as_deref() == Some(target_file) {
-                return Some(row);
+        self.module_refs()
+            .into_iter()
+            .find(|row| self.module_target(&row.0, &row.1).as_deref() == Some(target_file))
+    }
+
+    /// Every module reference's target, first declaration winning, so each
+    /// later lookup is one map probe instead of a scan of every module row.
+    fn module_parents(&self) -> Rc<HashMap<String, (String, String)>> {
+        if let Some(parents) = self.memos.module_parents.borrow().as_ref() {
+            return Rc::clone(parents);
+        }
+        let mut parents = HashMap::new();
+        for row in self.module_refs() {
+            if let Some(target) = self.module_target(&row.0, &row.1) {
+                parents.entry(target).or_insert(row);
             }
         }
-        None
+        let parents = Rc::new(parents);
+        *self.memos.module_parents.borrow_mut() = Some(Rc::clone(&parents));
+        parents
+    }
+
+    fn rust_files(&self) -> Rc<Vec<String>> {
+        if let Some(files) = self.memos.rust_files.borrow().as_ref() {
+            return Rc::clone(files);
+        }
+        let files = self
+            .conn
+            .prepare_cached("SELECT path FROM files WHERE lang = 'rust' ORDER BY path")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default();
+        let files = Rc::new(files);
+        *self.memos.rust_files.borrow_mut() = Some(Rc::clone(&files));
+        files
     }
 }
 
@@ -3833,20 +3873,9 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
         if self.memoize_resolver_indexes {
-            if let Some(cached) = self.memos.module_parents.borrow().get(target_file).cloned() {
-                return cached;
-            }
+            return self.module_parents().get(target_file).cloned();
         }
-
-        let parent = self.load_module_parent(target_file);
-        if self.memoize_resolver_indexes {
-            let mut memo = self.memos.module_parents.borrow_mut();
-            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
-                memo.clear();
-            }
-            memo.insert(target_file.to_string(), parent.clone());
-        }
-        parent
+        self.load_module_parent(target_file)
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -3948,6 +3977,15 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         };
         if let Some(target) = check(caller_file.to_string()) {
             return Some(target);
+        }
+        if self.memoize_resolver_indexes {
+            // One path-ordered list for the whole pass instead of a scan of
+            // the files table per qualified call.
+            return self
+                .rust_files()
+                .iter()
+                .filter(|path| path.as_str() != caller_file)
+                .find_map(|path| check(path.clone()));
         }
         let mut statement = self
             .conn

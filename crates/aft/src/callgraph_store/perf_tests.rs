@@ -451,3 +451,27 @@ fn cold_build_reads_each_package_json_a_bounded_number_of_times() {
         counts.package_json_reads
     );
 }
+
+#[test]
+fn rust_qualified_call_resolution_compiles_statements_independent_of_call_count() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut compiled = Vec::new();
+    for calls in [20usize, 80] {
+        let root = fixture_root(&dir, &format!("project-{calls}"));
+        let files = rust_qualified_call_fixture(&root, calls);
+        let (store, counts) =
+            cold_build_counts(&root, &dir.path().join(format!("store-{calls}")), &files);
+        let edges = dump_graph_rows(&store)
+            .lines()
+            .filter(|line| line.starts_with("edges\t") && line.contains("src/util.rs"))
+            .count();
+        assert_eq!(edges, calls * 2, "every qualified call must resolve");
+        compiled.push(counts.statements_compiled);
+    }
+    let growth = compiled[1].saturating_sub(compiled[0]);
+    eprintln!("statements compiled for 20 and 80 calls: {compiled:?}");
+    assert!(
+        growth < 20,
+        "60 more qualified calls must not compile statements per call: {compiled:?}"
+    );
+}
