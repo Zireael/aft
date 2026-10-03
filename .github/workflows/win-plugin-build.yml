@@ -1,0 +1,76 @@
+name: Windows plugin build
+
+# Manual, on-demand build of the AFT plugin for Windows.
+#
+# `release.yml` builds the Rust binary per platform, and the unit/e2e lanes
+# run on Linux; neither produces a Windows *plugin* bundle. This workflow does:
+#
+#   - pi-plugin      : the Pi / OMP extension (@cortexkit/aft-pi) — the artifact
+#                      this repo's OMP sidepanel program consumes
+#   - opencode-plugin: the OpenCode plugin (@cortexkit/aft-opencode)
+#
+# No Rust toolchain step: neither plugin build shells out to cargo (only the
+# test lanes do). Run it by hand (Actions -> Windows plugin build -> Run
+# workflow); a push does not trigger it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Plugin package to build
+        required: true
+        type: choice
+        default: pi-plugin
+        options:
+          - pi-plugin
+          - opencode-plugin
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ inputs.package }} (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun install cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install workspace dependencies
+        shell: bash
+        run: bun install --frozen-lockfile
+
+      - name: Build ${{ inputs.package }}
+        shell: bash
+        run: bun run --cwd packages/${{ inputs.package }} build
+
+      - name: Pack installable tarball
+        shell: bash
+        working-directory: packages/${{ inputs.package }}
+        run: npm pack --pack-destination "${{ github.workspace }}/artifacts"
+
+      - name: Upload installable tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: aft-${{ inputs.package }}-windows
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+      - name: Upload built dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: aft-${{ inputs.package }}-dist
+          path: packages/${{ inputs.package }}/dist
+          if-no-files-found: error
+          retention-days: 14
