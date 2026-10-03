@@ -2557,6 +2557,45 @@ fn subc_bridge_module_draining_closes_every_daemon_request_credit() {
     );
 }
 
+#[test]
+fn subc_bridge_deleted_root_reclaim_goodbyes_follow_terminals_and_allow_fresh_bind() {
+    run_subc_bridge_test(
+        "subc_bridge_deleted_root_reclaim_goodbyes_follow_terminals_and_allow_fresh_bind",
+        Duration::from_secs(60),
+        drive_deleted_root_reclaim_goodbyes_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed() {
+    run_subc_bridge_test(
+        "subc_bridge_deleted_root_reclaim_late_call_is_route_reclaimed",
+        Duration::from_secs(60),
+        |input| async {
+            let (mut session, _root, frames, late_error) = reclaim_bound_test_root(input).await;
+            eprintln!(
+                "reclaim late-call refusal: {}",
+                String::from_utf8_lossy(&late_error.body)
+            );
+            assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+            let error: ErrorBody =
+                serde_json::from_slice(&late_error.body).expect("late error body");
+            assert!(error.message.contains("project root was removed"));
+            assert!(error.message.contains("reopened"));
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.header.ty == FrameType::StreamEnd)
+                    .count(),
+                2
+            );
+            send_connection_goodbye(&mut session.stream).await;
+        },
+        |_, _, _| {},
+    );
+}
+
 /// The root's executor gets a single reader slot, so one long read occupies it
 /// and every bash wait poll on that root queues behind the read.
 fn single_reader_executor_config() -> ExecutorConfig {
@@ -8643,6 +8682,178 @@ async fn pump_daemon_credits(
         };
         ledger.observe(&frame);
     }
+}
+
+/// Exercises the actual frame loop, leaving the fake daemon's routes open until
+/// the module tells it to close them. A late request is deliberately forwarded
+/// even after Goodbye, to cover a carrier racing with route closure.
+async fn reclaim_bound_test_root(
+    input: FakeDaemonInput,
+) -> (FakeDaemonSession, tempfile::TempDir, Vec<Frame>, Frame) {
+    let mut session = open_fake_daemon_session(input).await;
+    let root_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let root = root_dir.path();
+    let root_id = ProjectRootId::from_path(root).expect("reclaimed root id");
+    for channel in [121, 122, 123] {
+        send_route_bind_with_session(
+            &mut session.stream,
+            channel,
+            u64::from(channel),
+            root,
+            &format!("session-reclaimed-{channel}"),
+        )
+        .await;
+        expect_route_bind_ack(&mut session.stream, u64::from(channel)).await;
+    }
+    let mut ledger = DaemonCreditLedger::default();
+    for channel in [121, 122] {
+        send_bg_events_subscribe(&mut session.stream, channel, 950).await;
+        ledger.open(channel, 950, "held bg_events on deleted root");
+    }
+    // The control reply is a FIFO barrier: both subscriptions have reached the
+    // frame loop before the directory disappears.
+    send_control_request(
+        &mut session.stream,
+        980,
+        ModuleControlRequest::HealthCheck {},
+    )
+    .await;
+    loop {
+        let frame = read_frame_timeout(&mut session.stream, "subscription barrier").await;
+        if frame.header.channel == 0 && frame.header.corr == 980 {
+            assert_eq!(frame.header.ty, FrameType::Response);
+            break;
+        }
+        ledger.observe(&frame);
+    }
+    assert_eq!(ledger.open.len(), 2, "streams must be held before deletion");
+    std::fs::remove_dir_all(root).expect("delete bound root");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut frames = Vec::new();
+    while session.executor.actor_registered(&root_id) {
+        assert!(
+            Instant::now() < deadline,
+            "deleted root was never reclaimed"
+        );
+        if let Some(frame) = read_any_frame_until(
+            &mut session.stream,
+            (Instant::now() + Duration::from_millis(100)).min(deadline),
+            "root reclaim",
+        )
+        .await
+        {
+            ledger.observe(&frame);
+            frames.push(frame);
+        }
+    }
+    // Restoring the same path must not resurrect the forgotten route. The
+    // session needs a fresh bind, just as a reclaimed worktree's carrier does.
+    std::fs::create_dir_all(root).expect("restore project directory");
+    std::fs::write(root.join("restored.txt"), "restored root is live\n").expect("restored file");
+    send_tool_call(
+        &mut session.stream,
+        121,
+        999,
+        "read",
+        json!({"filePath": root.join("restored.txt")}),
+    )
+    .await;
+    let late_error = loop {
+        let frame = read_frame_timeout(&mut session.stream, "late reclaimed-route call").await;
+        if frame.header.channel == 121 && frame.header.corr == 999 {
+            break frame;
+        }
+        ledger.observe(&frame);
+        frames.push(frame);
+    };
+    assert!(
+        ledger.open.is_empty(),
+        "held credits not answered: {:?}",
+        ledger.open_requests()
+    );
+    assert!(
+        ledger.unmatched_terminals.is_empty(),
+        "duplicate terminals: {:?}",
+        ledger.unmatched_terminals
+    );
+    eprintln!(
+        "deleted-root frame-loop reproduction: held terminals={}, route GOODBYEs={:?}, old-route refusal={}",
+        frames.iter().filter(|frame| frame.header.ty == FrameType::StreamEnd).count(),
+        frames.iter().filter(|frame| frame.header.ty == FrameType::Goodbye).map(|frame| (frame.header.channel, frame.header.epoch)).collect::<Vec<_>>(),
+        String::from_utf8_lossy(&late_error.body),
+    );
+    (session, root_dir, frames, late_error)
+}
+
+async fn drive_deleted_root_reclaim_goodbyes_daemon(input: FakeDaemonInput) {
+    let (mut session, root_dir, frames, late_error) = reclaim_bound_test_root(input).await;
+    let goodbyes = frames
+        .iter()
+        .filter(|frame| frame.header.ty == FrameType::Goodbye)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        goodbyes.len(),
+        3,
+        "daemon must receive one route Goodbye per reclaimed route"
+    );
+    assert_eq!(
+        goodbyes
+            .iter()
+            .map(|frame| (frame.header.channel, frame.header.epoch))
+            .collect::<HashSet<_>>(),
+        HashSet::from([(121, 1), (122, 1), (123, 1)])
+    );
+    for frame in &goodbyes {
+        assert_eq!(frame.header.ver, PROTOCOL_VERSION);
+        assert_eq!(frame.header.corr, 0);
+        assert!(frame.body.is_empty());
+    }
+    let first_goodbye = frames
+        .iter()
+        .position(|frame| frame.header.ty == FrameType::Goodbye)
+        .unwrap();
+    let last_terminal = frames
+        .iter()
+        .rposition(|frame| frame.header.ty == FrameType::StreamEnd)
+        .expect("held stream terminal");
+    assert!(
+        last_terminal < first_goodbye,
+        "all held terminals must precede route closure"
+    );
+    assert_error_frame(&late_error, 121, 999, "route_reclaimed");
+
+    // Reuse the channel with a new epoch, keeping both path and session. This
+    // also checks that the reclaimed epoch watermark does not poison a rebind.
+    send_route_bind_with_harness_session_principal_and_doc_epoch(
+        &mut session.stream,
+        121,
+        2,
+        1000,
+        root_dir.path(),
+        "opencode",
+        "session-reclaimed-121",
+        Some(Principal::Direct),
+        minimal_bind_doc(),
+    )
+    .await;
+    expect_route_bind_ack(&mut session.stream, 1000).await;
+    send_tool_call_epoch(
+        &mut session.stream,
+        121,
+        2,
+        1001,
+        "read",
+        json!({"filePath": root_dir.path().join("restored.txt")}),
+    )
+    .await;
+    let frame = read_frame_timeout(&mut session.stream, "fresh bind read").await;
+    assert_eq!(
+        (frame.header.channel, frame.header.epoch, frame.header.corr),
+        (121, 2, 1001)
+    );
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert!(tool_result_text(&frame).contains("restored root is live"));
+    send_connection_goodbye(&mut session.stream).await;
 }
 
 /// Reproduces a restart drain that ran to the daemon's forced-teardown ceiling
