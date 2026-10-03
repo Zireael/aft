@@ -3828,6 +3828,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/helpers/live-v2-probe.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/hoisted-tools.test.ts",
       "token": "filePath",
       "location": "file-level",
@@ -3906,6 +3913,13 @@
     },
     {
       "path": "packages/opencode-plugin/src/__tests__/tools.test.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
+      "path": "packages/opencode-plugin/src/__tests__/v2-tool-hooks.test.ts",
       "token": "filePath",
       "location": "file-level",
       "class": "compatibility-fixture",
@@ -4162,55 +4176,55 @@
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
-      "line": 204,
+      "line": 206,
       "column": 36,
       "token": "filePath",
       "text": "* V1 keeps OpenCode's historical `filePath` header key. V2's renderers read the",
-      "location": "line 204, column 36",
+      "location": "line 206, column 36",
       "ordinal": 1,
       "class": "host-display-contract",
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
-      "line": 209,
+      "line": 211,
       "column": 59,
       "token": "filePath",
       "text": "if (!V2_PATH_HEADER_TOOLS.has(bareToolName(name)) || !(\"filePath\" in definition.args)) {",
-      "location": "line 209, column 59",
+      "location": "line 211, column 59",
       "ordinal": 1,
       "class": "host-display-contract",
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
-      "line": 213,
+      "line": 215,
       "column": 11,
       "token": "filePath",
       "text": "const { filePath, ...rest } = definition.args;",
-      "location": "line 213, column 11",
+      "location": "line 215, column 11",
       "ordinal": 1,
       "class": "host-display-contract",
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
-      "line": 214,
+      "line": 216,
       "column": 18,
       "token": "filePath",
       "text": "return { path: filePath, ...rest };",
-      "location": "line 214, column 18",
+      "location": "line 216, column 18",
       "ordinal": 1,
       "class": "host-display-contract",
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
       "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
-      "line": 220,
+      "line": 222,
       "column": 12,
       "token": "filePath",
       "text": "return { filePath: path, ...rest };",
-      "location": "line 220, column 12",
+      "location": "line 222, column 12",
       "ordinal": 1,
       "class": "host-display-contract",
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
