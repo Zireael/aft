@@ -1081,6 +1081,186 @@ mod tests {
         let _ = registry.kill(&watched, session);
     }
 
+    #[cfg(unix)]
+    fn read_record(
+        ctx: &AppContext,
+        task_id: &str,
+    ) -> crate::bash_background::persistence::PersistedTask {
+        let path = ctx
+            .bash_background()
+            .task_json_path(task_id, "sandbox-spawn-test")
+            .expect("task json path");
+        crate::bash_background::persistence::read_task(&path).unwrap()
+    }
+
+    /// Rewrites the hard-kill limit in a task's record to `limit_ms`, as if
+    /// the task had already run past its recorded limit while AFT was down
+    /// (the start time cannot be faked: replay checks it against the live
+    /// process).
+    #[cfg(unix)]
+    fn set_recorded_limit(ctx: &AppContext, task_id: &str, limit_ms: u64) {
+        let path = ctx
+            .bash_background()
+            .task_json_path(task_id, "sandbox-spawn-test")
+            .expect("task json path");
+        let mut record = crate::bash_background::persistence::read_task(&path).unwrap();
+        record.timeout_ms = Some(limit_ms);
+        crate::bash_background::persistence::write_task(&path, &record).unwrap();
+    }
+
+    /// A fresh engine context over the same storage that reloads the session's
+    /// tasks from their records, as AFT does after a restart. `window_ms` is
+    /// the worker wait limit the restarted engine grants.
+    #[cfg(unix)]
+    fn restart(project: &Path, storage: &Path, window_ms: u64) -> AppContext {
+        let restarted = spawn_test_context(project, storage);
+        restarted
+            .bash_background()
+            .set_worker_wait_window(std::time::Duration::from_millis(window_ms));
+        restarted
+            .bash_background()
+            .replay_session_for_project(
+                &crate::bash_background::task_storage_dir(&restarted),
+                "sandbox-spawn-test",
+                project,
+            )
+            .expect("replay after restart");
+        restarted
+    }
+
+    /// A default kill a worker's waits extended is written to the task's
+    /// record (with its source), so a restart that reloads the task past its
+    /// original default limit keeps it alive instead of killing it at once.
+    /// The record starts out already past due (200 ms) and the restarted
+    /// engine grants only a 300 ms window, so only the written renewal can
+    /// keep the task running.
+    #[cfg(unix)]
+    #[test]
+    fn a_renewed_task_survives_a_restart_from_its_record() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let session = "sandbox-spawn-test";
+        let task = spawn_background_task(&ctx, json!({}));
+        set_recorded_limit(&ctx, &task, 200);
+        let renewed = ctx
+            .bash_background()
+            .renew_hard_kill(&task, session, std::time::Duration::from_secs(2 * 3600))
+            .expect("a default kill is renewable");
+
+        let record = read_record(&ctx, &task);
+        assert!(record.default_hard_kill, "the record carries the source");
+        assert_eq!(
+            record.timeout_ms,
+            Some(renewed),
+            "the renewed limit reached the record"
+        );
+
+        let restarted = restart(project.path(), storage.path(), 300);
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let status =
+            crate::commands::bash_status::handle(&status_request(&task, false), &restarted).data;
+        assert_eq!(status["status"], "running", "{status:?}");
+        let _ = restarted.bash_background().kill(&task, session);
+        let _ = ctx.bash_background().kill(&task, session);
+    }
+
+    /// A reloaded task whose recorded default limit passed during the
+    /// downtime is granted one worker wait window from the restart (not
+    /// killed the instant AFT comes back), stays renewable, and is still
+    /// killed by the default limit once the waits stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_reloaded_default_kill_task_gets_one_window_then_is_killed() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let session = "sandbox-spawn-test";
+        let task = spawn_background_task(&ctx, json!({}));
+        assert!(read_record(&ctx, &task).default_hard_kill);
+        // The recorded default limit passed while AFT was down.
+        set_recorded_limit(&ctx, &task, 1);
+
+        let reloaded_at = std::time::Instant::now();
+        let restarted = restart(project.path(), storage.path(), 1_000);
+        let status = |restarted: &AppContext| {
+            crate::commands::bash_status::handle(&status_request(&task, false), restarted).data
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let early = status(&restarted);
+        assert_eq!(
+            early["status"], "running",
+            "not killed when AFT comes back: {early:?}"
+        );
+        assert!(
+            restarted
+                .bash_background()
+                .renew_hard_kill(&task, session, std::time::Duration::from_millis(1_000))
+                .is_some(),
+            "a reloaded default kill stays renewable"
+        );
+        let deadline = reloaded_at + std::time::Duration::from_secs(10);
+        let killed = loop {
+            let data = status(&restarted);
+            if data["status"] == "timed_out" {
+                break data;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never killed once the waits stopped: {data:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            reloaded_at.elapsed() >= std::time::Duration::from_millis(1_200),
+            "killed before the renewed window ran out"
+        );
+        assert!(
+            killed["status_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("killed by AFT's default background limit"),
+            "{killed:?}"
+        );
+        let _ = ctx.bash_background().kill(&task, session);
+    }
+
+    /// A caller's explicit `timeout` is never extended, after a restart
+    /// either: a task reloaded past its timeout is killed, by that timeout.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_timeout_task_reloaded_past_its_timeout_is_killed() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let session = "sandbox-spawn-test";
+        let task = spawn_background_task(&ctx, json!({ "timeout": 60_000 }));
+        assert!(!read_record(&ctx, &task).default_hard_kill);
+        // The caller's timeout passed while AFT was down.
+        set_recorded_limit(&ctx, &task, 200);
+
+        let restarted = restart(project.path(), storage.path(), 2 * 3600 * 1000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let data =
+                crate::commands::bash_status::handle(&status_request(&task, false), &restarted)
+                    .data;
+            if data["status"] == "timed_out" {
+                assert_eq!(
+                    data["status_reason"], "killed by the `timeout` of 0.2s you passed (exit 124)",
+                    "{data:?}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an explicit timeout was extended across the restart: {data:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = ctx.bash_background().kill(&task, session);
+    }
+
     /// A kill by the caller's own `timeout` is named as that, not as AFT's
     /// default limit.
     #[cfg(unix)]

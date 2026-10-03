@@ -6120,6 +6120,12 @@ fn replay_configure_session_parts(
     root_path: &Path,
 ) {
     crate::bash_background::repair_legacy_root_tasks(storage_root, harness);
+    // A replayed task a worker was waiting on is granted one worker wait
+    // window from now, so the registry needs the configured window first.
+    ctx.bash_background()
+        .set_worker_wait_window(std::time::Duration::from_millis(
+            crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
+        ));
     #[cfg(test)]
     CONFIGURE_REPLAY_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
     if let Err(error) =

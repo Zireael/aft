@@ -67,6 +67,9 @@ use crate::db::bash_watches::BashPatternWatchRow;
 /// Agents can override per-call via the `timeout` parameter (in ms); see
 /// [`super::HardKill`].
 pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How far past the last written hard-kill limit a renewal must reach before
+/// it is written to the task's record (see `BgTaskRegistry::renew_hard_kill`).
+pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -282,9 +285,9 @@ pub struct HardKillDeadline {
 }
 
 impl HardKillDeadline {
-    /// The deadline a task record carries. `renewable` is known only for a
-    /// task this process started; otherwise a limit equal to the default is
-    /// taken to be the default.
+    /// The deadline a task record carries. `renewable` is the record's
+    /// `default_hard_kill`; for a record written before AFT stored it, a
+    /// limit equal to the default is taken to be the default.
     fn from_metadata(timeout_ms: Option<u64>, renewable: bool) -> Option<Self> {
         let limit_ms = timeout_ms?;
         let source = if renewable || limit_ms == DEFAULT_BG_TIMEOUT.as_millis() as u64 {
@@ -502,6 +505,10 @@ pub(crate) struct RegistryInner {
     pub(crate) shutdown: AtomicBool,
     pub(crate) long_running_reminder_enabled: AtomicBool,
     pub(crate) long_running_reminder_interval_ms: AtomicU64,
+    /// The worker wait limit (`bash.worker_wait_max_ms`) last seen, in ms.
+    /// A task reloaded after a restart is granted one such window from the
+    /// restart; set at configure and by every renewal.
+    worker_wait_window_ms: AtomicU64,
     persisted_gc_started: AtomicBool,
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
@@ -569,9 +576,12 @@ pub(crate) struct BgTask {
     pub(crate) started: Instant,
     /// Whether a delegated worker's wait may push this task's hard kill later
     /// ([`BgTaskRegistry::renew_hard_kill`]): true only for the implicit
-    /// default kill. A task rehydrated after a restart is not renewable, so it
-    /// keeps the kill its record carries.
+    /// default kill, which the task's record carries (`default_hard_kill`) so
+    /// a task reloaded after a restart stays renewable.
     hard_kill_renewable: bool,
+    /// The hard-kill limit last written to the task's record, so renewals
+    /// write it at most about once a minute (see [`RENEWAL_PERSIST_STEP_MS`]).
+    persisted_hard_kill_ms: AtomicU64,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -831,6 +841,9 @@ impl BgTaskRegistry {
                 shutdown: AtomicBool::new(false),
                 long_running_reminder_enabled: AtomicBool::new(true),
                 long_running_reminder_interval_ms: AtomicU64::new(600_000),
+                worker_wait_window_ms: AtomicU64::new(
+                    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+                ),
                 persisted_gc_started: AtomicBool::new(false),
                 #[cfg(test)]
                 persisted_gc_runs: AtomicU64::new(0),
@@ -2361,6 +2374,7 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
+        metadata.default_hard_kill = hard_kill.renewable();
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
         // bash/zsh PIPESTATUS, which does not exist on the Windows spawn path.
         #[cfg(unix)]
@@ -2443,6 +2457,7 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             hard_kill_renewable: hard_kill.renewable(),
+            persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -2590,6 +2605,7 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
+        metadata.default_hard_kill = hard_kill.renewable();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
         metadata.pty_rows = Some(rows);
@@ -2647,6 +2663,7 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             hard_kill_renewable: hard_kill.renewable(),
+            persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -2761,6 +2778,7 @@ impl BgTaskRegistry {
             compressed,
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
+        metadata.default_hard_kill = hard_kill.renewable();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         if let Err(error) = write_task_at(&task_layout, &metadata) {
             let _ = delete_resolved_task(&task_layout);
@@ -2808,6 +2826,7 @@ impl BgTaskRegistry {
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
             hard_kill_renewable: hard_kill.renewable(),
+            persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -4756,6 +4775,14 @@ impl BgTaskRegistry {
         Ok(true)
     }
 
+    /// Records the worker wait limit in force, which a task reloaded after a
+    /// restart is granted from the restart (see `insert_rehydrated_task`).
+    pub(crate) fn set_worker_wait_window(&self, window: Duration) {
+        self.inner
+            .worker_wait_window_ms
+            .store(window.as_millis() as u64, Ordering::Relaxed);
+    }
+
     /// Pushes a running task's implicit default hard kill to at least `window`
     /// from now, because a delegated worker is waiting on it. Returns the
     /// task's new limit (milliseconds since it started) when it was extended.
@@ -4766,18 +4793,28 @@ impl BgTaskRegistry {
     /// worker cannot see. Each wait therefore grants another window; once the
     /// worker stops waiting the task is killed at most `window` later, so
     /// nothing runs unbounded. An explicit timeout is never extended, and the
-    /// limit only ever grows. The new limit is kept in memory; it reaches the
-    /// task's record with the next metadata write (for example a promotion).
+    /// limit only ever grows.
+    ///
+    /// The new limit is written to the task's record through the normal
+    /// metadata write (JSON under the task's state lock like every other
+    /// metadata write, the aft.db row after it is released), but only once
+    /// it is [`RENEWAL_PERSIST_STEP_MS`] past the last written one, so a
+    /// worker polling every second costs about one write a minute. Without
+    /// the write, a restart would reload the 30-minute limit and kill a long
+    /// watched build at once.
     pub(crate) fn renew_hard_kill(
         &self,
         task_id: &str,
         session_id: &str,
         window: Duration,
     ) -> Option<u64> {
+        self.set_worker_wait_window(window);
         let task = self.task_for_session(task_id, session_id)?;
         if !task.hard_kill_renewable {
             return None;
         }
+        // Declared before the lock so the aft.db write runs after it is released.
+        let mut db = DeferredDbWrites::new(self, &task);
         let mut state = task.state.lock().ok()?;
         if state.metadata.status.is_terminal() {
             return None;
@@ -4788,6 +4825,15 @@ impl BgTaskRegistry {
             return None;
         }
         state.metadata.timeout_ms = Some(wanted);
+        let persisted = task.persisted_hard_kill_ms.load(Ordering::Relaxed);
+        if wanted >= persisted.saturating_add(RENEWAL_PERSIST_STEP_MS) {
+            match self.persist_task_locked(&task, &state.metadata, &mut db) {
+                Ok(()) => task.persisted_hard_kill_ms.store(wanted, Ordering::Relaxed),
+                Err(error) => crate::slog_warn!(
+                    "failed to persist the renewed hard kill of background task {task_id}: {error}"
+                ),
+            }
+        }
         Some(wanted)
     }
 
@@ -5513,13 +5559,29 @@ impl BgTaskRegistry {
 
     fn insert_rehydrated_task(
         &self,
-        metadata: PersistedTask,
+        mut metadata: PersistedTask,
         paths: TaskPaths,
         detached: bool,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
         let started = started_instant_from_unix_millis(metadata.started_at);
+        let renewable = metadata.default_hard_kill;
+        let persisted_hard_kill_ms = metadata.timeout_ms.unwrap_or(0);
+        // A worker may have been waiting on this task when AFT stopped, and
+        // its last renewal may have reached the record up to a minute late,
+        // or the downtime itself may have outlasted the recorded limit. Grant
+        // one worker wait window from now, so a watched build is not killed
+        // the moment AFT comes back; the worker's next wait renews it again,
+        // and if none comes the task is killed one window later. A caller's
+        // explicit `timeout` is never extended.
+        if renewable && !metadata.status.is_terminal() {
+            if let Some(limit) = metadata.timeout_ms {
+                let window = self.inner.worker_wait_window_ms.load(Ordering::Relaxed);
+                let granted = (started.elapsed().as_millis() as u64).saturating_add(window);
+                metadata.timeout_ms = Some(limit.max(granted));
+            }
+        }
         let suppress_replayed_running_reminder = metadata.status == BgTaskStatus::Running;
         let mode = metadata.mode.clone();
         let task = Arc::new(BgTask {
@@ -5530,7 +5592,8 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started,
-            hard_kill_renewable: false,
+            hard_kill_renewable: renewable,
+            persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             kill_settled: std::sync::Condvar::new(),
@@ -7934,7 +7997,8 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
             .map(|finished_at| finished_at.saturating_sub(metadata.started_at))
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
-    let hard_kill = HardKillDeadline::from_metadata(metadata.timeout_ms, false);
+    let hard_kill =
+        HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
     BgTaskSnapshot {
         info: BgTaskInfo {
             task_id: metadata.task_id,

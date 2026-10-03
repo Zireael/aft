@@ -506,6 +506,13 @@ pub struct PersistedTask {
     pub finished_at: Option<u64>,
     pub duration_ms: Option<u64>,
     pub timeout_ms: Option<u64>,
+    /// Whether `timeout_ms` is AFT's default background limit rather than a
+    /// caller's `timeout`. Only the default may be extended while a delegated
+    /// worker waits on the task, and that must still hold after a restart
+    /// reloads the task from this record. Absent (false) on records written
+    /// before AFT recorded it; such a task is never extended.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default_hard_kill: bool,
     pub exit_code: Option<i32>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
@@ -543,6 +550,10 @@ fn default_notify_on_completion() -> bool {
 
 fn default_compressed() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -584,6 +595,7 @@ impl PersistedTask {
             finished_at: None,
             duration_ms: None,
             timeout_ms,
+            default_hard_kill: false,
             exit_code: None,
             child_pid: None,
             pgid: None,
@@ -704,6 +716,7 @@ impl From<BashTaskRow> for PersistedTask {
             finished_at,
             duration_ms: finished_at.map(|finished_at| finished_at.saturating_sub(started_at)),
             timeout_ms: row.timeout_ms.and_then(|value| u64::try_from(value).ok()),
+            default_hard_kill: false,
             exit_code: row.exit_code,
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
