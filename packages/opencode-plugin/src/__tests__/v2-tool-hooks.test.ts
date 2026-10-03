@@ -23,6 +23,12 @@ test("V2 execute.before normalizes path aliases before the registered schema", a
   const foreign = { tool: "foreign", input: { filePath: "keep" } };
   await Effect.runPromise(before!(foreign));
   expect(foreign.input).toEqual({ filePath: "keep" });
+  // Unknown edit fields must not be silently stripped by the host decoder.
+  const invalid = {
+    tool: "edit",
+    input: { path: "file.ts", oldString: "old", newString: "new", unexpected: true },
+  };
+  expect((await Effect.runPromiseExit(before!(invalid)))._tag).toBe("Failure");
 });
 
 test("V2 execute.after appends the conflicts hint only to completed bash text", async () => {

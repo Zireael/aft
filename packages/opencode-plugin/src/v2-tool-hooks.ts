@@ -1,10 +1,16 @@
 import type { SessionDomain } from "@opencode/plugin/effect/session";
 import type { ToolDomain } from "@opencode/plugin/effect/tool";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { rememberReadModel } from "./shared/read-vision.js";
+
+// The host catches this tagged failure as a failed tool call, not a session
+// defect. Use its public error shape without coupling to a second schema copy.
+class ArgumentError extends Schema.TaggedError<ArgumentError>()("Tool.Error", {
+  message: Schema.String,
+}) {}
 
 /** Port the V1 raw-argument, result-text and current-model seams to V2. */
 export function registerV2ToolHooks(
@@ -16,17 +22,16 @@ export function registerV2ToolHooks(
   return Effect.gen(function* () {
     if (typeof host.tool?.hook === "function") {
       yield* host.tool.hook("execute.before", (event) =>
-        Effect.sync(() => {
-          if (!registeredTools.has(event.tool)) return;
-          try {
+        Effect.try({
+          try: () => {
+            if (!registeredTools.has(event.tool)) return;
             event.input = prepareOpenCodeArguments(event.tool, event.input, {
               hashlineEffective: runtime.hashlineEffective,
             });
-          } catch {
-            // Invalid arguments still go through host schema validation and the
-            // shared executor's strict preparation; never fail the whole session
-            // with a defect from this compatibility-only hook.
-          }
+          },
+          // Reject before the host can strip unknown fields from the raw input.
+          catch: (error) =>
+            new ArgumentError({ message: error instanceof Error ? error.message : String(error) }),
         }),
       );
       yield* host.tool.hook("execute.after", (event) =>
