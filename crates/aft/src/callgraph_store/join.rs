@@ -268,6 +268,7 @@ impl CallgraphBlob {
                 left.byte_start,
                 left.byte_end,
                 left.full_ref.as_deref(),
+                left.caller_symbol.as_deref(),
             )
                 .cmp(&(
                     right.ordinal,
@@ -275,6 +276,7 @@ impl CallgraphBlob {
                     right.byte_start,
                     right.byte_end,
                     right.full_ref.as_deref(),
+                    right.caller_symbol.as_deref(),
                 ))
         });
         refs.dedup_by(|left, right| {
@@ -283,6 +285,7 @@ impl CallgraphBlob {
                 && left.byte_start == right.byte_start
                 && left.byte_end == right.byte_end
                 && left.full_ref == right.full_ref
+                && left.caller_symbol == right.caller_symbol
         });
 
         let mut parse = ParseBlob {
@@ -625,12 +628,12 @@ fn blob_imports(data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobI
 
 fn blob_refs(source: &str, data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobRef> {
     let mut refs = Vec::new();
-    for (caller_symbol, calls) in &data.calls_by_symbol {
+    for (caller_symbol, calls) in ordered_symbol_sites(&data.calls_by_symbol) {
         for call in calls {
             refs.push(call_ref(caller_symbol, call, BlobRefKind::Call, ast_nodes));
         }
     }
-    for (caller_symbol, calls) in &data.value_refs_by_symbol {
+    for (caller_symbol, calls) in ordered_symbol_sites(&data.value_refs_by_symbol) {
         for call in calls {
             refs.push(call_ref(
                 caller_symbol,
@@ -660,6 +663,20 @@ fn blob_refs(source: &str, data: &FileCallData, ast_nodes: &[AstPreorderNode]) -
         });
     }
     refs
+}
+
+/// Reference construction must not depend on a hash map's randomized order.
+/// One source call can belong to several enclosing symbols, and each caller is
+/// distinct evidence even when the call's AST range is identical.
+fn ordered_symbol_sites(
+    sites: &HashMap<String, Vec<callgraph::CallSite>>,
+) -> Vec<(&str, &[callgraph::CallSite])> {
+    let mut ordered = sites
+        .iter()
+        .map(|(caller, calls)| (caller.as_str(), calls.as_slice()))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(caller, _)| *caller);
+    ordered
 }
 
 fn call_ref(
@@ -788,6 +805,52 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blob_extraction_is_deterministic_for_nested_callers() {
+        let source = include_str!("../../../../benchmarks/aft-search/author_real_query.py");
+        let first = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
+        let expected = first.to_bytes().unwrap();
+        for attempt in 1..32 {
+            let actual = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
+            assert!(
+                actual.to_bytes().unwrap() == expected,
+                "serialization changed at attempt {attempt}"
+            );
+        }
+        let call_start = source.find("subprocess.run(command,").unwrap();
+        let callers = first
+            .parse()
+            .unwrap()
+            .refs
+            .iter()
+            .filter(|r| {
+                r.full_ref.as_deref() == Some("subprocess.run") && r.byte_start == call_start
+            })
+            .filter_map(|r| r.caller_symbol.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(callers, BTreeSet::from(["at_pin", "pinned_domains"]));
+
+        // Check the construction order as well as final serialization: later
+        // stable sorts preserve input order when several references share a key.
+        // Fresh maps exercise different hash seeds without depending on a seed
+        // exposed by the standard library.
+        let expected = (0..64)
+            .map(|i| format!("caller_{i:02}"))
+            .collect::<Vec<_>>();
+        for _ in 0..16 {
+            let sites = expected
+                .iter()
+                .rev()
+                .map(|name| (name.clone(), Vec::new()))
+                .collect::<HashMap<_, _>>();
+            let actual = ordered_symbol_sites(&sites)
+                .into_iter()
+                .map(|(caller, _)| caller)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn blob_ordinals_are_tree_sitter_preorder_positions() {
         let source = "export function run() { return helper(); }\nfunction helper() {}\n";

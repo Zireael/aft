@@ -28,9 +28,10 @@ use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
 use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
-/// Bump when receiver hints or their interpretation changes. Legacy extraction
-/// keys are not compatible with this producer and cannot silently seed its graph.
-pub const PRODUCER: &str = "ruled-callgraph-v1";
+/// Bump when extracted evidence or its interpretation changes. Version 2 keeps
+/// every enclosing caller and serializes references in deterministic order, so
+/// older blobs must be rebuilt rather than silently seeding the new graph.
+pub const PRODUCER: &str = "ruled-callgraph-v2";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {
