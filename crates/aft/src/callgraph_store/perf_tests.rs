@@ -292,3 +292,162 @@ fn measure_cold_build_and_refresh_on_real_repo() {
         .expect("write queries");
     }
 }
+
+fn fixture_root(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+    let root = dir.path().join(name);
+    fs::create_dir_all(&root).expect("create fixture root");
+    fs::canonicalize(root).expect("canonical fixture root")
+}
+
+fn write(root: &Path, rel: &str, text: &str) -> PathBuf {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    fs::write(&path, text).expect("write fixture file");
+    path
+}
+
+/// A workspace whose app files import two workspace packages by name, so
+/// each import walks `package.json` files to find the package. Returns the
+/// source files and the number of `package.json` files.
+fn ts_workspace_fixture(root: &Path, app_files: usize) -> (Vec<PathBuf>, usize) {
+    write(
+        root,
+        "package.json",
+        r#"{"name":"fx-root","private":true,"workspaces":["packages/*"]}"#,
+    );
+    write(
+        root,
+        "tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":".","paths":{}}}"#,
+    );
+    let mut files = Vec::new();
+    for lib in ["alpha", "beta"] {
+        write(
+            root,
+            &format!("packages/{lib}/package.json"),
+            &format!(r#"{{"name":"@fx/{lib}","exports":{{".":{{"source":"./src/index.ts"}}}}}}"#),
+        );
+        files.push(write(
+            root,
+            &format!("packages/{lib}/src/index.ts"),
+            &format!("export function {lib}(value: number) {{ return value + 1; }}\n"),
+        ));
+    }
+    write(root, "packages/app/package.json", r#"{"name":"@fx/app"}"#);
+    for index in 0..app_files {
+        files.push(write(
+            root,
+            &format!("packages/app/src/deep/nested/caller_{index:03}.ts"),
+            &format!(
+                "import {{ alpha }} from \"@fx/alpha\";\nimport {{ beta }} from \"@fx/beta\";\n\
+                 export function caller{index}() {{ return alpha({index}) + beta({index}); }}\n"
+            ),
+        ));
+    }
+    (files, 4)
+}
+
+/// A Rust crate whose `caller.rs` makes `calls` path-qualified calls into a
+/// sibling module, plus a call into an inline module.
+fn rust_qualified_call_fixture(root: &Path, calls: usize) -> Vec<PathBuf> {
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let mut caller = String::new();
+    for index in 0..calls {
+        caller.push_str(&format!(
+            "pub fn caller_{index}() {{ crate::util::helper(); crate::util::inner::deep(); }}\n"
+        ));
+    }
+    vec![
+        write(root, "src/lib.rs", "pub mod caller;\npub mod util;\n"),
+        write(
+            root,
+            "src/util.rs",
+            "pub fn helper() {}\npub mod inner {\n    pub fn deep() {}\n}\n",
+        ),
+        write(root, "src/caller.rs", &caller),
+    ]
+}
+
+fn cold_build_counts(
+    root: &Path,
+    store_dir: &Path,
+    files: &[PathBuf],
+) -> (CallGraphStore, WorkCounts) {
+    let store =
+        CallGraphStore::open(store_dir.to_path_buf(), root.to_path_buf()).expect("open store");
+    let compiles = install_compile_counter(&store);
+    callgraph::clear_workspace_package_cache();
+    let (stats, counts) = measure(root, compiles, || store.cold_build(files));
+    stats.expect("cold build");
+    (store, counts)
+}
+
+#[test]
+fn cold_build_parses_each_file_once_and_matches_a_reparsing_build() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let (mut files, _) = ts_workspace_fixture(&root, 12);
+    let rust_root = root.join("crates/fx");
+    files.extend(rust_qualified_call_fixture(&rust_root, 6));
+
+    let (retaining, retained) = cold_build_counts(&root, &dir.path().join("store-a"), &files);
+    assert_eq!(
+        retained.parses,
+        files.len(),
+        "every source file is parsed by extraction and by nothing else"
+    );
+    assert_eq!(retained.max_parses_of_one_file, 1);
+
+    // With no retention budget the resolution pass parses every caller again,
+    // which is the reference the retained resolver inputs must match.
+    set_retained_caller_budget_for_test(Some(0));
+    let (reparsing, reparsed) = cold_build_counts(&root, &dir.path().join("store-b"), &files);
+    set_retained_caller_budget_for_test(None);
+    eprintln!(
+        "parses for {} files: retained={} reparsing={}",
+        files.len(),
+        retained.parses,
+        reparsed.parses
+    );
+    assert!(
+        reparsed.parses > files.len(),
+        "control: without retention callers are parsed twice ({} parses for {} files)",
+        reparsed.parses,
+        files.len()
+    );
+    assert_eq!(
+        dump_graph_rows(&retaining),
+        dump_graph_rows(&reparsing),
+        "retained resolver inputs must resolve exactly like a fresh parse"
+    );
+}
+
+#[test]
+fn cold_build_reads_each_package_json_a_bounded_number_of_times() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let app_files = 96;
+    let (files, package_jsons) = ts_workspace_fixture(&root, app_files);
+    // Readers sharing one memo can race to the first read of a file, at most
+    // once per parse thread; resolution adds at most one more read.
+    let bound = package_jsons * (build_pool_size() + 1);
+    assert!(
+        app_files > bound,
+        "fixture must import more often than the bound allows a per-file memo"
+    );
+
+    let (_store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    eprintln!(
+        "package.json reads: {} (bound {bound})",
+        counts.package_json_reads
+    );
+    assert!(
+        counts.package_json_reads <= bound,
+        "package.json reads must not scale with importers: {} reads, bound {bound}",
+        counts.package_json_reads
+    );
+}

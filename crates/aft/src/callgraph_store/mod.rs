@@ -3669,7 +3669,8 @@ impl ResolverIndex for ProjectIndex<'_> {
 /// staging to `resolving`. Resolution replaces `refs` rows only to add status,
 /// target, and provenance outputs, and inserts `edges`; `DbFileIndex` reads none
 /// of those output columns. Its inputs therefore stay immutable for an instance,
-/// so the memo needs no generation key or slice-fence invalidation.
+/// so the memo needs no generation key or slice-fence invalidation. For the
+/// same reason one `DiskIndexMemos` serves every caller file of the pass.
 struct DiskProjectIndex<'a> {
     project_root: &'a Path,
     conn: &'a Connection,
@@ -3677,22 +3678,30 @@ struct DiskProjectIndex<'a> {
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
     module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
-    file_index_memo: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
-    module_parent_memo: RefCell<HashMap<String, Option<(String, String)>>>,
+    memos: &'a DiskIndexMemos,
     memoize_resolver_indexes: bool,
+}
+
+/// Resolver lookups shared by every caller file of one cold-build resolution
+/// pass. Before this was per caller file, each caller reloaded the same target
+/// indexes and rescanned every module reference and Rust file.
+#[derive(Default)]
+struct DiskIndexMemos {
+    file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    module_parents: RefCell<HashMap<String, Option<(String, String)>>>,
 }
 
 impl DiskProjectIndex<'_> {
     fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
         if self.memoize_resolver_indexes {
-            if let Some(cached) = self.file_index_memo.borrow().get(rel_path).cloned() {
+            if let Some(cached) = self.memos.file_indexes.borrow().get(rel_path).cloned() {
                 return cached;
             }
         }
 
         let loaded = self.load_file_index(rel_path).map(Rc::new);
         if self.memoize_resolver_indexes {
-            let mut memo = self.file_index_memo.borrow_mut();
+            let mut memo = self.memos.file_indexes.borrow_mut();
             if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
                 // Keep the active caller's index hot even when an unusually broad
                 // resolution walk exhausts the bounded target-file memo.
@@ -3710,17 +3719,15 @@ impl DiskProjectIndex<'_> {
     fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
         let lang: String = self
             .conn
-            .query_row(
-                "SELECT lang FROM files WHERE path = ?1",
-                params![rel_path],
-                |row| row.get(0),
-            )
+            .prepare_cached("SELECT lang FROM files WHERE path = ?1")
+            .ok()?
+            .query_row(params![rel_path], |row| row.get(0))
             .optional()
             .ok()??;
         let mut index = DbFileIndex::empty(lang_from_label(&lang));
         let mut nodes = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT id, name, scoped_name, kind, exported, is_default_export
                  FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
             )
@@ -3746,7 +3753,7 @@ impl DiskProjectIndex<'_> {
 
         let mut refs = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
                   FROM refs
                   WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')
@@ -3826,14 +3833,14 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
         if self.memoize_resolver_indexes {
-            if let Some(cached) = self.module_parent_memo.borrow().get(target_file).cloned() {
+            if let Some(cached) = self.memos.module_parents.borrow().get(target_file).cloned() {
                 return cached;
             }
         }
 
         let parent = self.load_module_parent(target_file);
         if self.memoize_resolver_indexes {
-            let mut memo = self.module_parent_memo.borrow_mut();
+            let mut memo = self.memos.module_parents.borrow_mut();
             if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
                 memo.clear();
             }
@@ -3881,12 +3888,9 @@ impl ResolverIndex for DiskProjectIndex<'_> {
 
     fn contains_file(&self, file: &str) -> bool {
         self.conn
-            .query_row(
-                "SELECT 1 FROM files WHERE path = ?1 LIMIT 1",
-                params![file],
-                |_| Ok(()),
-            )
-            .is_ok()
+            .prepare_cached("SELECT 1 FROM files WHERE path = ?1 LIMIT 1")
+            .and_then(|mut statement| statement.exists(params![file]))
+            .unwrap_or(false)
     }
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
@@ -5027,6 +5031,12 @@ impl CallGraphStore {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
         let workspace_root = self.project_root.display().to_string();
+        // One parse pool, one module-resolution memo for the parallel parses,
+        // and the resolver inputs of every file parsed by this process, all
+        // shared by both passes so no file is parsed twice when it fits.
+        let pool = BuildPool::new();
+        let extraction_memo = callgraph::ModuleResolutionMemo::default();
+        let mut retained_callers = RetainedCallerData::new(retained_caller_budget());
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
@@ -5103,7 +5113,11 @@ impl CallGraphStore {
                 }
 
                 notify_cold_build_extract_observer(&needs_extract);
-                let build = build_extracts_parallel(&self.project_root, &needs_extract);
+                let build =
+                    pool.build_extracts(&self.project_root, &needs_extract, &extraction_memo);
+                for extract in &build.extracts {
+                    retained_callers.retain(&extract.rel_path, &extract.data);
+                }
                 self.verify_writer_lease()?;
                 let total_changes_before = conn.total_changes();
                 let tx = conn.transaction()?;
@@ -5190,6 +5204,9 @@ impl CallGraphStore {
 
         note_cold_build_phase("resolution");
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
+        // Resolver lookups are shared by every caller and window: their inputs
+        // are final once extraction ends (see `DiskProjectIndex`).
+        let index_memos = DiskIndexMemos::default();
         let total_refs = query_count(&conn, "SELECT COUNT(*) FROM refs")? as usize;
         let mut resolved_refs =
             query_count(&conn, "SELECT COUNT(*) FROM refs WHERE status <> 'staged'")? as usize;
@@ -5200,6 +5217,21 @@ impl CallGraphStore {
             let Some(last_rowid) = staged.last().map(|entry| entry.rowid) else {
                 break;
             };
+
+            // Callers this process did not extract (a resumed build, or past
+            // the retention budget) are parsed here, in parallel and before
+            // the write transaction opens.
+            let mut missing = BTreeSet::new();
+            for entry in &staged {
+                if !retained_callers.contains(&entry.raw.caller_file) {
+                    missing.insert(entry.raw.caller_file.clone());
+                }
+            }
+            let parsed_callers = pool.resolution_caller_data(
+                &self.project_root,
+                missing.into_iter().collect(),
+                &extraction_memo,
+            );
 
             self.verify_writer_lease()?;
             let total_changes_before = conn.total_changes();
@@ -5214,20 +5246,18 @@ impl CallGraphStore {
                         .position(|entry| entry.raw.caller_file != caller_file)
                         .map(|relative| offset + relative)
                         .unwrap_or(staged.len());
-                    let caller_extract = build_file_extract(
-                        &self.project_root,
-                        &self.project_root.join(&caller_file),
-                    );
-                    if let Ok(caller_extract) = caller_extract {
+                    let caller_data = retained_callers
+                        .get(&caller_file)
+                        .or_else(|| parsed_callers.get(&caller_file));
+                    if let Some(caller_data) = caller_data {
                         let index = DiskProjectIndex {
                             project_root: &self.project_root,
                             conn: &tx,
                             caller_file: &caller_file,
-                            caller_data: &caller_extract.data,
+                            caller_data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
                             module_resolution_memo,
-                            file_index_memo: RefCell::new(HashMap::new()),
-                            module_parent_memo: RefCell::new(HashMap::new()),
+                            memos: &index_memos,
                             memoize_resolver_indexes,
                         };
                         for staged_ref in &staged[offset..end] {
@@ -10922,62 +10952,228 @@ fn build_pool_size() -> usize {
         .clamp(1, 8)
 }
 
-fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtractsResult {
-    let extract_one = |path: &PathBuf| match build_file_extract(project_root, path) {
-        Ok(extract) => Ok(extract),
-        Err(error) => {
-            let abs_path =
-                normalize_file_path(project_root, path).unwrap_or_else(|_| path.to_path_buf());
-            let rel_path = relative_path(project_root, &abs_path);
-            let freshness = cache_freshness::collect(&abs_path).ok();
-            let undecodable = is_undecodable_source(&error);
-            if undecodable {
-                log_undecodable_source(project_root, &rel_path);
-            } else {
-                log::debug!(
-                    "callgraph store: skipping {} during cold build: {}",
-                    abs_path.display(),
-                    error
+/// The bounded parse pool of one cold build or refresh, created once and
+/// reused by every batch instead of spawning fresh threads per batch.
+struct BuildPool(Option<rayon::ThreadPool>);
+
+impl BuildPool {
+    fn new() -> Self {
+        // Fall back to the global pool only if the bounded pool can't be
+        // constructed.
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(build_pool_size())
+            .thread_name(|index| format!("aft-callgraph-build-{index}"))
+            .stack_size(8 * 1024 * 1024)
+            .build()
+        {
+            Ok(pool) => Self(Some(pool)),
+            Err(error) => {
+                log::warn!(
+                    "callgraph store: bounded build pool unavailable ({error}); using global pool"
                 );
+                Self(None)
             }
-            Err(ExtractFailure {
-                rel_path,
-                freshness,
-                undecodable,
-            })
-        }
-    };
-
-    let run = || -> Vec<std::result::Result<FileExtract, ExtractFailure>> {
-        files.par_iter().map(extract_one).collect()
-    };
-
-    // Run inside a dedicated bounded pool when one builds; fall back to the
-    // global pool only if the bounded pool can't be constructed.
-    let results = match rayon::ThreadPoolBuilder::new()
-        .num_threads(build_pool_size())
-        .thread_name(|index| format!("aft-callgraph-build-{index}"))
-        .stack_size(8 * 1024 * 1024)
-        .build()
-    {
-        Ok(pool) => pool.install(run),
-        Err(error) => {
-            log::warn!(
-                "callgraph store: bounded build pool unavailable ({error}); using global pool"
-            );
-            run()
-        }
-    };
-
-    let mut extracts = Vec::new();
-    let mut failures = Vec::new();
-    for result in results {
-        match result {
-            Ok(extract) => extracts.push(extract),
-            Err(failure) => failures.push(failure),
         }
     }
-    BuildExtractsResult { extracts, failures }
+
+    fn install<R: Send>(&self, run: impl FnOnce() -> R + Send) -> R {
+        match &self.0 {
+            Some(pool) => pool.install(run),
+            None => run(),
+        }
+    }
+
+    fn build_extracts(
+        &self,
+        project_root: &Path,
+        files: &[PathBuf],
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> BuildExtractsResult {
+        let extract_one =
+            |path: &PathBuf| match build_file_extract_with_memo(project_root, path, memo) {
+                Ok(extract) => Ok(extract),
+                Err(error) => {
+                    let abs_path = normalize_file_path(project_root, path)
+                        .unwrap_or_else(|_| path.to_path_buf());
+                    let rel_path = relative_path(project_root, &abs_path);
+                    let freshness = cache_freshness::collect(&abs_path).ok();
+                    let undecodable = is_undecodable_source(&error);
+                    if undecodable {
+                        log_undecodable_source(project_root, &rel_path);
+                    } else {
+                        log::debug!(
+                            "callgraph store: skipping {} during cold build: {}",
+                            abs_path.display(),
+                            error
+                        );
+                    }
+                    Err(ExtractFailure {
+                        rel_path,
+                        freshness,
+                        undecodable,
+                    })
+                }
+            };
+        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> =
+            self.install(|| files.par_iter().map(extract_one).collect());
+
+        let mut extracts = Vec::new();
+        let mut failures = Vec::new();
+        for result in results {
+            match result {
+                Ok(extract) => extracts.push(extract),
+                Err(failure) => failures.push(failure),
+            }
+        }
+        BuildExtractsResult { extracts, failures }
+    }
+
+    /// Resolver inputs of `rel_paths`, parsed in parallel. A file that no
+    /// longer parses is left out, and its references stay unresolved.
+    fn resolution_caller_data(
+        &self,
+        project_root: &Path,
+        rel_paths: Vec<String>,
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> HashMap<String, FileCallData> {
+        if rel_paths.is_empty() {
+            return HashMap::new();
+        }
+        self.install(|| {
+            rel_paths
+                .into_par_iter()
+                .filter_map(|rel_path| {
+                    let extract = build_file_extract_with_memo(
+                        project_root,
+                        &project_root.join(&rel_path),
+                        memo,
+                    )
+                    .ok()?;
+                    Some((rel_path, resolution_caller_data(&extract.data)))
+                })
+                .collect()
+        })
+    }
+}
+
+/// Upper bound on the estimated bytes of caller data a cold build keeps from
+/// extraction for resolution. Files past it are parsed a second time during
+/// resolution, which keeps the build's working set bounded on huge corpora.
+const COLD_BUILD_RETAINED_CALLER_BYTES: usize = 48 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_CALLER_BUDGET_FOR_TEST: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_retained_caller_budget_for_test(budget: Option<usize>) {
+    RETAINED_CALLER_BUDGET_FOR_TEST.with(|cell| cell.set(budget));
+}
+
+fn retained_caller_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = RETAINED_CALLER_BUDGET_FOR_TEST.with(Cell::get) {
+        return budget;
+    }
+    COLD_BUILD_RETAINED_CALLER_BYTES
+}
+
+/// The part of each extracted file that resolution reads (see
+/// `resolution_caller_data`), kept from the extraction pass so the
+/// resolution pass does not parse the file again.
+struct RetainedCallerData {
+    by_file: HashMap<String, FileCallData>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl RetainedCallerData {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            by_file: HashMap::new(),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn retain(&mut self, rel_path: &str, data: &FileCallData) {
+        let weight = resolution_caller_data_weight(rel_path, data);
+        if self.retained_bytes.saturating_add(weight) > self.max_bytes {
+            return;
+        }
+        self.retained_bytes += weight;
+        self.by_file
+            .insert(rel_path.to_string(), resolution_caller_data(data));
+    }
+
+    fn contains(&self, rel_path: &str) -> bool {
+        self.by_file.contains_key(rel_path)
+    }
+
+    fn get(&self, rel_path: &str) -> Option<&FileCallData> {
+        self.by_file.get(rel_path)
+    }
+}
+
+/// A copy of `data` with only what reference resolution reads: the import
+/// block, symbol metadata, exported and default-export names, and the names
+/// (not the call sites) of the symbols that contain calls, which symbol
+/// lookup also searches.
+fn resolution_caller_data(data: &FileCallData) -> FileCallData {
+    FileCallData {
+        calls_by_symbol: data
+            .calls_by_symbol
+            .keys()
+            .map(|symbol| (symbol.clone(), Vec::new()))
+            .collect(),
+        value_refs_by_symbol: HashMap::new(),
+        macro_body_calls_by_macro: HashMap::new(),
+        macro_mentions_by_symbol: HashMap::new(),
+        exported_symbols: data.exported_symbols.clone(),
+        symbol_metadata: data.symbol_metadata.clone(),
+        default_export_symbol: data.default_export_symbol.clone(),
+        import_block: data.import_block.clone(),
+        lang: data.lang,
+    }
+}
+
+fn resolution_caller_data_weight(rel_path: &str, data: &FileCallData) -> usize {
+    const ENTRY: usize = 96;
+    let imports = data
+        .import_block
+        .imports
+        .iter()
+        .map(|import| {
+            ENTRY * 2
+                + import.module_path.len()
+                + import.raw_text.len()
+                + import
+                    .names
+                    .iter()
+                    .map(|name| ENTRY + name.len())
+                    .sum::<usize>()
+                + import.default_import.as_deref().map_or(0, str::len)
+                + import.namespace_import.as_deref().map_or(0, str::len)
+        })
+        .sum::<usize>();
+    let metadata = data
+        .symbol_metadata
+        .iter()
+        .map(|(name, meta)| {
+            ENTRY * 2
+                + name.len()
+                + meta.signature.as_deref().map_or(0, str::len)
+                + meta.entry_point_attribute.as_deref().map_or(0, str::len)
+        })
+        .sum::<usize>();
+    let names = data
+        .calls_by_symbol
+        .keys()
+        .chain(data.exported_symbols.iter())
+        .map(|name| ENTRY + name.len())
+        .sum::<usize>();
+    ENTRY * 4 + rel_path.len() + imports + metadata + names
 }
 
 fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFreshness> {
@@ -10998,6 +11194,22 @@ fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFr
 }
 
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
+    build_file_extract_with_memo(
+        project_root,
+        path,
+        &callgraph::ModuleResolutionMemo::default(),
+    )
+}
+
+/// Parse one file into its store rows. `memo` caches module resolution
+/// (including every `package.json`/`tsconfig.json` read on the way); a build
+/// or refresh passes one memo for all of its files so a config file shared by
+/// many importers is read and parsed once instead of once per import.
+fn build_file_extract_with_memo(
+    project_root: &Path,
+    path: &Path,
+    memo: &callgraph::ModuleResolutionMemo,
+) -> Result<FileExtract> {
     let abs_path = normalize_file_path(project_root, path)?;
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
@@ -11014,26 +11226,21 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
         .collect();
+    let disk = DiskFacts::new(project_root);
+    let facts = FactPaths {
+        root: project_root,
+        facts: &disk,
+    };
     let import_dependencies = import_dependencies(
         project_root,
         &abs_path,
         &data.import_block.imports,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
+        memo,
+        &facts,
     );
     let line_index = LineIndex::new(&source);
-    let reexports = collect_reexport_refs(
-        project_root,
-        &abs_path,
-        &rel_path,
-        &source,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
-    );
+    let reexports =
+        collect_reexport_refs(project_root, &abs_path, &rel_path, &source, memo, &facts);
     let rust_reexports = if lang == LangId::Rust {
         collect_rust_pub_use_reexport_refs(
             project_root,
@@ -11041,10 +11248,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &rel_path,
             &data.import_block.imports,
             &line_index,
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
+            &facts,
         )
     } else {
         ReexportRefs {
@@ -11087,10 +11291,8 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &rel_path,
         &data.import_block.imports,
         &line_index,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
+        memo,
+        &facts,
     ));
     if lang == LangId::Rust {
         raw_refs.extend(build_rust_module_refs(
@@ -11098,10 +11300,7 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &abs_path,
             &rel_path,
             &source,
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
+            &facts,
         ));
     }
     let mut surface_parts = reexports.surface_parts;
@@ -11331,6 +11530,7 @@ fn build_import_refs(
     rel_path: &str,
     imports: &[ImportStatement],
     line_index: &LineIndex,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> Vec<RawRef> {
     let mut refs = Vec::new();
@@ -11363,7 +11563,13 @@ fn build_import_refs(
             line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            dependencies: module_dependencies(project_root, abs_path, &import.module_path, facts),
+            dependencies: module_dependencies_with_memo(
+                project_root,
+                abs_path,
+                &import.module_path,
+                memo,
+                facts,
+            ),
         });
     }
     refs
@@ -11714,6 +11920,7 @@ fn collect_reexport_refs(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> ReexportRefs {
     let mut raw_refs = Vec::new();
@@ -11767,7 +11974,13 @@ fn collect_reexport_refs(
             line,
             byte_start: start,
             byte_end: end,
-            dependencies: module_dependencies(project_root, abs_path, &module_path, facts),
+            dependencies: module_dependencies_with_memo(
+                project_root,
+                abs_path,
+                &module_path,
+                memo,
+                facts,
+            ),
         });
     }
     ReexportRefs {
@@ -18479,14 +18692,16 @@ fn import_dependencies(
     project_root: &Path,
     abs_path: &Path,
     imports: &[ImportStatement],
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     for import in imports {
-        deps.extend(module_dependencies(
+        deps.extend(module_dependencies_with_memo(
             project_root,
             abs_path,
             &import.module_path,
+            memo,
             facts,
         ));
     }

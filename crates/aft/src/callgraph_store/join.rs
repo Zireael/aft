@@ -227,9 +227,15 @@ impl CallgraphBlob {
             facts: &empty_facts,
         };
         let file = Path::new("/__callgraph_blob__");
-        let mut structural =
-            super::collect_reexport_refs(paths.root, file, "__callgraph_blob__", source, &paths)
-                .raw_refs;
+        let mut structural = super::collect_reexport_refs(
+            paths.root,
+            file,
+            "__callgraph_blob__",
+            source,
+            &crate::callgraph::ModuleResolutionMemo::default(),
+            &paths,
+        )
+        .raw_refs;
         structural.extend(
             super::collect_source_less_export_alias_refs("__callgraph_blob__", source).raw_refs,
         );

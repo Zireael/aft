@@ -71,10 +71,32 @@ struct RustCrateTargets {
     target_roots: Vec<PathBuf>,
 }
 
+/// Interior-mutable memo storage. A lock rather than a `RefCell` lets one memo
+/// be shared by the cold build's parse pool; each access holds it only for a
+/// single lookup or insert, never across the work that computes a value.
+#[derive(Default)]
+struct MemoCell<T>(std::sync::Mutex<T>);
+
+impl<T> MemoCell<T> {
+    fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    fn borrow(&self) -> std::sync::MutexGuard<'_, T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn borrow_mut(&self) -> std::sync::MutexGuard<'_, T> {
+        self.borrow()
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RustCrateRootMemo {
-    caller_roots: std::rc::Rc<RefCell<HashMap<PathBuf, Option<PathBuf>>>>,
-    crate_targets: std::rc::Rc<RefCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
+    caller_roots: Arc<MemoCell<HashMap<PathBuf, Option<PathBuf>>>>,
+    crate_targets: Arc<MemoCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
 }
 
 struct BoundedMemo<K, V> {
@@ -120,38 +142,38 @@ impl<K: Eq + std::hash::Hash, V> BoundedMemo<K, V> {
 /// the memo is dropped when publication completes or the build aborts.
 pub(crate) struct ModuleResolutionMemo {
     enabled: bool,
-    module_paths: RefCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
-    json_values: RefCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
-    workspace_packages: RefCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
-    rust_declared_modules: RefCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
+    module_paths: MemoCell<BoundedMemo<ModuleResolutionKey, Option<PathBuf>>>,
+    json_values: MemoCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
+    workspace_packages: MemoCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
+    rust_declared_modules: MemoCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
     rust_crate_roots: RustCrateRootMemo,
     #[cfg(test)]
     collect_metrics: bool,
     #[cfg(test)]
-    module_computations: RefCell<HashMap<ModuleResolutionKey, usize>>,
+    module_computations: MemoCell<HashMap<ModuleResolutionKey, usize>>,
     #[cfg(test)]
-    json_probes: RefCell<HashMap<PathBuf, usize>>,
+    json_probes: MemoCell<HashMap<PathBuf, usize>>,
     #[cfg(test)]
-    rust_declaration_parses: RefCell<HashMap<String, usize>>,
+    rust_declaration_parses: MemoCell<HashMap<String, usize>>,
 }
 
 impl Default for ModuleResolutionMemo {
     fn default() -> Self {
         Self {
             enabled: true,
-            module_paths: RefCell::new(BoundedMemo::new(
+            module_paths: MemoCell::new(BoundedMemo::new(
                 MODULE_RESOLUTION_MEMO_MAX_ENTRIES,
                 MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES,
             )),
-            json_values: RefCell::new(BoundedMemo::new(
+            json_values: MemoCell::new(BoundedMemo::new(
                 JSON_VALUE_MEMO_MAX_ENTRIES,
                 JSON_VALUE_MEMO_MAX_RETAINED_BYTES,
             )),
-            workspace_packages: RefCell::new(BoundedMemo::new(
+            workspace_packages: MemoCell::new(BoundedMemo::new(
                 WORKSPACE_PACKAGE_MEMO_MAX_ENTRIES,
                 WORKSPACE_PACKAGE_MEMO_MAX_RETAINED_BYTES,
             )),
-            rust_declared_modules: RefCell::new(BoundedMemo::new(
+            rust_declared_modules: MemoCell::new(BoundedMemo::new(
                 RUST_DECLARED_MODULE_MEMO_MAX_ENTRIES,
                 RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES,
             )),
@@ -159,11 +181,11 @@ impl Default for ModuleResolutionMemo {
             #[cfg(test)]
             collect_metrics: false,
             #[cfg(test)]
-            module_computations: RefCell::new(HashMap::new()),
+            module_computations: MemoCell::new(HashMap::new()),
             #[cfg(test)]
-            json_probes: RefCell::new(HashMap::new()),
+            json_probes: MemoCell::new(HashMap::new()),
             #[cfg(test)]
-            rust_declaration_parses: RefCell::new(HashMap::new()),
+            rust_declaration_parses: MemoCell::new(HashMap::new()),
         }
     }
 }
