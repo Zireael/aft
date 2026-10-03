@@ -395,7 +395,10 @@ pub(crate) fn schedule(
                 })();
                 match result {
                     Ok(()) => {
-                        target.ctx.view_publication_retry().lock().reset(&target.ctx.canonical_cache_root());
+                        // Resolve the root before taking the retry lock, so this
+                        // lock never waits on another one while held.
+                        let root = target.ctx.canonical_cache_root();
+                        target.ctx.view_publication_retry().lock().reset(&root);
                         break;
                     }
                     Err(error) => {
@@ -409,7 +412,8 @@ pub(crate) fn schedule(
                         }
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.
-                        target.ctx.view_publication_retry().lock().failed(&target.ctx.canonical_cache_root(), &error);
+                        let root = target.ctx.canonical_cache_root();
+                        target.ctx.view_publication_retry().lock().failed(&root, &error);
                     }
                 }
             }
