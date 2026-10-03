@@ -111,7 +111,20 @@ async function routeCompletion(
   bridge: AftProjectTransport,
 ): Promise<void> {
   const route = wakeRouteState().routes.get(completion.session_id);
-  if (route) return route.completion(completion, bridge);
+  if (route) {
+    try {
+      await route.completion(completion, bridge);
+      return;
+    } catch (error) {
+      // The bridge pushes once. Keep a failed admission for the next prompt or
+      // companion call instead of dropping it or spinning in a retry loop.
+      holdUnrouted(completion, bridge);
+      warn(
+        `[bash_completion] delivery of task ${completion.task_id} to session ${completion.session_id} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+  }
 
   // Not acknowledged, so the bridge keeps it pending. It is held here and
   // delivered when a Location registers the session.
@@ -143,20 +156,14 @@ async function routeLongRunning(
  * completion that arrived while its Location was not registered (for example
  * during a Location reload) would stay pending and never wake the session.
  */
-function deliverUnrouted(sessionID: string, route: WakeRoute): void {
+function deliverUnrouted(sessionID: string): void {
   const state = wakeRouteState();
   state.warnedUnrouted.delete(sessionID);
   const held = state.unrouted.get(sessionID);
   if (!held) return;
   state.unrouted.delete(sessionID);
   for (const { completion, bridge } of held.values()) {
-    route.completion(completion, bridge).catch((error: unknown) => {
-      warn(
-        `[bash_completion] late delivery of task ${completion.task_id} to session ${sessionID} failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
+    void routeCompletion(completion, bridge);
   }
 }
 
@@ -227,13 +234,13 @@ export function createV2RuntimeConsumer(context: V2WakeHostContext): V2RuntimeCo
     if (!sessionID) return;
     sessions.add(sessionID);
     const { routes } = wakeRouteState();
-    if (routes.get(sessionID) === route) return;
     routes.set(sessionID, route);
-    deliverUnrouted(sessionID, route);
+    deliverUnrouted(sessionID);
   };
 
   return {
     bridgeOptions: sharedBridgeOptions,
+    registerSession,
     executeBash: (execution) => {
       registerSession(execution.context.sessionID);
       return executeV2Bash(execution);

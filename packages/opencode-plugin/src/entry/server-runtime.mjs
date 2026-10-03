@@ -221,6 +221,7 @@ export function makeServerEffect(overrides = {}) {
         pool: runtime.pool,
         projectRoot: runtime.directory,
         getConfig: () => runtime.toolContext.config,
+        registerSession: runtime.consumers.registerSession,
       });
       yield* dependencies.registerTools(
         context,
