@@ -9678,7 +9678,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   workspace crate or an earlier `use`, imported calls follow re-exports to
 ///   the definition, and a file-level function wins over imports from nested
 ///   scopes. Stores built before v11 hold the old, partly unresolved edges.
-const BUILD_OUTPUT_VERSION: &str = "v11-rust-path-resolution";
+const BUILD_OUTPUT_VERSION: &str = "v12-receiver-contract-callers";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -13033,6 +13033,13 @@ fn rust_target_for_use<I: ResolverIndex>(
         .unwrap_or(&import.module_path)
         .trim()
         .trim_end_matches(';');
+    if let Some(module) = path.strip_suffix("::*") {
+        let segments = module.split("::").collect::<Vec<_>>();
+        let file = rust_use_module_file(index, caller_file, &segments, imports)?;
+        let (file, symbol) =
+            rust_resolve_reexport_if_symbol_missing(index, file, short_name.to_string());
+        return index.has_export(&file, &symbol).then_some((file, symbol));
+    }
     if let Some(brace_start) = path.find("::{") {
         let prefix = &path[..brace_start];
         // `use m::{f as g};` binds `g`; resolve the imported `f`.
@@ -13106,6 +13113,18 @@ fn rust_use_module_file_direct<I: ResolverIndex>(
     caller_file: &str,
     module_segments: &[&str],
 ) -> Option<String> {
+    // Local declarations, including #[path] modules in integration-test
+    // harnesses, take precedence over reconstructing a library-relative path.
+    if let Some((first, rest)) = module_segments.split_first() {
+        if !matches!(*first, "crate" | "self" | "super") {
+            if let Some(mut file) = index.module_target(caller_file, first) {
+                for segment in rest {
+                    file = index.module_target(&file, segment)?;
+                }
+                return Some(file);
+            }
+        }
+    }
     if !matches!(
         module_segments.first().copied(),
         Some("crate" | "self" | "super") | None
