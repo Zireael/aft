@@ -544,9 +544,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/semantic_search/external_pattern.rs",
-        enclosing_item: "semantic_results",
+        enclosing_item: "semantic_results, semantic_index",
         location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
-        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page",
+        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page. Discovery currently attributes the restricted-visibility method to its preceding semantic_index helper",
     },
 ];
 
