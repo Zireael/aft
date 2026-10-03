@@ -706,6 +706,93 @@ fn a_live_ticket_relays_the_governed_envelope_and_prints_the_url() {
     assert!(write["params"].get("session").is_none());
 }
 
+#[test]
+fn session_agent_mismatch_names_manifest_repository_and_known_bot_without_lookup() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-mismatch", "call-mm", "/p");
+    for known_handle in [false, true] {
+        let refusal = json!({"op": BOT_REQUEST_OPERATION, "status": "error", "data": {
+            "refusal_code": "assertion_session_agent_mismatch", "stage": "mint",
+            "message": "residence session ses-mismatch belongs to agent agent_session, not the requested agent agent_bound",
+        }});
+        let harness = harness(Arc::new(move |body| {
+            if known_handle && body["op"] == BINDINGS_READ_OPERATION {
+                json!({"op": BINDINGS_READ_OPERATION, "status": "ok", "data": {"result": {
+                    "repo_binding_generation": 1, "bindings": [{
+                        "repository": "cortexkit/aft", "agent_id": "agent_bound", "app_handle_id": "aft-alfonso[bot]",
+                    }],
+                }}})
+            } else {
+                refusal.clone()
+            }
+        }));
+        let mut manifest = v12_manifest();
+        manifest
+            .bindings
+            .insert("cortexkit/aft".into(), "agent_bound".into());
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".into(),
+            agent_id: "agent_bound".into(),
+        };
+        let args = comment_args("hi");
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("not governed");
+        };
+        let request = super::super::canonicalize_governed(
+            &args,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+        )
+        .unwrap();
+        let rung = RungDetermination::r3(
+            TEST_NOW,
+            manifest.manifest_version,
+            &RungRecordProvenance {
+                image_path: "/shim".into(),
+                version: "test".into(),
+                repo_key: "cortexkit/aft".into(),
+            },
+        )
+        .record;
+        let outcome = route(
+            &harness.paths,
+            &rung,
+            &binding,
+            request,
+            TEST_NOW,
+            &manifest,
+            &RelayContext {
+                connection_file: Some(harness.connection_file.clone()),
+                ticket: live.value().map(str::to_string),
+                transient_delays: [Duration::from_millis(1); 2],
+                relay_budget: Duration::from_secs(5),
+            },
+        );
+        let RouteOutcome::RelayRefusal { code, text } = outcome else {
+            panic!("not refused: {outcome:?}");
+        };
+        let identity = if known_handle {
+            "aft-alfonso[bot] (agent_bound)"
+        } else {
+            "agent_bound"
+        };
+        assert!(
+            text.starts_with(&format!(
+                "cortexkit/aft is bound to {identity}; this session is agent_session; "
+            )),
+            "{text}"
+        );
+        assert!(text.contains("residence session ses-mismatch belongs to agent agent_session"));
+        assert_eq!(code, "assertion_session_agent_mismatch");
+        assert_eq!(
+            harness.daemon.requests.lock().unwrap().len(),
+            if known_handle { 2 } else { 1 },
+            "no lookup or retry"
+        );
+    }
+}
+
 fn nonces(harness: &Harness) -> Vec<String> {
     harness
         .daemon

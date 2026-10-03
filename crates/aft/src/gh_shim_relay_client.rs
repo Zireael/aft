@@ -372,6 +372,10 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
 pub(super) struct BindingsCheck {
     pub(super) manifest_version: u64,
     pub(super) repo_binding_generation: u64,
+    /// Handles already returned by the normal bindings check; never fetched
+    /// just to improve a refusal. Older cached checks have no handle detail.
+    #[serde(default)]
+    pub(super) handles: BTreeMap<String, String>,
 }
 
 fn load_check(paths: &StatePaths) -> Option<BindingsCheck> {
@@ -602,6 +606,20 @@ impl Exchange<'_> {
         Ok(BindingsCheck {
             manifest_version: manifest.manifest_version,
             repo_binding_generation: generation,
+            handles: reply
+                .get("result")
+                .unwrap_or(&reply)
+                .get("bindings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some((
+                        row.get("repository")?.as_str()?.to_ascii_lowercase(),
+                        row.get("app_handle_id")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect(),
         })
     }
 }
@@ -909,7 +927,52 @@ pub(super) fn route(
             ));
         }
     }
-    outcome
+    describe_session_agent_mismatch(outcome, agent_binding, manifest, paths)
+}
+
+/// Preserve the mint refusal verbatim after a caller-facing identity summary.
+/// The repository's identity comes from the active manifest, not the ids in an
+/// upstream error. The session id is only reported when prefrontal names it.
+fn describe_session_agent_mismatch(
+    outcome: RouteOutcome,
+    binding: &AgentBinding,
+    manifest: &Manifest,
+    paths: &StatePaths,
+) -> RouteOutcome {
+    let RouteOutcome::RelayRefusal { code, text } = &outcome else {
+        return outcome;
+    };
+    if code != "assertion_session_agent_mismatch" {
+        return outcome;
+    }
+    let Some(agent) = manifest.bindings.get(&binding.repo) else {
+        return outcome;
+    };
+    let session_agent = text
+        .split_once("belongs to agent ")
+        .and_then(|(_, tail)| tail.split_once(", not the requested agent "))
+        .map(|(agent, _)| agent)
+        .filter(|agent| {
+            !agent.is_empty()
+                && agent
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '[' | ']'))
+        })
+        .unwrap_or("unknown (prefrontal did not name the session's agent)");
+    let handle = load_check(paths)
+        .filter(|check| check.manifest_version == manifest.manifest_version)
+        .and_then(|check| check.handles.get(&binding.repo).cloned())
+        .filter(|handle| super::valid_github_login(handle));
+    let identity = handle
+        .map(|handle| format!("{handle} ({agent})"))
+        .unwrap_or_else(|| agent.clone());
+    RouteOutcome::RelayRefusal {
+        code: code.clone(),
+        text: format!(
+            "{} is bound to {identity}; this session is {session_agent}; {text}",
+            binding.repo
+        ),
+    }
 }
 
 #[cfg(test)]
