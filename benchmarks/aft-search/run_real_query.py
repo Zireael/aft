@@ -477,7 +477,7 @@ def score_manifest_rows(
                 "input_form": "split" if split else "joined",
                 "answer_kind": row["answer_kind"],
                 "split_kind": row["split_kind"],
-                **({"pattern_summary": responses[0].get("pattern_summary"), "summary_text": str(responses[0].get("text", "")).splitlines()[:8]} if split else {}),
+                **({"pattern_summary": _relative_pattern_summary(responses[0].get("pattern_summary"), project_root), "summary_text": str(responses[0].get("text", "")).splitlines()[:8]} if split else {}),
                 # Diagnostics only, present when the engine runs with
                 # AFT_SEARCH_SPLIT_TRACE set: what placed each leading result.
                 **({"split_trace": responses[0]["split_trace"]} if split and responses[0].get("split_trace") else {}),
@@ -678,6 +678,27 @@ def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
 # Where the answer-key ignore list is copied inside the evidence tree, which is
 # a projection of this repository and so has the same relative layout.
 BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
+
+
+def _relative_pattern_summary(summary: Any, project_root: Path) -> Any:
+    """Rewrite the engine's absolute definition paths relative to the tree.
+
+    The evidence tree is copied into a fresh temporary directory on every run,
+    and that directory's name differs between runs and between platforms
+    (`/tmp/...` on Linux, `/private/var/folders/...` on macOS). The pattern
+    summary is part of each recorded row, so absolute paths there made two runs
+    of an identical engine compare unequal.
+    """
+    roots = {str(project_root), str(project_root.resolve())}
+    if isinstance(summary, dict):
+        return {key: _relative_pattern_summary(value, project_root) for key, value in summary.items()}
+    if isinstance(summary, list):
+        return [_relative_pattern_summary(value, project_root) for value in summary]
+    if isinstance(summary, str):
+        for root in roots:
+            if summary.startswith(root + os.sep):
+                return summary[len(root) + 1 :].replace(os.sep, "/")
+    return summary
 
 
 def copy_answer_key_ignore(root: Path) -> Optional[Path]:
