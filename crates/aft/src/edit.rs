@@ -107,7 +107,16 @@ pub fn replace_byte_range(
 /// Returns `Ok(Some(true))` if syntax is valid, `Ok(Some(false))` if there are
 /// parse errors, and `Ok(None)` if the language is unsupported.
 pub fn validate_syntax(path: &Path) -> Result<Option<bool>, AftError> {
-    let mut parser = FileParser::new();
+    validate_syntax_with_parser(&mut FileParser::new(), path)
+}
+
+/// [`validate_syntax`] through a caller-owned parser. The parsed tree stays in
+/// that parser's tree cache, so a caller that extracts symbols from the same
+/// file next reuses it instead of parsing the file a second time.
+pub fn validate_syntax_with_parser(
+    parser: &mut FileParser,
+    path: &Path,
+) -> Result<Option<bool>, AftError> {
     match parser.parse(path) {
         Ok((tree, _lang)) => Ok(Some(!tree.root_node().has_error())),
         Err(AftError::InvalidRequest { .. }) => {

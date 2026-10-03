@@ -14,7 +14,7 @@ use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
-use crate::parser::{detect_language, LangId};
+use crate::parser::{detect_language, FileParser, LangId, TreeSitterProvider};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
 use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
@@ -1348,6 +1348,15 @@ fn outline_many_files(
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
     let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
+    // One parser for the whole batch, sharing the provider's symbol cache:
+    // the syntax check below leaves its tree in this parser's tree cache, and
+    // symbol extraction for the same file then reuses that tree instead of
+    // parsing the file a second time. Other providers keep the old path.
+    let mut batch_parser = ctx
+        .provider()
+        .as_any()
+        .downcast_ref::<TreeSitterProvider>()
+        .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()));
 
     for file in files {
         let path = match ctx.validate_path(req_id, Path::new(file)) {
@@ -1360,12 +1369,24 @@ fn outline_many_files(
         }
 
         let rel_path = display_path(&path, file, project_root);
-        if let Some(reason) = outline_skip_reason(&path) {
+        if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
+            if let Some(parser) = batch_parser.as_mut() {
+                parser.evict_parse_tree(&path);
+            }
             skipped_files.push(SkippedFile::new(rel_path, reason));
             continue;
         }
 
-        match ctx.provider().list_symbols(&path) {
+        let symbols = match batch_parser.as_mut() {
+            Some(parser) => {
+                let symbols = parser.extract_symbols(&path);
+                // Each file is outlined once; keeping its tree only adds memory.
+                parser.evict_parse_tree(&path);
+                symbols
+            }
+            None => ctx.provider().list_symbols(&path),
+        };
+        match symbols {
             Ok(symbols) => {
                 let entries = build_outline_tree(&symbols);
                 file_outlines.push(FileOutline {
@@ -1666,7 +1687,7 @@ fn display_path(path: &Path, fallback: &str, project_root: Option<&Path>) -> Str
         .unwrap_or_else(|| fallback.to_string())
 }
 
-fn outline_skip_reason(path: &Path) -> Option<&'static str> {
+fn outline_skip_reason(path: &Path, parser: Option<&mut FileParser>) -> Option<&'static str> {
     if !path.is_file() {
         return Some("file_not_found");
     }
@@ -1687,11 +1708,13 @@ fn outline_skip_reason(path: &Path) -> Option<&'static str> {
     // return whatever symbols it can recover from a partially-broken file rather
     // than surfacing a parse error. To honor the contract that parse-error files
     // land in `skipped_files` (not the rendered outline), we still run
-    // `validate_syntax()` here. The cost is one extra parse per file, but
-    // Track 0's parser cache (per-language reused `Parser`, global compiled
-    // `Query`) makes that parse cheap relative to the full symbol-extraction
-    // pass that follows.
-    match edit::validate_syntax(path) {
+    // `validate_syntax()` here. With a batch parser the tree it builds is
+    // reused by the symbol extraction that follows, so the file is parsed once.
+    let validated = match parser {
+        Some(parser) => edit::validate_syntax_with_parser(parser, path),
+        None => edit::validate_syntax(path),
+    };
+    match validated {
         Ok(Some(false)) => Some("parse_error"),
         Ok(Some(true)) | Ok(None) => None,
         Err(e) => Some(outline_error_reason(&e)),
@@ -1942,6 +1965,51 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    /// Multi-file outline checks each file's syntax and then extracts its
+    /// symbols. Both steps must share one parse; the syntax check used to
+    /// build its own parser and tree, so every outlined file was parsed twice
+    /// and every call loaded a grammar.
+    #[test]
+    fn multi_file_outline_parses_each_file_once() {
+        use crate::parser::work_counters::{grammar_loads, tree_parses};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut files = Vec::new();
+        for index in 0..20 {
+            let path = temp.path().join(format!("f{index:02}.ts"));
+            std::fs::write(&path, format!("export function f{index}() {{}}\n")).unwrap();
+            files.push(path.display().to_string());
+        }
+        let broken = temp.path().join("broken.ts");
+        std::fs::write(&broken, "function (\n").unwrap();
+        files.push(broken.display().to_string());
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "outline-parses",
+            "command": "outline",
+            "files": files,
+        }))
+        .unwrap();
+
+        let parses_before = tree_parses();
+        let loads_before = grammar_loads();
+        let response = serde_json::to_value(handle_outline(&request, &ctx)).unwrap();
+        let parses = tree_parses() - parses_before;
+        let loads = grammar_loads() - loads_before;
+
+        assert_eq!(parses, 21, "one parse per outlined file");
+        assert!(loads <= 1, "grammar loaded {loads} times for one language");
+        let text = response["text"].as_str().expect("outline text");
+        for index in 0..20 {
+            assert!(text.contains(&format!("f{index}")), "{text}");
+        }
+        let skipped = response["skipped_files"].as_array().expect("skipped files");
+        assert_eq!(skipped.len(), 1, "{response}");
+        assert_eq!(skipped[0]["reason"], "parse_error");
+    }
 
     #[test]
     fn outline_walk_skips_and_reports_injected_foreign_mount() {

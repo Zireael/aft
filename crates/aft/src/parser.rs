@@ -982,6 +982,32 @@ thread_local! {
     static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
 }
 
+/// Per-thread counts of parser work, so tests can pin how many parses and
+/// grammar loads a request costs without timing anything.
+#[cfg(test)]
+pub(crate) mod work_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Tree-sitter parses of whole files done through `FileParser`.
+        pub(crate) static TREE_PARSES: Cell<usize> = const { Cell::new(0) };
+        /// Parser allocations with a grammar load.
+        pub(crate) static GRAMMAR_LOADS: Cell<usize> = const { Cell::new(0) };
+        /// Source reads the language provider does to inspect a file's tree.
+        pub(crate) static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
+        /// Copies of a cached symbol list handed out by `FileParser`.
+        pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn tree_parses() -> usize {
+        TREE_PARSES.with(Cell::get)
+    }
+
+    pub(crate) fn grammar_loads() -> usize {
+        GRAMMAR_LOADS.with(Cell::get)
+    }
+}
+
 /// Parse source with a parser retained by the current worker thread.
 pub(crate) fn parse_source_with_cached_parser(
     path: &Path,
@@ -991,6 +1017,8 @@ pub(crate) fn parse_source_with_cached_parser(
     REUSABLE_PARSERS.with(|parsers| {
         let mut parsers = parsers.borrow_mut();
         if let std::collections::hash_map::Entry::Vacant(entry) = parsers.entry(lang) {
+            #[cfg(test)]
+            work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
             let grammar = grammar_for(lang);
             let mut parser = Parser::new();
             parser.set_language(&grammar).map_err(|error| {
@@ -1026,7 +1054,10 @@ struct CachedSymbols {
     mtime: SystemTime,
     size: u64,
     content_hash: blake3::Hash,
-    symbols: Vec<Symbol>,
+    /// Shared so a lookup can snapshot an entry under the read lock with a
+    /// reference-count bump, and copy the symbols only after the lock is
+    /// released and only if the entry turns out to be fresh.
+    symbols: Arc<Vec<Symbol>>,
 }
 
 fn content_hash_for_source(source: &str) -> blake3::Hash {
@@ -1129,6 +1160,109 @@ fn symbols_estimated_bytes(symbols: &[Symbol]) -> u64 {
     })
 }
 
+/// A disk symbol cache decoded and checked against the files on disk, not yet
+/// installed in a [`SymbolCache`].
+pub(crate) struct DecodedSymbolCache {
+    root: PathBuf,
+    entries: HashMap<PathBuf, CachedSymbols>,
+    outcome: SymbolCacheLoadOutcome,
+}
+
+impl DecodedSymbolCache {
+    /// Decodes the disk cache and drops entries whose source file changed.
+    /// Returns `None` when there is no usable disk cache.
+    fn read(storage_dir: &Path, project_key: &str, current_root: &Path) -> Option<Self> {
+        debug_assert!(current_root.is_absolute());
+        let cache = symbol_cache_disk::read_from_disk(storage_dir, project_key)?;
+        let mut entries = HashMap::new();
+        let mut outcome = SymbolCacheLoadOutcome::default();
+
+        for entry in cache.entries {
+            #[cfg(test)]
+            SYMBOL_CACHE_DECODE_TEST_BARRIERS.with(|slot| {
+                if let Some((arrived, released)) = slot.borrow_mut().take() {
+                    arrived.wait();
+                    released.wait();
+                }
+            });
+            let Some(path) =
+                crate::search_index::cached_path_under_root(current_root, &entry.relative_path)
+            else {
+                outcome.needs_persistence = true;
+                continue;
+            };
+            let cached_freshness = FileFreshness {
+                mtime: entry.mtime,
+                size: entry.size,
+                content_hash: entry.content_hash,
+            };
+            let mtime = match cache_freshness::verify_file(&path, &cached_freshness) {
+                FreshnessVerdict::HotFresh => entry.mtime,
+                FreshnessVerdict::ContentFresh { new_mtime, .. } => {
+                    outcome.needs_persistence = true;
+                    new_mtime
+                }
+                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
+                    outcome.needs_persistence = true;
+                    continue;
+                }
+            };
+
+            entries.insert(
+                path,
+                CachedSymbols {
+                    mtime,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
+                    symbols: Arc::new(entry.symbols),
+                },
+            );
+            outcome.loaded += 1;
+        }
+
+        Some(Self {
+            root: current_root.to_path_buf(),
+            entries,
+            outcome,
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Parks a disk-cache decode before its next entry, so a test can act on
+    /// the shared cache while the decode is in flight.
+    static SYMBOL_CACHE_DECODE_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Loads the disk symbol cache into a shared cache for `generation`.
+///
+/// Decoding and checking each entry against its file (a stat, sometimes a
+/// content hash) happens with no lock held; only the final swap takes the
+/// write lock. Holding the write lock for the whole load blocked every outline,
+/// zoom and symbol lookup for as long as the startup load took. If the cache
+/// moved to another generation while decoding (a reconfigure reset it), the
+/// decoded entries belong to the old project state and are discarded, not
+/// merged.
+pub(crate) fn load_shared_symbol_cache_for_generation(
+    symbol_cache: &SharedSymbolCache,
+    generation: u64,
+    storage_dir: &Path,
+    project_key: &str,
+    current_root: &Path,
+) -> SymbolCacheLoadOutcome {
+    let Some(decoded) = DecodedSymbolCache::read(storage_dir, project_key, current_root) else {
+        return SymbolCacheLoadOutcome::default();
+    };
+    let Ok(mut cache) = symbol_cache.write() else {
+        return SymbolCacheLoadOutcome::default();
+    };
+    if cache.generation != generation {
+        return SymbolCacheLoadOutcome::default();
+    }
+    cache.install_decoded(decoded)
+}
+
 impl SymbolCache {
     pub fn new() -> Self {
         Self {
@@ -1173,7 +1307,7 @@ impl SymbolCache {
             mtime,
             size,
             content_hash,
-            symbols,
+            symbols: Arc::new(symbols),
         };
         if self.entries.get(&path) == Some(&entry) {
             return false;
@@ -1203,7 +1337,7 @@ impl SymbolCache {
     pub fn get(&self, path: &Path, mtime: SystemTime) -> Option<Vec<Symbol>> {
         self.entries.get(path).and_then(|cached| {
             cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime)
-                .then(|| cached.symbols.clone())
+                .then(|| cached.symbols.as_ref().clone())
         })
     }
 
@@ -1247,54 +1381,23 @@ impl SymbolCache {
         project_key: &str,
         current_root: &Path,
     ) -> SymbolCacheLoadOutcome {
-        debug_assert!(current_root.is_absolute());
-        let Some(cache) = symbol_cache_disk::read_from_disk(storage_dir, project_key) else {
-            return SymbolCacheLoadOutcome::default();
-        };
-
-        self.project_root = Some(current_root.to_path_buf());
-        self.entries.clear();
-        let mut outcome = SymbolCacheLoadOutcome::default();
-
-        for entry in cache.entries {
-            let Some(path) =
-                crate::search_index::cached_path_under_root(current_root, &entry.relative_path)
-            else {
-                outcome.needs_persistence = true;
-                continue;
-            };
-            let cached_freshness = FileFreshness {
-                mtime: entry.mtime,
-                size: entry.size,
-                content_hash: entry.content_hash,
-            };
-            let mtime = match cache_freshness::verify_file(&path, &cached_freshness) {
-                FreshnessVerdict::HotFresh => entry.mtime,
-                FreshnessVerdict::ContentFresh { new_mtime, .. } => {
-                    outcome.needs_persistence = true;
-                    new_mtime
-                }
-                FreshnessVerdict::Stale | FreshnessVerdict::Deleted => {
-                    outcome.needs_persistence = true;
-                    continue;
-                }
-            };
-
-            self.entries.insert(
-                path,
-                CachedSymbols {
-                    mtime,
-                    size: entry.size,
-                    content_hash: entry.content_hash,
-                    symbols: entry.symbols,
-                },
-            );
-            outcome.loaded += 1;
+        match DecodedSymbolCache::read(storage_dir, project_key, current_root) {
+            Some(decoded) => self.install_decoded(decoded),
+            None => SymbolCacheLoadOutcome::default(),
         }
+    }
 
-        self.mutation_revision = if outcome.needs_persistence { 1 } else { 0 };
+    /// Replace every entry with a decoded disk cache.
+    fn install_decoded(&mut self, decoded: DecodedSymbolCache) -> SymbolCacheLoadOutcome {
+        self.project_root = Some(decoded.root);
+        self.entries = decoded.entries;
+        self.mutation_revision = if decoded.outcome.needs_persistence {
+            1
+        } else {
+            0
+        };
         self.persisted_revision = 0;
-        outcome
+        decoded.outcome
     }
 
     /// Load valid symbol entries from disk only when the caller still belongs
@@ -1435,7 +1538,7 @@ impl SymbolCache {
                     cached.mtime,
                     cached.size,
                     cached.content_hash,
-                    &cached.symbols,
+                    cached.symbols.as_ref(),
                 )
             })
             .collect()
@@ -1446,7 +1549,6 @@ impl SymbolCache {
 /// symbol table caching, and query pattern execution via tree-sitter.
 pub struct FileParser {
     cache: HashMap<PathBuf, CachedTree>,
-    parsers: HashMap<LangId, Parser>,
     symbol_cache: SharedSymbolCache,
     symbol_cache_generation: Option<u64>,
 }
@@ -1469,29 +1571,22 @@ impl FileParser {
     ) -> Self {
         Self {
             cache: HashMap::new(),
-            parsers: HashMap::new(),
             symbol_cache,
             symbol_cache_generation,
         }
     }
 
-    fn parser_for(&mut self, lang: LangId) -> Result<&mut Parser, AftError> {
-        use std::collections::hash_map::Entry;
-
-        match self.parsers.entry(lang) {
-            Entry::Occupied(entry) => Ok(entry.into_mut()),
-            Entry::Vacant(entry) => {
-                let grammar = grammar_for(lang);
-                let mut parser = Parser::new();
-                parser.set_language(&grammar).map_err(|e| {
-                    crate::slog_error!("grammar init failed for {:?}: {}", lang, e);
-                    AftError::ParseError {
-                        message: format!("grammar init failed for {:?}: {}", lang, e),
-                    }
-                })?;
-                Ok(entry.insert(parser))
-            }
-        }
+    /// Parses `source` with this thread's retained parser for `lang` and
+    /// counts the parse for tests. Every `FileParser` used to own its own
+    /// per-language `Parser`, and most callers build a fresh `FileParser` per
+    /// request (the language provider does it per call), so each call paid a
+    /// parser allocation and grammar load before parsing.
+    fn parse_source(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {
+        #[cfg(test)]
+        work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
+        parse_source_with_cached_parser(path, source, lang).inspect_err(|_| {
+            crate::slog_error!("parse failed for {}", path.display());
+        })
     }
 
     /// Number of entries in the shared symbol cache.
@@ -1550,12 +1645,7 @@ impl FileParser {
                 path: format!("{}: {}", path.display(), e),
             })?;
 
-            let tree = self.parser_for(lang)?.parse(&source, None).ok_or_else(|| {
-                crate::slog_error!("parse failed for {}", path.display());
-                AftError::ParseError {
-                    message: format!("tree-sitter parse returned None for {}", path.display()),
-                }
-            })?;
+            let tree = Self::parse_source(path, &source, lang)?;
 
             self.cache.insert(
                 canon.clone(),
@@ -1624,12 +1714,7 @@ impl FileParser {
         };
 
         if needs_reparse {
-            let tree = self.parser_for(lang)?.parse(source, None).ok_or_else(|| {
-                crate::slog_error!("parse failed for {}", path.display());
-                AftError::ParseError {
-                    message: format!("tree-sitter parse returned None for {}", path.display()),
-                }
-            })?;
+            let tree = Self::parse_source(path, source, lang)?;
 
             self.cache.insert(
                 canon.clone(),
@@ -1717,7 +1802,9 @@ impl FileParser {
                         return self.extract_symbols_with_cache_status(path);
                     }
                 }
-                return Ok((cached.symbols, false));
+                #[cfg(test)]
+                work_counters::CACHED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+                return Ok((Arc::unwrap_or_clone(cached.symbols), false));
             }
         }
 
@@ -2017,14 +2104,33 @@ fn is_adjacent_line(upper: &Node, lower: &Node, source: &str) -> bool {
         return true;
     }
 
-    // Check that there's no blank line between them
-    let lines: Vec<&str> = source.lines().collect();
-    for row in (upper_end + 1)..lower_start {
-        if row < lines.len() && lines[row].trim().is_empty() {
+    // Check that there's no blank line between them. Only the bytes between
+    // the two nodes are scanned: splitting the whole file into lines here made
+    // every documented symbol cost a pass over the entire file. The gap text
+    // starts with the rest of `upper`'s last row and ends with the start of
+    // `lower`'s first row, so the pieces strictly between the first and last
+    // newline are exactly the rows in between.
+    let gap_start = upper.end_byte().min(source.len());
+    let gap_end = lower.start_byte().clamp(gap_start, source.len());
+    let gap = &source[gap_start..gap_end];
+    #[cfg(test)]
+    ADJACENT_LINE_BYTES_SCANNED.with(|bytes| bytes.set(bytes.get() + gap.len()));
+    let mut rows = gap.split('\n');
+    rows.next();
+    let mut rows = rows.peekable();
+    while let Some(row) = rows.next() {
+        if rows.peek().is_some() && row.trim().is_empty() {
             return false;
         }
     }
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Source bytes `is_adjacent_line` examined on this thread, so a test can
+    /// prove the check stays proportional to the gap rather than the file.
+    static ADJACENT_LINE_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Extract the text of a node from source.
@@ -2068,55 +2174,90 @@ fn variable_declarator_has_function_value(node: &Node) -> bool {
     })
 }
 
-/// Collect byte ranges of all export_statement nodes from query matches.
-fn collect_export_ranges(source: &str, root: &Node, query: &Query) -> Vec<std::ops::Range<usize>> {
-    let export_idx = query
-        .capture_names()
-        .iter()
-        .position(|n| *n == "export.stmt");
-    let export_idx = match export_idx {
-        Some(i) => i as u32,
-        None => return vec![],
-    };
+/// Byte ranges of every `export_statement` in a TS/JS tree, reduced to the
+/// outermost ones and sorted, plus the names those statements export.
+///
+/// Both come from one walk of the tree. They used to cost a separate full
+/// pass of the language's whole symbol query (to find the export statements)
+/// on top of this walk, and `is_exported` then compared every symbol with every
+/// export statement.
+struct ExportIndex {
+    ranges: Vec<std::ops::Range<usize>>,
+    names: HashSet<String>,
+}
 
-    let mut cursor = QueryCursor::new();
+fn collect_exports(source: &str, root: &Node) -> ExportIndex {
     let mut ranges = Vec::new();
-    let mut matches = cursor.matches(query, *root, source.as_bytes());
-
-    while let Some(m) = {
-        matches.advance();
-        matches.get()
-    } {
-        for cap in m.captures {
-            if cap.index == export_idx {
-                ranges.push(cap.node.byte_range());
-            }
+    let names = walk_export_statements(source, root, |node| ranges.push(node.byte_range()));
+    // Keep only ranges no other range contains. A node is inside some export
+    // statement exactly when it is inside one of the outermost ones, and once
+    // contained ranges are gone, both starts and ends increase along the list,
+    // which `is_exported` relies on for its binary search.
+    ranges.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    let mut outermost: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if outermost
+            .last()
+            .is_some_and(|last| last.start <= range.start && range.end <= last.end)
+        {
+            continue;
         }
+        outermost.push(range);
     }
-    ranges
+    ExportIndex {
+        ranges: outermost,
+        names,
+    }
 }
 
 /// Check if a node's byte range is contained within any export statement.
+///
+/// `export_ranges` comes from [`collect_exports`]: sorted, with no range
+/// containing another, so starts and ends both increase. Of the ranges that
+/// start at or before the node, the last one reaches furthest, so it is the
+/// only one that needs checking.
 fn is_exported(node: &Node, export_ranges: &[std::ops::Range<usize>]) -> bool {
     let r = node.byte_range();
-    export_ranges
-        .iter()
-        .any(|er| er.start <= r.start && r.end <= er.end)
+    let candidates = export_ranges.partition_point(|er| er.start <= r.start);
+    #[cfg(test)]
+    EXPORT_RANGE_COMPARISONS.with(|count| count.set(count.get() + 1));
+    candidates
+        .checked_sub(1)
+        .is_some_and(|index| r.end <= export_ranges[index].end)
 }
 
-/// Pre-order walk of the whole tree collecting exported names.
+#[cfg(test)]
+thread_local! {
+    /// Containment checks `is_exported` made on this thread.
+    static EXPORT_RANGE_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Names exported by the tree's export statements. Symbol extraction gets
+/// them from [`collect_exports`]; tests use this to check that walk.
+#[cfg(test)]
+fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
+    walk_export_statements(source, root, |_| {})
+}
+
+/// Pre-order walk of the whole tree: calls `on_export` for every
+/// `export_statement` and returns the names they export.
 ///
 /// Iterative with one cursor on purpose: the recursive form spent a stack
 /// frame per tree depth, and a large non-TypeScript document parsed by the
 /// TypeScript grammar (an HTML page whose URL ended in `.d.ts`) produced an
 /// error-recovery tree deep enough to overflow the 2 MiB executor worker
 /// stack and abort the daemon - twice, 55 s apart, on the same request.
-fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
+fn walk_export_statements(
+    source: &str,
+    root: &Node,
+    mut on_export: impl FnMut(&Node),
+) -> HashSet<String> {
     let mut exported = HashSet::new();
     let mut cursor = root.walk();
     loop {
         let node = cursor.node();
         if node.kind() == "export_statement" {
+            on_export(&node);
             collect_names_from_export_statement(source, &node, &mut exported);
         }
         if cursor.goto_first_child() {
@@ -2290,8 +2431,10 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     let lang = LangId::TypeScript;
     let capture_names = query.capture_names();
 
-    let export_ranges = collect_export_ranges(source, root, query);
-    let exported_names = collect_exported_symbol_names(source, root);
+    let ExportIndex {
+        ranges: export_ranges,
+        names: exported_names,
+    } = collect_exports(source, root);
 
     let mut symbols = Vec::new();
     let mut cursor = QueryCursor::new();
@@ -2612,8 +2755,10 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
     let lang = LangId::JavaScript;
     let capture_names = query.capture_names();
 
-    let export_ranges = collect_export_ranges(source, root, query);
-    let exported_names = collect_exported_symbol_names(source, root);
+    let ExportIndex {
+        ranges: export_ranges,
+        names: exported_names,
+    } = collect_exports(source, root);
 
     let mut symbols = Vec::new();
     let mut cursor = QueryCursor::new();
@@ -8044,11 +8189,17 @@ fn extract_md_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
 /// Class declarations can match both "class" and "method" patterns,
 /// producing duplicates.
 fn dedup_symbols(symbols: &mut Vec<Symbol>) {
-    let mut seen = std::collections::HashSet::new();
-    symbols.retain(|s| {
-        let key = (s.name.clone(), format!("{:?}", s.kind), s.range.start_line);
-        seen.insert(key)
-    });
+    // Keys borrow from the symbols instead of cloning the name and formatting
+    // the kind for every symbol.
+    let keep: Vec<bool> = {
+        let mut seen = std::collections::HashSet::with_capacity(symbols.len());
+        symbols
+            .iter()
+            .map(|s| seen.insert((s.name.as_str(), &s.kind, s.range.start_line)))
+            .collect()
+    };
+    let mut keep = keep.into_iter();
+    symbols.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// Provider that uses tree-sitter for real symbol extraction.
@@ -8110,14 +8261,17 @@ impl TreeSitterProvider {
             return Ok(local_matches);
         }
 
+        // Both the default-export lookup and the re-export scan need the
+        // file's source and tree; read and hash it once for both.
+        let parsed = self.read_parsed_file(parser, file)?;
         if name == "default" {
-            let default_matches = self.resolve_local_default_export(parser, file, &symbols)?;
+            let default_matches = self.resolve_local_default_export(&parsed, file, &symbols)?;
             if !default_matches.is_empty() {
                 return Ok(default_matches);
             }
         }
 
-        let reexport_targets = self.collect_reexport_targets(parser, file, name)?;
+        let reexport_targets = self.collect_reexport_targets(&parsed, file, name)?;
         let mut matches = Vec::new();
         let mut seen = HashSet::new();
         for target in reexport_targets {
@@ -8148,11 +8302,11 @@ impl TreeSitterProvider {
 
     fn collect_reexport_targets(
         &self,
-        parser: &mut FileParser,
+        (source, tree, lang): &(String, Tree, LangId),
         file: &Path,
         requested_name: &str,
     ) -> Result<Vec<ReExportTarget>, AftError> {
-        let (source, tree, lang) = self.read_parsed_file(parser, file)?;
+        let (source, lang) = (source.as_str(), *lang);
         if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
             return Ok(Vec::new());
         }
@@ -8227,11 +8381,11 @@ impl TreeSitterProvider {
 
     fn resolve_local_default_export(
         &self,
-        parser: &mut FileParser,
+        (source, tree, lang): &(String, Tree, LangId),
         file: &Path,
         symbols: &[Symbol],
     ) -> Result<Vec<SymbolMatch>, AftError> {
-        let (source, tree, lang) = self.read_parsed_file(parser, file)?;
+        let (source, lang) = (source.as_str(), *lang);
         if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
             return Ok(Vec::new());
         }
@@ -8282,6 +8436,8 @@ impl TreeSitterProvider {
         parser: &mut FileParser,
         file: &Path,
     ) -> Result<(String, Tree, LangId), AftError> {
+        #[cfg(test)]
+        work_counters::PARSED_FILE_READS.with(|count| count.set(count.get() + 1));
         let current_mtime = std::fs::metadata(file)
             .and_then(|m| m.modified())
             .map_err(|e| AftError::FileNotFound {
@@ -8603,6 +8759,236 @@ mod tests {
         parser.set_language(&grammar).unwrap();
         let tree = parser.parse(source, None).unwrap();
         extract_symbols_from_tree(source, &tree, lang).unwrap()
+    }
+
+    /// Export detection reads export statements from one tree walk and finds
+    /// the containing statement by binary search. It must agree, for every
+    /// node, with the old method: a full query pass for `@export.stmt`
+    /// captures and a scan of all of them.
+    #[test]
+    fn export_index_agrees_with_query_ranges_for_every_node() {
+        let mut sources: Vec<(String, LangId)> = [
+            ("sample.ts", LangId::TypeScript),
+            ("structure_ts.ts", LangId::TypeScript),
+            ("member_ts.ts", LangId::TypeScript),
+            ("imports_ts.ts", LangId::TypeScript),
+            ("sample.tsx", LangId::Tsx),
+            ("sample.js", LangId::JavaScript),
+            ("imports_js.js", LangId::JavaScript),
+        ]
+        .into_iter()
+        .map(|(name, lang)| (std::fs::read_to_string(fixture_path(name)).unwrap(), lang))
+        .collect();
+        sources.push((
+            "export namespace Outer {\n  export function inner() {}\n  function hidden() {}\n  export namespace Deep { export const x = 1; }\n}\nfunction after() {}\nexport { after };\nexport default class {}\nexport function (\n".to_string(),
+            LangId::TypeScript,
+        ));
+        for (source, lang) in &sources {
+            let mut parser = Parser::new();
+            parser.set_language(&grammar_for(*lang)).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let root = tree.root_node();
+            let query = cached_query_for(*lang).unwrap().unwrap();
+            let export_idx = query
+                .capture_names()
+                .iter()
+                .position(|name| *name == "export.stmt")
+                .unwrap() as u32;
+            let mut reference = Vec::new();
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(query, root, source.as_bytes());
+            while let Some(m) = {
+                matches.advance();
+                matches.get()
+            } {
+                for capture in m.captures {
+                    if capture.index == export_idx {
+                        reference.push(capture.node.byte_range());
+                    }
+                }
+            }
+            let index = collect_exports(source, &root);
+            assert_eq!(index.names, collect_exported_symbol_names(source, &root));
+            let mut walk = root.walk();
+            let mut checked = 0usize;
+            loop {
+                let node = walk.node();
+                let range = node.byte_range();
+                let expected = reference
+                    .iter()
+                    .any(|er| er.start <= range.start && range.end <= er.end);
+                assert_eq!(
+                    is_exported(&node, &index.ranges),
+                    expected,
+                    "{} at {:?} in {source:?}",
+                    node.kind(),
+                    range
+                );
+                checked += 1;
+                if walk.goto_first_child() {
+                    continue;
+                }
+                while !walk.goto_next_sibling() {
+                    if !walk.goto_parent() {
+                        break;
+                    }
+                }
+                if walk.node() == root {
+                    break;
+                }
+            }
+            assert!(checked > 10);
+        }
+    }
+
+    #[test]
+    fn export_detection_costs_one_check_per_symbol() {
+        let mut source = String::new();
+        for index in 0..300 {
+            source.push_str(&format!("export function f{index}() {{}}\n"));
+        }
+        let before = EXPORT_RANGE_COMPARISONS.with(|count| count.get());
+        let symbols = symbols_from_source(&source, LangId::TypeScript);
+        let comparisons = EXPORT_RANGE_COMPARISONS.with(|count| count.get()) - before;
+        assert_eq!(symbols.len(), 300);
+        assert!(symbols.iter().all(|symbol| symbol.exported));
+        assert!(
+            comparisons <= symbols.len(),
+            "{comparisons} export-range comparisons for {} symbols",
+            symbols.len()
+        );
+    }
+
+    /// A symbol-cache lookup snapshots the entry under the read lock. The
+    /// snapshot must not copy the symbol list: it is copied once, after the
+    /// lock is released, and only when the entry is still fresh. A stale
+    /// entry is re-extracted without ever copying the old list.
+    #[test]
+    fn symbol_cache_lookup_copies_symbols_only_for_fresh_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a.ts");
+        let mut source = String::new();
+        for index in 0..50 {
+            source.push_str(&format!("export function f{index}() {{}}\n"));
+        }
+        std::fs::write(&path, &source).unwrap();
+        let mut parser = FileParser::new();
+        parser.extract_symbols(&path).unwrap();
+        parser.evict_parse_tree(&path);
+
+        let copies = || work_counters::CACHED_SYMBOL_COPIES.with(|count| count.get());
+        let before = copies();
+        let fresh = parser.extract_symbols(&path).unwrap();
+        assert_eq!(fresh.len(), 50);
+        assert_eq!(copies() - before, 1, "a fresh hit copies the list once");
+
+        // A different size proves staleness without hashing.
+        std::fs::write(&path, "export function only() {}\n").unwrap();
+        let before = copies();
+        let reparsed = parser.extract_symbols(&path).unwrap();
+        assert_eq!(reparsed.len(), 1);
+        assert_eq!(copies() - before, 0, "a stale entry must not be copied");
+    }
+
+    /// Resolving a name through re-exports reads each visited file's source
+    /// once for both the default-export lookup and the re-export scan; each
+    /// of them used to read and hash the file again.
+    #[test]
+    fn default_resolution_reads_each_visited_file_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a.ts");
+        std::fs::write(&a, "export * from './b';\n").unwrap();
+        std::fs::write(
+            temp.path().join("b.ts"),
+            "export default function target() {}\n",
+        )
+        .unwrap();
+        let provider = TreeSitterProvider::new();
+        let before = work_counters::PARSED_FILE_READS.with(|count| count.get());
+        let matches = provider.resolve_symbol(&a, "default").unwrap();
+        let reads = work_counters::PARSED_FILE_READS.with(|count| count.get()) - before;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].symbol.name, "target");
+        assert_eq!(reads, 2, "one read per visited file");
+    }
+
+    /// The language provider builds a `FileParser` per call. Those parsers
+    /// must share this thread's retained tree-sitter parser instead of each
+    /// allocating a parser and loading the grammar again.
+    #[test]
+    fn provider_calls_reuse_the_thread_parser() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = TreeSitterProvider::new();
+        // Warm this thread's parser so the count below isolates the calls.
+        let warm = temp.path().join("warm.ts");
+        std::fs::write(&warm, "export const warm = 1;\n").unwrap();
+        provider.list_symbols(&warm).unwrap();
+
+        let loads_before = work_counters::grammar_loads();
+        let parses_before = work_counters::tree_parses();
+        for index in 0..10 {
+            let path = temp.path().join(format!("f{index}.ts"));
+            std::fs::write(&path, format!("export function f{index}() {{}}\n")).unwrap();
+            let symbols = provider.list_symbols(&path).unwrap();
+            assert_eq!(symbols[0].name, format!("f{index}"));
+        }
+        assert_eq!(work_counters::grammar_loads() - loads_before, 0);
+        assert_eq!(work_counters::tree_parses() - parses_before, 10);
+    }
+
+    /// The blank-line check between a doc comment and its symbol must only
+    /// look at the bytes between them. It used to split the whole file into
+    /// lines once per documented symbol, so a file with N documented symbols
+    /// cost N full passes.
+    #[test]
+    fn adjacent_line_check_scans_only_the_gap_and_keeps_doc_attachment() {
+        let mut source = String::new();
+        for index in 0..200 {
+            source.push_str(&format!(
+                "/** doc {index} */\nexport function f{index}() {{}}\n\n"
+            ));
+            source.push_str(&format!(
+                "/** detached {index} */\n\nexport function g{index}() {{}}\n\n"
+            ));
+        }
+        let scanned_before = ADJACENT_LINE_BYTES_SCANNED.with(|bytes| bytes.get());
+        let symbols = symbols_from_source(&source, LangId::TypeScript);
+        let scanned = ADJACENT_LINE_BYTES_SCANNED.with(|bytes| bytes.get()) - scanned_before;
+        assert!(
+            scanned <= source.len(),
+            "the check scanned {scanned} bytes of a {} byte file",
+            source.len()
+        );
+        assert_eq!(symbols.len(), 400);
+        for symbol in &symbols {
+            let doc_row = if symbol.name.starts_with('f') {
+                // An adjacent JSDoc block belongs to the symbol.
+                symbol.range.start_line + 1
+            } else {
+                // A blank line detaches the JSDoc block.
+                symbol.range.start_line
+            };
+            let declaration_row = source
+                .lines()
+                .position(|line| line.contains(&format!("function {}()", symbol.name)))
+                .unwrap() as u32;
+            assert_eq!(doc_row, declaration_row, "{}", symbol.name);
+        }
+    }
+
+    #[test]
+    fn adjacent_line_check_handles_crlf_and_whitespace_only_rows() {
+        let cases = [
+            ("/** a */\r\nfunction f() {}\r\n", 0),
+            ("/** a */\r\n\r\nfunction f() {}\r\n", 2),
+            ("/** a */\n   \t\nfunction f() {}\n", 2),
+            ("/** a\n * b\n */\nfunction f() {}\n", 0),
+            ("/** a */ function f() {}\n", 0),
+        ];
+        for (source, start_line) in cases {
+            let symbols = symbols_from_source(source, LangId::TypeScript);
+            assert_eq!(symbols[0].range.start_line, start_line, "{source:?}");
+        }
     }
 
     /// The export walk must not spend stack per tree depth. This runs it on a
@@ -9238,6 +9624,127 @@ pub(crate) mod outer {
         assert_eq!(cache.len(), 0);
         assert!(cache.project_root().is_none());
         assert!(!cache.contains_key(&source));
+    }
+
+    /// Writes `count` source files and a disk symbol cache listing all of
+    /// them; returns the project dir, the storage dir and the source paths.
+    fn disk_symbol_cache_fixture(
+        count: usize,
+        key: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>) {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let mut disk_cache = SymbolCache::new();
+        disk_cache.set_project_root(project.path().to_path_buf());
+        let mut sources = Vec::new();
+        for index in 0..count {
+            let source = project.path().join(format!("f{index}.rs"));
+            std::fs::write(&source, format!("pub fn f{index}() {{}}\n")).unwrap();
+            let metadata = std::fs::metadata(&source).unwrap();
+            let content = std::fs::read(&source).unwrap();
+            disk_cache.insert(
+                source.clone(),
+                metadata.modified().unwrap(),
+                content.len() as u64,
+                crate::cache_freshness::hash_bytes(&content),
+                vec![test_symbol(&format!("f{index}"))],
+            );
+            sources.push(source);
+        }
+        symbol_cache_disk::write_to_disk(&disk_cache, storage.path(), key)
+            .expect("write symbol cache");
+        (project, storage, sources)
+    }
+
+    /// Starts a shared-cache load on another thread and parks it after the
+    /// disk cache has been read and decoded, before its entries are checked
+    /// against their files.
+    fn park_shared_load_mid_decode(
+        shared: &SharedSymbolCache,
+        generation: u64,
+        storage: &Path,
+        key: &str,
+        root: &Path,
+    ) -> (
+        std::sync::Arc<std::sync::Barrier>,
+        std::thread::JoinHandle<SymbolCacheLoadOutcome>,
+    ) {
+        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let released = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let hook = (arrived.clone(), released.clone());
+        let shared = Arc::clone(shared);
+        let storage = storage.to_path_buf();
+        let key = key.to_owned();
+        let root = root.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            SYMBOL_CACHE_DECODE_TEST_BARRIERS.with(|slot| *slot.borrow_mut() = Some(hook));
+            load_shared_symbol_cache_for_generation(&shared, generation, &storage, &key, &root)
+        });
+        arrived.wait();
+        (released, handle)
+    }
+
+    #[test]
+    fn startup_symbol_cache_load_decodes_without_holding_the_cache_lock() {
+        let (project, storage, sources) = disk_symbol_cache_fixture(3, "lock-free-load");
+        let shared = Arc::new(RwLock::new(SymbolCache::new()));
+        let generation = shared.read().unwrap().generation();
+        let (released, handle) = park_shared_load_mid_decode(
+            &shared,
+            generation,
+            storage.path(),
+            "lock-free-load",
+            project.path(),
+        );
+        // The load is parked mid-decode. Readers and writers must not wait on it.
+        let readable = shared.try_read().is_ok();
+        let writable = shared.try_write().is_ok();
+        released.wait();
+        let outcome = handle.join().unwrap();
+        assert!(readable, "a reader was blocked by the in-flight decode");
+        assert!(writable, "a writer was blocked by the in-flight decode");
+        assert_eq!(outcome.loaded, 3);
+        let cache = shared.read().unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.project_root(), Some(project.path().to_path_buf()));
+        for source in &sources {
+            assert!(cache.contains_key(source));
+        }
+    }
+
+    #[test]
+    fn startup_symbol_cache_load_is_discarded_when_the_generation_moves_mid_decode() {
+        let (project, storage, sources) = disk_symbol_cache_fixture(3, "stale-load");
+        let shared = Arc::new(RwLock::new(SymbolCache::new()));
+        let generation = shared.read().unwrap().generation();
+        let (released, handle) = park_shared_load_mid_decode(
+            &shared,
+            generation,
+            storage.path(),
+            "stale-load",
+            project.path(),
+        );
+        // A reconfigure resets the cache while the decode is in flight, and a
+        // request of the new generation caches one file. `try_write` keeps a
+        // regression that holds the lock across the decode from deadlocking
+        // this test against the parked decode.
+        let active = shared
+            .try_write()
+            .expect("the cache lock is free while the decode is in flight")
+            .reset();
+        assert_ne!(active, generation);
+        let mut parser =
+            FileParser::with_symbol_cache_generation(Arc::clone(&shared), Some(active));
+        parser.extract_symbols(&sources[0]).unwrap();
+        released.wait();
+        let outcome = handle.join().unwrap();
+
+        assert_eq!(outcome, SymbolCacheLoadOutcome::default());
+        let cache = shared.read().unwrap();
+        assert_eq!(cache.generation(), active);
+        assert_eq!(cache.len(), 1, "the stale decode must not be merged in");
+        assert!(cache.contains_key(&sources[0]));
+        assert!(cache.project_root().is_none());
     }
 
     // --- Language detection ---

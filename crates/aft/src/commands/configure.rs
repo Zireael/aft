@@ -2332,20 +2332,23 @@ fn prewarm_symbol_cache_from_search_files(
             slog_info!("skipping stale symbol cache prewarm after reconfigure");
             return;
         }
-        if let Some(storage_dir) = symbol_storage.as_deref() {
-            let load_outcome = cache.load_from_disk_for_generation_with_outcome(
-                symbol_cache_generation,
-                storage_dir,
-                &symbol_project_key,
-                &root,
-            );
-            slog_info!(
-                "loaded symbol cache from disk: {} files",
-                load_outcome.loaded
-            );
-        }
     } else {
         return;
+    }
+    if let Some(storage_dir) = symbol_storage.as_deref() {
+        // Decodes and checks the disk cache with no lock held; only the swap
+        // takes the write lock, so symbol lookups are not blocked meanwhile.
+        let load_outcome = crate::parser::load_shared_symbol_cache_for_generation(
+            &symbol_cache,
+            symbol_cache_generation,
+            storage_dir,
+            &symbol_project_key,
+            &root,
+        );
+        slog_info!(
+            "loaded symbol cache from disk: {} files",
+            load_outcome.loaded
+        );
     }
 
     let mut parser = crate::parser::FileParser::with_symbol_cache_generation(

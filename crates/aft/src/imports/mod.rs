@@ -11,9 +11,9 @@ pub(crate) mod quotes;
 
 use std::ops::Range;
 
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
-use crate::parser::{grammar_for, LangId};
+use crate::parser::LangId;
 
 mod c;
 pub(crate) use c::{classify_group_c_import_kind, normalize_include_module};
@@ -516,17 +516,13 @@ fn parse_vue_imports(source: &str, tree: &Tree) -> ImportBlock {
         };
     };
     let inner = &source[start..end];
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&grammar_for(LangId::TypeScript))
-        .is_err()
-    {
-        return ImportBlock {
-            imports: Vec::new(),
-            byte_range: None,
-        };
-    }
-    let Some(inner_tree) = parser.parse(inner, None) else {
+    // This thread's retained parser: building a parser and loading the grammar
+    // per call was a fixed cost on every file an imports scan visits.
+    let Ok(inner_tree) = crate::parser::parse_source_with_cached_parser(
+        std::path::Path::new("<vue script>"),
+        inner,
+        LangId::TypeScript,
+    ) else {
         return ImportBlock {
             imports: Vec::new(),
             byte_range: None,
@@ -1381,19 +1377,9 @@ pub fn parse_file_imports(
             path: format!("{}: {}", path.display(), e),
         })?;
 
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|e| crate::error::AftError::ParseError {
-            message: format!("grammar init failed for {:?}: {}", lang, e),
-        })?;
-
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| crate::error::AftError::ParseError {
-            message: format!("tree-sitter parse returned None for {}", path.display()),
-        })?;
+    // This thread's retained parser: building a parser and loading the grammar
+    // per call was a fixed cost on every file an imports scan visits.
+    let tree = crate::parser::parse_source_with_cached_parser(path, &source, lang)?;
 
     let block = parse_imports(&source, &tree, lang);
     Ok((source, tree, block))
@@ -1574,9 +1560,12 @@ fn parse_es_import_attribute_type(clause: &str) -> Option<String> {
             .then_some(rest)
     })?;
     let synthetic = format!("import 'module' with{body};");
-    let mut parser = Parser::new();
-    parser.set_language(&grammar_for(LangId::TypeScript)).ok()?;
-    let tree = parser.parse(&synthetic, None)?;
+    let tree = crate::parser::parse_source_with_cached_parser(
+        std::path::Path::new("<import attributes>"),
+        &synthetic,
+        LangId::TypeScript,
+    )
+    .ok()?;
     (!tree.root_node().has_error())
         .then(|| find_type_attribute(&synthetic, tree.root_node()))
         .flatten()
@@ -2963,6 +2952,29 @@ fn skip_newline(source: &str, pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::grammar_for;
+    use tree_sitter::Parser;
+
+    /// Parsing imports file after file must reuse this thread's parser rather
+    /// than build a parser and load the grammar for every file.
+    #[test]
+    fn parse_file_imports_reuses_the_thread_parser() {
+        use crate::parser::work_counters::grammar_loads;
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..10 {
+            let path = temp.path().join(format!("f{index}.ts"));
+            std::fs::write(&path, format!("import {{ a{index} }} from './a';\n")).unwrap();
+            paths.push(path);
+        }
+        parse_file_imports(&paths[0], LangId::TypeScript).unwrap();
+        let before = grammar_loads();
+        for (index, path) in paths.iter().enumerate() {
+            let (_, _, block) = parse_file_imports(path, LangId::TypeScript).unwrap();
+            assert_eq!(block.imports.len(), 1, "f{index}");
+        }
+        assert_eq!(grammar_loads() - before, 0);
+    }
 
     // --- ImportForm field-mapping contract (Stream M) ---
     //
