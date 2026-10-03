@@ -19,7 +19,6 @@ import { WORKER_SESSION_FIELD } from "./transport.js";
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
-const STDOUT_BUFFER_COMPACT_THRESHOLD = 64 * 1024;
 const HASHLINE_REGISTRATION_LOG_INTERVAL_MS = 60_000;
 const HASHLINE_REGISTRATION_LOG_STATE_LIMIT = 256;
 const TERMINAL_BASH_STATUSES = new Set([
@@ -434,8 +433,15 @@ export class BinaryBridge implements AftProjectTransport {
   private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
   private processGeneration = 0;
-  private stdoutBuffer = "";
-  private stdoutReadOffset = 0;
+  /**
+   * Chunks of the current stdout line that has not seen its newline yet. They
+   * are joined once, when the newline arrives, so a response split across many
+   * pipe chunks is copied and scanned once instead of once per chunk.
+   */
+  private stdoutPending: string[] = [];
+  private stdoutPendingLength = 0;
+  /** Characters examined for newlines; tests use it to prove the scan is linear. */
+  private stdoutScannedChars = 0;
   private stderrBuffer = "";
   /** Ring buffer of the last N stderr lines, cleared on every spawn. */
   private stderrTail: string[] = [];
@@ -1500,8 +1506,8 @@ export class BinaryBridge implements AftProjectTransport {
     this.processGeneration += 1;
     this.recordSpawnedBinaryFingerprint();
     this.lastBinaryFingerprintCheckAt = Date.now();
-    this.stdoutBuffer = "";
-    this.stdoutReadOffset = 0;
+    this.stdoutPending = [];
+    this.stdoutPendingLength = 0;
     this.stderrBuffer = "";
     this.lastChildActivityAt = 0;
     this.consecutiveRequestTimeouts = 0;
@@ -1567,51 +1573,50 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private onStdoutData(data: string): void {
-    if (this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD) {
-      this.compactStdoutBuffer();
-    }
-    this.stdoutBuffer += data;
-    if (this.stdoutBuffer.length - this.stdoutReadOffset > MAX_STDOUT_BUFFER) {
+    // Unprocessed bytes are the carried partial line plus this chunk.
+    if (this.stdoutPendingLength + data.length > MAX_STDOUT_BUFFER) {
       this.handleCrash(
         new Error(`aft bridge stdout buffer exceeded ${MAX_STDOUT_BUFFER} bytes — killing bridge`),
       );
       return;
     }
 
-    // Process complete lines without repeatedly slicing the remaining buffer.
-    let newlineIdx: number;
-    while ((newlineIdx = this.stdoutBuffer.indexOf("\n", this.stdoutReadOffset)) !== -1) {
-      const line = this.stdoutBuffer.slice(this.stdoutReadOffset, newlineIdx).trim();
-      this.stdoutReadOffset = newlineIdx + 1;
-
+    // Only the new chunk is searched for newlines: the carried chunks are
+    // already known to contain none.
+    this.stdoutScannedChars += data.length;
+    const generation = this.processGeneration;
+    let start = 0;
+    let newlineIdx = data.indexOf("\n");
+    while (newlineIdx !== -1) {
+      let line = data.slice(start, newlineIdx);
+      if (this.stdoutPending.length > 0) {
+        this.stdoutPending.push(line);
+        line = this.stdoutPending.join("");
+        this.stdoutPending = [];
+        this.stdoutPendingLength = 0;
+      }
+      start = newlineIdx + 1;
+      line = line.trim();
       if (line) {
         this.processStdoutLine(line);
+        // A handler that replaced the child owns the buffer now; the rest of
+        // this chunk belongs to the old child and must not leak into it.
+        if (this.processGeneration !== generation) return;
       }
-
-      if (
-        this.stdoutReadOffset > STDOUT_BUFFER_COMPACT_THRESHOLD &&
-        this.stdoutReadOffset > this.stdoutBuffer.length / 2
-      ) {
-        this.compactStdoutBuffer();
-      }
+      newlineIdx = data.indexOf("\n", start);
     }
 
-    if (this.stdoutReadOffset === this.stdoutBuffer.length) {
-      this.stdoutBuffer = "";
-      this.stdoutReadOffset = 0;
+    if (start < data.length) {
+      const rest = start === 0 ? data : data.slice(start);
+      this.stdoutPending.push(rest);
+      this.stdoutPendingLength += rest.length;
     }
-  }
-
-  private compactStdoutBuffer(): void {
-    if (this.stdoutReadOffset === 0) return;
-    this.stdoutBuffer = this.stdoutBuffer.slice(this.stdoutReadOffset);
-    this.stdoutReadOffset = 0;
   }
 
   private flushStdoutBuffer(): void {
-    const line = this.stdoutBuffer.slice(this.stdoutReadOffset).trim();
-    this.stdoutBuffer = "";
-    this.stdoutReadOffset = 0;
+    const line = this.stdoutPending.join("").trim();
+    this.stdoutPending = [];
+    this.stdoutPendingLength = 0;
     if (!line) return;
     this.processStdoutLine(line);
   }
