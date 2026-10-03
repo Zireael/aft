@@ -21,7 +21,7 @@ use crate::lsp::registry::ServerKind;
 use crate::lsp::{transport, LspError};
 
 /// Default timeout for interactive LSP requests (hover, goto-def, references, rename).
-const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const INTERACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Longer budget for one-shot handshake requests (initialize, shutdown).
 pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1478,6 +1478,34 @@ impl LspClient {
         }
     }
 
+    /// The earliest moment after `now` at which [`Self::rust_check_state`]
+    /// or [`Self::take_rust_save_to_send`] can give a different answer with
+    /// no new message from the server. Every other change follows an event.
+    pub(crate) fn rust_check_next_timed_change(
+        &self,
+        now: Instant,
+        publish_settle: Duration,
+    ) -> Option<Instant> {
+        if !matches!(&self.kind, ServerKind::Rust) {
+            return None;
+        }
+        let mut times = Vec::with_capacity(4);
+        if let Some(save) = &self.rust_save {
+            times.extend(save.due_at);
+            if let Some(sent) = save.last_sent_at {
+                times.push(sent + SAVE_RESEND_AFTER);
+                times.push(sent + SAVE_CHECK_START_GRACE);
+            }
+        }
+        if let Some(owed_since) = self.rust_workspace_check_owed_since {
+            times.push(owed_since + WORKSPACE_CHECK_START_DEADLINE);
+        }
+        if let Some(finished) = self.rust_flycheck_finished_at {
+            times.push(finished + publish_settle);
+        }
+        times.into_iter().filter(|time| *time > now).min()
+    }
+
     /// Authority for a clean whole-workspace compiler result without reports.
     /// Current alone also describes absence of progress, so require a real
     /// matching begin/end after the latest load. Current additionally proves
@@ -1668,6 +1696,40 @@ impl LspClient {
             .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
         transport::write_notification(&mut *writer, &notification)?;
         Ok(())
+    }
+
+    /// Write an already serialized notification.
+    fn send_serialized_notification(&mut self, json: &str) -> Result<(), LspError> {
+        self.ensure_can_send()?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| LspError::ServerNotReady("writer lock poisoned".to_string()))?;
+        transport::write_message(&mut *writer, json)?;
+        Ok(())
+    }
+
+    /// Send `textDocument/didChange` carrying the whole document (see
+    /// [`full_did_change_message`]).
+    pub(crate) fn send_full_did_change(
+        &mut self,
+        uri: &lsp_types::Uri,
+        version: i32,
+        text: &str,
+    ) -> Result<(), LspError> {
+        let json = full_did_change_message(uri, version, text)?;
+        self.send_serialized_notification(&json)
+    }
+
+    /// Send `textDocument/didSave`, with the borrowed text when given (see
+    /// [`did_save_message`]).
+    pub(crate) fn send_did_save_borrowed(
+        &mut self,
+        uri: &lsp_types::Uri,
+        text: Option<&str>,
+    ) -> Result<(), LspError> {
+        let json = did_save_message(uri, text)?;
+        self.send_serialized_notification(&json)
     }
 
     /// Graceful shutdown: send shutdown request, then exit notification.
@@ -1909,6 +1971,80 @@ impl LspClient {
             pending.remove(id);
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedNotification<'a, P> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a P,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FullDidChangeParams<'a> {
+    text_document: VersionedDocument<'a>,
+    content_changes: [FullText<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct VersionedDocument<'a> {
+    uri: &'a lsp_types::Uri,
+    version: i32,
+}
+
+#[derive(serde::Serialize)]
+struct FullText<'a> {
+    text: &'a str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DidSaveParams<'a> {
+    text_document: SavedDocument<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct SavedDocument<'a> {
+    uri: &'a lsp_types::Uri,
+}
+
+/// The `textDocument/didChange` message for a whole-document change, the
+/// same JSON as the typed `DidChangeTextDocumentParams` produce. The text is
+/// serialized once from the borrowed string; the typed params copied the
+/// document into the params and again into a JSON value first, for every
+/// server the document is open in.
+pub(crate) fn full_did_change_message(
+    uri: &lsp_types::Uri,
+    version: i32,
+    text: &str,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BorrowedNotification {
+        jsonrpc: "2.0",
+        method: <lsp_types::notification::DidChangeTextDocument as lsp_types::notification::Notification>::METHOD,
+        params: &FullDidChangeParams {
+            text_document: VersionedDocument { uri, version },
+            content_changes: [FullText { text }],
+        },
+    })
+}
+
+/// The `textDocument/didSave` message, serialized from borrowed text like
+/// [`full_did_change_message`].
+pub(crate) fn did_save_message(
+    uri: &lsp_types::Uri,
+    text: Option<&str>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&BorrowedNotification {
+        jsonrpc: "2.0",
+        method: <lsp_types::notification::DidSaveTextDocument as lsp_types::notification::Notification>::METHOD,
+        params: &DidSaveParams {
+            text_document: SavedDocument { uri },
+            text,
+        },
+    })
 }
 
 /// A request written to a language server whose response has not been read
@@ -2282,6 +2418,50 @@ mod tests {
         let caps = parse_diagnostic_capabilities(&value);
         assert!(caps.pull_diagnostics);
         assert!(!caps.workspace_diagnostics);
+    }
+
+    #[test]
+    fn borrowed_document_messages_match_the_typed_notifications() {
+        use lsp_types::notification::{
+            DidChangeTextDocument, DidSaveTextDocument, Notification as _,
+        };
+        let uri: lsp_types::Uri = "file:///work/src/main.rs".parse().expect("uri");
+        let text = "fn main() {\n    println!(\"\\u{1F600} \\t\");\n}\n";
+        let typed = |method: &str, params: serde_json::Value| {
+            serde_json::to_value(crate::lsp::jsonrpc::Notification::new(method, Some(params)))
+                .expect("typed notification")
+        };
+        let change = typed(
+            DidChangeTextDocument::METHOD,
+            serde_json::to_value(lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier::new(uri.clone(), 7),
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.to_string(),
+                }],
+            })
+            .expect("change params"),
+        );
+        let borrowed: serde_json::Value =
+            serde_json::from_str(&full_did_change_message(&uri, 7, text).expect("message"))
+                .expect("borrowed change parses");
+        assert_eq!(borrowed, change);
+
+        for with_text in [Some(text), None] {
+            let save = typed(
+                DidSaveTextDocument::METHOD,
+                serde_json::to_value(lsp_types::DidSaveTextDocumentParams {
+                    text_document: lsp_types::TextDocumentIdentifier::new(uri.clone()),
+                    text: with_text.map(str::to_string),
+                })
+                .expect("save params"),
+            );
+            let borrowed: serde_json::Value =
+                serde_json::from_str(&did_save_message(&uri, with_text).expect("message"))
+                    .expect("borrowed save parses");
+            assert_eq!(borrowed, save);
+        }
     }
 
     #[test]

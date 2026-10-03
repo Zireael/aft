@@ -39,10 +39,11 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let config = ctx.config().clone();
     let matching_defs = servers_for_file(&canonical, &config);
-    let outcomes = {
-        let mut lsp = ctx.lsp();
-        lsp.ensure_server_for_file_detailed(&canonical, &config)
-    };
+    let outcomes = crate::lsp::manager::ensure_server_for_file_detailed_unlocked(
+        || ctx.lsp(),
+        &canonical,
+        &config,
+    );
 
     let mut pull_results_json = Vec::new();
     let mut diagnostics_gaps = outcomes
@@ -56,8 +57,9 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
             })),
         })
         .collect::<Vec<_>>();
+    let mut pull_results = Vec::new();
     if !outcomes.successful.is_empty() {
-        let pull_results = {
+        pull_results = {
             match crate::lsp::manager::pull_file_diagnostics_unlocked(
                 || ctx.lsp(),
                 &canonical,
@@ -99,6 +101,10 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let diagnostics = collect_file_diagnostics(ctx, &canonical);
+    // Documents opened only to answer this query are closed again; their
+    // diagnostics stay stored.
+    ctx.lsp()
+        .close_documents_opened_for_pulls(&canonical, &pull_results);
     let matching_servers: Vec<serde_json::Value> = matching_defs
         .iter()
         .map(|def| {

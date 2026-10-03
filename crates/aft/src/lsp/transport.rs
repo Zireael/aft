@@ -116,7 +116,8 @@ fn validate_content_type(value: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn write_message(writer: &mut impl Write, payload: &str) -> io::Result<()> {
+/// Write an already serialized JSON-RPC message with Content-Length framing.
+pub fn write_message(writer: &mut impl Write, payload: &str) -> io::Result<()> {
     write!(writer, "Content-Length: {}\r\n\r\n", payload.len())?;
     writer.write_all(payload.as_bytes())?;
     writer.flush()

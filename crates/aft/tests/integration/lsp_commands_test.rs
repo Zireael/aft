@@ -308,3 +308,166 @@ fn standalone_ndjson_polls_cold_navigation_off_the_input_loop() {
     assert_eq!(navigation["success"], true, "response: {navigation:#}");
     assert!(aft.shutdown().success());
 }
+
+/// Wait up to `timeout` for `path` to exist.
+fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    path.exists()
+}
+
+/// A hover waiting on a slow server must not hold the LSP manager lock: the
+/// request loop takes that lock to drain events and render the status bar
+/// for every other request, so a held lock made a sibling `read` wait for
+/// the slow server.
+#[test]
+fn slow_hover_leaves_the_lsp_manager_free_while_the_server_works() {
+    let (temp_dir, main_rs) = rust_workspace_with_file();
+    let signal = temp_dir.path().join("hover-arrived");
+    let ctx = Arc::new(app_context_with_fake_lsp());
+    {
+        let mut lsp = ctx.lsp();
+        lsp.set_extra_env("AFT_FAKE_LSP_HOVER_DELAY_MS", "3000");
+        lsp.set_extra_env(
+            "AFT_FAKE_LSP_HOVER_DELAY_SIGNAL",
+            signal.to_str().expect("utf-8 signal path"),
+        );
+    }
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "slow-hover",
+        "command": "lsp_hover",
+        "file": main_rs.display().to_string(),
+        "line": 1,
+        "character": 1,
+    }))
+    .expect("request parses");
+
+    let worker = {
+        let ctx = Arc::clone(&ctx);
+        std::thread::spawn(move || handle_lsp_hover(&request, &ctx))
+    };
+    assert!(
+        wait_for_file(&signal, Duration::from_secs(30)),
+        "the fake server never received the hover"
+    );
+
+    // The hover is now with the server for three seconds. The writer drops
+    // the manager lock right after writing it, so allow a moment for that,
+    // but far less than the server's delay.
+    let probe_deadline = std::time::Instant::now() + Duration::from_millis(1000);
+    let mut acquired = false;
+    while std::time::Instant::now() < probe_deadline {
+        if let Some(lsp) = ctx.try_lsp() {
+            // A second manager user gets real work done meanwhile.
+            assert_eq!(lsp.server_count(), 1);
+            acquired = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !worker.is_finished(),
+        "the hover finished before the probe; the server delay did not apply"
+    );
+    assert!(
+        acquired,
+        "the LSP manager lock stayed held while the server worked on the hover"
+    );
+
+    let response = worker.join().expect("hover worker");
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(json["success"], true, "expected success: {json:#}");
+    assert!(
+        json["contents"]
+            .as_str()
+            .is_some_and(|contents| contents.contains("const x: number")),
+        "hover reply must be unchanged: {json:#}"
+    );
+}
+
+/// Starting a server (spawn plus an `initialize` handshake of up to 30 s)
+/// must not hold the LSP manager lock either. A second caller for the same
+/// server waits for that one start and reuses its client instead of spawning
+/// a twin.
+#[test]
+fn cold_server_start_leaves_the_lsp_manager_free_and_is_shared() {
+    let (temp_dir, main_rs) = rust_workspace_with_file();
+    let signal = temp_dir.path().join("initialize-arrived");
+    let pid_dir = temp_dir.path().join("pids");
+    fs::create_dir_all(&pid_dir).expect("create pid dir");
+    let ctx = Arc::new(app_context_with_fake_lsp());
+    {
+        let mut lsp = ctx.lsp();
+        lsp.set_extra_env("AFT_FAKE_LSP_INIT_DELAY_MS", "3000");
+        lsp.set_extra_env(
+            "AFT_FAKE_LSP_INIT_DELAY_SIGNAL",
+            signal.to_str().expect("utf-8 signal path"),
+        );
+        lsp.set_extra_env(
+            "AFT_FAKE_LSP_PID_DIR",
+            pid_dir.to_str().expect("utf-8 pid dir"),
+        );
+    }
+    let hover = |id: &str| -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "command": "lsp_hover",
+            "file": main_rs.display().to_string(),
+            "line": 1,
+            "character": 1,
+        }))
+        .expect("request parses")
+    };
+
+    let first = {
+        let ctx = Arc::clone(&ctx);
+        let request = hover("cold-hover-1");
+        std::thread::spawn(move || handle_lsp_hover(&request, &ctx))
+    };
+    assert!(
+        wait_for_file(&signal, Duration::from_secs(30)),
+        "the fake server never received initialize"
+    );
+    let second = {
+        let ctx = Arc::clone(&ctx);
+        let request = hover("cold-hover-2");
+        std::thread::spawn(move || handle_lsp_hover(&request, &ctx))
+    };
+
+    let probe_deadline = std::time::Instant::now() + Duration::from_millis(1000);
+    let mut acquired = false;
+    while std::time::Instant::now() < probe_deadline {
+        if let Some(lsp) = ctx.try_lsp() {
+            // The server is still initializing: no client is published yet.
+            assert_eq!(lsp.server_count(), 0);
+            acquired = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !first.is_finished(),
+        "the start finished before the probe; the initialize delay did not apply"
+    );
+    assert!(
+        acquired,
+        "the LSP manager lock stayed held while the server initialized"
+    );
+
+    for worker in [first, second] {
+        let json = serde_json::to_value(worker.join().expect("hover worker"))
+            .expect("response serializes");
+        assert_eq!(json["success"], true, "expected success: {json:#}");
+    }
+    assert_eq!(ctx.lsp().server_count(), 1);
+    assert_eq!(
+        fs::read_dir(&pid_dir).expect("read pid dir").count(),
+        1,
+        "a concurrent caller for a starting server must not spawn a second one"
+    );
+}

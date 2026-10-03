@@ -51,9 +51,8 @@ pub fn handle_lsp_prepare_rename(req: &RawRequest, ctx: &AppContext) -> Response
     };
 
     let server_keys = {
-        let mut lsp = ctx.lsp();
         let config = ctx.config();
-        match lsp.ensure_file_open(&file_path, &config) {
+        match crate::lsp::manager::ensure_file_open_unlocked(|| ctx.lsp(), &file_path, &config) {
             Ok(keys) => keys,
             Err(err) => {
                 return Response::error(
@@ -100,20 +99,18 @@ pub fn handle_lsp_prepare_rename(req: &RawRequest, ctx: &AppContext) -> Response
 
     ctx.lsp().drain_events();
 
-    let result = {
-        let mut lsp = ctx.lsp();
-        let config = ctx.config();
-        let client = match lsp.client_for_file_mut(&canonical_path, &config) {
-            Some(client) => client,
-            None => {
-                return Response::error(
-                    &req.id,
-                    "no_server",
-                    "lsp_prepare_rename: no active LSP client for file",
-                );
-            }
-        };
-        client.send_request::<PrepareRenameRequest>(position_params)
+    let config = ctx.config();
+    let Some(result) = crate::lsp::manager::send_file_request_unlocked::<PrepareRenameRequest, _>(
+        || ctx.lsp(),
+        &canonical_path,
+        &config,
+        position_params,
+    ) else {
+        return Response::error(
+            &req.id,
+            "no_server",
+            "lsp_prepare_rename: no active LSP client for file",
+        );
     };
 
     match result {

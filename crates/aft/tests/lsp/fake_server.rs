@@ -852,6 +852,19 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    // AFT_FAKE_LSP_HOVER_DELAY_SIGNAL=<path> is written when a
+                    // hover arrives and AFT_FAKE_LSP_HOVER_DELAY_MS=<ms> holds
+                    // the reply, so a test can act while AFT waits on a slow
+                    // server.
+                    if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_HOVER_DELAY_SIGNAL") {
+                        let _ = std::fs::write(signal_path, b"hovering");
+                    }
+                    if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_HOVER_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
                     let (line, character) = request_position(&params);
                     if line == 0 && character == 0 {
                         write_response(

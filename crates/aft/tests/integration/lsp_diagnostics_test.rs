@@ -3539,3 +3539,58 @@ fn main() {
         }
     }
 }
+
+/// A push-only server's diagnostics end the `wait_ms` wait when they arrive.
+/// The wait used to sleep out the whole budget in 100 ms steps, taking the
+/// manager lock each time, even after the publish it waited for was stored.
+#[test]
+fn push_wait_ends_when_the_server_publishes_instead_of_sleeping_out_wait_ms() {
+    let (_temp_dir, _root, files) = typescript_workspace_with_files(&["index.ts"]);
+    let file = &files[0];
+    let ctx = app_context_with_fake_typescript_lsp();
+
+    let req: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "diag-push-wake",
+        "command": "lsp_diagnostics",
+        "file": file.display().to_string(),
+        "wait_ms": 10_000
+    }))
+    .expect("request parses");
+
+    let wakeups_before = aft::commands::lsp_diagnostics::wait_wakeups_for_test();
+    let started = Instant::now();
+    let json =
+        serde_json::to_value(handle_lsp_diagnostics(&req, &ctx)).expect("response serializes");
+    let elapsed = started.elapsed();
+    let wakeups = aft::commands::lsp_diagnostics::wait_wakeups_for_test() - wakeups_before;
+
+    assert_eq!(json["success"], true, "response: {json:#}");
+    assert_eq!(
+        json["lsp_servers_used"][0]["server_id"], "typescript",
+        "{json:#}"
+    );
+    assert_eq!(
+        json["lsp_servers_used"][0]["status"], "push_only",
+        "{json:#}"
+    );
+    // Only diagnostics of servers proven fresh for this document version are
+    // reported, so their presence shows the wait saw the publish. (The
+    // response stays incomplete: Biome and Oxlint have no root marker in
+    // this fixture.)
+    assert!(
+        !json["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .is_empty(),
+        "the fake server's diagnostics are reported: {json:#}"
+    );
+    // A 10 s budget slept out in 100 ms steps re-checks about 100 times.
+    assert!(
+        wakeups <= 10,
+        "the wait polled instead of waking on the publish: {wakeups} re-checks"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "the wait slept out its budget: {elapsed:?}"
+    );
+}

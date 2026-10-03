@@ -477,6 +477,25 @@ impl DiagnosticsStore {
     }
 
     /// True if this exact server instance has a non-stale report for this file.
+    /// `(file, resultId)` of every current (not stale) report from `server`
+    /// that carries a result id: what a workspace pull sends back as
+    /// `previousResultIds` so the server can answer "unchanged" for them.
+    pub(crate) fn result_ids_for_server(&self, server: &ServerKey) -> Vec<(PathBuf, String)> {
+        let mut ids: Vec<(PathBuf, String)> = self
+            .entries
+            .iter()
+            .filter(|((key, _), entry)| key == server && !entry.stale)
+            .filter_map(|((_, file), entry)| {
+                entry
+                    .result_id
+                    .as_ref()
+                    .map(|result_id| (file.clone(), result_id.clone()))
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn has_fresh_report_for_server_file(&self, server: &ServerKey, file: &Path) -> bool {
         self.entries
             .get(&(server.clone(), file.to_path_buf()))
