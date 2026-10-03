@@ -1,4 +1,7 @@
+import { Effect } from "effect";
+
 import { resolvePromptContext } from "./last-assistant-model.js";
+import { isV2PluginContext } from "./v2-context.js";
 
 /**
  * Append an `ignored: true` synthetic user message to a session.
@@ -24,6 +27,21 @@ export async function sendIgnoredMessage(
   sessionID: string,
   text: string,
 ): Promise<void> {
+  if (isV2PluginContext(client)) {
+    const context = client as {
+      session: {
+        synthetic(input: {
+          sessionID: string;
+          text: string;
+          resume: false;
+        }): Effect.Effect<unknown, unknown>;
+      };
+    };
+    // V2 owns the current agent/model itself. Synthetic inbox entries neither
+    // switch that context nor resume a turn, and must actually run as Effects.
+    await Effect.runPromise(context.session.synthetic({ sessionID, text, resume: false }));
+    return;
+  }
   const typedClient = client as {
     session?: {
       prompt?: (input: unknown) => unknown;

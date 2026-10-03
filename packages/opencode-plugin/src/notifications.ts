@@ -23,7 +23,9 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ConfigureWarningsDelivery } from "./config.js";
 import { sessionLog, warn } from "./logger.js";
+import { sendIgnoredMessage as sendSharedIgnoredMessage } from "./shared/ignored-message.js";
 import { resolvePromptContext } from "./shared/last-assistant-model.js";
+import { isV2PluginContext } from "./shared/v2-context.js";
 
 // --- TUI toast helper ---
 
@@ -262,6 +264,10 @@ async function sendIgnoredMessage(
   options?: { includeAgent?: boolean },
 ): Promise<boolean> {
   try {
+    if (isV2PluginContext(client)) {
+      await sendSharedIgnoredMessage(client, sessionId, text);
+      return true;
+    }
     const c = client as {
       session?: {
         prompt?: (input: unknown) => unknown;
