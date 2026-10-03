@@ -475,3 +475,188 @@ fn rust_qualified_call_resolution_compiles_statements_independent_of_call_count(
         "60 more qualified calls must not compile statements per call: {compiled:?}"
     );
 }
+
+/// Refresh `edit` in a store built from `files`, check the graph equals a
+/// cold build of the edited tree, and return the refresh's work counts.
+fn refresh_matches_cold_build(files: &[(&str, &str)], edit: (&str, &str)) -> WorkCounts {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let paths = files
+        .iter()
+        .map(|(rel, text)| write(&root, rel, text))
+        .collect::<Vec<_>>();
+    let (store, _) = cold_build_counts(&root, &dir.path().join("store"), &paths);
+    let compiles = install_compile_counter(&store);
+    let edited = write(&root, edit.0, edit.1);
+    let (stats, counts) = measure(&root, compiles, || {
+        store.refresh_files(std::slice::from_ref(&edited))
+    });
+    stats.expect("refresh");
+
+    let (rebuilt, _) = cold_build_counts(&root, &dir.path().join("store-rebuilt"), &paths);
+    assert_eq!(
+        dump_graph_rows(&store),
+        dump_graph_rows(&rebuilt),
+        "refreshing {} must give the rows of a cold build",
+        edit.0
+    );
+    counts
+}
+
+fn ts_importer_files(plain: usize) -> Vec<(String, String)> {
+    let mut files = vec![(
+        "src/lib.ts".to_string(),
+        "export function alpha() { return 1; }\nexport function beta() { return 2; }\n\
+         export default function main() { return alpha(); }\n"
+            .to_string(),
+    )];
+    for index in 0..plain {
+        files.push((
+            format!("src/plain_{index:02}.ts"),
+            format!(
+                "import {{ alpha, beta }} from \"./lib\";\n\
+                 export function plain{index}() {{ return alpha() + beta(); }}\n"
+            ),
+        ));
+    }
+    files.push((
+        "src/named.ts".to_string(),
+        "import { zed } from \"./lib\";\nexport function named() { return zed(); }\n".to_string(),
+    ));
+    files.push((
+        "src/aliased.ts".to_string(),
+        "import { zed as z } from \"./lib\";\nexport function aliased() { return z(); }\n"
+            .to_string(),
+    ));
+    files.push((
+        "src/through_default.ts".to_string(),
+        "import main from \"./lib\";\nexport function viaDefault() { return main(); }\n"
+            .to_string(),
+    ));
+    files
+}
+
+fn as_refs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect()
+}
+
+#[test]
+fn refresh_parses_only_importers_that_name_a_changed_symbol() {
+    let files = ts_importer_files(16);
+    let added = "export function alpha() { return 1; }\nexport function beta() { return 2; }\n\
+                 export default function main() { return alpha(); }\nexport function zed() { return 3; }\n";
+    let counts = refresh_matches_cold_build(&as_refs(&files), ("src/lib.ts", added));
+    eprintln!("added export: refresh parses={}", counts.parses);
+    // The changed file, the importer calling `zed` and the one calling it as
+    // `z`; the 16 importers of other names and the default importer are
+    // left alone.
+    assert_eq!(counts.parses, 3, "refresh parses: {counts:?}");
+}
+
+#[test]
+fn refresh_reresolves_every_caller_bound_to_a_removed_or_moved_symbol() {
+    let files = ts_importer_files(4);
+    // `beta` disappears and `alpha` moves (its node id changes).
+    let edited = "\nexport function alpha() { return 1; }\n\
+                  export default function main() { return alpha(); }\n";
+    refresh_matches_cold_build(&as_refs(&files), ("src/lib.ts", edited));
+}
+
+#[test]
+fn refresh_of_a_changed_default_export_falls_back_to_every_importer() {
+    let files = ts_importer_files(4);
+    let edited = "export function alpha() { return 1; }\nexport function beta() { return 2; }\n\
+                  export default function other() { return beta(); }\n";
+    let counts = refresh_matches_cold_build(&as_refs(&files), ("src/lib.ts", edited));
+    assert_eq!(
+        counts.parses,
+        files.len(),
+        "a default-export change reaches importers by their local name, so all are re-resolved"
+    );
+}
+
+#[test]
+fn rust_refresh_parses_only_callers_naming_a_changed_function() {
+    let mut files = vec![
+        (
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"fx\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+        ),
+        (
+            "src/lib.rs".to_string(),
+            "pub mod util;\npub mod late;\n".to_string()
+                + &(0..8)
+                    .map(|index| format!("pub mod caller_{index};\n"))
+                    .collect::<String>(),
+        ),
+        (
+            "src/util.rs".to_string(),
+            "pub fn helper() {}\n".to_string(),
+        ),
+        (
+            "src/late.rs".to_string(),
+            "pub fn late() { crate::util::added(); }\n".to_string(),
+        ),
+    ];
+    for index in 0..8 {
+        files.push((
+            format!("src/caller_{index}.rs"),
+            format!("use crate::util::helper;\npub fn run_{index}() {{ helper(); crate::util::helper(); }}\n"),
+        ));
+    }
+    let counts = refresh_matches_cold_build(
+        &as_refs(&files),
+        ("src/util.rs", "pub fn helper() {}\npub fn added() {}\n"),
+    );
+    eprintln!("rust added fn: refresh parses={}", counts.parses);
+    assert_eq!(counts.parses, 2, "refresh parses: {counts:?}");
+}
+
+#[test]
+fn refresh_releases_the_store_connection_while_it_parses() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let (files, _) = ts_workspace_fixture(&root, 4);
+    let (store, _) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    let edited = write(
+        &root,
+        "packages/alpha/src/index.ts",
+        "export function alpha(value: number) { return value + 2; }\n",
+    );
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let started_tx = Mutex::new(started_tx);
+    set_refresh_parse_hook_for_test(
+        &root,
+        Some(Arc::new(move || {
+            let _ = started_tx.lock().expect("hook").send(());
+            // The parse waits here until the reader below has finished.
+            let _ = release_rx
+                .lock()
+                .expect("hook")
+                .recv_timeout(Duration::from_secs(30));
+        })),
+    );
+    std::thread::scope(|scope| {
+        let refresh = scope.spawn(|| store.refresh_files(std::slice::from_ref(&edited)));
+        started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("refresh reached its parse");
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let store = &store;
+        scope.spawn(move || {
+            let _ = read_tx.send(store.indexed_file_count());
+        });
+        let read = read_rx.recv_timeout(Duration::from_secs(10));
+        release_tx.send(()).expect("release parse");
+        let read = read.expect("a reader must get the connection while the refresh parses");
+        assert_eq!(read.expect("indexed file count"), files.len());
+        refresh.join().expect("refresh thread").expect("refresh");
+    });
+    set_refresh_parse_hook_for_test(&root, None);
+}

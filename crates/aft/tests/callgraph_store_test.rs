@@ -616,11 +616,13 @@ export function caller() { used(); }
     }
     assert_no_dangling_caller_nodes(store.sqlite_path());
 
+    // Adding `extra` above `used` moves `used`, so the caller's `used()` call
+    // is re-resolved and the caller becomes a dependency caller of this edit.
     let target = root.join("src/target.ts");
     write_file(
         &target,
-        "export function used() { return 1; }
-export function extra() { return 2; }
+        "export function extra() { return 2; }
+export function used() { return 1; }
 ",
     );
     bump_mtime(&target);

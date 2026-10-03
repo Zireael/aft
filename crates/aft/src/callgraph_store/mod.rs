@@ -2851,6 +2851,10 @@ pub struct CallGraphStore {
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
     write_metrics: Arc<CallgraphWriteMetrics>,
+    /// Held by each multi-step writer (refresh, stale marking, cold build) for
+    /// its whole run, outside `conn`, so a refresh can release `conn` while it
+    /// parses files without another write landing in between.
+    writer_serial: Mutex<()>,
     conn: Mutex<TrackedConnection>,
 }
 
@@ -4820,6 +4824,7 @@ impl CallGraphStore {
             read_marker,
             database_ready: AtomicBool::new(false),
             write_metrics,
+            writer_serial: Mutex::new(()),
             conn: Mutex::new(conn),
         }
     }
@@ -5075,6 +5080,10 @@ impl CallGraphStore {
         let pool = BuildPool::new();
         let extraction_memo = callgraph::ModuleResolutionMemo::default();
         let mut retained_callers = RetainedCallerData::new(retained_caller_budget());
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         self.verify_writer_lease()?;
@@ -5381,9 +5390,21 @@ impl CallGraphStore {
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
-        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        // Writers on this store take `writer_serial` for their whole run, so
+        // the connection lock can be released while files are parsed: readers
+        // of the store are not blocked by the parse, and no other write can
+        // change what this refresh read before the parse.
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         ensure_database_ready(&conn)?;
         let total_changes_before = conn.total_changes();
+        // One module memo and one parse pool for every file this refresh
+        // parses and every import it checks.
+        let memo = callgraph::ModuleResolutionMemo::default();
+        let pool = BuildPool::new();
         let mut changed = Vec::new();
         let mut surface_changed = BTreeSet::new();
         let mut deleted = BTreeSet::new();
@@ -5427,7 +5448,8 @@ impl CallGraphStore {
                     ExportSurface::stored(&conn, &rel_path)?
                         .changed_names(&ExportSurface::default()),
                 ));
-                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                let dependent_refs =
+                    ref_ids_depending_on(&conn, &self.project_root, &rel_path, None, &memo)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
@@ -5447,6 +5469,8 @@ impl CallGraphStore {
             // extracted below resolve their imports against that cache.
             callgraph::clear_workspace_package_cache_under(&self.project_root);
         }
+        // Inputs whose content changed, in input order, for the parallel parse.
+        let mut to_parse: Vec<(PathBuf, String, Option<FileRow>)> = Vec::new();
         for input in changed_files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
@@ -5472,7 +5496,7 @@ impl CallGraphStore {
                             .changed_names(&ExportSurface::default()),
                     ));
                     let dependent_refs =
-                        ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                        ref_ids_depending_on(&conn, &self.project_root, &rel_path, None, &memo)?;
                     profile.dependency_selection += started.elapsed();
                     record_dependent_refs(
                         &mut selected_ref_ids,
@@ -5516,8 +5540,13 @@ impl CallGraphStore {
                                 ExportSurface::stored(&conn, &rel_path)?
                                     .changed_names(&ExportSurface::default()),
                             ));
-                            let dependent_refs =
-                                ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                            let dependent_refs = ref_ids_depending_on(
+                                &conn,
+                                &self.project_root,
+                                &rel_path,
+                                None,
+                                &memo,
+                            )?;
                             profile.dependency_selection += started.elapsed();
                             record_dependent_refs(
                                 &mut selected_ref_ids,
@@ -5530,9 +5559,23 @@ impl CallGraphStore {
                     FreshnessVerdict::Stale => {}
                 }
             }
+            to_parse.push((abs_path, rel_path, old_row));
+        }
 
-            let started = Instant::now();
-            let extract = match build_file_extract(&self.project_root, &abs_path) {
+        // Parse the changed inputs with the connection released.
+        drop(conn);
+        let started = Instant::now();
+        let parse_paths = to_parse
+            .iter()
+            .map(|(abs_path, _, _)| abs_path.clone())
+            .collect::<Vec<_>>();
+        note_refresh_parse_for_test(&self.project_root);
+        let parsed = pool.parse_files(&self.project_root, &parse_paths, &memo);
+        profile.parse += started.elapsed();
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+
+        for ((abs_path, rel_path, old_row), extract) in to_parse.into_iter().zip(parsed) {
+            let extract = match extract {
                 Ok(extract) => extract,
                 // One file that is not UTF-8 must not fail the whole batch.
                 // A failed batch is marked stale, every later refresh retries
@@ -5540,7 +5583,6 @@ impl CallGraphStore {
                 // unavailable for good. The file is left out of the graph and
                 // recorded as undecodable instead.
                 Err(error) if is_undecodable_source(&error) => {
-                    profile.parse += started.elapsed();
                     log_undecodable_source(&self.project_root, &rel_path);
                     if old_row.is_some() && deleted.insert(rel_path.clone()) {
                         // Its stored rows describe bytes that are gone. Drop
@@ -5552,8 +5594,13 @@ impl CallGraphStore {
                             ExportSurface::stored(&conn, &rel_path)?
                                 .changed_names(&ExportSurface::default()),
                         ));
-                        let dependent_refs =
-                            ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                        let dependent_refs = ref_ids_depending_on(
+                            &conn,
+                            &self.project_root,
+                            &rel_path,
+                            None,
+                            &memo,
+                        )?;
                         profile.dependency_selection += started.elapsed();
                         record_dependent_refs(
                             &mut selected_ref_ids,
@@ -5569,7 +5616,6 @@ impl CallGraphStore {
                 }
                 Err(error) => return Err(error),
             };
-            profile.parse += started.elapsed();
             let surface_is_changed = old_row
                 .as_ref()
                 .map(|row| row.surface_fingerprint != extract.surface_fingerprint)
@@ -5589,7 +5635,20 @@ impl CallGraphStore {
                     rel_path.clone(),
                     stored_surface.changed_names(&ExportSurface::from_extract(&extract)),
                 ));
-                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                // Only refs whose binding the change can move are selected:
+                // see `dependency_change`.
+                let change = if old_row.is_some() {
+                    dependency_change(&conn, &rel_path, &extract)?
+                } else {
+                    None
+                };
+                let dependent_refs = ref_ids_depending_on(
+                    &conn,
+                    &self.project_root,
+                    &rel_path,
+                    change.as_ref(),
+                    &memo,
+                )?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
@@ -5642,7 +5701,7 @@ impl CallGraphStore {
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
-                    ref_ids_depending_on(&conn, &self.project_root, &barrel)?,
+                    ref_ids_depending_on(&conn, &self.project_root, &barrel, None, &memo)?,
                 );
                 surface_changes.push((barrel, None));
             }
@@ -5656,7 +5715,7 @@ impl CallGraphStore {
                 record_dependent_refs(
                     &mut selected_ref_ids,
                     &mut selected_refs_by_caller,
-                    caller_refs_depending_on(&conn, &self.project_root, importer, file)?,
+                    caller_refs_depending_on(&conn, &self.project_root, importer, file, &memo)?,
                 );
             }
         }
@@ -5670,6 +5729,7 @@ impl CallGraphStore {
                     &file,
                     changed_names,
                     &created_reexporters,
+                    &memo,
                 )?,
             );
         }
@@ -5680,30 +5740,47 @@ impl CallGraphStore {
             selected_refs_by_caller.keys().cloned().collect();
         touched_callers.extend(candidate_own_refresh.iter().cloned());
 
-        let mut caller_extracts: HashMap<String, FileExtract> = HashMap::new();
+        // Dependents are parsed in parallel with the connection released, then
+        // taken in caller order so the first failure is the one reported.
+        let mut dependents = Vec::new();
         for rel_path in &touched_callers {
-            if deleted.contains(rel_path) {
-                continue;
-            }
-            if let Some(extract) = changed_extracts.get(rel_path) {
-                caller_extracts.insert(rel_path.clone(), extract.clone());
+            if deleted.contains(rel_path) || changed_extracts.contains_key(rel_path) {
                 continue;
             }
             let abs_path = self.project_root.join(rel_path);
             if abs_path.exists() {
-                let started = Instant::now();
-                let extract = match build_file_extract(&self.project_root, &abs_path) {
-                    Ok(extract) => extract,
-                    // A dependent that no longer decodes keeps its stored
-                    // rows until its own change event refreshes it.
-                    Err(error) if is_undecodable_source(&error) => {
-                        log_undecodable_source(&self.project_root, rel_path);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                profile.dependent_parse += started.elapsed();
-                caller_extracts.insert(rel_path.clone(), extract);
+                dependents.push((rel_path.clone(), abs_path));
+            }
+        }
+        drop(conn);
+        let started = Instant::now();
+        let dependent_paths = dependents
+            .iter()
+            .map(|(_, abs_path)| abs_path.clone())
+            .collect::<Vec<_>>();
+        let parsed_dependents = pool.parse_files(&self.project_root, &dependent_paths, &memo);
+        profile.dependent_parse += started.elapsed();
+        let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+
+        let mut caller_extracts: HashMap<String, FileExtract> = HashMap::new();
+        for rel_path in &touched_callers {
+            if let Some(extract) = changed_extracts.get(rel_path) {
+                if !deleted.contains(rel_path) {
+                    caller_extracts.insert(rel_path.clone(), extract.clone());
+                }
+            }
+        }
+        for ((rel_path, _), extract) in dependents.into_iter().zip(parsed_dependents) {
+            match extract {
+                Ok(extract) => {
+                    caller_extracts.insert(rel_path, extract);
+                }
+                // A dependent that no longer decodes keeps its stored
+                // rows until its own change event refreshes it.
+                Err(error) if is_undecodable_source(&error) => {
+                    log_undecodable_source(&self.project_root, &rel_path);
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -6002,6 +6079,10 @@ impl CallGraphStore {
 
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
         self.verify_writer_lease()?;
+        let _writer = self
+            .writer_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
@@ -10982,6 +11063,42 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
 /// starves the bridge so interactive tools time out (the same starvation the
 /// v0.35 embedder and the inspect Tier-2 pool already cap). 8MB worker stacks
 /// match the main thread, since the extract walks tree-sitter ASTs.
+#[cfg(test)]
+type RefreshParseHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static REFRESH_PARSE_HOOKS: OnceLock<Mutex<HashMap<PathBuf, RefreshParseHook>>> = OnceLock::new();
+
+/// Run `hook` each time a refresh of `project_root` starts parsing, with the
+/// store's connection released (None removes it).
+#[cfg(test)]
+fn set_refresh_parse_hook_for_test(project_root: &Path, hook: Option<RefreshParseHook>) {
+    let mut hooks = REFRESH_PARSE_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("refresh parse hook mutex poisoned");
+    match hook {
+        Some(hook) => hooks.insert(project_root.to_path_buf(), hook),
+        None => hooks.remove(project_root),
+    };
+}
+
+#[cfg(test)]
+fn note_refresh_parse_for_test(project_root: &Path) {
+    let hook = REFRESH_PARSE_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("refresh parse hook mutex poisoned")
+        .get(project_root)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn note_refresh_parse_for_test(_project_root: &Path) {}
+
 fn build_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -10992,33 +11109,52 @@ fn build_pool_size() -> usize {
 
 /// The bounded parse pool of one cold build or refresh, created once and
 /// reused by every batch instead of spawning fresh threads per batch.
-struct BuildPool(Option<rayon::ThreadPool>);
+/// Its threads start on first use with more than one file, so a refresh of a
+/// single file never spawns them.
+struct BuildPool(std::cell::OnceCell<Option<rayon::ThreadPool>>);
 
 impl BuildPool {
     fn new() -> Self {
-        // Fall back to the global pool only if the bounded pool can't be
-        // constructed.
-        match rayon::ThreadPoolBuilder::new()
-            .num_threads(build_pool_size())
-            .thread_name(|index| format!("aft-callgraph-build-{index}"))
-            .stack_size(8 * 1024 * 1024)
-            .build()
-        {
-            Ok(pool) => Self(Some(pool)),
-            Err(error) => {
-                log::warn!(
-                    "callgraph store: bounded build pool unavailable ({error}); using global pool"
-                );
-                Self(None)
-            }
-        }
+        Self(std::cell::OnceCell::new())
     }
 
     fn install<R: Send>(&self, run: impl FnOnce() -> R + Send) -> R {
-        match &self.0 {
+        let pool = self.0.get_or_init(|| {
+            // Fall back to the global pool only if the bounded pool can't be
+            // constructed.
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(build_pool_size())
+                .thread_name(|index| format!("aft-callgraph-build-{index}"))
+                .stack_size(8 * 1024 * 1024)
+                .build()
+            {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    log::warn!(
+                        "callgraph store: bounded build pool unavailable ({error}); using global pool"
+                    );
+                    None
+                }
+            }
+        });
+        match pool {
             Some(pool) => pool.install(run),
             None => run(),
         }
+    }
+
+    /// Parse `paths` into store rows, results in input order.
+    fn parse_files(
+        &self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        memo: &callgraph::ModuleResolutionMemo,
+    ) -> Vec<Result<FileExtract>> {
+        let parse = |path: &PathBuf| build_file_extract_with_memo(project_root, path, memo);
+        if paths.len() <= 1 {
+            return paths.iter().map(parse).collect();
+        }
+        self.install(|| paths.par_iter().map(parse).collect())
     }
 
     fn build_extracts(
@@ -11052,8 +11188,11 @@ impl BuildPool {
                     })
                 }
             };
-        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> =
-            self.install(|| files.par_iter().map(extract_one).collect());
+        let results: Vec<std::result::Result<FileExtract, ExtractFailure>> = if files.len() <= 1 {
+            files.iter().map(extract_one).collect()
+        } else {
+            self.install(|| files.par_iter().map(extract_one).collect())
+        };
 
         let mut extracts = Vec::new();
         let mut failures = Vec::new();
@@ -11231,6 +11370,7 @@ fn collect_source_freshness(path: &Path, source: &str) -> std::io::Result<FileFr
     })
 }
 
+#[cfg(test)]
 fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
     build_file_extract_with_memo(
         project_root,
@@ -17359,13 +17499,32 @@ struct DependentRefSelection {
     caller_file: String,
 }
 
+/// What a changed file's dependents can observe of the change, when that can
+/// be narrowed (see `dependency_change`).
+struct DependencyChange {
+    /// Every name and scoped name of a node that was added, removed, or
+    /// changed kind or export flags.
+    names: BTreeSet<String>,
+    /// The ids of the file's nodes after the change.
+    node_ids: HashSet<String>,
+}
+
+/// Refs that may resolve differently now that `rel_path` changed: refs bound
+/// to it, and refs of the files that import it. With a `change` (see
+/// `dependency_change`), only calls and value references are selected: one
+/// bound to `rel_path` when its target node is gone or its name changed, and
+/// one in an importer when its name, or the local name an import binds to
+/// it, is a changed name. With None every such ref is selected.
 fn ref_ids_depending_on(
     conn: &Connection,
     project_root: &Path,
     rel_path: &str,
+    change: Option<&DependencyChange>,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file,
+                r.short_name, r.target_node
          FROM refs r
          WHERE r.caller_file IN (
              SELECT file_path FROM file_dependencies WHERE dep_file = ?1
@@ -17373,26 +17532,199 @@ fn ref_ids_depending_on(
             OR r.target_file = ?1
          ORDER BY r.ref_id",
     )?;
-    let rows = stmt.query_map(params![rel_path], |row| {
-        Ok(RefDependencyRow {
-            ref_id: row.get(0)?,
-            kind: row.get(1)?,
-            caller_file: row.get(2)?,
-            module_path: row.get(3)?,
-            target_file: row.get(4)?,
-        })
-    })?;
+    let rows = stmt
+        .query_map(params![rel_path], |row| {
+            Ok((
+                RefDependencyRow {
+                    ref_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    caller_file: row.get(2)?,
+                    module_path: row.get(3)?,
+                    target_file: row.get(4)?,
+                },
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut bound_by_caller: HashMap<String, BTreeSet<String>> = HashMap::new();
     let mut ids = Vec::new();
-    for row in rows {
-        let row = row?;
-        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
-            ids.push(DependentRefSelection {
-                ref_id: row.ref_id,
-                caller_file: row.caller_file,
-            });
+    for (row, short_name, target_node) in rows {
+        match change {
+            Some(change) => {
+                // Only calls and value references resolve to a target. The
+                // other refs of an importer (imports, re-exports, module
+                // declarations) resolve the same whatever the file defines.
+                if !matches!(row.kind.as_str(), "call" | "value_ref") {
+                    continue;
+                }
+                let name = short_name.as_deref().map(callee_last_segment);
+                if name.is_some_and(|name| change.names.contains(name)) {
+                    // A changed name can bind or unbind this ref.
+                } else if row.target_file.as_deref() == Some(rel_path) {
+                    // Still bound to a node that exists unchanged.
+                    if target_node
+                        .as_ref()
+                        .is_some_and(|node| change.node_ids.contains(node))
+                    {
+                        continue;
+                    }
+                } else {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if !bound_by_caller.contains_key(&row.caller_file) {
+                        let bound = import_names_bound_in(conn, &row.caller_file, &change.names)?;
+                        bound_by_caller.insert(row.caller_file.clone(), bound);
+                    }
+                    if !bound_by_caller[&row.caller_file].contains(name) {
+                        continue;
+                    }
+                }
+            }
+            None => {
+                if !ref_dependency_row_depends_on(project_root, &row, rel_path, memo) {
+                    continue;
+                }
+            }
         }
+        ids.push(DependentRefSelection {
+            ref_id: row.ref_id,
+            caller_file: row.caller_file,
+        });
     }
     Ok(ids)
+}
+
+/// Local names `caller_file`'s imports bind to any of `names` (an aliased
+/// `import { a as b }` binds `b` to `a`). Every import row of the file is
+/// read, not only those naming the changed file, which can only select more.
+fn import_names_bound_in(
+    conn: &Connection,
+    caller_file: &str,
+    names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT local_name, requested_name FROM refs WHERE caller_file = ?1 AND kind = 'import'",
+    )?;
+    let rows = statement.query_map(params![caller_file], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+    let mut bound = BTreeSet::new();
+    for row in rows {
+        let (local_names, requested_names) = row?;
+        bound.extend(import_names_bound_to(
+            local_names.as_deref(),
+            requested_names.as_deref(),
+            names,
+        ));
+    }
+    Ok(bound)
+}
+
+/// What dependents of a changed file can observe of the change: the names
+/// under which a symbol was added, removed, or changed kind or export flags,
+/// and the node ids after the change. None (every call of every importer
+/// depends on the file) when the file's import, module, re-export or
+/// export-alias rows changed, or a default export changed: those can rebind a
+/// call by a name that is not the changed symbol's own.
+fn dependency_change(
+    conn: &Connection,
+    rel_path: &str,
+    extract: &FileExtract,
+) -> Result<Option<DependencyChange>> {
+    type StructuralRef = (
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+    );
+    const STRUCTURAL_KINDS: &[&str] = &["import", "module", "reexport", "export_alias"];
+    let mut stored_refs = conn
+        .prepare_cached(
+            "SELECT kind, module_path, full_ref, wildcard, local_name, requested_name FROM refs
+             WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')",
+        )?
+        .query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<StructuralRef>>>()?;
+    let mut new_refs = extract
+        .raw_refs
+        .iter()
+        .filter(|raw| STRUCTURAL_KINDS.contains(&raw.kind.as_str()))
+        .map(|raw| {
+            (
+                raw.kind.clone(),
+                raw.module_path.clone(),
+                raw.full_ref.clone(),
+                raw.wildcard,
+                raw.local_name.clone(),
+                raw.requested_name.clone(),
+            )
+        })
+        .collect::<Vec<StructuralRef>>();
+    stored_refs.sort();
+    new_refs.sort();
+    if stored_refs != new_refs {
+        return Ok(None);
+    }
+
+    let stored_nodes = conn
+        .prepare_cached(
+            "SELECT name, scoped_name, kind, exported, is_default_export
+             FROM nodes WHERE file_path = ?1",
+        )?
+        .query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let new_nodes = extract
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.name.clone(),
+                node.scoped_name.clone(),
+                node.kind.clone(),
+                node.exported,
+                node.is_default_export,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeSet::new();
+    for (name, scoped_name, _, _, is_default_export) in
+        stored_nodes.symmetric_difference(&new_nodes)
+    {
+        if *is_default_export {
+            return Ok(None);
+        }
+        names.insert(callee_last_segment(scoped_name).to_string());
+        names.insert(scoped_name.clone());
+        names.insert(name.clone());
+    }
+    Ok(Some(DependencyChange {
+        names,
+        node_ids: extract.nodes.iter().map(|node| node.id.clone()).collect(),
+    }))
 }
 
 /// What one file offers to a resolution walk: each exported name with what it
@@ -17547,6 +17879,7 @@ fn reexporters_of(
     conn: &Connection,
     project_root: &Path,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<ReexportRow>> {
     let mut statement = conn.prepare(
         "SELECT caller_file, module_path, full_ref, wildcard FROM refs
@@ -17568,7 +17901,7 @@ fn reexporters_of(
         let Some(module_path) = module_path else {
             continue;
         };
-        if module_ref_can_name(project_root, &caller_file, &module_path, rel_path) {
+        if module_ref_can_name(project_root, &caller_file, &module_path, rel_path, memo) {
             reexporters.push(ReexportRow {
                 caller_file,
                 full_ref,
@@ -17620,6 +17953,7 @@ fn reexport_consumer_refs(
     rel_path: &str,
     changed: Option<BTreeSet<String>>,
     created_reexporters: &BTreeMap<String, Vec<ReexportRow>>,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
     if changed.as_ref().is_some_and(BTreeSet::is_empty) {
         return Ok(Vec::new());
@@ -17629,7 +17963,7 @@ fn reexport_consumer_refs(
     let mut barrels: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
     let mut queue = VecDeque::from([(rel_path.to_string(), changed)]);
     while let Some((file, names)) = queue.pop_front() {
-        let mut reexporters = reexporters_of(conn, project_root, &file)?;
+        let mut reexporters = reexporters_of(conn, project_root, &file, memo)?;
         if let Some(created) = created_reexporters.get(&file) {
             reexporters.extend(created.iter().cloned());
         }
@@ -17731,7 +18065,7 @@ fn reexport_consumer_refs(
                     let Some(module_path) = module_path else {
                         continue;
                     };
-                    if !module_ref_can_name(project_root, &importer, &module_path, barrel) {
+                    if !module_ref_can_name(project_root, &importer, &module_path, barrel, memo) {
                         continue;
                     }
                     bound.extend(import_names_bound_to(
@@ -18260,6 +18594,7 @@ fn caller_refs_depending_on(
     project_root: &Path,
     caller_file: &str,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> Result<Vec<DependentRefSelection>> {
     let mut statement = conn.prepare(
         "SELECT ref_id, kind, caller_file, module_path, target_file FROM refs
@@ -18277,7 +18612,7 @@ fn caller_refs_depending_on(
     let mut selected = Vec::new();
     for row in rows {
         let row = row?;
-        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
+        if ref_dependency_row_depends_on(project_root, &row, rel_path, memo) {
             selected.push(DependentRefSelection {
                 ref_id: row.ref_id,
                 caller_file: row.caller_file,
@@ -18662,6 +18997,7 @@ fn ref_dependency_row_depends_on(
     project_root: &Path,
     row: &RefDependencyRow,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> bool {
     if row.target_file.as_deref() == Some(rel_path) {
         return true;
@@ -18673,7 +19009,7 @@ fn ref_dependency_row_depends_on(
         // reference only resolves once its target is callable).
         "call" | "value_ref" => true,
         "import" | "reexport" => row.module_path.as_deref().is_some_and(|module_path| {
-            module_ref_can_name(project_root, &row.caller_file, module_path, rel_path)
+            module_ref_can_name(project_root, &row.caller_file, module_path, rel_path, memo)
         }),
         "export_alias" => false,
         _ => false,
@@ -18688,42 +19024,31 @@ fn module_ref_can_name(
     caller_file: &str,
     module_path: &str,
     rel_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
 ) -> bool {
-    if module_dependencies_for_ref(project_root, caller_file, module_path).contains(rel_path) {
+    let disk = DiskFacts::new(project_root);
+    let facts = FactPaths {
+        root: project_root,
+        facts: &disk,
+    };
+    if module_dependencies_with_memo(
+        project_root,
+        &project_root.join(caller_file),
+        module_path,
+        memo,
+        &facts,
+    )
+    .contains(rel_path)
+    {
         return true;
     }
     Path::new(caller_file)
         .extension()
         .and_then(|ext| ext.to_str())
         == Some("rs")
-        && rust_declared_module_path_target(
-            project_root,
-            caller_file,
-            module_path,
-            &callgraph::ModuleResolutionMemo::default(),
-            &FactPaths {
-                root: project_root,
-                facts: &DiskFacts::new(project_root),
-            },
-        )
-        .as_deref()
+        && rust_declared_module_path_target(project_root, caller_file, module_path, memo, &facts)
+            .as_deref()
             == Some(rel_path)
-}
-
-fn module_dependencies_for_ref(
-    project_root: &Path,
-    caller_file: &str,
-    module_path: &str,
-) -> BTreeSet<String> {
-    module_dependencies(
-        project_root,
-        &project_root.join(caller_file),
-        module_path,
-        &FactPaths {
-            root: project_root,
-            facts: &DiskFacts::new(project_root),
-        },
-    )
 }
 
 fn import_dependencies(
@@ -22381,8 +22706,14 @@ export function leaf() {}
         {
             let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
             let tx = conn.transaction().expect("dependency transaction");
-            let dependent_refs = ref_ids_depending_on(&tx, project_root, "src/index.ts")
-                .expect("dependent refs for barrel");
+            let dependent_refs = ref_ids_depending_on(
+                &tx,
+                project_root,
+                "src/index.ts",
+                None,
+                &callgraph::ModuleResolutionMemo::default(),
+            )
+            .expect("dependent refs for barrel");
             let selected_ref_ids = dependent_refs
                 .iter()
                 .map(|dependent_ref| dependent_ref.ref_id.clone())
@@ -22420,9 +22751,12 @@ export function leaf() {}
             .refresh_files(std::slice::from_ref(&index_path))
             .expect("incremental refresh");
         assert_eq!(stats.surface_changed, vec!["src/index.ts".to_string()]);
-        assert!(
-            stats.dependency_selected_refs > 0,
-            "barrel surface edit should select dependent refs"
+        // No consumer calls the added `extra`, and the consumers' `target()`
+        // calls stay bound to an unchanged node, so nothing needs re-resolving;
+        // the rows below must still match a cold rebuild.
+        assert_eq!(
+            stats.dependency_selected_refs, 0,
+            "an export no consumer names must not re-resolve the barrel's consumers"
         );
 
         let cold_store = CallGraphStore::open(
