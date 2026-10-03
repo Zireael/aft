@@ -229,39 +229,45 @@ fn macos_argv0(pid: u32) -> Option<String> {
 /// owns the pipeline. Bash exposes per-segment statuses as `PIPESTATUS`, while
 /// zsh exposes them as `pipestatus`; plain POSIX sh has neither and therefore
 /// receives the original command without a capture suffix. The status stream
-/// uses fd 5, which the parent opens only for a clean pipeline and places beside
-/// the ordinary exit marker. The user command group closes it temporarily;
-/// bash/zsh save the descriptor close-on-exec and restore it for the capture
-/// suffix. Exit/failure markers belong only to the outer wrapper. Windows shells
-/// use their existing wrapper and have no portable per-segment status equivalent.
+/// is published in the task's already-writable io directory only after the
+/// pipeline finishes. Temporarily closing an inherited capture descriptor is
+/// insufficient: some shells pass their saved redirection copy to pipeline
+/// children. Exit/failure markers belong only to the outer wrapper. Windows
+/// shells have no portable per-segment status equivalent.
 #[cfg(unix)]
 pub(crate) const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
 shell=$1
 command=$2
 exit_fd=$3
-pipeline_status_fd=$4
+pipeline_status_path=$4
 pipeline_shell=$5
-case "$pipeline_status_fd:$pipeline_shell" in
-  5:bash)
-    "$shell" -c "{
+case "$pipeline_status_path:$pipeline_shell" in
+  ?*:bash)
+    "$shell" -c "__aft_pipeline_status=\$1
+shift
 $command
 __aft_code=\$? __aft_ps=(\"\${PIPESTATUS[@]}\")
-} 5>&-
-printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
-exit \"\$__aft_code\"" 3>&- 4>&-
+__aft_status_tmp=\"\${__aft_pipeline_status}.tmp.\$\$\"
+(umask 077; set -C; printf '%s\\n' \"\${__aft_ps[@]}\" > \"\$__aft_status_tmp\") 2>/dev/null &&
+  mv -f -- \"\$__aft_status_tmp\" \"\$__aft_pipeline_status\" 2>/dev/null ||
+  rm -f -- \"\$__aft_status_tmp\" 2>/dev/null
+exit \"\$__aft_code\"" "$shell" "$pipeline_status_path" 3>&- 4>&-
     ;;
-  5:zsh)
-    "$shell" -c "{
+  ?*:zsh)
+    "$shell" -c "__aft_pipeline_status=\$1
+shift
 $command
 __aft_code=\$? __aft_ps=(\"\${pipestatus[@]}\")
-} 5>&-
-printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
-exit \"\$__aft_code\"" 3>&- 4>&-
+__aft_status_tmp=\"\${__aft_pipeline_status}.tmp.\$\$\"
+(umask 077; set -C; printf '%s\\n' \"\${__aft_ps[@]}\" > \"\$__aft_status_tmp\") 2>/dev/null &&
+  mv -f -- \"\$__aft_status_tmp\" \"\$__aft_pipeline_status\" 2>/dev/null ||
+  rm -f -- \"\$__aft_status_tmp\" 2>/dev/null
+exit \"\$__aft_code\"" "$shell" "$pipeline_status_path" 3>&- 4>&-
     ;;
   *)
     # POSIX sh has no per-segment pipeline status array; preserve the original
     # invocation instead of changing its semantics with a best-effort guess.
-    "$shell" -c "$command" 3>&- 4>&- 5>&-
+    "$shell" -c "$command" 3>&- 4>&-
     ;;
 esac
 code=$?
@@ -440,7 +446,7 @@ mod tests {
     #[test]
     fn payload_wrapper_captures_bash_and_zsh_pipeline_statuses() {
         use std::os::fd::AsRawFd;
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::fs::MetadataExt;
         use std::process::Command;
 
         let mut shells = vec![("/bin/bash", "bash")];
@@ -451,11 +457,11 @@ mod tests {
         for (shell, kind) in shells {
             let temp = tempfile::tempdir().expect("create wrapper test directory");
             let exit_path = temp.path().join("exit");
-            let status_path = temp.path().join("pipeline-status");
+            let status_path = temp.path().join("pipeline ' status");
             let exit_file = std::fs::File::create(&exit_path).expect("create exit marker");
             let status_file = std::fs::File::create(&status_path).expect("create status file");
-            let exit_fd = exit_file.as_raw_fd();
-            let status_fd = status_file.as_raw_fd();
+            let original_status_inode = status_file.metadata().unwrap().ino();
+            let failure_file = std::fs::File::create(temp.path().join("failure")).unwrap();
             let mut command = Command::new("/bin/sh");
             command.args([
                 "-c",
@@ -464,35 +470,25 @@ mod tests {
                 shell,
                 "false | true",
                 "3",
-                "5",
+                status_path.to_str().unwrap(),
                 kind,
             ]);
-            unsafe {
-                command.pre_exec(move || {
-                    // Mirror apply_marker_fd_allowlist's two-step: a raw
-                    // dup2(fd, N) is a no-op when fd == N already, which keeps
-                    // the descriptor CLOEXEC and silently closes it at exec.
-                    // Parking above the target range first makes the final
-                    // dup2 a real copy that clears CLOEXEC.
-                    let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 6);
-                    let status_copy = libc::fcntl(status_fd, libc::F_DUPFD_CLOEXEC, 6);
-                    if exit_copy < 0
-                        || status_copy < 0
-                        || libc::dup2(exit_copy, 3) < 0
-                        || libc::dup2(status_copy, 5) < 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    libc::close(exit_copy);
-                    libc::close(status_copy);
-                    Ok(())
-                });
-            }
+            crate::sandbox_spawn::apply_marker_fd_allowlist(
+                &mut command,
+                exit_file.as_raw_fd(),
+                failure_file.as_raw_fd(),
+            )
+            .unwrap();
             let result = command.status().expect("run payload wrapper");
             drop(exit_file);
             drop(status_file);
             assert!(result.success(), "wrapper failed for {kind}");
             assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "1\n0\n");
+            assert_ne!(
+                std::fs::metadata(&status_path).unwrap().ino(),
+                original_status_inode,
+                "status must be published through an atomic rename"
+            );
             assert_eq!(std::fs::read_to_string(&exit_path).unwrap(), "0");
         }
     }
@@ -517,9 +513,11 @@ mod tests {
                 let status_path = temp.path().join("status");
                 let exit = std::fs::File::create(&exit_path).unwrap();
                 let failure = std::fs::File::create(temp.path().join("failure")).unwrap();
-                let status = std::fs::File::create(&status_path).unwrap();
+                let _status = std::fs::File::create(&status_path).unwrap();
                 let probe = temp.path().join("probe");
-                std::fs::write(&probe, "#!/bin/bash\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if (eval 'true >&'\"$fd\") 2>/dev/null; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
+                // A redirection probe would create Bash's own saved stderr fd
+                // and falsely report it as an inherited control descriptor.
+                std::fs::write(&probe, "#!/bin/bash\nif [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then\n  echo 'descriptor lookup cannot see open stdio' >&2\n  exit 43\nfi\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -e \"/dev/fd/$fd\" ]; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
                 let payload = if pipeline {
@@ -535,14 +533,17 @@ mod tests {
                     shell,
                     &payload,
                     "3",
-                    if pipeline { "5" } else { "" },
+                    if pipeline {
+                        status_path.to_str().unwrap()
+                    } else {
+                        ""
+                    },
                     kind,
                 ]);
                 crate::sandbox_spawn::apply_marker_fd_allowlist(
                     &mut command,
                     exit.as_raw_fd(),
                     failure.as_raw_fd(),
-                    Some(status.as_raw_fd()),
                 )
                 .unwrap();
                 let output = command.output().unwrap();
@@ -561,6 +562,68 @@ mod tests {
                 if pipeline {
                     assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "0\n0\n");
                 }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_pipeline_capture_preserves_shell_pipeline_semantics() {
+        use std::os::fd::AsRawFd;
+        use std::process::{Command, Stdio};
+
+        let mut shells = vec![("/bin/bash", "bash")];
+        if Path::new("/bin/zsh").is_file() {
+            shells.push(("/bin/zsh", "zsh"));
+        }
+        for (shell, kind) in shells {
+            for payload in [
+                "! false | true",
+                "time true | cat",
+                "printf '%s' \"$0:${1-unset}:$#\" | cat",
+                "printf 'sample\\n' | { read value; trap 'printf \"%s\\n\" \"$value\"' EXIT; }",
+            ] {
+                // The uninstrumented shell is the reference for shell-specific
+                // last-stage scope, pipeline negation, timing and positional args.
+                let reference = Command::new(shell)
+                    .args(["-c", payload])
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                let temp = tempfile::tempdir().unwrap();
+                let exit_path = temp.path().join("exit");
+                let status_path = temp.path().join("pipeline-status");
+                let exit = std::fs::File::create(&exit_path).unwrap();
+                let failure = std::fs::File::create(temp.path().join("failure")).unwrap();
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    std::str::from_utf8(PAYLOAD_WRAPPER).unwrap(),
+                    "aft-payload-wrapper",
+                    shell,
+                    payload,
+                    "3",
+                    status_path.to_str().unwrap(),
+                    kind,
+                ]);
+                crate::sandbox_spawn::apply_marker_fd_allowlist(
+                    &mut command,
+                    exit.as_raw_fd(),
+                    failure.as_raw_fd(),
+                )
+                .unwrap();
+                let captured = command.stdin(Stdio::null()).output().unwrap();
+                assert_eq!(
+                    captured.status.code(),
+                    reference.status.code(),
+                    "{shell}: {payload}"
+                );
+                assert_eq!(captured.stdout, reference.stdout, "{shell}: {payload}");
+                assert!(status_path.is_file(), "{shell}: capture was not published");
+                assert_eq!(
+                    std::fs::read_to_string(exit_path).unwrap(),
+                    reference.status.code().unwrap().to_string()
+                );
             }
         }
     }

@@ -2315,8 +2315,7 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
-        // bash/zsh PIPESTATUS and a dedicated inherited fd, neither of which
-        // exists on the Windows spawn path.
+        // bash/zsh PIPESTATUS, which does not exist on the Windows spawn path.
         #[cfg(unix)]
         let capture_pipeline_status = {
             let pipeline = single_top_level_pipeline(command);
@@ -6818,8 +6817,8 @@ fn should_capture_pipeline_status(
     shell: &Path,
 ) -> bool {
     if spawn_plan.is_native_launcher() {
-        // Landlock closes fd 5 and above before exec; sandboxed tasks therefore
-        // cannot safely pass CHILD_PIPE_STATUS_FD to the payload wrapper.
+        // Preserve the existing native-launcher capture policy; this transport
+        // change does not expand which spawn plans collect pipeline statuses.
         return false;
     }
     has_pipeline && super::process::pipeline_shell_kind(shell).is_some()
@@ -8256,16 +8255,15 @@ fn spawn_detached_child(
         let failure = io_handles
             .inheritable_file(TaskArtifact::SandboxUnavailable)
             .map_err(|e| format!("failed to inherit sandbox failure marker handle: {e}"))?;
-        let pipeline_status = capture_pipeline_status
-            .then(|| io_handles.inheritable_file(TaskArtifact::PipelineStatus))
-            .transpose()
-            .map_err(|e| format!("failed to inherit pipeline status handle: {e}"))?;
         let shell_path = spawn_plan.host_shell_path().unwrap_or(shell_path);
         let pipeline_shell = super::process::pipeline_shell_kind(shell_path).unwrap_or("");
-        let pipeline_status_fd = if capture_pipeline_status {
-            crate::sandbox_spawn::CHILD_PIPE_STATUS_FD.to_string()
+        // build_native_profile includes this task's io directory in its write
+        // roots. Publishing here requires no new sandbox write grant, and the
+        // wrapper opens the status file only after the user's pipeline exits.
+        let pipeline_status_path = if capture_pipeline_status {
+            paths.pipeline_status.as_os_str().to_owned()
         } else {
-            String::new()
+            OsString::new()
         };
         let base_executable = PathBuf::from("/bin/sh");
         let base_args = vec![
@@ -8275,7 +8273,7 @@ fn spawn_detached_child(
             shell_path.as_os_str().to_os_string(),
             payload.command_text.clone(),
             OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
-            OsString::from(pipeline_status_fd),
+            pipeline_status_path,
             OsString::from(pipeline_shell),
         ];
         #[cfg(target_os = "linux")]
@@ -8313,7 +8311,6 @@ fn spawn_detached_child(
             &mut child_command,
             exit.as_raw_fd(),
             failure.as_raw_fd(),
-            pipeline_status.as_ref().map(|file| file.as_raw_fd()),
         )?;
         child_command
             .current_dir(workdir)
@@ -8325,7 +8322,7 @@ fn spawn_detached_child(
         let child = child_command
             .spawn()
             .map_err(|e| format!("failed to spawn background bash command: {e}"));
-        drop((payload, exit, failure, pipeline_status, profile_handle));
+        drop((payload, exit, failure, profile_handle));
         child
     }
     #[cfg(windows)]

@@ -162,8 +162,7 @@ fn close_inherited_fds() -> Result<(), String> {
     // parent deliberately remaps the exit and failure markers to 3 and 4 in
     // apply_marker_fd_allowlist; descriptors >= 5 already carry FD_CLOEXEC
     // there, so closing from 5 is defense-in-depth for a non-CLOEXEC leak,
-    // not the primary descriptor-hygiene mechanism. CHILD_PIPE_STATUS_FD is
-    // intentionally in this closed range because this launcher path preserves
+    // not the primary descriptor-hygiene mechanism. This launcher preserves
     // only the exit and failure markers remapped to descriptors 3 and 4.
     let result = unsafe { libc::syscall(libc::SYS_close_range, 5_u32, u32::MAX, 0_u32) };
     if result == 0 {

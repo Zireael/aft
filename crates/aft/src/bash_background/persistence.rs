@@ -2183,7 +2183,7 @@ mod tests {
             );
         }
         let output = std::process::Command::new("/bin/bash")
-            .args(["-c", "for fd in \"$@\"; do if (eval 'true >&'\"$fd\") 2>/dev/null; then echo \"leaked marker $fd\" >&2; exit 1; fi; done", "marker-probe"])
+            .args(["-c", "if [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then echo 'descriptor lookup cannot see open stdio' >&2; exit 1; fi; for fd in \"$@\"; do if [ -e \"/dev/fd/$fd\" ]; then echo \"leaked marker $fd\" >&2; exit 1; fi; done", "marker-probe"])
             .args(markers.iter().map(|marker| marker.as_raw_fd().to_string()))
             .output().unwrap();
         assert!(

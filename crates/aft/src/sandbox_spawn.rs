@@ -2411,15 +2411,12 @@ pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() ->
 pub(crate) const CHILD_EXIT_FD: RawFd = 3;
 #[cfg(unix)]
 pub(crate) const CHILD_FAILURE_FD: RawFd = 4;
-#[cfg(unix)]
-pub(crate) const CHILD_PIPE_STATUS_FD: RawFd = 5;
 
 #[cfg(unix)]
 pub(crate) fn apply_marker_fd_allowlist(
     command: &mut Command,
     exit_fd: RawFd,
     failure_fd: RawFd,
-    pipeline_status_fd: Option<RawFd>,
 ) -> Result<(RawFd, RawFd), String> {
     use std::os::unix::process::CommandExt;
 
@@ -2441,38 +2438,17 @@ pub(crate) fn apply_marker_fd_allowlist(
                 libc::close(exit_copy);
                 return Err(error);
             }
-            let status_copy =
-                pipeline_status_fd.map(|fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 6));
-            if status_copy.is_some_and(|fd| fd < 0) {
-                let error = std::io::Error::last_os_error();
-                libc::close(exit_copy);
-                libc::close(failure_copy);
-                return Err(error);
-            }
-            let status_copy = status_copy.unwrap_or(-1);
             if libc::dup2(exit_copy, CHILD_EXIT_FD) < 0
                 || libc::dup2(failure_copy, CHILD_FAILURE_FD) < 0
-                || (status_copy >= 0 && libc::dup2(status_copy, CHILD_PIPE_STATUS_FD) < 0)
             {
                 let error = std::io::Error::last_os_error();
                 libc::close(exit_copy);
                 libc::close(failure_copy);
-                if status_copy >= 0 {
-                    libc::close(status_copy);
-                }
                 return Err(error);
             }
             libc::close(exit_copy);
             libc::close(failure_copy);
-            if status_copy >= 0 {
-                libc::close(status_copy);
-            }
-            let first_dynamic_fd = if pipeline_status_fd.is_some() {
-                CHILD_PIPE_STATUS_FD + 1
-            } else {
-                CHILD_PIPE_STATUS_FD
-            };
-            for fd in first_dynamic_fd..fd_limit {
+            for fd in (CHILD_FAILURE_FD + 1)..fd_limit {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
                     libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
@@ -3130,13 +3106,8 @@ mod policy_tests {
                     )
                     .unwrap();
                     let mut command = Command::new("/usr/bin/true");
-                    apply_marker_fd_allowlist(
-                        &mut command,
-                        exit.as_raw_fd(),
-                        failure.as_raw_fd(),
-                        None,
-                    )
-                    .unwrap();
+                    apply_marker_fd_allowlist(&mut command, exit.as_raw_fd(), failure.as_raw_fd())
+                        .unwrap();
                     let status = command
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
