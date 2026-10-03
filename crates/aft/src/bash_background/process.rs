@@ -230,8 +230,10 @@ fn macos_argv0(pid: u32) -> Option<String> {
 /// zsh exposes them as `pipestatus`; plain POSIX sh has neither and therefore
 /// receives the original command without a capture suffix. The status stream
 /// uses fd 5, which the parent opens only for a clean pipeline and places beside
-/// the ordinary exit marker. Windows shells use their existing wrapper and do
-/// not have a portable per-segment status equivalent.
+/// the ordinary exit marker. The user command group closes it temporarily;
+/// bash/zsh save the descriptor close-on-exec and restore it for the capture
+/// suffix. Exit/failure markers belong only to the outer wrapper. Windows shells
+/// use their existing wrapper and have no portable per-segment status equivalent.
 #[cfg(unix)]
 pub(crate) const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
 shell=$1
@@ -241,21 +243,25 @@ pipeline_status_fd=$4
 pipeline_shell=$5
 case "$pipeline_status_fd:$pipeline_shell" in
   5:bash)
-    "$shell" -c "$command
+    "$shell" -c "{
+$command
 __aft_code=\$? __aft_ps=(\"\${PIPESTATUS[@]}\")
+} 5>&-
 printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
-exit \"\$__aft_code\""
+exit \"\$__aft_code\"" 3>&- 4>&-
     ;;
   5:zsh)
-    "$shell" -c "$command
+    "$shell" -c "{
+$command
 __aft_code=\$? __aft_ps=(\"\${pipestatus[@]}\")
+} 5>&-
 printf '%s\\n' \"\${__aft_ps[@]}\" >&5 2>/dev/null || true
-exit \"\$__aft_code\""
+exit \"\$__aft_code\"" 3>&- 4>&-
     ;;
   *)
     # POSIX sh has no per-segment pipeline status array; preserve the original
     # invocation instead of changing its semantics with a best-effort guess.
-    "$shell" -c "$command"
+    "$shell" -c "$command" 3>&- 4>&- 5>&-
     ;;
 esac
 code=$?
@@ -488,6 +494,74 @@ mod tests {
             assert!(result.success(), "wrapper failed for {kind}");
             assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "1\n0\n");
             assert_eq!(std::fs::read_to_string(&exit_path).unwrap(), "0");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_wrapper_keeps_control_fds_out_of_user_commands() {
+        use std::os::fd::AsRawFd;
+        use std::process::Command;
+
+        let mut shells = vec![("/bin/sh", ""), ("/bin/bash", "bash")];
+        if Path::new("/bin/zsh").is_file() {
+            shells.push(("/bin/zsh", "zsh"));
+        }
+        for (shell, kind) in shells {
+            for pipeline in [false, true] {
+                if pipeline && kind.is_empty() {
+                    continue;
+                }
+                let temp = tempfile::tempdir().unwrap();
+                let exit_path = temp.path().join("exit");
+                let status_path = temp.path().join("status");
+                let exit = std::fs::File::create(&exit_path).unwrap();
+                let failure = std::fs::File::create(temp.path().join("failure")).unwrap();
+                let status = std::fs::File::create(&status_path).unwrap();
+                let probe = temp.path().join("probe");
+                std::fs::write(&probe, "#!/bin/bash\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if (eval 'true >&'\"$fd\") 2>/dev/null; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let payload = if pipeline {
+                    format!("'{}' | cat", probe.display())
+                } else {
+                    format!("'{}'", probe.display())
+                };
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    std::str::from_utf8(PAYLOAD_WRAPPER).unwrap(),
+                    "aft-payload-wrapper",
+                    shell,
+                    &payload,
+                    "3",
+                    if pipeline { "5" } else { "" },
+                    kind,
+                ]);
+                crate::sandbox_spawn::apply_marker_fd_allowlist(
+                    &mut command,
+                    exit.as_raw_fd(),
+                    failure.as_raw_fd(),
+                    Some(status.as_raw_fd()),
+                )
+                .unwrap();
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{shell} pipeline={pipeline}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.stdout,
+                    b"clean",
+                    "{shell} pipeline={pipeline}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read_to_string(&exit_path).unwrap(), "0");
+                if pipeline {
+                    assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "0\n0\n");
+                }
+            }
         }
     }
 

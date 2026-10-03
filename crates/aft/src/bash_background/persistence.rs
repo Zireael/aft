@@ -1817,7 +1817,10 @@ impl TaskIoHandles {
     #[cfg(unix)]
     pub fn inheritable_file(&self, artifact: TaskArtifact) -> io::Result<File> {
         let file = self.clone_file(artifact)?;
-        set_close_on_exec(file.as_raw_fd(), false)?;
+        // Only the child's pre-exec allowlist may make a marker inheritable.
+        // Clearing CLOEXEC here would expose it to unrelated concurrent spawns
+        // in the daemon before the owning wrapper has even been launched.
+        set_close_on_exec(file.as_raw_fd(), true)?;
         Ok(file)
     }
 
@@ -2158,6 +2161,36 @@ mod tests {
         ] {
             assert!(validate_task_id(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_clones_stay_close_on_exec_until_the_child_allowlist_remaps_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let task = create_task_layout(temp.path(), "marker-clones", &valid_id(1)).unwrap();
+        let handles = TaskIoHandles::create(&task, BgMode::Pipes, true).unwrap();
+        let markers = [
+            TaskArtifact::Exit,
+            TaskArtifact::SandboxUnavailable,
+            TaskArtifact::PipelineStatus,
+        ]
+        .map(|artifact| handles.inheritable_file(artifact).unwrap());
+        for marker in &markers {
+            let flags = unsafe { libc::fcntl(marker.as_raw_fd(), libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "marker clone is inheritable in the parent"
+            );
+        }
+        let output = std::process::Command::new("/bin/bash")
+            .args(["-c", "for fd in \"$@\"; do if (eval 'true >&'\"$fd\") 2>/dev/null; then echo \"leaked marker $fd\" >&2; exit 1; fi; done", "marker-probe"])
+            .args(markers.iter().map(|marker| marker.as_raw_fd().to_string()))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

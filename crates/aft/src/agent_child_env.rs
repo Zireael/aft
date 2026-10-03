@@ -69,14 +69,66 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
 ];
 
 /// Git for Windows runs shebang hooks through its bundled POSIX shell, so the
-/// same dispatcher bytes work there and on Unix. Dispatch never reads stdin and
-/// ends with `exec`, preserving Git's arguments, stdin, and the repository hook's
-/// exit status.
+/// same dispatcher bytes work there and on Unix. Only the repository hook
+/// receives Git's stdin; resolver probes have closed input and a deadline.
 const GIT_HOOK_DISPATCHER_TEMPLATE: &str = r#"#!/bin/sh
 # AFT selects this hook through the agent child's environment. It does not alter
 # the repository or the user's Git configuration.
 hook_name=@HOOK_NAME@
+# A worktree hook may have recorded this dispatcher as its original hooks path
+# and exec back to it. File identity alone cannot detect that indirect cycle.
+# Exec preserves the PID; a separate Git invocation from a hook has a new PID
+# and must still run its own repository policy.
+if [ "${AFT_GIT_HOOK_DISPATCH_OWNER:-}" = "$$:$hook_name" ]; then
+  reentered=1
+else
+  reentered=
+  AFT_GIT_HOOK_DISPATCH_OWNER="$$:$hook_name"
+  export AFT_GIT_HOOK_DISPATCH_OWNER
+fi
+
+bounded_probe() (
+  # Resolver commands do not consume hook input. Keep the watchdog's output out
+  # of command-substitution pipes, and reap it on success rather than waiting
+  # for the whole deadline or leaving its sleep behind.
+  "$@" </dev/null &
+  probe_pid=$!
+  (
+    sleeper=
+    trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null; wait "$sleeper" 2>/dev/null; fi; exit 0' TERM
+    sleep 10 &
+    sleeper=$!
+    wait "$sleeper"
+    kill -KILL "$probe_pid" 2>/dev/null
+  ) </dev/null >/dev/null 2>&1 &
+  watchdog_pid=$!
+  wait "$probe_pid" 2>/dev/null
+  probe_status=$?
+  kill "$watchdog_pid" 2>/dev/null || :
+  wait "$watchdog_pid" 2>/dev/null || :
+  # Git uses 128 for ordinary errors, including --show-toplevel in a bare
+  # repository. Only the watchdog's SIGKILL status denotes a deadline here.
+  if [ "$probe_status" -eq 137 ]; then
+    return 124
+  fi
+  return "$probe_status"
+)
+
+probe_value() {
+  bounded_probe "$@" 2>/dev/null
+  probe_status=$?
+  # An absent config key is normal; a stalled resolver is not. Do not turn a
+  # timeout into an empty path that silently skips repository policy.
+  if [ "$probe_status" -eq 124 ]; then
+    printf '%s\n' "AFT: $hook_name resolver exceeded its deadline" >&2
+    return 124
+  fi
+  return 0
+}
+if [ -z "$reentered" ]; then
+  : # Most hooks have no attribution pre-dispatch step.
 @PRE_DISPATCH@
+fi
 dispatch_candidate() {
   candidate=$1
   shift
@@ -90,7 +142,10 @@ dispatch_candidate() {
   fi
 }
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || git rev-parse --absolute-git-dir 2>/dev/null || :)
+repo_root=$(probe_value git rev-parse --show-toplevel) || exit 1
+if [ -z "$repo_root" ]; then
+  repo_root=$(probe_value git rev-parse --absolute-git-dir) || exit 1
+fi
 if [ -z "$repo_root" ]; then
   exit 0
 fi
@@ -101,8 +156,9 @@ fi
 # dispatcher; scoped queries exclude command-scope overrides and reflect the
 # hook path Git would have resolved natively.
 configured_hooks=
+if [ -z "$reentered" ]; then
 for scope in --worktree --local --global --system; do
-  configured_hooks=$(git config "$scope" --get core.hooksPath 2>/dev/null || :)
+  configured_hooks=$(probe_value git config "$scope" --get core.hooksPath) || exit 1
   if [ -n "$configured_hooks" ]; then
     break
   fi
@@ -119,10 +175,23 @@ if [ -n "$configured_hooks" ]; then
   # not fall back to the default hooks directory if the hook is absent.
   exit 0
 fi
+fi
 
 # Do not use `git rev-parse --git-path hooks/...` here: it honors the injected
 # core.hooksPath and resolves this dispatcher back to itself.
-git_dir=$(git rev-parse --git-common-dir 2>/dev/null || git rev-parse --git-dir 2>/dev/null || :)
+# On reentry the configured directory has already run its policy. Complete its
+# chain with Git's native common-directory hooks, not the configured wrapper
+# again. A native hook can itself chain to AFT, so visit that fallback only once
+# in this exec chain. Separate Git processes do not share this PID identity.
+if [ "${AFT_GIT_HOOK_NATIVE_OWNER:-}" = "$$:$hook_name" ]; then
+  exit 0
+fi
+AFT_GIT_HOOK_NATIVE_OWNER="$$:$hook_name"
+export AFT_GIT_HOOK_NATIVE_OWNER
+git_dir=$(probe_value git rev-parse --git-common-dir) || exit 1
+if [ -z "$git_dir" ]; then
+  git_dir=$(probe_value git rev-parse --git-dir) || exit 1
+fi
 if [ -n "$git_dir" ]; then
   case "$git_dir" in
     /*|[A-Za-z]:[\\/]*) candidate="$git_dir/hooks/$hook_name" ;;
@@ -131,6 +200,11 @@ if [ -n "$git_dir" ]; then
   dispatch_candidate "$candidate" "$@"
 fi
 
+# Git does not search .githooks natively; do not add a second policy directory
+# when completing an already-selected repository hook's chain.
+if [ -n "$reentered" ]; then
+  exit 0
+fi
 dispatch_candidate "$repo_root/.githooks/$hook_name" "$@"
 exit 0
 "#;
@@ -146,7 +220,7 @@ case "$mode" in
   off|'') ;;
   auto)
     if [ -n "${AFT_GH_SHIM_BINARY:-}" ]; then
-      line=$("$AFT_GH_SHIM_BINARY" gh-shim --co-author-line 2>/dev/null || :)
+      line=$(probe_value "$AFT_GH_SHIM_BINARY" gh-shim --co-author-line) || exit 1
     fi
     ;;
   *) line="Co-authored-by: $mode" ;;
@@ -154,8 +228,8 @@ esac
 
 if [ -n "$line" ]; then
   identity=${line#Co-authored-by: }
-  git interpret-trailers --in-place --if-exists doNothing \
-    --trailer "Co-authored-by=$identity" "$msg_file" 2>/dev/null || :
+  probe_value git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Co-authored-by=$identity" "$msg_file" || exit 1
 fi
 "#;
 
@@ -164,7 +238,9 @@ const GIT_HOOK_SET_KEY_LEN: usize = 32;
 
 /// The complete dispatcher set and the key derived from its bytes. Every hook
 /// name and body feeds the key, so any template change yields a new directory
-/// while identical content always resolves to the same one.
+/// while identical content always resolves to the same one. Older keys remain
+/// valid aliases: maintenance upgrades AFT-owned scripts there in place because
+/// worktree managers may have recorded those paths in their own hook chains.
 struct ManagedGitHookSet {
     hooks: Vec<(&'static str, String)>,
     key: String,
@@ -701,6 +777,146 @@ fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
     quarantine_foreign_hook_entries(hooks_dir, expected)?;
     for (name, contents) in expected {
         write_hook_if_changed(&hooks_dir.join(name), contents.as_bytes())?;
+    }
+    if let Some(root) = hooks_dir.parent() {
+        let report = refresh_legacy_git_hooks(root, Duration::from_secs(2))?;
+        if report.bounded {
+            // An unvisited directory may still contain the unguarded resolver.
+            // Do not launch a child whose worktree chain could enter that code.
+            return Err(format!(
+                "AFT Git hooks refresh was bounded after {} cache entries; retry refresh or remove unused AFT hook cache directories in {}",
+                report.entries_examined, root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+const LEGACY_HOOK_DIRECTORY_SCAN_LIMIT: usize = 256;
+const LEGACY_HOOK_MAX_BYTES: u64 = 64 * 1024;
+const MANAGED_HOOK_HEADER: &[u8] = b"#!/bin/sh\n# AFT selects this hook through the agent child's environment. It does not alter\n# the repository or the user's Git configuration.\n";
+
+#[derive(Debug, Default)]
+struct LegacyHookRefresh {
+    entries_examined: usize,
+    hooks_examined: usize,
+    rewritten: usize,
+    bounded: bool,
+}
+
+/// Upgrade only recognizable AFT dispatchers in old content-keyed directories.
+/// Their paths can outlive a version in a worktree manager's recorded hook chain;
+/// leaving stale scripts there would make a current dispatcher reenter old code.
+fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookRefresh, String> {
+    use std::io::Read;
+
+    let deadline = Instant::now() + budget;
+    let entries = fs::read_dir(root).map_err(|error| {
+        format!(
+            "failed to scan AFT Git hooks cache {}: {error}",
+            root.display()
+        )
+    })?;
+    let mut report = LegacyHookRefresh::default();
+    // Bound enumeration itself, not a vector collected from an unbounded walk.
+    for entry in entries.take(LEGACY_HOOK_DIRECTORY_SCAN_LIMIT) {
+        if Instant::now() >= deadline {
+            report.bounded = true;
+            break;
+        }
+        report.entries_examined += 1;
+        let entry =
+            entry.map_err(|error| format!("failed to read AFT hooks cache entry: {error}"))?;
+        let name = entry.file_name();
+        let keyed = name.to_str().is_some_and(|name| {
+            name.len() == GIT_HOOK_SET_KEY_LEN && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if !keyed || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        for (hook_name, contents) in &managed_git_hook_set().hooks {
+            if Instant::now() >= deadline {
+                report.bounded = true;
+                break;
+            }
+            let hook = entry.path().join(hook_name);
+            let Ok(metadata) = fs::symlink_metadata(&hook) else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            report.hooks_examined += 1;
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW);
+            }
+            let Ok(file) = options.open(&hook) else {
+                continue;
+            };
+            let mut existing = Vec::new();
+            file.take(LEGACY_HOOK_MAX_BYTES)
+                .read_to_end(&mut existing)
+                .map_err(|error| {
+                    format!("failed to read old AFT hook {}: {error}", hook.display())
+                })?;
+            if !existing.starts_with(MANAGED_HOOK_HEADER) || existing == contents.as_bytes() {
+                continue;
+            }
+            replace_legacy_hook(&hook, contents.as_bytes(), metadata.permissions())?;
+            report.rewritten += 1;
+            crate::slog_info!(
+                "[agent_child_env] upgraded legacy AFT Git hook {}",
+                hook.display()
+            );
+        }
+        if report.bounded {
+            break;
+        }
+    }
+    report.bounded |= report.entries_examined == LEGACY_HOOK_DIRECTORY_SCAN_LIMIT;
+    crate::slog_info!(
+        "[agent_child_env] Git hooks refresh {}: entries_examined={} hooks_examined={} rewritten={} bounded={}",
+        root.display(), report.entries_examined, report.hooks_examined, report.rewritten, report.bounded
+    );
+    Ok(report)
+}
+
+fn replace_legacy_hook(
+    path: &Path,
+    bytes: &[u8],
+    permissions: fs::Permissions,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = path.with_file_name(format!(
+        ".{}.refresh-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let replaced = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.set_permissions(permissions)?;
+        drop(file);
+        // rename replaces an existing regular file atomically, including on
+        // Windows. Preserve the old mode before publishing the new inode.
+        fs::rename(&temporary, path)
+    })();
+    if let Err(error) = replaced {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!(
+            "failed to refresh legacy AFT hook {}: {error}",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -1439,21 +1655,22 @@ mod tests {
     ) -> std::process::Output {
         use std::process::Stdio;
 
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .args(args)
             .current_dir(repo)
             .envs(environment)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        crate::bash_background::process::start_new_session(&mut command);
+        let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + timeout;
         loop {
             if child.try_wait().unwrap().is_some() {
                 return child.wait_with_output().unwrap();
             }
             if Instant::now() >= deadline {
-                child.kill().unwrap();
+                crate::bash_background::process::terminate_process(&mut child);
                 let output = child.wait_with_output().unwrap();
                 panic!(
                     "git {args:?} exceeded {timeout:?}; stdout={} stderr={}",
@@ -1985,6 +2202,12 @@ mod tests {
             }));
             assert!(body.contains("rev-parse --git-dir"));
             assert!(body.contains("-ef \"$0\""));
+            let status = Command::new("/bin/sh")
+                .arg("-n")
+                .arg(hooks_dir.join(name))
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name} is not valid POSIX shell syntax");
         }
     }
 
@@ -2138,6 +2361,300 @@ mod tests {
             "commit failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hooks_chaining_back_to_dispatcher_finish_add_and_commit() {
+        assert_worktree_hook_chain(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_dispatchers_are_refreshed_before_worktree_add_and_commit() {
+        assert_worktree_hook_chain(true);
+    }
+
+    #[cfg(unix)]
+    fn legacy_dispatcher(hook: &str) -> String {
+        // The unguarded resolver/exec shape that worktree managers captured in
+        // older AFT versions. Keep it independent of the current template.
+        format!("{}hook_name={hook}\nrepo_root=$(git rev-parse --show-toplevel 2>/dev/null || :)\nfor scope in --worktree --local --global --system; do\n  configured_hooks=$(git config \"$scope\" --get core.hooksPath 2>/dev/null || :)\n  if [ -n \"$configured_hooks\" ]; then\n    candidate=\"$configured_hooks/$hook_name\"\n    if [ -x \"$candidate\" ] && ! [ \"$candidate\" -ef \"$0\" ]; then exec \"$candidate\" \"$@\"; fi\n    exit 0\n  fi\ndone\nexit 0\n", std::str::from_utf8(MANAGED_HOOK_HEADER).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn assert_worktree_hook_chain(legacy: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        initialize_repo(&repo);
+        run_git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "initial"],
+            &HashMap::new(),
+        );
+        run_git(
+            &repo,
+            &["config", "extensions.worktreeConfig", "true"],
+            &HashMap::new(),
+        );
+        let worktree = temp.path().join("linked");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worker",
+                worktree.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+        let cache = temp.path().join("git-hooks");
+        let managed = cache.join(&managed_git_hook_set().key);
+        let original = if legacy {
+            cache.join("11111111111111111111111111111111")
+        } else {
+            managed.clone()
+        };
+        if legacy {
+            fs::create_dir_all(&original).unwrap();
+            for hook in ["post-index-change", PREPARE_COMMIT_MSG] {
+                write_executable(&original.join(hook), &legacy_dispatcher(hook));
+            }
+        }
+        ensure_managed_git_hooks(&managed).unwrap();
+        let environment = HashMap::from([
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                managed.to_string_lossy().into_owned(),
+            ),
+            (GIT_CO_AUTHOR_ENV.into(), TEST_CO_AUTHOR.into()),
+        ]);
+        let hooks = temp.path().join("mason-hooks");
+        fs::create_dir(&hooks).unwrap();
+        let calls = temp.path().join("calls");
+        for hook in ["post-index-change", PREPARE_COMMIT_MSG] {
+            // A worktree manager can record the ambient command-scope path as
+            // its original hooks directory, then chain back to the dispatcher.
+            write_executable(&hooks.join(hook), &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{hook}' >> '{}'\nhook='{}'\nif test -x \"$hook\"; then exec \"$hook\" \"$@\"; fi\nexit 0\n",
+                calls.display(), original.join(hook).display()
+            ));
+            write_executable(
+                &repo.join(".git/hooks").join(hook),
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' 'native-{hook}' >> '{}'\nexec '{}' \"$@\"\n",
+                    calls.display(),
+                    original.join(hook).display()
+                ),
+            );
+        }
+        run_git(
+            &worktree,
+            &[
+                "config",
+                "--worktree",
+                "core.hooksPath",
+                hooks.to_str().unwrap(),
+            ],
+            &HashMap::new(),
+        );
+        fs::write(worktree.join("data"), "delivery\n").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-m", "delivery"][..]] {
+            let output =
+                run_git_with_timeout(&worktree, args, &environment, Duration::from_secs(10));
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_single_co_author_message(&commit_message(&worktree), "delivery");
+        let calls = fs::read_to_string(calls).unwrap();
+        assert!(calls.lines().any(|line| line == "post-index-change"));
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == PREPARE_COMMIT_MSG)
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| *line == "native-prepare-commit-msg")
+                .count(),
+            1
+        );
+        assert!(calls.lines().any(|line| line == "native-post-index-change"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_refresh_preserves_modes_and_never_rewrites_foreign_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("git-hooks");
+        let old = root.join("22222222222222222222222222222222");
+        fs::create_dir_all(&old).unwrap();
+        let owned = old.join("post-index-change");
+        write_executable(&owned, &legacy_dispatcher("post-index-change"));
+        fs::set_permissions(&owned, fs::Permissions::from_mode(0o750)).unwrap();
+        let before = fs::metadata(&owned).unwrap();
+        let foreign = old.join("pre-commit");
+        write_executable(&foreign, "#!/bin/sh\nprintf 'user-owned hook\\n'\n");
+        let foreign_bytes = fs::read(&foreign).unwrap();
+        let foreign_inode = fs::metadata(&foreign).unwrap().ino();
+        let unkeyed = root.join("user-hooks");
+        fs::create_dir(&unkeyed).unwrap();
+        let copied_header = unkeyed.join("post-index-change");
+        fs::write(&copied_header, legacy_dispatcher("post-index-change")).unwrap();
+        let unkeyed_bytes = fs::read(&copied_header).unwrap();
+        let link = old.join("post-commit");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+
+        ensure_managed_git_hooks(&root.join(&managed_git_hook_set().key)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&owned).unwrap(),
+            managed_git_hook_contents("post-index-change")
+        );
+        let after = fs::metadata(&owned).unwrap();
+        assert_ne!(
+            before.ino(),
+            after.ino(),
+            "refresh must publish a new inode atomically"
+        );
+        assert_eq!(after.permissions().mode() & 0o777, 0o750);
+        assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
+        assert_eq!(fs::metadata(&foreign).unwrap().ino(), foreign_inode);
+        assert_eq!(fs::read(&copied_header).unwrap(), unkeyed_bytes);
+        assert_eq!(fs::read_link(&link).unwrap(), foreign);
+        assert_eq!(
+            refresh_legacy_git_hooks(&root, Duration::from_secs(2))
+                .unwrap()
+                .rewritten,
+            0
+        );
+    }
+
+    #[test]
+    fn legacy_refresh_bounds_enumeration() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..270 {
+            fs::write(temp.path().join(format!("foreign-{index}")), "not a hook").unwrap();
+        }
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert_eq!(report.entries_examined, 256);
+        assert!(report.bounded);
+    }
+
+    #[test]
+    fn legacy_refresh_obeys_its_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("foreign"), "not a hook").unwrap();
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::ZERO).unwrap();
+        assert_eq!(report.entries_examined, 0);
+        assert!(report.bounded);
+    }
+
+    #[test]
+    fn incomplete_legacy_refresh_refuses_to_launch_with_unvisited_dispatchers() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..270 {
+            fs::write(temp.path().join(format!("foreign-{index}")), "not a hook").unwrap();
+        }
+        let error =
+            ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key)).unwrap_err();
+        assert!(error.contains("refresh was bounded"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_bounds_its_probes_and_does_not_feed_them_hook_stdin() {
+        use std::process::Stdio;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hook = temp.path().join("post-index-change");
+        write_executable(&hook, &managed_git_hook_contents("post-index-change"));
+        let git = temp.path().join("git");
+        for body in [
+            "#!/bin/sh\nread value\nprintf 'probe read stdin\\n' >&2\n",
+            "#!/bin/sh\nexec sleep 60\n",
+        ] {
+            write_executable(&git, body);
+            let mut command = Command::new(&hook);
+            command
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        temp.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::bash_background::process::start_new_session(&mut command);
+            let mut child = command.spawn().unwrap();
+            // Keep the writer open: a probe that inherits hook stdin cannot
+            // finish its read, even though it was not given any input.
+            let input = child.stdin.take().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    crate::bash_background::process::terminate_process(&mut child);
+                    panic!("dispatcher probe waited beyond its deadline: {body}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            drop(input);
+            if body.contains("sleep") {
+                assert!(!status.success(), "a stalled resolver must fail closed");
+            } else {
+                assert!(status.success());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bare_dispatcher_uses_native_hooks_after_the_toplevel_probe_reports_128() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("bare.git");
+        fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "--bare", "--quiet"], &HashMap::new());
+        let marker = repo.join("native-hook-argument");
+        write_executable(
+            &repo.join("hooks/post-update"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{}'\n",
+                marker.display()
+            ),
+        );
+        let mut environment = co_author_environment(temp.path());
+        environment.insert("GIT_CONFIG_GLOBAL".into(), "/dev/null".into());
+        environment.insert("GIT_CONFIG_SYSTEM".into(), "/dev/null".into());
+        let managed = PathBuf::from(&environment["GIT_CONFIG_VALUE_0"]);
+        let output = Command::new(managed.join("post-update"))
+            .arg("refs/heads/main")
+            .current_dir(&repo)
+            .envs(&environment)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(marker).unwrap(), "refs/heads/main\n");
     }
 
     #[cfg(unix)]
