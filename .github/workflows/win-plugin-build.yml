@@ -51,6 +51,13 @@ jobs:
         shell: bash
         run: bun install --frozen-lockfile
 
+      - name: Build the workspace dependency the plugin imports
+        # Both plugin packages import `@cortexkit/aft-bridge`, whose package
+        # entry is `dist/index.js` — it has to exist before Bun can resolve the
+        # import, and the plugin build does not build it.
+        shell: bash
+        run: bun run --cwd packages/aft-bridge build
+
       - name: Build ${{ inputs.package }}
         shell: bash
         run: bun run --cwd packages/${{ inputs.package }} build
@@ -58,7 +65,10 @@ jobs:
       - name: Pack installable tarball
         shell: bash
         working-directory: packages/${{ inputs.package }}
-        run: npm pack --pack-destination "${{ github.workspace }}/artifacts"
+        # npm does not create the destination on Windows, so make it first.
+        run: |
+          mkdir -p "${{ github.workspace }}/artifacts"
+          npm pack --pack-destination "${{ github.workspace }}/artifacts"
 
       - name: Upload installable tarball
         uses: actions/upload-artifact@v4
