@@ -19,6 +19,8 @@ import { WORKER_SESSION_FIELD } from "./transport.js";
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
+/** Characters of an unparseable stdout line quoted in the warning log. */
+const MALFORMED_STDOUT_LOG_CHARS = 512;
 const HASHLINE_REGISTRATION_LOG_INTERVAL_MS = 60_000;
 const HASHLINE_REGISTRATION_LOG_STATE_LIMIT = 256;
 const TERMINAL_BASH_STATUSES = new Set([
@@ -1690,7 +1692,12 @@ export class BinaryBridge implements AftProjectTransport {
         this.logVia(`Ignoring unknown stdout push frame type: ${response.type}`);
       }
     } catch (_err) {
-      this.warnVia(`Failed to parse stdout line: ${line}`);
+      // A malformed frame can be megabytes long; quote only its start.
+      const quoted =
+        line.length > MALFORMED_STDOUT_LOG_CHARS
+          ? `${line.slice(0, MALFORMED_STDOUT_LOG_CHARS)}… (${line.length} chars)`
+          : line;
+      this.warnVia(`Failed to parse stdout line: ${quoted}`);
     }
   }
 

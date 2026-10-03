@@ -139,3 +139,26 @@ describe("BinaryBridge stdout scan cost", () => {
     expect(completions.map((c) => c.task_id)).toEqual(["a", "b", "c"]);
   });
 });
+
+describe("BinaryBridge malformed stdout logging", () => {
+  // A malformed frame can be megabytes long; the warning quotes its start.
+  test("quotes at most 512 characters of an unparseable line", () => {
+    const warnings: string[] = [];
+    const logger = {
+      log: () => {},
+      warn: (message: string) => warnings.push(message),
+      error: () => {},
+    };
+    const bridge = new BinaryBridge("/tmp/aft-does-not-need-to-exist", process.cwd(), {
+      logger,
+    } as any);
+
+    (bridge as any).onStdoutData(`{not json${"y".repeat(100_000)}\n`);
+    (bridge as any).onStdoutData("{short\n");
+
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0].length).toBeLessThan(600);
+    expect(warnings[0]).toEndWith("… (100009 chars)");
+    expect(warnings[1]).toBe("Failed to parse stdout line: {short");
+  });
+});
