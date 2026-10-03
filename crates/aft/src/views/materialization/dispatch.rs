@@ -39,6 +39,9 @@ pub(super) fn emit(
             .filter_map(|(file, blob)| blob.parse().map(|p| (file.clone(), p)))
             .collect(),
     );
+    resolver.type_targets =
+        crate::callgraph_store::join::dispatch_type_targets(manifest, reader, &resolver.files)
+            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
     {
         let mut query = transaction.prepare("SELECT caller_file, module_path, target_file FROM refs WHERE kind='import' AND module_path IS NOT NULL AND target_file IS NOT NULL ORDER BY caller_file, module_path, target_file")?;
         for row in query.query_map([], |r| {
@@ -60,8 +63,12 @@ pub(super) fn emit(
         .map(|(file, parse)| (file, &parse.language, &parse.dispatch, &parse.imports))
         .collect::<Vec<_>>();
     let signature = blake3::hash(
-        &serde_json::to_vec(&(inputs, &resolver.import_targets))
-            .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?,
+        &serde_json::to_vec(&(
+            inputs,
+            resolver.import_targets.iter().collect::<Vec<_>>(),
+            resolver.type_targets.iter().collect::<Vec<_>>(),
+        ))
+        .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?,
     )
     .to_hex()
     .to_string();
@@ -85,14 +92,14 @@ pub(super) fn emit(
     if changed {
         transaction.execute_batch(
             "DELETE FROM view_dispatch_sites; DELETE FROM view_unknown_live;
-            DELETE FROM edges WHERE provenance IN ('exact', 'dispatch');",
+            DELETE FROM edges WHERE provenance IN ('exact', 'dispatch', 'name_match');",
         )?;
     }
     for (file, parse) in &resolver.files {
         for site in &parse.dispatch.sites {
             let ref_id = format!("view:{file}:{}", site.ordinal);
             transaction.execute(
-                "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch')",
+                "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match')",
                 [&ref_id],
             )?;
             let resolution = resolver.resolve(file, site);

@@ -1427,6 +1427,108 @@ fn manifest_payloads(
     Ok(loaded)
 }
 
+/// Bind receiver type paths using the same workspace, module and re-export
+/// rules as ordinary Rust paths. All evidence belongs to the immutable manifest.
+pub(crate) fn dispatch_type_targets(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    parses: &BTreeMap<String, &ParseBlob>,
+) -> Result<BTreeMap<(String, String), (String, String)>, ManifestJoinError> {
+    let loaded = manifest_payloads(manifest, blobs)?;
+    let reader = |key: &BlobKey| loaded.get(key).cloned();
+    let facts = Rc::new(ManifestFacts {
+        manifest,
+        blobs: &reader,
+    });
+    let root = Path::new("/");
+    let paths = FactPaths {
+        root,
+        facts: facts.as_ref(),
+    };
+    let extracts = parses
+        .iter()
+        .map(|(file, parse)| Ok((file.clone(), parse.bind(file, &paths)?)))
+        .collect::<Result<HashMap<_, _>, ManifestJoinError>>()?;
+    let files = extracts
+        .iter()
+        .map(|(file, extract)| {
+            (
+                file.clone(),
+                super::DbFileIndex::from_extract(root, extract, &paths),
+            )
+        })
+        .collect();
+    let index = ManifestProjectIndex::from_parts(
+        root,
+        files,
+        extracts
+            .iter()
+            .map(|(file, extract)| (file.clone(), &extract.data))
+            .collect(),
+        super::WorkspaceCratePrefixCache::default(),
+        facts.clone(),
+    );
+    let mut targets = BTreeMap::new();
+    for (file, parse) in parses {
+        if parse.language != "rust" {
+            continue;
+        }
+        let mut names = BTreeSet::new();
+        for ty in &parse.dispatch.types {
+            names.insert(ty.name.clone());
+            names.extend(ty.bases.iter().cloned());
+        }
+        for method in &parse.dispatch.methods {
+            names.insert(method.owner.clone());
+            names.extend(method.trait_name.iter().cloned());
+        }
+        names.extend(parse.dispatch.fields.iter().map(|f| f.ty.clone()));
+        names.extend(parse.dispatch.returns.iter().map(|r| r.ty.clone()));
+        for site in &parse.dispatch.sites {
+            if let Some(receiver) = &site.receiver {
+                let mut name = receiver.as_str();
+                while let Some(expression) = name.strip_prefix("@field:") {
+                    name = expression
+                        .rsplit_once('|')
+                        .map(|(base, _)| base)
+                        .unwrap_or(expression);
+                }
+                names.insert(name.strip_prefix("@return:").unwrap_or(name).to_string());
+            }
+        }
+        let data = &extracts[file].data;
+        for name in names {
+            let short = name.rsplit("::").next().unwrap_or(&name);
+            let raw = super::RawRef {
+                ref_id: String::new(),
+                caller_node: None,
+                caller_symbol: None,
+                caller_file: file.clone(),
+                kind: "call".into(),
+                short_name: Some(short.into()),
+                full_ref: Some(name.clone()),
+                module_path: None,
+                import_kind: None,
+                local_name: None,
+                requested_name: None,
+                namespace_alias: None,
+                wildcard: false,
+                line: 0,
+                byte_start: 0,
+                byte_end: 0,
+                dependencies: BTreeSet::new(),
+            };
+            let resolved = super::resolve_rust_target(&index, file, &name, short, data, &raw);
+            if let Some((_, target_file, symbol)) = resolved {
+                if super::ResolverIndex::node_for_symbol(&index, &target_file, &symbol).is_some() {
+                    targets.insert((file.clone(), name), (target_file, symbol));
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
 #[cfg(test)]
 #[path = "../../tests/integration/join_manifest_test.rs"]
 mod manifest_integration_tests;

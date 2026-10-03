@@ -13,6 +13,23 @@ pub struct DispatchFacts {
     pub types: Vec<TypeHint>,
     pub methods: Vec<MethodHint>,
     pub sites: Vec<SiteHint>,
+    #[serde(default)]
+    pub fields: Vec<FieldHint>,
+    #[serde(default)]
+    pub returns: Vec<ReturnHint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FieldHint {
+    pub owner: String,
+    pub name: String,
+    pub ty: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReturnHint {
+    pub symbol: String,
+    pub ty: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -186,11 +203,13 @@ pub fn complete_members(
 ) -> Result<(), ManifestJoinError> {
     let all = descendants(root);
     let spans = exact_ordinals(parse);
-    let mut identities = parse
-        .symbols
-        .iter()
-        .map(|s| (s.start_line, s.start_col, s.name.clone()))
-        .collect::<HashSet<_>>();
+    // Symbol starts may include documentation. End positions still identify the
+    // same member, and an indexed lookup avoids scanning all symbols per node.
+    let mut identities = HashMap::new();
+    for symbol in &parse.symbols {
+        identities.entry((symbol.end_line, symbol.end_col, symbol.name.clone()))
+            .or_insert_with(|| symbol.scoped_name.clone());
+    }
     let mut scoped_names = parse
         .symbols
         .iter()
@@ -211,7 +230,9 @@ pub fn complete_members(
             node.start_position().row as u32,
             node.start_position().column as u32,
         );
-        if !identities.insert((position.0, position.1, name.clone())) {
+        let identity = (node.end_position().row as u32, node.end_position().column as u32, name.clone());
+        if let Some(symbol) = identities.get(&identity) {
+            callers.entry(position).or_insert_with(|| symbol.clone());
             continue;
         }
         let mut scoped_name = format!("{owner}::{name}");
@@ -223,6 +244,7 @@ pub fn complete_members(
             scoped_name = format!("{scoped_name}@{ordinal}");
         }
         scoped_names.insert(scoped_name.clone());
+        identities.insert(identity, scoped_name.clone());
         callers
             .entry(position)
             .or_insert_with(|| scoped_name.clone());
@@ -338,8 +360,8 @@ pub fn extract(
     let mut functions = HashMap::<(u32, u32), Node<'_>>::new();
     for &node in all.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
         let key = (
-            node.start_position().row as u32,
-            node.start_position().column as u32,
+            node.end_position().row as u32,
+            node.end_position().column as u32,
         );
         functions
             .entry(key)
@@ -353,6 +375,39 @@ pub fn extract(
     }
     let language = parse.language.as_str();
     let mut facts = DispatchFacts::default();
+    if language == "rust" {
+        for node in &all {
+            if node.kind() == "field_declaration" {
+                if let (Some(container), Some(name), Some(ty)) = (
+                    enclosing(*node, &["struct_item"]),
+                    field(*node, &["name"]),
+                    field(*node, &["type"]),
+                ) {
+                    if let Some(owner) = named(container, source) {
+                        facts.fields.push(FieldHint {
+                            owner,
+                            name: text(name, source).to_string(),
+                            ty: type_name(text(ty, source)),
+                        });
+                    }
+                }
+            }
+        }
+        for symbol in &parse.symbols {
+            if let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) {
+                if let Some(ty) = field(node, &["return_type"]) {
+                    let mut ty = type_name(text(ty, source));
+                    if ty == "Self" {
+                        ty = owner(node, source, language).map(|(o, _)| o).unwrap_or(ty);
+                    }
+                    facts.returns.push(ReturnHint {
+                        symbol: symbol.scoped_name.clone(),
+                        ty,
+                    });
+                }
+            }
+        }
+    }
     for node in &all {
         if !TYPES.contains(&node.kind()) {
             continue;
@@ -423,7 +478,7 @@ pub fn extract(
         });
     }
     for symbol in &parse.symbols {
-        let Some(&node) = functions.get(&(symbol.start_line, symbol.start_col)) else {
+        let Some(&node) = functions.get(&(symbol.end_line, symbol.end_col)) else {
             continue;
         };
         if !["method", "function"].contains(&symbol.kind.as_str()) {
@@ -550,7 +605,7 @@ pub fn extract(
         let Some(call) = target.map(|i| calls[i]) else {
             continue;
         };
-        let Some(callee) = field(call, &["function", "name"]).or_else(|| {
+        let Some(callee) = field(call, &["function", "name", "macro"]).or_else(|| {
             if language == "kotlin" {
                 call.named_child(0)
             } else {
@@ -574,6 +629,25 @@ pub fn extract(
         // Java method invocations carry their receiver on the invocation itself.
         let receiver_node = receiver_node.or_else(|| field(call, &["object"]));
         if !dynamic && receiver_node.is_none() {
+            // Token-tree calls already extracted by calls.rs have no receiver
+            // expression in the outer syntax tree. Retain the written member
+            // as uncertain evidence instead of dropping a real macro caller.
+            if language == "rust"
+                && call.kind() == "macro_invocation"
+                && reference
+                    .full_ref
+                    .as_deref()
+                    .is_some_and(|name| name.contains('.'))
+            {
+                facts.sites.push(SiteHint {
+                    ordinal: reference.ordinal,
+                    caller: reference.caller_symbol.clone(),
+                    line: reference.line,
+                    member: reference.short_name.clone(),
+                    receiver: None,
+                    dynamic: false,
+                });
+            }
             continue;
         }
         if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source))) {
@@ -722,6 +796,16 @@ fn receiver_type(
     let value = text(receiver, source);
     let function = enclosing(call, FUNCTIONS)?;
     let current_owner = owner(function, source, language).map(|(o, _)| o);
+    if language == "rust" {
+        if receiver.kind() == "call_expression" {
+            return field(receiver, &["function"]).map(|n| format!("@return:{}", text(n, source)));
+        }
+        if receiver.kind() == "field_expression" {
+            let base = receiver_type(field(receiver, &["value"])?, call, source, language, facts)?;
+            let member = text(field(receiver, &["field"])?, source);
+            return Some(format!("@field:{base}|{member}"));
+        }
+    }
     match language {
         "typescript" | "tsx" | "javascript" | "java" | "csharp" | "kotlin" if value == "this" => {
             return current_owner
@@ -870,16 +954,28 @@ fn receiver_type(
             if language != "javascript"
                 && !["var", "val"].contains(&text(annotation, source).trim())
             {
-                let annotation = type_name(text(annotation, source));
+                let raw_annotation = text(annotation, source);
+                let annotation = type_name(raw_annotation);
+                if nodes.iter().any(|n| {
+                    ["type_parameter", "type_parameter_declaration"].contains(&n.kind())
+                        && named(*n, source).as_deref() == Some(&annotation)
+                }) {
+                    return None;
+                }
                 if language == "rust" {
-                    for parameter in nodes.iter().filter(|n| n.kind() == "type_parameter") {
-                        if named(*parameter, source).as_deref() == Some(&annotation) {
-                            if let Some(bounds) = field(*parameter, &["bounds"]) {
-                                return Some(type_name(
-                                    text(bounds, source).split('+').next().unwrap_or_default(),
-                                ));
-                            }
-                        }
+                    // A generic, trait object or associated type is not a concrete
+                    // implementation. Preserve its call as name-only evidence.
+                    if raw_annotation.contains("dyn ")
+                        || raw_annotation.contains("impl ")
+                        || raw_annotation.contains('<')
+                            && nodes.iter().any(|n| n.kind() == "type_parameter")
+                        || annotation.contains("::")
+                            && !annotation
+                                .split("::")
+                                .next()
+                                .is_some_and(|s| s.chars().next().is_some_and(char::is_lowercase))
+                    {
+                        return None;
                     }
                 }
                 return Some(annotation);
@@ -891,7 +987,14 @@ fn receiver_type(
                 .named_children(&mut declaration.walk())
                 .find(|n| n.kind() == "type_annotation")
             {
-                return Some(type_name(text(annotation, source)));
+                let annotation = type_name(text(annotation, source));
+                if nodes.iter().any(|n| {
+                    n.kind() == "type_parameter"
+                        && named(*n, source).as_deref() == Some(&annotation)
+                }) {
+                    return None;
+                }
+                return Some(annotation);
             }
         }
         if declaration.start_byte() > call.start_byte() {
@@ -957,14 +1060,24 @@ fn receiver_type(
                 }
             }
             "rust" => {
+                if initializer.kind() == "identifier"
+                    && text(initializer, source)
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_uppercase)
+                {
+                    return Some(text(initializer, source).to_string());
+                }
                 if initializer.kind() == "struct_expression" {
                     return field(initializer, &["name"]).map(|n| type_name(text(n, source)));
                 }
                 if initializer.kind() == "call_expression" {
                     let name = text(field(initializer, &["function"])?, source);
-                    let (ty, method) = name.split_once("::")?;
+                    let Some((ty, method)) = name.split_once("::") else {
+                        return Some(format!("@return:{name}"));
+                    };
                     if method != "new" {
-                        return None;
+                        return Some(format!("@return:{name}"));
                     }
                     let valid = descendants(enclosing(function, &["source_file"])?)
                         .into_iter()
@@ -1002,22 +1115,71 @@ pub struct Resolution {
 }
 
 /// The ruled resolver operates on a complete manifest's immutable hints. Unknown
-/// receivers protect members by written name, but never produce graph edges.
+/// receivers protect members by written name and expose interface candidates as
+/// name-only edges, never as proof of a particular implementation.
 pub struct Resolver<'a> {
     pub files: BTreeMap<String, &'a ParseBlob>,
     pub import_targets: BTreeMap<(String, String), String>,
+    pub type_targets: BTreeMap<(String, String), (String, String)>,
 }
 impl<'a> Resolver<'a> {
     pub fn new(files: BTreeMap<String, &'a ParseBlob>) -> Self {
         Self {
             files,
             import_targets: BTreeMap::new(),
+            type_targets: BTreeMap::new(),
         }
     }
     fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+        self.project_type_at_depth(file, name, 0)
+    }
+    fn project_type_at_depth(
+        &self,
+        file: &str,
+        name: &str,
+        depth: usize,
+    ) -> Option<(String, &TypeHint)> {
+        if depth > 16 {
+            return None;
+        }
+        if let Some(expression) = name.strip_prefix("@field:") {
+            let (base, member) = expression.rsplit_once('|')?;
+            let (base_file, ty) = self.project_type_at_depth(file, base, depth + 1)?;
+            let field = self.files[&base_file]
+                .dispatch
+                .fields
+                .iter()
+                .find(|f| f.owner == ty.name && f.name == member)?;
+            return self.project_type_at_depth(&base_file, &field.ty, depth + 1);
+        }
+        if let Some(expression) = name.strip_prefix("@return:") {
+            let (target_file, symbol) = self
+                .type_targets
+                .get(&(file.to_string(), expression.to_string()))?;
+            let returned = self.files[target_file]
+                .dispatch
+                .returns
+                .iter()
+                .find(|r| &r.symbol == symbol)?;
+            return self.project_type_at_depth(target_file, &returned.ty, depth + 1);
+        }
         let parse = self.files.get(file)?;
         if let Some(t) = parse.dispatch.types.iter().find(|t| t.name == name) {
             return Some((file.to_string(), t));
+        }
+        if let Some((target_file, symbol)) =
+            self.type_targets.get(&(file.to_string(), name.to_string()))
+        {
+            if let Some(ty) = self
+                .files
+                .get(target_file)?
+                .dispatch
+                .types
+                .iter()
+                .find(|t| &t.name == symbol)
+            {
+                return Some((target_file.clone(), ty));
+            }
         }
         if ["go", "java", "csharp"].contains(&parse.language.as_str()) {
             let directory = std::path::Path::new(file).parent();
@@ -1207,7 +1369,46 @@ impl<'a> Resolver<'a> {
                     .map(move |m| (file.clone(), m.symbol.clone()))
             })
             .collect();
+        let targets = protected
+            .iter()
+            .filter(|(file, symbol)| {
+                let parse = self.files[file];
+                parse
+                    .dispatch
+                    .methods
+                    .iter()
+                    .find(|m| &m.symbol == symbol)
+                    .is_some_and(|m| {
+                        m.trait_name.is_some()
+                            || self.project_type(file, &m.owner).is_some_and(|(_, t)| {
+                                t.interface
+                                    || t.bases.iter().any(|base| {
+                                        self.project_type(file, base)
+                                            .is_some_and(|(_, b)| b.interface)
+                                    })
+                            })
+                            || language == "go"
+                                && self.files.values().any(|p| {
+                                    p.language == "go"
+                                        && p.dispatch.types.iter().any(|t| {
+                                            t.interface
+                                                && p.dispatch.methods.iter().any(|required| {
+                                                    required.owner == t.name
+                                                        && required.name == m.name
+                                                        && required.shape == m.shape
+                                                })
+                                        })
+                                })
+                    })
+            })
+            .map(|(file, symbol)| Target {
+                file: file.clone(),
+                symbol: symbol.clone(),
+                provenance: "name_match",
+            })
+            .collect();
         Resolution {
+            targets,
             unresolved: usize::from(!protected.is_empty()),
             external: usize::from(protected.is_empty()),
             protected,
@@ -1263,6 +1464,43 @@ impl<'a> Resolver<'a> {
             return self.unknown(&parse.language, member);
         }
         let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
+        // Concrete implementations also call the contract declaration. A known
+        // unrelated receiver must not be linked just because it has the same name.
+        if !ty.interface {
+            for base in &ty.bases {
+                if let Some((base_file, base_ty)) = self.project_type(&type_file, base) {
+                    if base_ty.interface {
+                        targets.extend(self.methods(&base_file, &base_ty.name, member));
+                    }
+                }
+            }
+            if parse.language == "go" {
+                for (contract_file, contract) in &self.files {
+                    if contract.language != "go" {
+                        continue;
+                    }
+                    for interface in contract.dispatch.types.iter().filter(|t| t.interface) {
+                        let required = contract
+                            .dispatch
+                            .methods
+                            .iter()
+                            .filter(|m| m.owner == interface.name)
+                            .collect::<Vec<_>>();
+                        if !required.is_empty()
+                            && required.iter().all(|required| {
+                                self.files[&type_file].dispatch.methods.iter().any(|m| {
+                                    m.owner == ty.name
+                                        && m.name == required.name
+                                        && m.shape == required.shape
+                                })
+                            })
+                        {
+                            targets.extend(self.methods(contract_file, &interface.name, member));
+                        }
+                    }
+                }
+            }
+        }
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate) in &self.files {
                 if candidate.language != parse.language {
@@ -1315,6 +1553,15 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
+        }
+        if ty.interface {
+            targets = targets
+                .into_iter()
+                .map(|mut target| {
+                    target.provenance = "name_match";
+                    target
+                })
+                .collect();
         }
         let external = usize::from(targets.is_empty());
         Resolution {

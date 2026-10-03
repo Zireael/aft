@@ -2602,7 +2602,7 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         return format!("Unable to format {op}: response omitted required `{field}` collection.");
     }
 
-    let sections = match op {
+    let mut sections = match op {
         "call_tree" => format_call_tree_sections(record, include_unresolved),
         "callers" => format_callers_sections(record),
         "trace_to_symbol" => format_trace_to_symbol_sections(record),
@@ -2610,6 +2610,11 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         "impact" => format_impact_sections(record),
         _ => format_trace_data_sections(record),
     };
+    if matches!(op, "callers" | "impact") {
+        if let Some(reason) = string_field(record, "incomplete_reason") {
+            sections.insert(0, reason.to_string());
+        }
+    }
     let body = sections.join("\n");
     // A checkout that reads another checkout's callgraph gets a one-line
     // notice that the callers and line numbers below may not match its own

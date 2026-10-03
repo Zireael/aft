@@ -178,10 +178,10 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
         .callers_of(std::path::Path::new("fixture.ts"), "A::m", 1)
         .unwrap();
     assert_eq!(callers.callers.len(), 1);
-    assert_eq!(callers.callers[0].provenance, "dispatch");
+    assert_eq!(callers.callers[0].provenance, "name_match");
     assert_eq!(
         callers.callers[0].supplemental_resolution(),
-        Some("possible_target (dispatch)")
+        Some("name_match")
     );
     *driver.revision.lock().unwrap() = 2;
     assert!(driver.install(&access, &snapshot, 1).is_err());

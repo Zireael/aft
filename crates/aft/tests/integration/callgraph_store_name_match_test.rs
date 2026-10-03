@@ -812,11 +812,436 @@ fn canonical_root(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+#[test]
+fn trait_callers_cross_workspace_generic_and_dynamic_receivers() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"core\", \"worker\"]\nresolver = \"2\"\n",
+    );
+    write_file(
+        &root.join("core/Cargo.toml"),
+        "[package]\nname = \"rows-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root.join("worker/Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nrows-core = { path = \"../core\" }\n");
+    write_file(
+        &root.join("core/src/lib.rs"),
+        r#"pub trait AccountRows { fn rate_counter(&self); }
+pub struct MemRows;
+impl AccountRows for MemRows { fn rate_counter(&self) {} }
+"#,
+    );
+    write_file(
+        &root.join("worker/src/lib.rs"),
+        r#"use rows_core::{AccountRows, MemRows};
+pub struct SqlRows;
+impl AccountRows for SqlRows { fn rate_counter(&self) {} }
+struct Other;
+impl Other { fn rate_counter(&self) {} }
+fn generic<R: AccountRows>(rows: &R) { rows.rate_counter(); }
+fn dynamic(rows: &dyn AccountRows) { rows.rate_counter(); }
+fn opaque(rows: impl AccountRows) { rows.rate_counter(); }
+fn associated<R: Iterator>(rows: R::Item) { rows.rate_counter(); }
+fn exact(rows: &SqlRows) { rows.rate_counter(); }
+fn unrelated(rows: &Other) { rows.rate_counter(); }
+"#,
+    );
+    let store = build_view_store(&root, "trait-callers");
+    for (file, symbol) in [
+        ("core/src/lib.rs", "AccountRows::rate_counter"),
+        ("worker/src/lib.rs", "SqlRows::rate_counter"),
+    ] {
+        let callers = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join(file),
+            symbol,
+            1,
+            true,
+        ));
+        let entries = flattened_callers(&callers);
+        assert_eq!(entries.len(), 5, "{symbol}: {callers:#}");
+        for name in ["generic", "dynamic", "opaque", "associated"] {
+            let entry = entries.iter().find(|e| e["symbol"] == name).unwrap();
+            assert_eq!(entry["resolved_by"], "name_match", "{callers:#}");
+            assert_eq!(entry["approximate"], true);
+        }
+        let exact = entries.iter().find(|e| e["symbol"] == "exact").unwrap();
+        assert_ne!(exact["approximate"], true, "{callers:#}");
+        assert!(entries.iter().all(|e| e["symbol"] != "unrelated"));
+    }
+}
+
+#[test]
+fn trait_callers_honest_empty_and_impact_disclose_unresolved_sites() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(&root.join("lib.rs"), "struct A; impl A { fn m(&self) {} } struct B; impl B { fn m(&self) {} } fn caller(x: Unknown) { x.m(); }\n");
+    let store = build_store(&root, "honest-empty", &project_files(&root));
+    for result in [
+        json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join("lib.rs"),
+            "A::m",
+            1,
+            true,
+        )),
+        json(callgraph_store_adapter::impact_result(
+            &store,
+            &root.join("lib.rs"),
+            "A::m",
+            1,
+            true,
+        )),
+    ] {
+        assert_eq!(result["complete"], false, "{result:#}");
+        assert_eq!(result["unresolved_method_calls"], 1, "{result:#}");
+        assert!(result["incomplete_reason"]
+            .as_str()
+            .unwrap()
+            .contains("grep"));
+        for op in ["callers", "impact"] {
+            let rendered = aft::subc_format::format_callgraph(op, &result, false);
+            assert!(
+                rendered.starts_with("Incomplete: 1 unresolved method call sites"),
+                "{rendered}"
+            );
+        }
+    }
+}
+
+#[test]
+fn trait_callers_inherent_workspace_local_field_and_return() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"store\", \"module\"]\nresolver = \"2\"\n",
+    );
+    write_file(
+        &root.join("store/Cargo.toml"),
+        "[package]\nname = \"engram-store\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root.join("module/Cargo.toml"), "[package]\nname = \"module\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nengram-store = { path = \"../store\" }\n");
+    write_file(&root.join("store/src/lib.rs"), "pub struct EngramStore; impl EngramStore { pub fn delete_generation(&self) {} } pub fn open() -> EngramStore { EngramStore }\n");
+    write_file(
+        &root.join("module/src/lib.rs"),
+        r#"use engram_store::{EngramStore, open};
+struct Holder { store: EngramStore }
+fn local(store: &engram_store::EngramStore) { store.delete_generation(); }
+fn field(holder: &Holder) { holder.store.delete_generation(); }
+fn returned() { open().delete_generation(); }
+fn bound_return() { let store = open(); store.delete_generation(); }
+"#,
+    );
+    let store = build_view_store(&root, "inherent-workspace");
+    let result = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("store/src/lib.rs"),
+        "delete_generation",
+        1,
+        true,
+    ));
+    let entries = flattened_callers(&result);
+    assert_eq!(entries.len(), 4, "{result:#}");
+    for name in ["local", "field", "returned", "bound_return"] {
+        let entry = entries.iter().find(|e| e["symbol"] == name).unwrap();
+        assert_ne!(entry["resolved_by"], "name_match", "{result:#}");
+        assert_ne!(entry["approximate"], true, "{result:#}");
+    }
+}
+
+#[test]
+fn trait_callers_documented_method_is_one_candidate() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(&root.join("lib.rs"), "struct EngramStore;\nimpl EngramStore {\n    /// Remove a published generation atomically.\n    pub fn delete_generation(&self) {}\n}\n");
+    let store = build_view_store(&root, "documented-method");
+    for symbol in ["delete_generation", "EngramStore::delete_generation"] {
+        let result = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join("lib.rs"),
+            symbol,
+            1,
+            true,
+        ));
+        assert_eq!(result["symbol"], "EngramStore::delete_generation");
+    }
+}
+
+#[test]
+fn trait_callers_generic_nominal_and_macro_receivers() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(&root.join("lib.rs"), "trait AccountRows { fn rate_counter(&self) -> u32; }\nstruct SqlRows<B>(B);\nimpl<B> AccountRows for SqlRows<B> { fn rate_counter(&self) -> u32 { 0 } }\nfn generic<B>(rows: &SqlRows<B>) { rows.rate_counter(); }\nfn macro_caller(rows: Unknown) { assert_eq!(rows.rate_counter(), 0); }\n");
+    let store = build_view_store(&root, "generic-nominal-macro");
+    for symbol in ["AccountRows::rate_counter", "SqlRows::rate_counter"] {
+        let result = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join("lib.rs"),
+            symbol,
+            1,
+            true,
+        ));
+        let entries = flattened_callers(&result);
+        assert_eq!(entries.len(), 2, "{result:#}");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["resolved_by"] == "name_match"),
+            "{result:#}"
+        );
+    }
+}
+
+#[test]
+fn trait_callers_typescript_and_go_interface_receivers_are_name_only() {
+    for (file, source, symbol) in [
+        ("api.ts", "interface I { m(): void; }\nclass A implements I { m() {} }\nclass Other { m() {} }\nfunction generic<T extends I>(x: T) { x.m(); }\nfunction dynamic(x: I) { x.m(); }\nfunction unrelated(x: Other) { x.m(); }", "I::m"),
+        ("api.go", "package api\ntype I interface { m() }\ntype A struct{}\nfunc (a A) m() {}\nfunc caller(x I) { x.m() }\n", "I::m"),
+    ] {
+        let dir = tempdir().unwrap();
+        let root = canonical_root(dir.path());
+        write_file(&root.join(file), source);
+        let store = build_view_store(&root, "interface-callers");
+        let result = json(callgraph_store_adapter::callers_result(&store, &root.join(file), symbol, 1, true));
+        let entries = flattened_callers(&result);
+        assert_eq!(entries.len(), if file.ends_with("ts") { 2 } else { 1 }, "{result:#}");
+        assert!(entries.iter().all(|e| e["resolved_by"] == "name_match" && e["approximate"] == true), "{result:#}");
+    }
+}
+
+#[test]
+fn trait_callers_integration_harness_path_override_and_filter() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(&root.join("Cargo.toml"), "[package]\nname = \"worker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[test]]\nname = \"it\"\npath = \"tests/it/main.rs\"\n");
+    write_file(
+        &root.join("src/lib.rs"),
+        "pub mod rows; pub fn public_api() {}\n",
+    );
+    write_file(
+        &root.join("src/rows.rs"),
+        "pub fn verify_signed_publish() {} pub fn build_chunked_statements() {}\n",
+    );
+    write_file(&root.join("tests/it/main.rs"), "mod publish; mod rows;\n");
+    write_file(&root.join("tests/it/publish.rs"), "#[path = \"../../src/rows.rs\"] mod rows_sql; use rows_sql::*; #[test] fn publishes() { verify_signed_publish(); worker::public_api(); }\n");
+    write_file(&root.join("tests/it/rows.rs"), "#[path = \"../../src/rows.rs\"] mod rows_sql; use rows_sql::*; #[test] fn chunks() { build_chunked_statements(); }\n");
+    let store = build_view_store(&root, "test-harness");
+    for (file, symbol, expected) in [
+        ("src/rows.rs", "verify_signed_publish", "publishes"),
+        ("src/rows.rs", "build_chunked_statements", "chunks"),
+        ("src/lib.rs", "public_api", "publishes"),
+    ] {
+        let result = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join(file),
+            symbol,
+            1,
+            true,
+        ));
+        let entries = flattened_callers(&result);
+        assert_eq!(entries.len(), 1, "{result:#}");
+        assert_eq!(entries[0]["symbol"], expected);
+        assert_ne!(entries[0]["approximate"], true);
+        let hidden = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join(file),
+            symbol,
+            1,
+            false,
+        ));
+        assert!(flattened_callers(&hidden).is_empty(), "{hidden:#}");
+        assert_eq!(hidden["hidden_test_callers"], 1);
+    }
+}
+
+#[test]
+#[ignore = "requires AFT_ENGRAM_COPY pointing to an isolated ENGRAM source copy"]
+fn trait_callers_engram_copy_reproduction() {
+    let root = canonical_root(Path::new(&std::env::var("AFT_ENGRAM_COPY").unwrap()));
+    let store = build_view_store(&root, "engram-repro");
+    let result = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("engram-core/src/cloud/rows.rs"),
+        "AccountRows::rate_counter",
+        1,
+        true,
+    ));
+    println!(
+        "{} callers · {} file groups\n{result:#}",
+        result["total_callers"],
+        result["callers"].as_array().unwrap().len()
+    );
+    for (file, symbol) in [
+        ("engram-store/src/lib.rs", "delete_generation"),
+        ("engram-store/src/lib.rs", "EngramStore::delete_generation"),
+        ("engram-worker/src/rows_sql.rs", "verify_signed_publish"),
+        ("engram-worker/src/rows_sql.rs", "build_chunked_statements"),
+    ] {
+        let callers = json(callgraph_store_adapter::callers_result(
+            &store,
+            &root.join(file),
+            symbol,
+            1,
+            true,
+        ));
+        println!("REPRO {symbol}: {callers:#}");
+        let entries = flattened_callers(&callers);
+        if symbol.contains("delete_generation") {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry["symbol"] == "recover_stale_publish_plan"
+                        && entry["resolved_by"] != "name_match"),
+                "{callers:#}"
+            );
+        } else {
+            let expected_file = if symbol == "verify_signed_publish" {
+                "engram-worker/tests/it/publish_v2.rs"
+            } else {
+                "engram-worker/tests/it/rows_v2.rs"
+            };
+            let group = callers["callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["file"] == expected_file)
+                .unwrap();
+            assert!(
+                group["callers"].as_array().unwrap().len()
+                    >= if symbol == "verify_signed_publish" {
+                        3
+                    } else {
+                        7
+                    },
+                "{callers:#}"
+            );
+            let hidden = json(callgraph_store_adapter::callers_result(
+                &store,
+                &root.join(file),
+                symbol,
+                1,
+                false,
+            ));
+            assert!(hidden["callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|g| g["file"] != expected_file));
+        }
+    }
+    for (file, line) in [
+        ("engram-worker/src/sync_routes.rs", 65),
+        ("engram-worker/tests/it/publish_v2.rs", 456),
+    ] {
+        assert!(
+            result["callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["file"] == file
+                    && group["callers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["line"] == line)),
+            "missing {file}:{line}"
+        );
+    }
+}
+
 fn build_store(root: &Path, name: &str, files: &[PathBuf]) -> CallGraphStore {
     let store =
         CallGraphStore::open(root.join(format!(".{name}-store")), root.to_path_buf()).unwrap();
     store.cold_build(files).unwrap();
     store
+}
+
+fn build_view_store(root: &Path, name: &str) -> aft::callgraph_store::ReadonlyCallGraphStore {
+    use aft::callgraph_store::join::CallgraphBlob;
+    use aft::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    let storage = root.join(format!(".{name}-view"));
+    fs::create_dir_all(&storage).unwrap();
+    let blobs = storage.join("blobs.sqlite");
+    let conn = rusqlite::Connection::open(&blobs).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL)",
+    )
+    .unwrap();
+    let mut files = project_files(root);
+    fn configs(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                configs(&path, files);
+            } else if path.file_name().unwrap() == "Cargo.toml" {
+                files.push(path);
+            }
+        }
+    }
+    configs(root, &mut files);
+    let entries = files
+        .iter()
+        .map(|file| {
+            let source = fs::read_to_string(file).unwrap();
+            let config = file.file_name().unwrap() == "Cargo.toml";
+            let blob = if config {
+                CallgraphBlob::config(source.as_bytes().to_vec(), "fixture")
+            } else {
+                CallgraphBlob::extract(
+                    &source,
+                    if file.extension().unwrap() == "rs" {
+                        "rust"
+                    } else if file.extension().unwrap() == "go" {
+                        "go"
+                    } else {
+                        "typescript"
+                    },
+                    "fixture",
+                )
+                .unwrap()
+            };
+            let payload = blob.to_bytes().unwrap();
+            let key = blake3::hash(&payload);
+            conn.execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
+                params![key.as_bytes().as_slice(), payload],
+            )
+            .unwrap();
+            (
+                RelPath::new(
+                    file.strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key.to_hex().to_string()),
+                        semantic: None,
+                    },
+                    resolution_input: config,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(conn);
+    let manifest = Manifest::new(entries).unwrap();
+    let store = CallGraphStore::open(storage.join("graph"), root.to_path_buf()).unwrap();
+    let database = store.sqlite_path().to_path_buf();
+    drop(store);
+    aft::views::materialization::materialize_manifest_view_database(&database, &blobs, &manifest)
+        .unwrap();
+    CallGraphStore::open_readonly(storage.join("graph"), root.to_path_buf())
+        .unwrap()
+        .unwrap()
 }
 
 fn json<T: serde::Serialize>(value: Result<T, aft::callgraph_store::CallGraphStoreError>) -> Value {
@@ -866,7 +1291,7 @@ fn collect_project_files(dir: &Path, files: &mut Vec<PathBuf>) {
         }
         if matches!(
             path.extension().and_then(|extension| extension.to_str()),
-            Some("rs" | "ts")
+            Some("rs" | "ts" | "go")
         ) {
             files.push(path);
         }

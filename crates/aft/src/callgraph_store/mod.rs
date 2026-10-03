@@ -2939,6 +2939,17 @@ pub trait CallGraphRead {
         let _ = (kind, short_name, limit);
         Ok(Vec::new())
     }
+    /// Unbound receiver calls of the written member name, excluding sites that
+    /// already have a supplemental edge. An empty reverse graph cannot prove
+    /// these calls do not reach the queried method.
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        let _ = (name, language);
+        Ok(Vec::new())
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -6438,6 +6449,26 @@ impl CallGraphStore {
         self.ensure_ready(&conn)?;
         ref_sites_named(&conn, kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        let mut stmt = conn.prepare_cached("SELECT r.caller_file, n.scoped_name, r.line FROM refs r JOIN files f ON f.path=r.caller_file LEFT JOIN nodes n ON n.id=r.caller_node WHERE r.kind='call' AND r.short_name=?1 AND f.lang=?2 AND r.status='unresolved' AND r.full_ref LIKE '%.%' AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.ref_id=r.ref_id AND e.kind='call') ORDER BY r.caller_file, r.line, r.ref_id")?;
+        let rows = stmt.query_map(params![name, lang_label(language)], |row| {
+            Ok(StoreRefSite {
+                file: row.get(0)?,
+                caller_symbol: row.get(1)?,
+                line: row.get::<_, i64>(2)?.max(0) as u32,
+                local_name: None,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
     pub fn call_tree(
         &self,
@@ -7082,6 +7113,13 @@ impl CallGraphRead for CallGraphStore {
     ) -> Result<Vec<StoreRefSite>> {
         CallGraphStore::ref_sites_named(self, kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        CallGraphStore::unresolved_method_sites_named(self, name, language)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -7193,6 +7231,13 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     ) -> Result<Vec<StoreRefSite>> {
         (**self).ref_sites_named(kind, short_name, limit)
     }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        (**self).unresolved_method_sites_named(name, language)
+    }
     fn call_tree(
         &self,
         file_rel: &Path,
@@ -7303,6 +7348,13 @@ impl CallGraphRead for ReadonlyCallGraphStore {
         limit: usize,
     ) -> Result<Vec<StoreRefSite>> {
         ReadonlyCallGraphStore::ref_sites_named(self, kind, short_name, limit)
+    }
+    fn unresolved_method_sites_named(
+        &self,
+        name: &str,
+        language: LangId,
+    ) -> Result<Vec<StoreRefSite>> {
+        self.inner.unresolved_method_sites_named(name, language)
     }
     fn call_tree(
         &self,
@@ -7454,7 +7506,7 @@ fn nodes_for_file_matching_symbol(
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
                 n.signature, n.exported, n.is_callgraph_entry_point, f.lang
          FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.file_path = ?1 AND n.scoped_name = ?2
+          WHERE n.file_path = ?1 AND (n.scoped_name = ?2 OR (f.lang='rust' AND instr(n.scoped_name, ' for ') > 0 AND substr(n.scoped_name, instr(n.scoped_name, ' for ') + 5) = ?2))
          ORDER BY n.scoped_name, n.start_line, n.start_col"
     } else {
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
@@ -7465,8 +7517,40 @@ fn nodes_for_file_matching_symbol(
     };
     let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![rel_path, symbol], store_node_from_row)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    let matched = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    if qualified_query && matched.is_empty() {
+        let short = symbol.rsplit("::").next().unwrap_or(symbol);
+        return Ok(nodes_for_file_matching_symbol(conn, rel_path, short)?
+            .into_iter()
+            .filter(|node| {
+                if node.lang != LangId::Rust {
+                    return false;
+                }
+                let suffix = node
+                    .symbol
+                    .split_once(" for ")
+                    .map(|(_, implementation)| implementation)
+                    .unwrap_or(&node.symbol);
+                let mut depth = 0usize;
+                let normalized = suffix
+                    .chars()
+                    .filter(|ch| match ch {
+                        '<' => {
+                            depth += 1;
+                            false
+                        }
+                        '>' if depth > 0 => {
+                            depth -= 1;
+                            false
+                        }
+                        _ => depth == 0,
+                    })
+                    .collect::<String>();
+                normalized == symbol
+            })
+            .collect());
+    }
+    Ok(matched)
 }
 
 fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNode>> {
@@ -7475,7 +7559,7 @@ fn nodes_matching_symbol(conn: &Connection, symbol: &str) -> Result<Vec<StoreNod
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
                 n.signature, n.exported, n.is_callgraph_entry_point, f.lang
          FROM nodes n JOIN files f ON f.path = n.file_path
-         WHERE n.scoped_name = ?1
+          WHERE n.scoped_name = ?1 OR (f.lang='rust' AND instr(n.scoped_name, ' for ') > 0 AND substr(n.scoped_name, instr(n.scoped_name, ' for ') + 5) = ?1)
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col"
     } else {
         "SELECT n.id, n.file_path, n.scoped_name, n.name, n.kind, n.start_line, n.end_line,
@@ -9678,6 +9762,9 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   workspace crate or an earlier `use`, imported calls follow re-exports to
 ///   the definition, and a file-level function wins over imports from nested
 ///   scopes. Stores built before v11 hold the old, partly unresolved edges.
+/// - v12: receiver contracts preserve name-only trait/interface callers, module
+///   overrides and wildcard imports bind integration harness calls, and member
+///   completion does not duplicate documented methods.
 const BUILD_OUTPUT_VERSION: &str = "v12-receiver-contract-callers";
 
 fn schema_fingerprint() -> String {
@@ -13117,7 +13204,10 @@ fn rust_use_module_file_direct<I: ResolverIndex>(
     // harnesses, take precedence over reconstructing a library-relative path.
     if let Some((first, rest)) = module_segments.split_first() {
         if !matches!(*first, "crate" | "self" | "super") {
-            if let Some(mut file) = index.module_target(caller_file, first) {
+            if let Some(mut file) = index
+                .module_target(caller_file, first)
+                .filter(|file| file != caller_file)
+            {
                 for segment in rest {
                     file = index.module_target(&file, segment)?;
                 }
