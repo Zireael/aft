@@ -1918,18 +1918,67 @@ fn account_write_description(tuple: &str, named: Option<&str>) -> String {
 
 /// Refusal text for an undeclared invocation.
 ///
-/// It names the verb the classifier decided on, because the decision is made on
-/// the verb alone: a reader who is told only that "this invocation" was refused
-/// cannot tell whether the verb or something in the tail was the problem, and
-/// output flags such as `--json` or `-q` are the usual wrong guess.
+/// Native commands name their verb; API commands name their method and endpoint
+/// or GraphQL operation kind, so an undeclared mutation does not look like a
+/// refusal of all API reads. Output flags are not the classification boundary.
 fn unclassified_refusal_text(args: &[OsString], manifest_version: u64) -> String {
     let subject = match invocation_verb(args) {
+        Some(verb) if verb == "api" => api_refusal_subject(args),
         Some(verb) => format!("verb \"{verb}\""),
         // A non-UTF-8 argument vector has no verb that can be quoted back.
         None => "this invocation".to_string(),
     };
     format!(
         "{subject} is not declared in manifest {manifest_version} (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+    )
+}
+
+fn api_refusal_subject(args: &[OsString]) -> String {
+    let Some((_, _, index)) = command_head(args) else {
+        return "api (uninspectable endpoint)".into();
+    };
+    let args = &args[index..];
+    let Some(shape) = api_request_shape(args) else {
+        return "api (uninspectable endpoint)".into();
+    };
+    if shape.path != "/graphql" {
+        return format!("api {} {}", shape.effective_method(), shape.path);
+    }
+    let mutation = args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
+        let field = arg
+            .strip_prefix("--field=")
+            .or_else(|| arg.strip_prefix("--raw-field="))
+            .or_else(|| arg.strip_prefix("-f"))
+            .or_else(|| arg.strip_prefix("-F"))
+            .unwrap_or(arg);
+        let Some(document) = field.strip_prefix("query=") else {
+            return false;
+        };
+        let Some(tokens) = graphql_tokens(document) else {
+            return false;
+        };
+        let mut index = 0;
+        while let Some(token) = tokens.get(index) {
+            if *token == "mutation" {
+                return true;
+            }
+            if matches!(*token, "{" | "(" | "[") {
+                if !graphql_skip_group(&tokens, &mut index) {
+                    return false;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        false
+    });
+    format!(
+        "api graphql ({})",
+        if mutation {
+            "mutation"
+        } else {
+            "uninspectable query"
+        }
     )
 }
 
@@ -11887,7 +11936,7 @@ INHERITED FLAGS
             ),
             "verb \"issue create\" is not declared in manifest 13 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
         );
-        // One-word verb: a raw API call decides on `api` alone.
+        // Raw API calls name the effective method and normalized endpoint.
         assert_eq!(
             unclassified_refusal_text(
                 &os_args(&[
@@ -11898,8 +11947,43 @@ INHERITED FLAGS
                 ]),
                 9
             ),
-            "verb \"api\" is not declared in manifest 9 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+            "api DELETE /repos/cortexkit/aft/actions/runs/123 is not declared in manifest 9 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
         );
+    }
+
+    #[test]
+    fn unclassified_api_refusal_names_graphql_mutations_and_uninspectable_queries() {
+        for (tail, subject) in [
+            (
+                &["-f", "query=mutation { addStar }"][..],
+                "api graphql (mutation)",
+            ),
+            (
+                &[
+                    "--field=query=query Read { viewer { login } } mutation Write { addStar }",
+                    "-f",
+                    "operationName=Write",
+                ],
+                "api graphql (mutation)",
+            ),
+            (&["-F", "query=@-"], "api graphql (uninspectable query)"),
+            (
+                &["--input", "body.json"],
+                "api graphql (uninspectable query)",
+            ),
+            (
+                &["-f", "query=subscription { events }"],
+                "api graphql (uninspectable query)",
+            ),
+        ] {
+            let mut args = os_args(&["api", "graphql"]);
+            args.extend(os_args(tail));
+            let text = unclassified_refusal_text(&args, 17);
+            assert!(
+                text.starts_with(&format!("{subject} is not declared in manifest 17")),
+                "{text}"
+            );
+        }
     }
 
     #[test]
