@@ -31,14 +31,17 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   createReadStream,
   createWriteStream,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   readlinkSync,
   realpathSync,
   renameSync,
@@ -51,8 +54,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
-  execFileSync,
-  execTarExtractionSync,
+  execFile,
   getAftLspBinariesDir,
   relativePathEscapesRoot,
   windowsTarExecutable,
@@ -298,8 +300,60 @@ function sha256OfFile(path: string): Promise<string> {
   });
 }
 
+/**
+ * Hash a file synchronously in 1 MiB slices. Cached LSP binaries are tens to
+ * hundreds of MB; reading one whole into a single buffer costs that much memory
+ * at once.
+ */
 function sha256OfFileSync(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  const hash = createHash("sha256");
+  const fd = openSync(path, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let read = readSync(fd, buffer, 0, buffer.length, null);
+    while (read > 0) {
+      hash.update(buffer.subarray(0, read));
+      read = readSync(fd, buffer, 0, buffer.length, null);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Digests of cached binaries this process already hashed, keyed by path and
+ * guarded by the file's identity (device, inode, size, mtime, ctime).
+ *
+ * Startup validates every cached binary, and the refresh after background
+ * installs settle validates them all again. Without this memo each check read
+ * and hashed the whole binary once more. Any write, replacement or chmod
+ * changes the identity (ctime moves on every one of them), so a binary that
+ * changed since it was hashed is always hashed again.
+ */
+const binaryDigestMemo = new Map<string, { identity: string; digest: string }>();
+let binaryHashCount = 0;
+
+function fileIdentity(path: string): string {
+  const info = statSync(path, { bigint: true });
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+}
+
+function cachedBinarySha256(path: string): string {
+  // Take the identity before reading so a write during hashing leaves a stale
+  // identity behind, which forces the next check to hash again.
+  const identity = fileIdentity(path);
+  const known = binaryDigestMemo.get(path);
+  if (known && known.identity === identity) return known.digest;
+  const digest = sha256OfFileSync(path);
+  binaryHashCount += 1;
+  binaryDigestMemo.set(path, { identity, digest });
+  return digest;
+}
+
+/** Test hook: how many cached-binary hashes this process has computed. */
+export function __githubBinaryHashCountForTests(): number {
+  return binaryHashCount;
 }
 
 /* ─────────────────────────── pin resolution ─────────────────────────── */
@@ -778,9 +832,39 @@ function assertArchiveEntryPath(entry: string): void {
   }
 }
 
-function precheckWithTar(archivePath: string, command: string): number {
+/**
+ * Run an archive tool without blocking the host's event loop. Listing and
+ * extracting a large LSP archive can take minutes (the extract timeout is
+ * 180 s); a synchronous call froze every other plugin hook for that long.
+ */
+function runArchiveTool(command: string, args: string[], timeout?: number): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    execFile(
+      command,
+      args,
+      { encoding: "utf8", ...(timeout !== undefined ? { timeout } : {}) },
+      (err, stdout) => {
+        if (err) reject(err);
+        else resolvePromise(stdout);
+      },
+    );
+  });
+}
+
+/** Run the platform tar extractor and name the resolved executable in failures. */
+async function runTarExtraction(args: string[], timeout: number): Promise<void> {
+  const executable = windowsTarExecutable();
+  try {
+    await runArchiveTool(executable, args, timeout);
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    throw new Error(`tar extraction failed using ${executable}: ${detail}`, { cause });
+  }
+}
+
+async function precheckWithTar(archivePath: string, command: string): Promise<number> {
   let totalBytes = 0;
-  const verbose = execFileSync(command, ["-tvf", archivePath], { encoding: "utf8" });
+  const verbose = await runArchiveTool(command, ["-tvf", archivePath]);
   for (const line of verbose.split("\n")) {
     // Both bsdtar and GNU tar render hardlinks with a leading `h` type marker.
     // Reject them before extraction because the extracted inode cannot reveal
@@ -797,36 +881,40 @@ function precheckWithTar(archivePath: string, command: string): number {
     }
   }
 
-  const names = execFileSync(command, ["-tf", archivePath], { encoding: "utf8" });
+  const names = await runArchiveTool(command, ["-tf", archivePath]);
   for (const entry of names.split("\n")) {
     if (entry.length > 0) assertArchiveEntryPath(entry);
   }
   return totalBytes;
 }
 
-export function precheckArchiveContents(
+export async function precheckArchiveContents(
   archivePath: string,
   archiveType: string,
   zipListingMode: ZipListingMode = "platform",
-): void {
+): Promise<void> {
   let totalBytes = 0;
   if (archiveType === "zip" && zipListingMode === "platform" && process.platform !== "win32") {
-    const out = execFileSync("unzip", ["-l", archivePath], { encoding: "utf8" });
+    const out = await runArchiveTool("unzip", ["-l", archivePath]);
     const match = out.match(/^\s*(\d+)\s+\d+\s+files?\s*$/m);
     if (match) totalBytes = Number.parseInt(match[1] ?? "0", 10);
-    const names = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" });
+    const names = await runArchiveTool("unzip", ["-Z1", archivePath]);
     for (const entry of names.split("\n")) {
       if (entry.length > 0) assertArchiveEntryPath(entry);
     }
   } else {
-    totalBytes = precheckWithTar(archivePath, windowsTarExecutable());
+    totalBytes = await precheckWithTar(archivePath, windowsTarExecutable());
   }
   if (totalBytes > MAX_EXTRACT_BYTES) {
     throw new Error(`archive uncompressed size ${totalBytes} exceeds ${MAX_EXTRACT_BYTES}`);
   }
 }
 
-function extractArchiveSafely(archivePath: string, destDir: string, archiveType: string): void {
+async function extractArchiveSafely(
+  archivePath: string,
+  destDir: string,
+  archiveType: string,
+): Promise<void> {
   // Per-process random suffix avoids collisions if two installs of the
   // same package somehow race past the install lock (defense in depth).
   const suffix = randomBytes(8).toString("hex");
@@ -842,8 +930,8 @@ function extractArchiveSafely(archivePath: string, destDir: string, archiveType:
   mkdirSync(stagingDir, { recursive: true });
 
   try {
-    precheckArchiveContents(archivePath, archiveType);
-    runPlatformExtractor(archivePath, stagingDir, archiveType);
+    await precheckArchiveContents(archivePath, archiveType);
+    await runPlatformExtractor(archivePath, stagingDir, archiveType);
     validateExtraction(stagingDir);
 
     // Atomic publish: remove old destDir THEN rename staging into place.
@@ -894,7 +982,7 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
     quarantineCachedGithubInstall(spec, "missing/unsafe metadata or binary");
     return false;
   }
-  const currentHash = sha256OfFileSync(binaryPath);
+  const currentHash = cachedBinarySha256(binaryPath);
   const recordedBinaryHash = meta.binarySha256 ?? meta.sha256;
   if (recordedBinaryHash && currentHash === recordedBinaryHash) {
     if (meta.sha256 !== currentHash || meta.binarySha256 !== currentHash) {
@@ -927,28 +1015,29 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
  * `unzip` and `tar` reject absolute paths and `..` components, but we
  * still validate post-extraction in case a defense slipped past.
  */
-function runPlatformExtractor(archivePath: string, destDir: string, archiveType: string): void {
+async function runPlatformExtractor(
+  archivePath: string,
+  destDir: string,
+  archiveType: string,
+): Promise<void> {
   if (archiveType === "zip") {
     if (process.platform === "win32") {
       // Avoid PowerShell and PATH-resolved GNU tar. System32 bsdtar accepts
       // drive-letter paths and direct argv execution adds no shell parser.
-      execTarExtractionSync(["-xf", archivePath, "-C", destDir], 180_000);
+      await runTarExtraction(["-xf", archivePath, "-C", destDir], 180_000);
       return;
     }
-    execFileSync("unzip", ["-q", "-o", archivePath, "-d", destDir], {
-      stdio: "pipe",
-      timeout: 180_000,
-    });
+    await runArchiveTool("unzip", ["-q", "-o", archivePath, "-d", destDir], 180_000);
     return;
   }
 
   if (archiveType === "tar.gz") {
-    execTarExtractionSync(["-xzf", archivePath, "-C", destDir], 180_000);
+    await runTarExtraction(["-xzf", archivePath, "-C", destDir], 180_000);
     return;
   }
 
   if (archiveType === "tar.xz") {
-    execTarExtractionSync(["-xf", archivePath, "-C", destDir], 180_000);
+    await runTarExtraction(["-xf", archivePath, "-C", destDir], 180_000);
     return;
   }
 
@@ -1038,7 +1127,7 @@ async function downloadAndInstall(
   }
 
   try {
-    extractArchiveSafely(archivePath, extractDir, expected.archive);
+    await extractArchiveSafely(archivePath, extractDir, expected.archive);
   } catch (err) {
     const message = `extract failed: ${err instanceof Error ? err.message : String(err)}`;
     error(`[lsp] extract ${spec.id} failed: ${err}`);
@@ -1073,7 +1162,13 @@ async function downloadAndInstall(
   }
 
   try {
+    const identityBeforeHash = fileIdentity(targetBinary);
     const binarySha256 = await sha256OfFile(targetBinary);
+    // The refresh after installs settle validates this binary again; remember
+    // the digest just computed so that check does not hash it a second time.
+    if (fileIdentity(targetBinary) === identityBeforeHash) {
+      binaryDigestMemo.set(targetBinary, { identity: identityBeforeHash, digest: binarySha256 });
+    }
     log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
     log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);
     return { ok: true, archiveSha256, binarySha256 };
@@ -1403,5 +1498,6 @@ export {
   GITHUB_LSP_TABLE,
   type GithubServerSpec,
   type Platform,
+  extractArchiveSafely as _extractArchiveSafelyForTesting,
   precheckArchiveContents as _precheckArchiveSizeForTesting,
 };
