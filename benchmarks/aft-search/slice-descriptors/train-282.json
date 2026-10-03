@@ -1,0 +1,18 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/data_file.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/commands/semantic_search/regex_route.rs",
+    "crates/aft/src/commands/semantic_search/split_query.rs"
+  ],
+  "slices": [
+    "ancestor-gen-data-file",
+    "lsp-manager-lock-and-waits",
+    "worker-wait-cap"
+  ],
+  "note": "Fence files: crates/aft/src/commands/semantic_search/ (the gen-ancestor data-file fix: only the path inside the project root decides a generated shape). Corpus paths have no gen ancestor, so ranked rows are byte-identical to the reference re-recorded in train 280. The LSP manager lock work and the worker wait cap touch no fence file."
+}
