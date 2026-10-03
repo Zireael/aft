@@ -409,7 +409,8 @@ describe("V2 server effect", () => {
 
     await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(context)));
 
-    expect(hooks.map((hook) => hook.name)).toEqual(["prompt", "context"]);
+    // Editing tools are now gated in auxiliary requests as well as primary context.
+    expect(hooks.map((hook) => hook.name)).toEqual(["prompt", "compaction", "generate", "context"]);
     const prompt = hooks[0]?.callback;
     if (!prompt) return;
     const settle = () => new Promise((resolve) => setTimeout(resolve, 0));

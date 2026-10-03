@@ -280,11 +280,28 @@ export function pluginConfigNeedsUpdate(
  * leaves AFT's `bash` as the only command tool. OpenCode 1 has no such plugin.
  */
 export const OPENCODE_HOST_SHELL_DISABLE_ENTRY = "-opencode.tool.shell";
+export const OPENCODE_HOST_PATCH_DISABLE_ENTRY = "-opencode.tool.patch";
+
+/** Removing a host plugin removes its tool and its tool-name-specific hooks together. */
+export const OPENCODE_HOST_TOOLS = {
+  shell: { aftTool: "bash", disableEntry: OPENCODE_HOST_SHELL_DISABLE_ENTRY },
+  patch: { aftTool: "apply_patch", disableEntry: OPENCODE_HOST_PATCH_DISABLE_ENTRY },
+} as const;
+
+export type OpenCodeHostTool = keyof typeof OPENCODE_HOST_TOOLS;
+export const OPENCODE_HOST_TOOL_NAMES = Object.keys(OPENCODE_HOST_TOOLS) as OpenCodeHostTool[];
+
+export function hostToolPluginDisabled(
+  value: Record<string | symbol, unknown> | null,
+  hostTool: OpenCodeHostTool,
+): boolean {
+  const list = value?.plugins;
+  return Array.isArray(list) && list.includes(OPENCODE_HOST_TOOLS[hostTool].disableEntry);
+}
 
 /** True when the OpenCode 2 `plugins` list removes the host's shell tool plugin. */
 export function hostShellPluginDisabled(value: Record<string | symbol, unknown> | null): boolean {
-  const list = value?.plugins;
-  return Array.isArray(list) && list.includes(OPENCODE_HOST_SHELL_DISABLE_ENTRY);
+  return hostToolPluginDisabled(value, "shell");
 }
 
 /**
@@ -299,10 +316,20 @@ export function setHostShellPluginDisabled(
   value: Record<string | symbol, unknown>,
   disabled: boolean,
 ): { changed: boolean } {
+  return setHostToolPluginDisabled(value, "shell", disabled);
+}
+
+/** Edit only this host tool's removal entries, retaining JSONC comments and other plugins. */
+export function setHostToolPluginDisabled(
+  value: Record<string | symbol, unknown>,
+  hostTool: OpenCodeHostTool,
+  disabled: boolean,
+): { changed: boolean } {
+  const entry = OPENCODE_HOST_TOOLS[hostTool].disableEntry;
   const existing = Array.isArray(value.plugins) ? (value.plugins as unknown[]) : null;
   const indexes: number[] = [];
   existing?.forEach((entry, index) => {
-    if (entry === OPENCODE_HOST_SHELL_DISABLE_ENTRY) indexes.push(index);
+    if (entry === OPENCODE_HOST_TOOLS[hostTool].disableEntry) indexes.push(index);
   });
   if (disabled ? indexes.length === 1 : indexes.length === 0) return { changed: false };
 
@@ -314,7 +341,7 @@ export function setHostShellPluginDisabled(
   for (let index = remove.length - 1; index >= 0; index -= 1) {
     list.splice(remove[index] as number, 1);
   }
-  if (disabled && indexes.length === 0) list.push(OPENCODE_HOST_SHELL_DISABLE_ENTRY);
+  if (disabled && indexes.length === 0) list.push(entry);
   return { changed: true };
 }
 
@@ -328,10 +355,20 @@ export function setHostShellPluginDisabled(
  * AFT disabled as a whole (`enabled: false`) counts as bash disabled.
  */
 export function aftBashEnabled(userConfig: Record<string, unknown> | null): boolean {
+  return aftHostReplacementEnabled(userConfig, "shell");
+}
+
+/** Whether AFT can replace the host tool; shell also has a separate runtime gate. */
+export function aftHostReplacementEnabled(
+  userConfig: Record<string, unknown> | null,
+  hostTool: OpenCodeHostTool,
+): boolean {
   if (!userConfig) return true;
   if (userConfig.enabled === false) return false;
   const disabled = userConfig.disabled_tools;
-  if (Array.isArray(disabled) && disabled.includes("bash")) return false;
+  if (Array.isArray(disabled) && disabled.includes(OPENCODE_HOST_TOOLS[hostTool].aftTool))
+    return false;
+  if (hostTool !== "shell") return true;
   const bash = userConfig.bash;
   if (bash === false) return false;
   if (

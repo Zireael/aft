@@ -59,7 +59,7 @@ test("V2 context model recording follows model switches for image reads", async 
     ["text", false],
   ] as const) {
     await Effect.runPromise(
-      context!({ sessionID: "s", model: { providerID: "p", id }, system: [] }),
+      context!({ sessionID: "s", model: { providerID: "p", id }, system: [], tools: {} }),
     );
     expect(await currentSessionVisionCapability(runtime.context, "s")).toBe(expected);
   }
@@ -69,4 +69,63 @@ test("V2 vision lookup runs provider.list and reads native capabilities", async 
   const runtime = await bootV2Runtime();
   rememberReadModel(runtime.context, "s", { providerID: "p", modelID: "vision" });
   expect(await currentSessionVisionCapability(runtime.context, "s")).toBe(true);
+});
+
+for (const hook of ["context", "compaction", "generate"]) {
+  for (const [id, expected] of [
+    ["gpt-5.5", ["apply_patch", "bash", "foreign"]],
+    ["gpt-4o", ["bash", "edit", "foreign", "write"]],
+    ["gpt-oss-120b", ["bash", "edit", "foreign", "write"]],
+    ["claude-sonnet-4-5", ["bash", "edit", "foreign", "write"]],
+  ] as const) {
+    test(`V2 ${hook} gates AFT editing tools for ${id}`, async () => {
+      const runtime = await bootV2Runtime();
+      const callback = runtime.sessionHooks.get(hook);
+      expect(callback).toBeDefined();
+      const tools = Object.fromEntries(
+        ["edit", "write", "apply_patch", "bash", "foreign"].map((name) => [name, { name }]),
+      );
+      await Effect.runPromise(
+        callback!({ sessionID: "s", model: { providerID: "p", id }, system: [], tools }),
+      );
+      expect(Object.keys(tools).sort()).toEqual(expected);
+    });
+  }
+
+  test(`V2 ${hook} leaves host editing tools alone when AFT did not register them`, async () => {
+    const runtime = await bootV2Runtime({ disabled_tools: ["edit", "write", "apply_patch"] });
+    const callback = runtime.sessionHooks.get(hook);
+    expect(callback).toBeDefined();
+    const hostEdit = { description: "Host edit" };
+    for (const id of ["gpt-5.5", "claude-sonnet-4-5"]) {
+      const tools = { edit: hostEdit, write: {}, apply_patch: {}, patch: {} };
+      await Effect.runPromise(
+        callback!({ sessionID: "s", model: { providerID: "p", id }, system: [], tools }),
+      );
+      expect(Object.keys(tools).sort()).toEqual(["apply_patch", "edit", "patch", "write"]);
+      expect(tools.edit).toBe(hostEdit);
+    }
+  });
+
+  test(`V2 ${hook} keeps host edit while gating AFT write for GPT`, async () => {
+    const runtime = await bootV2Runtime({ disabled_tools: ["edit"] });
+    expect(runtime.tools.has("edit")).toBe(false);
+    const hostEdit = { description: "Host edit" };
+    const tools = { edit: hostEdit, write: {}, apply_patch: {}, patch: {} };
+    await Effect.runPromise(
+      runtime.sessionHooks.get(hook)!({
+        sessionID: "s",
+        model: { providerID: "p", id: "gpt-5.5" },
+        system: [],
+        tools,
+      }),
+    );
+    expect(Object.keys(tools).sort()).toEqual(["apply_patch", "edit", "patch"]);
+    expect(tools.edit).toBe(hostEdit);
+  });
+}
+
+test("V2 apply_patch uses the host edit permission action", async () => {
+  const runtime = await bootV2Runtime();
+  expect(runtime.tools.get("apply_patch").options.permission).toBe("edit");
 });

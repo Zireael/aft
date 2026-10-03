@@ -26,6 +26,7 @@ test("V2 context and compaction inject byte-identical V1 workflow guidance after
       sessionID: "s",
       model: { providerID: "p", id: "text" },
       system: [{ type: "text", text: "host system" }],
+      tools: {},
     };
     await Effect.runPromise(hook!(event));
     expect(event.system).toEqual([

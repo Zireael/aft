@@ -1,4 +1,4 @@
-import type { SessionDomain } from "@opencode/plugin/effect/session";
+import type { SessionContext, SessionDomain } from "@opencode/plugin/effect/session";
 import type { ToolDomain } from "@opencode/plugin/effect/tool";
 import { Effect, Schema } from "effect";
 
@@ -11,6 +11,15 @@ import { rememberReadModel } from "./shared/read-vision.js";
 class ArgumentError extends Schema.TaggedError<ArgumentError>()("Tool.Error", {
   message: Schema.String,
 }) {}
+
+/** Match the host's GPT patch preference without touching tools AFT did not register. */
+function gateEditingTools(event: SessionContext, registeredTools: ReadonlySet<string>): void {
+  const id = event.model.id;
+  const prefersPatch = id.includes("gpt-") && !id.includes("oss") && !id.includes("gpt-4");
+  for (const name of prefersPatch ? ["edit", "write"] : ["apply_patch"]) {
+    if (registeredTools.has(name)) delete event.tools[name];
+  }
+}
 
 /** Port the V1 raw-argument, result-text and current-model seams to V2. */
 export function registerV2ToolHooks(
@@ -59,8 +68,16 @@ export function registerV2ToolHooks(
       );
     }
     if (typeof host.session?.hook === "function") {
+      // Each request starts with its own tool draft, including auxiliary requests.
+      // Disabling the built-in patch plugin removes its gate, so AFT owns this one.
+      for (const name of ["compaction", "generate"] as const) {
+        yield* host.session.hook(name, (event) =>
+          Effect.sync(() => gateEditingTools(event, registeredTools)),
+        );
+      }
       yield* host.session.hook("context", (event) =>
         Effect.sync(() => {
+          gateEditingTools(event, registeredTools);
           rememberReadModel(context as object, event.sessionID, {
             providerID: event.model.providerID,
             modelID: event.model.id,

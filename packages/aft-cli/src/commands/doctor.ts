@@ -102,7 +102,9 @@ import {
 import {
   AFT_OPENCODE_PACKAGE,
   exactPinnedVersion,
-  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+  OPENCODE_HOST_TOOL_NAMES,
+  OPENCODE_HOST_TOOLS,
+  type OpenCodeHostTool,
   pinnedPluginEntry,
 } from "../setup/opencode-config.js";
 
@@ -393,8 +395,10 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       // Same text as the "Issues found" entry, so the two never disagree.
       if (opencodeSkew) log.error(`  ${opencodeSkew.message} ${opencodeSkew.remediation}`);
-      const hostShell = hostShellDoctorLine(opencodeAdapter);
-      if (hostShell) log[hostShell.level](`  ${hostShell.text}`);
+      for (const hostTool of OPENCODE_HOST_TOOL_NAMES) {
+        const line = hostToolDoctorLine(opencodeAdapter, hostTool);
+        if (line) log[line.level](`  ${line.text}`);
+      }
     }
     const blockers = h.pluginLoad?.blockers ?? [];
     if (h.pluginRegistered && blockers.length > 0) {
@@ -834,32 +838,47 @@ export function clearOldBinaries(): BinaryCacheClearResult {
 export function hostShellDoctorLine(
   adapter: HarnessAdapter | undefined,
 ): { level: "info" | "warn"; text: string } | null {
+  return hostToolDoctorLine(adapter, "shell");
+}
+
+/** Report each built-in separately; doctor --fix only removes usable duplicates. */
+export function hostToolDoctorLine(
+  adapter: HarnessAdapter | undefined,
+  hostTool: OpenCodeHostTool,
+): { level: "info" | "warn"; text: string } | null {
   if (!(adapter instanceof OpenCodeAdapter)) return null;
-  const state = adapter.hostShellState();
+  const { disableEntry, aftTool } = OPENCODE_HOST_TOOLS[hostTool];
+  const state = adapter.hostToolState(hostTool);
   if (state === "not_applicable") return null;
   if (state === "disabled") {
     return {
       level: "info",
-      text: `OpenCode's own shell tool: disabled (${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is set); agents use AFT's bash`,
+      text: `OpenCode's own ${hostTool} tool: disabled (${disableEntry} is set); agents use AFT's ${aftTool}`,
     };
   }
-  if (!adapter.aftBashEnabled()) {
+  if (!adapter.aftHostReplacementEnabled(hostTool)) {
     return {
       level: "info",
-      text: "OpenCode's own shell tool: enabled (AFT's bash is disabled, so it stays)",
+      text: `OpenCode's own ${hostTool} tool: enabled (AFT's ${aftTool} is disabled, so it stays)`,
     };
   }
   return {
     level: "warn",
-    text: `OpenCode's own shell tool: enabled beside AFT's bash — run \`${CLI} doctor --fix\` or \`${CLI} setup\` to disable it (${OPENCODE_HOST_SHELL_DISABLE_ENTRY})`,
+    text: `OpenCode's own ${hostTool} tool: enabled beside AFT's ${aftTool} — run \`${CLI} doctor --fix\` or \`${CLI} setup\` to disable it (${disableEntry})`,
   };
 }
 
-/** The OpenCode 2 adapter whose host shell `doctor --fix` would disable, if any. */
-function hostShellFixTarget(adapters: HarnessAdapter[]): OpenCodeAdapter | null {
+/** Built-ins that doctor can remove without disabling the only available implementation. */
+function hostToolFixTargets(adapters: HarnessAdapter[]): Array<{
+  adapter: OpenCodeAdapter;
+  hostTool: OpenCodeHostTool;
+}> {
   const adapter = openCodeAdapter(adapters);
-  if (!(adapter instanceof OpenCodeAdapter)) return null;
-  return adapter.hostShellState() === "enabled" && adapter.aftBashEnabled() ? adapter : null;
+  if (!(adapter instanceof OpenCodeAdapter)) return [];
+  return OPENCODE_HOST_TOOL_NAMES.filter(
+    (hostTool) =>
+      adapter.hostToolState(hostTool) === "enabled" && adapter.aftHostReplacementEnabled(hostTool),
+  ).map((hostTool) => ({ adapter, hostTool }));
 }
 
 export interface DoctorFixPlanItem {
@@ -1189,11 +1208,11 @@ export function buildDoctorFixPlan(
     });
   }
 
-  const hostShellTarget = hostShellFixTarget(adapters);
-  if (hostShellTarget) {
+  for (const { adapter, hostTool } of hostToolFixTargets(adapters)) {
+    const { disableEntry, aftTool } = OPENCODE_HOST_TOOLS[hostTool];
     items.push({
       kind: "plugin",
-      message: `Will add ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} to ${hostShellTarget.detectConfigPaths().harnessConfig} so agents use AFT's bash instead of OpenCode's own shell tool`,
+      message: `Will add ${disableEntry} to ${adapter.detectConfigPaths().harnessConfig} so agents use AFT's ${aftTool} instead of OpenCode's own ${hostTool} tool`,
     });
   }
 
@@ -1394,11 +1413,9 @@ async function runFixFlow(
   const pluginEntrySummary = configWritesRefused
     ? { changed: 0, errors: 0 }
     : await fixPluginEntries(adapters);
-  // --fix only ever disables the host's shell (when AFT's bash can replace
-  // it); turning it back on is a choice made in `aft setup`.
-  const hostShellTarget = configWritesRefused ? null : hostShellFixTarget(adapters);
-  if (hostShellTarget) {
-    const result = hostShellTarget.setHostShellDisabled(true);
+  // Restoring a removed host plugin remains an explicit choice in setup.
+  for (const { adapter, hostTool } of configWritesRefused ? [] : hostToolFixTargets(adapters)) {
+    const result = adapter.setHostToolDisabled(hostTool, true);
     if (result.ok) {
       if (result.action !== "already_present") log.success(`OpenCode: ${result.message}`);
       pluginEntrySummary.changed += result.action === "already_present" ? 0 : 1;

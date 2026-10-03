@@ -17,6 +17,11 @@ import {
   runFeatureSetup,
 } from "../setup/feature-wizard.js";
 import { describeOpenCodeHost, type OpenCodeHostDetection } from "../setup/host-generation.js";
+import {
+  OPENCODE_HOST_TOOL_NAMES,
+  OPENCODE_HOST_TOOLS,
+  type OpenCodeHostTool,
+} from "../setup/opencode-config.js";
 
 export interface SetupOptions {
   resolveAdapters?: typeof resolveAdaptersForCommand;
@@ -29,6 +34,8 @@ export interface SetupOptions {
   downloadBinary?: BinaryDownloader;
   /** Answers the OpenCode 2 host-shell question (tests stub it; defaults to a prompt). */
   confirmHostShell?: (message: string, defaultYes: boolean) => Promise<boolean>;
+  /** Answers either OpenCode 2 host-tool question; the shell-specific override still works. */
+  confirmHostTool?: (message: string, defaultYes: boolean) => Promise<boolean>;
   /** Whether setup may prompt; defaults to whether stdin is a terminal. */
   interactive?: boolean;
 }
@@ -73,11 +80,13 @@ export async function runSetup(argv: string[], options: SetupOptions = {}): Prom
     if (featureStatus !== 0) anyFailure = true;
   }
 
-  // Asked after the feature step, which can turn bash on or off: the answer
-  // depends on whether AFT's bash is there to replace the host's shell.
+  // Feature choices determine whether AFT can replace each built-in host tool.
   for (const adapter of nextSteps) {
     if (!(adapter instanceof OpenCodeAdapter)) continue;
-    if ((await offerHostShellDisable(adapter, argv, options)) === "failed") anyFailure = true;
+    for (const hostTool of OPENCODE_HOST_TOOL_NAMES) {
+      if ((await offerHostToolDisable(adapter, hostTool, argv, options)) === "failed")
+        anyFailure = true;
+    }
   }
 
   // Restart instructions come last, after every choice has been saved.
@@ -196,24 +205,48 @@ export async function offerHostShellDisable(
   argv: string[],
   options: SetupOptions = {},
 ): Promise<"ok" | "failed" | "skipped"> {
-  if (adapter.hostShellState() === "not_applicable") return "skipped";
-  const bashOn = adapter.aftBashEnabled();
+  return offerHostToolDisable(adapter, "shell", argv, options);
+}
+
+/** Keep the host tool by default when AFT's replacement is disabled. */
+export async function offerHostToolDisable(
+  adapter: OpenCodeAdapter,
+  hostTool: OpenCodeHostTool,
+  argv: string[],
+  options: SetupOptions = {},
+): Promise<"ok" | "failed" | "skipped"> {
+  if (adapter.hostToolState(hostTool) === "not_applicable") return "skipped";
+  const { aftTool } = OPENCODE_HOST_TOOLS[hostTool];
+  const replacementOn = adapter.aftHostReplacementEnabled(hostTool);
   const interactive =
     !argv.includes("--yes") &&
     !argv.includes("-y") &&
     (options.interactive ?? Boolean(process.stdin.isTTY));
   const disable = interactive
-    ? await (options.confirmHostShell ?? confirm)(HOST_SHELL_QUESTION, bashOn)
-    : bashOn;
-  const result = adapter.setHostShellDisabled(disable);
+    ? await (
+        options.confirmHostTool ??
+        (hostTool === "shell" ? options.confirmHostShell : undefined) ??
+        confirm
+      )(
+        hostTool === "shell"
+          ? HOST_SHELL_QUESTION
+          : `OpenCode's own ${hostTool} tool: disable it so agents use AFT's ${aftTool}?`,
+        replacementOn,
+      )
+    : replacementOn;
+  const result = adapter.setHostToolDisabled(hostTool, disable);
   if (!result.ok) {
     log.error(`${adapter.displayName}: ${result.message}`);
     return "failed";
   }
   if (result.action === "already_present") {
     log.info(
-      `${adapter.displayName}: OpenCode's own shell tool is ${disable ? "already disabled" : "enabled"}${
-        disable ? "; agents use AFT's bash" : bashOn ? "" : " (AFT's bash is disabled)"
+      `${adapter.displayName}: OpenCode's own ${hostTool} tool is ${disable ? "already disabled" : "enabled"}${
+        disable
+          ? `; agents use AFT's ${aftTool}`
+          : replacementOn
+            ? ""
+            : ` (AFT's ${aftTool} is disabled)`
       }`,
     );
   } else {

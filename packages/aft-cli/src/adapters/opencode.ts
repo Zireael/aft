@@ -21,18 +21,19 @@ import {
 } from "../setup/host-generation.js";
 import {
   AFT_OPENCODE_PACKAGE,
-  aftBashEnabled,
+  aftHostReplacementEnabled,
   ensurePinnedPluginConfig,
-  hostShellPluginDisabled,
+  hostToolPluginDisabled,
   isAftNpmEntry,
-  OPENCODE_HOST_SHELL_DISABLE_ENTRY,
+  OPENCODE_HOST_TOOLS,
   type OpenCodeConfigGeneration,
+  type OpenCodeHostTool,
   openCodePluginKey,
   openCodePluginReadKeys,
   pinnedPluginEntry,
   pluginConfigNeedsUpdate,
   pluginEntryPackage,
-  setHostShellPluginDisabled,
+  setHostToolPluginDisabled,
 } from "../setup/opencode-config.js";
 import type {
   HarnessAdapter,
@@ -401,15 +402,23 @@ export class OpenCodeAdapter implements HarnessAdapter {
    * guessed at.
    */
   hostShellState(): "disabled" | "enabled" | "not_applicable" {
+    return this.hostToolState("shell");
+  }
+
+  hostToolState(hostTool: OpenCodeHostTool): "disabled" | "enabled" | "not_applicable" {
     if (this.configGeneration() !== "v2") return "not_applicable";
     const { value } = readJsoncFile(this.detectConfigPaths().harnessConfig);
-    return hostShellPluginDisabled(value) ? "disabled" : "enabled";
+    return hostToolPluginDisabled(value, hostTool) ? "disabled" : "enabled";
   }
 
   /** Whether the user AFT config leaves AFT's bash registered and runnable. */
   aftBashEnabled(): boolean {
+    return this.aftHostReplacementEnabled("shell");
+  }
+
+  aftHostReplacementEnabled(hostTool: OpenCodeHostTool): boolean {
     const { value } = readJsoncFile(this.detectConfigPaths().aftConfig);
-    return aftBashEnabled(value as Record<string, unknown> | null);
+    return aftHostReplacementEnabled(value as Record<string, unknown> | null, hostTool);
   }
 
   /**
@@ -417,13 +426,19 @@ export class OpenCodeAdapter implements HarnessAdapter {
    * OpenCode 2 server config. Idempotent; refuses on any other generation.
    */
   setHostShellDisabled(disabled: boolean): PluginEntryResult {
+    return this.setHostToolDisabled("shell", disabled);
+  }
+
+  /** Remove or restore a built-in OpenCode 2 plugin, not merely its tool definition. */
+  setHostToolDisabled(hostTool: OpenCodeHostTool, disabled: boolean): PluginEntryResult {
+    const { disableEntry, aftTool } = OPENCODE_HOST_TOOLS[hostTool];
     const configPath = this.detectConfigPaths().harnessConfig;
     const format = this.detectConfigPaths().harnessConfigFormat;
     if (this.configGeneration() !== "v2") {
       return {
         ok: false,
         action: "error",
-        message: "only OpenCode 2 has a built-in shell tool plugin to disable",
+        message: `only OpenCode 2 has a built-in ${hostTool} tool plugin to disable`,
         configPath,
       };
     }
@@ -432,13 +447,13 @@ export class OpenCodeAdapter implements HarnessAdapter {
         return { ok: true, action: "already_present", message: "no config to change", configPath };
       }
       const failed = this.tryWrite(configPath, () =>
-        writeJsoncFile(configPath, { plugins: [OPENCODE_HOST_SHELL_DISABLE_ENTRY] }, "json"),
+        writeJsoncFile(configPath, { plugins: [disableEntry] }, "json"),
       );
       if (failed) return failed;
       return {
         ok: true,
         action: "added",
-        message: `Created ${configPath} with ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} under \`plugins\``,
+        message: `Created ${configPath} with ${disableEntry} under \`plugins\``,
         configPath,
       };
     }
@@ -451,14 +466,14 @@ export class OpenCodeAdapter implements HarnessAdapter {
         configPath,
       };
     }
-    const { changed } = setHostShellPluginDisabled(value, disabled);
+    const { changed } = setHostToolPluginDisabled(value, hostTool, disabled);
     if (!changed) {
       return {
         ok: true,
         action: "already_present",
         message: disabled
-          ? `${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is already set in ${configPath}`
-          : `${OPENCODE_HOST_SHELL_DISABLE_ENTRY} is not set in ${configPath}`,
+          ? `${disableEntry} is already set in ${configPath}`
+          : `${disableEntry} is not set in ${configPath}`,
         configPath,
       };
     }
@@ -468,8 +483,8 @@ export class OpenCodeAdapter implements HarnessAdapter {
       ok: true,
       action: disabled ? "added" : "updated",
       message: disabled
-        ? `Added ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} under \`plugins\` in ${configPath}: OpenCode's own shell tool is disabled, so agents use AFT's bash`
-        : `Removed ${OPENCODE_HOST_SHELL_DISABLE_ENTRY} from ${configPath}: OpenCode's own shell tool is enabled again`,
+        ? `Added ${disableEntry} under \`plugins\` in ${configPath}: OpenCode's own ${hostTool} tool is disabled, so agents use AFT's ${aftTool}`
+        : `Removed ${disableEntry} from ${configPath}: OpenCode's own ${hostTool} tool is enabled again`,
       configPath,
     };
   }
