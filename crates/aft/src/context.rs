@@ -2959,6 +2959,10 @@ pub struct AppContext {
     lsp_watcher_forward_slot: crate::lsp::manager::WatcherForwardSlot,
     /// How many of those helper threads were started, for tests.
     lsp_watcher_forward_helpers_spawned: AtomicUsize,
+    /// Document and configuration-file changes waiting for the LSP manager
+    /// lock (see [`crate::lsp::pending_changes`]); a busy lock queues them
+    /// instead of dropping them.
+    lsp_pending_change_slot: crate::lsp::pending_changes::PendingLspChangeSlot,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
     /// teardown. Already-admitted workers use it to decide whether their disk
@@ -3579,6 +3583,7 @@ impl AppContext {
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
+            lsp_pending_change_slot: Default::default(),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle,
@@ -9972,13 +9977,27 @@ impl AppContext {
 
     /// Notify LSP servers that a file was written.
     /// Call this after write_format_validate in command handlers.
+    /// A busy manager queues the change rather than dropping it.
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(e) = lsp.notify_file_changed_if_running(file_path, content, &config) {
-                crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
-            }
-        }
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(e) = lsp.notify_file_changed_if_running(file_path, content, &config) {
+                    crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
+                }
+            },
+            |pending| pending.queue_document(file_path, false),
+        );
+    }
+
+    /// Whether document or configuration-file changes are still queued for
+    /// the LSP manager.
+    #[doc(hidden)]
+    pub fn lsp_pending_changes_for_test(&self) -> bool {
+        self.lsp_pending_change_slot.lock().is_some()
     }
 
     /// Forward paths the project file watcher saw change to the language
@@ -10128,19 +10147,26 @@ impl AppContext {
         };
 
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(err) = lsp.notify_file_changed(file_path, &content, &config) {
-                crate::slog_warn!(
-                    "LSP resync failed for {} after external edit: {}",
-                    file_path.display(),
-                    err
-                );
-                return false;
-            }
-            true
-        } else {
-            false
-        }
+        let mut sent = true;
+        // A busy manager queues the resync (delivered with the file's
+        // contents at that time) instead of dropping it.
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(err) = lsp.notify_file_changed(file_path, &content, &config) {
+                    crate::slog_warn!(
+                        "LSP resync failed for {} after external edit: {}",
+                        file_path.display(),
+                        err
+                    );
+                    sent = false;
+                }
+            },
+            |pending| pending.queue_document(file_path, true),
+        );
+        sent
     }
 
     /// Notify LSP and optionally wait for diagnostics.
@@ -10159,8 +10185,27 @@ impl AppContext {
         timeout: std::time::Duration,
     ) -> crate::lsp::manager::PostEditWaitOutcome {
         let config = self.config();
-        let Some(mut lsp) = self.lsp_manager.try_lock() else {
-            return crate::lsp::manager::PostEditWaitOutcome::default();
+        // Start any missing server without the manager lock (a start is not
+        // charged to the diagnostics budget, as before), then wait for the
+        // lock within that budget. A budget spent waiting queues the change
+        // and reports every server that would have answered as pending: an
+        // empty outcome would read as "checked, no diagnostics".
+        crate::lsp::manager::start_servers_for_file_unlocked(
+            || self.lsp_manager.lock(),
+            file_path,
+            &config,
+        );
+        let lock_wait_started = Instant::now();
+        let locked = self.lsp_manager.try_lock_for(timeout);
+        let timeout = timeout.saturating_sub(lock_wait_started.elapsed());
+        let Some(mut lsp) = locked else {
+            self.lsp_notify_file_changed_queued_with_servers(file_path, &config);
+            return crate::lsp::manager::PostEditWaitOutcome {
+                pending_servers: crate::lsp::manager::expected_server_keys_for_file(
+                    file_path, &config,
+                ),
+                ..Default::default()
+            };
         };
 
         // Clear any queued notifications before this write so the wait loop only
@@ -10236,6 +10281,25 @@ impl AppContext {
         self.lsp_manager
             .lock()
             .finish_post_edit_diagnostics_wait(wait)
+    }
+
+    /// Queue a change that may start the file's servers, for a caller that
+    /// could not reach the LSP manager within its budget.
+    fn lsp_notify_file_changed_queued_with_servers(&self, file_path: &Path, config: &Arc<Config>) {
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(config),
+            |lsp| {
+                let content = std::fs::read_to_string(file_path);
+                if let Ok(content) = content {
+                    if let Err(e) = lsp.notify_file_changed(file_path, &content, config) {
+                        crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
+                    }
+                }
+            },
+            |pending| pending.queue_document(file_path, true),
+        );
     }
 
     /// Collect custom server root_markers from user config for use in
@@ -10345,11 +10409,17 @@ impl AppContext {
         }
 
         let config = self.config();
-        if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
-                crate::slog_warn!("watched-file sync error: {}", e);
-            }
-        }
+        crate::lsp::pending_changes::send_or_queue_lsp_change(
+            &self.lsp_manager,
+            &self.lsp_pending_change_slot,
+            Arc::clone(&config),
+            |lsp| {
+                if let Err(e) = lsp.notify_files_watched_changed(config_paths, &config) {
+                    crate::slog_warn!("watched-file sync error: {}", e);
+                }
+            },
+            |pending| pending.queue_watched(config_paths),
+        );
     }
 
     pub fn lsp_notify_watched_config_file(&self, file_path: &Path, change_type: FileChangeType) {

@@ -471,3 +471,61 @@ fn cold_server_start_leaves_the_lsp_manager_free_and_is_shared() {
         "a concurrent caller for a starting server must not spawn a second one"
     );
 }
+
+/// An edit's `didChange` that finds the LSP manager busy (here held by the
+/// test, standing in for any long holder) is queued and reaches the server
+/// once the lock frees, instead of being dropped and leaving the server on
+/// the old contents.
+#[test]
+fn edit_notification_reaches_the_server_after_a_busy_manager_frees() {
+    let (_temp_dir, main_rs) = rust_workspace_with_file();
+    let ctx = app_context_with_fake_lsp();
+    let canonical = fs::canonicalize(&main_rs).expect("canonical main.rs");
+    let config = ctx.config();
+    let opened = ctx
+        .lsp()
+        .ensure_file_open(&main_rs, &config)
+        .expect("open main.rs");
+    assert_eq!(
+        opened.server_keys.len(),
+        1,
+        "the fake server serves main.rs"
+    );
+
+    let new_content = "fn main() {\n    let changed = 1;\n}\n";
+    fs::write(&main_rs, new_content).expect("rewrite main.rs");
+    let held = ctx.lsp();
+    ctx.lsp_notify_file_changed(&main_rs, new_content);
+    assert!(
+        ctx.lsp_pending_changes_for_test(),
+        "a change that found the manager busy must be queued"
+    );
+    drop(held);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut delivered = false;
+    while std::time::Instant::now() < deadline {
+        {
+            let mut lsp = ctx.lsp();
+            lsp.drain_events();
+            delivered = lsp
+                .diagnostics_store_for_test()
+                .entries_for_file(&canonical)
+                .iter()
+                .any(|(_, entry)| entry.version == Some(1));
+        }
+        if delivered {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        delivered,
+        "the server never published for document version 1: the queued didChange was lost"
+    );
+    let drained_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while ctx.lsp_pending_changes_for_test() && std::time::Instant::now() < drained_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!ctx.lsp_pending_changes_for_test(), "the backlog drained");
+}
