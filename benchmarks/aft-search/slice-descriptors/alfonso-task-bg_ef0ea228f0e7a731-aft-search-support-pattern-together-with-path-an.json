@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs::split_request_tests"
+  ],
+  "slices": ["external-project-pattern-search"],
+  "note": "Enable explicit pattern requests against another Git project, using the existing split-query and ranked-regex engines with that project's disk-validated saved index or a bounded in-memory disk scan. Current-project inputs, lane plans and ranking rules must remain byte-identical to the reference re-recorded at train 280. No benchmark row may move."
+}

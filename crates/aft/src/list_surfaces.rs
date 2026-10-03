@@ -542,6 +542,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::semantic_search::nearest_names NEAREST_NAME_FILE_LIMIT, NEAREST_NAME_LIMIT",
         reason: "a not-found answer suggests a few nearest names: the scan reads a bounded number of files and keeps the most similar names; these are suggestions for a name that occurs nowhere, not a cut of matching results",
     },
+    ExclusionEntry {
+        file: "commands/semantic_search/external_pattern.rs",
+        enclosing_item: "semantic_results",
+        location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
+        reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.

@@ -1504,6 +1504,17 @@ impl SearchIndex {
         Self::build_with_limit(root, DEFAULT_MAX_FILE_SIZE)
     }
 
+    /// An empty in-memory corpus to populate through a bounded disk walk.
+    /// Marking it ready prevents query lanes from starting an unbounded build;
+    /// the caller must disclose the walk's coverage separately.
+    pub(crate) fn empty_ready_for_root(root: &Path) -> Self {
+        Self {
+            project_root: root.to_path_buf(),
+            ready: true,
+            ..Self::new()
+        }
+    }
+
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
         let started = Instant::now();
         let cache_dir = transient_search_cache_dir(root);
