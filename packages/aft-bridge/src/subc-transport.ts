@@ -17,7 +17,7 @@
  * published plugin dist; it is never a published runtime dependency.
  */
 
-import { existsSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 
 import type { RouteHandle } from "@cortexkit/subc-client";
 import {
@@ -1382,9 +1382,10 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   /**
-   * Check a root immediately before opening a route. The reclaim marker is only
-   * an existence hint; a directory that has already returned wins over a stale
-   * sibling marker, so the marker contents are never parsed.
+   * Check a root immediately before opening a route. Only the directory's
+   * existence decides: a reclaim marker beside it (`<root>.reclaimed`) needs
+   * no check, since an absent directory suspends the bind either way and a
+   * directory that has returned wins over a stale marker.
    */
   private rootCanAttach(root: CanonicalRootPath): boolean {
     let directoryExists = false;
@@ -1396,14 +1397,6 @@ export class SubcTransportPool implements AftTransportPool {
     if (directoryExists) {
       this.dormantRoots.delete(root);
       return true;
-    }
-
-    // Read the marker only as a latency hint. Directory absence is sufficient
-    // to suspend the bind, and the marker's JSON is intentionally irrelevant.
-    const reclaimedMarkerPresent = existsSync(`${root}.reclaimed`);
-    if (reclaimedMarkerPresent) {
-      this.markRootDormant(root);
-      return false;
     }
     this.markRootDormant(root);
     return false;
