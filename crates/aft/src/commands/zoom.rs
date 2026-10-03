@@ -110,6 +110,16 @@ thread_local! {
     static ZOOM_COORD_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_CALL_NAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ZOOM_ENRICHMENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ZOOM_FILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Files a multi-target zoom already resolved and read, keyed by the target's
+/// `file` string, plus the per-file call enrichment. Several targets in one
+/// file then share one read and one enrichment instead of each repeating it.
+#[derive(Default)]
+struct ZoomTargetMemo {
+    files: HashMap<String, (PathBuf, String)>,
+    enrichments: HashMap<PathBuf, ZoomEnrichment>,
 }
 
 struct ZoomEnrichment {
@@ -171,6 +181,8 @@ fn resolve_zoom_file(
         ));
     }
 
+    #[cfg(test)]
+    ZOOM_FILE_READS.with(|count| count.set(count.get() + 1));
     let source = std::fs::read_to_string(&path).map_err(|error| {
         Response::error(
             &req.id,
@@ -191,27 +203,33 @@ fn zoom_one_target_response(
     symbol: &str,
     context_lines: usize,
     include_callgraph: bool,
+    memo: &mut ZoomTargetMemo,
 ) -> Response {
     if is_github_read_target(file) {
         return handle_github_zoom(req, ctx, file, symbol);
     }
-    let (path, source) = match resolve_zoom_file(req, ctx, file) {
-        Ok(file) => file,
-        Err(resp) => return resp,
-    };
+    if !memo.files.contains_key(file) {
+        match resolve_zoom_file(req, ctx, file) {
+            Ok(resolved) => {
+                memo.files.insert(file.to_string(), resolved);
+            }
+            Err(resp) => return resp,
+        }
+    }
+    let (path, source) = &memo.files[file];
     let lines: Vec<&str> = source.lines().collect();
 
     zoom_one_symbol(
         req,
         ctx,
-        &path,
+        path,
         file,
-        &source,
+        source,
         &lines,
         symbol,
         context_lines,
         include_callgraph,
-        &mut HashMap::new(),
+        &mut memo.enrichments,
     )
 }
 
@@ -294,6 +312,7 @@ fn handle_zoom_targets(
     let mut entries = Vec::with_capacity(targets.len());
     let mut first_refusal: Option<String> = None;
     let mut any_usable = false;
+    let mut memo = ZoomTargetMemo::default();
     for (index, target) in targets.iter().enumerate() {
         match zoom_target_fields(target, index) {
             Ok((file, symbol, target_label)) => {
@@ -305,6 +324,7 @@ fn handle_zoom_targets(
                     symbol,
                     context_lines,
                     include_callgraph,
+                    &mut memo,
                 );
                 entries.push(serde_json::json!({
                     "targetLabel": target_label,
@@ -2787,6 +2807,49 @@ function helper(value: number): number {
             names.len() + 1
         );
         assert!(ZOOM_INDEXED_OFFSET_LOOKUPS.with(|count| count.get()) > names.len());
+    }
+
+    /// Several targets in one file share one read and one call enrichment,
+    /// and answer exactly as separate zooms would.
+    #[test]
+    fn multi_target_zoom_reads_and_enriches_each_file_once() {
+        let ctx = make_ctx();
+        let path = fixture_path("calls.ts");
+        let file = path.to_str().unwrap();
+        let names = ["helper", "compute", "orchestrate"];
+        let targets: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| serde_json::json!({ "file": file, "symbol": name }))
+            .collect();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "targets",
+            "command": "zoom",
+            "targets": targets,
+            "callgraph": true,
+        }))
+        .unwrap();
+        ZOOM_FILE_READS.with(|count| count.set(0));
+        ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(0));
+        let batch = serde_json::to_value(handle_zoom(&request, &ctx)).unwrap();
+        assert_eq!(ZOOM_FILE_READS.with(|count| count.get()), 1);
+        assert_eq!(ZOOM_ENRICHMENT_BUILDS.with(|count| count.get()), 1);
+
+        let entries = batch["targets"].as_array().expect("targets");
+        assert_eq!(entries.len(), names.len());
+        for (entry, name) in entries.iter().zip(names) {
+            let alone = zoom_one_target_response(
+                &request,
+                &ctx,
+                file,
+                name,
+                3,
+                true,
+                &mut ZoomTargetMemo::default(),
+            );
+            let single = serialize_zoom_target_response(&request, alone);
+            assert_eq!(entry["response"], single, "{name}");
+            assert_eq!(single["success"], true, "{name}: {single}");
+        }
     }
 
     #[test]
