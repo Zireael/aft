@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "perf-typescript-bridge-plugins",
+    "perf-parser-outline-zoom-pins",
+    "durability-per-store-report"
+  ],
+  "note": "No ranking-fence file is touched. Plugin and bridge hot paths (idle completion drain, NDJSON scan, async LSP extraction, cached-binary hashing, diff trimming, aft_search git probe, config reload, RPC endpoint reuse); parser, outline, zoom, symbol cache, ast tools, formatter wait and batched pin writes, with outline and zoom output byte-identical across 11,385 requests; and the durability measurement report with its macOS-only ignored census tests."
+}
