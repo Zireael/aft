@@ -256,6 +256,21 @@ fn completed_replies_render_every_plexus_shape() {
 }
 
 #[test]
+fn issue_and_pr_creation_replies_print_only_the_url_like_gh() {
+    for url in [
+        "https://github.com/org/repo/issues/42",
+        "https://github.com/org/repo/pull/43",
+    ] {
+        assert_eq!(
+            rendered(completed(Some(
+                json!({"url": url, "id": 7, "number": 42, "title": "Title"})
+            ))),
+            format!("{url}\n")
+        );
+    }
+}
+
+#[test]
 fn daemon_and_plexus_refusals_decode_with_their_stage() {
     let plexus = parse_reply(&ok_envelope(json!({
         "repo_binding_generation": 4,
@@ -790,6 +805,92 @@ fn session_agent_mismatch_names_manifest_repository_and_known_bot_without_lookup
             if known_handle { 2 } else { 1 },
             "no lookup or retry"
         );
+    }
+}
+
+#[test]
+fn governed_thread_state_confirmations_match_gh_sentences_on_stderr() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-state-output", "call-so", "/p");
+    for (verb, noun, action, state) in [
+        ("issue", "issue", "close", "closed"),
+        ("issue", "issue", "reopen", "open"),
+        ("pr", "pull request", "close", "closed"),
+        ("pr", "pull request", "reopen", "open"),
+    ] {
+        for title in [None, Some("A real title")] {
+            let mut result = json!({"state": state, "state_reason": "not_planned", "url": "https://github.com/cortexkit/aft/issues/42", "comment": {"url": "https://github.com/cortexkit/aft/issues/42#issuecomment-9"}});
+            if let Some(title) = title {
+                result["title"] = json!(title);
+            }
+            let harness = harness(ticket_gated(vec![
+                json!({"op": BOT_REQUEST_OPERATION, "status": "ok", "data": completed(Some(result))}),
+            ]));
+            let manifest = v12_manifest();
+            let mut args = vec![
+                OsString::from(verb),
+                OsString::from(action),
+                OsString::from("42"),
+                OsString::from("-R"),
+                OsString::from("cortexkit/aft"),
+            ];
+            if verb == "issue" && action == "close" {
+                args.extend([OsString::from("--reason"), OsString::from("not planned")]);
+            }
+            let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+            else {
+                panic!("not governed");
+            };
+            let request = super::super::canonicalize_governed(
+                &args,
+                &tuple,
+                &canonical,
+                manifest.manifest_version,
+            )
+            .unwrap();
+            let rung = RungDetermination::r3(
+                TEST_NOW,
+                manifest.manifest_version,
+                &RungRecordProvenance {
+                    image_path: "/shim".into(),
+                    version: "test".into(),
+                    repo_key: "cortexkit/aft".into(),
+                },
+            )
+            .record;
+            let binding = AgentBinding {
+                repo: "cortexkit/aft".into(),
+                agent_id: "alfonso-aft".into(),
+            };
+            let outcome = route(
+                &harness.paths,
+                &rung,
+                &binding,
+                request,
+                TEST_NOW,
+                &manifest,
+                &RelayContext {
+                    connection_file: Some(harness.connection_file.clone()),
+                    ticket: live.value().map(str::to_string),
+                    transient_delays: [Duration::from_millis(1); 2],
+                    relay_budget: Duration::from_secs(5),
+                },
+            );
+            let RouteOutcome::ResultStderr(text) = outcome else {
+                panic!("expected gh stderr confirmation, got {outcome:?}");
+            };
+            let past = if action == "close" {
+                "Closed"
+            } else {
+                "Reopened"
+            };
+            let suffix = title.map(|title| format!(" ({title})")).unwrap_or_default();
+            assert_eq!(text, format!("✓ {past} {noun} cortexkit/aft#42{suffix}\n"));
+            assert_eq!(
+                harness.daemon.requests.lock().unwrap().len(),
+                2,
+                "no additional title lookup"
+            );
+        }
     }
 }
 

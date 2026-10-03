@@ -299,9 +299,9 @@ pub(super) fn parse_reply(bytes: &[u8]) -> Reply {
 }
 
 /// Render a completed write the way upstream `gh` would where plexus says
-/// enough: a speech verb prints its URL, a close or reopen prints the state
-/// it applied (and the URL of the comment it posted, when there was one), and
-/// other fields go through the governed renderer. Plexus omits any field
+/// enough: a speech verb prints its URL, and other fields go through the
+/// governed renderer. Native close/reopen confirmations are rendered with
+/// their request context by `render_thread_state_confirmation`. Plexus omits any field
 /// GitHub did not return, so every field is optional; a reply with no detail
 /// prints a plain completion line.
 ///
@@ -329,6 +329,33 @@ pub(super) fn render_completed(result: &Value) -> Result<String, RouteOutcome> {
     }
     let field_order: Vec<Value> = object.keys().map(|key| json!(key)).collect();
     render_governed_response(result, &field_order)
+}
+
+/// gh v2.86.0's issue/pr close/reopen commands print these confirmations on
+/// stderr (pkg/cmd/{issue,pr}/{close,reopen}). The relay may return only state,
+/// so use the already-canonical request for the repository and number. Include
+/// a title only when GitHub returned one; do not invent it or make another read.
+fn render_thread_state_confirmation(result: &Value, request: &Value) -> Option<String> {
+    let (past, noun, segment) = match request.get("verb")?.as_str()? {
+        "issue close" => ("Closed", "issue", "issues"),
+        "issue reopen" => ("Reopened", "issue", "issues"),
+        "pr close" => ("Closed", "pull request", "pull"),
+        "pr reopen" => ("Reopened", "pull request", "pull"),
+        _ => return None,
+    };
+    let repository = request.get("repository")?.as_str()?;
+    let number = request.get("number")?;
+    let number = if let Some(number) = number.as_str() {
+        super::parse_thread_target(number, segment)?.1
+    } else {
+        number.as_u64()?
+    };
+    let title = result
+        .get("title")
+        .and_then(Value::as_str)
+        .map(|title| format!(" ({title})"))
+        .unwrap_or_default();
+    Some(format!("✓ {past} {noun} {repository}#{number}{title}\n"))
 }
 
 fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
@@ -688,16 +715,22 @@ async fn exchange(
         }
         match reply {
             Reply::Completed { result, .. } => {
-                let output = match render_completed(&result) {
-                    Ok(output) => output,
-                    Err(outcome) => return outcome,
+                let outcome = if let Some(output) =
+                    render_thread_state_confirmation(&result, &body["params"]["request"])
+                {
+                    RouteOutcome::ResultStderr(output)
+                } else {
+                    match render_completed(&result) {
+                        Ok(output) => RouteOutcome::Result(output),
+                        Err(outcome) => return outcome,
+                    }
                 };
                 if let Some(RouteOutcome::RelayRefusal { text, .. }) = &mismatch {
                     // The write already happened; say so, and leave the check
                     // cleared so the next governed write refuses up front.
                     eprintln!("gh-shim: warning: {text}");
                 }
-                return RouteOutcome::Result(output);
+                return outcome;
             }
             Reply::Malformed(message) => {
                 // The request was sent; an unreadable reply cannot prove the

@@ -2011,6 +2011,10 @@ fn governed_outcome_status(
             print!("{output}");
             0
         }
+        RouteOutcome::ResultStderr(output) => {
+            eprint!("{output}");
+            0
+        }
         RouteOutcome::StateAppliedCommentFailed(output) => {
             print!("{output}");
             UPSTREAM_FAILURE_EXIT_STATUS
@@ -4691,7 +4695,9 @@ fn invalidate_successful_github_read_mutation_at(
 ) {
     if !matches!(
         outcome,
-        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+        RouteOutcome::Result(_)
+            | RouteOutcome::ResultStderr(_)
+            | RouteOutcome::StateAppliedCommentFailed(_)
     ) {
         return;
     }
@@ -6257,6 +6263,8 @@ fn parse_thread_target(target: &str, segment: &str) -> Option<(Option<String>, u
 #[derive(Debug)]
 enum RouteOutcome {
     Result(String),
+    /// Native close/reopen confirmations go to stderr, as upstream gh does.
+    ResultStderr(String),
     StateAppliedCommentFailed(String),
     UpstreamError(String),
     Refusal(String),
@@ -6321,7 +6329,9 @@ fn route_governed(
     );
     if matches!(
         &outcome,
-        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+        RouteOutcome::Result(_)
+            | RouteOutcome::ResultStderr(_)
+            | RouteOutcome::StateAppliedCommentFailed(_)
     ) && determination.rung == Rung::R3
     {
         let mut updated = determination.clone();
@@ -14829,6 +14839,26 @@ mod github_read_mutation_tests {
             !cached_issue_exists(&conn, "cortexkit/aft", 42, "principal:bob"),
             "a successful comment invalidates every identity's cached issue"
         );
+    }
+
+    #[test]
+    fn stderr_state_confirmation_invalidates_the_changed_thread() {
+        let storage = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        write_cached_issue(&conn, "cortexkit/aft", 42, "principal:alice");
+        let request = github_read_mutation_request("issue close", "cortexkit/aft", 42);
+        let mutation = GithubReadMutation::from_governed_request(&request).unwrap();
+        invalidate_successful_github_read_mutation_at(
+            storage.path(),
+            Some(&mutation),
+            &RouteOutcome::ResultStderr("✓ Closed issue cortexkit/aft#42\n".into()),
+        );
+        assert!(!cached_issue_exists(
+            &conn,
+            "cortexkit/aft",
+            42,
+            "principal:alice"
+        ));
     }
 
     #[test]
