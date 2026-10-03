@@ -9931,9 +9931,10 @@ mod tier2_deadline_tests {
     fn tier2_pass_deadline_cooperative_stub_returns_within_grace() {
         let limiter = cold_build_limiter::isolated_limiter(1);
         let permit = limiter.try_acquire().expect("test permit");
+        let root = tempfile::tempdir().expect("existing deadline-test root");
         let started = Instant::now();
         let (value, timed_out) = run_tier2_pass_with_deadline(
-            Path::new("/tmp/tier2-timeout"),
+            root.path(),
             InspectCategory::Duplicates,
             Duration::from_millis(20),
             Some(Arc::new(Mutex::new(Some(permit)))),

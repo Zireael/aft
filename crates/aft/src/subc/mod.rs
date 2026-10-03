@@ -1650,12 +1650,7 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
     });
     // The response only reports whether a delta was written; the next sweep
     // re-reads the blocker itself, so the receiver is not awaited.
-    drop(executor.submit_maintenance_async(
-        root_id.clone(),
-        Lane::MaintenanceCommit,
-        request_id,
-        job,
-    ));
+    drop(executor.submit_unbound_teardown_async(root_id.clone(), request_id, job));
 }
 
 /// Which live roots' directories existed at one probe. The idle reaper needs
@@ -8471,7 +8466,7 @@ pub(crate) mod test_support {
         ))
     }
 
-    fn inspect_context(root: &Path) -> Arc<AppContext> {
+    pub(super) fn inspect_context(root: &Path) -> Arc<AppContext> {
         inspect_context_with_timeout(root, None)
     }
 
@@ -9588,8 +9583,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        completion_frame, reap_until_forgotten, route_identity, test_ctx, test_root,
-        wait_for_actor_root_count, wait_for_watcher_count,
+        completion_frame, inspect_context, reap_until_forgotten, route_identity, test_ctx,
+        test_root, wait_for_actor_root_count, wait_for_watcher_count,
     };
     use super::*;
     use crate::bash_background::BgTaskStatus;
@@ -11774,6 +11769,7 @@ mod tests {
         for index in 0..4 {
             let (dir, root) = test_root(&format!("thread-census-{index}"));
             let ctx = inspect_context(root.as_path());
+            ctx.set_canonical_cache_root(root.as_path().to_path_buf());
             ctx.mark_subc_bound();
             executor.register_actor(root.clone(), Arc::clone(&ctx));
             crate::commands::configure::ensure_project_watcher(&ctx);

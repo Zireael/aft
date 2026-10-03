@@ -232,19 +232,34 @@ fn parse_source(path: &Path, language: LangId, source: &str) -> Option<Tree> {
         let parser = parsers
             .get_mut(&language)
             .expect("parser inserted for language");
-        // Tree-sitter resumes a timed-out parse on the same buffer. Short slices
-        // make a large generated file interruptible without discarding its tree.
-        #[allow(deprecated)]
-        parser.set_timeout_micros(100_000);
-        loop {
-            if crate::executor::current_job_cancelled() || !path.is_file() {
-                parser.reset();
-                return None;
-            }
-            if let Some(tree) = parser.parse(source, None) {
-                return Some(tree);
-            }
+        if crate::executor::current_job_cancelled() || !path.is_file() {
+            parser.reset();
+            return None;
         }
+        // Progress callbacks interrupt large generated files without reparsing
+        // them. Throttle filesystem checks so ordinary parsing stays CPU-bound.
+        let mut last_check = Instant::now();
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if last_check.elapsed() >= std::time::Duration::from_millis(100) {
+                last_check = Instant::now();
+                if crate::executor::current_job_cancelled() || !path.is_file() {
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        };
+        let bytes = source.as_bytes();
+        let tree = parser.parse_with_options(
+            &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        );
+        if tree.is_none() {
+            // A cancelled parser keeps resumable state; the next file must not
+            // accidentally resume the abandoned source buffer.
+            parser.reset();
+        }
+        tree
     })
 }
 

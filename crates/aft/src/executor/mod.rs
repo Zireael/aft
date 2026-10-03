@@ -1499,6 +1499,30 @@ impl Executor {
         self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
     }
 
+    /// Final persistence is allowed after unbind so TTL eviction does not lose
+    /// retained deltas. This exception does not admit indexing or refresh work.
+    pub(crate) fn submit_unbound_teardown_async(
+        &self,
+        root_id: ProjectRootId,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> oneshot::Receiver<Response> {
+        let (tx, rx) = oneshot::channel();
+        self.submit_labeled(
+            root_id,
+            JobClass::Maintenance,
+            Lane::MaintenanceCommit,
+            request_id,
+            "unbound-teardown-persist".to_owned(),
+            job,
+            CompletionSender::Async(tx),
+            None,
+            None,
+            None,
+        );
+        rx
+    }
+
     #[cfg(test)]
     fn submit_maintenance_cancellable_async(
         &self,
@@ -1615,7 +1639,7 @@ impl Executor {
         rerun: Option<RepeatableJob>,
     ) {
         let cancellation = if job_class == JobClass::Maintenance || command == "inspect" {
-            Some(cancellation.unwrap_or_default())
+            Some(cancellation.unwrap_or_else(JobCancellation::new))
         } else {
             cancellation
         };
@@ -1632,7 +1656,10 @@ impl Executor {
                 Some(actor) => {
                     let mut admission_error = None;
                     if job_class == JobClass::Maintenance {
-                        if actor.ctx.subc_unbound_quiesced() || !root_id.as_path().is_dir() {
+                        if (actor.ctx.subc_unbound_quiesced()
+                            && command != "unbound-teardown-persist")
+                            || !root_id.as_path().is_dir()
+                        {
                             admission_error = Some(maintenance_cancelled_response(
                                 request_id.clone(),
                                 "maintenance root is unbound or missing",
@@ -3814,7 +3841,9 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
     let run = |job: ExecutorJob| {
         if cancel_requested()
             || ((run_job.job_class == JobClass::Maintenance || run_job.command == "inspect")
-                && (run_job.ctx.subc_unbound_quiesced() || !run_job.root_id.as_path().is_dir()))
+                && ((run_job.ctx.subc_unbound_quiesced()
+                    && run_job.command != "unbound-teardown-persist")
+                    || !run_job.root_id.as_path().is_dir()))
         {
             return cancelled_before_execution();
         }

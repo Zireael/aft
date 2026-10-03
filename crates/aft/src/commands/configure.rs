@@ -8842,7 +8842,7 @@ mod tests {
         // after deletion, without depending on a later filesystem walk.
         fs::write(
             project_root.join("lib.rs"),
-            "pub fn alpha() -> u32 { 1 }\npub fn beta() -> u32 { 2 }\npub fn gamma() -> u32 { 3 }\n",
+            "pub fn alpha() -> u32 {\n    1\n}\npub fn beta() -> u32 {\n    2\n}\npub fn gamma() -> u32 {\n    3\n}\n",
         )
         .expect("write semantic chunks");
         let ctx = Arc::new(AppContext::new(
@@ -8911,9 +8911,10 @@ mod tests {
                 Response::success("delayed-semantic-refresh", json!({ "worker_exited": true }))
             }),
         );
-        entered_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("real refresh reached delayed embedding batch");
+        if let Err(error) = entered_rx.recv_timeout(Duration::from_secs(10)) {
+            let events = observed_rx.recv_timeout(Duration::from_secs(10));
+            panic!("real refresh did not reach embedding: {error}; events={events:?}");
+        }
         assert_eq!(batches.load(Ordering::SeqCst), 1);
         if delete_root {
             directory.close().expect("delete semantic root mid-refresh");

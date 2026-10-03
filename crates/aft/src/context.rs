@@ -2824,6 +2824,9 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
+    deleted_view_root_retired: AtomicBool,
+    #[cfg(test)]
+    view_publication_attempts: AtomicUsize,
     checkout_driver: crate::views::first_load::InstalledDriver,
     /// The views-on semantic lane of this root (see `views::semantic_runtime`).
     checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
@@ -3474,6 +3477,9 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
+            deleted_view_root_retired: AtomicBool::new(false),
+            #[cfg(test)]
+            view_publication_attempts: AtomicUsize::new(0),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
             checkout_semantic: Arc::default(),
             view_disk_limits_next_ms,
@@ -6137,6 +6143,8 @@ impl AppContext {
         snapshot: ViewRuntimeSnapshot,
         pin: Option<crate::pins::QueryPin>,
     ) {
+        self.deleted_view_root_retired
+            .store(false, Ordering::Release);
         *self
             .view_runtime
             .write()
@@ -6144,6 +6152,33 @@ impl AppContext {
             snapshot,
             pin: pin.map(Arc::new),
         });
+    }
+
+    /// A deleted checkout has no publication consumer. Retire once rather than
+    /// letting watcher quiet-window retries spawn git indefinitely.
+    pub(crate) fn retire_deleted_view_root(&self) -> bool {
+        let missing = self
+            .canonical_cache_root_opt()
+            .is_some_and(|root| !root.is_dir());
+        if !missing && !self.deleted_view_root_retired.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.deleted_view_root_retired.swap(true, Ordering::AcqRel) {
+            crate::executor::view_publication::cancel_for_context(self);
+            self.clear_view_runtime();
+            log::info!(
+                "content-addressed view publication retired deleted root={}",
+                self.canonical_cache_root_opt()
+                    .unwrap_or_default()
+                    .display()
+            );
+        }
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_publication_attempts_for_test(&self) -> usize {
+        self.view_publication_attempts.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_view_runtime(&self) {
@@ -6199,6 +6234,9 @@ impl AppContext {
     }
 
     pub(crate) fn refresh_view_head_for_watcher(&self, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+        if self.retire_deleted_view_root() {
+            return BTreeSet::new();
+        }
         let Some(root) = self.canonical_cache_root_opt() else {
             return BTreeSet::new();
         };
@@ -6276,8 +6314,14 @@ impl AppContext {
         allow_blob_put: bool,
         phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
     ) -> Result<PreparedViewUpdate, String> {
+        #[cfg(test)]
+        self.view_publication_attempts
+            .fetch_add(1, Ordering::AcqRel);
         let content_generation = self.configure_content_generation();
         phase("manifest").map_err(|error| error.to_string())?;
+        if self.retire_deleted_view_root() {
+            return Err("view publication root was deleted".to_owned());
+        }
         let snapshot = self
             .view_runtime_snapshot()
             .ok_or_else(|| "view runtime is not configured".to_string())?;

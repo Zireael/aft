@@ -3072,7 +3072,7 @@ fn semantic_ready_view_publication_paths(
     pending.filter(|paths| !paths.is_empty())
 }
 
-fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
+pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     if !ctx.config().views.enabled
         || !matches!(state.phase, WatcherDrainPhase::Collect)
         || state
@@ -3084,6 +3084,16 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
     };
+    if ctx.retire_deleted_view_root() {
+        state.view_publication_due = None;
+        state.view_publication_paths.clear();
+        return;
+    }
+    if ctx.view_runtime_snapshot().is_none() {
+        state.view_publication_due = None;
+        state.view_publication_paths.clear();
+        return;
+    }
     let changed = state
         .view_publication_paths
         .iter()
@@ -3105,6 +3115,11 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
             state.view_publication_due = None;
         }
         Err(error) => {
+            if ctx.retire_deleted_view_root() || ctx.view_runtime_snapshot().is_none() {
+                state.view_publication_due = None;
+                state.view_publication_paths.clear();
+                return;
+            }
             aft::slog_warn!(
                 "content-addressed view publication failed root={} error={}",
                 root.display(),

@@ -441,3 +441,48 @@ fn publication_health_reports_root_and_each_off_lane_phase() {
         fixture.wait_idle();
     }
 }
+
+#[test]
+fn deleted_root_pending_publication_retires_once_without_rescheduling() {
+    let fixture = Fixture::new();
+    fixture.change("next");
+    let root = fixture.job_root();
+    let before = fixture.ctx.view_publication_attempts_for_test();
+    let gate = Gate::new(&root, "manifest");
+    let completions = Completions::new(root.clone());
+    fixture.schedule();
+    gate.started();
+    std::fs::remove_dir_all(fixture.project.path()).unwrap();
+    drop(gate);
+    completions.next();
+    fixture.wait_idle();
+    assert_eq!(
+        fixture.ctx.view_publication_attempts_for_test(),
+        before + 1,
+        "pending publication must make exactly one preparation attempt"
+    );
+    assert!(
+        fixture.ctx.view_runtime_snapshot().is_none(),
+        "deletion must retire views state, not just stop the current thread"
+    );
+    // Repeated quiet-window ticks simulate watcher publication retries after
+    // checkout deletion. Late paths must not recreate a retired publication.
+    let mut state = crate::context::WatcherDrainSliceState::new(
+        fixture.ctx.configure_generation(),
+        fixture.ctx.configure_content_generation(),
+    );
+    for _ in 0..3 {
+        state.view_publication_due = Some(Instant::now());
+        state.view_publication_paths.insert(root.join("tracked.rs"));
+        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+        assert!(state.view_publication_due.is_none());
+        assert!(state.view_publication_paths.is_empty());
+        assert!(schedule(&fixture.ctx, BTreeSet::new(), true).is_ok());
+    }
+    assert_eq!(
+        fixture.ctx.view_publication_attempts_for_test(),
+        before + 1,
+        "deleted publication must never be re-scheduled"
+    );
+    assert!(!running_for_context(&fixture.ctx));
+}

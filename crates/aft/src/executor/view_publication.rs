@@ -190,6 +190,9 @@ pub(crate) fn schedule(
     mut paths: BTreeSet<Vec<u8>>,
     allow_blob_put: bool,
 ) -> Result<(), String> {
+    if ctx.retire_deleted_view_root() {
+        return Ok(());
+    }
     let target = CURRENT.with(|slot| slot.borrow().clone());
     let Some(target) = target.filter(|target| std::ptr::eq(ctx, target.ctx.as_ref())) else {
         return ctx.publish_view_paths(paths, allow_blob_put).map(|_| ());
@@ -234,6 +237,9 @@ pub(crate) fn schedule(
         .spawn(move || {
             let _cancellation = super::install_job_cancellation(token.clone());
             loop {
+                if target.ctx.retire_deleted_view_root() {
+                    break;
+                }
                 if token.cancel_requested_before_commit()
                     || target.ctx.configure_content_generation() != content_generation
                     || target.ctx.subc_unbound_quiesced()
@@ -287,6 +293,9 @@ pub(crate) fn schedule(
                 match result {
                     Ok(()) => break,
                     Err(error) => {
+                        if target.ctx.retire_deleted_view_root() || target.ctx.view_runtime_snapshot().is_none() {
+                            break;
+                        }
                         log::warn!("content-addressed view publication failed: {}", error);
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.
