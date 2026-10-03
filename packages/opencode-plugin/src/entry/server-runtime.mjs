@@ -19,6 +19,7 @@ import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
+import { registerV2ToolHooks } from "../v2-tool-hooks.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
   buildAftToolDefinitions,
@@ -36,6 +37,7 @@ const defaults = {
   registerRpc: registerAftRpc,
   registerConfigErrorRpc: registerAftConfigErrorRpc,
   registerPromptHook: registerV2PromptDetachHook,
+  registerToolHooks: registerV2ToolHooks,
   // The prompt server comes from the user-only `opencode` block of the
   // Location's config; without it AFT finds the server it runs inside.
   toolConsumers: (context, config) => ({
@@ -229,6 +231,7 @@ export function makeServerEffect(overrides = {}) {
         runtime.tools,
         runtime.consumers,
       );
+      yield* dependencies.registerToolHooks(context, runtime.toolContext, new Set(Object.keys(runtime.tools)));
     });
   };
 }

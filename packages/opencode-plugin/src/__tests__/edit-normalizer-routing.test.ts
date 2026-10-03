@@ -73,6 +73,7 @@ test("edit argument normalizer call sites stay behind the audited plugin boundar
     "packages/opencode-plugin/src/index.ts:prepareOpenCodeArguments:3",
     "packages/opencode-plugin/src/normalize-schemas.ts:prepareCanonicalEditArguments:2",
     "packages/opencode-plugin/src/normalize-schemas.ts:prepareOpenCodeArguments:3",
+    "packages/opencode-plugin/src/v2-tool-hooks.ts:prepareOpenCodeArguments:3",
     "packages/pi-plugin/src/tools/_shared.ts:prepareCanonicalEditArguments:2",
   ]);
 });
