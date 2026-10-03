@@ -177,6 +177,14 @@ describe("resolveBashConfig", () => {
     ).toBe(1_800_000);
   });
 
+  test("worker_wait_max_ms defaults to 30 minutes and takes a configured value", () => {
+    expect(resolveBashConfig(cfg({})).worker_wait_max_ms).toBe(1_800_000);
+    expect(resolveBashConfig(cfg({ bash: true })).worker_wait_max_ms).toBe(1_800_000);
+    expect(
+      resolveBashConfig(cfg({ bash: { worker_wait_max_ms: 5_400_000 } })).worker_wait_max_ms,
+    ).toBe(5_400_000);
+  });
+
   // ---- Reminder tuning carries through ---------------------------------
 
   test("long_running_reminder_* on top-level carries through", () => {

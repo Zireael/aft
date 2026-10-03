@@ -426,6 +426,13 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
               },
+              worker_wait_max_ms: {
+                type: "integer",
+                minimum: 60000,
+                default: 1800000,
+                description:
+                  "Longest a delegated worker (subagent) waits on one command before control returns to it, in milliseconds: a bash_watch without a timeout, or a bash call that blocks until the command finishes (wait: true, or every foreground call when subagent_background is false). The command keeps running in the background; the worker is told it is still running and can wait again or kill it. While a worker keeps waiting, the command's default 30-minute hard kill is pushed back by this much. Default 1800000 (30 minutes); values below 60000 are a config error. Project-safe.",
+              },
               linux_scope: {
                 type: "boolean",
                 default: false,

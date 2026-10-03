@@ -7,6 +7,7 @@ import {
   isTerminalStatus,
   maxWatchTimeoutMs,
   resolveWatchTimeoutMs,
+  taskKillDeadlineText,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -15,6 +16,7 @@ import {
   watchPollDelayMs,
   watchTimeoutSteer,
   watchUnavailableSteer,
+  workerWatchStillRunning,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -152,14 +154,15 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       const syncWaitCap = bashCfg.watch_sync_max_ms;
       const role: WatchCallerRole = isSubagent ? "worker" : "primary";
       // A worker's async request that was turned into a sync wait keeps the
-      // async request's meaning, "tell me when it's done", so it waits with no
-      // deadline like any worker watch without a timeout.
+      // async request's meaning, "tell me when it's done", so it waits like any
+      // worker watch without a timeout: up to the worker wait limit.
       const effectiveWaitMs = subagentForcedSync
-        ? undefined
+        ? bashCfg.worker_wait_max_ms
         : resolveWatchTimeoutMs(
             coerceConfiguredWatchTimeout(args.timeoutMs, role, syncWaitCap),
             role,
             syncWaitCap,
+            bashCfg.worker_wait_max_ms,
           );
       const data = await waitForBashStatus(
         ctx,
@@ -186,11 +189,15 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;
         metadata?.({ taskId, status: data.status, waited, convertedToAsync: true });
-        return convertedText;
+        return withKillDeadline(convertedText, data, role);
       }
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
       if (waited) metadata?.({ taskId, status: data.status, waited, effectiveWaitMs });
-      return formatWatchResultText(taskId, data, waited, role, syncWaitCap);
+      return withKillDeadline(
+        formatWatchResultText(taskId, data, waited, role, syncWaitCap),
+        data,
+        role,
+      );
     },
   };
 }
@@ -268,6 +275,19 @@ async function convertToAsyncWatchOnAbort(
   }
 }
 
+/**
+ * Every watch result also names the task's own kill deadline (or the limit
+ * that killed it), kept apart from how long the watch waited.
+ */
+function withKillDeadline(
+  text: string,
+  data: Record<string, unknown>,
+  role: WatchCallerRole,
+): string {
+  const deadline = taskKillDeadlineText(data, role);
+  return deadline === "" ? text : `${text}\n${deadline}`;
+}
+
 function formatWatchResultText(
   taskId: string,
   data: Record<string, unknown>,
@@ -290,11 +310,19 @@ function formatWatchResultText(
     if (waited.reason === "matched") {
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
       text += `\n${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
-    } else if (waited.reason === "timeout") {
+    } else if (waited.reason === "timeout" && role === "worker") {
       // A watch deadline is not a failure of the command, and a delegated
-      // worker that reads it as one declares a failed result mid-run. Tell
-      // the caller what it is and the move that fits its own role.
-      text += `\n${waitedText}; timeout reached without match. ${watchTimeoutSteer(role)}`;
+      // worker that reads it as one declares a failed result mid-run. Tell it
+      // the command is still running, how long it has run and what it last
+      // printed, and how to wait again or stop it.
+      text += `\n${waitedText}; timeout reached without match. ${workerWatchStillRunning({
+        taskId,
+        waitedMs: waited.elapsed_ms,
+        ranMs: typeof data.duration_ms === "number" ? data.duration_ms : undefined,
+        output: data.output_preview as string | undefined,
+      })}`;
+    } else if (waited.reason === "timeout") {
+      text += `\n${waitedText}; timeout reached without match. ${watchTimeoutSteer()}`;
     } else if (waited.reason === "unavailable") {
       text += `\n${waitedText}; ${watchUnavailableSteer(role)}`;
     } else if (waited.reason === "aborted") {

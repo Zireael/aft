@@ -25,6 +25,18 @@ pub const DEFAULT_INSPECT_TIER2_PASS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
 pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
 pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
+/// How long a delegated worker's wait on one command blocks before control
+/// returns to the worker (`bash.worker_wait_max_ms`): a `bash_watch` without a
+/// timeout, or a blocking `bash` call (`wait: true`, or every foreground call
+/// when `bash.subagent_background` is false), which then moves to the
+/// background instead of being killed. The worker then
+/// decides whether to wait again or kill the command, so a stuck command can
+/// never hold a worker for longer than this.
+pub const DEFAULT_BASH_WORKER_WAIT_MAX_MS: u64 = 1_800_000;
+/// Smallest accepted `bash.worker_wait_max_ms`. A shorter limit would make a
+/// worker re-wait (and re-read its whole context) every few seconds; a value
+/// below it is a config error rather than a silent clamp.
+pub const MIN_BASH_WORKER_WAIT_MAX_MS: u64 = 60_000;
 
 /// Unbound-root artifact eviction idle window, in minutes.
 pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
@@ -53,6 +65,10 @@ const fn default_bash_detach_on_user_message() -> bool {
 
 pub(crate) const fn default_bash_watch_sync_max_ms() -> u64 {
     DEFAULT_BASH_WATCH_SYNC_MAX_MS
+}
+
+pub(crate) const fn default_bash_worker_wait_max_ms() -> u64 {
+    DEFAULT_BASH_WORKER_WAIT_MAX_MS
 }
 
 use crate::harness::Harness;
@@ -569,6 +585,13 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_watch_sync_max_ms")]
     pub watch_sync_max_ms: u64,
+    /// Longest a delegated worker's wait on one command blocks before control
+    /// returns to it; see [`DEFAULT_BASH_WORKER_WAIT_MAX_MS`]. The engine caps
+    /// a worker's blocking bash call with it, and each wait a worker makes on a
+    /// task without its own timeout pushes that task's default hard kill to at
+    /// least this long after the wait.
+    #[serde(default = "default_bash_worker_wait_max_ms")]
+    pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
@@ -583,6 +606,7 @@ impl Default for BashConfig {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
+            worker_wait_max_ms: default_bash_worker_wait_max_ms(),
             linux_scope: false,
             powershell_tool: false,
         }
@@ -875,6 +899,13 @@ mod tests {
         let parsed: BashConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed.watch_sync_max_ms, DEFAULT_BASH_WATCH_SYNC_MAX_MS);
         assert_eq!(BashConfig::default().watch_sync_max_ms, 120_000);
+    }
+
+    #[test]
+    fn bash_worker_wait_max_defaults_to_thirty_minutes_when_deserialized() {
+        let parsed: BashConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.worker_wait_max_ms, DEFAULT_BASH_WORKER_WAIT_MAX_MS);
+        assert_eq!(BashConfig::default().worker_wait_max_ms, 1_800_000);
     }
 
     #[test]

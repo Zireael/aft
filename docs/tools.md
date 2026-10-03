@@ -233,7 +233,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | Param | Type | Description |
 |---|---|---|
 | `command` | string | Shell command to execute |
-| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset, except a delegated (subagent) session's `wait: true` call, which has no hard kill unless one is passed. NOT a polling window — see below. |
+| `timeout` | number | Hard-kill cap in milliseconds (positive integer). Default 30 minutes when unset; while a delegated (subagent) session keeps waiting on the command, each wait pushes that default to at least `bash.worker_wait_max_ms` after the wait. An explicit `timeout` is never extended. NOT a polling window — see below. |
 | `workdir` | string | Working directory for command execution |
 | `description` | string | Short human-readable summary for harness UI metadata |
 | `background` | boolean | Spawn detached and return a `taskId` (requires the background flag) |
@@ -353,8 +353,17 @@ waits are for a short remaining wait on a task (default 30s, max `bash.watch_syn
 by default); for anything longer end the turn on `bash({background:true})` and let the completion
 reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. In a
 delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
-`timeoutMs` has no deadline and returns when the task exits, and an explicit `timeoutMs` is used
-as given rather than capped. Sync mode
+`timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
+then reports the command is still running with how long it has run and its latest output; the
+worker watches again to keep waiting or kills it. An explicit `timeoutMs` is used as given rather
+than capped. A delegated session's blocking `bash` call (`wait: true`, or any foreground call when
+`bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
+background, not killed, and the reply gives its task id. The wait limit is not the task's kill
+deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`
+result also names the task's own deadline ("AFT kills this task once it has run 30 minutes (its
+default background limit)…", or the `timeout` you passed), and a task killed by it is reported by
+name ("killed by AFT's default background limit of 30 minutes (exit 124)") rather than as a bare
+timeout. Sync mode
 waits until a `pattern` matches, the task exits, `timeoutMs` elapses, a new message arrives, or the
 call is aborted. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default

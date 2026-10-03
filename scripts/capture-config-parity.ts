@@ -213,6 +213,32 @@ const CASES: ParityCase[] = [
     project: { bash: { watch_sync_max_ms: 1800000 } },
   },
   {
+    // `bash.worker_wait_max_ms` only changes how long a worker waits, so a
+    // project may set it, and a harness block overrides it like any bash key.
+    name: "bash_worker_wait_project_override",
+    harness: "opencode",
+    user: {
+      bash: { worker_wait_max_ms: 600000 },
+      harnesses: { opencode: { bash: { worker_wait_max_ms: 900000 } } },
+    },
+    project: { bash: { worker_wait_max_ms: 120000 } },
+  },
+  {
+    name: "bash_worker_wait_harness_override",
+    harness: "pi",
+    user: {
+      bash: { worker_wait_max_ms: 600000 },
+      harnesses: { pi: { bash: { worker_wait_max_ms: 2700000 } } },
+    },
+  },
+  {
+    // Below the one-minute minimum is a config error, not a clamp: the
+    // invalid `bash` block is dropped (its `compress: false` too) and the rest
+    // of the file still loads.
+    name: "bash_worker_wait_below_minimum",
+    user: { format_on_edit: false, bash: { compress: false, worker_wait_max_ms: 59999 } },
+  },
+  {
     name: "index_roots_user_semantic_closure",
     user: { index: { roots: [{ path: "~/.aft-standing-root", indexes: ["semantic"] }] } },
   },

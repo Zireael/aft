@@ -75,6 +75,9 @@ enum BashSpawnControl {
         wait_window_ms: u64,
         detach_on_user_message: bool,
         worker_session: bool,
+        /// The worker wait limit bounding this wait, when it is a delegated
+        /// worker's blocking call (`wait: true` or `block_to_completion`).
+        worker_cap_ms: Option<u64>,
     },
 }
 
@@ -128,13 +131,22 @@ struct DeferredWaitObservation {
 /// terminal snapshot may render cached output from disk. Doing either inline
 /// stops the frame loop, so no route's frames are read or written until the
 /// lock frees. Here the frame loop only awaits.
+///
+/// `renew_window` is set for a delegated worker's capped wait: the worker is
+/// waiting on its command, so each wake keeps the task's default hard kill at
+/// least that far away, and the kill cannot fire before the cap hands control
+/// back to the worker.
 async fn observe_deferred_bash_wait(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
     session_id: String,
     wait_mode: bool,
+    renew_window: Option<Duration>,
 ) -> DeferredWaitObservation {
     tokio::task::spawn_blocking(move || {
+        if let Some(window) = renew_window {
+            registry.renew_hard_kill(&task_id, &session_id, window);
+        }
         let target_finished = registry
             .observed_status(&task_id, &session_id, 0)
             .is_none_or(|snapshot| snapshot.info.status.is_terminal());
@@ -211,7 +223,11 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 let response = Response::success(
                     &target.request_id,
                     json!({
-                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
+                        "output": format!(
+                        "{}{}",
+                        crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
+                        crate::commands::bash_orchestrate::kill_deadline_note(&target.registry, &target.task_id, &target.session_id, target.worker_session),
+                    ),
                         "task_id": target.task_id,
                         "status": "running",
                     }),
@@ -350,11 +366,15 @@ fn bash_background_launch_response(
     task_id: &str,
     is_pty: bool,
     worker_session: bool,
+    deadline_note: &str,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session),
+            "output": format!(
+                "{}{deadline_note}",
+                crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session)
+            ),
             "task_id": task_id,
             "status": "running",
             "mode": if is_pty { "pty" } else { "pipes" },
@@ -613,6 +633,12 @@ pub(super) fn submit_deferred_bash(
                         &task_id,
                         is_pty,
                         worker_session,
+                        &crate::commands::bash_orchestrate::kill_deadline_note(
+                            ctx.bash_background(),
+                            &task_id,
+                            &session_for_spawn,
+                            worker_session,
+                        ),
                     );
                     return finish_bash_spawn_immediate(
                         response,
@@ -626,12 +652,20 @@ pub(super) fn submit_deferred_bash(
                     );
                 }
 
-                let wait_window_ms =
+                // A server-owned call is killed rather than detached when it
+                // ends, so the worker wait limit (which detaches) leaves it be.
+                let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
+                    worker_session && !server_completion,
+                    settings.block_to_completion || settings.wait,
+                    crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
+                );
+                let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
                     crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
                         ctx.config().foreground_wait_window_ms,
                         settings.timeout,
                         settings.wait,
-                    );
+                    )
+                });
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
                 let project_root = ctx.config().project_root.clone();
                 // Register the session as detachable exactly like the
@@ -652,11 +686,14 @@ pub(super) fn submit_deferred_bash(
                         project_root,
                         storage_dir,
                         deadline,
-                        block_to_completion: settings.block_to_completion || settings.wait,
+                        // A capped worker wait detaches at its deadline.
+                        block_to_completion: (settings.block_to_completion || settings.wait)
+                            && worker_cap_ms.is_none(),
                         timeout: settings.timeout,
                         wait_window_ms,
                         detach_on_user_message,
                         worker_session,
+                        worker_cap_ms,
                     });
                 }
                 response
@@ -712,6 +749,7 @@ pub(super) fn submit_deferred_bash(
                 wait_window_ms,
                 detach_on_user_message,
                 worker_session,
+                worker_cap_ms,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -743,6 +781,7 @@ pub(super) fn submit_deferred_bash(
                     wait_window_ms,
                     detach_on_user_message,
                     worker_session,
+                    worker_cap_ms,
                     format_context,
                     cancel,
                     claim,
@@ -794,6 +833,7 @@ async fn run_deferred_bash_wait(
     wait_window_ms: u64,
     detach_on_user_message: bool,
     worker_session: bool,
+    worker_cap_ms: Option<u64>,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
@@ -897,6 +937,7 @@ async fn run_deferred_bash_wait(
                     task_id.clone(),
                     session_id.clone(),
                     detach_on_user_message,
+                    worker_cap_ms.map(Duration::from_millis),
                 )
                 .await
             } => {
@@ -1189,6 +1230,7 @@ async fn run_deferred_bash_wait(
                             timeout,
                             wait_window_ms,
                             worker_session,
+                            worker_cap_ms.is_some(),
                             format_context.clone(),
                             repeat.clone(),
                         )
@@ -1225,6 +1267,7 @@ async fn submit_bash_promote(
     timeout: Option<u64>,
     wait_window_ms: u64,
     worker_session: bool,
+    capped_worker_wait: bool,
     format_context: crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
@@ -1259,6 +1302,7 @@ async fn submit_bash_promote(
                         wait_window_ms,
                         &request_id_for_promote,
                         worker_session,
+                        capped_worker_wait,
                     )
                 };
                 let result = finalized_bash_result(

@@ -210,17 +210,21 @@ impl BgTaskStatus {
 /// When a background bash task is killed for running too long (its hard kill).
 ///
 /// Every spawn names one explicitly, so no caller can drop the default by
-/// passing an empty timeout by accident.
+/// passing an empty timeout by accident. There is deliberately no "never"
+/// variant: a delegated worker that blocked on a command with no hard kill once
+/// sat behind a stuck test run for fifteen hours. Instead a worker's wait is
+/// capped (`bash.worker_wait_max_ms`), and each wait it makes pushes a
+/// [`HardKill::Default`] task's kill later (see
+/// [`registry::BgTaskRegistry::renew_hard_kill`]), so a long build the worker
+/// keeps watching runs to completion while one it stops watching is still
+/// killed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardKill {
-    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes).
+    /// The registry's default, [`registry::DEFAULT_BG_TIMEOUT`] (30 minutes),
+    /// extended by a delegated worker's waits on the task.
     Default,
-    /// Never killed for running too long. Only a delegated worker's
-    /// `wait: true` call without a timeout uses this: the worker blocks until
-    /// the command finishes and cannot be woken later, so an implicit kill
-    /// would only cut a long build short.
-    Never,
     /// Killed once it has run this long (the caller's explicit `timeout`).
+    /// Never extended: the caller chose the limit.
     After(Duration),
 }
 
@@ -231,13 +235,18 @@ impl HardKill {
         timeout_ms.map_or(Self::Default, |ms| Self::After(Duration::from_millis(ms)))
     }
 
-    /// How long the task may run, or `None` when it is never killed for it.
-    pub fn limit(self) -> Option<Duration> {
+    /// How long the task may run before its first renewal.
+    pub fn limit(self) -> Duration {
         match self {
-            Self::Default => Some(registry::DEFAULT_BG_TIMEOUT),
-            Self::Never => None,
-            Self::After(limit) => Some(limit),
+            Self::Default => registry::DEFAULT_BG_TIMEOUT,
+            Self::After(limit) => limit,
         }
+    }
+
+    /// Whether a delegated worker's wait may push the kill later. Only the
+    /// implicit default is; an explicit timeout is the caller's own limit.
+    pub fn renewable(self) -> bool {
+        matches!(self, Self::Default)
     }
 }
 

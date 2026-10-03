@@ -1,0 +1,12 @@
+{
+  "bash": {
+    "worker_wait_max_ms": 600000
+  },
+  "harnesses": {
+    "opencode": {
+      "bash": {
+        "worker_wait_max_ms": 900000
+      }
+    }
+  }
+}

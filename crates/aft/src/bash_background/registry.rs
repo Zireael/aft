@@ -261,6 +261,41 @@ fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// Where a task's hard kill comes from, so replies can tell AFT's default
+/// background limit apart from a `timeout` the caller passed.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HardKillSource {
+    /// AFT's default background limit ([`DEFAULT_BG_TIMEOUT`]), possibly
+    /// extended by a delegated worker's waits.
+    Default,
+    /// The caller's explicit `timeout`.
+    Timeout,
+}
+
+/// A task's own kill deadline: it is killed once it has run `limit_ms`.
+/// Distinct from how long any wait on it lasts.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct HardKillDeadline {
+    pub limit_ms: u64,
+    pub source: HardKillSource,
+}
+
+impl HardKillDeadline {
+    /// The deadline a task record carries. `renewable` is known only for a
+    /// task this process started; otherwise a limit equal to the default is
+    /// taken to be the default.
+    fn from_metadata(timeout_ms: Option<u64>, renewable: bool) -> Option<Self> {
+        let limit_ms = timeout_ms?;
+        let source = if renewable || limit_ms == DEFAULT_BG_TIMEOUT.as_millis() as u64 {
+            HardKillSource::Default
+        } else {
+            HardKillSource::Timeout
+        };
+        Some(Self { limit_ms, source })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BgTaskSnapshot {
     #[serde(flatten)]
@@ -295,6 +330,13 @@ pub struct BgTaskSnapshot {
     pub kill_signaled: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub kill_reached: usize,
+    /// The task's own kill deadline, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_kill: Option<HardKillDeadline>,
+    /// How long a still-running task has run so far (`duration_ms` is only
+    /// set once it ends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -525,6 +567,11 @@ pub(crate) struct BgTask {
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
     pub(crate) started: Instant,
+    /// Whether a delegated worker's wait may push this task's hard kill later
+    /// ([`BgTaskRegistry::renew_hard_kill`]): true only for the implicit
+    /// default kill. A task rehydrated after a restart is not renewable, so it
+    /// keeps the kill its record carries.
+    hard_kill_renewable: bool,
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
@@ -2268,7 +2315,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
+        let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
         } else {
@@ -2395,6 +2442,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            hard_kill_renewable: hard_kill.renewable(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -2497,7 +2545,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
+        let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
         #[cfg(unix)]
         let (spawn_plan, task_layout) = if let Some(prepared) = spawn_plan.prepared_task() {
             (spawn_plan.clone(), prepared.resolved_task())
@@ -2598,6 +2646,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            hard_kill_renewable: hard_kill.renewable(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -2695,7 +2744,7 @@ impl BgTaskRegistry {
             ));
         }
 
-        let timeout_ms = hard_kill.limit().map(|limit| limit.as_millis() as u64);
+        let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
         let task_layout = allocate_task_layout(&storage_dir, &session_id)
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
@@ -2758,6 +2807,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            hard_kill_renewable: hard_kill.renewable(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
             kill_settled: std::sync::Condvar::new(),
@@ -4706,9 +4756,95 @@ impl BgTaskRegistry {
         Ok(true)
     }
 
+    /// Pushes a running task's implicit default hard kill to at least `window`
+    /// from now, because a delegated worker is waiting on it. Returns the
+    /// task's new limit (milliseconds since it started) when it was extended.
+    ///
+    /// A worker's wait is capped (`bash.worker_wait_max_ms`) and the worker
+    /// then waits again if it wants the result, so a long build it keeps
+    /// watching would otherwise hit the 30-minute default kill, a timer the
+    /// worker cannot see. Each wait therefore grants another window; once the
+    /// worker stops waiting the task is killed at most `window` later, so
+    /// nothing runs unbounded. An explicit timeout is never extended, and the
+    /// limit only ever grows. The new limit is kept in memory; it reaches the
+    /// task's record with the next metadata write (for example a promotion).
+    pub(crate) fn renew_hard_kill(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        window: Duration,
+    ) -> Option<u64> {
+        let task = self.task_for_session(task_id, session_id)?;
+        if !task.hard_kill_renewable {
+            return None;
+        }
+        let mut state = task.state.lock().ok()?;
+        if state.metadata.status.is_terminal() {
+            return None;
+        }
+        let wanted = task.started.elapsed().saturating_add(window).as_millis() as u64;
+        let current = state.metadata.timeout_ms?;
+        if wanted <= current {
+            return None;
+        }
+        state.metadata.timeout_ms = Some(wanted);
+        Some(wanted)
+    }
+
+    /// Kills a task whose hard kill has come due, recording which limit
+    /// killed it. A worker that only sees "timed out, exit 124" cannot tell
+    /// AFT's own default limit from its command failing, and once read the
+    /// kill as a failed gate and re-ran the command twice more.
     pub(crate) fn kill_for_timeout(&self, task_id: &str, session_id: &str) -> Result<(), String> {
-        self.kill_with_status(task_id, session_id, BgTaskStatus::TimedOut)
-            .map(|_| ())
+        let reason = self.task_for_session(task_id, session_id).and_then(|task| {
+            let state = task.state.lock().ok()?;
+            HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
+        });
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::TimedOut,
+            reason.map(hard_kill_reason),
+        )
+        .map(|_| ())
+    }
+
+    /// The task's own kill deadline, for replies that hand the task back.
+    pub(crate) fn hard_kill_deadline(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Option<HardKillDeadline> {
+        let task = self.task_for_session(task_id, session_id)?;
+        let state = task.state.lock().ok()?;
+        HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
+    }
+
+    /// The task's current hard-kill limit in milliseconds since it started.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hard_kill_limit_ms_for_test(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Option<u64> {
+        let task = self.task_for_session(task_id, session_id)?;
+        let state = task.state.lock().ok()?;
+        state.metadata.timeout_ms
+    }
+
+    /// Replaces the task's hard-kill limit, so a test can bring the kill close
+    /// without waiting out the 30-minute default.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_hard_kill_limit_ms_for_test(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        limit_ms: u64,
+    ) {
+        let task = self
+            .task_for_session(task_id, session_id)
+            .expect("task for hard-kill limit");
+        task.state.lock().unwrap().metadata.timeout_ms = Some(limit_ms);
     }
 
     pub fn cleanup_finished(&self, older_than: Duration) {
@@ -5394,6 +5530,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started,
+            hard_kill_renewable: false,
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
             kill_settled: std::sync::Condvar::new(),
@@ -7766,6 +7903,23 @@ fn task_bundle_is_absent(storage_dir: &Path, session_id: &str, task_id: &str) ->
     !session_dir.join(task_id).exists() && !session_dir.join(format!("{task_id}.json")).exists()
 }
 
+/// A task killed by its hard kill, named by the limit that killed it.
+pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
+    let limit = crate::commands::bash_orchestrate::format_wait_limit(deadline.limit_ms);
+    let default_ms = DEFAULT_BG_TIMEOUT.as_millis() as u64;
+    match deadline.source {
+        HardKillSource::Default if deadline.limit_ms > default_ms => format!(
+            "killed by AFT's default background limit, which waits on it had extended to {limit}, after the waits stopped (exit 124); the command itself did not fail"
+        ),
+        HardKillSource::Default => format!(
+            "killed by AFT's default background limit of {limit} (exit 124); the command itself did not fail, pass a longer `timeout` if it needs more time"
+        ),
+        HardKillSource::Timeout => {
+            format!("killed by the `timeout` of {limit} you passed (exit 124)")
+        }
+    }
+}
+
 fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTaskSnapshot {
     let existing_path = |path: Option<String>| {
         path.filter(|path| {
@@ -7780,6 +7934,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
             .map(|finished_at| finished_at.saturating_sub(metadata.started_at))
     });
     let live_descendants_summary = live_descendants_summary(&metadata);
+    let hard_kill = HardKillDeadline::from_metadata(metadata.timeout_ms, false);
     BgTaskSnapshot {
         info: BgTaskInfo {
             task_id: metadata.task_id,
@@ -7809,6 +7964,8 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         live_descendants_summary,
         kill_signaled: false,
         kill_reached: 0,
+        hard_kill,
+        elapsed_ms: None,
     }
 }
 
@@ -7880,6 +8037,12 @@ impl BgTask {
             live_descendants_summary: live_descendants_summary(metadata),
             kill_signaled: false,
             kill_reached: 0,
+            hard_kill: HardKillDeadline::from_metadata(
+                metadata.timeout_ms,
+                self.hard_kill_renewable,
+            ),
+            elapsed_ms: (!metadata.status.is_terminal())
+                .then(|| self.started.elapsed().as_millis() as u64),
         }
     }
 

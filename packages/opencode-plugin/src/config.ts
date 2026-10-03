@@ -6,8 +6,10 @@ import {
   ConfigRejectedError,
   type ConfigTier,
   DEFAULT_DISABLED_TOOLS,
+  DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
   legacyConfigNoticeMessage,
+  MIN_WORKER_WAIT_MAX_MS,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
   noticeDigest,
@@ -327,6 +329,19 @@ const BashFeaturesSchema = z.object({
   foreground_wait_window_ms: z.number().int().positive().optional(),
   /** Maximum synchronous bash_watch wait in milliseconds; clamped to 1000..1800000. Default 120000. */
   watch_sync_max_ms: z.number().int().positive().optional(),
+  /**
+   * Longest a delegated worker's wait on one command blocks before control
+   * returns to it: a bash_watch without a timeout, or a blocking bash call.
+   * The command keeps running in the background. Default 1800000 (30 minutes);
+   * values below 60000 are a config error.
+   */
+  worker_wait_max_ms: z
+    .number()
+    .int()
+    .min(MIN_WORKER_WAIT_MAX_MS, {
+      message: `bash.worker_wait_max_ms must be at least ${MIN_WORKER_WAIT_MAX_MS}`,
+    })
+    .optional(),
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   linux_scope: z.boolean().optional(),
   // Pi-only registration fallback. OpenCode accepts this shared config key but
@@ -885,6 +900,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
+      config.bash.worker_wait_max_ms !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
@@ -897,6 +913,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.watch_sync_max_ms !== undefined
         ? { watch_sync_max_ms: config.bash.watch_sync_max_ms }
+        : {}),
+      ...(config.bash.worker_wait_max_ms !== undefined
+        ? { worker_wait_max_ms: config.bash.worker_wait_max_ms }
         : {}),
       ...(config.bash.powershell_tool !== undefined
         ? { powershell_tool: config.bash.powershell_tool }
@@ -949,6 +968,8 @@ export interface ResolvedBashConfig {
   foreground_wait_window_ms: number;
   /** Maximum synchronous bash_watch wait. Defaults to 120000 and is clamped to 1000..1800000. */
   watch_sync_max_ms: number;
+  /** Longest a delegated worker's wait blocks (ms). Defaults to 1800000; at least 60000. */
+  worker_wait_max_ms: number;
   /** Pi-only manual PowerShell registration fallback. Default false. */
   powershell_tool: boolean;
 }
@@ -1038,6 +1059,9 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
     watch_sync_max_ms: watchSyncMaxMs,
+    worker_wait_max_ms:
+      (typeof top === "object" && top !== null ? top.worker_wait_max_ms : undefined) ??
+      DEFAULT_WORKER_WAIT_MAX_MS,
     powershell_tool:
       typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
   };

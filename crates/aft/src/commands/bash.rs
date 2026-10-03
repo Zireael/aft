@@ -73,22 +73,13 @@ struct BashParams {
     env: HashMap<String, String>,
 }
 
-/// The hard kill for a bash request.
-///
-/// An explicit `timeout` always wins. Without one the registry's default
-/// (30 minutes) applies, except to a delegated worker's `wait: true` call
-/// (`worker_session`, see [`RawRequest::worker_session`]): the worker blocks
-/// on it because it has nothing else to do until the command finishes, and
-/// killing a long build at an implicit limit would only make it start over.
-/// That wait still ends on a new message (which detaches the command to the
-/// background) or on an abort of the tool call.
-fn hard_kill_for(params: &BashParams, worker_session: bool) -> crate::bash_background::HardKill {
-    use crate::bash_background::HardKill;
-    match params.timeout {
-        Some(_) => HardKill::from_timeout_ms(params.timeout),
-        None if worker_session && params.wait => HardKill::Never,
-        None => HardKill::Default,
-    }
+/// The hard kill for a bash request: the caller's explicit `timeout`, or the
+/// registry's default. A delegated worker's `wait: true` call gets the default
+/// like every other call; its wait is capped by `bash.worker_wait_max_ms`
+/// instead (see `bash_orchestrate::worker_wait_cap_ms`), and its waits extend
+/// the default kill while it keeps waiting.
+fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
+    crate::bash_background::HardKill::from_timeout_ms(params.timeout)
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -376,7 +367,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         shell_path,
         workdir,
         env,
-        hard_kill_for(&params, req.worker_session()),
+        hard_kill_for(&params),
         ctx,
         effective_background,
         params.notify_on_completion,
@@ -926,16 +917,17 @@ mod tests {
         task.timeout_ms
     }
 
-    // A delegated worker blocks on `wait: true` until its command finishes, so
-    // the implicit 30-minute kill must not cut a long build short. Everything
-    // else keeps the default, and an explicit timeout always wins.
+    // Nothing a delegated worker starts runs without a hard kill: a worker's
+    // `wait: true` call without a timeout gets the same default as every other
+    // call (it used to get none, and a stuck test run then held a worker for
+    // fifteen hours). An explicit timeout always wins.
     #[cfg(unix)]
     #[test]
-    fn worker_wait_without_timeout_gets_no_default_hard_kill() {
+    fn worker_wait_without_timeout_gets_the_default_hard_kill() {
         let default_ms = crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64;
         assert_eq!(
             spawned_hard_kill_ms(json!({ "wait": true, "worker_session": true })),
-            None
+            Some(default_ms)
         );
         assert_eq!(
             spawned_hard_kill_ms(json!({ "wait": true })),
@@ -946,11 +938,175 @@ mod tests {
             Some(default_ms)
         );
         assert_eq!(
+            spawned_hard_kill_ms(json!({ "background": true, "worker_session": true })),
+            Some(default_ms)
+        );
+        assert_eq!(
             spawned_hard_kill_ms(
                 json!({ "wait": true, "worker_session": true, "timeout": 45_000 })
             ),
             Some(45_000)
         );
+    }
+
+    #[cfg(unix)]
+    fn spawn_background_task(ctx: &AppContext, extra: serde_json::Value) -> String {
+        let mut request = spawn_test_request("renew", "sleep 30", true);
+        for (key, value) in extra.as_object().unwrap() {
+            request.params["params"][key] = value.clone();
+        }
+        let response = handle(&request, ctx);
+        assert!(response.success, "spawn failed: {:?}", response.data);
+        response.data["task_id"].as_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    fn status_request(task_id: &str, worker: bool) -> RawRequest {
+        let mut request = json!({
+            "id": "renew-status",
+            "command": "bash_status",
+            "session_id": "sandbox-spawn-test",
+            "params": { "task_id": task_id },
+        });
+        if worker {
+            request[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+        }
+        serde_json::from_value(request).unwrap()
+    }
+
+    /// A delegated worker's status read (what its `bash_watch` polls) pushes
+    /// the task's default hard kill to at least one worker wait limit away. A
+    /// primary's read does not, and an explicit timeout is never extended.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_status_read_extends_only_the_default_hard_kill() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = 50 * 60 * 1000);
+        let registry = ctx.bash_background();
+        let session = "sandbox-spawn-test";
+        let default_ms = crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64;
+
+        let implicit = spawn_background_task(&ctx, json!({}));
+        let explicit = spawn_background_task(&ctx, json!({ "timeout": 45_000 }));
+
+        crate::commands::bash_status::handle(&status_request(&implicit, false), &ctx);
+        assert_eq!(
+            registry.hard_kill_limit_ms_for_test(&implicit, session),
+            Some(default_ms),
+            "a primary's status read must not extend the kill"
+        );
+
+        crate::commands::bash_status::handle(&status_request(&implicit, true), &ctx);
+        let renewed = registry
+            .hard_kill_limit_ms_for_test(&implicit, session)
+            .unwrap();
+        assert!(
+            renewed >= 50 * 60 * 1000,
+            "a worker's status read extends the kill to the worker wait limit: {renewed}"
+        );
+
+        crate::commands::bash_status::handle(&status_request(&explicit, true), &ctx);
+        assert_eq!(
+            registry.hard_kill_limit_ms_for_test(&explicit, session),
+            Some(45_000),
+            "an explicit timeout is never extended"
+        );
+
+        for task_id in [&implicit, &explicit] {
+            let _ = registry.kill(task_id, session);
+        }
+    }
+
+    /// The watchdog kills by the extended limit: a task whose kill is due in
+    /// 300 ms survives once a worker's wait extends it, while an identical
+    /// task nobody waits on is timed out.
+    #[cfg(unix)]
+    #[test]
+    fn an_extended_hard_kill_keeps_a_watched_task_alive() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let registry = ctx.bash_background();
+        let session = "sandbox-spawn-test";
+
+        let watched = spawn_background_task(&ctx, json!({}));
+        let unwatched = spawn_background_task(&ctx, json!({}));
+        registry.set_hard_kill_limit_ms_for_test(&watched, session, 300);
+        registry.set_hard_kill_limit_ms_for_test(&unwatched, session, 300);
+        assert!(registry
+            .renew_hard_kill(&watched, session, std::time::Duration::from_secs(60))
+            .is_some());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = |task_id: &str| {
+            crate::commands::bash_status::handle(&status_request(task_id, false), &ctx).data
+                ["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        while status(&unwatched) != "timed_out" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unwatched task was never timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(status(&watched), "running");
+        // The kill is named by the limit that fired, AFT's default, so it is
+        // not mistaken for the command failing; a still-running task's status
+        // names its own deadline.
+        let killed = crate::commands::bash_status::handle(&status_request(&unwatched, true), &ctx);
+        let reason = killed.data["status_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("killed by AFT's default background limit of 0.3s (exit 124)"),
+            "{:?}",
+            killed.data
+        );
+        assert_eq!(killed.data["exit_code"], 124, "{:?}", killed.data);
+        let alive = crate::commands::bash_status::handle(&status_request(&watched, false), &ctx);
+        assert_eq!(
+            alive.data["hard_kill"]["source"], "default",
+            "{:?}",
+            alive.data
+        );
+        assert!(alive.data["hard_kill"]["limit_ms"].as_u64().unwrap() >= 60_000);
+        assert!(
+            alive.data["elapsed_ms"].as_u64().is_some(),
+            "{:?}",
+            alive.data
+        );
+        let _ = registry.kill(&watched, session);
+    }
+
+    /// A kill by the caller's own `timeout` is named as that, not as AFT's
+    /// default limit.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_timeout_kill_is_named_as_the_callers_timeout() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let task = spawn_background_task(&ctx, json!({ "timeout": 200 }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let data =
+                crate::commands::bash_status::handle(&status_request(&task, false), &ctx).data;
+            if data["status"] == "timed_out" {
+                assert_eq!(
+                    data["status_reason"], "killed by the `timeout` of 0.2s you passed (exit 124)",
+                    "{data:?}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never timed out: {data:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[cfg(unix)]

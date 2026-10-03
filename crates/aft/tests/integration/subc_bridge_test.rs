@@ -3165,6 +3165,20 @@ fn subc_bridge_bash_hand_off_text_follows_the_worker_role() {
     );
 }
 
+/// A delegated worker's blocking bash call over subc (`wait: true`, and a
+/// `block_to_completion` call) returns at the worker wait limit with the
+/// command still running in the background, as on the standalone path.
+#[test]
+fn subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_worker_blocking_bash_detaches_at_the_worker_wait_limit",
+        Duration::from_secs(60),
+        || vec![set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "1500")],
+        drive_bash_worker_wait_limit_daemon,
+        |_, _, _| {},
+    );
+}
+
 #[test]
 fn subc_bridge_bash_records_call_key_and_refuses_malformed_keys() {
     run_subc_bridge_test(
@@ -4547,6 +4561,76 @@ async fn drive_bash_worker_role_daemon(input: FakeDaemonInput) {
         )
         .await;
         let _ = read_frame_timeout(&mut stream, "worker role bash kill").await;
+    }
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
+        let mut arguments = json!({
+            "command": "printf 'started\\n'; sleep 30",
+            "foreground_orchestrate": true,
+            "compressed": false,
+        });
+        arguments[mode] = json!(true);
+        let body = json!({ "name": "bash", "arguments": arguments, "worker_session": true });
+        let started = Instant::now();
+        send_frame(
+            &mut stream,
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&body).expect("worker limit tool call body"),
+            )
+            .expect("worker limit tool call frame"),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "worker limit bash").await;
+        let elapsed = started.elapsed();
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame), "{mode}");
+        let text = tool_result_text(&frame);
+        assert!(
+            elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
+            "{mode}: the call must return at the 1.5s limit, took {elapsed:?}"
+        );
+        assert!(
+            text.contains("still running after 1.5s"),
+            "{mode}: {text:?}"
+        );
+        assert!(text.contains("it was not killed"), "{mode}: {text:?}");
+        assert!(text.contains("Recent output:\nstarted"), "{mode}: {text:?}");
+        let task_id = extract_bash_task_id(&text);
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 100,
+            "bash_status",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let status =
+            tool_response_json(&read_frame_timeout(&mut stream, "worker limit status").await);
+        assert_eq!(
+            status["status"], "running",
+            "{mode}: the command keeps running: {status:?}"
+        );
+        send_tool_call(
+            &mut stream,
+            1,
+            corr + 200,
+            "bash_kill",
+            json!({ "params": { "task_id": task_id } }),
+        )
+        .await;
+        let _ = read_frame_timeout(&mut stream, "worker limit bash kill").await;
     }
     send_connection_goodbye(&mut stream).await;
 }

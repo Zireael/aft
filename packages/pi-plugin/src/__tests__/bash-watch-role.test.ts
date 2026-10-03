@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
-import { LONGEST_TIMER_DELAY_MS, watchClock, watchTimeoutSteer } from "@cortexkit/aft-bridge";
+import { watchClock, watchTimeoutSteer } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { __resetSyncWatchAbortForTests, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import { resolveSessionId } from "../tools/_shared.js";
@@ -121,15 +121,20 @@ describe("Pi bash_watch caller role", () => {
   });
 
   test("timeout gives a headless worker only the worker steer, with no cap", async () => {
-    const tool = watchTool(() => ({ success: true, status: "running" }), {
-      bash: { watch_sync_max_ms: 90_000 },
-    });
+    const tool = watchTool(
+      () => ({ success: true, status: "running", duration_ms: 4_000, output_preview: "tick\n" }),
+      { bash: { watch_sync_max_ms: 90_000 } },
+    );
     const result = await watch(tool, { task_id: "bash-worker", timeout_ms: 1 }, false);
     const text = result.content[0].text;
     expect(text).toContain("timeout reached without match");
-    expect(text).toContain(watchTimeoutSteer("worker", "timeout_ms"));
-    expect(text).toContain("a bash_watch without timeout_ms waits until the command finishes");
-    expect(text).not.toContain("up to");
+    expect(text).toContain("The command is still running after");
+    expect(text).toContain('Call bash_watch({ task_id: "bash-worker" }) again to keep waiting');
+    expect(text).toContain("without timeout_ms a watch waits up to the worker wait limit");
+    expect(text).toContain('bash_kill({ task_id: "bash-worker" })');
+    expect(text).toContain("It has run for 4s.");
+    expect(text).toContain("Recent output:\ntick");
+    expect(text).not.toContain("waits until the command finishes");
     expect(text).not.toContain("90000");
     expect(text).not.toContain("end your turn");
     expect(text).not.toContain("don't poll");
@@ -141,30 +146,31 @@ describe("Pi bash_watch caller role", () => {
     const result = await watch(tool, { task_id: "bash-primary", timeout_ms: 1 }, true);
     const text = result.content[0].text;
     expect(text).toContain("timeout reached without match");
-    expect(text).toContain(watchTimeoutSteer("primary"));
+    expect(text).toContain(watchTimeoutSteer());
     expect(text).not.toContain("don't report a result");
   });
 
-  test("without timeout_ms a worker's watch has no deadline and a primary's 30000", async () => {
-    const effectiveFor = async (hasUI: boolean) => {
+  test("without timeout_ms a worker's watch waits up to the worker wait limit and a primary's 30000", async () => {
+    const effectiveFor = async (hasUI: boolean, config: Record<string, unknown> = {}) => {
       let polls = 0;
       const tool = watchTool(() => {
         polls += 1;
         return polls === 1
           ? { success: true, status: "running" }
           : { success: true, status: "completed", exit_code: 0 };
-      });
+      }, config);
       const result = await watch(tool, { task_id: `bash-default-${hasUI}` }, hasUI);
       return result.details.effectiveWaitMs;
     };
-    expect(await effectiveFor(false)).toBeUndefined();
+    expect(await effectiveFor(false)).toBe(1_800_000);
+    expect(await effectiveFor(false, { bash: { worker_wait_max_ms: 300_000 } })).toBe(300_000);
     expect(await effectiveFor(true)).toBe(30_000);
   });
 
   // The rest run on simulated time (useFakeWatchClock), so a wait of several
   // minutes finishes in milliseconds.
 
-  test("a worker's watch without timeout_ms returns only when the task exits, past 120 s", async () => {
+  test("a worker's watch without timeout_ms returns when the task exits, past 120 s and before the limit", async () => {
     __resetSyncWatchAbortForTests();
     const clock = useFakeWatchClock();
     try {
@@ -177,7 +183,7 @@ describe("Pi bash_watch caller role", () => {
       });
       const text = (await watch(tool, { task_id: "bash-worker-long" }, false)).content[0].text;
       expect(text).toContain("task exited (completed, exit 0)");
-      expect(text).toContain("no limit: waits until the command finishes");
+      expect(text).toContain("(limit 1800000ms)");
       expect(text).not.toContain("timeout reached");
       expect(Number(/Waited (\d+)ms/.exec(text)?.[1])).toBeGreaterThanOrEqual(150_000);
       // The poll interval backs off, so a long wait stays cheap: at a fixed
@@ -188,7 +194,101 @@ describe("Pi bash_watch caller role", () => {
     }
   });
 
-  test("a new message ends a worker's watch that has no deadline", async () => {
+  // The worker wait limit: a stuck command once held a worker for fifteen
+  // hours behind a watch with no deadline.
+  test("a worker's watch without timeout_ms returns still-running at the worker wait limit", async () => {
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      const tool = watchTool(() => ({
+        success: true,
+        status: "running",
+        mode: "pipes",
+        output_preview: "(pass) one\n",
+      }));
+      const text = (await watch(tool, { task_id: "bash-worker-stuck" }, false)).content[0].text;
+      expect(text).toMatch(/Waited 1800000ms \(limit 1800000ms\); timeout reached without match/);
+      expect(text).toContain("The command is still running after 30 minutes of watching");
+      expect(text).toContain('Call bash_watch({ task_id: "bash-worker-stuck" }) again');
+      expect(text).toContain("Recent output:\n(pass) one");
+      expect(clock.now()).toBeLessThan(1_802_000);
+    } finally {
+      clock.restore();
+    }
+  });
+
+  // A worker once watched a background task with "no limit", never learned
+  // the task had AFT's 30-minute default kill, and took the kill for its
+  // command failing.
+  test("a worker's watch names the task's kill deadline and the default limit that killed it", async () => {
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    const reason =
+      "killed by AFT's default background limit of 30 minutes (exit 124); the command itself did not fail, pass a longer `timeout` if it needs more time";
+    try {
+      const tool = watchTool(() =>
+        clock.now() < 1_000_000
+          ? {
+              success: true,
+              status: "running",
+              hard_kill: { limit_ms: 1_800_000, source: "default" },
+            }
+          : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
+      );
+      const running = (
+        await watch(tool, { task_id: "bash-worker-deadline", timeout_ms: 60_000 }, false)
+      ).content[0].text;
+      expect(running).toContain(
+        "AFT kills this task once it has run 30 minutes (its default background limit)",
+      );
+      const killed = (await watch(tool, { task_id: "bash-worker-deadline" }, false)).content[0]
+        .text;
+      expect(killed).toContain("task exited (timed_out");
+      expect(killed).toContain(
+        "The task was killed by AFT's default background limit of 30 minutes (exit 124)",
+      );
+      expect(killed).not.toContain("no limit");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a worker's second watch keeps waiting and returns the result", async () => {
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      const tool = watchTool(() =>
+        clock.now() < 2_400_000
+          ? { success: true, status: "running" }
+          : { success: true, status: "completed", exit_code: 0, output_preview: "all green\n" },
+      );
+      const first = (await watch(tool, { task_id: "bash-worker-twice" }, false)).content[0].text;
+      expect(first).toContain("still running after 30 minutes of watching");
+      const second = (await watch(tool, { task_id: "bash-worker-twice" }, false)).content[0].text;
+      expect(second).toContain("task exited (completed, exit 0)");
+      expect(second).toContain("all green");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a worker's watch honours a configured worker_wait_max_ms", async () => {
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    try {
+      const tool = watchTool(() => ({ success: true, status: "running" }), {
+        bash: { worker_wait_max_ms: 300_000 },
+      });
+      const text = (await watch(tool, { task_id: "bash-worker-configured" }, false)).content[0]
+        .text;
+      expect(text).toMatch(/Waited 300000ms \(limit 300000ms\); timeout reached without match/);
+      expect(text).toContain("still running after 5 minutes of watching");
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test("a new message ends a worker's watch before its limit", async () => {
     __resetSyncWatchAbortForTests();
     const clock = useFakeWatchClock();
     const sessionId = resolveSessionId({ cwd: process.cwd(), hasUI: false } as never);
@@ -208,7 +308,7 @@ describe("Pi bash_watch caller role", () => {
     }
   });
 
-  test("an aborted tool call ends a worker's watch that has no deadline", async () => {
+  test("an aborted tool call ends a worker's watch before its limit", async () => {
     __resetSyncWatchAbortForTests();
     const clock = useFakeWatchClock();
     const controller = new AbortController();
@@ -247,7 +347,7 @@ describe("Pi bash_watch caller role", () => {
       const tool = watchTool(() => ({ success: true, status: "running" }));
       const text = (await watch(tool, { task_id: "bash-primary-default" }, true)).content[0].text;
       expect(text).toMatch(/Waited 30000ms \(limit 30000ms\); timeout reached without match/);
-      expect(text).toContain(watchTimeoutSteer("primary"));
+      expect(text).toContain(watchTimeoutSteer());
     } finally {
       clock.restore();
     }
@@ -274,14 +374,14 @@ describe("Pi bash wait:true caller role", () => {
     return calls[0];
   }
 
-  test("a worker's wait:true without a timeout asks the engine for no default hard kill", async () => {
+  test("a worker's wait:true without a timeout gets a transport budget of the worker wait limit", async () => {
     const [params, options] = await waitCall({ wait: true }, false);
     expect(params.wait).toBe(true);
     expect(params.timeout).toBeUndefined();
     expect(params.worker_session).toBe(true);
-    // The 30-minute default no longer bounds the call, so the transport
-    // timeout is the longest delay a JavaScript timer supports.
-    expect(options?.transportTimeoutMs).toBe(LONGEST_TIMER_DELAY_MS);
+    // The engine hands the call back at the worker wait limit (30 minutes by
+    // default), so the transport waits that long plus its margin.
+    expect(options?.transportTimeoutMs).toBe(1_800_000 + 10_000);
   });
 
   test("a worker's wait:true with an explicit timeout keeps it", async () => {
@@ -296,7 +396,7 @@ describe("Pi bash wait:true caller role", () => {
     expect(options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
   });
 
-  test("a worker's requests carry its role and the engine's hand-off text is shown as is", async () => {
+  test("a worker's requests carry its role and the engine's hand-off text gets the bash_watch note", async () => {
     const sent: Array<Record<string, unknown>> = [];
     // The engine's reply to a request with worker_session says the task won't wake it.
     const handOff =
@@ -313,7 +413,11 @@ describe("Pi bash wait:true caller role", () => {
       { cwd: process.cwd(), hasUI: false },
     )) as ToolResult;
     expect(sent[0]?.worker_session).toBe(true);
-    expect(result.content[0].text).toBe(handOff);
+    // The engine cannot assume the host has bash_watch, so the plugin adds
+    // how to wait on the task, in Pi's argument spelling.
+    expect(result.content[0].text.startsWith(handOff)).toBe(true);
+    expect(result.content[0].text).toContain('bash_watch({ task_id: "bash-bg" })');
+    expect(result.content[0].text).toContain("waits up to the worker wait limit");
   });
 
   test("a worker's bash_watch status polls carry its role too", async () => {

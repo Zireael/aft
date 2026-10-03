@@ -797,6 +797,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
+    live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
@@ -917,6 +918,7 @@ fn classification_is_exhaustive(config: &Config) {
         host_fallback: _,
         detach_on_user_message: _,
         watch_sync_max_ms: _,
+        worker_wait_max_ms: _,
         linux_scope: _,
         powershell_tool: _,
     } = bash;
