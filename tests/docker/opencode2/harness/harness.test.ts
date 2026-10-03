@@ -53,6 +53,7 @@ import {
   observeThenRespond,
   toolResultForCall,
 } from "./mock-server.js";
+import { taskKillDeadlineText } from "../../../../packages/aft-bridge/src/bash-hints.js";
 import {
   assertComparison,
   assertDualHostParity,
@@ -2287,6 +2288,67 @@ describe("a parity row compares the two hosts", () => {
       const stillRunning = V1_RESULT.replace("a302ff: killed", "a302ff: running");
 
       expect(() => projectText(stillRunning, rules)).toThrow("projection_unparsed");
+    });
+  });
+});
+
+describe("the kill-deadline line is a typed projection element", () => {
+  // AFT appends the task's own kill deadline to every reply that hands a
+  // task back and to every bash_watch result. Read the wordings from the
+  // plugins' own source, so the pattern cannot drift from what the product
+  // prints.
+  const rules = [{ kind: "kill_deadline" as const }];
+  const running = (hardKill: Record<string, unknown>) => ({ status: "running", hard_kill: hardKill });
+
+  test("every wording the product emits parses into limit, source and worker renewal", () => {
+    const defaultLimit = { limit_ms: 1_800_000, source: "default" };
+    expect(projectText(taskKillDeadlineText(running(defaultLimit), "primary"), rules)).toEqual({
+      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: false },
+    });
+    expect(projectText(taskKillDeadlineText(running(defaultLimit), "worker"), rules)).toEqual({
+      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: true },
+    });
+    expect(
+      projectText(
+        taskKillDeadlineText(running({ limit_ms: 45_000, source: "timeout" }), "worker"),
+        rules,
+      ),
+    ).toEqual({ kill_deadline: { limit: "45s", source: "timeout", worker_renewal: false } });
+    expect(projectText(taskKillDeadlineText({ status: "running" }, "primary"), rules)).toEqual({
+      kill_deadline: { source: "none", worker_renewal: false },
+    });
+  });
+
+  test("a changed or mangled deadline wording is unparsed, not skipped", () => {
+    const line = taskKillDeadlineText(running({ limit_ms: 1_800_000, source: "default" }), "primary");
+    expect(() => projectText(line.replace("unless", "until"), rules)).toThrow(
+      "projection_unparsed",
+    );
+    // The caller-timeout wording never carries the default-limit continuation.
+    expect(() =>
+      projectText(
+        line.replace("its default background limit", "the `timeout` you passed"),
+        rules,
+      ),
+    ).toThrow("default-limit continuation");
+  });
+
+  test("a scenario row reads the deadline beside the outcome it already projected", () => {
+    const watchRules = [
+      {
+        kind: "field" as const,
+        field: "task_state",
+        pattern: "^Task bash-[0-9a-f]+: (?<value>running)$",
+      },
+      { kind: "kill_deadline" as const },
+    ];
+    const text = `Task bash-1a2b: running\n${taskKillDeadlineText(
+      running({ limit_ms: 1_800_000, source: "default" }),
+      "primary",
+    )}`;
+    expect(projectText(text, watchRules)).toEqual({
+      task_state: "running",
+      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: false },
     });
   });
 });

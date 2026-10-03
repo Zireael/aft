@@ -12,7 +12,7 @@ import {
 import { fail } from "./errors.js";
 import { readPermissionAskInventory, validatePermissionInventory } from "./inventory.js";
 import { readPinnedV1HostVersion } from "./pin.js";
-import { TRUNCATION_TRAILER_PATTERN } from "./projection.js";
+import { projectedField, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import type {
   HarnessValidationContext,
   ScenarioDefinition,
@@ -734,8 +734,7 @@ export async function validateParityAllowlist(
     if (
       !scenario.comparison.rules.some(
         (rule) =>
-          rule.kind !== "ignore" &&
-          (rule.kind === "trailer" ? (rule.field ?? "trailer") : rule.field) === entry.field,
+          rule.kind !== "ignore" && projectedField(rule) === entry.field,
       )
     ) {
       fail(
@@ -763,8 +762,7 @@ export async function validateParityAllowlist(
     const projected = new Set(
       scenario.comparison.mode === "shape"
         ? scenario.comparison.rules
-            .filter((rule) => rule.kind !== "ignore")
-            .map((rule) => (rule.kind === "trailer" ? (rule.field ?? "trailer") : rule.field))
+            .flatMap((rule) => (rule.kind === "ignore" ? [] : [projectedField(rule)]))
         : [],
     );
     for (const entry of allowedForScenario) projected.delete(entry.field);

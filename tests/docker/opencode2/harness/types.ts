@@ -38,7 +38,23 @@ export interface TrailerProjectionRule {
   field?: string;
 }
 
-export type ProjectionRule = FieldProjectionRule | IgnoreProjectionRule | TrailerProjectionRule;
+/**
+ * The line naming a background task's own kill deadline, which AFT appends to
+ * every reply that hands a task back and to every bash_watch result. Parsed
+ * by a fixed pattern into `{ limit, source, worker_renewal }` (see
+ * `KILL_DEADLINE_PATTERN` in projection.ts), so a scenario states which
+ * deadline it expects rather than skipping the line.
+ */
+export interface KillDeadlineProjectionRule {
+  kind: "kill_deadline";
+  field?: string;
+}
+
+export type ProjectionRule =
+  | FieldProjectionRule
+  | IgnoreProjectionRule
+  | TrailerProjectionRule
+  | KillDeadlineProjectionRule;
 
 export interface ExactComparison {
   mode: "exact";
