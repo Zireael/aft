@@ -21,6 +21,8 @@ use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
 use crate::symbols::{Range, SymbolKind};
+#[cfg(test)]
+use join::Parser;
 use rayon::prelude::*;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
@@ -35,7 +37,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+#[cfg(not(test))]
+use tree_sitter::Parser;
 
 const SCHEMA_VERSION: i64 = 1;
 /// Highest callgraph generation schema this build reads (and writes).
@@ -11981,6 +11985,10 @@ fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
         return;
     };
 
+    extend_rust_imports_from_tree(source, tree.root_node(), data);
+}
+
+fn extend_rust_imports_from_tree(source: &str, root: Node<'_>, data: &mut FileCallData) {
     let mut seen = data
         .import_block
         .imports
@@ -11988,7 +11996,7 @@ fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
         .map(|import| (import.byte_range.start, import.byte_range.end))
         .collect::<HashSet<_>>();
     let mut nested_imports = Vec::new();
-    collect_rust_use_imports(source, tree.root_node(), &mut seen, &mut nested_imports);
+    collect_rust_use_imports(source, root, &mut seen, &mut nested_imports);
     if nested_imports.is_empty() {
         return;
     }
@@ -12121,6 +12129,26 @@ fn collect_reexport_refs(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> ReexportRefs {
+    collect_reexport_refs_with_line_index(
+        project_root,
+        abs_path,
+        rel_path,
+        source,
+        memo,
+        facts,
+        &LineIndex::new(source),
+    )
+}
+
+fn collect_reexport_refs_with_line_index(
+    project_root: &Path,
+    abs_path: &Path,
+    rel_path: &str,
+    source: &str,
+    memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
+    line_index: &LineIndex,
+) -> ReexportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut search_start = 0usize;
@@ -12141,11 +12169,7 @@ fn collect_reexport_refs(
         };
         ordinal += 1;
         let wildcard = statement.contains('*');
-        let line = source[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1;
+        let line = line_index.byte_to_line(start);
         let ref_id = ref_id(&[
             rel_path,
             "reexport",
@@ -12330,6 +12354,14 @@ struct SourceLessExportRefs {
 }
 
 fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> SourceLessExportRefs {
+    collect_source_less_export_alias_refs_with_line_index(rel_path, source, &LineIndex::new(source))
+}
+
+fn collect_source_less_export_alias_refs_with_line_index(
+    rel_path: &str,
+    source: &str,
+    line_index: &LineIndex,
+) -> SourceLessExportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut search_start = 0usize;
@@ -12354,11 +12386,7 @@ fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> Source
         // differs between two extractions of the same file.
         let mut aliases = aliases.into_iter().collect::<Vec<_>>();
         aliases.sort();
-        let line = source[..start]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u32
-            + 1;
+        let line = line_index.byte_to_line(start);
         for (exported, source_symbol) in aliases {
             ordinal += 1;
             let ref_id = ref_id(&[
@@ -19724,28 +19752,60 @@ fn hex_to_bytes(value: &str) -> Option<[u8; 32]> {
 }
 
 #[derive(Debug, Clone)]
-struct LineIndex {
-    newline_offsets: Vec<usize>,
+pub(crate) struct LineIndex {
+    starts: Vec<usize>,
+    ends: Vec<usize>,
     source_len: usize,
 }
 
 impl LineIndex {
-    fn new(source: &str) -> Self {
+    pub(crate) fn new(source: &str) -> Self {
+        #[cfg(test)]
+        join::extraction_work::note(|work| work.position_bytes += source.len());
+        let mut starts = vec![0];
+        let mut ends = Vec::new();
+        for (offset, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                // Call attribution clamps columns before CRLF terminators;
+                // blob ranges retain the older inclusive segment convention.
+                ends.push(if offset > 0 && source.as_bytes()[offset - 1] == b'\r' {
+                    offset - 1
+                } else {
+                    offset
+                });
+                starts.push(offset + 1);
+            }
+        }
+        ends.push(source.len());
         Self {
-            newline_offsets: source
-                .bytes()
-                .enumerate()
-                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset))
-                .collect(),
+            starts,
+            ends,
             source_len: source.len(),
         }
     }
 
     fn byte_to_line(&self, byte_offset: usize) -> u32 {
         let byte_offset = byte_offset.min(self.source_len);
-        self.newline_offsets
-            .partition_point(|offset| *offset < byte_offset) as u32
-            + 1
+        self.starts.partition_point(|start| *start <= byte_offset) as u32
+    }
+
+    pub(crate) fn byte_offset(&self, line: u32, column: u32) -> usize {
+        let Some(&start) = self.starts.get(line as usize) else {
+            return self.source_len;
+        };
+        start + (column as usize).min(self.ends[line as usize] - start)
+    }
+
+    fn inclusive_byte_offset(&self, line: u32, column: u32) -> usize {
+        let Some(&start) = self.starts.get(line as usize) else {
+            return self.source_len;
+        };
+        let end = self
+            .starts
+            .get(line as usize + 1)
+            .copied()
+            .unwrap_or(self.source_len);
+        start + (column as usize).min(end - start)
     }
 }
 

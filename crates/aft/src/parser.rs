@@ -4,8 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
 
+#[cfg(test)]
+use crate::callgraph_store::join::Parser;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor, Tree};
+#[cfg(not(test))]
+use tree_sitter::Parser;
+use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::resolve_module_path;

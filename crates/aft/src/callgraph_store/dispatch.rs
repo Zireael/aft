@@ -1,12 +1,12 @@
 //! Source-independent method linking for manifest views. Extraction records only
 //! syntactic receiver evidence; joining never reparses or opens checkout files.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
 use super::{BlobRef, BlobRefKind, BlobSymbol, ManifestJoinError, ParseBlob};
-use crate::parser::{grammar_for, LangId};
+use crate::parser::LangId;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
@@ -52,12 +52,35 @@ fn field<'a>(node: Node<'a>, names: &[&str]) -> Option<Node<'a>> {
 }
 fn descendants(node: Node<'_>) -> Vec<Node<'_>> {
     let mut result = Vec::new();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        result.push(node);
-        stack.extend(node.named_children(&mut node.walk()));
+    let mut cursor = node.walk();
+    let mut depth = 0;
+    loop {
+        result.push(cursor.node());
+        // Preserve reverse named-child preorder: parameter shapes and duplicate
+        // span tie-breaking already depend on this order in persisted blobs.
+        if cursor.goto_last_child() {
+            while !cursor.node().is_named() && cursor.goto_previous_sibling() {}
+            if cursor.node().is_named() {
+                depth += 1;
+                continue;
+            }
+            cursor.goto_parent();
+        }
+        loop {
+            if depth == 0 {
+                return result;
+            }
+            let mut previous = cursor.goto_previous_sibling();
+            while previous && !cursor.node().is_named() {
+                previous = cursor.goto_previous_sibling();
+            }
+            if previous {
+                break;
+            }
+            cursor.goto_parent();
+            depth -= 1;
+        }
     }
-    result
 }
 fn method_shape(node: Node<'_>, source: &str) -> String {
     let parameters = field(node, &["parameters"])
@@ -158,16 +181,23 @@ fn owner(node: Node<'_>, source: &str, language: &str) -> Option<(String, Option
 pub fn complete_members(
     source: &str,
     lang: LangId,
+    root: Node<'_>,
     parse: &mut ParseBlob,
 ) -> Result<(), ManifestJoinError> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&grammar_for(lang))
-        .map_err(|e| ManifestJoinError::Parse(e.to_string()))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| ManifestJoinError::Parse("missing member syntax tree".into()))?;
-    for node in descendants(tree.root_node()) {
+    let all = descendants(root);
+    let spans = exact_ordinals(parse);
+    let mut identities = parse
+        .symbols
+        .iter()
+        .map(|s| (s.start_line, s.start_col, s.name.clone()))
+        .collect::<HashSet<_>>();
+    let mut scoped_names = parse
+        .symbols
+        .iter()
+        .map(|s| s.scoped_name.clone())
+        .collect::<HashSet<_>>();
+    let mut callers = symbol_callers(parse);
+    for &node in &all {
         if !FUNCTIONS.contains(&node.kind()) {
             continue;
         }
@@ -177,23 +207,25 @@ pub fn complete_members(
         let Some(name) = named(node, source) else {
             continue;
         };
-        if parse.symbols.iter().any(|s| {
-            s.start_line == node.start_position().row as u32
-                && s.start_col == node.start_position().column as u32
-                && s.name == name
-        }) {
+        let position = (
+            node.start_position().row as u32,
+            node.start_position().column as u32,
+        );
+        if !identities.insert((position.0, position.1, name.clone())) {
             continue;
         }
         let mut scoped_name = format!("{owner}::{name}");
-        let ordinal = parse
-            .ast_nodes
-            .iter()
-            .find(|n| n.byte_start == node.start_byte() && n.byte_end == node.end_byte())
-            .map(|n| n.ordinal)
+        let ordinal = spans
+            .get(&(node.start_byte(), node.end_byte()))
+            .copied()
             .unwrap_or_default();
-        if parse.symbols.iter().any(|s| s.scoped_name == scoped_name) {
+        if scoped_names.contains(&scoped_name) {
             scoped_name = format!("{scoped_name}@{ordinal}");
         }
+        scoped_names.insert(scoped_name.clone());
+        callers
+            .entry(position)
+            .or_insert_with(|| scoped_name.clone());
         parse.symbols.push(BlobSymbol {
             ordinal,
             name,
@@ -218,7 +250,13 @@ pub fn complete_members(
             parse.callable_symbols.push(scoped_name);
         }
     }
-    for call in descendants(tree.root_node())
+    let mut call_ordinals = parse
+        .refs
+        .iter()
+        .filter(|r| r.kind == BlobRefKind::Call)
+        .map(|r| r.ordinal)
+        .collect::<HashSet<_>>();
+    for call in all
         .into_iter()
         .filter(|n| crate::calls::call_node_kinds(lang).contains(&n.kind()))
     {
@@ -232,33 +270,24 @@ pub fn complete_members(
         let Some(callee) = callee else {
             continue;
         };
-        let Some(ast) = parse
-            .ast_nodes
-            .iter()
-            .find(|n| n.byte_start == call.start_byte() && n.byte_end == call.end_byte())
-        else {
+        let Some(&ordinal) = spans.get(&(call.start_byte(), call.end_byte())) else {
             continue;
         };
-        if parse
-            .refs
-            .iter()
-            .any(|r| r.kind == BlobRefKind::Call && r.ordinal == ast.ordinal)
-        {
+        if call_ordinals.contains(&ordinal) {
             continue;
         }
         let caller = enclosing(call, FUNCTIONS).and_then(|function| {
-            parse
-                .symbols
-                .iter()
-                .find(|s| {
-                    s.start_line == function.start_position().row as u32
-                        && s.start_col == function.start_position().column as u32
-                })
-                .map(|s| s.scoped_name.clone())
+            callers
+                .get(&(
+                    function.start_position().row as u32,
+                    function.start_position().column as u32,
+                ))
+                .cloned()
         });
         if caller.is_none() {
             continue;
         }
+        call_ordinals.insert(ordinal);
         let full = text(callee, source).to_string();
         let short = full
             .rsplit(['.', ':'])
@@ -266,7 +295,7 @@ pub fn complete_members(
             .unwrap_or_default()
             .to_string();
         parse.refs.push(BlobRef {
-            ordinal: ast.ordinal,
+            ordinal,
             kind: BlobRefKind::Call,
             caller_symbol: caller,
             short_name: Some(short),
@@ -294,16 +323,34 @@ pub fn complete_members(
 pub fn extract(
     source: &str,
     lang: LangId,
+    root: Node<'_>,
     parse: &ParseBlob,
 ) -> Result<DispatchFacts, ManifestJoinError> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&grammar_for(lang))
-        .map_err(|e| ManifestJoinError::Parse(e.to_string()))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| ManifestJoinError::Parse("missing dispatch syntax tree".into()))?;
-    let all = descendants(tree.root_node());
+    let all = descendants(root);
+    let spans = exact_ordinals(parse);
+    let callers = symbol_callers(parse);
+    let mut symbols_by_name_line = HashMap::new();
+    for symbol in &parse.symbols {
+        symbols_by_name_line
+            .entry((symbol.name.as_str(), symbol.start_line))
+            .or_insert(symbol);
+    }
+    let mut functions = HashMap::<(u32, u32), Node<'_>>::new();
+    for &node in all.iter().filter(|n| FUNCTIONS.contains(&n.kind())) {
+        let key = (
+            node.start_position().row as u32,
+            node.start_position().column as u32,
+        );
+        functions
+            .entry(key)
+            .and_modify(|previous| {
+                if node.end_byte() - node.start_byte() < previous.end_byte() - previous.start_byte()
+                {
+                    *previous = node;
+                }
+            })
+            .or_insert(node);
+    }
     let language = parse.language.as_str();
     let mut facts = DispatchFacts::default();
     for node in &all {
@@ -376,7 +423,7 @@ pub fn extract(
         });
     }
     for symbol in &parse.symbols {
-        let Some(node) = symbol_node(&all, symbol) else {
+        let Some(&node) = functions.get(&(symbol.start_line, symbol.start_col)) else {
             continue;
         };
         if !["method", "function"].contains(&symbol.kind.as_str()) {
@@ -402,6 +449,11 @@ pub fn extract(
     }
     // Some interface grammars expose method signatures without callable symbol
     // metadata. Their declaration still has to be a possible exact target.
+    let mut method_names = facts
+        .methods
+        .iter()
+        .map(|m| (m.owner.clone(), m.name.clone(), m.trait_name.clone()))
+        .collect::<HashSet<_>>();
     for node in &all {
         if ![
             "method_signature",
@@ -419,18 +471,13 @@ pub fn extract(
         let Some(name) = named(*node, source) else {
             continue;
         };
-        if facts
-            .methods
-            .iter()
-            .any(|m| m.owner == owner && m.name == name && m.trait_name == trait_name)
-        {
+        if method_names.contains(&(owner.clone(), name.clone(), trait_name.clone())) {
             continue;
         }
-        if let Some(symbol) = parse
-            .symbols
-            .iter()
-            .find(|s| s.name == name && s.start_line == node.start_position().row as u32)
+        if let Some(symbol) =
+            symbols_by_name_line.get(&(name.as_str(), node.start_position().row as u32))
         {
+            method_names.insert((owner.clone(), name.clone(), trait_name.clone()));
             facts.methods.push(MethodHint {
                 owner,
                 trait_name,
@@ -448,6 +495,10 @@ pub fn extract(
         }
     }
     if language == "rust" {
+        let mut type_indices = HashMap::new();
+        for (index, ty) in facts.types.iter().enumerate() {
+            type_indices.entry(ty.name.clone()).or_insert(index);
+        }
         // Trait implementations supply both concrete lookup and default-body
         // inheritance; trait receivers still fan out to every implementation.
         for implementation in all.iter().filter(|n| n.kind() == "impl_item") {
@@ -457,7 +508,7 @@ pub fn extract(
             ) {
                 let ty = type_name(text(ty, source));
                 let trait_name = type_name(text(trait_node, source));
-                if let Some(t) = facts.types.iter_mut().find(|t| t.name == ty) {
+                if let Some(t) = type_indices.get(&ty).map(|&i| &mut facts.types[i]) {
                     if !t.bases.contains(&trait_name) {
                         t.bases.push(trait_name);
                     }
@@ -465,20 +516,37 @@ pub fn extract(
             }
         }
     }
-    for reference in &parse.refs {
-        if reference.kind != BlobRefKind::Call {
-            continue;
-        }
-        let Some(call) = all
-            .iter()
-            .filter(|n| {
-                crate::calls::call_node_kinds(lang).contains(&n.kind())
-                    && n.start_byte() <= reference.byte_start
-                    && n.end_byte() >= reference.byte_end
-            })
-            .min_by_key(|n| n.end_byte() - n.start_byte())
-            .copied()
-        else {
+    let call_kinds = crate::calls::call_node_kinds(lang);
+    let calls = all
+        .iter()
+        .copied()
+        .filter(|n| call_kinds.contains(&n.kind()))
+        .collect::<Vec<_>>();
+    let call_ranges = calls
+        .iter()
+        .map(|n| (n.start_byte(), n.end_byte()))
+        .collect::<Vec<_>>();
+    let references = parse
+        .refs
+        .iter()
+        .filter(|r| r.kind == BlobRefKind::Call)
+        .collect::<Vec<_>>();
+    let queries = references
+        .iter()
+        .map(|r| (r.byte_start, r.byte_end))
+        .collect::<Vec<_>>();
+    let targets = super::extraction_index::range_minima(
+        &call_ranges,
+        &queries,
+        super::extraction_index::LookupWork::Dispatch,
+    );
+    let namespace_imports = parse
+        .imports
+        .iter()
+        .filter_map(|i| i.namespace_import.as_deref())
+        .collect::<HashSet<_>>();
+    for (reference, target) in references.into_iter().zip(targets) {
+        let Some(call) = target.map(|i| calls[i]) else {
             continue;
         };
         let Some(callee) = field(call, &["function", "name"]).or_else(|| {
@@ -507,12 +575,7 @@ pub fn extract(
         if !dynamic && receiver_node.is_none() {
             continue;
         }
-        if receiver_node.is_some_and(|n| {
-            parse
-                .imports
-                .iter()
-                .any(|i| i.namespace_import.as_deref() == Some(text(n, source)))
-        }) {
+        if receiver_node.is_some_and(|n| namespace_imports.contains(text(n, source))) {
             // A namespace-qualified function is a static import binding, not an
             // unknown object receiver. Preserve the ordinary manifest resolver.
             continue;
@@ -523,14 +586,12 @@ pub fn extract(
             ordinal: reference.ordinal,
             caller: enclosing(call, FUNCTIONS)
                 .and_then(|function| {
-                    parse
-                        .symbols
-                        .iter()
-                        .find(|s| {
-                            s.start_line == function.start_position().row as u32
-                                && s.start_col == function.start_position().column as u32
-                        })
-                        .map(|s| s.scoped_name.clone())
+                    callers
+                        .get(&(
+                            function.start_position().row as u32,
+                            function.start_position().column as u32,
+                        ))
+                        .cloned()
                 })
                 .or_else(|| reference.caller_symbol.clone()),
             line: reference.line,
@@ -560,10 +621,30 @@ pub fn extract(
         });
     }
     // Computed calls may have no extracted callee name and hence no BlobRef.
-    for call in &all {
-        if !crate::calls::call_node_kinds(lang).contains(&call.kind()) {
-            continue;
-        }
+    let mut site_ordinals = facts
+        .sites
+        .iter()
+        .map(|s| s.ordinal)
+        .collect::<HashSet<_>>();
+    let callable_symbols = parse
+        .symbols
+        .iter()
+        .filter(|s| ["method", "function"].contains(&s.kind.as_str()))
+        .collect::<Vec<_>>();
+    let symbol_lines = callable_symbols
+        .iter()
+        .map(|s| (s.start_line as usize, s.end_line as usize))
+        .collect::<Vec<_>>();
+    let call_lines = calls
+        .iter()
+        .map(|n| (n.start_position().row, n.end_position().row))
+        .collect::<Vec<_>>();
+    let dynamic_callers = super::extraction_index::range_minima(
+        &symbol_lines,
+        &call_lines,
+        super::extraction_index::LookupWork::Dispatch,
+    );
+    for (call, caller) in calls.iter().zip(dynamic_callers) {
         let Some(callee) = field(*call, &["function", "name"]).or_else(|| {
             if language == "kotlin" {
                 call.named_child(0)
@@ -576,26 +657,14 @@ pub fn extract(
         if !syntactic_dynamic(callee, source, language) {
             continue;
         }
-        let ordinal = parse
-            .ast_nodes
-            .iter()
-            .filter(|n| n.byte_start <= call.start_byte() && n.byte_end >= call.end_byte())
-            .min_by_key(|n| n.byte_end - n.byte_start)
-            .map(|n| n.ordinal)
+        let ordinal = spans
+            .get(&(call.start_byte(), call.end_byte()))
+            .copied()
             .unwrap_or_default();
-        if facts.sites.iter().any(|s| s.ordinal == ordinal) {
+        if !site_ordinals.insert(ordinal) {
             continue;
         }
-        let caller = parse
-            .symbols
-            .iter()
-            .filter(|s| {
-                s.start_line <= call.start_position().row as u32
-                    && s.end_line >= call.end_position().row as u32
-                    && ["method", "function"].contains(&s.kind.as_str())
-            })
-            .min_by_key(|s| s.end_line - s.start_line)
-            .map(|s| s.scoped_name.clone());
+        let caller = caller.map(|i| callable_symbols[i].scoped_name.clone());
         facts.sites.push(SiteHint {
             ordinal,
             caller,
@@ -612,15 +681,24 @@ pub fn extract(
     Ok(facts)
 }
 
-fn symbol_node<'a>(all: &[Node<'a>], symbol: &BlobSymbol) -> Option<Node<'a>> {
-    all.iter()
-        .filter(|n| {
-            FUNCTIONS.contains(&n.kind())
-                && n.start_position().row as u32 == symbol.start_line
-                && n.start_position().column as u32 == symbol.start_col
-        })
-        .min_by_key(|n| n.end_byte() - n.start_byte())
-        .copied()
+fn exact_ordinals(parse: &ParseBlob) -> HashMap<(usize, usize), u32> {
+    let mut spans = HashMap::new();
+    for node in &parse.ast_nodes {
+        spans
+            .entry((node.byte_start, node.byte_end))
+            .or_insert(node.ordinal);
+    }
+    spans
+}
+
+fn symbol_callers(parse: &ParseBlob) -> HashMap<(u32, u32), String> {
+    let mut callers = HashMap::new();
+    for symbol in &parse.symbols {
+        callers
+            .entry((symbol.start_line, symbol.start_col))
+            .or_insert_with(|| symbol.scoped_name.clone());
+    }
+    callers
 }
 fn syntactic_dynamic(callee: Node<'_>, source: &str, language: &str) -> bool {
     match language {

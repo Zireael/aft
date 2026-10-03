@@ -9,10 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+#[cfg(test)]
+use crate::callgraph_store::join::Parser;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use serde_json::Value;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+#[cfg(not(test))]
+use tree_sitter::Parser;
 
 use crate::callgraph_store::disk_facts::DiskFacts;
 use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
@@ -1279,60 +1283,17 @@ struct SymbolCallRange {
     byte_end: usize,
 }
 
-struct SourceLineIndex {
-    bounds: Vec<(usize, usize)>,
-    source_len: usize,
-}
-
-impl SourceLineIndex {
-    fn new(source: &str) -> Self {
-        let bytes = source.as_bytes();
-        let mut bounds = Vec::new();
-        let mut line_start = 0usize;
-        let mut index = 0usize;
-
-        while index < bytes.len() {
-            match bytes[index] {
-                // Tree-sitter points only advance rows on `\n`; a lone carriage
-                // return is line content, and the `\r` of a CRLF pair is excluded
-                // from the line's byte extent so a column never lands on it.
-                b'\n' => {
-                    let line_end = if index > 0 && bytes[index - 1] == b'\r' {
-                        index - 1
-                    } else {
-                        index
-                    };
-                    bounds.push((line_start, line_end));
-                    index += 1;
-                    line_start = index;
-                }
-                _ => index += 1,
-            }
-        }
-        bounds.push((line_start, bytes.len()));
-
-        Self {
-            bounds,
-            source_len: bytes.len(),
-        }
-    }
-
-    fn byte_offset(&self, line: u32, column: u32) -> usize {
-        let Some(&(line_start, line_end)) = self.bounds.get(line as usize) else {
-            return self.source_len;
-        };
-        line_start + (column as usize).min(line_end.saturating_sub(line_start))
-    }
-}
+type SourceLineIndex = crate::callgraph_store::LineIndex;
 
 fn collect_calls_by_symbol(
     source: &str,
     root: Node<'_>,
     lang: LangId,
     symbols: &[Symbol],
+    line_index: &SourceLineIndex,
 ) -> HashMap<String, Vec<CallSite>> {
     attribute_sites_to_symbols(
-        source,
+        line_index,
         symbols,
         extract_calls_full(source, root, 0, source.len(), lang),
     )
@@ -1345,7 +1306,7 @@ fn collect_calls_by_symbol(
 /// because attributing it to the code around the definition would name a
 /// caller that never runs it.
 fn split_macro_body_calls(
-    source: &str,
+    line_index: &SourceLineIndex,
     symbols: &[Symbol],
     raw_calls: Vec<crate::calls::CallTuple>,
     bodies: &[crate::calls::RustMacroBody],
@@ -1354,7 +1315,6 @@ fn split_macro_body_calls(
     if bodies.is_empty() {
         return (raw_calls, body_calls);
     }
-    let line_index = SourceLineIndex::new(source);
     let symbol_ranges = symbols
         .iter()
         .map(|symbol| {
@@ -1415,16 +1375,20 @@ fn collect_rust_value_refs_by_symbol(
     source: &str,
     root: Node<'_>,
     symbols: &[Symbol],
+    line_index: &SourceLineIndex,
 ) -> HashMap<String, Vec<CallSite>> {
-    attribute_sites_to_symbols(source, symbols, extract_rust_value_references(source, root))
+    attribute_sites_to_symbols(
+        line_index,
+        symbols,
+        extract_rust_value_references(source, root),
+    )
 }
 
 fn attribute_sites_to_symbols(
-    source: &str,
+    line_index: &SourceLineIndex,
     symbols: &[Symbol],
     raw_sites: Vec<(String, String, u32, usize, usize)>,
 ) -> HashMap<String, Vec<CallSite>> {
-    let line_index = SourceLineIndex::new(source);
     let mut ranges = symbols
         .iter()
         .enumerate()
@@ -1507,6 +1471,18 @@ pub(crate) fn build_file_data_from_source_with_lang(
             message: format!("parse failed for {}", path.display()),
         })?;
 
+    let line_index = SourceLineIndex::new(source);
+    build_file_data_from_tree(path, source, lang, &tree, &line_index)
+}
+
+/// Reuse a caller-owned syntax tree and position index during blob extraction.
+pub(crate) fn build_file_data_from_tree(
+    path: &Path,
+    source: &str,
+    lang: LangId,
+    tree: &tree_sitter::Tree,
+    line_index: &SourceLineIndex,
+) -> Result<FileCallData, AftError> {
     // Parse imports
     let import_block = imports::parse_imports(&source, &tree, lang);
 
@@ -1520,16 +1496,16 @@ pub(crate) fn build_file_data_from_source_with_lang(
         let (raw_calls, macro_facts) =
             crate::calls::extract_rust_calls_with_macro_facts(&source, root, 0, source.len());
         let (raw_calls, body_calls) =
-            split_macro_body_calls(&source, &symbols, raw_calls, &macro_facts.bodies);
+            split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
         macro_mentions_by_symbol =
-            attribute_sites_to_symbols(&source, &symbols, macro_facts.unparsed_mentions);
-        attribute_sites_to_symbols(&source, &symbols, raw_calls)
+            attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions);
+        attribute_sites_to_symbols(line_index, &symbols, raw_calls)
     } else {
-        collect_calls_by_symbol(&source, root, lang, &symbols)
+        collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
     };
     let value_refs_by_symbol = if lang == LangId::Rust {
-        collect_rust_value_refs_by_symbol(&source, root, &symbols)
+        collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
     } else {
         HashMap::new()
     };
@@ -3971,7 +3947,13 @@ def right():
             let (tree, symbols) = parse_symbols(source, lang);
             let reference =
                 collect_calls_by_symbol_reference(source, tree.root_node(), lang, &symbols);
-            let actual = collect_calls_by_symbol(source, tree.root_node(), lang, &symbols);
+            let actual = collect_calls_by_symbol(
+                source,
+                tree.root_node(),
+                lang,
+                &symbols,
+                &SourceLineIndex::new(source),
+            );
             assert_eq!(actual, reference, "call attribution changed for {name}");
 
             let class_sites = actual.get("Worker").expect("class receives method calls");
@@ -4005,8 +3987,13 @@ def right():
             LangId::TypeScript,
             &symbols,
         );
-        let actual =
-            collect_calls_by_symbol(source, tree.root_node(), LangId::TypeScript, &symbols);
+        let actual = collect_calls_by_symbol(
+            source,
+            tree.root_node(),
+            LangId::TypeScript,
+            &symbols,
+            &SourceLineIndex::new(source),
+        );
         assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
         assert_eq!(
             actual["outer"]

@@ -19,34 +19,34 @@ const MAX_RUST_MACRO_CALL_DEPTH: u32 = 32;
 
 /// Returns the tree-sitter node kind strings that represent call expressions
 /// for the given language.
-pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
+pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
     match lang {
-        LangId::TypeScript | LangId::JavaScript => vec!["call_expression", "new_expression"],
-        LangId::Tsx => vec![
+        LangId::TypeScript | LangId::JavaScript => &["call_expression", "new_expression"],
+        LangId::Tsx => &[
             "call_expression",
             "new_expression",
             "jsx_opening_element",
             "jsx_self_closing_element",
         ],
-        LangId::Go => vec!["call_expression"],
-        LangId::Python => vec!["call"],
-        LangId::Rust => vec!["call_expression", "macro_invocation"],
-        LangId::Solidity | LangId::Scala => vec!["call_expression"],
-        LangId::Java => vec!["method_invocation"],
-        LangId::Ruby => vec!["call"],
-        LangId::Kotlin | LangId::Swift => vec!["call_expression"],
-        LangId::Php => vec![
+        LangId::Go => &["call_expression"],
+        LangId::Python => &["call"],
+        LangId::Rust => &["call_expression", "macro_invocation"],
+        LangId::Solidity | LangId::Scala => &["call_expression"],
+        LangId::Java => &["method_invocation"],
+        LangId::Ruby => &["call"],
+        LangId::Kotlin | LangId::Swift => &["call_expression"],
+        LangId::Php => &[
             "function_call_expression",
             "member_call_expression",
             "nullsafe_member_call_expression",
             "scoped_call_expression",
         ],
-        LangId::Perl => vec!["function_call_expression", "method_call_expression"],
-        LangId::Lua => vec!["function_call"],
+        LangId::Perl => &["function_call_expression", "method_call_expression"],
+        LangId::Lua => &["function_call"],
         LangId::C | LangId::Cpp | LangId::Cuda | LangId::Metal | LangId::Zig => {
-            vec!["call_expression"]
+            &["call_expression"]
         }
-        LangId::CSharp => vec!["invocation_expression"],
+        LangId::CSharp => &["invocation_expression"],
         LangId::Bash
         | LangId::Scss
         | LangId::Vue
@@ -58,7 +58,7 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         | LangId::R
         | LangId::Groovy
         | LangId::ObjC
-        | LangId::Toml => vec![],
+        | LangId::Toml => &[],
     }
 }
 
