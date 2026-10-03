@@ -33,6 +33,7 @@ import {
 } from "./bridge-bootstrap.js";
 import {
   ConfigRejectedError,
+  createUnchangedConfigLoader,
   getConfigLoadErrors,
   loadAftConfig,
   resolveBridgePoolTransportOptions,
@@ -304,9 +305,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // Reloads keep the last configuration that loaded successfully when the
   // current file is rejected.
   const lastGoodConfig = new Map<string, typeof aftConfig>([[registrationRoot, aftConfig]]);
+  // chat.message loads the config on every message; skip the full reload while
+  // neither config file has changed.
+  const loadAftConfigIfChanged = createUnchangedConfigLoader(loadAftConfig);
   const loadAftConfigOrLastGood = (projectRoot: string): typeof aftConfig => {
     try {
-      const loaded = loadAftConfig(projectRoot);
+      const loaded = loadAftConfigIfChanged(projectRoot);
       lastGoodConfig.set(projectRoot, loaded);
       return loaded;
     } catch (err) {

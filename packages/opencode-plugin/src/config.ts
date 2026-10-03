@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
@@ -2174,4 +2174,49 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   });
   if (costNotice !== null) configLoadNotices.push(costNotice);
   return resolved;
+}
+
+/**
+ * Identity of each config file a load for `projectDirectory` would read:
+ * path plus device, inode, size, mtime and ctime, or "absent". Any edit,
+ * replacement, chmod or deletion changes it.
+ */
+function configFilesIdentity(projectDirectory: string): string {
+  const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(projectDirectory);
+  return [userConfigPath, projectConfigPath]
+    .map((path) => {
+      try {
+        const info = statSync(path, { bigint: true });
+        return `${path}:${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+      } catch {
+        return `${path}:absent`;
+      }
+    })
+    .join("|");
+}
+
+/**
+ * Wrap a config loader for hot paths that only need the current value (the
+ * OpenCode `chat.message` hook loads it on every message). A full load reads
+ * and parses each file twice (once for the on-disk migration check, once to
+ * load it) and validates the result; while neither file has changed, the last
+ * successful result for the project is returned after two stat calls instead.
+ *
+ * The identity is taken before loading, so a file written during the load
+ * (including the loader's own migration rewrite) forces one more load next
+ * time. A load that throws is not remembered, so a rejected config is retried
+ * (and reported) on every call as before.
+ */
+export function createUnchangedConfigLoader(
+  load: (projectDirectory: string) => AftConfig,
+): (projectDirectory: string) => AftConfig {
+  const lastLoads = new Map<string, { identity: string; config: AftConfig }>();
+  return (projectDirectory: string): AftConfig => {
+    const identity = configFilesIdentity(projectDirectory);
+    const last = lastLoads.get(projectDirectory);
+    if (last && last.identity === identity) return last.config;
+    const config = load(projectDirectory);
+    lastLoads.set(projectDirectory, { identity, config });
+    return config;
+  };
 }
