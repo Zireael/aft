@@ -1182,11 +1182,13 @@ mod tests {
         set_recorded_limit(&ctx, &task, 1);
 
         let reloaded_at = std::time::Instant::now();
-        let restarted = restart(project.path(), storage.path(), 1_000);
+        let restarted = restart(project.path(), storage.path(), 3_000);
         let status = |restarted: &AppContext| {
             crate::commands::bash_status::handle(&status_request(&task, false), restarted).data
         };
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Past at least two watchdog passes (one every 500 ms), which would
+        // have killed a task whose limit was not extended.
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
         let early = status(&restarted);
         assert_eq!(
             early["status"], "running",
@@ -1195,11 +1197,11 @@ mod tests {
         assert!(
             restarted
                 .bash_background()
-                .renew_hard_kill(&task, session, std::time::Duration::from_millis(1_000))
+                .renew_hard_kill(&task, session, std::time::Duration::from_millis(3_000))
                 .is_some(),
             "a reloaded default kill stays renewable"
         );
-        let deadline = reloaded_at + std::time::Duration::from_secs(10);
+        let deadline = reloaded_at + std::time::Duration::from_secs(20);
         let killed = loop {
             let data = status(&restarted);
             if data["status"] == "timed_out" {
@@ -1212,7 +1214,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         assert!(
-            reloaded_at.elapsed() >= std::time::Duration::from_millis(1_200),
+            reloaded_at.elapsed() >= std::time::Duration::from_millis(4_000),
             "killed before the renewed window ran out"
         );
         assert!(
