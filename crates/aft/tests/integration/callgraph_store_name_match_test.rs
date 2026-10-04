@@ -1247,11 +1247,14 @@ fn build_view_store(root: &Path, name: &str) -> aft::callgraph_store::ReadonlyCa
             )
             .unwrap();
             (
+                // Manifest paths are repository-relative with `/` separators
+                // on every platform, as git writes them.
                 RelPath::new(
                     file.strip_prefix(root)
                         .unwrap()
                         .to_str()
                         .unwrap()
+                        .replace('\\', "/")
                         .as_bytes(),
                 )
                 .unwrap(),

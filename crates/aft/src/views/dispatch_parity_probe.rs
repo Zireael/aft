@@ -81,8 +81,17 @@ fn ruled_rows_are_root_independent_with_unreadable_checkouts() {
         let callers = reader
             .callers_of(Path::new("fixture.ts"), "A::m", 1)
             .unwrap();
-        assert_eq!(callers.callers.len(), 1);
-        assert_eq!(callers.callers[0].provenance, "dispatch");
+        // `caller(x: I)` reaches A::m through typed interface dispatch;
+        // `unknown(x)` has an untyped receiver, so it is a name-only candidate.
+        let by_symbol = callers
+            .callers
+            .iter()
+            .map(|c| (c.caller.symbol.as_str(), c.provenance.as_ref()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_symbol,
+            BTreeMap::from([("caller", "dispatch"), ("unknown", "name_match")])
+        );
         let bound = callers
             .callers
             .into_iter()
