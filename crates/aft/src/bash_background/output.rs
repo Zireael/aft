@@ -40,22 +40,40 @@ pub struct CappedText {
 }
 
 pub fn cap_final_output(input: &str) -> CappedText {
-    cap_head_tail(
+    cap_test_verdict(
         input,
         FINAL_OUTPUT_CAP_BYTES,
         FINAL_OUTPUT_HEAD_BYTES,
         FINAL_OUTPUT_TAIL_BYTES,
+        None,
     )
+    .unwrap_or_else(|| {
+        cap_head_tail(
+            input,
+            FINAL_OUTPUT_CAP_BYTES,
+            FINAL_OUTPUT_HEAD_BYTES,
+            FINAL_OUTPUT_TAIL_BYTES,
+        )
+    })
 }
 
 pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
-    cap_head_tail_with_marker(
+    cap_test_verdict(
         input,
         FINAL_OUTPUT_CAP_BYTES,
         FINAL_OUTPUT_HEAD_BYTES,
         FINAL_OUTPUT_TAIL_BYTES,
-        marker,
+        Some(marker),
     )
+    .unwrap_or_else(|| {
+        cap_head_tail_with_marker(
+            input,
+            FINAL_OUTPUT_CAP_BYTES,
+            FINAL_OUTPUT_HEAD_BYTES,
+            FINAL_OUTPUT_TAIL_BYTES,
+            marker,
+        )
+    })
 }
 
 /// Byte threshold under which a completion preview is passed through uncapped.
@@ -83,12 +101,97 @@ fn completion_caps(exit_ok: bool) -> (usize, usize, usize) {
 /// failure keeps a small head plus a larger tail (see the constants above).
 pub fn cap_completion_output(input: &str, exit_ok: bool) -> CappedText {
     let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_head_tail(input, threshold, head, tail)
+    cap_test_verdict(input, threshold, head, tail, None)
+        .unwrap_or_else(|| cap_head_tail(input, threshold, head, tail))
 }
 
 pub fn cap_completion_output_with_marker(input: &str, marker: &str, exit_ok: bool) -> CappedText {
     let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_head_tail_with_marker(input, threshold, head, tail, marker)
+    cap_test_verdict(input, threshold, head, tail, Some(marker))
+        .unwrap_or_else(|| cap_head_tail_with_marker(input, threshold, head, tail, marker))
+}
+
+/// Reserve the runner's verdict before spending bytes on ordinary head/tail
+/// context. Cargo writes test results to stdout and progress/rerun instructions
+/// to stderr; concatenating those streams puts the results in the *middle*.
+/// A chronological byte cut can therefore hide every failure in a failed run.
+///
+/// The byte cap is soft only when the mandatory names/totals themselves exceed
+/// it: reporting every failing name takes precedence over the preview budget.
+/// Other commands continue through the original byte-cap path unchanged.
+fn cap_test_verdict(
+    input: &str,
+    threshold: usize,
+    keep_head: usize,
+    keep_tail: usize,
+    marker: Option<&str>,
+) -> Option<CappedText> {
+    if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
+        return None;
+    }
+    let lines: Vec<&str> = input.trim_end().lines().collect();
+    let verdict = crate::compress::cargo::test_verdict(&lines)?;
+    let mut required = vec![false; lines.len()];
+    for index in verdict.required {
+        required[index] = true;
+    }
+    // Like the compressor line cut, always retain the command's last line,
+    // including a wrapper's verdict after the runner's own summary.
+    let last = lines.len().checked_sub(1)?;
+    required[last] = true;
+    let mut empty = vec![false; lines.len()];
+    let mut empty_count = 0;
+    for index in verdict.empty_results {
+        if !required[index] {
+            empty[index] = true;
+            empty_count += 1;
+        }
+    }
+    let mut context = Vec::new();
+    let mut essentials = Vec::new();
+    let mut counted_empty = false;
+    for (index, line) in lines.iter().enumerate() {
+        if required[index] {
+            essentials.push((*line).to_string());
+        } else if empty[index] {
+            if !counted_empty {
+                essentials.push(format!("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out ({empty_count} empty test targets)"));
+                counted_empty = true;
+            }
+        } else {
+            context.push(*line);
+        }
+    }
+    let essentials = essentials.join("\n");
+    let context = context.join("\n");
+    let marker = marker.unwrap_or("[truncated output; full output unavailable]");
+    let available = threshold.saturating_sub(essentials.len() + marker.len() + 2);
+    // Keep the familiar head plus up to twenty final context lines, bounded by
+    // the compressor tail window. Mandatory verdict lines do not spend that
+    // window, and the actual last command line is already in essentials.
+    let mut tail_bytes = 0;
+    let mut tail_lines = 0;
+    for line in context.lines().rev() {
+        let bytes = line.len() + 1;
+        if tail_lines == crate::compress::line_cut::TAIL_WINDOW_LINES
+            || tail_bytes + bytes > keep_tail.min(crate::compress::line_cut::TAIL_WINDOW_BYTES)
+        {
+            break;
+        }
+        tail_bytes += bytes;
+        tail_lines += 1;
+    }
+    let capped = cap_head_tail_with_marker(
+        &context,
+        available + marker.len() + 1,
+        keep_head.min(available),
+        tail_bytes.min(available),
+        marker,
+    );
+    Some(CappedText {
+        text: format!("{}\n{essentials}", capped.text.trim_end()),
+        truncated: true,
+    })
 }
 
 pub fn cap_head_tail(
@@ -521,5 +624,62 @@ mod tests {
             assert!(!capped.truncated);
             assert_eq!(capped.text, input);
         }
+    }
+
+    #[test]
+    fn cargo_verdict_caps_do_not_change_other_command_output() {
+        let input = format!("{}last line\n", "ordinary output\n".repeat(4000));
+        let marker = "[truncated output; full output unavailable]";
+        assert_eq!(
+            cap_final_output(&input),
+            cap_head_tail(
+                &input,
+                FINAL_OUTPUT_CAP_BYTES,
+                FINAL_OUTPUT_HEAD_BYTES,
+                FINAL_OUTPUT_TAIL_BYTES
+            )
+        );
+        assert_eq!(
+            cap_final_output_with_marker(&input, marker),
+            cap_head_tail_with_marker(
+                &input,
+                FINAL_OUTPUT_CAP_BYTES,
+                FINAL_OUTPUT_HEAD_BYTES,
+                FINAL_OUTPUT_TAIL_BYTES,
+                marker
+            )
+        );
+        for exit_ok in [true, false] {
+            let (threshold, head, tail) = completion_caps(exit_ok);
+            assert_eq!(
+                cap_completion_output(&input, exit_ok),
+                cap_head_tail(&input, threshold, head, tail)
+            );
+            assert_eq!(
+                cap_completion_output_with_marker(&input, marker, exit_ok),
+                cap_head_tail_with_marker(&input, threshold, head, tail, marker)
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_names_outgrow_soft_cap_but_panic_locations_are_bounded() {
+        let mut input = String::new();
+        for index in 0..300 {
+            input.push_str(&format!("test long_module_name::case_{index} ... FAILED\nthread 'case_{index}' panicked at src/lib.rs:{index}:1:\n{}", "backtrace\n".repeat(20)));
+        }
+        input.push_str("test result: FAILED. 0 passed; 300 failed\nwrapper verdict\n");
+        let capped = cap_completion_output(&input, false);
+        for index in 0..300 {
+            assert!(capped
+                .text
+                .contains(&format!("test long_module_name::case_{index} ... FAILED")));
+        }
+        assert!(capped
+            .text
+            .contains("test result: FAILED. 0 passed; 300 failed"));
+        assert!(capped.text.ends_with("wrapper verdict"));
+        assert_eq!(capped.text.matches("panicked at").count(), 20);
+        assert!(capped.text.len() > COMPLETION_FAILURE_PREVIEW_BYTES);
     }
 }

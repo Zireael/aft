@@ -9676,6 +9676,305 @@ mod tests {
         assert!(!snapshot.output_preview.contains("tail -n +"));
     }
 
+    // Use the disk-backed terminal path, not a proxy for the reply's byte cap.
+    // stdout is followed by stderr, just as in a real pipes-mode bash task.
+    fn cargo_verdict_agent_text(
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        exit: i32,
+    ) -> (String, String) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+            captured.lock().unwrap().push(frame);
+        }));
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
+        registry.record_live_delivery_session("session");
+        let dir = tempfile::tempdir().unwrap();
+        let filters = crate::compress::toml_filter::FilterRegistry::default();
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            let result = crate::compress::compress_with_registry_exit_code(
+                command, &output, exit_code, &filters,
+            );
+            assert!(
+                result.text.len() > FINAL_OUTPUT_CAP_BYTES,
+                "fixture must reach the reply byte cap after compression"
+            );
+            result
+        });
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.exit_code = Some(exit);
+            state.metadata.status = if exit == 0 {
+                BgTaskStatus::Completed
+            } else {
+                BgTaskStatus::Failed
+            };
+            state.terminal_output_cache = None;
+        }
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+        registry.post_terminal_transition(&task, true).unwrap();
+        let frames = frames.lock().unwrap();
+        let completion = frames
+            .iter()
+            .find_map(|frame| match frame {
+                PushFrame::BashCompleted(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("actual bash completion frame");
+        assert!(snapshot.output_truncated);
+        assert!(completion.output_truncated);
+        for (text, cap) in [
+            (&snapshot.output_preview, FINAL_OUTPUT_CAP_BYTES),
+            (
+                &completion.output_preview,
+                completion_preview_threshold(exit == 0),
+            ),
+        ] {
+            assert!(
+                text.rsplit_once("\nshown ").unwrap().0.len() <= cap,
+                "ordinary verdict fits its real byte cap"
+            );
+        }
+        let normalize = |text: String| {
+            text.replace(&task.paths.stdout.display().to_string(), "<stdout>")
+                .replace(&task.paths.stderr.display().to_string(), "<stderr>")
+        };
+        (
+            normalize(snapshot.output_preview),
+            normalize(completion.output_preview.clone()),
+        )
+    }
+
+    fn synapse_agent_text() -> (String, String) {
+        let text = cargo_verdict_agent_text(
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/command.sh").trim(),
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/stdout"),
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/stderr"),
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/exit")
+                .trim()
+                .parse()
+                .unwrap(),
+        );
+        // Opt-in capture records exactly the agent's output for golden updates
+        // and diagnosis; normal test runs never write fixtures.
+        if let Ok(prefix) = std::env::var("AFT_BASH_GOLDEN_CAPTURE") {
+            fs::write(format!("{prefix}.foreground.txt"), &text.0).unwrap();
+            fs::write(format!("{prefix}.completion.txt"), &text.1).unwrap();
+        }
+        text
+    }
+
+    fn cargo_verdict_noise(label: &str, count: usize) -> String {
+        // Distinct lines cannot be folded away by generic consecutive dedup,
+        // so these fixtures really exercise the registry's byte caps.
+        (0..count)
+            .map(|index| format!("{label} {index}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_keeps_failure_names() {
+        let (foreground, completion) = synapse_agent_text();
+        for text in [foreground, completion] {
+            for name in [
+                "conv_cache_write_round_trips",
+                "conv_step_kernel_is_bit_exact_vs_cpu_reference",
+                "conv_step_kernel_is_deterministic",
+            ] {
+                assert!(
+                    text.contains(&format!(
+                        "test lfm2_decode_metal_step::tests::{name} ... FAILED"
+                    )),
+                    "missing failure name: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_keeps_panic_locations() {
+        let (foreground, completion) = synapse_agent_text();
+        for text in [foreground, completion] {
+            for location in ["838:14:", "759:14:", "801:22:"] {
+                assert!(text.contains(&format!("panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:{location}")), "missing panic location: {location}");
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_keeps_totals() {
+        let (foreground, completion) = synapse_agent_text();
+        for text in [foreground, completion] {
+            assert!(
+                text.contains("test result: FAILED. 64 passed; 3 failed; 22 ignored"),
+                "missing failed aggregate"
+            );
+            for count in [7, 58, 12, 30] {
+                assert!(
+                    text.contains(&format!("test result: ok. {count} passed; 0 failed")),
+                    "missing passing aggregate: {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_keeps_rerun_line() {
+        let (foreground, completion) = synapse_agent_text();
+        for text in [foreground, completion] {
+            assert!(text.contains("error: test failed, to rerun pass `-p spike-unified-rt --bin spike-unified-rt`"), "missing rerun line");
+        }
+        // A wrapper may print more progress after Cargo's rerun instruction;
+        // the instruction must not depend on being the stream's final line.
+        let stderr = format!(
+            "{}{}wrapper finished\n",
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/stderr"),
+            cargo_verdict_noise("post-test progress", 4000)
+        );
+        let (foreground, completion) = cargo_verdict_agent_text(
+            "cargo fmt --all --check && cargo test --workspace",
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/stdout"),
+            &stderr,
+            101,
+        );
+        for text in [foreground, completion] {
+            assert!(text.contains("error: test failed, to rerun pass `-p spike-unified-rt --bin spike-unified-rt`"), "missing non-final rerun line");
+            assert!(text.contains("wrapper finished"));
+        }
+    }
+
+    fn nextest_agent_text() -> (String, String) {
+        let stderr = format!(
+            "{}        FAIL [   0.004s] demo::unit fails\n     TIMEOUT [  60.001s] demo::unit hangs\nthread 'fails' panicked at src/lib.rs:42:9:\n{}     Summary [  60.100s] 100 tests run: 98 passed, 1 failed, 1 timed out\n{}wrapper finished\n",
+            cargo_verdict_noise("nextest progress", 2000),
+            cargo_verdict_noise("failure backtrace noise", 2000),
+            cargo_verdict_noise("wrapper progress", 2000),
+        );
+        cargo_verdict_agent_text("cargo nextest run", "", &stderr, 100)
+    }
+
+    #[test]
+    fn cargo_verdict_nextest_keeps_fail_and_timeout_names() {
+        let (foreground, completion) = nextest_agent_text();
+        for text in [foreground, completion] {
+            assert!(text.contains("FAIL [   0.004s] demo::unit fails"));
+            assert!(text.contains("TIMEOUT [  60.001s] demo::unit hangs"));
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_nextest_keeps_timeout_name_independently() {
+        let (foreground, completion) = nextest_agent_text();
+        for text in [foreground, completion] {
+            assert!(text.contains("TIMEOUT [  60.001s] demo::unit hangs"));
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_nextest_keeps_summary() {
+        let (foreground, completion) = nextest_agent_text();
+        for text in [foreground, completion] {
+            assert!(text
+                .contains("Summary [  60.100s] 100 tests run: 98 passed, 1 failed, 1 timed out"));
+            assert!(text.contains("wrapper finished"));
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_nextest_keeps_panic_location() {
+        let (foreground, completion) = nextest_agent_text();
+        for text in [foreground, completion] {
+            assert!(text.contains("thread 'fails' panicked at src/lib.rs:42:9:"));
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_passing_runs_keep_totals_and_collapse_empty_targets() {
+        for (command, stdout, expected) in [
+            ("cargo fmt --check && cargo test", "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n".to_string() + &"running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n".repeat(200), "test result: ok. 42 passed; 0 failed"),
+            ("cargo nextest run", "     Summary [   0.050s] 42 tests run: 42 passed, 0 skipped\n".to_string(), "Summary [   0.050s] 42 tests run: 42 passed, 0 skipped"),
+        ] {
+            let (foreground, completion) = cargo_verdict_agent_text(command, &stdout, &cargo_verdict_noise("runner progress", 2000), 0);
+            for text in [foreground, completion] {
+                assert!(text.contains(expected));
+                if command.contains("cargo test") {
+                    assert!(text.contains("(200 empty test targets)"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_layer_diagnosis() {
+        let stdout = include_str!("../../tests/fixtures/bash/synapse-cargo-test/stdout");
+        let stderr = include_str!("../../tests/fixtures/bash/synapse-cargo-test/stderr");
+        let merged = combine_streams(stdout, stderr);
+        let compressed = crate::compress::compress_with_registry_exit_code(
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/command.sh").trim(),
+            &merged,
+            Some(101),
+            &crate::compress::toml_filter::FilterRegistry::default(),
+        );
+        // The compound command deliberately bypasses Cargo's extractor. No
+        // failure is lost until the registry applies its reply byte cap.
+        assert_eq!(
+            compressed.text,
+            crate::compress::generic::GenericCompressor::compress_output(&merged)
+        );
+        assert!(compressed
+            .text
+            .contains("conv_cache_write_round_trips ... FAILED"));
+        assert!(compressed
+            .text
+            .contains("test result: FAILED. 64 passed; 3 failed"));
+        assert!(compressed.text.len() > FINAL_OUTPUT_CAP_BYTES);
+        let legacy = super::super::output::cap_head_tail_with_marker(
+            &compressed.text,
+            FINAL_OUTPUT_CAP_BYTES,
+            super::super::output::FINAL_OUTPUT_HEAD_BYTES,
+            super::super::output::FINAL_OUTPUT_TAIL_BYTES,
+            "[truncated output; full output unavailable]",
+        );
+        assert!(!legacy
+            .text
+            .contains("conv_cache_write_round_trips ... FAILED"));
+        assert!(!legacy
+            .text
+            .contains("test result: FAILED. 64 passed; 3 failed"));
+    }
+
+    #[test]
+    fn cargo_verdict_fixture_golden_agent_output() {
+        let (foreground, completion) = synapse_agent_text();
+        // The context budget depends on the platform's absolute capture-path
+        // length. Golden the complete verdict block in the final visible text,
+        // while the neighboring tests assert each line class independently.
+        let golden =
+            include_str!("../../tests/fixtures/bash/synapse-cargo-test/verdict.txt").trim_end();
+        for text in [foreground, completion] {
+            let body = text.rsplit_once("\nshown ").expect("bash cap trailer").0;
+            assert!(
+                body.ends_with(golden),
+                "agent-visible verdict differs from golden: {body}"
+            );
+            assert!(body.contains(
+                "[truncated output; full output: read \"<stdout>\" and read \"<stderr>\"]"
+            ));
+        }
+    }
+
     #[test]
     fn over_ceiling_structured_json_uses_pointer_not_partial_json() {
         let registry = BgTaskRegistry::default();

@@ -1,0 +1,163 @@
+
+running 7 tests
+test neon_convert::tests::test_empty_slices ... ok
+test neon_convert::tests::test_exact_4_element_alignment ... ok
+test neon_convert::tests::test_f32_to_f16_remainder ... ok
+test neon_convert::tests::test_f16_to_f32_remainder ... ok
+test neon_convert::tests::test_special_float_values ... ok
+test neon_convert::tests::test_f32_to_f16_roundtrip ... ok
+test neon_convert::tests::test_large_array ... ok
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 0 tests
+
+
+
+running 58 tests
+test boundary::tests::cancellation_applies_when_no_deadline_expired ... ok
+test boundary::tests::cancellation_recorded_after_boundary_is_ignored ... ok
+test boundary::tests::cancellation_wins_over_deadline_when_both_pending ... ok
+test boundary::tests::progress_with_no_controls_is_accepted ... ok
+test boundary::tests::deadline_at_exact_boundary_is_expired ... ok
+test boundary::tests::terminal_completion_wins_over_cancel_and_deadline ... ok
+test boundary::tests::worker_reported_cancelled_finish_is_cancellation ... ok
+test error::tests::fallback_eligibility_is_exactly_the_six_pre_dispatch_refusals ... ok
+test error::tests::stable_ids_are_the_documented_wire_literals ... ok
+test error::tests::deadline_and_cancel_use_literal_wire_binding_ids ... ok
+test identity::tests::canonical_identity_is_the_documented_decode_lane ... ok
+test identity::tests::quarantine_key_storage_id_is_stable ... ok
+test identity::tests::production_n_is_restricted_to_the_committed_set ... ok
+test ownership::tests::manifest_covers_every_documented_fault_site ... ok
+test budget::tests::second_crash_exhausts_and_quarantines ... ok
+test budget::tests::save_failure_surfaces_and_marks_the_key_unpersisted ... ok
+test budget::tests::first_crash_leaves_one_unit_and_permits_redispatch ... ok
+test ownership::tests::destroy_all_frees_everything_without_double_free ... ok
+test budget::tests::classifications_are_recorded_in_order ... ok
+test ownership::tests::clean_lifecycle_is_safe ... ok
+test ownership::tests::invalid_free_is_detected ... ok
+test ownership::tests::double_free_is_detected ... ok
+test ownership::tests::use_after_free_is_detected ... ok
+test budget::tests::a_later_successful_save_clears_the_unpersisted_mark ... ok
+test budget::tests::retry_persist_clears_the_mark_only_when_the_save_succeeds ... ok
+test protocol::tests::constraint_first_mismatched_field_is_precise ... ok
+test protocol::tests::finish_reasons_are_the_documented_four ... ok
+test identity::tests::runtime_digest_is_stable_and_scheduler_sensitive ... ok
+test protocol::tests::constraint_bytes_round_trip_through_base64 ... ok
+test protocol::tests::envelope_round_trips_and_rejects_foreign_protocol ... ok
+test streaming::tests::abort_preflights_retention_at_the_committed_prefix ... ok
+test protocol::tests::sidecar_bank_installation_round_trips_and_denies_unknown_fields ... ok
+test protocol::tests::owned_transport_round_trips_and_rejects_unknown_fields ... ok
+test streaming::tests::progress_is_ordered_idempotent_and_has_one_terminal ... ok
+test streaming::tests::gap_fails_closed_after_worker_death_and_refuses_continuation ... ok
+test streaming::tests::forget_session_drops_only_that_sessions_records ... ok
+test protocol::tests::start_and_constraint_reject_unknown_wire_fields ... ok
+test streaming::tests::terminal_identity_and_grammar_chain_are_not_relaxed ... ok
+test streaming::tests::retention_refusal_reclaims_resources_in_one_supervision_cycle ... ok
+test streaming::tests::terminal_status_recovers_lost_delivery_with_its_committed_count ... ok
+test streaming::tests::worker_death_emits_failed_terminal_when_ordered_history_is_provable ... ok
+test supervisor::tests::budget_persistence_failure_fails_closed_until_a_save_succeeds ... ok
+test budget::tests::budget_state_persists_across_store_reopens ... ok
+test supervisor::tests::clean_single_quantum_completion_succeeds ... ok
+test supervisor::tests::crash_then_clean_redispatch_preserves_generation_id ... ok
+test supervisor::tests::crash_while_sending_start_is_charged_and_redispatched ... ok
+test supervisor::tests::pending_bank_source_does_not_install_or_delay_a_continue ... ok
+test supervisor::tests::protocol_transport_error_returns_typed_failure_without_a_strike ... ok
+test supervisor::tests::quarantined_key_is_refused_before_dispatch ... ok
+test supervisor::tests::second_crash_is_terminal_and_quarantines ... ok
+test supervisor::tests::ready_bank_installs_after_progress_before_continue ... ok
+test supervisor::tests::timeout_is_terminal_and_not_redispatched ... ok
+test validation::tests::clean_start_authorizes_min_n_max_tokens ... ok
+test validation::tests::constraint_mismatches_map_to_constraint_version_mismatch ... ok
+test validation::tests::non_greedy_sampling_is_unsupported ... ok
+test validation::tests::runtime_identity_mismatches_map_to_runtime_config_mismatch ... ok
+test validation::tests::structural_faults_map_to_protocol_mismatch ... ok
+test wire_error_bindings::tests::bindings_are_literal_not_symbolic ... ok
+
+
+
+running 12 tests
+test fixture_lfm2_conv_cache_ffi_site_is_safe ... ok
+test fixture_timeout_cleanup_teardown_is_safe ... ok
+test fixture_ownership_transfer_across_ffi_is_safe ... ok
+test fixture_allocation_site_is_safe ... ok
+test fixture_manifest_revision_and_fault_site_coverage ... ok
+test fixture_generation_site_is_safe ... ok
+test fixture_partial_initialization_teardown_is_safe ... ok
+test fixture_cancellation_teardown_is_safe ... ok
+test fixture_shutdown_site_is_safe ... ok
+test fixture_worker_death_destroys_all_resident_state ... ok
+test fixture_unload_site_is_safe ... ok
+test fixture_every_fault_site_has_a_clean_lifecycle ... ok
+
+
+
+running 30 tests
+test fixture_cancellation_beats_deadline_at_non_terminal_boundary ... ok
+test fixture_first_quantum_authorizes_min_n_max_tokens ... ok
+test fixture_cancellation_uses_literal_wire_error_and_no_budget ... ok
+test fixture_deadline_cleanup_uses_literal_wire_error_and_no_budget ... ok
+test fixture_failed_cancellation_at_cancel_boundary_charges_and_kills ... ok
+[truncated output; full output: read "<stdout>" and read "<stderr>"]
+   Compiling lane-candle-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
+   Compiling lane-llama v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
+   Compiling lane-wrap-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
+   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 00s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/ane-187c25c9ee3aa8bd)
+     Running unittests src/main.rs (target/debug/deps/lane_burn-a7dbe2f04f692c64)
+     Running unittests src/main.rs (target/debug/deps/lane_candle_embed-c1746166a0ad53d4)
+     Running unittests src/main.rs (target/debug/deps/lane_llama-3b1db8f719cebc6c)
+     Running unittests src/lib.rs (target/debug/deps/lane_llama_inproc-dc23307cd3132888)
+     Running unittests src/main.rs (target/debug/deps/lane_llama_inproc-f9972241158d4d41)
+     Running unittests src/bin/latency.rs (target/debug/deps/latency-78072a54be231578)
+     Running unittests src/main.rs (target/debug/deps/lane_ort_embed-1aa7aa5dba1eddf1)
+     Running unittests src/main.rs (target/debug/deps/lane_wrap_embed-0007e6723999e1cd)
+     Running unittests src/lib.rs (target/debug/deps/owned_decode_worker-f2b338e0f908554c)
+     Running tests/ownership_fixtures.rs (target/debug/deps/ownership_fixtures-cc72bad6b5b9ab3c)
+     Running tests/protocol_fixtures.rs (target/debug/deps/protocol_fixtures-2e5d83914483b7c7)
+     Running unittests src/main.rs (target/debug/deps/spike_unified_rt-8633ea13f51809ac)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out (8 empty test targets)
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test lfm2_decode_metal_step::tests::conv_cache_write_round_trips ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic ... FAILED
+thread 'lfm2_decode_metal_step::tests::conv_cache_write_round_trips' (152849554) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:838:14:
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference' (152849555) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:759:14:
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic' (152849556) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:801:22:
+test result: FAILED. 64 passed; 3 failed; 22 ignored; 0 measured; 0 filtered out; finished in 0.13s
+error: test failed, to rerun pass `-p spike-unified-rt --bin spike-unified-rt`
+shown 161 of 719 lines (cap)

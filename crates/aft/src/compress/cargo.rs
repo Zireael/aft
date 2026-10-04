@@ -200,7 +200,10 @@ fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
-        if trimmed.starts_with("running ") || trimmed.starts_with("test result:") {
+        if trimmed.starts_with("running ")
+            || trimmed.starts_with("test result:")
+            || trimmed.starts_with("error: test failed, to rerun")
+        {
             blocks.push(ClassifiedBlock::unclassified(line.to_string()));
             index += 1;
             continue;
@@ -263,6 +266,90 @@ fn trim_trailing_lines(input: &str) -> String {
         .join("\n")
 }
 
+/// Lines a byte-capped bash reply must retain even when stderr follows the
+/// test results. Names and totals are never capped; priority protection covers
+/// the first twenty distinct panic locations so backtraces cannot consume the reply.
+pub(crate) struct TestVerdict {
+    pub required: Vec<usize>,
+    pub empty_results: Vec<usize>,
+}
+
+pub(crate) fn test_verdict(lines: &[&str]) -> Option<TestVerdict> {
+    use std::collections::HashSet;
+
+    if !lines.iter().any(|line| {
+        is_cargo_test_signature_line(line.trim_start()) || is_nextest_verdict(line.trim_start())
+    }) {
+        return None;
+    }
+
+    let mut required = Vec::new();
+    let mut empty_results = Vec::new();
+    let mut names = HashSet::new();
+    let mut locations = HashSet::new();
+    let mut in_failure_list = false;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "failures:" {
+            in_failure_list = true;
+            continue;
+        }
+        let failure_name = failure_name(trimmed, in_failure_list);
+        if !trimmed.is_empty() && failure_name.is_none() {
+            in_failure_list = false;
+        }
+        let is_name = failure_name.is_some_and(|name| names.insert(name));
+        let is_panic = (trimmed.starts_with("thread '") && trimmed.contains("panicked at"))
+            || (index > 0 && lines[index - 1].trim_end().ends_with("panicked at"));
+        let is_location = is_panic && locations.len() < 20 && locations.insert(trimmed);
+        if trimmed.starts_with(
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+        ) {
+            empty_results.push(index);
+        } else if is_name
+            || is_location
+            || trimmed.starts_with("test result:")
+            || trimmed.starts_with("Summary [")
+            || trimmed.starts_with("error: test failed, to rerun")
+        {
+            required.push(index);
+        }
+    }
+    Some(TestVerdict {
+        required,
+        empty_results,
+    })
+}
+
+fn is_nextest_verdict(line: &str) -> bool {
+    ["FAIL [", "TIMEOUT [", "Summary ["]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+fn failure_name(line: &str, in_failure_list: bool) -> Option<&str> {
+    if let Some(name) = line
+        .strip_prefix("test ")
+        .and_then(|line| line.strip_suffix(" ... FAILED"))
+    {
+        return Some(name);
+    }
+    if let Some(name) = line
+        .strip_prefix("---- ")
+        .and_then(|line| line.strip_suffix(" stdout ----"))
+    {
+        return Some(name);
+    }
+    if line.starts_with("FAIL [") || line.starts_with("TIMEOUT [") {
+        return line.split_once(']').map(|(_, name)| name.trim());
+    }
+    // The second libtest `failures:` block lists bare names, one per line.
+    if in_failure_list && !line.is_empty() && !line.contains(char::is_whitespace) {
+        return Some(line);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +401,16 @@ error: could not compile `demo` (lib test) due to 1 previous error
         assert!(result.text.contains("error[E0432]"));
         assert!(result.text.contains("unresolved import"));
         assert!(result.text.contains("error: could not compile"));
+    }
+
+    #[test]
+    fn cargo_verdict_extractor_keeps_nonfinal_rerun_with_unknown_exit() {
+        let output = format!("running 1 test\n\nfailures:\n\n---- case stdout ----\nthread 'case' panicked at src/lib.rs:1:1:\n\nfailures:\n    case\n\ntest result: FAILED. 0 passed; 1 failed\nerror: test failed, to rerun pass `--lib`\n{}wrapper finished\n", "wrapper progress\n".repeat(200));
+        let result = compress_test(&output, None);
+        assert!(result
+            .text
+            .contains("error: test failed, to rerun pass `--lib`"));
+        assert!(result.text.ends_with("wrapper finished"));
     }
 
     #[test]
