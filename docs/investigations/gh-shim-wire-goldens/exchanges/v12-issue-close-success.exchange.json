@@ -13,6 +13,6 @@
   "response": "responses/success-applied-closed.response.json",
   "holder_behavior": "replied with the response file bytes",
   "exit_code": 0,
-  "stdout": "closed\nnot_planned\n",
-  "stderr": ""
+  "stdout": "",
+  "stderr": "✓ Closed issue cortexkit/aft#42\n"
 }

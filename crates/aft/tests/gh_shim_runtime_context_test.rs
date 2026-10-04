@@ -362,6 +362,14 @@ fn unclassified_refusal(verb: &str, manifest_version: u64) -> String {
     )
 }
 
+/// Raw `gh api` refusals name the HTTP method and endpoint instead of the bare
+/// verb, so an operator can see exactly which call needs a manifest entry.
+fn unclassified_api_refusal(method: &str, endpoint: &str, manifest_version: u64) -> String {
+    format!(
+        "gh-shim: gh_shim_unclassified: api {method} /{endpoint} is not declared in manifest {manifest_version} (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration\n"
+    )
+}
+
 fn admin_refusal(verb: &str) -> String {
     format!(
         "gh-shim: gh_shim_admin_tier: `{verb}` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.\n"
@@ -926,7 +934,10 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     assert_eq!(raw_api_delete.status.code(), Some(86));
     assert!(raw_api_delete.stdout.is_empty());
     let raw_api_refusal = String::from_utf8_lossy(&raw_api_delete.stderr);
-    assert_eq!(raw_api_refusal, unclassified_refusal("api", 9));
+    assert_eq!(
+        raw_api_refusal,
+        unclassified_api_refusal("DELETE", "repos/cortexkit/insula/actions/runs/123", 9)
+    );
     assert_ne!(
         expected_admin_refusal, raw_api_refusal,
         "native admin and raw API delete refusals must remain distinguishable"
@@ -994,7 +1005,10 @@ fn gh_shim_operator_bypass_does_not_lift_unclassified_refusal_and_keeps_admin_me
     assert!(unclassified_stderr.contains(
         "GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
     ));
-    assert_eq!(unclassified_stderr, unclassified_refusal("api", 9));
+    assert_eq!(
+        unclassified_stderr,
+        unclassified_api_refusal("DELETE", "repos/cortexkit/insula/actions/runs/123", 9)
+    );
 
     let admin = shim_command(
         &["repo", "edit", "cortexkit/insula", "--visibility", "public"],
@@ -1091,7 +1105,14 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     assert_eq!(raw_v10.status.code(), Some(86));
     assert!(raw_v10.stdout.is_empty());
     let raw_v10_refusal = String::from_utf8_lossy(&raw_v10.stderr);
-    assert_eq!(raw_v10_refusal, unclassified_refusal("api", 10));
+    assert_eq!(
+        raw_v10_refusal,
+        unclassified_api_refusal(
+            "POST",
+            "repos/cortexkit/aft/actions/workflows/ci.yml/dispatches",
+            10
+        )
+    );
     assert_ne!(
         expected_admin_refusal, raw_v10_refusal,
         "native workflow admin and raw API dispatch refusals must remain distinguishable"
@@ -1141,7 +1162,11 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     assert!(raw_v9.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&raw_v9.stderr),
-        unclassified_refusal("api", 9)
+        unclassified_api_refusal(
+            "POST",
+            "repos/cortexkit/aft/actions/workflows/ci.yml/dispatches",
+            9
+        )
     );
     assert!(!v9_recorder.exists());
 }
@@ -1238,7 +1263,10 @@ fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassifi
     .expect("spawn raw comment PATCH invocation");
     assert_eq!(raw_patch.status.code(), Some(86));
     let raw_patch_refusal = String::from_utf8_lossy(&raw_patch.stderr);
-    assert_eq!(raw_patch_refusal, unclassified_refusal("api", 10));
+    assert_eq!(
+        raw_patch_refusal,
+        unclassified_api_refusal("PATCH", "repos/cortexkit/aft/issues/comments/123", 10)
+    );
     assert_ne!(raw_patch_refusal, governed_stderr);
     assert!(raw_patch.stdout.is_empty());
 
