@@ -528,7 +528,6 @@ fn mark_pins(
             if reclaim {
                 let _ = fs::remove_file(&metadata_path);
                 let _ = fs::remove_file(&keys_path);
-                crate::fs_lock::sync_parent(&metadata_path);
                 marks.reclaimed_pins += 1;
             }
             continue;

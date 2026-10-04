@@ -918,10 +918,11 @@ fn trigram_materializer_pins_all_keys_with_one_key_file_write() {
     let (writes_after, syncs_after) = key_file_work();
     // Creating the pin writes an empty key list, the 200 blob keys go in one
     // batch, and the built segment id is pinned last: three key-file writes,
-    // independent of the number of files.
+    // independent of the number of files. Keys need no sync: a sweep consumes
+    // them only while this process lives, and reclaims the pin after its death.
     assert_eq!(
         (writes_after - writes_before, syncs_after - syncs_before),
-        (2, 3),
+        (2, 0),
         "pinning 200 trigram blobs must not rewrite the key file per blob"
     );
     let pinned = fs::read_to_string(materialized.pin.keys_path()).unwrap();

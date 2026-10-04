@@ -146,7 +146,6 @@ fn mark_live_assembly_pins(
         if expired || !pins::owner_is_live(&metadata.owner) {
             let _ = fs::remove_file(&metadata_path);
             let _ = fs::remove_file(&keys_path);
-            crate::fs_lock::sync_parent(&metadata_path);
             report.reclaimed_pins += 1;
             continue;
         }
