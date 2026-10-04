@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import struct
@@ -18,7 +19,7 @@ from embedding_fixture_server import Server, corpus_key, query_key
 from evidence_tree import evidence_tree_sha256
 from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
-from run_real_query import ROOT, assemble_score, load_inputs, score_manifest_rows, probe_pattern_capability
+from run_real_query import ROOT, assemble_score, load_capability, load_inputs, score_manifest_rows, probe_pattern_capability
 from search_quality_lib import (
     D_0,
     EVIDENCE_SHA,
@@ -285,6 +286,82 @@ class SplitQueryRunnerTests(unittest.TestCase):
         self.assertIn("ignored_pattern", ignored["split_rows_not_applicable"]["reason"])
         honoured = self.assembled(base | {"pattern_declared": True, "pattern_probe": "invalid_pattern"})
         self.assertNotIn("split_rows_not_applicable", honoured)
+
+
+class CapabilitySchemaTests(unittest.TestCase):
+    SCHEMA_BLOCK = '''const SearchParams = Type.Object(
+  {
+    query: Type.Optional(Type.String({ description: "Search text" })),
+    offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 100000 })),
+  },
+  { additionalProperties: false },'''
+    SOURCE = "// Plugin imports\n" + SCHEMA_BLOCK + "\n);\nfunction renderCall(args) { return args.query; }\n"
+    JSON_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search text"},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 100000},
+        },
+    }
+
+    def capability(self, source: str) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema"
+            path.write_bytes(source.encode("utf-8"))
+            return load_capability(path)
+
+    def digest(self, source: str) -> str:
+        return str(self.capability(source)["schema_sha256"])
+
+    def test_typescript_digest_hashes_only_the_extracted_schema_bytes(self) -> None:
+        self.assertEqual(self.digest(self.SOURCE), hashlib.sha256(self.SCHEMA_BLOCK.encode("utf-8")).hexdigest())
+        capability = self.capability(self.SOURCE)
+        self.assertTrue(capability["offset_declared"])
+        self.assertEqual(capability["offset_bounds"], {"minimum": 0, "maximum": 100000})
+
+    def test_typescript_edit_outside_schema_leaves_digest_unchanged(self) -> None:
+        changed = self.SOURCE.replace("return args.query;", "return typeof args.query === 'string' ? args.query : '';")
+        self.assertNotEqual(self.SOURCE, changed)
+        self.assertEqual(self.digest(self.SOURCE), self.digest(changed))
+
+    def test_typescript_edits_inside_schema_change_digest(self) -> None:
+        for label, old, new in (
+            ("new parameter", "    query:", "    pattern: Type.Optional(Type.String()),\n    query:"),
+            ("changed bound", "maximum: 100000", "maximum: 200000"),
+            ("changed description", "Search text", "Search text or regex"),
+        ):
+            with self.subTest(edit=label):
+                changed = self.SOURCE.replace(old, new)
+                self.assertNotEqual(self.SOURCE, changed)
+                self.assertNotEqual(self.digest(self.SOURCE), self.digest(changed))
+
+    def test_typescript_crlf_and_lf_have_the_same_digest(self) -> None:
+        self.assertEqual(self.digest(self.SOURCE), self.digest(self.SOURCE.replace("\n", "\r\n")))
+
+    def test_typescript_schema_whitespace_is_not_normalized(self) -> None:
+        changed = self.SOURCE.replace("    query:", "      query:")
+        self.assertNotEqual(self.digest(self.SOURCE), self.digest(changed))
+
+    def test_json_digest_hashes_canonical_schema_not_file_formatting(self) -> None:
+        compact = json.dumps(self.JSON_SCHEMA, separators=(",", ":"))
+        reordered = {"properties": dict(reversed(list(self.JSON_SCHEMA["properties"].items()))), "type": "object"}
+        formatted = json.dumps(reordered, indent=2)
+        expected = hashlib.sha256(canonical_json(self.JSON_SCHEMA)).hexdigest()
+        self.assertEqual(self.digest(compact), expected)
+        self.assertEqual(self.digest(formatted), expected)
+        self.assertEqual(self.digest(formatted.replace("\n", "\r\n")), expected)
+
+    def test_json_schema_edits_change_digest(self) -> None:
+        original = self.digest(json.dumps(self.JSON_SCHEMA))
+        for label, name, value in (
+            ("new parameter", "pattern", {"type": "string"}),
+            ("changed bound", "offset", {"type": "integer", "minimum": 0, "maximum": 200000}),
+            ("changed description", "query", {"type": "string", "description": "Search text or regex"}),
+        ):
+            with self.subTest(edit=label):
+                changed = copy.deepcopy(self.JSON_SCHEMA)
+                changed["properties"][name] = value
+                self.assertNotEqual(original, self.digest(json.dumps(changed)))
 
 
 class RealQueryRunnerTests(unittest.TestCase):
