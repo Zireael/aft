@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -39,14 +40,22 @@ impl SandboxProfile {
         cache_roots: Vec<PathBuf>,
         temp_dir: PathBuf,
     ) -> Result<Self, SandboxProfileError> {
+        // The credential floor appears in both write and read denies. Resolve
+        // each path once in this profile's snapshot, never across launches:
+        // symlinks and formerly missing paths may change between spawns.
+        let mut deny_paths = HashMap::new();
         Ok(Self {
             v: SANDBOX_PROFILE_VERSION,
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
-            write_deny: canonicalize_optional_paths(write_deny, "write_deny")?,
-            write_deny_nested: canonicalize_optional_paths(write_deny_nested, "write_deny_nested")?,
+            write_deny: canonicalize_optional_paths(write_deny, "write_deny", &mut deny_paths)?,
+            write_deny_nested: canonicalize_optional_paths(
+                write_deny_nested,
+                "write_deny_nested",
+                &mut deny_paths,
+            )?,
             read_allow: canonicalize_required_paths(read_allow, "read_allow")?,
-            read_deny: canonicalize_optional_paths(read_deny, "read_deny")?,
-            socket_deny: canonicalize_optional_paths(socket_deny, "socket_deny")?,
+            read_deny: canonicalize_optional_paths(read_deny, "read_deny", &mut deny_paths)?,
+            socket_deny: canonicalize_optional_paths(socket_deny, "socket_deny", &mut deny_paths)?,
             cache_roots: canonicalize_required_dirs(cache_roots, "cache_roots")?,
             temp_dir: canonicalize_required_dir(temp_dir, "temp_dir")?,
         })
@@ -64,17 +73,27 @@ impl SandboxProfile {
             )));
         }
 
+        let mut deny_paths = HashMap::new();
         Ok(Self {
             v: self.v,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
-            write_deny: canonicalize_optional_paths(self.write_deny, "write_deny")?,
+            write_deny: canonicalize_optional_paths(
+                self.write_deny,
+                "write_deny",
+                &mut deny_paths,
+            )?,
             write_deny_nested: canonicalize_optional_paths(
                 self.write_deny_nested,
                 "write_deny_nested",
+                &mut deny_paths,
             )?,
             read_allow: canonicalize_required_paths(self.read_allow, "read_allow")?,
-            read_deny: canonicalize_optional_paths(self.read_deny, "read_deny")?,
-            socket_deny: canonicalize_optional_paths(self.socket_deny, "socket_deny")?,
+            read_deny: canonicalize_optional_paths(self.read_deny, "read_deny", &mut deny_paths)?,
+            socket_deny: canonicalize_optional_paths(
+                self.socket_deny,
+                "socket_deny",
+                &mut deny_paths,
+            )?,
             cache_roots: canonicalize_required_dirs(self.cache_roots, "cache_roots")?,
             temp_dir: canonicalize_required_dir(self.temp_dir, "temp_dir")?,
         })
@@ -115,6 +134,17 @@ impl fmt::Display for SandboxProfileError {
 
 impl std::error::Error for SandboxProfileError {}
 
+fn canonicalize_path(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|count| count.set(count.get() + 1));
+    path.canonicalize()
+}
+
+#[cfg(test)]
+thread_local! {
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn canonicalize_required_dirs(
     paths: Vec<PathBuf>,
     field: &str,
@@ -127,7 +157,7 @@ fn canonicalize_required_dirs(
 
 fn canonicalize_required_dir(path: PathBuf, field: &str) -> Result<PathBuf, SandboxProfileError> {
     validate_absolute(&path, field)?;
-    let canonical = path.canonicalize().map_err(|error| {
+    let canonical = canonicalize_path(&path).map_err(|error| {
         SandboxProfileError::new(format!(
             "{field} path is not an existing directory: {}: {error}",
             path.display()
@@ -149,7 +179,7 @@ fn canonicalize_required_paths(
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         validate_absolute(&path, field)?;
-        canonical.push(path.canonicalize().map_err(|error| {
+        canonical.push(canonicalize_path(&path).map_err(|error| {
             SandboxProfileError::new(format!(
                 "{field} path does not exist: {}: {error}",
                 path.display()
@@ -164,20 +194,27 @@ fn canonicalize_required_paths(
 fn canonicalize_optional_paths(
     paths: Vec<PathBuf>,
     field: &str,
+    resolved: &mut HashMap<PathBuf, PathBuf>,
 ) -> Result<Vec<PathBuf>, SandboxProfileError> {
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         validate_absolute(&path, field)?;
-        match path.canonicalize() {
-            Ok(path) => canonical.push(path),
+        if let Some(known) = resolved.get(&path) {
+            canonical.push(known.clone());
+            continue;
+        }
+        let normalized = match canonicalize_path(&path) {
+            Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 validate_normalized(&path, field)?;
-                canonical.push(canonicalize_missing_path(path, field)?);
+                canonicalize_missing_path(path.clone(), field)?
             }
             Err(error) => {
                 return Err(canonicalization_error(&path, field, &error));
             }
-        }
+        };
+        resolved.insert(path, normalized.clone());
+        canonical.push(normalized);
     }
     canonical.sort_unstable();
     canonical.dedup();
@@ -190,7 +227,7 @@ fn canonicalize_missing_path(path: PathBuf, field: &str) -> Result<PathBuf, Sand
     let mut missing_tail = Vec::new();
 
     loop {
-        match ancestor.canonicalize() {
+        match canonicalize_path(&ancestor) {
             Ok(mut canonical) => {
                 for component in missing_tail.iter().rev() {
                     canonical.push(component);
@@ -252,6 +289,82 @@ fn validate_normalized(path: &Path, field: &str) -> Result<(), SandboxProfileErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_credential_floor_normalizes_each_path_once_per_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let deny: Vec<_> = [
+            ".ssh",
+            ".aws",
+            ".gnupg",
+            ".config/gcloud",
+            ".azure",
+            ".config/cortexkit",
+        ]
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+        CANONICALIZE_CALLS.with(|count| count.set(0));
+        let profile = SandboxProfile::build(
+            vec![root.clone()],
+            deny.clone(),
+            Vec::new(),
+            Vec::new(),
+            deny.clone(),
+            Vec::new(),
+            Vec::new(),
+            root.clone(),
+        )
+        .unwrap();
+        let calls = CANONICALIZE_CALLS.with(std::cell::Cell::get);
+        eprintln!("credential-floor canonicalize calls per profile: {calls}");
+        assert_eq!(calls, 22);
+        let mut expected = deny;
+        expected.sort_unstable();
+        assert_eq!(profile.write_deny, expected);
+        assert_eq!(profile.read_deny, expected);
+        CANONICALIZE_CALLS.with(|count| count.set(0));
+        assert_eq!(profile.clone().canonicalize_for_launch().unwrap(), profile);
+        assert_eq!(CANONICALIZE_CALLS.with(std::cell::Cell::get), 22);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_normalization_is_fresh_for_every_profile_and_launcher() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let target = root.join("credential-target");
+        std::fs::create_dir(&target).unwrap();
+        let deny = root.join(".ssh");
+        let build = || {
+            SandboxProfile::build(
+                vec![root.clone()],
+                vec![deny.clone()],
+                Vec::new(),
+                Vec::new(),
+                vec![deny.clone()],
+                Vec::new(),
+                Vec::new(),
+                root.clone(),
+            )
+            .unwrap()
+        };
+        let missing = build();
+        assert_eq!(missing.read_deny, vec![deny.clone()]);
+        symlink(&target, &deny).unwrap();
+        let existing = build();
+        assert_eq!(existing.read_deny, vec![target.clone()]);
+        assert_eq!(existing.write_deny, existing.read_deny);
+        assert_eq!(
+            missing.canonicalize_for_launch().unwrap().read_deny,
+            vec![target]
+        );
+        std::fs::remove_file(&deny).unwrap();
+        assert_eq!(build().read_deny, vec![deny]);
+    }
 
     #[test]
     fn build_canonicalizes_write_paths_and_retains_missing_denies() {
