@@ -688,11 +688,14 @@ fn run_probe(
         }
         match child.try_wait() {
             Ok(Some(status)) if eof => {
-                break if status.success() && err.is_empty() {
+                // Judge the probe by its exit status and JSON stdout only. The
+                // sandbox launcher reports unenforceable rules on stderr (for
+                // example under Landlock), which is not a probe failure.
+                break if status.success() {
                     String::from_utf8(out).map_err(|_| ProbeFailure::Error)
                 } else {
                     Err(ProbeFailure::Error)
-                }
+                };
             }
             Err(_) => break Err(ProbeFailure::Error),
             _ => std::thread::sleep(Duration::from_millis(5)),

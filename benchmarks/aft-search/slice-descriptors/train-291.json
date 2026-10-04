@@ -1,8 +1,10 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
-  "fixtures": ["harness-goldens"],
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
   "slices": ["db-schema-hints-route-reclaim-worktree-callgraph-wording"],
-  "note": "bash sqlite schema-hint trailer, deleted-root route Goodbyes and typed reclaim refusals, worktree callgraph refusal wording; no ranking-fence file."
+  "note": "The only ranking-fenced file touched is crates/aft/src/lib.rs, which registers the new bash_db_hints module. The change adds a sqlite schema-hint trailer to failed bash output, deleted-root route Goodbyes with typed reclaim refusals, and new worktree callgraph refusal wording. No search input, lane plan or ranking rule changes; no benchmark row may move."
 }
