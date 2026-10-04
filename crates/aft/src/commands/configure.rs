@@ -7180,8 +7180,26 @@ fn open_view_runtime_for_configure(
     // Schedule a replacement before the warm reader rejects the old output.
     let callgraph_unready = ctx.config().indexes.callgraph
         && generation.as_deref().is_some_and(|generation| {
-            !crate::callgraph_store::manifest_view_database_ready(view.view_dir(), generation)
-                .is_ok_and(|ready| ready)
+            match crate::callgraph_store::manifest_view_database_ready(
+                view.view_dir(), generation, Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
+            ) {
+                Ok(ready) => !ready,
+                Err(error) if error.is_unreadable_database() => true,
+                Err(error) if error.is_transient_lock_contention() => {
+                    slog_info!(
+                        "content-addressed view callgraph readiness unknown (busy) root={} generation={} reason=busy",
+                        job.canonical_cache_root.display(), generation
+                    );
+                    false
+                }
+                Err(error) => {
+                    slog_warn!(
+                        "content-addressed view callgraph readiness unknown root={} generation={} reason=probe_failed error={}",
+                        job.canonical_cache_root.display(), generation, error
+                    );
+                    false
+                }
+            }
         });
     if callgraph_unready {
         slog_info!(
@@ -8248,6 +8266,88 @@ mod tests {
             "the newer configure's tail runs to completion: {records:?}"
         );
         assert!(!ctx.configure_tail_has_work());
+    }
+
+    #[test]
+    fn busy_readiness_does_not_schedule_a_configure_rebuild() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = test_context();
+        let params = json!({
+            "project_root": project.path(), "storage_dir": storage.path(), "harness": "opencode",
+            "config": [user_tier(json!({ "views": { "enabled": true },
+                "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+        });
+        let root = project.path().canonicalize().unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+            storage: storage.path().to_owned(),
+            family: crate::search_index::artifact_cache_key(&root),
+            scope: scope.clone(),
+            desired_head: crate::views::assembly::head_tree_fingerprint(
+                &crate::alias::head_tree_entries(&root).unwrap(),
+            ),
+            project_root: root,
+            changed_paths: BTreeSet::new(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        })
+        .unwrap();
+        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
+        let initial = view.current_generation().unwrap();
+        let derived = view.derived_path(initial.as_deref().unwrap()).unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
+        let writer = crate::db::file_identity::IdentityConnection::open(
+            &derived,
+            "busy_configure_readiness_test",
+        )
+        .unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params.clone(), "while-locked"),
+                &ctx
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            ctx.view_runtime_snapshot()
+                .unwrap()
+                .pending_paths
+                .is_empty(),
+            "busy readiness must not schedule a configure rebuild"
+        );
+        assert_eq!(view.current_generation().unwrap(), initial);
+        assert_eq!(
+            crate::views::assembly::cold_build_counts(view.view_dir()),
+            Default::default()
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params, "after-unlock"),
+                &ctx
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(view.current_generation().unwrap(), initial);
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(_)
+        ));
     }
 
     #[test]

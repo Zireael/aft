@@ -572,6 +572,42 @@ mod write_amplification_tests {
     }
 
     #[test]
+    fn busy_readiness_probe_waits_within_its_deadline() {
+        let temp = tempdir().unwrap();
+        let generation = "locked-probe";
+        let path = temp.path().join(format!("derived-{generation}.sqlite"));
+        let writer = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT); BEGIN EXCLUSIVE;").unwrap();
+        let started = Instant::now();
+        let error = manifest_view_database_ready(
+            temp.path(),
+            generation,
+            started + Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.is_transient_lock_contention(), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "probe exceeded its bounded wait"
+        );
+
+        // A short-lived writer should clear inside the next attempt's budget,
+        // rather than every attempt immediately observing a busy database.
+        let release = std::thread::spawn(move || {
+            let (_tx, rx) = std::sync::mpsc::channel::<()>();
+            let _ = rx.recv_timeout(Duration::from_millis(50));
+            writer.execute_batch("ROLLBACK").unwrap();
+        });
+        assert!(!manifest_view_database_ready(
+            temp.path(),
+            generation,
+            Instant::now() + Duration::from_secs(2)
+        )
+        .unwrap());
+        release.join().unwrap();
+    }
+
+    #[test]
     fn callgraph_reader_setup_does_not_read_locked_schema() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("locked.sqlite");
@@ -1674,6 +1710,14 @@ pub enum CallGraphStoreError {
 }
 
 impl CallGraphStoreError {
+    pub(crate) fn is_unreadable_database(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+        )
+    }
+
     pub(crate) fn is_transient_lock_contention(&self) -> bool {
         matches!(
             self,
@@ -9243,12 +9287,23 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
 
 /// Publication reuse must satisfy the same build-output check as a view reader.
 /// HEAD and manifest equality cannot make output from an older builder readable.
-pub(crate) fn manifest_view_database_ready(view_dir: &Path, generation: &str) -> Result<bool> {
+pub(crate) fn manifest_view_database_ready(
+    view_dir: &Path,
+    generation: &str,
+    deadline: Instant,
+) -> Result<bool> {
     let path = manifest_view_database_path(view_dir, generation)?;
-    if !path.is_file() {
-        return Ok(false);
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     }
-    let conn = open_readonly_connection(&path)?;
+    // Use the store's reader opener, not a raw descriptor on its live file set.
+    // Contention that outlasts this job's budget remains an unknown readiness
+    // result (the SQLite busy/locked error), never a definitive negative answer.
+    let conn = open_readonly_connection_before(&path, deadline)?;
+    conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     database_ready(&conn)
 }
 
@@ -9265,6 +9320,10 @@ fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<Path
 }
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
+    open_readonly_connection_before(path, Instant::now())
+}
+
+fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
     let uri = sqlite_readonly_uri(path);
     let conn = TrackedConnection::open_with_flags(
         &uri,
@@ -9273,9 +9332,9 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     )?;
     // Readers do not change durability or journal settings: even synchronous
     // reads the schema and can block behind an exclusive writer before setup.
-    // Fail fast so repeated readiness probes cannot accumulate busy waits on
-    // the request thread; callers report contention as a retryable build.
-    conn.busy_timeout(Duration::ZERO)?;
+    // Request readers pass an expired deadline and fail fast; maintenance probes
+    // may wait within their bounded budget without changing durability settings.
+    conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
 }
@@ -9731,19 +9790,16 @@ pub(crate) fn set_meta_ready(conn: &Connection, ready: bool) -> Result<()> {
 }
 
 fn database_ready(conn: &Connection) -> Result<bool> {
-    let schema_version: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    let fingerprint: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'fingerprint'", [], |row| {
-            row.get(0)
-        })
-        .optional()?;
-    let ready: Option<String> = conn
-        .query_row("SELECT v FROM meta WHERE k = 'ready'", [], |row| row.get(0))
-        .optional()?;
+    // One statement reads one snapshot and consumes at most one busy-timeout
+    // window; three independent queries could each wait the entire job budget.
+    let (schema_version, fingerprint, ready): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT (SELECT v FROM meta WHERE k = 'schema_version'),
+                (SELECT v FROM meta WHERE k = 'fingerprint'),
+                (SELECT v FROM meta WHERE k = 'ready')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
 
     let expected_schema = SCHEMA_VERSION.to_string();
     let expected_fingerprint = schema_fingerprint();

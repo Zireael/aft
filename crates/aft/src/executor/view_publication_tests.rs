@@ -289,6 +289,77 @@ fn commit(root: &Path) {
 }
 
 #[test]
+fn publication_busy_readiness_uses_backoff_and_recovers_after_unlock() {
+    let fixture = Fixture::new();
+    let derived = fixture.view.derived_path(&fixture.initial).unwrap();
+    crate::views::wait_for_derived_checkpoint_for_test(fixture.view.view_dir());
+    let writer = crate::db::file_identity::IdentityConnection::open(
+        &derived,
+        "publication_busy_readiness_test",
+    )
+    .unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    fixture.change("after_unlock");
+    let failures = Failures::new(fixture.job_root());
+    let completions = Completions::new(fixture.job_root());
+    fixture.schedule();
+    let (_, delay, count, _) = failures.next();
+    assert_eq!(delay, Duration::from_secs(1));
+    assert_eq!(count, 1);
+    assert_eq!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+    assert_eq!(
+        crate::views::assembly::cold_build_counts(fixture.view.view_dir()),
+        Default::default()
+    );
+    assert!(fixture
+        .ctx
+        .view_publication_retry()
+        .lock()
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("database is locked"));
+    assert!(!fixture
+        .ctx
+        .view_publication_retry()
+        .lock()
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("invalid view manifest"));
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+
+    completions.next();
+    fixture.wait_idle();
+    assert_ne!(
+        fixture.view.current_generation().unwrap().as_deref(),
+        Some(fixture.initial.as_str())
+    );
+    assert_eq!(
+        crate::views::assembly::cold_build_counts(fixture.view.view_dir()),
+        Default::default()
+    );
+    assert!(fixture.ctx.view_publication_retry().lock().due().is_none());
+    match fixture.ctx.callgraph_store_for_ops() {
+        CallgraphStoreAccess::Ready(store) => {
+            assert!(crate::callgraph_store::CallGraphRead::node_for(
+                &store,
+                Path::new("tracked.rs"),
+                "after_unlock"
+            )
+            .is_ok())
+        }
+        _ => panic!("publication did not recover after the writer released its lock"),
+    }
+}
+
+#[test]
 fn publication_omits_staged_and_unstaged_working_tree_deletions() {
     use crate::views::{
         contracts::{PlaneAdapter, PlaneLoader, ViewAccess},

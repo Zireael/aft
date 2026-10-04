@@ -159,6 +159,7 @@ pub fn prepare_checkout(
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
     publication_delay_for_test();
+    let readiness_deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
     // Every publisher (scheduler, migration import, tests) reaches this point
     // with the HEAD fingerprint it observed, so the read-path cache that
@@ -183,7 +184,11 @@ pub fn prepare_checkout(
     let unusable_base = match current_generation
         .as_deref()
         .map(|generation| {
-            crate::callgraph_store::manifest_view_database_ready(view.view_dir(), generation)
+            crate::callgraph_store::manifest_view_database_ready(
+                view.view_dir(),
+                generation,
+                readiness_deadline,
+            )
         })
         .transpose()
     {
@@ -192,6 +197,14 @@ pub fn prepare_checkout(
             "derived graph fails the current build-output readiness check".to_string(),
         )),
         Ok(_) => None,
+        // A checkpoint or live writer can temporarily prevent the probe. Keep
+        // SQLite's typed contention error so the publication scheduler retries
+        // with its existing backoff instead of treating the manifest as invalid.
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if crate::db::is_busy_error(&error) =>
+        {
+            return Err(ViewError::Sqlite(error));
+        }
         Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
             if sqlite_error_is_unreadable_database(&error) =>
         {

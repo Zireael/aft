@@ -86,3 +86,29 @@ loading immediately, without waiting for that event. The timeout at `401-426`
 can also mean maintenance has not reached that release step. No #399 view
 metadata was inspected, so shared causality is unconfirmed; its request-loop
 and restart paths are deliberately unchanged here.
+
+## Contention is unknown readiness, not stale output
+
+The staging gate exposed a separate boundary error in the first repair:
+`republishing_an_unchanged_checkout_keeps_the_current_generation` could receive
+`InvalidManifest("sqlite error: database is locked")` while the published
+generation's deferred checkpoint was active. Configure also treated any probe
+error as a negative readiness answer. Neither inference is valid for contention.
+
+The probe now uses the callgraph store's own tracked SQLite reader opener with
+an absolute deadline. Configure gives its readiness step 250 ms; assembly gives
+the step the existing derived-reader budget of 5 seconds, measured from the start
+of preparation. One SQL statement reads all readiness metadata in one snapshot
+and consumes at most one remaining busy-timeout window. Request readers remain
+fail-fast. No raw file descriptor or file-set inspection opener is introduced.
+
+SQLite busy/locked remains a typed unknown result. Configure logs
+`callgraph readiness unknown (busy)` with `reason=busy` and schedules no rebuild.
+Assembly returns the typed SQLite error, not an invalid-manifest error, so the
+existing detached publication retry retains its paths and applies backoff. A
+definitive negative readiness answer or corrupt/unreadable database still selects
+the cold replacement path; other probe failures remain unknown.
+
+Lock-holding regressions verify the configure and preparation decisions, bounded
+waiting, and automatic detached retry: the first busy attempt backs off for one
+second, performs no cold rebuild, and publishes after the lock is released.
