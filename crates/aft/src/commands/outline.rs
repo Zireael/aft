@@ -1346,6 +1346,15 @@ fn outline_many_files(
     req_id: &str,
     project_root: Option<&Path>,
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
+    let paths = files
+        .iter()
+        .map(|file| ctx.validate_path(req_id, Path::new(file)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let display_root = project_root
+        .filter(|root| paths.iter().all(|path| path.starts_with(root)))
+        .map(Path::to_path_buf)
+        .or_else(|| common_outline_path_ancestor(&paths));
+
     let mut file_outlines: Vec<FileOutline> = Vec::with_capacity(files.len());
     let mut skipped_files: Vec<SkippedFile> = Vec::new();
     // One parser for the whole batch, sharing the provider's symbol cache:
@@ -1358,17 +1367,13 @@ fn outline_many_files(
         .downcast_ref::<TreeSitterProvider>()
         .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()));
 
-    for file in files {
-        let path = match ctx.validate_path(req_id, Path::new(file)) {
-            Ok(path) => path,
-            Err(resp) => return Err(resp),
-        };
+    for (file, path) in files.iter().zip(paths) {
         if !path.exists() {
             skipped_files.push(SkippedFile::new(file, "file_not_found"));
             continue;
         }
 
-        let rel_path = display_path(&path, file, project_root);
+        let rel_path = display_path(&path, file, display_root.as_deref());
         if let Some(reason) = outline_skip_reason(&path, batch_parser.as_mut()) {
             if let Some(parser) = batch_parser.as_mut() {
                 parser.evict_parse_tree(&path);
@@ -1399,6 +1404,18 @@ fn outline_many_files(
     }
 
     Ok((file_outlines, skipped_files))
+}
+
+fn common_outline_path_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.parent()?.to_path_buf();
+    for path in paths.iter().skip(1) {
+        while !path.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    Some(common)
 }
 
 fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
@@ -1683,7 +1700,7 @@ fn should_skip_directory(path: &Path) -> bool {
 fn display_path(path: &Path, fallback: &str, project_root: Option<&Path>) -> String {
     project_root
         .and_then(|root| path.strip_prefix(root).ok())
-        .map(|p| p.to_string_lossy().to_string())
+        .map(path_to_slash)
         .unwrap_or_else(|| fallback.to_string())
 }
 
@@ -1851,24 +1868,6 @@ fn render_entries(entries: &[OutlineEntry], indent: usize, output: &mut String, 
     }
 }
 
-/// Render only top-level entries. Directory/multi-file outlines are a structure
-/// map; callers can request a specific file when they need methods or fields.
-fn render_top_level_entries(
-    entries: &[OutlineEntry],
-    indent: usize,
-    output: &mut String,
-    with_sig: bool,
-) {
-    let prefix = "  ".repeat(indent);
-    for entry in entries {
-        if with_sig {
-            output.push_str(&format!("{}{}\n", prefix, format_entry_with_sig(entry)));
-        } else {
-            output.push_str(&format!("{}{}\n", prefix, format_entry_compact(entry)));
-        }
-    }
-}
-
 /// Format single-file outline as tree text with signatures.
 fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
     let mut output = format!("{}\n", filename);
@@ -1920,9 +1919,7 @@ fn format_multi_file_tree(
         let file_indent = "  ".repeat(dir_parts.len());
         output.push_str(&format!("{}{}\n", file_indent, file_name));
 
-        // Emit only top-level symbols under each file. Full nested members stay
-        // available via the single-file outline path.
-        render_top_level_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
+        render_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();
@@ -2009,6 +2006,130 @@ mod tests {
         let skipped = response["skipped_files"].as_array().expect("skipped files");
         assert_eq!(skipped.len(), 1, "{response}");
         assert_eq!(skipped[0]["reason"], "parse_error");
+    }
+
+    #[test]
+    fn multi_file_outline_nests_rust_impl_methods_and_preserves_single_file_symbols() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = r#"
+pub struct Widget;
+pub trait Render { fn render(&self); }
+impl Widget { pub fn new() -> Self { Self } }
+impl Render for Widget { pub fn render(&self) {} }
+pub struct GenericBox<T> { value: T }
+pub trait Boxed { fn boxed(&self); }
+impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
+"#;
+        let path = temp.path().join("sample.rs");
+        std::fs::write(&path, source).expect("write Rust outline fixture");
+
+        let symbols = parsed_symbols("rs", source);
+        let expected_names = symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        let output = multi_file_text(&[path]);
+
+        for name in expected_names {
+            assert_eq!(
+                output.matches(name).count(),
+                1,
+                "multi-file outline must render the same symbol once as single-file mode: {name}\n{output}"
+            );
+        }
+        let lines = output.lines().collect::<Vec<_>>();
+        for (type_name, method_name) in [
+            ("Widget", "new"),
+            ("Widget", "render"),
+            ("GenericBox", "boxed"),
+        ] {
+            let owner_prefix = format!("  E st   {type_name} ");
+            let owner_index = lines
+                .iter()
+                .position(|line| line.starts_with(&owner_prefix))
+                .unwrap_or_else(|| panic!("missing owner {type_name}:\n{output}"));
+            let next_type = lines
+                .iter()
+                .enumerate()
+                .skip(owner_index + 1)
+                .find(|(_, line)| line.starts_with("  E ") || line.starts_with("  - "))
+                .map(|(index, _)| index)
+                .unwrap_or(lines.len());
+            assert!(
+                lines[owner_index + 1..next_type]
+                    .iter()
+                    .any(|line| line.starts_with("    .") && line.contains(method_name)),
+                "{method_name} must be nested under {type_name}:\n{output}"
+            );
+        }
+        let new_line = lines
+            .iter()
+            .position(|line| line.starts_with("    .E mth  new "))
+            .expect("Widget::new should be nested");
+        let render_line = lines
+            .iter()
+            .position(|line| line.starts_with("    .E mth  render "))
+            .expect("Render for Widget method should be nested");
+        assert!(
+            new_line < render_line,
+            "methods should preserve source order:\n{output}"
+        );
+        assert!(output.contains("  E st   Widget "), "{output}");
+        assert!(output.contains("  E st   GenericBox "), "{output}");
+    }
+
+    #[test]
+    fn multi_file_outline_nests_typescript_class_methods() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sample.ts");
+        std::fs::write(
+            &path,
+            "export class Greeter { greet(name: string) { return name; } }\n",
+        )
+        .expect("write TypeScript outline fixture");
+
+        let output = multi_file_text(&[path]);
+        assert!(output.contains("  E cls  Greeter "), "{output}");
+        assert!(
+            output
+                .lines()
+                .any(|line| { line.starts_with("    .") && line.contains("greet") }),
+            "class method must be nested:\n{output}"
+        );
+    }
+
+    #[test]
+    fn multi_file_outline_roots_paths_at_their_common_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let left = temp.path().join("left").join("first.ts");
+        let right = temp.path().join("right").join("second.ts");
+        std::fs::create_dir_all(left.parent().unwrap()).expect("create left directory");
+        std::fs::create_dir_all(right.parent().unwrap()).expect("create right directory");
+        std::fs::write(&left, "export function first() {}\n").unwrap();
+        std::fs::write(&right, "export function second() {}\n").unwrap();
+
+        let output = multi_file_text(&[left, right]);
+        assert!(output.starts_with("left/\n  first.ts\n"), "{output}");
+        assert!(output.contains("right/\n  second.ts\n"), "{output}");
+        assert!(
+            !output.contains(temp.path().to_string_lossy().as_ref()),
+            "{output}"
+        );
+    }
+
+    fn multi_file_text(paths: &[std::path::PathBuf]) -> String {
+        let files = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let ctx = crate::context::AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let (outlines, skipped) = outline_many_files(&files, &ctx, "outline-fixture", None)
+            .expect("outline fixture files");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        format_multi_file_tree(&outlines, 30 * 1024, files.len())
     }
 
     #[test]

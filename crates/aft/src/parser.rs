@@ -3618,7 +3618,17 @@ fn extract_rs_symbols_from_root(
                 } else {
                     type_names.first().cloned().unwrap_or_default()
                 };
-                let parent_name = type_names.last().cloned().unwrap_or_default();
+                let parent_name = type_names
+                    .last()
+                    .map(|name| {
+                        let base_type = name.split('<').next().unwrap_or(name).trim();
+                        base_type
+                            .rsplit("::")
+                            .next()
+                            .unwrap_or(base_type)
+                            .to_string()
+                    })
+                    .unwrap_or_default();
 
                 let mut child_cursor = node.walk();
                 if child_cursor.goto_first_child() {
