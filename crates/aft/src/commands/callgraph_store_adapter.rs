@@ -2323,7 +2323,7 @@ pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Re
             req_id,
             "callgraph_unavailable",
             format!(
-                "{operation}: persisted callgraph store is unavailable in this read-only worktree; run a callgraph operation in the main checkout to build it first"
+                "{operation}: no call graph has been built for this repository yet; it is built when the main checkout is opened; use grep or aft_search with pattern to find references in this checkout"
             ),
             IndexObservation::unavailable(cause::READ_ONLY_STORE_NOT_BUILT),
         );

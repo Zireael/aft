@@ -32,6 +32,7 @@ mod callgraph_rust_bin_targets_test;
 mod callgraph_stale_missing_refresh_test;
 mod callgraph_store_name_match_test;
 mod callgraph_test;
+mod callgraph_worktree_test;
 mod checkpoint_metadata_test;
 mod commands_test;
 mod compress_cli_commands_test;
