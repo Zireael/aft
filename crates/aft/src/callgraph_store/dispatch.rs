@@ -207,7 +207,8 @@ pub fn complete_members(
     // same member, and an indexed lookup avoids scanning all symbols per node.
     let mut identities = HashMap::new();
     for symbol in &parse.symbols {
-        identities.entry((symbol.end_line, symbol.end_col, symbol.name.clone()))
+        identities
+            .entry((symbol.end_line, symbol.end_col, symbol.name.clone()))
             .or_insert_with(|| symbol.scoped_name.clone());
     }
     let mut scoped_names = parse
@@ -230,7 +231,11 @@ pub fn complete_members(
             node.start_position().row as u32,
             node.start_position().column as u32,
         );
-        let identity = (node.end_position().row as u32, node.end_position().column as u32, name.clone());
+        let identity = (
+            node.end_position().row as u32,
+            node.end_position().column as u32,
+            name.clone(),
+        );
         if let Some(symbol) = identities.get(&identity) {
             callers.entry(position).or_insert_with(|| symbol.clone());
             continue;
