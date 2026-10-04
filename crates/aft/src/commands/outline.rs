@@ -1868,6 +1868,23 @@ fn render_entries(entries: &[OutlineEntry], indent: usize, output: &mut String, 
     }
 }
 
+/// Render only top-level entries for directory and multi-file structure maps.
+fn render_top_level_entries(
+    entries: &[OutlineEntry],
+    indent: usize,
+    output: &mut String,
+    with_sig: bool,
+) {
+    let prefix = "  ".repeat(indent);
+    for entry in entries {
+        if with_sig {
+            output.push_str(&format!("{}{}\n", prefix, format_entry_with_sig(entry)));
+        } else {
+            output.push_str(&format!("{}{}\n", prefix, format_entry_compact(entry)));
+        }
+    }
+}
+
 /// Format single-file outline as tree text with signatures.
 fn format_single_file_tree(filename: &str, entries: &[OutlineEntry]) -> String {
     let mut output = format!("{}\n", filename);
@@ -1919,7 +1936,9 @@ fn format_multi_file_tree(
         let file_indent = "  ".repeat(dir_parts.len());
         output.push_str(&format!("{}{}\n", file_indent, file_name));
 
-        render_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
+        // Directory outlines are a structure map; members remain available
+        // from the single-file outline to keep broad results bounded.
+        render_top_level_entries(&fo.entries, dir_parts.len() + 1, &mut output, false);
 
         files_shown += 1;
         prev_parts = parts.iter().map(|s| *s).collect();
@@ -2009,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_file_outline_nests_rust_impl_methods_and_preserves_single_file_symbols() {
+    fn multi_file_outline_keeps_rust_impl_methods_out_of_structure_map() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = r#"
 pub struct Widget;
@@ -2024,62 +2043,45 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         std::fs::write(&path, source).expect("write Rust outline fixture");
 
         let symbols = parsed_symbols("rs", source);
-        let expected_names = symbols
-            .iter()
-            .map(|symbol| symbol.name.as_str())
-            .collect::<Vec<_>>();
+        let tree = build_outline_tree(&symbols);
         let output = multi_file_text(&[path]);
-
-        for name in expected_names {
-            assert_eq!(
-                output.matches(name).count(),
-                1,
-                "multi-file outline must render the same symbol once as single-file mode: {name}\n{output}"
+        for method_name in ["new", "render", "boxed"] {
+            assert!(
+                !output.lines().any(|line| line.contains(method_name)),
+                "structure-map output must not leak {method_name} as a file-level symbol:\n{output}"
             );
         }
-        let lines = output.lines().collect::<Vec<_>>();
+
+        let single_file = format_single_file_tree("sample.rs", &tree);
+        let lines = single_file.lines().collect::<Vec<_>>();
         for (type_name, method_name) in [
             ("Widget", "new"),
             ("Widget", "render"),
             ("GenericBox", "boxed"),
         ] {
-            let owner_prefix = format!("  E st   {type_name} ");
+            let owner_prefix = format!("  pub struct {type_name}");
             let owner_index = lines
                 .iter()
                 .position(|line| line.starts_with(&owner_prefix))
-                .unwrap_or_else(|| panic!("missing owner {type_name}:\n{output}"));
+                .unwrap_or_else(|| panic!("missing owner {type_name}:\n{single_file}"));
             let next_type = lines
                 .iter()
                 .enumerate()
                 .skip(owner_index + 1)
-                .find(|(_, line)| line.starts_with("  E ") || line.starts_with("  - "))
+                .find(|(_, line)| line.starts_with("  ") && !line.starts_with("    "))
                 .map(|(index, _)| index)
                 .unwrap_or(lines.len());
             assert!(
                 lines[owner_index + 1..next_type]
                     .iter()
                     .any(|line| line.starts_with("    .") && line.contains(method_name)),
-                "{method_name} must be nested under {type_name}:\n{output}"
+                "single-file outline should nest {method_name} under {type_name}:\n{single_file}"
             );
         }
-        let new_line = lines
-            .iter()
-            .position(|line| line.starts_with("    .E mth  new "))
-            .expect("Widget::new should be nested");
-        let render_line = lines
-            .iter()
-            .position(|line| line.starts_with("    .E mth  render "))
-            .expect("Render for Widget method should be nested");
-        assert!(
-            new_line < render_line,
-            "methods should preserve source order:\n{output}"
-        );
-        assert!(output.contains("  E st   Widget "), "{output}");
-        assert!(output.contains("  E st   GenericBox "), "{output}");
     }
 
     #[test]
-    fn multi_file_outline_nests_typescript_class_methods() {
+    fn multi_file_outline_does_not_leak_typescript_class_methods() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("sample.ts");
         std::fs::write(
@@ -2091,10 +2093,8 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let output = multi_file_text(&[path]);
         assert!(output.contains("  E cls  Greeter "), "{output}");
         assert!(
-            output
-                .lines()
-                .any(|line| { line.starts_with("    .") && line.contains("greet") }),
-            "class method must be nested:\n{output}"
+            !output.lines().any(|line| line.contains("greet")),
+            "structure-map output must not leak class methods:\n{output}"
         );
     }
 
