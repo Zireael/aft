@@ -21154,6 +21154,24 @@ mod cold_build_insert_tests {
         cache_dir
     }
 
+    /// The PID of a process that has already exited. A synthetic value such as
+    /// `u32::MAX` is not provably dead everywhere: on Windows, `process_alive`
+    /// asks `tasklist`, which rejects an out-of-range PID, and an unanswerable
+    /// liveness question is treated as alive.
+    fn exited_process_pid() -> u32 {
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for short-lived child");
+        pid
+    }
+
     fn age_callgraph_root_tree(path: &Path) {
         let old = SystemTime::now()
             .checked_sub(CALLGRAPH_ROOT_ORPHAN_MIN_AGE + Duration::from_secs(60))
@@ -21272,7 +21290,8 @@ mod cold_build_insert_tests {
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
         drop(lease);
-        metadata["pid"] = serde_json::json!(u32::MAX);
+        let dead_pid = exited_process_pid();
+        metadata["pid"] = serde_json::json!(dead_pid);
         metadata["created_at_ms"] = serde_json::json!(0);
         metadata["heartbeat_at_ms"] = serde_json::json!(0);
         fs::write(&lease_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
@@ -21284,7 +21303,7 @@ mod cold_build_insert_tests {
             filetime::FileTime::from_system_time(SystemTime::now()),
         )
         .unwrap();
-        assert!(!crate::fs_lock::process_alive(u32::MAX));
+        assert!(!crate::fs_lock::process_alive(dead_pid));
 
         let summary = sweep_callgraph_root_dirs_with_limits(
             &callgraph_root,
@@ -21328,7 +21347,7 @@ mod cold_build_insert_tests {
         let marker_path = marker.path().to_path_buf();
         let mut metadata = marker.metadata().clone();
         drop(marker);
-        metadata.pid = u32::MAX;
+        metadata.pid = exited_process_pid();
         fs::write(&marker_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
         assert!(!crate::fs_lock::process_alive(metadata.pid));
         // The replacement marker is fresh too, but a dead same-host PID no
