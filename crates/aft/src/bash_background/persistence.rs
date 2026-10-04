@@ -1624,12 +1624,6 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
     task.dirs.control.open_file(OsStr::new(name), false)
 }
 
-fn sync_file(file: &File) -> io::Result<()> {
-    #[cfg(test)]
-    work_counts::record_sync();
-    file.sync_all()
-}
-
 #[cfg(test)]
 pub(crate) mod work_counts {
     use std::cell::Cell;
@@ -1639,7 +1633,6 @@ pub(crate) mod work_counts {
         pub opens: usize,
         pub metadata_reads: usize,
         pub parses: usize,
-        pub syncs: usize,
     }
 
     thread_local! {
@@ -1662,9 +1655,6 @@ pub(crate) mod work_counts {
     }
     pub(crate) fn record_parse() {
         record(|counts| counts.parses += 1);
-    }
-    pub(crate) fn record_sync() {
-        record(|counts| counts.syncs += 1);
     }
     pub(crate) fn reset() {
         COUNTS.with(|cell| cell.set(Counts::default()));
@@ -2311,13 +2301,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn task_lifecycle_syncs_neither_metadata_nor_ephemeral_payloads() {
+    fn task_lifecycle_round_trips_payloads_and_metadata() {
         let storage = tempfile::tempdir().unwrap();
         let (task, mut metadata) = counted_task(storage.path());
         work_counts::reset();
         // Task metadata uses atomic replacement without a disk flush (the
-        // durability design treats bash task history as rebuildable), and
-        // payload files are only consumed through verified handles.
+        // durability design treats bash task history as rebuildable; no
+        // flush helper remains in this module), and payload files are only
+        // consumed through verified handles.
         write_task_at(&task, &metadata).unwrap();
         for (name, bytes) in [
             (COMMAND_FILE, metadata.command.as_bytes()),
@@ -2336,7 +2327,6 @@ mod tests {
         write_task_at(&task, &metadata).unwrap();
         let counts = work_counts::get();
         eprintln!("task lifecycle work: {counts:?}");
-        assert_eq!(counts.syncs, 0);
         assert!(read_task_at(&task).unwrap().is_terminal());
     }
 
