@@ -130,8 +130,40 @@ collected child vectors, scanned every node for each query, constructed a second
 position index, or allocated call-kind vectors. All mutants were restored from
 the staged live state; the unstaged `git diff --stat` was empty after restoration.
 
-Remaining required suite and Windows results are recorded after their gates
-finish.
+## Required gates and environment limitations
+
+All work mutations were restored before these commands. Toolchain versions are
+listed below; Cargo commands used three-hour timeouts and were run sequentially.
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p agent-file-tools --lib callgraph -- --test-threads=1` | 340 passed, 0 failed, 5 ignored |
+| `cargo test -p agent-file-tools --lib views:: -- --test-threads=1` | 159 passed, 0 failed, 6 ignored |
+| `cargo test -p agent-file-tools --bin aft -- callgraph` | 6 passed, 0 failed |
+| `cargo test -p agent-file-tools --test rest -- callgraph` | 83 passed, 0 failed, 6 ignored |
+| `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu` | Finished successfully, including test targets; compile-only, not Windows runtime verification |
+| `cargo fmt --all -- --check` | Passed, silent success |
+
+The default parallel lib filter initially passed 338 tests and failed two
+runtime-drain demand tests. Both passed individually, then the complete filter
+passed with one test thread. No production code or assertions were changed for
+those concurrency-sensitive failures.
+
+The additional broad integration filter passed 84 tests, failed 10 and ignored
+one. All failures came from fixtures under `tests/fixtures/callgraph` configured
+inside this isolated Git worktree: operations reported
+`callgraph_unavailable` / `read_only_store_not_built`. The representative
+`callgraph_cross_file_tree` test also failed identically on the deterministic
+unoptimized fixed base, proving an existing fixture/worktree limitation rather
+than an optimization regression. The fixtures were not rewritten. The separate
+persisted-store acceptance target and temporary-project integration cases pass.
+
+`aft_inspect` returned partial diagnostics because its rust-analyzer Cargo check
+had not completed within the inspection budget. The actual library/test
+compilations and strict-warning Windows check are the authoritative compiler
+gates. No idle-machine timing claim is made: the later timing-window check found
+load averages about 39/44/46 on an 18-logical-CPU host, with other compiler jobs
+still active. The measured debug wall times above are retained with that caveat.
 
 ## Commands and retained evidence
 
