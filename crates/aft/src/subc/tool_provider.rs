@@ -883,6 +883,7 @@ mod route_tests {
             PhaseTrace::new(Instant::now()),
             &routes,
             &HashMap::new(),
+            &crate::subc::ReclaimedRoutes::default(),
             &mut HashMap::new(),
             &executor,
             &Arc::default(),

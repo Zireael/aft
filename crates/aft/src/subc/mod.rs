@@ -1569,6 +1569,9 @@ struct ReclaimedRoutes {
     highest_epoch_by_channel: HashMap<u16, u32>,
 }
 
+const ROUTE_RECLAIMED_MESSAGE: &str =
+    "project root was removed; the route must be reopened with a fresh bind before retrying";
+
 impl ReclaimedRoutes {
     fn insert(&mut self, route: RouteChannel) {
         self.highest_epoch_by_channel
@@ -2168,15 +2171,16 @@ fn reap_idle_lsp_servers(
 }
 
 /// Forgets a project root whose directory is gone, together with every route
-/// bound to it. The daemon still has those routes bound (nothing here tells it
-/// otherwise) and still counts every request open on them until it sees a
-/// terminal frame for the request's corr. The returned frames are those
-/// terminals, one per request this call stops tracking: a StreamEnd for each
-/// held bg_events stream and a `route_not_bound` error for each tool call or
-/// permission ask. The caller must queue them; dropping them leaves requests
-/// the daemon waits on forever, which pins its restart drain at the ceiling.
+/// bound to it. The daemon counts each request open until it sees a terminal
+/// frame for that request's corr. Return those terminals before any route
+/// Goodbye so drain accounting settles before the daemon closes the routes and
+/// tells carriers to reopen them. Held tool calls may already have run, so their
+/// errors must not invite automatic retries; pending permission asks have not
+/// dispatched a command and can safely be retried after a fresh bind.
+/// The caller must queue every frame in order; dropping terminals can pin the
+/// daemon's drain, and dropping Goodbyes leaves carriers holding dead routes.
 #[allow(clippy::too_many_arguments)]
-#[must_use = "the returned terminal frames must be queued, or the daemon keeps those requests open"]
+#[must_use = "queue the returned terminals and route Goodbyes in order to settle and close the routes"]
 fn purge_deleted_root_residents(
     root_id: &ProjectRootId,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -2196,7 +2200,6 @@ fn purge_deleted_root_residents(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
 ) -> Vec<Frame> {
-    const RECLAIMED_MESSAGE: &str = "project root was removed; the route is no longer bound";
     let mut terminals = Vec::new();
     let mut push_terminal = |built: Result<Frame, SubcError>| match built {
         Ok(frame) => terminals.push(frame),
@@ -2220,7 +2223,7 @@ fn purge_deleted_root_residents(
             .filter_map(|ask| (&ask.root == root_id).then_some(ask.route)),
     );
 
-    for route in stale_routes {
+    for route in stale_routes.iter().copied() {
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
         remove_route_channel(routes, root_channels, route);
@@ -2236,8 +2239,8 @@ fn purge_deleted_root_residents(
                 route.epoch,
                 corr,
                 request.flags,
-                "route_not_bound",
-                RECLAIMED_MESSAGE,
+                "outcome_unknown_root_reclaimed",
+                "project root was removed while the tool call was in flight; it may have run partly and must not be re-sent automatically",
             ));
         }
         retry_buffer.remove(&route);
@@ -2261,8 +2264,10 @@ fn purge_deleted_root_residents(
             ask.route.epoch,
             ask.tool_corr,
             ask.tool_flags,
-            "route_not_bound",
-            RECLAIMED_MESSAGE,
+            // The ask is stored before submit_deferred_bash, which runs only
+            // after an allow reply. No command has started on this path.
+            "route_reclaimed",
+            ROUTE_RECLAIMED_MESSAGE,
         ));
         false
     });
@@ -2274,6 +2279,17 @@ fn purge_deleted_root_residents(
         root_id.as_path().display(),
         terminals.len()
     );
+    // Close only after every held corr has its terminal, including permission
+    // asks above. The daemon releases each binding and relays Goodbye to its
+    // carrier, whose next call opens a fresh route instead of reusing this one.
+    for route in stale_routes {
+        match build_goodbye_frame(PROTOCOL_VERSION, route.channel, route.epoch, 0) {
+            Ok(frame) => terminals.push(frame),
+            Err(error) => {
+                log::warn!("subc attach: failed to build root-reclaim route Goodbye: {error}")
+            }
+        }
+    }
     terminals
 }
 
@@ -2386,7 +2402,7 @@ fn ingress_route_should_be_processed(
     }
 
     // A late request for a reclaimed root reaches the normal unknown-route
-    // handler, which returns the typed `route_not_bound` error. Other stale or
+    // handler, which returns the typed `route_reclaimed` error. Other stale or
     // never-installed generations remain silent so they cannot affect a newer
     // route or change the protocol's rejected-bind behavior.
     frame.header.ty == FrameType::Request
@@ -4642,6 +4658,7 @@ where
                                 phase_trace,
                                 &routes,
                                 &pending_binds,
+                                &reclaimed_routes,
                                 &mut live_roots,
                                 &executor,
                                 &active_tool_calls,
@@ -5091,7 +5108,7 @@ where
                 root_presence.request(live_roots.keys().cloned().collect());
                 for root_id in &reap.forgotten_deleted_roots {
                     bg_unacked_keys_by_root.remove(root_id);
-                    let terminals = purge_deleted_root_residents(
+                    let reclaim_frames = purge_deleted_root_residents(
                         root_id,
                         &mut routes,
                         &mut root_channels,
@@ -5110,12 +5127,12 @@ where
                         &mut pending_bash_asks,
                         &dispatch_path_metrics,
                     );
-                    for terminal in terminals {
+                    for frame in reclaim_frames {
                         if let Err(error) = send_reliable_writer_frame(
                             &writer_tx,
                             &dispatch_path_metrics,
-                            terminal,
-                            "root-reclaim terminal",
+                            frame,
+                            "root-reclaim terminal or route Goodbye",
                         )
                         .await
                         {
@@ -7063,6 +7080,7 @@ async fn handle_tool_call(
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
+    reclaimed_routes: &ReclaimedRoutes,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     active_tool_calls: &ActiveToolCalls,
@@ -7101,16 +7119,25 @@ async fn handle_tool_call(
     }
 
     let Some(identity) = routes.get(&route_id).cloned() else {
+        // Both refusals happen before decoding or dispatching the call. Keep
+        // them distinct from reclaiming an already-running call: carriers may
+        // reopen and resend these requests without duplicating tool effects.
+        let (code, message) = if reclaimed_routes.contains(route_id) {
+            ("route_reclaimed", ROUTE_RECLAIMED_MESSAGE)
+        } else {
+            ("route_not_bound", "route is not bound before tool call")
+        };
         let error = build_error_frame(
             frame.header.ver,
             frame.header.channel,
             frame.header.epoch,
             frame.header.corr,
             frame.header.flags,
-            "route_not_bound",
-            "route is not bound before tool call",
+            code,
+            message,
         )?;
-        return send_reliable_writer_frame(tx, metrics, error, "route_not_bound error").await;
+        return send_reliable_writer_frame(tx, metrics, error, "unbound or reclaimed route error")
+            .await;
     };
     let restore_watcher = live_roots
         .get(&identity.root)
@@ -11061,10 +11088,11 @@ mod tests {
         assert!(route_bash_cancels.is_empty());
         assert!(reclaimed_routes.contains(route));
         assert!(cancel_signal.is_cancelled());
-        // The daemon still has the route bound, so every request the purge
-        // stops tracking is answered on its own corr and route.
+        // Answer held requests before telling the daemon to close the route.
+        assert_eq!(terminals.last().unwrap().header.ty, FrameType::Goodbye);
         let mut ended = terminals
             .iter()
+            .filter(|frame| frame.header.ty != FrameType::Goodbye)
             .map(|frame| {
                 assert_eq!(
                     (frame.header.channel, frame.header.epoch),
@@ -11083,7 +11111,7 @@ mod tests {
             .find(|frame| frame.header.ty == FrameType::Error)
             .expect("error terminal");
         let error: Value = serde_json::from_slice(&error_frame.body).expect("error body");
-        assert_eq!(error["code"], "route_not_bound");
+        assert_eq!(error["code"], "outcome_unknown_root_reclaimed");
         assert!(active_tool_calls.lock().expect("active calls").is_empty());
         assert_eq!(
             health::take_bg_observability_logs_for_test(),
@@ -11091,6 +11119,132 @@ mod tests {
                 "subc bg subscription: ended root={} session=deleted-route channel=19@3 cause=root-reclaim suppressed=0",
                 root.as_path().display()
             )]
+        );
+    }
+
+    /// Invoke the purge with a held call or a permission ask, independently of
+    /// the reaper's idle gates, so each terminal's retry contract is observable.
+    fn reclaim_test_request(pending_permission: bool) -> Vec<Frame> {
+        let (_dir, root) = test_root("reclaim-request-code");
+        let route = route_key(19, 3);
+        let executor = Executor::new();
+        let identity = route_identity(&root, "reclaim-session");
+        let active: ActiveToolCalls = Arc::default();
+        let mut asks = HashMap::new();
+        if pending_permission {
+            asks.insert(
+                ReverseCorrKey { route, corr: 100 },
+                PendingBashAsk {
+                    route,
+                    tool_corr: 78,
+                    tool_flags: control_flags(),
+                    tool_ver: PROTOCOL_VERSION,
+                    root: root.clone(),
+                    project_root: root.as_path().to_path_buf(),
+                    session_id: identity.session.clone(),
+                    spawn_principal: identity.spawn_principal.clone(),
+                    edit_slot_survives: None,
+                    call_key: None,
+                    request_id: "pending-permission".to_string(),
+                    arguments: json!({"command": "printf must-not-run"}),
+                    format_context: crate::subc_format::FormatContext::default(),
+                    cancel: bash::BashWaitCancel {
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    },
+                    grants: Vec::new(),
+                    repeat: None,
+                    worker_session: false,
+                    asked_at: Instant::now(),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        } else {
+            active.lock().unwrap().insert(
+                (route, 78),
+                ActiveToolCall {
+                    root_id: root.clone(),
+                    cancellation: JobCancellation::new(),
+                    detach_policy: RouteDetachPolicy::RetainForReplay,
+                    tool: "edit".to_string(),
+                    started_at: Instant::now(),
+                    request: RequestFrameMeta {
+                        ver: PROTOCOL_VERSION,
+                        flags: control_flags(),
+                    },
+                    answering: false,
+                },
+            );
+        }
+        let frames = purge_deleted_root_residents(
+            &root,
+            &mut HashMap::from([(route, identity)]),
+            &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+            &mut HashMap::from([(route.channel, route.epoch)]),
+            &mut HashMap::new(),
+            &active,
+            &executor,
+            &mut HashMap::new(),
+            &mut ReclaimedRoutes::default(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut asks,
+            &DispatchPathMetrics::new(),
+        );
+        assert!(asks.is_empty());
+        assert!(active.lock().unwrap().is_empty());
+        frames
+    }
+
+    #[test]
+    fn deleted_root_reclaim_in_flight_call_is_outcome_unknown() {
+        let frames = reclaim_test_request(false);
+        let terminal = frames
+            .iter()
+            .find(|frame| frame.header.ty == FrameType::Error)
+            .unwrap();
+        assert_eq!(
+            (
+                terminal.header.channel,
+                terminal.header.epoch,
+                terminal.header.corr
+            ),
+            (19, 3, 78)
+        );
+        let error: ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error.code, "outcome_unknown_root_reclaimed");
+        assert!(error.message.contains("may have run partly"));
+        assert!(error.message.contains("must not be re-sent automatically"));
+    }
+
+    #[test]
+    fn deleted_root_reclaim_pending_permission_is_route_reclaimed() {
+        let frames = reclaim_test_request(true);
+        let terminal = frames
+            .iter()
+            .find(|frame| frame.header.ty == FrameType::Error)
+            .unwrap();
+        assert_eq!(
+            (
+                terminal.header.channel,
+                terminal.header.epoch,
+                terminal.header.corr
+            ),
+            (19, 3, 78)
+        );
+        let error: ErrorBody = serde_json::from_slice(&terminal.body).unwrap();
+        assert_eq!(error.code, "route_reclaimed");
+        assert!(error.message.contains("project root was removed"));
+        assert!(error.message.contains("reopened"));
+        assert_eq!(
+            frames.last().unwrap().header.ty,
+            FrameType::Goodbye,
+            "permission terminal must precede Goodbye"
         );
     }
 
@@ -13902,6 +14056,7 @@ mod tests {
                     decoded.phase_trace,
                     &routes,
                     &HashMap::new(),
+                    &ReclaimedRoutes::default(),
                     &mut HashMap::new(),
                     executor,
                     &Arc::default(),
