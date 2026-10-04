@@ -4062,6 +4062,38 @@ fn plan_needs_exact_index(plan: &extensions::LanePlan<'_>) -> bool {
         || plan.query_facts.has_identifier_token
 }
 
+fn take_semantic_preview(
+    metadata: &mut HashMap<PathBuf, HybridResult>,
+    ranked_path: &Path,
+) -> Option<HybridResult> {
+    #[cfg(windows)]
+    return take_windows_semantic_preview(metadata, ranked_path);
+    #[cfg(not(windows))]
+    metadata.remove(ranked_path)
+}
+
+#[cfg(any(windows, test))]
+fn take_windows_semantic_preview(
+    metadata: &mut HashMap<PathBuf, HybridResult>,
+    ranked_path: &Path,
+) -> Option<HybridResult> {
+    if let Some(preview) = metadata.remove(ranked_path) {
+        return Some(preview);
+    }
+    // Views and lexical candidates can spell the same Windows file with
+    // different separators or a canonicalize-produced verbatim prefix.
+    // PathBuf equality then misses the symbol attached to a lexical winner.
+    // Normalize only this presentation lookup: changing candidate paths would
+    // change fusion identities and re-key downstream stores.
+    let ranked_key = crate::windows_path::normalize_windows_path(ranked_path);
+    let semantic_path = metadata
+        .keys()
+        .filter(|path| crate::windows_path::normalize_windows_path(path) == ranked_key)
+        .min()
+        .cloned()?;
+    metadata.remove(&semantic_path)
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -4867,32 +4899,31 @@ fn run_engine_ranking(
     let mut results = Vec::with_capacity(page.reply.page.len());
     for entry in &page.reply.page {
         let ranked = &entry.result;
-        let semantic_backed = semantic_metadata.contains_key(&ranked.path);
-        let mut result = semantic_metadata
-            .remove(&ranked.path)
-            .unwrap_or_else(|| HybridResult {
-                file: ranked.path.clone(),
-                name: ranked
-                    .path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                kind: SymbolKind::FileSummary,
-                start_line: 0,
-                end_line: 0,
-                exported: false,
-                score: 0.0,
-                source: "lexical",
-                semantic_score: None,
-                lexical_score: None,
-                hybrid_boosted: false,
-                exact: false,
-                exact_phrase_count: 0,
-                exact_window_lines: None,
-                fusion_score: 0.0,
-                snippet: String::new(),
-            });
+        let semantic_preview = take_semantic_preview(&mut semantic_metadata, &ranked.path);
+        let semantic_backed = semantic_preview.is_some();
+        let mut result = semantic_preview.unwrap_or_else(|| HybridResult {
+            file: ranked.path.clone(),
+            name: ranked
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            score: 0.0,
+            source: "lexical",
+            semantic_score: None,
+            lexical_score: None,
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+            snippet: String::new(),
+        });
         result.exact = ranked.evidence.tier == EvidenceTier::Exact;
         result.exact_phrase_count = ranked.evidence.occurrences.unwrap_or_default();
         result.exact_window_lines = ranked.evidence.window_lines;
@@ -11157,6 +11188,60 @@ mod tests {
         );
         assert!(text.contains("terminate_child();"), "{text}");
         assert!(text.contains("[lexical match]"), "{text}");
+    }
+
+    #[test]
+    fn windows_path_spellings_keep_lexical_winner_semantic_symbol_preview() {
+        // Plain strings exercise the Windows comparison even on Unix hosts.
+        // The lexical winner and the views symbol refer to one file, but a
+        // verbatim prefix makes their PathBuf keys unequal on Windows too.
+        for (semantic_path, lexical_path) in [
+            (r"C:\r\src/watchdog.rs", r"C:\r\src\watchdog.rs"),
+            (r"\\?\C:\r\src/watchdog.rs", r"\\?\C:\r\src\watchdog.rs"),
+            (r"\\?\C:\r\src\watchdog.rs", r"C:\r\src\watchdog.rs"),
+            (r"C:\r\src\watchdog.rs", r"\\?\C:\r\src\watchdog.rs"),
+            (r"\\?\c:\r\src/watchdog.rs", r"C:\r\src\watchdog.rs"),
+        ] {
+            let mut symbol = long_line_result(0, "    terminate_child();".into());
+            symbol.file = PathBuf::from(semantic_path);
+            symbol.name = "kill_expired_task".into();
+            symbol.kind = SymbolKind::Function;
+            symbol.start_line = 2;
+            symbol.end_line = 4;
+            symbol.source = "semantic";
+            symbol.semantic_score = Some(0.01);
+            let original = symbol.clone();
+            let mut metadata = HashMap::from([(symbol.file.clone(), symbol)]);
+            let unrelated = long_line_result(1, String::new());
+            metadata.insert(unrelated.file.clone(), unrelated.clone());
+
+            for different_file in [r"C:\r\other\watchdog.rs", r"C:\r\src\retry.rs"] {
+                assert!(
+                    take_windows_semantic_preview(&mut metadata, Path::new(different_file))
+                        .is_none()
+                );
+                assert_eq!(metadata.len(), 2);
+            }
+
+            let mut preview = take_windows_semantic_preview(&mut metadata, Path::new(lexical_path))
+                .unwrap_or_else(|| {
+                    panic!("semantic preview lookup missed {semantic_path:?} for {lexical_path:?}")
+                });
+            // Ranking still chose lexical; attaching the symbol only changes
+            // presentation, not either lane's path or the ranked score.
+            preview.source = "lexical";
+            assert_eq!(preview.file, original.file);
+            assert_eq!(preview.semantic_score, original.semantic_score);
+            assert_eq!(metadata.len(), 1);
+            assert!(metadata.contains_key(&unrelated.file));
+            let text = format_semantic_text(&[preview], Path::new(r"C:\r"), false, false, None);
+            assert!(
+                text.contains("kill_expired_task [function] lines 3-5"),
+                "{text}"
+            );
+            assert!(text.contains("terminate_child();"), "{text}");
+            assert!(text.contains("[lexical match]"), "{text}");
+        }
     }
 
     #[test]

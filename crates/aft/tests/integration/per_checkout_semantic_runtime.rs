@@ -364,7 +364,10 @@ fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
     assert!(vectors > 0 && !raw.results.is_empty());
     assert_eq!(answer["complete"], true, "{answer:#}");
     let text = answer["text"].as_str().unwrap();
-    assert!(text.contains("[function] lines"), "{text}");
+    assert!(
+        text.contains("kill_expired_task [function] lines 3-5"),
+        "{text}"
+    );
     assert!(text.contains("terminate_child();"), "{text}");
 }
 
