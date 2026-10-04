@@ -721,7 +721,6 @@ impl ReadMarker {
 impl Drop for ReadMarker {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-        fs_lock::sync_parent(&self.path);
     }
 }
 
@@ -812,7 +811,6 @@ fn read_marker_protection(
             MarkerProtection::Protected => sweep.protected = true,
             MarkerProtection::Stale | MarkerProtection::Malformed => {
                 if remove_stale && fs::remove_file(&path).is_ok() {
-                    fs_lock::sync_parent(&path);
                     sweep.removed_stale += 1;
                 }
             }
@@ -893,10 +891,10 @@ fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<(
         let mut file = open_private_file(&tmp)?;
         serde_json::to_writer(&mut file, metadata).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
+        // Readers protect generations only while their process is live. A
+        // marker that disappears or tears after power loss has no live owner.
         drop(file);
         fs_lock::rename_over(&tmp, path)?;
-        fs_lock::sync_parent(path);
         Ok(())
     })();
     if result.is_err() {
@@ -1220,6 +1218,17 @@ fn current_hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn durability_read_marker_count() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        let marker = ReadMarker::create(dir.path(), "current").unwrap();
+        marker.touch().unwrap();
+        assert!(protected_read_marker_exists(dir.path(), "current"));
+        drop(marker);
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+    }
 
     #[test]
     fn read_marker_file_is_private_and_touchable() {
