@@ -122,6 +122,7 @@ fn make_impact_result(count: usize, depth_limited: bool, truncated: usize) -> St
         depth_limited,
         truncated,
         sites_list_envelope,
+        incomplete: None,
     }
 }
 
@@ -175,6 +176,7 @@ fn make_callers_result(count: usize, depth_limited: bool, truncated: usize) -> S
         truncated,
         callers_list_envelope,
         macro_note: None,
+        incomplete: None,
     }
 }
 
