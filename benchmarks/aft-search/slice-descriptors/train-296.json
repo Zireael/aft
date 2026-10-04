@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["inspect-one-status-line-scoped-findings", "callgraph-sweep-lease-heartbeat"],
+  "note": "crates/aft/src/subc_tool_schemas.json changes only the aft_inspect tool description (plain-language result states); the aft_search entry, the engine, its inputs and its rendered text are untouched, so no benchmark row may move. The rest of the train is aft_inspect rendering and scoping, and the call-graph cache sweep's freshness clock."
+}
