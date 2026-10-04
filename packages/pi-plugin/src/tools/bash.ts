@@ -1816,9 +1816,10 @@ function renderBashCall(
   context: RenderContextLike,
 ): Text {
   const text = reuseText(context.lastComponent);
-  const display = description ?? (command ? shortenCommand(command) : undefined);
-  const suffix = display ? ` ${theme.fg("accent", display)}` : "";
-  text.setText(`${theme.fg("toolTitle", theme.bold("bash"))}${suffix}`);
+  // While arguments are still streaming, keep the "..." placeholder the
+  // renderer has always shown rather than a bare title.
+  const display = description ?? (command ? shortenCommand(command) : "...");
+  text.setText(`${theme.fg("toolTitle", theme.bold("bash"))} ${theme.fg("accent", display)}`);
   return text;
 }
 

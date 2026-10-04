@@ -566,8 +566,10 @@ function validateBatchEdits(edits: unknown): void {
 function renderReadCall(args: unknown, theme: Theme, context: RenderContextLike): Text {
   const text = reuseText(context.lastComponent);
   const filePath = readPathArg(args);
-  const pathDisplay = filePath ? ` ${theme.fg("accent", shortenPath(filePath))}` : "";
-  text.setText(`${theme.fg("toolTitle", theme.bold("read"))}${pathDisplay}`);
+  const pathDisplay = filePath
+    ? theme.fg("accent", shortenPath(filePath))
+    : theme.fg("toolOutput", "...");
+  text.setText(`${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}`);
   return text;
 }
 
@@ -1120,8 +1122,10 @@ export function renderMutationCall(
   context: RenderContextLike,
 ): Text {
   const text = reuseText(context.lastComponent);
-  const pathDisplay = filePath ? ` ${theme.fg("accent", shortenPath(filePath))}` : "";
-  text.setText(`${theme.fg("toolTitle", theme.bold(toolName))}${pathDisplay}`);
+  const pathDisplay = filePath
+    ? theme.fg("accent", shortenPath(filePath))
+    : theme.fg("toolOutput", "...");
+  text.setText(`${theme.fg("toolTitle", theme.bold(toolName))} ${pathDisplay}`);
   return text;
 }
 
