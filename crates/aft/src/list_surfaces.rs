@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "logging.rs",
+        enclosing_item: "write_str",
+        location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",
+        reason: "panic diagnostics bound formatted text, not a tool-result list; message and stack have separate byte budgets and an explicit truncation marker",
+    },
+    ExclusionEntry {
         file: "bash_db_hints/mod.rs",
         enclosing_item: "table_list, render, run_probe",
         location_or_primitive: "BLOCK_CAP, PROBE_OUTPUT_CAP",

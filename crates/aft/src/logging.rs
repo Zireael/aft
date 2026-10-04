@@ -36,6 +36,11 @@ const SLOW_TOOL_CALL_THRESHOLD: Duration = Duration::from_millis(50);
 const TOOL_CALL_SAMPLE_CAPACITY: usize = 256;
 /// Census lines stay greppable and short; extra fields are dropped past this.
 const INDEX_EVENT_MAX_BYTES: usize = 300;
+/// Reserve independent space for the message and trace: a huge panic payload
+/// must not crowd every stack frame out of the diagnostic.
+const PANIC_MESSAGE_BYTES: usize = 4 * 1024;
+const PANIC_BACKTRACE_BYTES: usize = 24 * 1024;
+const PANIC_TRUNCATION: &str = "\n[panic diagnostic truncated]";
 
 /// Standing-index plane recorded on every `index_event` line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -706,8 +711,83 @@ pub fn init() {
         })
         .init();
 
+    install_panic_hook(file_path);
+
     if let Some(summary) = startup_sweep {
         log_sweep_summary(summary);
+    }
+}
+
+/// Log before delegating to the previous hook. Do not change RUST_BACKTRACE:
+/// stderr retains the default hook's normal short/full/disabled behavior while
+/// the durable diagnostic always includes the stack needed after a respawn.
+fn install_panic_hook(initial_path: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = bounded_panic_text(format_args!("{info}"), PANIC_MESSAGE_BYTES);
+        let trace = std::backtrace::Backtrace::force_capture();
+        let trace = bounded_panic_text(format_args!("{trace}"), PANIC_BACKTRACE_BYTES);
+        let report = crate::log_redact::aft_redact_bytes(
+            format!(
+                "{} [aft] ERROR panic {message}\nforced backtrace:\n{trace}\n",
+                format_utc_timestamp()
+            )
+            .as_bytes(),
+        )
+        .into_owned();
+        // Never enter env_logger or wait on the file writer from its panic
+        // hook: the panicking thread may already hold either logger lock.
+        let path = FILE_CONTROL
+            .try_lock()
+            .ok()
+            .and_then(|control| control.storage_root.clone())
+            .map(|root| {
+                root.join("logs")
+                    .join(format!("aft-{}.log", std::process::id()))
+            })
+            .unwrap_or_else(|| initial_path.clone());
+        let persisted = open_private_log_file(&path, false).and_then(|mut file| {
+            file.write_all(&report)?;
+            file.sync_all()
+        });
+        if persisted.is_err() {
+            let _ = io::stderr().write_all(&report);
+        }
+        previous(info);
+    }));
+}
+
+fn bounded_panic_text(args: std::fmt::Arguments<'_>, max_bytes: usize) -> String {
+    use std::fmt::Write;
+
+    let mut text = PanicText {
+        text: String::new(),
+        budget: max_bytes.saturating_sub(PANIC_TRUNCATION.len()),
+        truncated: false,
+    };
+    let _ = text.write_fmt(args);
+    if text.truncated {
+        text.text.push_str(PANIC_TRUNCATION);
+    }
+    text.text
+}
+
+struct PanicText {
+    text: String,
+    budget: usize,
+    truncated: bool,
+}
+
+impl std::fmt::Write for PanicText {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let remaining = self.budget.saturating_sub(self.text.len());
+        let mut end = value.len().min(remaining);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&value[..end]);
+        self.truncated |= end != value.len();
+        Ok(())
     }
 }
 
@@ -1925,6 +2005,90 @@ mod tests {
     use super::*;
     use filetime::{set_file_mtime, FileTime};
     use tempfile::TempDir;
+
+    #[test]
+    fn panic_hook_child_probe() {
+        if std::env::var_os("AFT_TEST_PANIC_LOG_CHILD").is_none() {
+            return;
+        }
+        let path = crate::bash_background::storage_dir(None)
+            .join("logs")
+            .join(format!("aft-{}.log", std::process::id()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let persisted =
+                fs::read_to_string(&path).is_ok_and(|text| text.contains("forced backtrace:"));
+            eprintln!("panic diagnostic persisted before previous hook: {persisted}");
+            previous(info);
+        }));
+        init();
+        let backtrace_env = std::env::var_os("RUST_BACKTRACE");
+        let panic = std::panic::catch_unwind(|| panic!("durable panic diagnostic probe"));
+        assert!(panic.is_err());
+        assert_eq!(std::env::var_os("RUST_BACKTRACE"), backtrace_env);
+        // No writer flush or destructor: exercise persistence before an abrupt
+        // daemon exit, not merely a diagnostic still queued in memory.
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn panic_hook_preserves_default_backtrace_behavior_and_persists() {
+        for backtrace in [None, Some("0"), Some("1"), Some("full")] {
+            let storage = TempDir::new().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "logging::tests::panic_hook_child_probe",
+                    "--nocapture",
+                ])
+                .env("AFT_TEST_PANIC_LOG_CHILD", "1")
+                .env("AFT_STORAGE_DIR", storage.path())
+                .env("RUST_LOG", "off")
+                .env_remove("RUST_BACKTRACE");
+            if let Some(value) = backtrace {
+                child.env("RUST_BACKTRACE", value);
+            }
+            let output = child.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "child failed: {stderr}");
+            let paths = fs::read_dir(storage.path().join("logs")).unwrap();
+            let log = paths
+                .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<String>();
+            assert!(log.contains("durable panic diagnostic probe"), "{log}");
+            assert!(log.contains("forced backtrace:"), "{log}");
+            assert!(log.contains("panic_hook_child_probe"), "{log}");
+            assert!(stderr.contains("panic diagnostic persisted before previous hook: true"));
+            assert!(stderr.contains("durable panic diagnostic probe"));
+            assert_eq!(
+                stderr.contains("stack backtrace:"),
+                matches!(backtrace, Some("1" | "full")),
+                "RUST_BACKTRACE={backtrace:?}: {stderr}"
+            );
+            if backtrace == Some("full") {
+                assert!(
+                    stderr.contains("0x"),
+                    "default full backtrace was lost: {stderr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn panic_diagnostic_text_is_bounded_at_utf8_boundaries() {
+        let enormous = "é🚀".repeat(PANIC_BACKTRACE_BYTES);
+        for budget in [PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES] {
+            let text = bounded_panic_text(format_args!("{enormous}"), budget);
+            assert!(text.len() <= budget);
+            assert!(text.ends_with(PANIC_TRUNCATION));
+            assert!(text.starts_with("é🚀"));
+        }
+        assert_eq!(
+            bounded_panic_text(format_args!("small"), PANIC_MESSAGE_BYTES),
+            "small"
+        );
+    }
 
     fn line(value: &str) -> Vec<Vec<u8>> {
         vec![format!("{value}\n").into_bytes()]

@@ -11904,6 +11904,110 @@ mod tests {
     }
 
     #[test]
+    fn deleted_root_reap_drops_synapse_runtime_on_async_frame_loop() {
+        use crate::commands::semantic_search::rerank::{slot, synapse, SelectedBackend};
+
+        let (root_dir, root) = test_root("deleted-root-synapse-runtime");
+        let connection = tempfile::NamedTempFile::new().expect("connection file");
+        let app = App::default_shared();
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.mark_subc_bound();
+        let mut inputs = slot::BuildInputs::from_config(&Config::default(), true);
+        inputs.search.rerank = Some(crate::config::RerankConfig {
+            backend: Some(crate::config::RerankBackendKind::Synapse),
+            ..Default::default()
+        });
+        inputs.semantic.subc_connection_file = Some(connection.path().to_path_buf());
+        inputs.semantic.route_project_root = Some(root.as_path().to_path_buf());
+        // An explicit pin needs no discovery server, but constructs the real
+        // Synapse transport and its nested Tokio runtime on the build thread.
+        ctx.rerank_slot().set_constructor_for_test(
+            Arc::new(|inputs| {
+                let backend = synapse::SynapseReranker::connect(
+                    &inputs.semantic,
+                    "test-reranker".into(),
+                    Some("test-pin".into()),
+                    100,
+                    true,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                Ok(Some(SelectedBackend {
+                    backend: Arc::new(backend),
+                    fail_closed: false,
+                }))
+            }),
+            Duration::ZERO,
+        );
+        ctx.rerank_slot().reconcile(inputs.clone());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if matches!(
+                ctx.rerank_slot().read(inputs.clone()),
+                slot::Installed::Ready(_)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Synapse backend never installed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let root_channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([RouteChannel {
+                channel: 17,
+                epoch: 1,
+            }]),
+        )]);
+        root_dir.close().expect("delete bound project root");
+
+        // Match run_subc_mode_inner: a current-thread runtime driving the
+        // frame loop. A frame-loop context reference can outlive the detached
+        // actor teardown, so its final drop must not rely on that thread.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("frame-loop runtime");
+        runtime.block_on(async move {
+            let metrics = DispatchPathMetrics::new();
+            loop {
+                let outcome = reap_idle_roots(
+                    Instant::now(),
+                    &mut live_roots,
+                    &HashMap::new(),
+                    &root_channels,
+                    &executor,
+                    &metrics,
+                );
+                if outcome.forgotten_deleted_roots.contains(&root) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "deleted root was never reaped");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(!executor.actor_registered(&root));
+            assert!(!live_roots.contains_key(&root));
+            // Wait for LSP shutdown and the actor's detached drop. This pins
+            // the last reference to the async caller instead of racing it.
+            while Arc::strong_count(&ctx) != 1 {
+                assert!(Instant::now() < deadline, "actor teardown never finished");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(app.actor_root_count(), 0);
+            drop(ctx);
+        });
+    }
+
+    #[test]
     fn deleted_root_reap_blocker_census_is_exposed_in_health_metrics() {
         let (root_dir, root) = test_root("deleted-root-reap-census");
         let executor = Arc::new(Executor::new());
