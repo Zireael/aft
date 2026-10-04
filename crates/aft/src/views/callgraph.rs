@@ -152,15 +152,24 @@ impl CallgraphPlane {
         access: &ViewAccess,
         snapshot: &Snapshot,
     ) -> Result<Arc<PinnedReader>, PlaneError> {
-        self.readers
+        let reader = self
+            .readers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(
                 access.scope().to_string(),
                 snapshot.generation().name().to_string(),
             ))
-            .cloned()
-            .ok_or_else(|| error("pinned callgraph reader is not resident"))
+            .cloned();
+        match reader {
+            Some(reader) => Ok(reader),
+            None => {
+                // A refused keyless generation will never have a resident reader.
+                // Preserve that refusal instead of making it look like a build.
+                queryable_manifest(snapshot.generation().manifest())?;
+                Err(error("pinned callgraph reader is not resident"))
+            }
+        }
     }
 }
 impl PlaneAdapter for CallgraphPlane {
@@ -181,7 +190,7 @@ impl PlaneAdapter for CallgraphPlane {
         access: &ViewAccess,
         generation: &Arc<OpenGeneration>,
     ) -> Result<(), PlaneError> {
-        project_manifest(generation.manifest())?;
+        queryable_manifest(generation.manifest())?;
         let (root, dir): (PathBuf, PathBuf) = match access {
             ViewAccess::Owner(view) => (view.root().to_path_buf(), view.view_dir().to_path_buf()),
             ViewAccess::Reader {
@@ -253,6 +262,15 @@ impl PlaneAdapter for CallgraphPlane {
             readiness
         }
     }
+}
+fn queryable_manifest(manifest: &ManifestV2) -> Result<Manifest, PlaneError> {
+    let projected = project_manifest(manifest)?;
+    // A disabled plane still has a valid empty derived database. It must not
+    // answer navigation or reachability questions as though a graph was built.
+    if super::assembly::manifest_lacks_callgraph(&projected) {
+        return Err(error(super::read::CALLGRAPH_DISABLED));
+    }
+    Ok(projected)
 }
 fn error(reason: impl std::fmt::Display) -> PlaneError {
     PlaneError {

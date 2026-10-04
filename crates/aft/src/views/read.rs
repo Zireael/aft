@@ -15,8 +15,9 @@ pub(crate) const CALLGRAPH_DISABLED: &str = "call graph is disabled (indexes.cal
 ///
 /// A generation published with the call graph off has an empty derived
 /// database; serving it would answer "no callers" and "no dead code" for a
-/// graph that was never built. Every reader of a view's call graph opens it
-/// here, so it is refused here, as unavailable with [`CALLGRAPH_DISABLED`].
+/// graph that was never built. Published v1 readers refuse it here, as unavailable
+/// with [`CALLGRAPH_DISABLED`]; the checkout plane applies the same manifest guard
+/// before opening a pinned v2 reader.
 /// A manifest that cannot be read is refused too, rather than assumed to
 /// carry a call graph.
 pub(crate) fn open_published_callgraph(

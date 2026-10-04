@@ -1439,6 +1439,13 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
     // Zoom's own call lists come from the file's syntax tree; its call graph
     // field must say the index is not serving, not present an empty graph.
     assert_eq!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
+    assert!(
+        zoom["callgraph"]["index"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("call graph is disabled (indexes.callgraph=false)"),
+        "{zoom:#}"
+    );
     // Once the republish with call graph data lands, callers answers. Right
     // after that publication its derived database is checkpointed, and a
     // reader that meets the checkpoint gets a retryable `callgraph_building`.
@@ -1462,6 +1469,18 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         );
         thread::sleep(Duration::from_millis(250));
     }
+    let zoom = aft.send(
+        &json!({
+            "id": "zoom-ready",
+            "command": "zoom",
+            "file": root.join("src/lib.rs"),
+            "symbol": "target",
+            "callgraph": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(zoom["success"], true, "{zoom:#}");
+    assert_ne!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
     assert!(aft.shutdown().success());
 }
 

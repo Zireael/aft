@@ -7091,6 +7091,9 @@ impl AppContext {
             };
             return match runtime.callgraph.reader(&runtime.access, snapshot) {
                 Ok(reader) => CallgraphStoreAccess::Ready(Arc::clone(&reader.store)),
+                Err(error) if error.reason == crate::views::read::CALLGRAPH_DISABLED => {
+                    CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(error.reason))
+                }
                 Err(_) => CallgraphStoreAccess::Building,
             };
         }

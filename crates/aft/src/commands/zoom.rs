@@ -1308,8 +1308,29 @@ fn zoom_one_symbol(
 /// the index is ready. Zoom's own call lists are file-local and unaffected.
 /// Observing the index never starts a build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
-    use crate::feature_status::{observed_index_status, IndexEffective, IndexPlane};
-    let observation = observed_index_status(ctx, IndexPlane::Callgraph);
+    use crate::feature_status::{
+        callgraph_access_observation, observed_index_status, IndexEffective, IndexObservation,
+        IndexPlane,
+    };
+    // Only roots already served by a view use this zero-wait access. It opens
+    // their pinned plane, never the legacy cold-build path; observing a legacy
+    // root below stays passive. The view refusal also names keyless generations.
+    let served_by_view = ctx.checkout_query_runtime_active()
+        || (ctx.config().views.enabled
+            && ctx
+                .pinned_view_runtime()
+                .is_some_and(|view| view.manifest.is_some()));
+    let observation = if served_by_view {
+        let access = ctx.schedule_callgraph_store_warm();
+        match &access {
+            crate::context::CallgraphStoreAccess::Error(error) => {
+                IndexObservation::unavailable(error.to_string())
+            }
+            _ => callgraph_access_observation(ctx, &access),
+        }
+    } else {
+        observed_index_status(ctx, IndexPlane::Callgraph)
+    };
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",

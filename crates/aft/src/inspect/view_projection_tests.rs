@@ -312,3 +312,47 @@ fn views_tier2_keyless_generation_reports_callgraph_disabled_not_empty() {
         "call graph is disabled (indexes.callgraph=false)"
     );
 }
+
+#[test]
+fn views_keyless_callgraph_generation_preserves_unused_exports_but_names_dead_code_gap() {
+    let (_project, _storage, mut job, mut request) = view_projection_fixture();
+    request.callgraph = false;
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    let view = crate::views::ViewStore::open(&request.storage, &request.scope).unwrap();
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
+
+    // Unused exports is an independent import/export analysis, not a call-graph
+    // projection. A generation without graph keys must preserve its real findings
+    // while dead-code reachability remains unknown, never a zero-findings result.
+    job.category = InspectCategory::UnusedExports;
+    let scan = crate::inspect::scanners::unused_exports::run_unused_exports_scan(&job)
+        .outcome
+        .unwrap();
+    let unused = roll_up_unused_exports_contributions(&job, &scan.contributions, None);
+    assert_eq!(unused["count"], 2, "{unused:#}");
+    assert_eq!(unused["items"][0]["symbol"], "main", "{unused:#}");
+    assert_eq!(unused["items"][1]["symbol"], "dead", "{unused:#}");
+
+    job.category = InspectCategory::DeadCode;
+    // No refresh-path check: this specifically exercises the generation guard,
+    // rather than an unrelated mismatch between source bytes and missing keys.
+    job.callgraph_snapshot = build_tier2_callgraph_snapshot_with_refresh(&job, true, &[]);
+    let dead = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+        .outcome
+        .unwrap()
+        .aggregate;
+    assert_eq!(dead["callgraph_available"], false, "{dead:#}");
+    assert_eq!(
+        dead["callgraph_unavailable_reason"],
+        crate::views::read::CALLGRAPH_DISABLED,
+        "{dead:#}"
+    );
+    assert!(
+        dead.get("count").is_none(),
+        "unknown dead code is not zero findings: {dead:#}"
+    );
+    assert_eq!(
+        roll_up_dead_code_contributions(&job, &scan.contributions, None),
+        dead
+    );
+}
