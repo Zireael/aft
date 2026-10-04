@@ -8,7 +8,7 @@ fn synthetic(functions: usize) -> String {
 }
 
 fn measured(source: &str, language: &str) -> (CallgraphBlob, Work) {
-    measure(|| CallgraphBlob::extract(source, language, "work-census-v1").unwrap())
+    measure(|| CallgraphBlob::extract(source, language, crate::views::callgraph::PRODUCER).unwrap())
 }
 
 #[test]

@@ -6,11 +6,14 @@ The immutable inputs are tracked regular files from AFT revision
 `be561ad598bba4576ae92fac9b9e0813b9233b06` and opencode revision
 `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`. Supported extensions are selected by
 `parser::detect_language`. Both extractors receive the same source bytes,
-language label and `work-census-v1` extractor-version string.
+language label and the runtime `ruled-callgraph-v2` extractor-version string for
+the final parity comparison. The initial investigation used `work-census-v1`.
 
 The baseline is an archived workspace with test-only instrumentation, frozen
-before implementation. Production extraction logic is unchanged in that
-workspace. Parser invocations are intercepted by a test-only parser wrapper;
+before optimization. The final fixed-base workspace adds only the deterministic
+caller-evidence fix and producer-version bump from commit
+`8442ff65547bca2118a9c3690eb0dea7569f7130`; it retains all original extraction
+algorithms. Parser invocations are intercepted by a test-only parser wrapper;
 restricted Rust macro-body ranges are recorded separately from whole-file
 parses. Node-kind copies and child-vector collections are counted at their
 construction sites. Baseline ordinal and dispatch counters count candidate
@@ -28,13 +31,15 @@ measurements, not an idle-machine performance claim.
 
 | File | Source bytes / lines | AST nodes | Whole-file / macro parses | Kind copies | Child-vector collections | Ordinal visits | Dispatch visits | Position bytes scanned | Call-kind vectors | Extract wall time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AFT `crates/aft/src/subc/mod.rs` | 589,914 / 14,841 | 125,838 | 6 / 0 | 125,838 | 251,676 | 975,370,338 | 468,566,856 | 195,576,446 | 468,704,385 | 84.231 s |
-| AFT `packages/opencode-plugin/test/load-matrix/load-matrix.ts` | 119,139 / 2,999 | 21,193 | 4 / 0 | 21,193 | 21,193 | 24,647,459 | 12,066,552 | 3,474,829 | 12,089,669 | 1.945 s |
-| opencode `packages/client/src/promise/generated/types.ts` | 215,570 / 6,265 | 66,653 | 4 / 0 | 66,653 | 66,653 | 50,722,933 | 0 | 116,879,920 | 72,511 | 4.629 s |
+| AFT `crates/aft/src/subc/mod.rs` | 589,914 / 14,841 | 125,838 | 6 / 0 | 125,838 | 251,676 | 975,370,338 | 468,908,676 | 195,576,446 | 469,046,205 | 83.824 s |
+| AFT `packages/opencode-plugin/test/load-matrix/load-matrix.ts` | 119,139 / 2,999 | 21,193 | 4 / 0 | 21,193 | 21,193 | 24,647,459 | 12,135,900 | 3,474,829 | 12,159,017 | 2.148 s |
+| opencode `packages/client/src/promise/generated/types.ts` | 215,570 / 6,265 | 66,653 | 4 / 0 | 66,653 | 66,653 | 50,722,933 | 0 | 116,879,920 | 72,511 | 2.576 s |
 
-Baseline corpus extraction produced 3,526 AFT blobs (1,076,172,901 serialized
-bytes, 2,142.68 s) and 5,037 opencode blobs (931,275,084 serialized bytes,
-463.64 s). Every supported regular file in each snapshot was extracted.
+Fixed-base corpus extraction produced 3,526 AFT blobs (1,078,460,157 serialized
+bytes, 2,183.67 s) and 5,037 opencode blobs (938,552,340 serialized bytes,
+397.97 s). Every supported regular file in each snapshot was extracted. Before
+the determinism fix, the Rust sample took 84.231 s and the two full corpora
+produced 1,076,172,901 and 931,275,084 bytes respectively.
 
 The baseline work-budget run failed the six expected guards: whole-file parse
 count, kind copies, child vectors, position scans, call-kind vectors and lookup
@@ -49,18 +54,17 @@ before starting the corpus comparison.
 
 | File | Whole-file / macro parses | Kind copies | Child-vector collections | Ordinal index visits | Dispatch index visits | Position bytes scanned | Call-kind vectors | Extract wall time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AFT `crates/aft/src/subc/mod.rs` | 1 / 0 | 0 | 0 | 3,680,814 | 345,002 | 589,914 | 0 | 7.886 s |
-| AFT `packages/opencode-plugin/test/load-matrix/load-matrix.ts` | 1 / 0 | 0 | 0 | 513,997 | 46,596 | 119,139 | 0 | 0.209 s |
-| opencode `packages/client/src/promise/generated/types.ts` | 1 / 0 | 0 | 0 | 1,759,295 | 0 | 215,570 | 0 | 0.315 s |
+| AFT `crates/aft/src/subc/mod.rs` | 1 / 0 | 0 | 0 | 3,680,814 | 345,099 | 589,914 | 0 | 7.981 s |
+| AFT `packages/opencode-plugin/test/load-matrix/load-matrix.ts` | 1 / 0 | 0 | 0 | 513,997 | 46,699 | 119,139 | 0 | 0.143 s |
+| opencode `packages/client/src/promise/generated/types.ts` | 1 / 0 | 0 | 0 | 1,759,295 | 0 | 215,570 | 0 | 0.299 s |
 
-The head work-budget run passed: 13 tests passed, none failed, and one corpus
+The head work-budget run passed: 14 tests passed, none failed, and one corpus
 probe was ignored. The filter includes four existing extraction-related tests
-as well as the nine new tests. Synthetic lookup work grew from 47,743 to
+as well as the nine work tests and the determinism regression. Synthetic lookup work grew from 47,743 to
 103,822 visits for 64 to 128 functions (approximately 2.17×). The macro fixture
 asserted exactly two range parses with distinct ranges and retained both symbols.
 
-These wall times are instrumented debug measurements under fleet load. An
-idle-ish timing run was not completed before the comparison failure.
+These wall times are instrumented debug measurements under fleet load.
 
 ## Implementation
 
@@ -76,9 +80,9 @@ At the baseline revision, `collect_reexport_refs` scans source text rather than
 parsing a tree. Dispatch, however, allocates call-kind vectors inside node and
 reference-candidate predicates, not merely once per file.
 
-## Byte comparison failed: verification stopped
+## Pre-existing nondeterminism and producer rebuild
 
-The AFT corpus comparison stopped at
+The initial AFT corpus comparison stopped at
 `benchmarks/aft-search/author_real_query.py`. Baseline serialization has 319,954
 bytes; head serialization has 319,970 bytes. Inspection of the saved payloads
 found exactly two differing JSON values:
@@ -88,17 +92,46 @@ found exactly two differing JSON values:
 | `$.refs[29].caller_symbol` | `at_pin` | `pinned_domains` |
 | `$.refs[30].caller_symbol` | `at_pin` | `pinned_domains` |
 
-`at_pin` is nested inside `pinned_domains`. Extraction still iterates
-`calls_by_symbol`, a hash map, and reference sorting and deduplication still omit
-`caller_symbol` from their keys. That unchanged behavior is a plausible source
-of nondeterministic selection between enclosing callers, but a repeat-baseline
-experiment has **not** been run: extraction and verification were stopped at the
-first mismatch as required. Byte equivalence is not established.
+Five subsequent baseline extractions produced two distinct blobs: runs 1/4/5
+selected `pinned_domains`; runs 2/3 selected `at_pin`. Five optimized extractions
+also produced both blobs. Their SHA-256 values were identical across versions:
+`9edd8871b96c25d6f87558e74156f9b76257bf1361884e94a86d1db3eba5fb7e`
+and `36e12a418273a043c2ecc2ca08e48d83a105ca0b1e63296ea3259229743d797c`.
 
-No extractor-version bump or reference canonicalization was attempted. The
-opencode comparison, mutation controls, callgraph/views suites and Windows check
-were not run after this failure. This implementation remains a failed acceptance
-candidate, not a completed optimization.
+The cause was a pre-existing bug: `at_pin` is nested inside `pinned_domains`, so
+call attribution emits evidence for both enclosing callers. Construction used
+randomized `calls_by_symbol` iteration, while sorting and deduplication omitted
+`caller_symbol`. Deduplication therefore retained whichever caller happened to
+arrive first. The standalone fix sorts both caller maps and includes caller
+identity in reference ordering and deduplication, preserving both references.
+
+Because this intentionally changes bytes and evidence identity, producer keys
+advance from `callgraph-v1` to `callgraph-v2` and from `ruled-callgraph-v1` to
+`ruled-callgraph-v2`, causing a one-time rebuild. Payload schema stays 1: the JSON
+layout is unchanged. This fix is the first task commit, before the optimization.
+
+The new determinism test performs 32 extractions of the real failing file,
+asserts both enclosing callers remain, and checks canonical caller-map iteration
+across fresh hash seeds. It failed before the fix at attempt 1, passed after the
+fix, and failed at attempt 3 when hash-order construction and caller-omitting
+keys were restored with a `NON-VACUITY BREAK` mutation.
+
+## Final serialized-byte parity and work mutations
+
+Every file is byte-identical between the deterministic fixed-base extractor and
+the optimized head: 3,526 AFT files and 5,037 opencode files, totaling 8,563 files.
+The head comparison consumed 1,078,460,157 AFT bytes and 938,552,340 opencode
+bytes. No normalization of caller fields or other payload data was used.
+
+Seven independent work mutations each failed exactly one named guard, with the
+other eight work tests passing. The temporary mutants actually performed a
+second whole-file parse, repeated macro-body parses, copied kind strings,
+collected child vectors, scanned every node for each query, constructed a second
+position index, or allocated call-kind vectors. All mutants were restored from
+the staged live state; the unstaged `git diff --stat` was empty after restoration.
+
+Remaining required suite and Windows results are recorded after their gates
+finish.
 
 ## Commands and retained evidence
 
@@ -107,18 +140,20 @@ an explicit three-hour timeout. The baseline commands run from
 `tmp/extraction/base` with `CARGO_TARGET_DIR` set to the worktree's `target/`.
 
 - `cargo test -p agent-file-tools --lib extraction_ -- --nocapture`: baseline
-  produced six expected budget failures; head passed 13 tests with one ignored.
+  produced six expected budget failures; fixed head passed 14 tests with one ignored.
 - `cargo test -p agent-file-tools --lib extraction_corpus_bytes_and_work -- --ignored --nocapture`:
   baseline passed once for each full corpus; head passed once for each of the
   three single-file work probes.
-- The same corpus command with `AFT_EXTRACT_COMPARE=1`: failed on the AFT corpus
-  with the mismatch above.
+- The same corpus command with `AFT_EXTRACT_COMPARE=1`: both full corpora passed
+  against the deterministic fixed base.
 - `cargo fmt --all -- --check`: passed (silent success).
 
 Ignored evidence is retained under `tmp/extraction/`: `baseline-tests-resumed.log`,
 `baseline-aft-resumed.log`, `baseline-opencode-resumed.log`,
 `head-work-tests-fixed.log`, `head-subc-work.log`, `head-load-matrix-work.log`,
 `head-opencode-work.log`, `head-aft-byte-comparison.log`, and
-`byte-mismatch-fields.txt`. The differing payloads are
+`byte-mismatch-fields.txt`, `fixed-base-aft.log`, `fixed-base-opencode.log`,
+`fixed-head-aft-parity.log`, `fixed-head-opencode-parity.log`,
+`mutation-determinism.log` and `mutation-work-*.log`. The original differing payloads are
 `baseline-aft/benchmarks/aft-search/author_real_query.py` and
 `baseline-aft/benchmarks/aft-search/author_real_query.head.json`.
