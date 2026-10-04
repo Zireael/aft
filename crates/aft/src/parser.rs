@@ -3403,6 +3403,18 @@ thread_local! {
 /// invisible. Code bases that group whole runtimes of methods inside macro
 /// bodies depend on seeing them, so each such body is parsed again on its own
 /// and contributes its items when, and only when, it parses cleanly as Rust.
+/// The type an impl block's methods belong to, as outlines name it: generic
+/// arguments and path qualifiers are dropped, so `impl<T> Trait for a::Box<T>`
+/// nests its methods under the `Box` struct instead of a name no symbol has.
+fn rust_impl_parent_name(impl_target: &str) -> String {
+    let base_type = impl_target.split('<').next().unwrap_or(impl_target).trim();
+    base_type
+        .rsplit("::")
+        .next()
+        .unwrap_or(base_type)
+        .to_string()
+}
+
 fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
     let mut symbols = Vec::new();
     let mut macro_bodies = Vec::new();
@@ -3620,14 +3632,7 @@ fn extract_rs_symbols_from_root(
                 };
                 let parent_name = type_names
                     .last()
-                    .map(|name| {
-                        let base_type = name.split('<').next().unwrap_or(name).trim();
-                        base_type
-                            .rsplit("::")
-                            .next()
-                            .unwrap_or(base_type)
-                            .to_string()
-                    })
+                    .map(|name| rust_impl_parent_name(name))
                     .unwrap_or_default();
 
                 let mut child_cursor = node.walk();
@@ -9199,11 +9204,8 @@ mod tests {
 
             if let Some(impl_node) = impl_node {
                 let scope_name = rust_impl_scope_name(&impl_node, source);
-                let parent_name = scope_name
-                    .rsplit(" for ")
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+                let parent_name =
+                    rust_impl_parent_name(scope_name.rsplit(" for ").next().unwrap_or_default());
                 let mut impl_cursor = impl_node.walk();
                 if impl_cursor.goto_first_child() {
                     loop {
