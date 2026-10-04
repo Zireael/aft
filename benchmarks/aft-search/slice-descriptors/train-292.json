@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["durability-per-store", "outline-target-ignore-rules", "outline-impl-leak"],
+  "note": "crates/aft/src/search_index.rs and crates/aft/src/semantic_index.rs change only their persistence: the cache and spill writes drop their disk syncs, and the semantic snapshot keeps one data sync. Search inputs, lane plans and ranking rules are untouched, so no benchmark row may move. Outline walks now apply the target repository's own ignore rules, and Rust generic impl methods no longer leak to file level."
+}
