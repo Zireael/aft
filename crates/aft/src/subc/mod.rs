@@ -14249,8 +14249,14 @@ mod tests {
             resumed && recovered.complete(),
             "resumed server could not resync the current document: {recovered:?}"
         );
+        // Consulting the silent server again would wait out the whole 2 s
+        // budget, so the discriminating bound is half of it. The time spent
+        // is otherwise the notify path's own cost, which a loaded Windows
+        // runner measured at about 200 ms.
         assert!(
-            !skipped.complete() && skipped_elapsed < Duration::from_millis(100),
+            !skipped.complete()
+                && skipped.unresponsive_servers.contains(&key)
+                && skipped_elapsed < Duration::from_millis(1000),
             "unresponsive diagnostics were consulted again: {skipped:?} {skipped_elapsed:?}"
         );
     }

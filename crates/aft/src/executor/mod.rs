@@ -2213,8 +2213,13 @@ impl SchedulerState {
             })
             .collect::<Vec<_>>();
         in_flight_readers.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        // The bind's own configure job can hold the mutating slot while it
+        // runs. It is not a blocker of the bind; reporting it as one would
+        // tell the caller to wait for a different job when the bind's own
+        // configure is what is slow.
         let in_flight_writer = actor
             .and_then(|actor| actor.mutating_inflight.as_ref())
+            .filter(|job| job.request_id != request_id)
             .map(|job| MutatingLaneSnapshot {
                 root_id: root_id.clone(),
                 request_id: job.request_id.clone(),
