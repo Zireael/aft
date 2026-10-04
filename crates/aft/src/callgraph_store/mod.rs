@@ -6769,15 +6769,7 @@ impl ReadonlyCallGraphStore {
         generation: &str,
         pin: Option<Arc<crate::pins::QueryPin>>,
     ) -> Result<Self> {
-        let generation_path = crate::views::resolve_derived_path(&view_dir, generation)
-            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        // Older publications used one checkout-wide database. Keep them readable
-        // until the first generation-owned publication replaces their handle.
-        let sqlite_path = if generation_path.is_file() {
-            generation_path
-        } else {
-            view_dir.join("derived.sqlite")
-        };
+        let sqlite_path = manifest_view_database_path(&view_dir, generation)?;
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
         let mut inner = CallGraphStore::from_connection(
@@ -9247,6 +9239,29 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
     }
     let digest = hash_to_hex(hasher.finalize());
     format!("legacy-{}", &digest[..16])
+}
+
+/// Publication reuse must satisfy the same build-output check as a view reader.
+/// HEAD and manifest equality cannot make output from an older builder readable.
+pub(crate) fn manifest_view_database_ready(view_dir: &Path, generation: &str) -> Result<bool> {
+    let path = manifest_view_database_path(view_dir, generation)?;
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let conn = open_readonly_connection(&path)?;
+    database_ready(&conn)
+}
+
+fn manifest_view_database_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
+    let generation_path = crate::views::resolve_derived_path(view_dir, generation)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    // Older publications used one checkout-wide database. Keep them readable
+    // until the first generation-owned publication replaces their handle.
+    Ok(if generation_path.is_file() {
+        generation_path
+    } else {
+        view_dir.join("derived.sqlite")
+    })
 }
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {

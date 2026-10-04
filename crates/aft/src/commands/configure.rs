@@ -7175,7 +7175,22 @@ fn open_view_runtime_for_configure(
         && manifest
             .as_ref()
             .is_some_and(crate::views::assembly::manifest_lacks_callgraph);
-    let pending_paths = if callgraph_missing {
+    // Existing keys do not imply a usable graph: a binary upgrade can change
+    // extraction or resolution without changing HEAD or checkout membership.
+    // Schedule a replacement before the warm reader rejects the old output.
+    let callgraph_unready = ctx.config().indexes.callgraph
+        && generation.as_deref().is_some_and(|generation| {
+            !crate::callgraph_store::manifest_view_database_ready(view.view_dir(), generation)
+                .is_ok_and(|ready| ready)
+        });
+    if callgraph_unready {
+        slog_info!(
+            "content-addressed view callgraph rebuild scheduled root={} generation={} reason=derived_not_ready",
+            job.canonical_cache_root.display(),
+            generation.as_deref().unwrap_or_default()
+        );
+    }
+    let pending_paths = if callgraph_missing || callgraph_unready {
         head_paths.clone()
     } else if generation_matches_head {
         BTreeSet::new()
@@ -8233,6 +8248,181 @@ mod tests {
             "the newer configure's tail runs to completion: {records:?}"
         );
         assert!(!ctx.configure_tail_has_work());
+    }
+
+    #[test]
+    fn views_owner_rebuilds_stale_callgraph_with_multiple_sessions_and_linked_worktrees() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let storage = temp.path().join("storage");
+        init_git_fixture(&main);
+        let main = main.canonicalize().unwrap();
+        for name in ["linked-one", "linked-two"] {
+            assert!(git_command(&main)
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(temp.path().join(name))
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success());
+        }
+        let family = crate::search_index::artifact_cache_key(&main);
+        let scope = crate::path_identity::project_scope_key(&main);
+        let head = crate::views::assembly::head_tree_fingerprint(
+            &crate::alias::head_tree_entries(&main).unwrap(),
+        );
+        let seeded =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: main.clone(),
+                family: family.clone(),
+                scope: scope.clone(),
+                desired_head: head,
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        let generation = seeded.generation.unwrap();
+        let view = crate::views::ViewStore::open(&storage, &scope).unwrap();
+        let derived = view.derived_path(&generation).unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(&derived);
+        // An older binary published the same HEAD with callgraph keys, but its
+        // extraction producer and derived build output are no longer readable.
+        let source = fs::read_to_string(main.join("tracked.rs")).unwrap();
+        let old_producer = "ruled-callgraph-v2";
+        let old_key =
+            crate::blob_store::CallgraphKey::from_bytes(source.as_bytes(), "rust", old_producer)
+                .full_key();
+        let old_blob =
+            crate::callgraph_store::join::CallgraphBlob::extract(&source, "rust", old_producer)
+                .unwrap();
+        let mut blobs = crate::blob_store::BlobStore::open(
+            &storage,
+            &family,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        blobs.put(&old_key, &old_blob.to_bytes().unwrap()).unwrap();
+        // Leave only old-producer payloads: the owner must extract current
+        // blobs before a read-only worktree can assemble its own graph.
+        let connection = rusqlite::Connection::open(blobs.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM blob_payloads WHERE full_key != ?1",
+                [old_key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        drop(connection);
+        let old_manifest =
+            crate::views::Manifest::new(view.load_manifest(&generation).unwrap().entries().map(
+                |(path, entry)| {
+                    let mut entry = entry.clone();
+                    if let crate::views::ManifestEntry::Regular { planes, .. } = &mut entry {
+                        planes.callgraph = Some(old_key.to_hex());
+                    }
+                    (path.clone(), entry)
+                },
+            ))
+            .unwrap();
+        fs::write(
+            view.manifest_path(&generation).unwrap(),
+            old_manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        let connection = rusqlite::Connection::open(&derived).unwrap();
+        connection.execute("UPDATE meta SET v = '9e904a6dac7809c1250e41cc0eb9c1811afc33f707da25d3938c095b6e3bca2c' WHERE k = 'fingerprint'", []).unwrap();
+        drop(connection);
+
+        let params = |root: &Path| {
+            json!({
+                "project_root": root, "storage_dir": storage, "harness": "opencode",
+                "config": [user_tier(json!({ "views": { "enabled": true },
+                    "search_index": false, "semantic_search": false, "callgraph_store": true }))]
+            })
+        };
+        let owner = test_context();
+        for session in ["owner-one", "owner-two", "owner-three"] {
+            let response = handle_configure_for_test(
+                &configure_request_with_session(params(&main), session),
+                &owner,
+            );
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["artifact_owner"]["mode"], "owner");
+        }
+        assert!(owner.callgraph_writer());
+        super::drain_deferred_configure_maintenance(&owner);
+        match owner.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert!(crate::callgraph_store::CallGraphRead::node_for(
+                    &store,
+                    Path::new("tracked.rs"),
+                    "tracked"
+                )
+                .is_ok());
+            }
+            CallgraphStoreAccess::Error(error) => {
+                panic!("bound owner did not rebuild its stale view: {error}")
+            }
+            _ => panic!("bound owner did not rebuild its stale view"),
+        }
+        assert_ne!(
+            view.current_generation().unwrap().as_deref(),
+            Some(generation.as_str())
+        );
+        // Rebinding a ready owner must not manufacture redundant generations.
+        let ready_generation = view.current_generation().unwrap();
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_session(params(&main), "owner-four"),
+                &owner
+            )
+            .success
+        );
+        super::drain_deferred_configure_maintenance(&owner);
+        assert_eq!(view.current_generation().unwrap(), ready_generation);
+        for name in ["linked-one", "linked-two"] {
+            let linked = temp.path().join(name);
+            let borrower = test_context();
+            let response = handle_configure_for_test(
+                &configure_request_with_session(params(&linked), name),
+                &borrower,
+            );
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["artifact_owner"]["mode"], "read_only");
+            assert!(!borrower.callgraph_writer());
+            super::drain_deferred_configure_maintenance(&borrower);
+            match borrower.callgraph_store_for_ops() {
+                CallgraphStoreAccess::Ready(store) => {
+                    assert_eq!(store.reader_kind(), "view");
+                    assert!(crate::callgraph_store::CallGraphRead::node_for(
+                        &store,
+                        Path::new("tracked.rs"),
+                        "tracked"
+                    )
+                    .is_ok());
+                }
+                CallgraphStoreAccess::Error(error) => {
+                    panic!("linked worktree could not read the rebuilt graph: {error}")
+                }
+                _ => panic!("linked worktree could not read the rebuilt graph"),
+            }
+            let request = RawRequest {
+                id: "linked-callers".into(),
+                command: "callers".into(),
+                session_id: Some(name.into()),
+                lsp_hints: None,
+                params: json!({ "file": linked.join("tracked.rs"), "symbol": "tracked" }),
+            };
+            let answer = crate::commands::callers::handle_callers(&request, &borrower);
+            assert!(answer.success, "{}", answer.data);
+        }
     }
 
     #[test]

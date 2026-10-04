@@ -178,6 +178,28 @@ pub fn prepare_checkout(
         .as_deref()
         .map(|generation| view.load_manifest(generation))
         .transpose()?;
+    // A byte-identical manifest can still name incompatible build output after
+    // an upgrade. Never no-op, reuse, or patch a graph its reader would refuse.
+    let unusable_base = match current_generation
+        .as_deref()
+        .map(|generation| {
+            crate::callgraph_store::manifest_view_database_ready(view.view_dir(), generation)
+        })
+        .transpose()
+    {
+        Ok(Some(false)) => Some((
+            ColdBuildReason::BaseNotReady,
+            "derived graph fails the current build-output readiness check".to_string(),
+        )),
+        Ok(_) => None,
+        Err(crate::callgraph_store::CallGraphStoreError::Sqlite(error))
+            if sqlite_error_is_unreadable_database(&error) =>
+        {
+            Some((ColdBuildReason::BaseUnreadable, error.to_string()))
+        }
+        Err(error) => return Err(ViewError::InvalidManifest(error.to_string())),
+    };
+    let base_ready = current_generation.is_some() && unusable_base.is_none();
     timing.phase("previous_manifest");
     let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
@@ -486,6 +508,7 @@ pub fn prepare_checkout(
         .as_deref()
         .is_some_and(|generation| generation.ends_with(&request.desired_head))
         && previous.as_ref() == Some(&manifest)
+        && base_ready
     {
         prepared.profile.outcome = "no_op";
         prepared.report.manifest = None;
@@ -493,9 +516,10 @@ pub fn prepare_checkout(
         return Ok(prepared);
     }
     prepared.profile.enter(2, phase)?;
-    let reused_derived = previous
-        .as_ref()
-        .is_some_and(|base| super::materialization::manifest_callgraph_equivalent(base, &manifest))
+    let reused_derived = base_ready
+        && previous.as_ref().is_some_and(|base| {
+            super::materialization::manifest_callgraph_equivalent(base, &manifest)
+        })
         && current_generation
             .as_deref()
             .is_some_and(|base| view.derived_path(base).is_ok_and(|path| path.is_file()));
@@ -510,7 +534,7 @@ pub fn prepare_checkout(
     if !reused_derived {
         let clone_started = Instant::now();
         let base = match current_generation.as_deref() {
-            Some(base) => {
+            Some(base) if base_ready => {
                 let base_path = view.derived_path(base)?;
                 if base_path.is_file() {
                     let base_manifest = view
@@ -521,9 +545,9 @@ pub fn prepare_checkout(
                     None
                 }
             }
-            None => None,
+            _ => None,
         };
-        let mut cold_build: Option<(ColdBuildReason, String)> = None;
+        let mut cold_build = unusable_base;
         let mut incremental_base = None;
         if let Some((base_path, base_manifest)) = base {
             let size = super::materialization::manifest_diff_size(&base_manifest, &manifest);
@@ -875,6 +899,8 @@ mod tests {
 /// even though a current generation existed to patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColdBuildReason {
+    /// The base was built with incompatible output, is unfinished, or is missing.
+    BaseNotReady,
     /// The current generation's database records a different manifest than
     /// the one its generation names, so its rows cannot seed the diff.
     BaseFingerprintMismatch,
@@ -889,6 +915,7 @@ enum ColdBuildReason {
 impl ColdBuildReason {
     fn as_str(self) -> &'static str {
         match self {
+            Self::BaseNotReady => "base_not_ready",
             Self::BaseFingerprintMismatch => "base_fingerprint_mismatch",
             Self::BaseUnreadable => "base_unreadable",
             Self::LargeDiff => "large_diff",
@@ -908,6 +935,7 @@ enum PatchFailure {
 /// by reason, since this process started. Reported in view health.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ColdBuildCounts {
+    pub base_not_ready: u64,
     pub base_fingerprint_mismatch: u64,
     pub base_unreadable: u64,
     pub large_diff: u64,
@@ -923,6 +951,7 @@ fn record_cold_build(view_dir: &Path, reason: ColdBuildReason) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = counts.entry(view_dir.to_path_buf()).or_default();
     match reason {
+        ColdBuildReason::BaseNotReady => entry.base_not_ready += 1,
         ColdBuildReason::BaseFingerprintMismatch => entry.base_fingerprint_mismatch += 1,
         ColdBuildReason::BaseUnreadable => entry.base_unreadable += 1,
         ColdBuildReason::LargeDiff => entry.large_diff += 1,
