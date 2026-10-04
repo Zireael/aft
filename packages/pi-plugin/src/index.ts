@@ -95,6 +95,7 @@ import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { startPiLiveConfigReload } from "./config-live-reload.js";
 import { recordActiveExtensionApi } from "./harness.js";
+import { loadOmpInternalUrlRouter } from "./omp-internal-urls.js";
 import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import {
@@ -917,6 +918,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     );
   }
 
+  ctx.ompRouter = await loadOmpInternalUrlRouter(pi);
   registerPiToolSurface(pi, ctx, surface);
 
   // Pi binds its live tool registry after extension factories run. A modern Pi

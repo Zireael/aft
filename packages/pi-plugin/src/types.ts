@@ -1,5 +1,6 @@
 import type { AftTransportPool } from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
+import type { OmpInternalUrlRouter } from "./omp-internal-urls.js";
 
 /**
  * Shared context passed to every tool wrapper.
@@ -13,6 +14,8 @@ import type { AftConfig } from "./config.js";
 export interface PluginContext {
   pool: AftTransportPool;
   config: AftConfig;
+  /** OMP's process-global internal URL router, absent on upstream Pi. */
+  ompRouter?: OmpInternalUrlRouter;
   /** Whether hashline edit/read mode is active for this plugin registration. */
   hashlineEffective?: boolean;
   /** Absolute path to AFT's data storage dir (e.g. ~/.local/share/cortexkit/aft). */
