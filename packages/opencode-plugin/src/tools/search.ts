@@ -317,7 +317,6 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         ),
         metadata: {
           count: files.length,
-          ...(Array.isArray(response.files) ? { files } : {}),
           ...(typeof response.total === "number" ? { total: response.total } : {}),
           ...(typeof response.complete === "boolean" ? { complete: response.complete } : {}),
           ...(typeof response.truncated === "boolean" ? { truncated: response.truncated } : {}),

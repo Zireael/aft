@@ -224,7 +224,10 @@ describe("searchTools", () => {
         "  one.ts, two.ts, three.ts, four.ts, five.ts, ...",
       ].join("\n"),
     );
-    expect(result.metadata).toMatchObject({ count: 2, files: ["src/one.ts", "src/two.ts"] });
+    expect(result.metadata).toMatchObject({ count: 2 });
+    // The path list is already in the output; repeating it in metadata would
+    // store it twice in the host session.
+    expect(result.metadata).not.toHaveProperty("files");
   });
 
   test("V2 projection preserves the host glob count and grep line count", async () => {
@@ -245,7 +248,7 @@ describe("searchTools", () => {
     const globResult = await Effect.runPromise(glob.execute({ pattern: "**/*.ts" }, context));
 
     expect(grepResult.metadata).toMatchObject({ matches: 2 });
-    expect(globResult.metadata).toMatchObject({ count: 2, files: ["a.ts", "b.ts"] });
+    expect(globResult.metadata).toMatchObject({ count: 2 });
   });
 
   test("grep forwards include strings for server-side brace-aware translation", async () => {
