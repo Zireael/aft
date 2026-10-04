@@ -13102,7 +13102,6 @@ mod tests {
         // resolve Ready on the first call. Configure maintenance runs on the
         // transport loop; if it inherited that wait, stdin EOF would not be
         // observed until the cold build finished or the window expired.
-        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(60_000);
         let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -13112,6 +13111,7 @@ mod tests {
         init_git_fixture(root.path());
         std::fs::write(root.path().join("lib.rs"), "pub fn marker() {}\n").unwrap();
         let ctx = Arc::new(test_context());
+        let _wait_guard = crate::context::override_callgraph_build_wait_ms_for_test(&ctx, 60_000);
         ctx.isolate_cold_build_limiter_for_test(1);
         let req = configure_request_with_params(json!({
             "project_root": root.path(),

@@ -8066,10 +8066,7 @@ mod tests {
     use crate::callgraph::walk_project_files;
     use crate::callgraph_store::CallGraphStore;
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
-    use crate::context::{
-        callgraph_cold_build_spawn_count_for_test, reset_callgraph_cold_build_spawn_count_for_test,
-        AppContext,
-    };
+    use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::semantic_index::{
         with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
@@ -11880,7 +11877,6 @@ mod tests {
     fn absent_warm_callgraph_emits_no_blast_radius_and_starts_no_build() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ctx = test_context(dir.path());
-        reset_callgraph_cold_build_spawn_count_for_test();
         let results = vec![write_symbol_hit(dir.path(), "target.rs", "target", 1)];
 
         let text = format_semantic_text(&results, dir.path(), false, false, Some(&ctx));
@@ -11889,7 +11885,7 @@ mod tests {
             !text.contains("↩"),
             "cold store should not annotate rows: {text}"
         );
-        assert_eq!(callgraph_cold_build_spawn_count_for_test(), 0);
+        assert_eq!(ctx.callgraph_cold_build_spawn_count_for_test(), 0);
         assert!(ctx.callgraph_store_rx().lock().is_none());
     }
 

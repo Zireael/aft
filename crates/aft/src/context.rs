@@ -2869,6 +2869,12 @@ pub struct AppContext {
         parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,
     callgraph_store_rx:
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
+    // Unit tests must observe only this context's admissions and wait policy:
+    // another root can start a worker or request an inline wait concurrently.
+    #[cfg(test)]
+    callgraph_cold_build_spawn_count: AtomicUsize,
+    #[cfg(test)]
+    callgraph_build_wait_override: parking_lot::Mutex<Option<Duration>>,
     callgraph_store_rx_generation: AtomicU64,
     callgraph_store_rx_epoch: AtomicU64,
     callgraph_store_build_denied: parking_lot::Mutex<Option<(u64, String)>>,
@@ -3146,14 +3152,13 @@ enum CallgraphBackgroundWork {
 
 #[cfg(test)]
 struct CallgraphBuildStartGate {
-    root: PathBuf,
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
 }
 
 #[cfg(test)]
 static CALLGRAPH_BUILD_START_GATE: std::sync::OnceLock<
-    parking_lot::Mutex<Option<CallgraphBuildStartGate>>,
+    parking_lot::Mutex<BTreeMap<PathBuf, CallgraphBuildStartGate>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -3165,13 +3170,20 @@ fn install_callgraph_build_start_gate(
 ) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *CALLGRAPH_BUILD_START_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock() = Some(CallgraphBuildStartGate {
-        root,
-        reached: reached_tx,
-        release: release_rx,
-    });
+    let previous = CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+        .lock()
+        .insert(
+            root,
+            CallgraphBuildStartGate {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "callgraph build-start gate already installed for root"
+    );
     (reached_rx, release_tx)
 }
 
@@ -3186,26 +3198,15 @@ pub(crate) fn install_callgraph_build_start_gate_for_test(
 }
 
 #[cfg(test)]
-static CALLGRAPH_BUILD_WAIT_MS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) struct CallgraphBuildWaitMsGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
+pub(crate) struct CallgraphBuildWaitMsGuard<'a> {
+    context: &'a AppContext,
+    previous: Option<Duration>,
 }
 
 #[cfg(test)]
-impl Drop for CallgraphBuildWaitMsGuard {
+impl Drop for CallgraphBuildWaitMsGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK for this guard's
-        // lifetime, and restored before the lock is released.
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", value),
-                None => std::env::remove_var("AFT_CALLGRAPH_BUILD_WAIT_MS"),
-            }
-        }
+        *self.context.callgraph_build_wait_override.lock() = self.previous;
     }
 }
 
@@ -3308,34 +3309,28 @@ impl MaintenanceProbeLock {
     ];
 }
 
-/// Serialize test overrides of the query-op inline wait. Configure-tail tests
-/// share this with query-op tests so they cannot clobber each other's env.
+/// Override only this context's inline wait, including queries on helper threads.
+/// Mutating the environment would also change unrelated roots' query outcomes.
 #[cfg(test)]
-pub(crate) fn override_callgraph_build_wait_ms_for_test(ms: u64) -> CallgraphBuildWaitMsGuard {
-    let guard = crate::test_env::lock_test_mutex(
-        CALLGRAPH_BUILD_WAIT_MS_LOCK.get_or_init(|| std::sync::Mutex::new(())),
-    );
-    let previous = std::env::var_os("AFT_CALLGRAPH_BUILD_WAIT_MS");
-    // SAFETY: serialized by CALLGRAPH_BUILD_WAIT_MS_LOCK and restored on drop.
-    unsafe {
-        std::env::set_var("AFT_CALLGRAPH_BUILD_WAIT_MS", ms.to_string());
-    }
-    CallgraphBuildWaitMsGuard {
-        _guard: guard,
-        previous,
-    }
+pub(crate) fn override_callgraph_build_wait_ms_for_test(
+    context: &AppContext,
+    ms: u64,
+) -> CallgraphBuildWaitMsGuard<'_> {
+    let previous = context
+        .callgraph_build_wait_override
+        .lock()
+        .replace(Duration::from_millis(ms));
+    CallgraphBuildWaitMsGuard { context, previous }
 }
 
 #[cfg(test)]
 fn wait_on_callgraph_build_start_gate(root: &Path) {
-    let mut slot = CALLGRAPH_BUILD_START_GATE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock();
-    if !slot.as_ref().is_some_and(|gate| gate.root == root) {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
+    // Remove only the worker's root, and release the registry lock before waiting
+    // so a held worker cannot prevent another root from reaching its own gate.
+    let gate = CALLGRAPH_BUILD_START_GATE
+        .get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+        .lock()
+        .remove(root);
     if let Some(gate) = gate {
         let _ = gate.reached.send(());
         let _ = gate.release.recv();
@@ -3415,6 +3410,9 @@ fn callgraph_build_wait_window() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+// Retain the aggregate for integration harnesses compiled without cfg(test).
+// In-process unit tests use the context-local counter instead: resetting an
+// aggregate can erase another test's admission, and its workers can inflate it.
 static CALLGRAPH_COLD_BUILD_SPAWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
@@ -3522,6 +3520,10 @@ impl AppContext {
             callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            callgraph_cold_build_spawn_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            callgraph_build_wait_override: parking_lot::Mutex::new(None),
             callgraph_store_rx_generation: AtomicU64::new(0),
             callgraph_store_rx_epoch: AtomicU64::new(0),
             callgraph_store_build_denied: parking_lot::Mutex::new(None),
@@ -7023,6 +7025,19 @@ impl AppContext {
         outcome
     }
 
+    #[cfg(test)]
+    pub(crate) fn callgraph_cold_build_spawn_count_for_test(&self) -> usize {
+        self.callgraph_cold_build_spawn_count.load(Ordering::SeqCst)
+    }
+
+    fn callgraph_build_wait_window(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(wait) = *self.callgraph_build_wait_override.lock() {
+            return wait;
+        }
+        callgraph_build_wait_window()
+    }
+
     pub fn callgraph_store_for_ops(&self) -> CallgraphStoreAccess {
         let active = self
             .checkout_query_runtime
@@ -7032,7 +7047,7 @@ impl AppContext {
         self.callgraph_store_for_ops_with_wait(if active {
             crate::views::contracts::CALLGRAPH_QUERY_WAIT
         } else {
-            callgraph_build_wait_window()
+            self.callgraph_build_wait_window()
         })
     }
 
@@ -7541,6 +7556,9 @@ impl AppContext {
         let persist_epoch_flag = self.callgraph_persist_epoch_flag();
 
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.callgraph_cold_build_spawn_count
+            .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
 
         std::thread::spawn(move || {
@@ -11684,12 +11702,12 @@ mod callgraph_store_for_ops_tests {
     use std::sync::Barrier;
     use tempfile::TempDir;
 
-    fn callgraph_build_wait_ms(ms: u64) -> super::CallgraphBuildWaitMsGuard {
-        super::override_callgraph_build_wait_ms_for_test(ms)
+    fn callgraph_build_wait_ms(ctx: &AppContext, ms: u64) -> super::CallgraphBuildWaitMsGuard<'_> {
+        super::override_callgraph_build_wait_ms_for_test(ctx, ms)
     }
 
-    fn force_async_callgraph_builds() -> super::CallgraphBuildWaitMsGuard {
-        callgraph_build_wait_ms(0)
+    fn force_async_callgraph_builds(ctx: &AppContext) -> super::CallgraphBuildWaitMsGuard<'_> {
+        callgraph_build_wait_ms(ctx, 0)
     }
 
     /// Returns the project and storage directories with the context that uses
@@ -11716,6 +11734,95 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
+    }
+
+    #[test]
+    fn callgraph_build_wait_override_is_per_context_and_reaches_query_threads() {
+        let (_first_dirs, first) = cold_build_context();
+        let (_second_dirs, second) = cold_build_context();
+        let original = first.callgraph_build_wait_window();
+        let first_wait = callgraph_build_wait_ms(&first, 30_000);
+        let _second_wait = force_async_callgraph_builds(&second);
+
+        let query_ctx = Arc::clone(&first);
+        assert_eq!(
+            std::thread::spawn(move || query_ctx.callgraph_build_wait_window())
+                .join()
+                .expect("query thread"),
+            Duration::from_secs(30),
+            "another root's async policy must not change this root's query wait"
+        );
+        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
+        {
+            let _nested_wait = callgraph_build_wait_ms(&first, 50);
+            assert_eq!(
+                first.callgraph_build_wait_window(),
+                Duration::from_millis(50)
+            );
+        }
+        assert_eq!(first.callgraph_build_wait_window(), Duration::from_secs(30));
+        drop(first_wait);
+        assert_eq!(first.callgraph_build_wait_window(), original);
+        assert_eq!(second.callgraph_build_wait_window(), Duration::ZERO);
+    }
+
+    #[test]
+    fn callgraph_cold_build_spawn_count_is_per_context() {
+        let (_first_dirs, first) = cold_build_context();
+        let (_second_dirs, second) = cold_build_context();
+        let _first_wait = force_async_callgraph_builds(&first);
+        let _second_wait = force_async_callgraph_builds(&second);
+        first.isolate_cold_build_limiter_for_test(1);
+        second.isolate_cold_build_limiter_for_test(1);
+
+        assert!(matches!(
+            first.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(second.callgraph_cold_build_spawn_count_for_test(), 0);
+        assert!(matches!(
+            second.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
+        assert_eq!(first.callgraph_cold_build_spawn_count_for_test(), 1);
+        assert_eq!(second.callgraph_cold_build_spawn_count_for_test(), 1);
+
+        for ctx in [&first, &second] {
+            let events = ctx
+                .callgraph_store_rx()
+                .lock()
+                .take()
+                .expect("build receiver");
+            events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("worker settles");
+        }
+    }
+
+    #[test]
+    fn callgraph_build_start_gates_are_per_root() {
+        let first = TempDir::new().expect("first root");
+        let second = TempDir::new().expect("second root");
+        let (first_reached, first_release) =
+            install_callgraph_build_start_gate(first.path().into());
+        let (second_reached, second_release) =
+            install_callgraph_build_start_gate(second.path().into());
+        let workers = [first.path(), second.path()].map(|root| {
+            let root = root.to_path_buf();
+            std::thread::spawn(move || wait_on_callgraph_build_start_gate(&root))
+        });
+
+        first_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("installing a second root's gate must not discard the first root's gate");
+        second_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a held first root must not prevent the second root reaching its gate");
+        first_release.send(()).expect("release first root");
+        second_release.send(()).expect("release second root");
+        for worker in workers {
+            worker.join().expect("gated worker");
+        }
     }
 
     fn with_fake_home_env<R>(home: &Path, f: impl FnOnce() -> R) -> R {
@@ -11803,7 +11910,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn home_root_gate_blocks_callgraph_store_entry_points() {
-        let _wait_guard = force_async_callgraph_builds();
         let home = TempDir::new().expect("home tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = home.path().join("src");
@@ -11816,6 +11922,7 @@ mod callgraph_store_for_ops_tests {
 
         with_fake_home_env(home.path(), || {
             let ctx = configure_context(home.path(), storage.path());
+            let _wait_guard = force_async_callgraph_builds(&ctx);
             assert!(
                 !ctx.heavy_root_work_allowed(),
                 "HOME root configure must close the heavy-root-work gate"
@@ -11852,7 +11959,6 @@ mod callgraph_store_for_ops_tests {
                 "HOME root health must not advertise callgraph building"
             );
 
-            reset_callgraph_cold_build_spawn_count_for_test();
             assert!(matches!(
                 ctx.callgraph_store_for_ops(),
                 CallgraphStoreAccess::Unavailable
@@ -11864,7 +11970,7 @@ mod callgraph_store_for_ops_tests {
                 "shared gate must also block synchronous standalone callgraph builds"
             );
             assert_eq!(
-                callgraph_cold_build_spawn_count_for_test(),
+                ctx.callgraph_cold_build_spawn_count_for_test(),
                 0,
                 "HOME root gate must not spawn a cold callgraph build"
             );
@@ -11931,9 +12037,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn non_home_root_still_allows_callgraph_cold_builds() {
-        let _env_guard = force_async_callgraph_builds();
-        reset_callgraph_cold_build_spawn_count_for_test();
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
 
         assert!(ctx.heavy_root_work_allowed());
         assert!(matches!(
@@ -11941,7 +12046,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building | CallgraphStoreAccess::Ready(_)
         ));
         assert_eq!(
-            callgraph_cold_build_spawn_count_for_test(),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "non-home roots must still be able to cold-build the callgraph store"
         );
@@ -11959,9 +12064,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.semantic_index_rx().lock() = Some(rx);
         ctx.schedule_semantic_cold_seed_gate_for_configure();
@@ -11971,7 +12075,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "the semantic cold seed must not block callgraph admission"
         );
@@ -11991,7 +12095,7 @@ mod callgraph_store_for_ops_tests {
             "semantic Ready must resume deferred Tier-2 work"
         );
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "semantic Ready must not schedule a duplicate callgraph warm"
         );
@@ -12008,9 +12112,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         ctx.schedule_semantic_cold_seed_gate_for_configure();
 
         assert!(matches!(
@@ -12018,7 +12121,7 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "the semantic cold seed must not block callgraph admission"
         );
@@ -12033,7 +12136,7 @@ mod callgraph_store_for_ops_tests {
             "cached-load or retry-wait clear must resume deferred Tier-2 work"
         );
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "clearing the semantic gate must not schedule a duplicate callgraph warm"
         );
@@ -12050,9 +12153,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn semantic_cold_seed_gate_allows_callgraph_cold_spawn_immediately() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let (_ctx_dirs, ctx) = cold_build_context();
+        let _wait_guard = force_async_callgraph_builds(&ctx);
 
         ctx.set_semantic_cold_seed_active_for_test(true);
         assert!(matches!(
@@ -12060,14 +12162,14 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Building
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "callgraph navigation must start while the semantic cold seed is active"
         );
 
         ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "clearing the semantic cold gate must not schedule a second callgraph warm"
         );
@@ -12245,7 +12347,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn query_wait_joins_callgraph_build_scheduled_without_wait() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -12261,6 +12362,7 @@ mod callgraph_store_for_ops_tests {
                 ..Config::default()
             },
         ));
+        let _wait_guard = callgraph_build_wait_ms(&ctx, 10_000);
         let (reached, release) = install_callgraph_build_start_gate(project_root);
 
         assert!(matches!(
@@ -12362,7 +12464,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn callgraph_cold_build_stops_at_next_fence_when_root_is_abandoned_past_grace() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let (ctx, _project, _storage, project_root, release, events) =
             gated_callgraph_cold_build(Duration::ZERO);
         let census = ctx.cold_build_limiter().census();
@@ -12387,7 +12488,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn callgraph_cold_build_continues_through_unbind_inside_grace() {
-        let _env_guard = callgraph_build_wait_ms(10_000);
         let (ctx, _project, _storage, _project_root, release, events) =
             gated_callgraph_cold_build(Duration::from_secs(600));
 
@@ -12406,7 +12506,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn inline_wait_settled_event_clears_superseded_receiver() {
-        let _env_guard = callgraph_build_wait_ms(2_000);
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         std::fs::write(project.path().join("lib.rs"), "pub fn marker() {}\n").expect("source file");
@@ -12420,6 +12519,7 @@ mod callgraph_store_for_ops_tests {
                 ..Config::default()
             },
         ));
+        let _wait_guard = callgraph_build_wait_ms(&ctx, 2_000);
         let (reached, release) = install_callgraph_build_start_gate(project_root);
         let request_ctx = Arc::clone(&ctx);
         let request = std::thread::spawn(move || request_ctx.callgraph_store_for_ops());
@@ -13355,10 +13455,8 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn writer_denied_callgraph_build_is_terminal_not_building() {
-        let _env_guard = callgraph_build_wait_ms(30_000);
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-
         let (_denied_ctx_dirs, denied_ctx) = cold_build_context();
+        let _denied_wait_guard = callgraph_build_wait_ms(&denied_ctx, 30_000);
         let denied_reason = match denied_ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason)) => reason,
             CallgraphStoreAccess::Building => {
@@ -13376,7 +13474,7 @@ mod callgraph_store_for_ops_tests {
                 if reason.contains("could not acquire writer capability")
         ));
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            denied_ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "polling a denied root must not spawn another doomed build"
         );
@@ -13384,6 +13482,7 @@ mod callgraph_store_for_ops_tests {
         // Control case: granting the artifact-access capability installed by
         // `configure_artifact_access` should change this cold build from denied to ready.
         let (_writable_ctx_dirs, writable_ctx) = cold_build_context();
+        let _writable_wait_guard = callgraph_build_wait_ms(&writable_ctx, 30_000);
         let writable_root = writable_ctx
             .config()
             .project_root
@@ -13402,9 +13501,6 @@ mod callgraph_store_for_ops_tests {
 
     #[test]
     fn concurrent_cold_callgraph_store_for_ops_spawns_one_build() {
-        let _env_guard = force_async_callgraph_builds();
-        CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");
@@ -13425,6 +13521,7 @@ mod callgraph_store_for_ops_tests {
             },
         ));
 
+        let _wait_guard = force_async_callgraph_builds(&ctx);
         let barrier = Arc::new(Barrier::new(3));
         let handles = (0..2)
             .map(|_| {
@@ -13449,7 +13546,7 @@ mod callgraph_store_for_ops_tests {
         }
 
         assert_eq!(
-            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            ctx.callgraph_cold_build_spawn_count_for_test(),
             1,
             "concurrent cold callers must share one background build"
         );
