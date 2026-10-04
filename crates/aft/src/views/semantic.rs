@@ -114,7 +114,9 @@ impl SemanticProducer {
         .full_key()
     }
 
-    /// The family key of `bytes` at `rel_path` under this producer.
+    /// The input-addressed family key of `bytes` at `rel_path` under this
+    /// producer. Model output can vary across invocations; the store keeps the
+    /// first valid payload for these inputs, never replaces it with new floats.
     pub fn key(&self, bytes: &[u8], rel_path: &RelPath) -> FamilyKey {
         FamilyKey::from(&self.full_key(bytes, rel_path))
     }

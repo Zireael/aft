@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/per_checkout_semantic_runtime.rs"
+  ],
+  "note": "The ranking-fenced semantic_search/mod.rs edits render lexical-winning semantic symbols and disclose checkout coverage gaps. Candidate enumeration, lane plans, scores, fusion and paging are unchanged. Legacy migration keeps a valid first-writer payload on input-key conflicts and leaves only unusable keys pending. No trailer wording is changed. The engine_unwired replay must keep every benchmark ranked row byte-identical."
+}

@@ -214,6 +214,165 @@ fn a_snapshot_of_another_model_is_rejected() {
     assert!(convert_semantic(&snapshot, &root, &other).is_err());
 }
 
+#[test]
+fn semantic_import_keeps_the_first_vector_payload_and_imports_other_keys() {
+    let (dir, root) = fixture();
+    let storage = dir.path().join("storage");
+    let producer = producer();
+    let snapshot = legacy_semantic(&root);
+    let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
+    assert!(bundle.entries.len() >= 2);
+    let registry = FamilyRegistry::open(&storage, "family").unwrap();
+    let registration = registry.register_view("scope", &root).unwrap();
+    let store = registration.open_store(FamilyPlane::Semantic).unwrap();
+    let first = &bundle.entries[0];
+    let relative = segment_store::rel_path_to_os(&first.rel_path).unwrap();
+    let source = fs::read(root.join(&relative)).unwrap();
+    let chunks = crate::semantic_index::chunk_view_file(&root, &relative, &source, producer.caps)
+        .unwrap()
+        .unwrap();
+    // The same input and producer can yield different float bytes on another
+    // backend invocation. It is still the same input-addressed family key.
+    let runs = crate::semantic_index::embed_view_files(
+        vec![chunks],
+        &mut |texts: Vec<String>| {
+            Ok(texts
+                .iter()
+                .map(|text| deterministic(text).into_iter().map(|v| v * 0.99).collect())
+                .collect())
+        },
+        64,
+    )
+    .unwrap();
+    let payload = runs[0].encode_view_payload(&crate::semantic_index::ViewPayloadProducer {
+        chunker_version: &producer.chunker_version,
+        template_version: &producer.template_version,
+        model_fingerprint: &producer.model_fingerprint,
+    });
+    assert_ne!(payload, first.payload);
+    let key = FamilyKey::new(FamilyPlane::Semantic, first.key);
+    store.put_or_touch(&key, &payload).unwrap();
+    let legacy = legacy_semantic_path(&storage, "legacy");
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, &snapshot).unwrap();
+    let report = run_import(
+        &ImportRequest {
+            storage: storage.clone(),
+            family: "family".into(),
+            legacy_key: "legacy".into(),
+            scope: "scope".into(),
+            root: root.clone(),
+            producers: Producers {
+                trigram: "unregistered".into(),
+                semantic: Some(producer.id()),
+                callgraph: "unregistered".into(),
+            },
+            trigram_policy: None,
+            semantic: Some(producer),
+        },
+        None,
+    )
+    .expect("a single vector conflict must not abort the import");
+    assert_eq!(report.outcome, ImportOutcome::Completed);
+    assert_eq!(report.semantic_files, bundle.entries.len());
+    assert_eq!(
+        store.get(&key).unwrap().unwrap(),
+        payload,
+        "the first payload is immutable"
+    );
+    for entry in &bundle.entries[1..] {
+        assert_eq!(
+            store
+                .get(&FamilyKey::new(FamilyPlane::Semantic, entry.key))
+                .unwrap()
+                .unwrap(),
+            entry.payload
+        );
+    }
+    assert!(
+        ImportLedger::open(&storage, "legacy")
+            .unwrap()
+            .status()
+            .unwrap()
+            .complete
+    );
+    assert_eq!(
+        fs::read(legacy).unwrap(),
+        snapshot,
+        "the legacy cache stays intact"
+    );
+}
+
+#[test]
+fn semantic_import_rejects_only_the_unusable_key() {
+    for quarantined in [false, true] {
+        let (dir, root) = fixture();
+        let storage = dir.path().join("storage");
+        let producer = producer();
+        let snapshot = legacy_semantic(&root);
+        let (bundle, _) = convert_semantic(&snapshot, &root, &producer).unwrap();
+        assert!(bundle.entries.len() >= 2);
+        let registry = FamilyRegistry::open(&storage, "family").unwrap();
+        let registration = registry.register_view("scope", &root).unwrap();
+        let store = registration.open_store(FamilyPlane::Semantic).unwrap();
+        let first = &bundle.entries[0];
+        let key = FamilyKey::new(FamilyPlane::Semantic, first.key);
+        if quarantined {
+            store.quarantine(&key).unwrap();
+        } else {
+            store
+                .put_or_touch(&key, b"invalid semantic payload")
+                .unwrap();
+        }
+        let legacy = legacy_semantic_path(&storage, "legacy");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, snapshot).unwrap();
+        let report = run_import(
+            &ImportRequest {
+                storage: storage.clone(),
+                family: "family".into(),
+                legacy_key: "legacy".into(),
+                scope: "scope".into(),
+                root: root.clone(),
+                producers: Producers {
+                    trigram: "unregistered".into(),
+                    semantic: Some(producer.id()),
+                    callgraph: "unregistered".into(),
+                },
+                trigram_policy: None,
+                semantic: Some(producer),
+            },
+            None,
+        )
+        .expect("one unusable semantic key must not abort the import");
+        assert_eq!(report.semantic_files, bundle.entries.len() - 1);
+        for entry in &bundle.entries[1..] {
+            assert_eq!(
+                store
+                    .get(&FamilyKey::new(FamilyPlane::Semantic, entry.key))
+                    .unwrap()
+                    .unwrap(),
+                entry.payload
+            );
+        }
+        let view = registration.view_store().unwrap();
+        let generation = view.current_generation().unwrap().unwrap();
+        let manifest = view.load_manifest_v2(&generation).unwrap();
+        let entry = manifest.get(&first.rel_path).unwrap();
+        assert!(matches!(
+            entry.plane_state(FamilyPlane::Semantic),
+            Some(PlaneState::Pending { .. })
+        ));
+        assert!(
+            ImportLedger::open(&storage, "legacy")
+                .unwrap()
+                .status()
+                .unwrap()
+                .complete
+        );
+    }
+}
+
 fn owner_of(pid: u32, start_time: u64, token: &str) -> ClaimOwner {
     ClaimOwner {
         pid,

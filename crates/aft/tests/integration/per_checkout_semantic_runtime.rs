@@ -345,6 +345,29 @@ fn search(ctx: &AppContext, query: &str) -> Value {
     .unwrap()
 }
 
+#[test]
+fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
+    let server = MockEmbedder::start();
+    let repo = repository();
+    write(&repo.main, "src/watchdog.rs",
+        "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n");
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&ctx);
+    let runtime = ctx.checkout_semantic_runtime().unwrap();
+    let query = "how does the bash watchdog kill a background task that exceeded its timeout";
+    let query_vector = vector(&format!("views-semantic-mock\u{0}{query}"));
+    let vectors = runtime.index().unwrap().len();
+    let raw = runtime.search(&query_vector, 100, &|_| true).unwrap();
+    let answer = search(&ctx, query);
+    eprintln!("watchdog reproduction: vectors={vectors}, raw_semantic_hits={}, pending={}, failed={}, complete={}\n{}", raw.results.len(), raw.pending.len(), raw.failed.len(), raw.complete(), answer["text"]);
+    assert!(vectors > 0 && !raw.results.is_empty());
+    assert_eq!(answer["complete"], true, "{answer:#}");
+    let text = answer["text"].as_str().unwrap();
+    assert!(text.contains("[function] lines"), "{text}");
+    assert!(text.contains("terminate_child();"), "{text}");
+}
+
 /// The ranked rows of a search answer, relative to `root`.
 fn ranked(root: &Path, answer: &Value) -> Vec<Value> {
     answer["results"]

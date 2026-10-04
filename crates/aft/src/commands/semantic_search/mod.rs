@@ -1238,7 +1238,9 @@ fn split_semantic_results(
     SplitSemantic {
         results,
         more_available,
-        status: if mass_refresh_pending.is_some() {
+        status: if let Some(gaps) = &checkout_gaps {
+            gaps.status()
+        } else if mass_refresh_pending.is_some() {
             "refreshing"
         } else {
             "ready"
@@ -1785,9 +1787,30 @@ impl SearchLaneStatus {
         let Some(data) = response.data.as_object_mut() else {
             return;
         };
+        // Runtime readiness means the resident index can be queried, not that
+        // this query covered the checkout. Do not contradict its named gaps
+        // with a later, generic `semantic: ready` footer.
+        let semantic_label = data.get("semantic_gap").map(|gap| {
+            gap.get("unavailable")
+                .and_then(serde_json::Value::as_str)
+                .map(|reason| format!("semantic: unavailable: {reason}"))
+                .unwrap_or_else(|| "semantic: partial (checkout coverage gaps)".to_string())
+        });
+        let labels = self.text(ctx);
+        let labels = labels
+            .lines()
+            .map(|line| {
+                if line.starts_with("semantic:") {
+                    semantic_label.as_deref().unwrap_or(line)
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if let Some(text) = data.get_mut("text") {
             if let Some(current) = text.as_str() {
-                *text = serde_json::json!(format!("{current}\n{}", self.text(ctx)));
+                *text = serde_json::json!(format!("{current}\n{labels}"));
             }
         }
         data.insert("lanes".to_string(), self.lanes_json());
@@ -3628,6 +3651,14 @@ struct CheckoutSemanticGaps {
 const CHECKOUT_SEMANTIC_GAP_NAMES: usize = 5;
 
 impl CheckoutSemanticGaps {
+    fn status(&self) -> &'static str {
+        if self.unavailable.is_some() {
+            "unavailable"
+        } else {
+            "refreshing"
+        }
+    }
+
     fn from(answer: &crate::views::semantic::SemanticQuery) -> Self {
         Self {
             pending: answer.pending.clone(),
@@ -3771,7 +3802,8 @@ const NEAREST_NAME_SOURCE: &str = "nearest_name";
 /// Results whose snippet the engine already chose (a matching line or a
 /// nearest name's line) rather than one read from the symbol range.
 fn snippet_set_by_engine(result: &HybridResult) -> bool {
-    result.source == "lexical" || result.source == NEAREST_NAME_SOURCE
+    (result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary))
+        || result.source == NEAREST_NAME_SOURCE
 }
 
 /// What a request carrying both `query` and `pattern` adds to an engine run.
@@ -5363,6 +5395,9 @@ fn handle_semantic_or_hybrid_search(
             }
         }
     };
+    let semantic_status = semantic_gaps
+        .as_ref()
+        .map_or(semantic_status, CheckoutSemanticGaps::status);
     if ctx.shared_artifacts_read_only() {
         semantic_results.retain(|result| result.file.is_file());
     }
@@ -7717,7 +7752,10 @@ fn format_result_sections_within_budget(
         if groups[file].iter().any(|(_, result)| result.exact) {
             header.push_str(" [exact]");
         }
-        if matching_line.is_some_and(|(_, result)| result.source == "lexical") {
+        if groups[file]
+            .iter()
+            .any(|(_, result)| result.source == "lexical")
+        {
             header.push_str(" [lexical match]");
         }
         if !out.push(&header) {
@@ -7739,11 +7777,8 @@ fn format_result_sections_within_budget(
             if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
                 continue;
             }
-            if result.source == "lexical" {
+            if result.source == "lexical" && matches!(result.kind, SymbolKind::FileSummary) {
                 // A lexical result without a readable source line keeps the file-level marker.
-                if !out.push(" [lexical match]") {
-                    break 'groups;
-                }
                 shown += 1;
                 continue;
             }
@@ -11083,6 +11118,94 @@ mod tests {
 
         assert!(text.contains("src/transform-mode.ts:8 [lexical match]"));
         assert!(text.contains("export function resolveTransformMode() {"));
+    }
+
+    #[test]
+    fn lexical_winner_with_semantic_symbol_keeps_its_location_and_preview() {
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("watchdog.rs");
+        std::fs::write(
+            &file,
+            "// background task watchdog\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n",
+        )
+        .unwrap();
+        // Fusion can choose the lexical lane for a file for which the semantic
+        // lane supplied a real symbol. That symbol must not become a bare path.
+        let mut results = vec![HybridResult {
+            file,
+            name: "kill_expired_task".into(),
+            kind: SymbolKind::Function,
+            start_line: 2,
+            end_line: 4,
+            exported: true,
+            score: 0.1,
+            source: "lexical",
+            semantic_score: Some(0.01),
+            lexical_score: Some(0.8),
+            hybrid_boosted: true,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.1,
+            snippet: String::new(),
+        }];
+        enrich_snippets_from_source(&mut results, project.path());
+        let text = format_semantic_text(&results, project.path(), false, false, None);
+        assert!(
+            text.contains("kill_expired_task [function] lines 3-5"),
+            "{text}"
+        );
+        assert!(text.contains("terminate_child();"), "{text}");
+        assert!(text.contains("[lexical match]"), "{text}");
+    }
+
+    #[test]
+    fn unfilled_checkout_semantic_view_names_the_gap_without_a_ready_footer() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn kill_expired_task() {}\n").unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                storage.path(),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current("gap-model", Default::default()),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        assert_eq!(runtime.index().unwrap().len(), 0);
+        assert!(slot.install(epoch, runtime));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let query = "how does the watchdog stop a background task";
+        for pattern in [None, Some("kill_expired_task")] {
+            let mut req = semantic_request(query, 8);
+            if let Some(pattern) = pattern {
+                req.params["pattern"] = serde_json::json!(pattern);
+            }
+            let response = with_precomputed_query_vector(query, vec![1.0, 0.0], || {
+                response_value(handle_semantic_search(&req, &ctx))
+            });
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["complete"], false, "{response}");
+            assert_eq!(
+                response["semantic_gap"]["pending"],
+                serde_json::json!(["lib.rs"])
+            );
+            let text = response["text"].as_str().unwrap();
+            assert!(text.contains("not yet embedded: lib.rs"), "{text}");
+            assert!(
+                !text.lines().any(|line| line == "semantic: ready"),
+                "{text}"
+            );
+        }
     }
 
     fn long_line_result(index: usize, snippet: String) -> HybridResult {
