@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["db-schema-hints-route-reclaim-worktree-callgraph-wording"],
+  "note": "bash sqlite schema-hint trailer, deleted-root route Goodbyes and typed reclaim refusals, worktree callgraph refusal wording; no ranking-fence file."
+}
