@@ -12,6 +12,12 @@ assert.match(packageInfo.version, /^18\.6\./, "The headless check requires an OM
 const host = await import(entry);
 const root = process.env.HOME!;
 const cwd = join(root, "project");
+const configDir = join(process.env.XDG_CONFIG_HOME!, "cortexkit");
+mkdirSync(configDir, { recursive: true });
+writeFileSync(
+  join(configDir, "aft.jsonc"),
+  JSON.stringify({ lsp: { auto_install: false }, indexes: { semantic: false } }),
+);
 const skillDir = join(root, "skills", "aft-handback");
 mkdirSync(cwd, { recursive: true });
 mkdirSync(skillDir, { recursive: true });
@@ -30,6 +36,8 @@ const modelRegistry = new host.ModelRegistry(authStorage, join(root, "models.yml
   settings,
   fetch: () => Promise.reject(new Error("Network is disabled in the internal URL headless check")),
 });
+const startupStarted = performance.now();
+console.error("[omp-internal-urls] SDK session/extension startup begins");
 const { session, extensionsResult } = await host.createAgentSession({
   cwd,
   agentDir: join(root, "agent"),
@@ -37,7 +45,10 @@ const { session, extensionsResult } = await host.createAgentSession({
   authStorage,
   modelRegistry,
   model: modelRegistry.getAll()[0],
-  additionalExtensionPaths: [resolve(import.meta.dir, "omp-internal-urls-extension.ts")],
+  additionalExtensionPaths: [
+    process.env.AFT_OMP_EXTENSION_ENTRY ??
+      resolve(import.meta.dir, "omp-internal-urls-extension.ts"),
+  ],
   disableExtensionDiscovery: true,
   enableMCP: false,
   enableLsp: false,
@@ -57,6 +68,9 @@ const { session, extensionsResult } = await host.createAgentSession({
   toolNames: ["read", "write", "edit", "grep", "bash"],
   autoApprove: true,
 });
+console.error(
+  `[omp-internal-urls] session created; AFT extension finished loading (${Math.round(performance.now() - startupStarted)} ms)`,
+);
 
 function text(result: any): string {
   return result.content
@@ -72,6 +86,35 @@ try {
   ]);
   const bash = aftTools.find((tool: any) => (tool.definition ?? tool).name === "bash");
   assert(bash, "AFT bash override was not installed");
+  const schemaTools = new Map(
+    aftTools.map((tool: any) => {
+      const definition = tool.definition ?? tool;
+      return [definition.name, definition];
+    }),
+  );
+  const validator = await import(Bun.resolveSync("@oh-my-pi/pi-ai/utils/schema", dirname(entry)));
+  for (const [name, params] of [
+    ["read", { path: "agent://Main", offset: 0 }],
+    ["write", { path: "proc://x/kill" }],
+    ["edit", { path: "local://x", edits: [{ op: "update", diff: "patch" }] }],
+    ["grep", { path: "local://x", pattern: "x", case: false, skip: null }],
+    ["bash", { command: "pwd", cwd: "skill://aft-handback", timeout: 0.5 }],
+  ] as const) {
+    const parameters = (schemaTools.get(name) as any).parameters;
+    const schema =
+      typeof parameters.toJsonSchema === "function" ? parameters.toJsonSchema() : parameters;
+    assert(schema.properties.path || name === "bash", `${name} schema lost its path property`);
+    assert(
+      validator.validateJsonSchemaValue(schema, params).success,
+      `${name} native input was rejected by OMP schema validation`,
+    );
+    if (name !== "edit") {
+      assert(
+        !validator.validateJsonSchemaValue(schema, {}).success,
+        `${name} schema lost its required arguments`,
+      );
+    }
+  }
   const call = async (name: string, params: Record<string, unknown>) => {
     const tool = session.getToolByName(name);
     assert(tool, `${name} is not active`);
@@ -112,6 +155,27 @@ try {
     Bun.resolveSync("@oh-my-pi/pi-coding-agent/internal-urls", dirname(entry))
   );
   assert.equal(routerModule.InternalUrlRouter.instance().canHandle("mcp://x"), true);
+  const filesystemDiagnostics: Record<string, string> = {};
+  for (const [name, params, expected] of [
+    ["write", { path: "plain.txt" }, /content.*required/],
+    [
+      "edit",
+      { path: "plain.txt", old_string: "old", new_string: "new" },
+      /old_string.*oldString\/newString/,
+    ],
+    ["grep", { path: ".", pattern: "x", case: false }, /case.*offset/],
+    ["bash", { command: "pwd", cwd: "." }, /cwd.*workdir/],
+  ] as const) {
+    await assert.rejects(
+      () => call(name, params),
+      (error: unknown) => {
+        assert(error instanceof Error);
+        assert.match(error.message, expected);
+        filesystemDiagnostics[name] = error.message;
+        return true;
+      },
+    );
+  }
   console.log(
     JSON.stringify({
       version: `OMP ${packageInfo.version}`,
@@ -121,6 +185,7 @@ try {
       killed,
       skillPrompt: true,
       registeredMcp: true,
+      filesystemDiagnostics,
     }),
   );
 } finally {

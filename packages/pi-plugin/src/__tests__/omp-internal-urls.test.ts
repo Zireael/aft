@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { Value } from "typebox/value";
+import * as logger from "../logger.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "../tool-registration.js";
 import { makeContext, mockTheme, renderToString } from "./render-test-helpers.js";
 import {
@@ -68,11 +69,17 @@ describe("OMP internal URL hand-back", () => {
   test("routing predicate delegates read without preparing or copying parameters", async () => {
     const s = setup();
     const params = { path: "agent://worker", offset: 0, opaque: "keep" };
+    expect(Value.Check(s.tools.get("read")!.parameters as TSchema, params)).toBe(true);
     const prepare = (
       s.tools.get("read")! as unknown as { prepareArguments: (args: unknown) => unknown }
     ).prepareArguments;
     expect(prepare(params)).toBe(params);
-    expect(await executeTool(s.tools.get("read")!, params, s.extCtx)).toBe(s.nativeResult);
+    const result = await executeTool(s.tools.get("read")!, params, s.extCtx);
+    expect(result).toEqual({
+      ...s.nativeResult,
+      details: { ...s.nativeResult.details, delegatedTo: "omp", delegatedTarget: params.path },
+    });
+    expect(s.nativeResult.details).not.toHaveProperty("delegatedTo");
     expect(s.invocations[0]).toBe(params);
     expect(s.calls).toHaveLength(0);
   });
@@ -143,6 +150,9 @@ describe("OMP internal URL hand-back", () => {
       "cat mcp://x",
       "cmd > mcp://x",
       "cat\tlocal://x;pwd",
+      "tool --opt=skill://x",
+      'tool --opt="skill://x"',
+      "echo $(cat skill://x)",
     ]) {
       const params = { command };
       await executeTool(s.tools.get("bash")!, params, s.extCtx);
@@ -168,6 +178,26 @@ describe("OMP internal URL hand-back", () => {
       await executeTool(s.tools.get(name)!, params, s.extCtx);
     expect(s.invocations).toHaveLength(0);
     expect(s.calls).toHaveLength(7);
+  });
+
+  test("OMP router import failures warn once while upstream Pi stays silent", async () => {
+    // A fresh module isolates the warn-once state from other host-init tests.
+    const { loadOmpInternalUrlRouter } = await import("../omp-internal-urls.js?warning-test");
+    const messages: string[] = [];
+    const warning = spyOn(logger, "warn").mockImplementation((message) => {
+      messages.push(message);
+    });
+    try {
+      await loadOmpInternalUrlRouter({ registerTool: () => {} });
+      expect(messages).toEqual([]);
+      await loadOmpInternalUrlRouter({ arktype: {} });
+      await loadOmpInternalUrlRouter({ arktype: {} });
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toContain("OMP internal URL delegation is unavailable");
+      expect(messages[0]).toContain("internal-urls");
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   test("GitHub reads delegate but read-only OMP GitHub writes stay on AFT", async () => {
@@ -243,6 +273,164 @@ describe("OMP internal URL hand-back", () => {
     expect(s.calls).toHaveLength(0);
   });
 
+  test("write filesystem errors name missing content and the AFT form", async () => {
+    const s = setup();
+    await expect(executeTool(s.tools.get("write")!, { path: "x" }, s.extCtx)).rejects.toThrow(
+      /content.*required.*proc:\/\//,
+    );
+    expect(s.calls).toHaveLength(0);
+  });
+
+  test("read filesystem errors name paging arguments and the AFT form", async () => {
+    const s = setup();
+    await expect(
+      executeTool(s.tools.get("read")!, { path: "x", offset: 0 }, s.extCtx),
+    ).rejects.toThrow(/offset.*positive integers/);
+    expect(s.calls).toHaveLength(0);
+  });
+
+  test("edit filesystem errors name native arguments and the AFT form", async () => {
+    const s = setup();
+    for (const [params, field] of [
+      [{ path: "x", old_string: "old", new_string: "new" }, "old_string"],
+      [{ path: "x", input: "native input" }, "input"],
+      [{ path: "x", edits: [{ op: "update", diff: "patch", rename: "y" }] }, "edits[0].op"],
+    ] as const) {
+      let error: unknown;
+      try {
+        await executeTool(s.tools.get("edit")!, params, s.extCtx);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(field);
+      expect((error as Error).message).toContain("oldString/newString");
+      expect((error as Error).message).toContain("only for OMP internal URLs");
+      const prepare = (
+        s.tools.get("edit")! as unknown as { prepareArguments: (args: unknown) => unknown }
+      ).prepareArguments;
+      expect(() => prepare(params)).toThrow("only for OMP internal URLs");
+    }
+    const hashline = setup("omp", true, true);
+    await expect(
+      executeTool(
+        hashline.tools.get("edit")!,
+        { path: "x", old_string: "old", new_string: "new" },
+        hashline.extCtx,
+      ),
+    ).rejects.toThrow(/old_string.*patch string/);
+    expect(hashline.calls).toHaveLength(0);
+    expect(s.calls).toHaveLength(0);
+  });
+
+  test("grep filesystem errors name native arguments and the AFT form", async () => {
+    const s = setup();
+    await expect(
+      executeTool(
+        s.tools.get("grep")!,
+        { path: "src", pattern: "x", case: false, gitignore: false, skip: null },
+        s.extCtx,
+      ),
+    ).rejects.toThrow(/case.*gitignore.*skip.*offset/);
+    await expect(
+      executeTool(s.tools.get("grep")!, { path: ["src"], pattern: "x" }, s.extCtx),
+    ).rejects.toThrow(/path.*string path/);
+    expect(s.calls).toHaveLength(0);
+  });
+
+  test("bash filesystem errors name native arguments and the AFT form", async () => {
+    const s = setup();
+    await expect(
+      executeTool(
+        s.tools.get("bash")!,
+        { command: "pwd", cwd: "src", async: true, name: "service", ready: { port: 3000 } },
+        s.extCtx,
+      ),
+    ).rejects.toThrow(/cwd.*async.*name.*ready.*workdir/);
+    await expect(
+      executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "0.5" }, s.extCtx),
+    ).rejects.toThrow(/timeout.*integer milliseconds/);
+    await executeTool(s.tools.get("bash")!, { command: "pwd", timeout: "500" }, s.extCtx);
+    expect(s.calls).toHaveLength(1);
+  });
+
+  test("URL arguments without invokeTool render as normal AFT output", async () => {
+    const s = setup();
+    const params = { path: "agent://worker" };
+    const tool = s.tools.get("read")!;
+    const result = await executeTool(tool, params, makeExtContext());
+    const rendered = renderToString(
+      tool.renderResult!(
+        result,
+        { expanded: true },
+        mockTheme,
+        makeContext(params),
+      ) as import("@earendil-works/pi-tui").Component,
+    );
+    expect(rendered).toBe("AFT");
+    expect(s.invocations).toHaveLength(0);
+  });
+
+  test("delegated result attribution survives serialization without mutating native details", async () => {
+    const s = setup();
+    const tool = s.tools.get("read")!;
+    const result = (await executeTool(tool, { path: "agent://worker" }, s.extCtx)) as {
+      details: Record<string, unknown>;
+    };
+    expect(result.details.delegatedTo).toBe("omp");
+    expect(s.nativeResult.details).not.toHaveProperty("delegatedTo");
+    expect(result.details).not.toBe(s.nativeResult.details);
+    const serialized = JSON.parse(JSON.stringify(result));
+    const rendered = renderToString(
+      tool.renderResult!(
+        serialized,
+        { expanded: true },
+        mockTheme,
+        makeContext({}),
+      ) as import("@earendil-works/pi-tui").Component,
+    );
+    expect(rendered).toContain("OMP completed");
+    expect(rendered).toContain("native status");
+  });
+
+  test("delegated progress copies carry renderer attribution without changing host updates", async () => {
+    const s = setup();
+    const tool = s.tools.get("read")!;
+    const progress = {
+      content: [{ type: "text", text: "native progress" }],
+      details: { status: "running" },
+    };
+    let update: any;
+    const context = Object.assign(makeExtContext(), {
+      invokeTool: async (_params: unknown, options: { onUpdate?: (result: unknown) => void }) => {
+        options.onUpdate?.(progress);
+        return s.nativeResult;
+      },
+    });
+    await tool.execute(
+      "id",
+      { path: "agent://worker" },
+      undefined,
+      (value) => {
+        update = value;
+      },
+      context,
+    );
+    expect(update.details.delegatedTo).toBe("omp");
+    expect(progress.details).not.toHaveProperty("delegatedTo");
+    const rendered = renderToString(
+      tool.renderResult!(
+        JSON.parse(JSON.stringify(update)),
+        { isPartial: true, expanded: true },
+        mockTheme,
+        makeContext({}),
+      ) as import("@earendil-works/pi-tui").Component,
+    );
+    expect(rendered).toContain("agent://worker");
+    expect(rendered).toContain("OMP running");
+    expect(rendered).toContain("native progress");
+  });
+
   test("plain Pi and hosts missing invokeTool or router retain AFT behavior", async () => {
     for (const mode of ["pi", "no-invoke", "no-router"]) {
       const s = setup(mode === "pi" ? "pi" : "omp", mode !== "no-router");
@@ -298,8 +486,15 @@ describe("OMP internal URL hand-back", () => {
       expect(rendered).toContain(name === "bash" ? "skill://sample" : "proc://x/kill");
       expect(rendered).toContain("OMP");
       expect(rendered).toContain("native status");
+      const nativeError = { content: [], details: null, isError: true };
+      const errorResult = await executeTool(
+        tool,
+        params,
+        Object.assign(makeExtContext(), { invokeTool: async () => nativeError }),
+      );
+      expect(nativeError.details).toBeNull();
       const error = tool.renderResult!(
-        { content: [], details: null, isError: true },
+        errorResult,
         {},
         mockTheme,
         makeContext(params, { isError: true }),

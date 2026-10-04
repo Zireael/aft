@@ -103,7 +103,7 @@ describe.serial.skipIf(process.platform === "win32")(
       } as Parameters<PiPlugin>[0];
     }
 
-    test("a cached binary with a matching identity sidecar is used without running it", async () => {
+    test("a warm-cache factory registers tools without executing the cached binary", async () => {
       writeBinaryIdentitySidecar(cachedAft, PLUGIN_VERSION, "0".repeat(64));
       const tools: string[] = [];
       const pi = makePi();
@@ -113,7 +113,7 @@ describe.serial.skipIf(process.platform === "win32")(
 
       await (await loadPlugin())(pi);
 
-      // Tools registered means init resolved a binary and finished.
+      // Tool registration must not require resolving or executing the binary.
       expect(tools.length).toBeGreaterThan(0);
       // Pi's eager warmup may legitimately spawn the bridge process (the
       // stub logs that as an exec with no arguments): whether it is skipped
@@ -154,14 +154,58 @@ describe.serial.skipIf(process.platform === "win32")(
         throw new Error("stop after the transport choice");
       });
 
-      await expect((await loadPlugin())(makePi())).rejects.toThrow(
-        "stop after the transport choice",
-      );
+      const pi = makePi();
+      let read: any;
+      pi.registerTool = (tool) => {
+        if (tool.name === "read") read = tool;
+      };
+      await (await loadPlugin())(pi);
+      expect(poolBinaryPath).toBeUndefined();
+      expect(read).toBeDefined();
+      await expect(
+        read.execute("call", { path: "file.txt" }, undefined, undefined, {
+          cwd: process.cwd(),
+          hasUI: false,
+        }),
+      ).rejects.toThrow("stop after the transport choice");
 
       expect(poolSubcFile).toBe(join(tempDir, "subc-connection.json"));
       expect(poolBinaryPath).toBeNull();
       expect(resolverCalls).toEqual([]);
       expect(existsSync(execLog)).toBe(false);
+    });
+
+    test("a cold-cache factory registers tools without binary resolution, downloads or migration", async () => {
+      rmSync(join(tempDir, "cache", "aft", "bin"), { recursive: true, force: true });
+      const started: string[] = [];
+      spyOn(bridge, "findBinarySync").mockImplementation(() => {
+        started.push("findBinarySync");
+        return null;
+      });
+      spyOn(bridge, "findBinary").mockImplementation(async () => {
+        started.push("findBinary");
+        throw new Error("network disabled");
+      });
+      spyOn(bridge, "ensureBinary").mockImplementation(async () => {
+        started.push("ensureBinary");
+        throw new Error("network disabled");
+      });
+      spyOn(bridge, "ensureStorageMigrated").mockImplementation(async () => {
+        started.push("migration");
+      });
+      spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
+        started.push("pool");
+        throw new Error("transport must remain lazy");
+      });
+      const tools: string[] = [];
+      const pi = makePi();
+      pi.registerTool = (tool) => {
+        tools.push(tool.name);
+      };
+      await (await loadPlugin())(pi);
+      expect(tools).toContain("read");
+      expect(tools).toContain("write");
+      expect(started).toEqual([]);
     });
   },
 );

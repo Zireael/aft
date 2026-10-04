@@ -107,6 +107,51 @@ describe("RevivableTransportPool", () => {
     expect(revivedClient.closed).toBe(1);
   });
 
+  test("a deferred pool initializes once on demand and preserves pre-start configuration", async () => {
+    let created = 0;
+    const client = new FakeClient();
+    const overrides: Array<[string, unknown]> = [];
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      const pool = makeSubcPool(client);
+      pool.setConfigureOverride = (key, value) => {
+        overrides.push([key, value]);
+      };
+      return pool;
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+    owner.setConfigureOverride("edit_slot_survives", true);
+    await owner.reconfigure(TEST_PROJECT_ROOT, { lsp_paths_extra: ["/cache"] });
+    await owner.closeSession(TEST_PROJECT_ROOT, "unused");
+    expect(owner.activeBridges()).toEqual([]);
+    expect(owner.getActiveBridgeForRoot(TEST_PROJECT_ROOT)).toBeNull();
+    expect(owner.isShutdown()).toBe(false);
+    expect(created).toBe(0);
+    const results = await Promise.all([
+      transport.toolCall("one", "read", {}),
+      transport.toolCall("two", "read", {}),
+    ]);
+    expect(results.map((result) => result.text)).toEqual(["revived", "revived"]);
+    expect(created).toBe(1);
+    expect(overrides).toEqual([
+      ["edit_slot_survives", true],
+      ["lsp_paths_extra", ["/cache"]],
+    ]);
+    await owner.shutdown();
+    expect(client.closed).toBe(1);
+  });
+
+  test("shutting down an unused deferred pool does not initialize it", async () => {
+    let created = 0;
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      return makeSubcPool(new FakeClient());
+    });
+    await owner.shutdown("validation finished");
+    expect(created).toBe(0);
+    expect(owner.isShutdown()).toBe(true);
+  });
+
   test("reconfigure during or after shutdown records overrides without reviving the pool", async () => {
     let created = 0;
     const revivedOverrides: Array<[string, unknown]> = [];

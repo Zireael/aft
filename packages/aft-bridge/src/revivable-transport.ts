@@ -22,12 +22,12 @@ const REVIVAL_RETRY_FLOOR_MS = 100;
 const REVIVAL_RETRY_CAP_MS = 2_000;
 
 /**
- * Owns one terminal transport instance and replaces it when new demand arrives
+ * Owns one transport instance (or defers its creation) and replaces it when new demand arrives
  * after the host has shut it down. The replaced instance is never reused: its
  * routes, sessions, and sockets remain owned by the dead instance.
  */
 export class RevivableTransportPool implements AftTransportPool {
-  private activePool: AftTransportPool;
+  private activePool: AftTransportPool | null;
   private revival: Promise<AftTransportPool> | null = null;
   private revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
   private revivalRetryNotBefore = 0;
@@ -37,7 +37,9 @@ export class RevivableTransportPool implements AftTransportPool {
   private editSlotSurvivesCaptured = false;
 
   constructor(
-    initialPool: AftTransportPool,
+    // A null initial pool defers construction until the first request. Hosts
+    // can register tools without resolving/downloading a standalone binary.
+    initialPool: AftTransportPool | null,
     private readonly createPool: PoolFactory,
     private readonly onBinaryReplaced?: (path: string) => void,
   ) {
@@ -57,7 +59,7 @@ export class RevivableTransportPool implements AftTransportPool {
   /** Delegate to the active pool: session-scoped signal fan-out reaches the
    * same live transports the underlying pool would report. */
   activeBridges(): AftProjectTransport[] {
-    return this.activePool.activeBridges();
+    return this.activePool?.activeBridges() ?? [];
   }
 
   getActiveBridgeForRoot(projectRoot: string): RevivableProjectTransport | null {
@@ -87,7 +89,7 @@ export class RevivableTransportPool implements AftTransportPool {
       if (this.editSlotSurvivesCaptured) {
         throw new Error("edit_slot_survives is write-once and was already captured");
       }
-      this.activePool.setConfigureOverride(key, value);
+      this.activePool?.setConfigureOverride(key, value);
       this.editSlotSurvivesCaptured = true;
       this.configureOverrides.set(key, value);
       return;
@@ -95,11 +97,11 @@ export class RevivableTransportPool implements AftTransportPool {
 
     if (value === undefined) this.configureOverrides.delete(key);
     else this.configureOverrides.set(key, value);
-    this.activePool.setConfigureOverride(key, value);
+    this.activePool?.setConfigureOverride(key, value);
   }
 
   async reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
-    if (this.activePool.isShutdown() && !this.revival) {
+    if ((!this.activePool || this.activePool.isShutdown()) && !this.revival) {
       // Reconfigure only updates live bridges, and a shut-down pool has none.
       // Reviving here would leave a live pool behind after the host's shutdown
       // hook finished: background work that settles during shutdown (an LSP
@@ -126,13 +128,13 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   async replaceBinary(path: string): Promise<string> {
-    const replaced = await this.activePool.replaceBinary(path);
+    const replaced = this.activePool ? await this.activePool.replaceBinary(path) : path;
     this.onBinaryReplaced?.(replaced);
     return replaced;
   }
 
   closeSession(projectRoot: string, session: string): Promise<void> {
-    return this.activePool.closeSession(projectRoot, session);
+    return this.activePool?.closeSession(projectRoot, session) ?? Promise.resolve();
   }
 
   async shutdown(reason = "unknown"): Promise<void> {
@@ -141,18 +143,18 @@ export class RevivableTransportPool implements AftTransportPool {
       await Promise.allSettled([revival]);
     }
     this.shutdownReason = reason;
-    await this.activePool.shutdown(reason);
+    await this.activePool?.shutdown(reason);
     for (const transport of this.transports.values()) {
       transport.refreshStatusSubscription(null);
     }
   }
 
   isShutdown(): boolean {
-    return this.activePool.isShutdown();
+    return this.activePool?.isShutdown() ?? this.shutdownReason !== null;
   }
 
   async ensureActivePool(): Promise<AftTransportPool> {
-    if (!this.activePool.isShutdown()) return this.activePool;
+    if (this.activePool && !this.activePool.isShutdown()) return this.activePool;
     if (this.revival) return this.revival;
 
     const delay = Math.max(0, this.revivalRetryNotBefore - Date.now());
@@ -170,9 +172,11 @@ export class RevivableTransportPool implements AftTransportPool {
       return scheduled;
     }
 
-    warn(
-      `transport was shut down (reason: ${this.shutdownReason ?? "unknown"}) but new demand arrived — reviving`,
-    );
+    if (this.activePool || this.shutdownReason !== null) {
+      warn(
+        `transport was shut down (reason: ${this.shutdownReason ?? "unknown"}) but new demand arrived — reviving`,
+      );
+    }
     const revival = Promise.resolve()
       .then(() => this.createPool())
       .then((pool) => {
@@ -214,7 +218,7 @@ export class RevivableTransportPool implements AftTransportPool {
     const concretePool = this.activePool as AftTransportPool & {
       getActiveBridgeForRootGeneration?: (value: BgNudgeRef) => AftProjectTransport | null;
     };
-    if (!concretePool.getActiveBridgeForRootGeneration?.(ref)) return null;
+    if (!concretePool?.getActiveBridgeForRootGeneration?.(ref)) return null;
     return this.transports.get(ref.canonicalRoot) ?? null;
   }
 
@@ -222,25 +226,25 @@ export class RevivableTransportPool implements AftTransportPool {
     const pool = this.activePool as AftTransportPool & {
       recordBgNudgeRejection?: (value: BgNudgeRef) => void;
     };
-    pool.recordBgNudgeRejection?.(ref);
+    pool?.recordBgNudgeRejection?.(ref);
   }
 
   getCurrentRootGeneration(root: string): BgNudgeRef["generation"] | undefined {
     const pool = this.activePool as AftTransportPool & {
       getCurrentRootGeneration?: (value: string) => BgNudgeRef["generation"] | undefined;
     };
-    return pool.getCurrentRootGeneration?.(root);
+    return pool?.getCurrentRootGeneration?.(root);
   }
 
   getConcretePoolId(): BgNudgeRef["concretePoolId"] | undefined {
     const pool = this.activePool as AftTransportPool & {
       getConcretePoolId?: () => BgNudgeRef["concretePoolId"] | undefined;
     };
-    return pool.getConcretePoolId?.();
+    return pool?.getConcretePoolId?.();
   }
 
   currentBridge(projectRoot: string): AftProjectTransport | null {
-    return this.activePool.getActiveBridgeForRoot(projectRoot);
+    return this.activePool?.getActiveBridgeForRoot(projectRoot) ?? null;
   }
 
   async send(
