@@ -53,6 +53,8 @@ import {
 } from "./_shared.js";
 import { formatDiffForPi } from "./diff-format.js";
 import {
+  asRecord,
+  asString,
   collapsibleResult,
   normalizeTerminalText,
   type RenderResultOptionsLike,
@@ -499,12 +501,12 @@ interface FileMutationDetails {
   noOp?: boolean;
 }
 
-function readPathArg(args: { path?: unknown }): string | undefined {
-  return typeof args.path === "string" ? args.path : undefined;
+function readPathArg(args: unknown): string | undefined {
+  return asString(asRecord(args)?.path);
 }
 
-function mutationFilePathArg(args: { path?: unknown }): string | undefined {
-  return typeof args.path === "string" ? args.path : undefined;
+function mutationFilePathArg(args: unknown): string | undefined {
+  return asString(asRecord(args)?.path);
 }
 
 function hasOwn(record: Record<string, unknown>, key: string): boolean {
@@ -561,17 +563,11 @@ function validateBatchEdits(edits: unknown): void {
   });
 }
 
-function renderReadCall(
-  args: { path?: unknown; filePath?: unknown } | undefined,
-  theme: Theme,
-  context: RenderContextLike,
-): Text {
+function renderReadCall(args: unknown, theme: Theme, context: RenderContextLike): Text {
   const text = reuseText(context.lastComponent);
-  const filePath = args ? readPathArg(args) : undefined;
-  const pathDisplay = filePath
-    ? theme.fg("accent", shortenPath(filePath))
-    : theme.fg("toolOutput", "...");
-  text.setText(`${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}`);
+  const filePath = readPathArg(args);
+  const pathDisplay = filePath ? ` ${theme.fg("accent", shortenPath(filePath))}` : "";
+  text.setText(`${theme.fg("toolTitle", theme.bold("read"))}${pathDisplay}`);
   return text;
 }
 
@@ -1124,10 +1120,8 @@ export function renderMutationCall(
   context: RenderContextLike,
 ): Text {
   const text = reuseText(context.lastComponent);
-  const pathDisplay = filePath
-    ? theme.fg("accent", shortenPath(filePath))
-    : theme.fg("toolOutput", "...");
-  text.setText(`${theme.fg("toolTitle", theme.bold(toolName))} ${pathDisplay}`);
+  const pathDisplay = filePath ? ` ${theme.fg("accent", shortenPath(filePath))}` : "";
+  text.setText(`${theme.fg("toolTitle", theme.bold(toolName))}${pathDisplay}`);
   return text;
 }
 

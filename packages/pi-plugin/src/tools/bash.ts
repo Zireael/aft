@@ -58,7 +58,7 @@ import {
   resolveSessionId,
   textResult,
 } from "./_shared.js";
-import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
+import { asString, collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
@@ -936,7 +936,7 @@ export function registerBashTool(
       );
     },
     renderCall(args, theme, context) {
-      return renderBashCall(args?.command, args?.description, theme, context);
+      return renderBashCall(asString(args?.command), asString(args?.description), theme, context);
     },
     renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
       return renderBashResult(result, theme, context, options);
@@ -1816,8 +1816,9 @@ function renderBashCall(
   context: RenderContextLike,
 ): Text {
   const text = reuseText(context.lastComponent);
-  const display = description ?? (command ? shortenCommand(command) : "...");
-  text.setText(`${theme.fg("toolTitle", theme.bold("bash"))} ${theme.fg("accent", display)}`);
+  const display = description ?? (command ? shortenCommand(command) : undefined);
+  const suffix = display ? ` ${theme.fg("accent", display)}` : "";
+  text.setText(`${theme.fg("toolTitle", theme.bold("bash"))}${suffix}`);
   return text;
 }
 

@@ -22,6 +22,7 @@ import {
 import {
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -161,11 +162,11 @@ const SearchParams = Type.Object(
 );
 
 /** Exported for renderer unit tests. */
-export function buildSemanticSections(
-  args: Static<typeof SearchParams>,
-  payload: unknown,
-  theme: Theme,
-): string[] {
+export function buildSemanticSections(args: unknown, payload: unknown, theme: Theme): string[] {
+  const safeArgs = asRecordOrEmpty(args);
+  const query = asString(safeArgs.query);
+  const pattern = asString(safeArgs.pattern);
+  const topK = asNumber(safeArgs.topK) ?? 10;
   const response = asRecord(payload);
   if (!response) return [theme.fg("muted", "No search result.")];
 
@@ -182,7 +183,7 @@ export function buildSemanticSections(
     : responseText;
   const sections = [
     ...(hasGenerationDisclosure ? [theme.fg("warning", GENERATION_CHANGED_DISCLOSURE)] : []),
-    `${theme.fg(semanticStatus === "ready" ? "success" : "warning", `semantic: ${semanticStatus}`)} ${theme.fg("muted", `mode=${interpretedAs}${queryKind ? ` kind=${queryKind}` : ""}${args.query !== undefined ? ` query=${JSON.stringify(args.query)}` : ""}${args.pattern !== undefined ? ` pattern=${JSON.stringify(args.pattern)}` : ""} topK=${args.topK ?? 10}`)}`,
+    `${theme.fg(semanticStatus === "ready" ? "success" : "warning", `semantic: ${semanticStatus}`)} ${theme.fg("muted", `mode=${interpretedAs}${queryKind ? ` kind=${queryKind}` : ""}${query !== undefined ? ` query=${JSON.stringify(query)}` : ""}${pattern !== undefined ? ` pattern=${JSON.stringify(pattern)}` : ""} topK=${topK}`)}`,
   ];
 
   const warnings = Array.isArray(response.warnings)
@@ -279,14 +280,13 @@ export function buildSemanticSections(
 }
 
 /** Exported for renderer unit tests. */
-export function renderSemanticCall(
-  args: Static<typeof SearchParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
+export function renderSemanticCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const query = asString(safeArgs.query);
+  const pattern = asString(safeArgs.pattern);
   return renderToolCall(
     "search",
-    theme.fg("toolOutput", args.query ?? (args.pattern ? `pattern ${args.pattern}` : "")),
+    theme.fg("toolOutput", query ?? (pattern ? `pattern ${pattern}` : "")),
     theme,
     context,
   );

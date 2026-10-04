@@ -17,6 +17,7 @@ import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js"
 import {
   asNumber,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -448,18 +449,18 @@ export function buildInspectSections(payload: unknown, theme: Theme): string[] {
 }
 
 /** Exported for renderer unit tests. */
-export function renderInspectCall(
-  args: Static<typeof InspectParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
-  const sections = Array.isArray(args.sections)
-    ? `${args.sections.length} sections`
-    : args.sections;
-  const scope = Array.isArray(args.scope) ? `${args.scope.length} scopes` : args.scope;
-  const summary = [sections, scope, args.topK ? `topK=${args.topK}` : undefined]
-    .filter(Boolean)
-    .join(" ");
+export function renderInspectCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const sectionsValue = safeArgs.sections;
+  const scopeValue = safeArgs.scope;
+  const sections = Array.isArray(sectionsValue)
+    ? `${sectionsValue.filter((section) => typeof section === "string").length} sections`
+    : asString(sectionsValue);
+  const scope = Array.isArray(scopeValue)
+    ? `${scopeValue.filter((entry) => typeof entry === "string").length} scopes`
+    : asString(scopeValue);
+  const topK = asNumber(safeArgs.topK);
+  const summary = [sections, scope, topK ? `topK=${topK}` : undefined].filter(Boolean).join(" ");
   return renderToolCall(
     "inspect",
     summary ? theme.fg("toolOutput", summary) : undefined,

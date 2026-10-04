@@ -11,6 +11,7 @@ import { bridgeFor, callToolCall, textResult, withPathAliasPreparation } from ".
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
+  asRecordOrEmpty,
   collapsibleResult,
   type RenderContextLike,
   type RenderResultOptionsLike,
@@ -59,12 +60,15 @@ function deletedPath(entry: unknown): string | undefined {
 /** Exported for renderer unit tests. */
 export function renderFsCall(
   toolName: "aft_delete" | "aft_move",
-  args: Static<typeof DeleteParams> | Static<typeof MoveParams>,
+  args: unknown,
   theme: Theme,
   context: RenderContextLike,
 ) {
+  const safeArgs = asRecordOrEmpty(args);
   if (toolName === "aft_delete") {
-    const files = (args as Static<typeof DeleteParams>).files;
+    const rawFiles = safeArgs.files;
+    if (!Array.isArray(rawFiles)) return renderToolCall("delete", undefined, theme, context);
+    const files = rawFiles.filter((file): file is string => typeof file === "string");
     const summary =
       files.length === 1
         ? accentPath(theme, files[0])
@@ -72,19 +76,21 @@ export function renderFsCall(
     return renderToolCall("delete", summary, theme, context);
   }
 
-  const moveArgs = args as Static<typeof MoveParams>;
-  return renderToolCall(
-    "move",
-    `${accentPath(theme, moveArgs.path)} ${theme.fg("muted", "→")} ${accentPath(theme, moveArgs.destination)}`,
-    theme,
-    context,
-  );
+  const path = typeof safeArgs.path === "string" ? safeArgs.path : undefined;
+  const destination = typeof safeArgs.destination === "string" ? safeArgs.destination : undefined;
+  const summary = [
+    path ? accentPath(theme, path) : undefined,
+    destination ? accentPath(theme, destination) : undefined,
+  ]
+    .filter(Boolean)
+    .join(` ${theme.fg("muted", "→")} `);
+  return renderToolCall("move", summary, theme, context);
 }
 
 /** Exported for renderer unit tests. */
 export function renderFsResult(
   toolName: "aft_delete" | "aft_move",
-  args: Static<typeof DeleteParams> | Static<typeof MoveParams>,
+  args: unknown,
   result: AgentToolResult<unknown>,
   theme: Theme,
   context: RenderContextLike,
@@ -94,8 +100,12 @@ export function renderFsResult(
     return renderErrorResult(result, `${toolName} failed`, theme, context);
   }
 
+  const safeArgs = asRecordOrEmpty(args);
+
   if (toolName === "aft_delete") {
-    const files = (args as Static<typeof DeleteParams>).files;
+    const files = Array.isArray(safeArgs.files)
+      ? safeArgs.files.filter((file): file is string => typeof file === "string")
+      : [];
     const data = (result?.details ?? {}) as {
       deleted?: string[];
       skipped_files?: Array<{ file: string; reason: string }>;
@@ -125,13 +135,15 @@ export function renderFsResult(
     });
   }
 
-  const moveArgs = args as Static<typeof MoveParams>;
+  const path = typeof safeArgs.path === "string" ? safeArgs.path : "";
+  const destination = typeof safeArgs.destination === "string" ? safeArgs.destination : "";
   const sections = [
-    `${theme.fg("success", "✓ moved")} ${theme.fg("accent", shortenPath(moveArgs.path ?? ""))}`,
-    `${theme.fg("muted", "to")} ${theme.fg("accent", shortenPath(moveArgs.destination))}`,
+    `${theme.fg("success", "✓ moved")}${path ? ` ${theme.fg("accent", shortenPath(path))}` : ""}`,
   ];
+  if (destination)
+    sections.push(`${theme.fg("muted", "to")} ${theme.fg("accent", shortenPath(destination))}`);
   return collapsibleResult({
-    summary: `moved ${shortenPath(moveArgs.path ?? "")} to ${shortenPath(moveArgs.destination)}`,
+    summary: `moved${path ? ` ${shortenPath(path)}` : ""}${destination ? ` to ${shortenPath(destination)}` : ""}`,
     full: renderSections(sections, context),
     expanded: options.expanded,
     context,

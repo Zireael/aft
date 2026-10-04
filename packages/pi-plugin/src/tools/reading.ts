@@ -32,6 +32,7 @@ import { assertExternalDirectoryPermission, resolvePathArg, whenGhReadEnabled } 
 import {
   accentPath,
   asRecord,
+  asRecordOrEmpty,
   asRecords,
   asString,
   collapsibleResult,
@@ -132,8 +133,9 @@ async function assertReadPathPermissions(
 }
 
 /** Best-effort label for renderers when zoom is called with `path` OR `url`. */
-function zoomTargetLabel(args: { path?: string; url?: string }): string {
-  return args.path ?? args.url ?? "(no target)";
+function zoomTargetLabel(args: unknown): string {
+  const safeArgs = asRecordOrEmpty(args);
+  return asString(safeArgs.path) ?? asString(safeArgs.url) ?? "(no target)";
 }
 
 export interface ReadingSurface {
@@ -214,11 +216,8 @@ function renderZoomRecord(
 }
 
 /** Exported for renderer unit tests. */
-export function buildZoomSections(
-  args: Static<typeof ZoomParams>,
-  payload: unknown,
-  theme: Theme,
-): string[] {
+export function buildZoomSections(args: unknown, payload: unknown, theme: Theme): string[] {
+  const safeArgs = asRecordOrEmpty(args);
   const batch = asRecord(payload);
   const batchItems = Array.isArray(batch?.targets)
     ? (batch.targets as unknown[])
@@ -237,7 +236,7 @@ export function buildZoomSections(
         if (!record) return theme.fg("muted", "No zoom result available.");
         const response = asRecord(record.response) ?? record;
         const name = asString(record.name) ?? asString(response.name) ?? "(unknown symbol)";
-        const itemTargetLabel = asString(record.targetLabel) ?? zoomTargetLabel(args);
+        const itemTargetLabel = asString(record.targetLabel) ?? zoomTargetLabel(safeArgs);
         if (response.success === false || record.success === false) {
           const location = record.targetLabel ? ` in ${shortenPath(itemTargetLabel)}` : "";
           return theme.fg(
@@ -273,21 +272,20 @@ export function buildZoomSections(
     .map((item) => {
       const record = asRecord(item);
       if (!record) return theme.fg("muted", "No zoom result available.");
-      return renderZoomRecord(record, zoomTargetLabel(args), theme);
+      return renderZoomRecord(record, zoomTargetLabel(safeArgs), theme);
     })
     .filter(Boolean);
 }
 
 /** Exported for renderer unit tests. */
-export function renderOutlineCall(
-  args: Static<typeof OutlineParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
-  const summary = Array.isArray(args.target)
-    ? theme.fg("accent", `${args.target.length} ${args.files ? "directories" : "files"}`)
-    : typeof args.target === "string"
-      ? `${accentPath(theme, args.target)}${args.files ? " files" : ""}`
+export function renderOutlineCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const target = safeArgs.target;
+  const files = safeArgs.files === true;
+  const summary = Array.isArray(target)
+    ? theme.fg("accent", `${target.length} ${files ? "directories" : "files"}`)
+    : typeof target === "string"
+      ? `${accentPath(theme, target)}${files ? " files" : ""}`
       : undefined;
   return renderToolCall("outline", summary, theme, context);
 }
@@ -310,14 +308,12 @@ export function renderOutlineResult(
 }
 
 /** Exported for renderer unit tests. */
-export function renderZoomCall(
-  args: Static<typeof ZoomParams>,
-  theme: Theme,
-  context: RenderContextLike,
-) {
+export function renderZoomCall(args: unknown, theme: Theme, context: RenderContextLike) {
+  const safeArgs = asRecordOrEmpty(args);
+  const hasExplicitTarget = typeof safeArgs.path === "string" || typeof safeArgs.url === "string";
   // `symbols` accepts string OR string[]; renderer adapts to both shapes.
-  const symbols = args.symbols;
-  const targets = args.targets;
+  const symbols = safeArgs.symbols;
+  const targets = safeArgs.targets;
   let summary: string;
   if (typeof symbols === "string") {
     summary = theme.fg("toolOutput", symbols);
@@ -326,16 +322,25 @@ export function renderZoomCall(
   } else if (Array.isArray(targets) && targets.length > 0) {
     summary = theme.fg("toolOutput", `${targets.length} targets`);
   } else if (targets && typeof targets === "object" && !Array.isArray(targets)) {
-    summary = theme.fg("toolOutput", (targets as { symbol?: string }).symbol ?? "1 target");
-  } else {
+    summary = theme.fg("toolOutput", asString(asRecord(targets)?.symbol) ?? "1 target");
+  } else if (hasExplicitTarget) {
     summary = theme.fg("toolOutput", "lines");
+  } else {
+    summary = "";
   }
-  return renderToolCall(
-    "zoom",
-    `${accentPath(theme, zoomTargetLabel(args))} ${summary}`,
-    theme,
-    context,
-  );
+  const hasKnownTarget =
+    hasExplicitTarget ||
+    typeof symbols === "string" ||
+    Array.isArray(symbols) ||
+    Array.isArray(targets) ||
+    asRecord(targets) !== undefined;
+  const display = [
+    hasKnownTarget ? accentPath(theme, zoomTargetLabel(safeArgs)) : undefined,
+    summary || undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return renderToolCall("zoom", display, theme, context);
 }
 
 /** Exported for renderer unit tests. */
