@@ -189,6 +189,8 @@ pub struct PinnedDir {
 
 impl PinnedDir {
     pub fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(test)]
+        work_counts::record_open();
         #[cfg(unix)]
         let file = OpenOptions::new()
             .read(true)
@@ -233,6 +235,8 @@ impl PinnedDir {
 
     #[cfg(unix)]
     fn open_dir_at(&self, name: &OsStr) -> io::Result<Self> {
+        #[cfg(test)]
+        work_counts::record_open();
         let file = openat_file(
             self.file.as_raw_fd(),
             name,
@@ -297,6 +301,8 @@ impl PinnedDir {
     }
 
     pub fn open_file(&self, name: &OsStr, write: bool) -> io::Result<File> {
+        #[cfg(test)]
+        work_counts::record_open();
         #[cfg(unix)]
         let file = openat_file(
             self.file.as_raw_fd(),
@@ -1252,12 +1258,16 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
 }
 
 fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
+    #[cfg(test)]
+    work_counts::record_read();
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     // The version is read before the full shape, so metadata written by a
     // newer build is refused by name (and kept out of quarantine) instead of
     // failing as an unparseable task.
+    #[cfg(test)]
+    work_counts::record_parse();
     let version = serde_json::from_str::<serde_json::Value>(&content)
         .ok()
         .and_then(|value| value.get("schema_version")?.as_u64());
@@ -1268,6 +1278,8 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
         version,
     )
     .map_err(crate::persisted_format::UnsupportedPersistedFormat::into_io_error)?;
+    #[cfg(test)]
+    work_counts::record_parse();
     let task: PersistedTask = serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
@@ -1594,6 +1606,9 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
 pub fn create_control_file(dirs: &TaskDirs, name: &str, content: &[u8]) -> io::Result<File> {
     let mut file = dirs.control.open_new_file(OsStr::new(name))?;
     file.write_all(content)?;
+    // These immutable payloads are verified and read through held handles
+    // before spawning. They need cross-process visibility, not power-loss
+    // durability: recovery never re-executes a task from its payload files.
     file.seek(SeekFrom::Start(0))?;
     validate_regular_handle(&file)?;
     Ok(file)
@@ -1607,6 +1622,56 @@ pub fn open_control_file(task: &ResolvedTask, name: &str) -> io::Result<File> {
         ));
     }
     task.dirs.control.open_file(OsStr::new(name), false)
+}
+
+fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    work_counts::record_sync();
+    file.sync_all()
+}
+
+#[cfg(test)]
+pub(crate) mod work_counts {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub opens: usize,
+        pub metadata_reads: usize,
+        pub parses: usize,
+        pub syncs: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+    }
+
+    fn record(update: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| {
+            let mut counts = cell.get();
+            update(&mut counts);
+            cell.set(counts);
+        });
+    }
+
+    pub(crate) fn record_open() {
+        record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_read() {
+        record(|counts| counts.metadata_reads += 1);
+    }
+    pub(crate) fn record_parse() {
+        record(|counts| counts.parses += 1);
+    }
+    pub(crate) fn record_sync() {
+        record(|counts| counts.syncs += 1);
+    }
+    pub(crate) fn reset() {
+        COUNTS.with(|cell| cell.set(Counts::default()));
+    }
+    pub(crate) fn get() -> Counts {
+        COUNTS.with(Cell::get)
+    }
 }
 
 #[derive(Debug)]
@@ -1713,13 +1778,9 @@ fn open_task_artifact_with_access(
             "background task layout identity changed",
         ));
     }
-    let metadata = read_task_at(&resolved)?;
-    if metadata.task_id != paths.task_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "background task metadata identity mismatch",
-        ));
-    }
+    // The resolver has already read the current metadata and checked its task
+    // identity. Re-reading that same file adds no artifact-path validation;
+    // the open below remains relative to the freshly pinned I/O directory.
     let file = resolved
         .dirs
         .io
@@ -2200,6 +2261,83 @@ mod tests {
 
     fn valid_id(suffix: u64) -> String {
         format!("bash-{suffix:016x}")
+    }
+
+    fn counted_task(storage: &Path) -> (ResolvedTask, PersistedTask) {
+        let task = create_task_layout(storage, "counted", &valid_id(42)).unwrap();
+        let metadata = PersistedTask::starting(
+            task.paths.task_id.clone(),
+            "counted".into(),
+            "printf 'a realistic long build command'; ".repeat(128),
+            storage.into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        write_task_at(&task, &metadata).unwrap();
+        (task, metadata)
+    }
+
+    #[test]
+    fn artifact_open_reads_metadata_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let mut handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        let output = b"build output\n".repeat(10_000);
+        handles.write(TaskArtifact::Stdout, &output).unwrap();
+        work_counts::reset();
+        let mut file = open_task_artifact(&task.paths, TaskArtifact::Stdout).unwrap();
+        assert_eq!(file.read_all().unwrap(), output);
+        let counts = work_counts::get();
+        eprintln!("artifact open work: {counts:?}");
+        assert_eq!(counts.metadata_reads, 1);
+        assert_eq!(counts.parses, 2);
+        #[cfg(unix)]
+        assert_eq!(counts.opens, 7);
+    }
+
+    #[test]
+    fn missing_exit_marker_reads_metadata_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        work_counts::reset();
+        assert_eq!(read_exit_marker(&task.paths).unwrap(), None);
+        let counts = work_counts::get();
+        eprintln!("missing marker work: {counts:?}");
+        assert_eq!(counts.metadata_reads, 1);
+        assert_eq!(counts.parses, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_lifecycle_syncs_neither_metadata_nor_ephemeral_payloads() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(storage.path());
+        work_counts::reset();
+        // Task metadata uses atomic replacement without a disk flush (the
+        // durability design treats bash task history as rebuildable), and
+        // payload files are only consumed through verified handles.
+        write_task_at(&task, &metadata).unwrap();
+        for (name, bytes) in [
+            (COMMAND_FILE, metadata.command.as_bytes()),
+            (WRAPPER_FILE, super::super::process::PAYLOAD_WRAPPER),
+            (ENVIRONMENT_FILE, b"PATH=/usr/bin".as_slice()),
+            (MANIFEST_FILE, b"verified digest".as_slice()),
+        ] {
+            let mut held = create_control_file(&task.dirs, name, bytes).unwrap();
+            let mut actual = Vec::new();
+            held.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, bytes);
+        }
+        metadata.status = super::super::BgTaskStatus::Running;
+        write_task_at(&task, &metadata).unwrap();
+        metadata.status = super::super::BgTaskStatus::Completed;
+        write_task_at(&task, &metadata).unwrap();
+        let counts = work_counts::get();
+        eprintln!("task lifecycle work: {counts:?}");
+        assert_eq!(counts.syncs, 0);
+        assert!(read_task_at(&task).unwrap().is_terminal());
     }
 
     #[test]
