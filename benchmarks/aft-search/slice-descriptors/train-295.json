@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["perf-bash-sandbox-compression", "pi-renderers-untrusted-args", "bash-cargo-test-verdicts"],
+  "note": "Bash artifact and sandbox path work counts, Pi renderer guards for partial arguments, and cargo/nextest verdict lines kept under the bash reply caps; no ranking-fence file."
+}
