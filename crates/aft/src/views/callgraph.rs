@@ -28,10 +28,10 @@ use super::readiness::{plane_readiness, FillMap, PlaneReadiness, PlaneState};
 use super::snapshot::{DiskState, LiveEntry, OpenGeneration, Snapshot};
 use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
-/// Bump when extracted evidence or its interpretation changes. Version 2 keeps
-/// every enclosing caller and serializes references in deterministic order, so
-/// older blobs must be rebuilt rather than silently seeding the new graph.
-pub const PRODUCER: &str = "ruled-callgraph-v2";
+/// Bump when extracted evidence or its interpretation changes. Version 3 adds
+/// receiver facts and precise typed dispatch to the deterministic, single-parse
+/// extraction. Earlier blobs must be rebuilt instead of seeding old call edges.
+pub const PRODUCER: &str = "ruled-callgraph-v3";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {

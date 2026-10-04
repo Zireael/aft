@@ -9765,7 +9765,9 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 /// - v12: receiver contracts preserve name-only trait/interface callers, module
 ///   overrides and wildcard imports bind integration harness calls, and member
 ///   completion does not duplicate documented methods.
-const BUILD_OUTPUT_VERSION: &str = "v12-receiver-contract-callers";
+/// - v13: known interface contracts and their implementation fan-out retain
+///   exact/dispatch provenance; a concrete trait call has only its actual target.
+const BUILD_OUTPUT_VERSION: &str = "v13-typed-dispatch-precision";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)

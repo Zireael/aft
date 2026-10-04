@@ -83,12 +83,12 @@ fn seeded_dispatch_incremental_equals_independent_cold_through_switches() {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT COUNT(*) FROM edges WHERE provenance='name_match'",
+                    "SELECT COUNT(*) FROM edges WHERE provenance='dispatch'",
                     [],
                     |r| r.get::<_, usize>(0)
                 )
                 .unwrap(),
-            if next == 1 { 6 } else { 4 }
+            if next == 1 { 2 } else { 1 }
         );
         assert_eq!(
             connection

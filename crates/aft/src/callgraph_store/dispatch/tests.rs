@@ -27,9 +27,9 @@ fn interface_two_implementations_are_possible_targets() {
         result[0]
             .targets
             .iter()
-            .filter(|t| t.provenance == "name_match")
+            .filter(|t| t.provenance == "dispatch")
             .count(),
-        3
+        2
     );
     assert_eq!(
         result[0]
@@ -37,7 +37,16 @@ fn interface_two_implementations_are_possible_targets() {
             .iter()
             .filter(|t| t.provenance == "exact")
             .count(),
-        0
+        1
+    );
+    assert_eq!(
+        result[0].targets,
+        BTreeSet::from([
+            Target { file: "fixture".into(), symbol: "I::m".into(), provenance: "exact" },
+            Target { file: "fixture".into(), symbol: "A::m".into(), provenance: "dispatch" },
+            Target { file: "fixture".into(), symbol: "B::m".into(), provenance: "dispatch" },
+        ]),
+        "a known interface binds its declaration precisely and only its implementations as possible targets"
     );
 }
 
@@ -118,9 +127,9 @@ fn interface_zero_one_two_implementation_cells() {
             result[0]
                 .targets
                 .iter()
-                .filter(|t| t.provenance == "name_match")
+                .filter(|t| t.provenance == "dispatch")
                 .count(),
-            count + 1
+            count
         );
     }
 }
@@ -129,7 +138,7 @@ fn interface_zero_one_two_implementation_cells() {
 fn rust_concrete_trait_default_and_ambiguous_cells() {
     for (source, expected, unknown) in [
         ("struct T; impl T { fn m(&self) {} } fn caller(x: &T) { x.m(); }", 1, false),
-        ("trait I { fn m(&self); } struct T; impl I for T { fn m(&self) {} } fn caller(x: &T) { x.m(); }", 2, false),
+        ("trait I { fn m(&self); } struct T; impl I for T { fn m(&self) {} } fn caller(x: &T) { x.m(); }", 1, false),
         ("trait I { fn m(&self) {} } struct T; impl I for T {} fn caller(x: &T) { x.m(); }", 1, false),
         ("trait I { fn m(&self) {} } trait J { fn m(&self) {} } struct T; impl I for T {} impl J for T {} fn caller(x: &T) { x.m(); }", 2, true),
     ] {
@@ -139,6 +148,14 @@ fn rust_concrete_trait_default_and_ambiguous_cells() {
         assert_eq!(result[0].targets.len(), expected, "{:#?}\n{:#?}", parsed.dispatch, parsed.symbols);
         assert_eq!(result[0].unresolved, usize::from(unknown), "{:#?}", parsed.dispatch);
         assert_eq!(result[0].dynamic, 0);
+        if unknown {
+            // Both trait defaults are visible candidates. Retaining them as
+            // name-only evidence is more honest than dropping both targets;
+            // neither default can be asserted as the exact callee.
+            assert!(result[0].targets.iter().all(|t| t.provenance == "name_match"));
+        } else {
+            assert!(result[0].targets.iter().all(|t| t.provenance == "exact"));
+        }
     }
 }
 
@@ -285,7 +302,8 @@ fn trait_and_go_interface_fanout_and_rust_generic_bound_forms() {
         let result = resolutions(&parsed);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].targets.len(), 3, "{:#?}", parsed.dispatch);
-        assert_eq!(result[0].targets.iter().filter(|t| t.provenance == "name_match").count(), 3);
+        assert_eq!(result[0].targets.iter().filter(|t| t.provenance == "dispatch").count(), 2);
+        assert_eq!(result[0].targets.iter().filter(|t| t.provenance == "exact").count(), 1);
     }
     let parsed = parse("package p\ntype I interface { m() }\ntype A struct{}\nfunc (a A) m() {}\ntype B struct{}\nfunc (b B) m() {}\nfunc caller(x I) { x.m() }", "go");
     let result = resolutions(&parsed);
@@ -295,9 +313,9 @@ fn trait_and_go_interface_fanout_and_rust_generic_bound_forms() {
         result[0]
             .targets
             .iter()
-            .filter(|t| t.provenance == "name_match")
+            .filter(|t| t.provenance == "dispatch")
             .count(),
-        3
+        2
     );
 }
 
@@ -401,7 +419,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                                 .iter()
                                 .filter(|t| t.provenance == "exact")
                                 .count(),
-                            usize::from(!interface)
+                            1
                         );
                         assert_eq!(
                             resolution
@@ -409,7 +427,7 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
                                 .iter()
                                 .filter(|t| t.provenance == "dispatch")
                                 .count(),
-                            if interface { 0 } else { fanout }
+                            fanout
                         );
                         assert_eq!(
                             resolution

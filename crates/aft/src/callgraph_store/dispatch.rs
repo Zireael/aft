@@ -956,19 +956,26 @@ fn receiver_type(
             {
                 let raw_annotation = text(annotation, source);
                 let annotation = type_name(raw_annotation);
-                if nodes.iter().any(|n| {
+                if let Some(parameter) = nodes.iter().find(|n| {
                     ["type_parameter", "type_parameter_declaration"].contains(&n.kind())
-                        && named(*n, source).as_deref() == Some(&annotation)
+                        && named(**n, source).as_deref() == Some(&annotation)
                 }) {
+                    if language == "rust" {
+                        // A bound identifies the called contract, not its eventual
+                        // implementation. Keep that declaration exact and let the
+                        // resolver mark implementation fan-out as dispatch.
+                        return field(*parameter, &["bounds"]).map(|bounds| {
+                            type_name(text(bounds, source).split('+').next().unwrap_or_default())
+                        });
+                    }
                     return None;
                 }
                 if language == "rust" {
-                    // A generic, trait object or associated type is not a concrete
-                    // implementation. Preserve its call as name-only evidence.
-                    if raw_annotation.contains("dyn ")
-                        || raw_annotation.contains("impl ")
-                        || raw_annotation.contains('<')
-                            && nodes.iter().any(|n| n.kind() == "type_parameter")
+                    // A generic nominal instantiation or associated type is not
+                    // resolved by these syntactic hints. Trait objects and opaque
+                    // parameters still name a known contract and retain its type.
+                    if raw_annotation.contains('<')
+                        && nodes.iter().any(|n| n.kind() == "type_parameter")
                         || annotation.contains("::")
                             && !annotation
                                 .split("::")
@@ -1464,43 +1471,6 @@ impl<'a> Resolver<'a> {
             return self.unknown(&parse.language, member);
         }
         let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
-        // Concrete implementations also call the contract declaration. A known
-        // unrelated receiver must not be linked just because it has the same name.
-        if !ty.interface {
-            for base in &ty.bases {
-                if let Some((base_file, base_ty)) = self.project_type(&type_file, base) {
-                    if base_ty.interface {
-                        targets.extend(self.methods(&base_file, &base_ty.name, member));
-                    }
-                }
-            }
-            if parse.language == "go" {
-                for (contract_file, contract) in &self.files {
-                    if contract.language != "go" {
-                        continue;
-                    }
-                    for interface in contract.dispatch.types.iter().filter(|t| t.interface) {
-                        let required = contract
-                            .dispatch
-                            .methods
-                            .iter()
-                            .filter(|m| m.owner == interface.name)
-                            .collect::<Vec<_>>();
-                        if !required.is_empty()
-                            && required.iter().all(|required| {
-                                self.files[&type_file].dispatch.methods.iter().any(|m| {
-                                    m.owner == ty.name
-                                        && m.name == required.name
-                                        && m.shape == required.shape
-                                })
-                            })
-                        {
-                            targets.extend(self.methods(contract_file, &interface.name, member));
-                        }
-                    }
-                }
-            }
-        }
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate) in &self.files {
                 if candidate.language != parse.language {
@@ -1553,15 +1523,6 @@ impl<'a> Resolver<'a> {
                     }
                 }
             }
-        }
-        if ty.interface {
-            targets = targets
-                .into_iter()
-                .map(|mut target| {
-                    target.provenance = "name_match";
-                    target
-                })
-                .collect();
         }
         let external = usize::from(targets.is_empty());
         Resolution {

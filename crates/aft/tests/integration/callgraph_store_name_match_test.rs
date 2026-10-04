@@ -860,14 +860,40 @@ fn unrelated(rows: &Other) { rows.rate_counter(); }
             true,
         ));
         let entries = flattened_callers(&callers);
-        assert_eq!(entries.len(), 5, "{symbol}: {callers:#}");
-        for name in ["generic", "dynamic", "opaque", "associated"] {
+        let is_declaration = symbol == "AccountRows::rate_counter";
+        assert_eq!(
+            entries.len(),
+            if is_declaration { 4 } else { 5 },
+            "{symbol}: {callers:#}"
+        );
+        let associated = entries
+            .iter()
+            .find(|e| e["symbol"] == "associated")
+            .unwrap();
+        assert_eq!(associated["resolved_by"], "name_match", "{callers:#}");
+        assert_eq!(associated["approximate"], true);
+        for name in ["generic", "dynamic", "opaque"] {
             let entry = entries.iter().find(|e| e["symbol"] == name).unwrap();
-            assert_eq!(entry["resolved_by"], "name_match", "{callers:#}");
-            assert_eq!(entry["approximate"], true);
+            assert_ne!(entry["resolved_by"], "name_match", "{callers:#}");
+            if !is_declaration {
+                assert_eq!(
+                    entry["resolved_by"], "possible_target (dispatch)",
+                    "{callers:#}"
+                );
+            }
         }
-        let exact = entries.iter().find(|e| e["symbol"] == "exact").unwrap();
-        assert_ne!(exact["approximate"], true, "{callers:#}");
+        if is_declaration {
+            // A call on a concrete SqlRows reaches its one implementation, not
+            // an additional call target at the trait declaration.
+            assert!(
+                entries.iter().all(|e| e["symbol"] != "exact"),
+                "{callers:#}"
+            );
+        } else {
+            let exact = entries.iter().find(|e| e["symbol"] == "exact").unwrap();
+            assert_ne!(exact["approximate"], true, "{callers:#}");
+            assert_ne!(exact["resolved_by"], "possible_target (dispatch)");
+        }
         assert!(entries.iter().all(|e| e["symbol"] != "unrelated"));
     }
 }
@@ -995,7 +1021,7 @@ fn trait_callers_generic_nominal_and_macro_receivers() {
 }
 
 #[test]
-fn trait_callers_typescript_and_go_interface_receivers_are_name_only() {
+fn trait_callers_known_and_unknown_interface_receivers_keep_provenance() {
     for (file, source, symbol) in [
         ("api.ts", "interface I { m(): void; }\nclass A implements I { m() {} }\nclass Other { m() {} }\nfunction generic<T extends I>(x: T) { x.m(); }\nfunction dynamic(x: I) { x.m(); }\nfunction unrelated(x: Other) { x.m(); }", "I::m"),
         ("api.go", "package api\ntype I interface { m() }\ntype A struct{}\nfunc (a A) m() {}\nfunc caller(x I) { x.m() }\n", "I::m"),
@@ -1007,7 +1033,15 @@ fn trait_callers_typescript_and_go_interface_receivers_are_name_only() {
         let result = json(callgraph_store_adapter::callers_result(&store, &root.join(file), symbol, 1, true));
         let entries = flattened_callers(&result);
         assert_eq!(entries.len(), if file.ends_with("ts") { 2 } else { 1 }, "{result:#}");
-        assert!(entries.iter().all(|e| e["resolved_by"] == "name_match" && e["approximate"] == true), "{result:#}");
+        for entry in entries {
+            if entry["symbol"] == "generic" {
+                assert_eq!(entry["resolved_by"], "name_match", "{result:#}");
+                assert_eq!(entry["approximate"], true);
+            } else {
+                assert_ne!(entry["resolved_by"], "name_match", "{result:#}");
+                assert_ne!(entry["approximate"], true);
+            }
+        }
     }
 }
 

@@ -100,7 +100,7 @@ pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
 
-const MATERIALIZATION_VERSION: &str = "8";
+const MATERIALIZATION_VERSION: &str = "9";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
