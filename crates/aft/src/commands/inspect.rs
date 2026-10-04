@@ -1630,37 +1630,94 @@ enum InspectTerminal {
     },
 }
 
-/// Why a completed inspect is partial, or `None` when its diagnostics are
-/// authoritative (or were not part of the answer). The reason names every
-/// producer the diagnostics gaps attribute, in first-seen order, for example
-/// "diagnostics unknown for rust, typescript".
+/// The same diagnostic uncertainty is described once, in the status header.
+/// Structured gaps retain the full reasons and individual affected paths.
 pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<String> {
     let diagnostics = payload.get("summary")?.get("diagnostics")?;
+    diagnostics_unknown_reason(diagnostics)
+}
+
+fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
     if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
         return None;
     }
-    let mut producers = Vec::<String>::new();
-    for gap in diagnostics
+    let gaps = diagnostics
         .get("gaps")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let producer = gap
-            .get("producer")
-            .or_else(|| gap.get("cause").and_then(|cause| cause.get("producer")))
-            .and_then(Value::as_str);
-        if let Some(producer) = producer {
-            if !producers.iter().any(|known| known == producer) {
-                producers.push(producer.to_string());
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut causes = Vec::<(String, String, String, usize)>::new();
+    // Producer gaps are the primary explanation; uncovered files add counts
+    // to that explanation rather than restating it with slightly different words.
+    for uncovered in [false, true] {
+        for gap in gaps {
+            if (gap["kind"] == "uncovered_file") != uncovered {
+                continue;
+            }
+            let cause = if uncovered {
+                gap.get("cause").unwrap_or(gap)
+            } else {
+                gap
+            };
+            let producer = cause["producer"].as_str().unwrap_or("unknown producer");
+            let root = cause["root"].as_str().unwrap_or("");
+            let reason = cause["reason"]
+                .as_str()
+                .unwrap_or("no authoritative report");
+            if let Some(existing) = causes.iter_mut().find(|entry| {
+                entry.0 == producer && (entry.1 == root || entry.1.is_empty() || root.is_empty())
+            }) {
+                existing.3 += usize::from(uncovered);
+                if existing.1.is_empty() {
+                    existing.1 = root.to_string();
+                }
+            } else {
+                causes.push((
+                    producer.to_string(),
+                    root.to_string(),
+                    reason.to_string(),
+                    usize::from(uncovered),
+                ));
             }
         }
     }
-    Some(if producers.is_empty() {
-        "diagnostics unknown".to_string()
-    } else {
-        format!("diagnostics unknown for {}", producers.join(", "))
-    })
+    let explanations = causes
+        .into_iter()
+        .map(|(producer, root, reason, files)| {
+            let producer = if producer == "rust" {
+                "rust-analyzer"
+            } else {
+                &producer
+            };
+            let reason = reason.strip_prefix("still checking: ").unwrap_or(&reason);
+            let reason = reason
+                .strip_prefix(&format!("{producer}: "))
+                .unwrap_or(reason);
+            let reason = reason
+                .trim_end_matches("; retry aft_inspect")
+                .trim_end_matches("; retry");
+            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+            let root = if root.is_empty() {
+                String::new()
+            } else {
+                format!(" @ {root}")
+            };
+            let count = match files {
+                0 => String::new(),
+                1 => " (1 file)".to_string(),
+                n => format!(" ({n} files)"),
+            };
+            format!("{producer}{root}: {reason}{count}")
+        })
+        .collect::<Vec<_>>();
+    Some(format!(
+        "diagnostics unknown: {}; retry aft_inspect.",
+        if explanations.is_empty() {
+            "no authoritative report".to_string()
+        } else {
+            explanations.join("; ")
+        }
+    ))
 }
 
 fn build_inspect_terminal(
@@ -2426,6 +2483,13 @@ fn render_inspect_text(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
+    if let Some(reason) = summary
+        .get("diagnostics")
+        .and_then(diagnostics_unknown_reason)
+    {
+        lines.push(format!("PARTIAL — {reason}"));
+    }
+
     if let Some((root_count, file_count)) = scope {
         let root_label = if root_count == 1 { "root" } else { "roots" };
         let file_label = if file_count == 1 { "file" } else { "files" };
@@ -2490,6 +2554,12 @@ fn render_inspect_text(
 /// failed to load, say) is a gap, and counting it here would read as success
 /// next to the gap line.
 fn render_scoped_diagnostics_coverage(lines: &mut Vec<String>, summary: &Map<String, Value>) {
+    if summary
+        .get("diagnostics")
+        .is_some_and(|section| section["complete"] == false)
+    {
+        return;
+    }
     let Some(coverage) = summary
         .get("diagnostics")
         .and_then(|section| section.get("coverage"))
@@ -2559,6 +2629,10 @@ fn render_incomplete_categories(
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
             continue;
         }
+        if category == "diagnostics" {
+            render_uncovered_file_groups(lines, category, value, details);
+            continue;
+        }
         for gap in value
             .get("gaps")
             .and_then(Value::as_array)
@@ -2622,53 +2696,25 @@ fn render_incomplete_categories(
     }
 }
 
-/// Render scoped files that no producer analyzed as one line per
-/// (producer root, producer, reason) with a file count, then at most `topK`
-/// of the affected paths. A scope over a few hundred files whose producer is
-/// unavailable would otherwise print the same reason once per file and bury
-/// the one fact the agent needs: why nothing was analyzed.
+/// List at most `topK` affected paths, without repeating the header's causes
+/// and file counts. Full per-file authority gaps stay in structured data.
 fn render_uncovered_file_groups(
     lines: &mut Vec<String>,
     category: &str,
     section: &Value,
     details: &Map<String, Value>,
 ) {
-    let Some(groups) = section
+    if section
         .get("uncovered_file_groups")
         .and_then(Value::as_array)
         .filter(|groups| !groups.is_empty())
-    else {
+        .is_none()
+    {
         return;
-    };
-    for group in groups {
-        let count = group.get("files").and_then(Value::as_u64).unwrap_or(0);
-        let files = if count == 1 { "file" } else { "files" };
-        let reason = group
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("unavailable");
-        let producer = group.get("producer").and_then(Value::as_str);
-        let root = group.get("root").and_then(Value::as_str);
-        // A cause that is the failure of a producer already printed on its
-        // own "producer ... failed" line refers to that line by producer
-        // name: a multi-line cargo error printed twice buries everything else.
-        let reason = match producer {
-            Some(producer) if producer_failure_is_rendered(section, producer, reason) => {
-                format!("producer {producer} failed, reason above")
-            }
-            _ => reason.to_string(),
-        };
-        let cause = match (producer, root) {
-            (Some(producer), Some(root)) => format!("{producer} in {root}: {reason}"),
-            (Some(producer), None) => format!("{producer}: {reason}"),
-            (None, _) => reason,
-        };
-        lines.push(format!(
-            "Incomplete {category}: no authoritative diagnostics for {count} {files} ({cause})"
-        ));
     }
+    // Causes and file counts are already in the PARTIAL header.
     let list_key = format!("{category}_uncovered_files");
-    lines.push("Files without authoritative diagnostics:".to_string());
+    lines.push("Affected files:".to_string());
     for file in details
         .get(&list_key)
         .and_then(Value::as_array)
@@ -2681,22 +2727,6 @@ fn render_uncovered_file_groups(
     if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, &list_key) {
         lines.push(trailer);
     }
-}
-
-/// True when `section` carries a failed-producer gap for `producer` with
-/// exactly `reason`; `render_incomplete_categories` prints such a gap with
-/// its full reason on its own line.
-fn producer_failure_is_rendered(section: &Value, producer: &str, reason: &str) -> bool {
-    section
-        .get("gaps")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|gap| {
-            gap.get("kind").and_then(Value::as_str) == Some("failed_producer")
-                && gap.get("producer").and_then(Value::as_str) == Some(producer)
-                && gap.get("reason").and_then(Value::as_str) == Some(reason)
-        })
 }
 
 fn render_complexity_category(
@@ -2766,9 +2796,13 @@ fn render_cycles_category(
     let largest = section.get("largest").and_then(Value::as_u64).unwrap_or(0);
     let cycle_word = if count == 1 { "cycle" } else { "cycles" };
     let file_word = if largest == 1 { "file" } else { "files" };
-    lines.push(format!(
-        "Import cycles: {count} import {cycle_word} (largest: {largest} {file_word})"
-    ));
+    if section["scope_relation"] == "touches" {
+        lines.push(format!("Import cycles: {count} {cycle_word} touch the scope (largest: {largest} scoped {file_word})"));
+    } else {
+        lines.push(format!(
+            "Import cycles: {count} import {cycle_word} (largest: {largest} {file_word})"
+        ));
+    }
     let Some(items) = details.get("cycles").and_then(Value::as_array) else {
         return;
     };
@@ -3188,6 +3222,19 @@ fn render_duplicates_category(
         format!(" (generated: {generated_count})")
     };
     let excluded = excluded_test_clause(section);
+    if section["scope_relation"] == "touches" && !show_zero_denominator {
+        lines.push(format!(
+            "{label}: {count} groups touch the scope{generated_suffix}"
+        ));
+        if count > 0 {
+            render_duplicate_rows(lines, summary, details, key);
+        }
+        if let Some(trailer) = crate::list_surfaces::inspect::trailer_from_details(details, key) {
+            lines.push(trailer);
+        }
+        render_generated_duplicate_usage(lines, summary, details, key);
+        return;
+    }
     let Some(duplicated_lines) = section.get("duplicated_lines").and_then(Value::as_u64) else {
         if count == 0 {
             lines.push(format!("{label}: 0{generated_suffix}{excluded}"));
@@ -3431,14 +3478,35 @@ fn render_diagnostics_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
-    // Non-file gaps already have their reasons printed by
-    // `render_incomplete_categories`, so the diagnostics summary line names
-    // each such producer without repeating its reason.
-    if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
-        Some(&Value::Object(summary.clone())),
-        true,
-    ) {
-        lines.push(line);
+    // Unknown totals belong only in the status header. Counts from producers
+    // that answered remain useful and must not imply an all-clear total.
+    if let Some(producers) = summary
+        .get("diagnostics")
+        .filter(|section| section["complete"] == false)
+        .and_then(|section| section["by_producer"].as_object())
+    {
+        for (producer, counts) in producers {
+            if let (Some(e), Some(w), Some(i), Some(h)) = (
+                counts["errors"].as_u64(),
+                counts["warnings"].as_u64(),
+                counts["info"].as_u64(),
+                counts["hints"].as_u64(),
+            ) {
+                lines.push(format!(
+                    "diagnostics: {e} errors, {w} warnings, {i} info, {h} hints from {producer}"
+                ));
+            }
+        }
+    } else if !summary
+        .get("diagnostics")
+        .is_some_and(|section| section["complete"] == false)
+    {
+        if let Some(line) = crate::subc_format::format_diagnostics_summary_with(
+            Some(&Value::Object(summary.clone())),
+            true,
+        ) {
+            lines.push(line);
+        }
     }
     let trailer = crate::list_surfaces::inspect::trailer_from_details(details, "diagnostics");
     if trailer.is_none()
@@ -3623,6 +3691,7 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
                     .unwrap_or_else(|| count_from_payload(Some(payload)))),
             );
             for key in [
+                "scope_relation",
                 "generated_count",
                 "total_count",
                 "duplicated_lines",
@@ -3659,6 +3728,11 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         }),
         _ => serde_json::json!({ "count": count_from_payload(Some(payload)) }),
     };
+    if category == InspectCategory::Cycles {
+        if let Some(relation) = payload.get("scope_relation") {
+            summary["scope_relation"] = relation.clone();
+        }
+    }
     // Findings withheld from `count` because they live in test files or
     // fixtures; carried through so a reader can see what was left out.
     if matches!(
@@ -4090,6 +4164,100 @@ mod render_text_tests {
 
     fn render_with_details(summary: Value, details: Value) -> String {
         render_inspect_text(&summary_map(summary), &summary_map(details), None)
+    }
+
+    #[test]
+    fn scoped_unfinished_producer_has_one_status_line_golden() {
+        let summary = summary_map(serde_json::json!({
+            "diagnostics": {"complete": false, "by_producer": {}, "gaps": [
+                {"kind": "checking_producer", "producer": "rust", "root": ".",
+                 "reason": "rust-analyzer: cargo check still running; retry"},
+                {"kind": "uncovered_file", "file": "src/lib.rs",
+                 "cause": {"producer": "rust", "root": ".",
+                           "reason": "still checking: rust-analyzer: cargo check still running; retry"}}
+            ], "coverage": {"files": 1, "authoritative": 0},
+            "uncovered_file_groups": [{"producer": "rust", "root": ".", "files": 1,
+                "reason": "still checking: rust-analyzer: cargo check still running; retry"}]},
+            "complexity": {"count": 0, "threshold": 10},
+            "todos": {"count": 0}
+        }));
+        let details =
+            summary_map(serde_json::json!({"diagnostics_uncovered_files": ["src/lib.rs"]}));
+        let text = render_inspect_text(&summary, &details, Some((1, 1)));
+        assert_eq!(text, "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.\nscope: 1 root, 1 file\nAffected files:\n  src/lib.rs\nCyclomatic complexity: 0 functions >= 10");
+        let response = Response::success(
+            "scoped-inspect",
+            serde_json::json!({
+                "inspect_terminal": "partial", "partial_reason": diagnostics_unknown_reason(&summary["diagnostics"]),
+                "text": text, "summary": summary, "details": details,
+                "wait_stamp": {"text": "waited: yes; completed: lsp_start, lsp_quiescence",
+                    "phases": [{"id": "lsp_start", "producer": "rust"}]}
+            }),
+        );
+        assert_eq!(crate::subc_format::format_inspect_for_test(&response), text);
+    }
+
+    #[test]
+    fn unscoped_fresh_body_is_byte_identical_golden() {
+        assert_eq!(render(serde_json::json!({
+            "duplicates": {"count": 0, "duplicated_lines": 0, "total_analyzed_lines": 968281},
+            "complexity": {"count": 1, "threshold": 10,
+                "worst": {"file": "outside.ts", "function": "perform", "complexity": 215}},
+            "dead_code": {"count": 0, "test_only_count": 479},
+            "unused_exports": {"count": 0, "test_only_count": 35},
+            "todos": {"count": 0},
+            "diagnostics": {"errors": 0, "warnings": 0, "info": 0, "hints": 0}
+        })), "Duplicates: 0 duplicated lines (0.0% of 968281 analyzed lines) across 0 files, 0 groups\nCyclomatic complexity: 1 functions >= 10 (worst: outside.ts::perform 215)\nDead code: 0\n  test-only usage: 479:\nUnused exports: 0\n  test-only usage: 35:\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints");
+    }
+
+    #[test]
+    fn scoped_fixture_output_excludes_outside_duplicates_complexity_and_test_only_findings() {
+        let scope = JobScope::from_roots("/repo", vec![PathBuf::from("/repo/src/in.rs")]);
+        let payloads = [
+            (
+                InspectCategory::Duplicates,
+                serde_json::json!({
+                    "count": 1, "duplicated_lines": 40, "total_analyzed_lines": 968281,
+                    "items": [{"files": ["src/out.rs:1-20", "src/other.rs:1-20"]}]
+                }),
+            ),
+            (
+                InspectCategory::Complexity,
+                serde_json::json!({
+                    "count": 1, "threshold": 10,
+                    "worst": {"file": "src/out.rs", "function": "perform", "complexity": 215},
+                    "items": [{"file": "src/out.rs", "function": "perform", "complexity": 215}]
+                }),
+            ),
+            (
+                InspectCategory::DeadCode,
+                serde_json::json!({
+                    "count": 0, "test_only_count": 479, "items": [],
+                    "test_only_items": [{"file": "src/out.rs", "symbol": "outside"}],
+                    "test_only_top": [{"file": "src/out.rs", "symbol": "outside"}]
+                }),
+            ),
+            (
+                InspectCategory::UnusedExports,
+                serde_json::json!({
+                    "count": 0, "test_only_count": 35, "items": [],
+                    "test_only_items": [{"file": "src/out.rs", "symbol": "outside"}],
+                    "test_only_top": [{"file": "src/out.rs", "symbol": "outside"}]
+                }),
+            ),
+        ];
+        let summary = payloads
+            .into_iter()
+            .map(|(category, payload)| {
+                let filtered = crate::inspect::filter_payload_for_scope_for_test(payload, &scope);
+                (
+                    category.as_str().to_string(),
+                    summary_for(category, &filtered),
+                )
+            })
+            .collect();
+        assert_eq!(render_inspect_text(&summary, &Map::new(), Some((1, 1))),
+            "scope: 1 root, 1 file\nDuplicates: 0 groups touch the scope\nCyclomatic complexity: 0 functions >= 10\nDead code: 0\nUnused exports: 0");
     }
 
     #[test]
@@ -4974,18 +5142,14 @@ mod fresh_payload_tests {
         );
         let text = payload["text"].as_str().expect("text");
 
-        // One line per (root, producer, reason), with the file count, instead
-        // of one line per file.
+        // Each cause and file count appears once, together in the status header.
         let group_lines = text
             .lines()
-            .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+            .filter(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
             .collect::<Vec<_>>();
         assert_eq!(
             group_lines,
-            vec![
-                "Incomplete diagnostics: no authoritative diagnostics for 8 files (typescript in web: producer typescript failed, reason above)",
-                "Incomplete diagnostics: no authoritative diagnostics for 4 files (biome in tools: running, but has not reported on these files)",
-            ],
+            vec!["PARTIAL — diagnostics unknown: typescript @ web: typescript-language-server is unavailable; no node_modules in web: the project's dependencies are not installed; run your package manager's install (8 files); biome @ tools: running, but has not reported on these files (4 files); retry aft_inspect."],
             "{text}"
         );
         // At most topK (5 here) affected paths, largest group first, then the
@@ -5005,11 +5169,11 @@ mod fresh_payload_tests {
         // uncovered files instead of naming each one.
         let status = text
             .lines()
-            .find(|line| line.starts_with("diagnostics: unknown"))
+            .find(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
             .expect("diagnostics status line");
         assert!(!status.contains("file_0"), "{status}");
         assert!(
-            status.contains("12 files without an authoritative report"),
+            status.contains("(8 files)") && status.contains("(4 files)"),
             "{status}"
         );
 
@@ -5138,11 +5302,8 @@ mod fresh_payload_tests {
 
     /// A producer whose workspace failed to load (rust-analyzer run with
     /// `--locked` over a stale Cargo.lock) leaves the one scoped file without
-    /// diagnostics. The multi-line cargo error is printed once, on the
-    /// producer line; the file-group line and the status line name the
-    /// producer instead of repeating it, and the coverage line counts files
-    /// with authoritative diagnostics (none), so it cannot read as success
-    /// beside the gap.
+    /// diagnostics. The cargo error is compacted into one status line, not
+    /// repeated in file groups and a footer; coverage cannot read as success.
     #[test]
     fn failed_producer_error_renders_once_and_coverage_counts_authoritative_files() {
         let ctx = AppContext::new(
@@ -5200,24 +5361,15 @@ mod fresh_payload_tests {
         );
         assert!(
             text.contains(&format!(
-                "Incomplete diagnostics: producer rust @ . failed ({cargo_error})"
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: {} (1 file); retry aft_inspect.",
+                cargo_error.split_whitespace().collect::<Vec<_>>().join(" ")
             )),
             "{text}"
         );
+        assert!(!text.contains("Incomplete diagnostics:"), "{text}");
+        assert!(!text.contains("\ndiagnostics: unknown"), "{text}");
         assert!(
-            text.contains(
-                "Incomplete diagnostics: no authoritative diagnostics for 1 file (rust in .: producer rust failed, reason above)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "diagnostics: unknown (producer rust @ . failed, reason above; 1 file without an authoritative report)"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("diagnostics: authoritative results for 0 of 1 scoped file"),
+            !text.contains("diagnostics: authoritative results"),
             "{text}"
         );
         assert!(!text.contains("analyzed 1 of 1"), "{text}");
@@ -5552,13 +5704,13 @@ mod deferred_terminal_tests {
         assert_eq!(response.data["inspect_terminal"], "partial");
         assert_eq!(
             response.data["partial_reason"],
-            "diagnostics unknown for rust, typescript"
+            "diagnostics unknown: rust-analyzer @ spikes/x: Failed to load workspaces.; rust-analyzer @ .: still indexing; typescript @ .: x (1 file); retry aft_inspect."
         );
         assert!(response.data["wait_stamp"]["text"].is_string());
         let rendered = crate::subc_format::format_inspect_for_test(&response);
         assert_eq!(
             rendered.lines().next(),
-            Some("PARTIAL: diagnostics unknown for rust, typescript (see below)")
+            Some("PARTIAL — diagnostics unknown: rust-analyzer @ spikes/x: Failed to load workspaces.; rust-analyzer @ .: still indexing; typescript @ .: x (1 file); retry aft_inspect.")
         );
     }
 

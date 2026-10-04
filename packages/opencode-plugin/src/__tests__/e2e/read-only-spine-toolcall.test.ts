@@ -161,8 +161,8 @@ export function runReadOnlySpineToolcallSuite(
       );
 
       expect(output).toContain("FRESH");
-      expect(output).toContain("wait-stamp:");
-      expect(output).toContain("completed phases:");
+      expect(output).not.toContain("wait-stamp:");
+      expect(output).not.toContain("completed phases:");
       expect(output).toContain("TODOs: 1");
       expect(output).toContain("src/hit.ts:9 TODO cutover inspect marker");
     }, 90_000);

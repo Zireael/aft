@@ -969,18 +969,27 @@ first line of the tool output:
 | `inspect_terminal` | Header | Meaning |
 |---|---|---|
 | `fresh` | `FRESH` | Completed, and every diagnostics producer gave an authoritative answer. Carries `wait_stamp` (`text` and `phases`). |
-| `partial` | `PARTIAL: diagnostics unknown for rust, typescript (see below)` | Completed with the same payload and `wait_stamp` as `fresh`, but diagnostics are unknown for the named producers. `partial_reason` holds the header text without the `PARTIAL:` prefix. The body names each producer and its server root, for example `Incomplete diagnostics: producer rust @ spikes/x failed (...)`. |
-| `interrupted` | prose | Cancelled before completion; `completed_phases` lists what finished. |
-| `phase_failed` | prose | A phase failed; `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` say which and why. |
+| `partial` | `PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect.` | Completed with the same payload and `wait_stamp` as `fresh`, but some diagnostics are unknown. The header explains each analyzer's reason and affected file count once. `partial_reason` holds the header text without the `PARTIAL — ` prefix. Full reasons and per-file gaps remain structured. |
+| `interrupted` | `INTERRUPTED — ...` | Cancelled before completion; retry the request. `completed_phases` remains in structured data. |
+| `phase_failed` | `PHASE-FAILED — ...` | Inspection could not finish; address the reported reason and retry or narrow the scope. `completed_phases`, `failed_phase`, `failure_reason` and `failure_detail` remain structured. |
 
 `FRESH` never heads a result whose diagnostics summary reads `diagnostics: unknown`. A missing
 language server binary (for example `docker-langserver`) leaves its files' diagnostics unknown and
 the result `partial`; install the server or disable it with `lsp.disabled` to get `fresh`.
 
-The wait stamp counts phases instead of listing each one:
+Wait stamps and phase lists are retained only in structured data, not agent-visible text.
+For example, the structured wait stamp counts phases instead of listing each one:
 `waited: yes; completed: lsp_start ×9 (typescript 3, python 2, bash 1, ...), lsp_quiescence ×9 (...), tier2_rescan ×5 (...)`.
 Repeated TypeScript runtime notes collapse the same way
 (`TypeScript 5.9.3: project installation ×3 (first: ...)`).
+
+With `scope`, all findings, counts, worst offenders, and examples are narrowed to those paths.
+Duplicate groups can cross the boundary: their summary says how many groups touch the scope,
+and their examples show only scoped occurrences. Project-wide duplicate percentages and
+suppression totals are omitted because they cannot be narrowed from the cached aggregate.
+Cross-boundary import cycles likewise show only scoped members and edges, labeled as cycles
+touching the scope rather than claiming a closed cycle entirely within it.
+Without `scope`, the repository-wide summaries are unchanged.
 
 #### Which language servers start
 

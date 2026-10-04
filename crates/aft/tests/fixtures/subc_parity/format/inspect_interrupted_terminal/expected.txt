@@ -1,2 +1,1 @@
-inspect was interrupted before it could complete (after 1 completed phase); no fresh snapshot was produced.
-Retry is safe; retry inspect, or narrow with sections=...
+INTERRUPTED — inspect stopped before it could complete; no fresh snapshot was produced. Retry aft_inspect, or narrow the scope.

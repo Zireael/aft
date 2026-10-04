@@ -2332,14 +2332,22 @@ fn format_inspect(response: &Response) -> String {
         return text;
     }
     let body = if let Some(text) = response.data.get("text").and_then(Value::as_str) {
-        append_rendered_diagnostics(text, &response.data)
+        if response.data["inspect_terminal"] == "partial" {
+            text.to_string()
+        } else {
+            append_rendered_diagnostics(text, &response.data)
+        }
     } else {
         let json =
             serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
         append_rendered_diagnostics(&json, &response.data)
     };
     match inspect_partial_header(&response.data) {
-        Some(header) => format!("{header}\n{body}"),
+        Some(header) if !body.starts_with("PARTIAL — ") => format!("{header}\n{body}"),
+        _ if response.data["inspect_terminal"] == "fresh" && !body.starts_with("FRESH\n") => {
+            format!("FRESH\n{body}")
+        }
+        Some(_) => body,
         None => body,
     }
 }
@@ -2360,11 +2368,14 @@ fn inspect_partial_header(data: &Value) -> Option<String> {
         .get("partial_reason")
         .and_then(Value::as_str)
         .unwrap_or("diagnostics unknown");
-    Some(format!("PARTIAL: {reason} (see below)"))
+    Some(format!("PARTIAL — {reason}"))
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts appendRenderedDiagnostics.
 fn append_rendered_diagnostics(text: &str, data: &Value) -> String {
+    if text.starts_with("PARTIAL — ") {
+        return text.to_string();
+    }
     if text.lines().any(|line| {
         let lower = line.to_lowercase();
         lower.starts_with("diagnostics:") || lower.starts_with("diagnostics ")
@@ -3764,24 +3775,19 @@ fn format_inspect_terminal(data: &Value) -> Option<String> {
         .get("inspect_terminal")
         .and_then(Value::as_str)
         .map(|kind| kind.to_ascii_lowercase().replace('_', "-"))?;
-    let completed = data
-        .get("completed_phases")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-
     match kind.as_str() {
         "phase-failed" => {
             let detail = compact_inspect_terminal_field(data.get("failure_detail"), "not supplied");
             let reason = compact_inspect_terminal_field(data.get("failure_reason"), "not supplied");
             Some(format!(
-                "inspect could not complete: {detail} ({reason}).\nCompleted phases: {completed}. Retry, or narrow with sections=..."
+                "PHASE-FAILED — inspect could not complete: {detail} ({reason}). Retry aft_inspect, or narrow the scope."
             ))
         }
         "interrupted" => {
-            let phase_label = if completed == 1 { "phase" } else { "phases" };
-            Some(format!(
-                "inspect was interrupted before it could complete (after {completed} completed {phase_label}); no fresh snapshot was produced.\nRetry is safe; retry inspect, or narrow with sections=..."
-            ))
+            Some(
+                "INTERRUPTED — inspect stopped before it could complete; no fresh snapshot was produced. Retry aft_inspect, or narrow the scope."
+                    .to_string()
+            )
         }
         _ => None,
     }
@@ -3795,7 +3801,17 @@ fn compact_inspect_terminal_field(value: Option<&Value>, fallback: &str) -> Stri
     if parts.is_empty() {
         fallback.to_string()
     } else {
-        parts.join(" ")
+        let mut compact = parts.join(" ");
+        for (internal, plain) in [
+            ("lsp_start", "starting language servers"),
+            ("lsp_quiescence", "waiting for language servers"),
+            ("stat_verification", "verifying files are unchanged"),
+            ("callgraph_ready", "preparing call analysis"),
+            ("tier2_rescan", "running code analysis"),
+        ] {
+            compact = compact.replace(internal, plain);
+        }
+        compact
     }
 }
 

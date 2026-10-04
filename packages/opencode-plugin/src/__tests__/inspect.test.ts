@@ -101,7 +101,29 @@ function freshTerminal() {
 }
 
 describe("aft_inspect tool", () => {
-  test("heads unknown diagnostics PARTIAL, never FRESH, and collapses repeated phases", () => {
+  test("keeps terminal phases structured but never renders phase vocabulary", () => {
+    const payload = freshTerminal();
+    const terminal = parseInspectTerminal(payload)!;
+    expect(terminal.phases).toHaveLength(1);
+    expect(terminal.waitStampText).toBe(payload.wait_stamp.text);
+    expect(renderInspectTerminal(terminal, "FRESH\nfresh result body")).toBe(
+      "FRESH\nfresh result body",
+    );
+    const partial = parseInspectTerminal({ ...payload, inspect_terminal: "partial" })!;
+    const serverText =
+      "PARTIAL — diagnostics unknown: rust-analyzer is still checking (1 file); retry aft_inspect.\nscope: 1 root, 1 file";
+    expect(renderInspectTerminal(partial, serverText)).toBe(serverText);
+    for (const kind of ["interrupted", "phase_failed"]) {
+      const interrupted = parseInspectTerminal({
+        inspect_terminal: kind,
+        completed_phases: payload.wait_stamp.phases,
+      })!;
+      expect(renderInspectTerminal(interrupted)).not.toMatch(
+        /completed phases|stat_verification|wait-stamp|after 1 completed/i,
+      );
+    }
+  });
+  test("heads unknown diagnostics PARTIAL, never FRESH, and keeps repeated phases out of text", () => {
     const phases = [
       ...Array.from({ length: 3 }, () => ({ id: "lsp_start", producer: "typescript" })),
       { id: "lsp_start", producer: "rust" },
@@ -115,22 +137,22 @@ describe("aft_inspect tool", () => {
     expect(terminal?.kind).toBe("PARTIAL");
     const rendered = renderInspectTerminal(terminal!, "body");
     const lines = rendered.split("\n");
-    expect(lines[0]).toBe("PARTIAL: diagnostics unknown for rust, typescript (see below)");
+    expect(lines[0]).toBe("PARTIAL — diagnostics unknown for rust, typescript");
     expect(rendered).not.toContain("FRESH");
-    expect(rendered).toContain("- lsp_start ×4 (typescript 3, rust 1)");
-    expect(rendered).toContain("- lsp_quiescence (rust)");
-    expect(lines.filter((line) => line.startsWith("- lsp_start"))).toHaveLength(1);
+    expect(rendered).not.toContain("lsp_start");
+    expect(rendered).not.toContain("lsp_quiescence");
+    expect(terminal?.phases).toHaveLength(5);
 
     const fresh = parseInspectTerminal({ inspect_terminal: "fresh", wait_stamp: { phases } });
     expect(renderInspectTerminal(fresh!).split("\n")[0]).toBe("FRESH");
   });
-  test("documents blocking-fresh results, scope narrowing, and the alert channel", () => {
+  test("documents terminal outcomes and scope narrowing without phase jargon", () => {
     const { tools } = createInspectHarness(() => freshTerminal());
     const inspect = tools.aft_inspect;
 
-    expect(inspect.description).toContain("Blocking-fresh");
-    expect(inspect.description).toContain("wait-stamp");
-    expect(inspect.description).toContain("alert channel");
+    expect(inspect.description).toContain("waits for current analysis");
+    expect(inspect.description).not.toContain("wait-stamp");
+    expect(inspect.description).not.toContain("alert channel");
     expect(inspect.description).not.toContain("short deadline");
     expect(inspect.description).not.toContain("pending_categories");
     expect(inspect.description).not.toContain("background warmup");
@@ -194,7 +216,8 @@ describe("aft_inspect tool", () => {
     expect(rendered).toContain(
       "inspect could not complete: metrics did not complete (inspect_not_fresh).",
     );
-    expect(rendered).toContain("Completed phases: 1. Retry, or narrow with sections=...");
+    expect(rendered).toContain("Retry aft_inspect, or narrow the scope.");
+    expect(rendered).not.toContain("Completed phases");
     expect(rendered).not.toContain("request failed");
   });
 
@@ -205,8 +228,8 @@ describe("aft_inspect tool", () => {
     });
 
     const rendered = renderInspectTerminal(terminal!, "request failed");
-    expect(rendered).toContain("inspect was interrupted");
-    expect(rendered).toContain("Retry is safe");
+    expect(rendered).toContain("INTERRUPTED — inspect stopped");
+    expect(rendered).toContain("Retry aft_inspect");
     expect(rendered).not.toContain("request failed");
   });
 
@@ -241,7 +264,7 @@ describe("aft_inspect tool", () => {
 
       const terminal = response.inspect_terminal.toUpperCase().replaceAll("_", "-");
       if (terminal === "INTERRUPTED") {
-        expect(result).toContain("inspect was interrupted");
+        expect(result).toContain("INTERRUPTED — inspect stopped");
       } else if (terminal === "PHASE-FAILED") {
         expect(result).toContain("inspect could not complete");
       } else {

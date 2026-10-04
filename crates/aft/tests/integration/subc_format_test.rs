@@ -212,7 +212,8 @@ fn inspect_phase_failed_text_preserves_failure_details_and_retry_guidance() {
     assert!(
         text.contains("inspect could not complete: metrics did not complete (inspect_not_fresh).")
     );
-    assert!(text.contains("Completed phases: 1. Retry, or narrow with sections=..."));
+    assert!(text.contains("Retry aft_inspect, or narrow the scope."));
+    assert!(!text.contains("Completed phases"));
     assert!(
         !text.contains("request failed"),
         "generic failure leaked into text: {text}"
@@ -232,12 +233,28 @@ fn inspect_interrupted_text_names_the_terminal_and_safe_retry() {
     };
 
     let text = format_response_with_context("inspect", &response, &FormatContext::default());
-    assert!(text.contains("inspect was interrupted"));
-    assert!(text.contains("Retry is safe"));
+    assert!(text.contains("INTERRUPTED — inspect stopped"));
+    assert!(text.contains("Retry aft_inspect"));
     assert!(
         !text.contains("request failed"),
         "generic failure leaked into text: {text}"
     );
+}
+
+#[test]
+fn inspect_deadline_details_use_plain_language_not_phase_ids() {
+    let response = Response {
+        id: "inspect".to_string(),
+        success: false,
+        data: serde_json::json!({
+            "inspect_terminal": "phase_failed",
+            "failure_reason": "lsp_quiescence timeout",
+            "failure_detail": "request deadline elapsed during lsp_quiescence",
+            "completed_phases": [{"id": "lsp_start"}]
+        }),
+    };
+    let text = format_response_with_context("inspect", &response, &FormatContext::default());
+    assert_eq!(text, "PHASE-FAILED — inspect could not complete: request deadline elapsed during waiting for language servers (waiting for language servers timeout). Retry aft_inspect, or narrow the scope.");
 }
 
 #[test]

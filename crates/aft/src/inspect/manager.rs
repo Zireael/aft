@@ -5619,6 +5619,11 @@ fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome
     }
 }
 
+#[cfg(test)]
+pub(crate) fn filter_payload_for_scope_for_test(payload: Value, scope: &JobScope) -> Value {
+    filter_payload_for_scope(payload, scope)
+}
+
 fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) -> serde_json::Value {
     if scope.is_project_wide() {
         return payload;
@@ -5627,18 +5632,64 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
     // Scoped Tier 2 callers pass an uncapped rollup into this filter and cap
     // drill-down only afterwards, so the recomputed count below remains the
     // true in-scope total rather than the size of a capped sample.
+    let duplicates = payload.get("duplicated_lines").is_some();
+    if duplicates {
+        // A duplicate group may cross the boundary. Keep its scoped occurrences
+        // even if only one remains, and label the count as groups touching scope.
+        for key in ["items", "groups", "generated_items"] {
+            if let Some(values) = payload.get_mut(key).and_then(Value::as_array_mut) {
+                values.retain_mut(|value| {
+                    let Some(files) = value.get_mut("files").and_then(Value::as_array_mut) else {
+                        return false;
+                    };
+                    files.retain(|file| {
+                        file.as_str().is_some_and(|file| {
+                            scope.contains_display_path(display_file_from_occurrence(file))
+                        })
+                    });
+                    let first = files.first().and_then(Value::as_str).map(str::to_string);
+                    if let Some(first) = first {
+                        let lines = value["files"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .filter_map(parse_duplicate_occurrence)
+                            .map(|(_, start, end)| end.saturating_sub(start).saturating_add(1))
+                            .sum::<u64>();
+                        if value.get("duplicated_lines").is_some() {
+                            value["duplicated_lines"] = json!(lines);
+                        }
+                        update_duplicate_group_sample(value, &first);
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+        }
+    }
     if let Some(items) = payload
         .get_mut("items")
         .and_then(|value| value.as_array_mut())
     {
-        let count = filter_values_for_scope(items, scope);
+        let count = if duplicates {
+            items.len()
+        } else {
+            filter_values_for_scope(items, scope)
+        };
+        let headline_count = items
+            .iter()
+            .filter(|item| item["generated"] != true)
+            .count();
         let largest_cycle = items
             .iter()
             .filter_map(|item| item.get("files").and_then(Value::as_array).map(Vec::len))
             .max();
         if let Some(object) = payload.as_object_mut() {
-            object.insert("count".to_string(), serde_json::json!(count));
+            object.insert("count".to_string(), serde_json::json!(headline_count));
             if object.contains_key("largest") {
+                object.insert("scope_relation".to_string(), json!("touches"));
                 object.insert(
                     "largest".to_string(),
                     serde_json::json!(largest_cycle.unwrap_or(0)),
@@ -5657,7 +5708,11 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
         .get_mut("groups")
         .and_then(|value| value.as_array_mut())
     {
-        let count = filter_values_for_scope(groups, scope);
+        let count = if duplicates {
+            groups.len()
+        } else {
+            filter_values_for_scope(groups, scope)
+        };
         if let Some(object) = payload.as_object_mut() {
             object.insert("count".to_string(), serde_json::json!(count));
             object.insert("total_groups".to_string(), serde_json::json!(count));
@@ -5673,6 +5728,49 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
     // carry per-item language, so we can't faithfully recompute it — drop it so
     // the scoped summary doesn't render a misleading project-wide breakdown.
     if let Some(object) = payload.as_object_mut() {
+        for (items_key, count_key, top_key) in [
+            ("test_only_items", "test_only_count", "test_only_top"),
+            ("generated_items", "generated_count", "generated_top"),
+            ("uncertain_items", "uncertain_count", "uncertain_top"),
+        ] {
+            if let Some(items) = object.get_mut(items_key).and_then(Value::as_array_mut) {
+                if !duplicates {
+                    filter_values_for_scope(items, scope);
+                }
+                let count = items.len();
+                let top = scoped_top_preview(items);
+                object.insert(count_key.to_string(), json!(count));
+                object.insert(top_key.to_string(), top);
+            } else {
+                object.remove(count_key);
+                object.remove(top_key);
+            }
+        }
+        if object.contains_key("total_count") {
+            let total = ["count", "test_only_count", "generated_count"]
+                .iter()
+                .filter_map(|key| object.get(*key).and_then(Value::as_u64))
+                .sum::<u64>();
+            object.insert("total_count".to_string(), json!(total));
+        }
+        if object.contains_key("worst") {
+            let worst = object
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .max_by(|left, right| {
+                    left["complexity"]
+                        .as_u64()
+                        .cmp(&right["complexity"].as_u64())
+                        .then_with(|| right["file"].as_str().cmp(&left["file"].as_str()))
+                        .then_with(|| right["function"].as_str().cmp(&left["function"].as_str()))
+                        .then_with(|| right["line"].as_u64().cmp(&left["line"].as_u64()))
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            object.insert("worst".to_string(), worst);
+        }
         if object.contains_key("top") {
             if let Some(top) = recompute_scoped_top_preview(object) {
                 object.insert("top".to_string(), top);
@@ -5680,10 +5778,41 @@ fn filter_payload_for_scope(mut payload: serde_json::Value, scope: &JobScope) ->
                 filter_values_for_scope(top, scope);
             }
         }
-        if object.contains_key("duplicated_lines") {
+        if duplicates {
             recompute_duplicate_payload_stats(object);
+            object.insert("scope_relation".to_string(), json!("touches"));
+            // No per-file denominator or suppression census survives in a
+            // project aggregate. Do not pass those repo-wide totals as scoped.
+            for key in [
+                "duplicated_percent",
+                "total_analyzed_lines",
+                "generated_duplicated_lines",
+                "generated_duplicated_file_count",
+                "total_duplicated_lines",
+                "total_duplicated_file_count",
+                "suppressed_groups",
+                "mirror_suppressed_groups",
+                "marker_suppressed_groups",
+            ] {
+                object.remove(key);
+            }
         }
         object.remove("by_language");
+        for key in [
+            "excluded_test_count",
+            "excluded_test_files",
+            "languages_skipped",
+            "scanned_files",
+        ] {
+            object.remove(key);
+        }
+        // Parse failures belong to the files that failed, not to every scope
+        // sharing a cached aggregate. Keep non-file capability gaps unchanged.
+        for key in ["gaps", "parse_errors"] {
+            if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+                filter_values_for_scope(rows, scope);
+            }
+        }
     }
 
     payload
@@ -5697,21 +5826,11 @@ fn recompute_duplicate_payload_stats(object: &mut serde_json::Map<String, Value>
         .cloned()
         .unwrap_or_default();
     let (duplicated_lines, duplicated_file_count) = duplicate_line_stats_from_values(&values);
-    let total_analyzed_lines = object
-        .get("total_analyzed_lines")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let duplicated_percent = if total_analyzed_lines == 0 {
-        0.0
-    } else {
-        (duplicated_lines as f64 * 100.0) / total_analyzed_lines as f64
-    };
     object.insert("duplicated_lines".to_string(), json!(duplicated_lines));
     object.insert(
         "duplicated_file_count".to_string(),
         json!(duplicated_file_count),
     );
-    object.insert("duplicated_percent".to_string(), json!(duplicated_percent));
 }
 
 fn duplicate_line_stats_from_values(values: &[Value]) -> (u64, usize) {
@@ -5764,13 +5883,22 @@ fn recompute_scoped_top_preview(
         .get("items")
         .or_else(|| object.get("groups"))
         .and_then(Value::as_array)?;
-    Some(Value::Array(
+    let headline = values
+        .iter()
+        .filter(|item| item["generated"] != true)
+        .cloned()
+        .collect::<Vec<_>>();
+    Some(scoped_top_preview(&headline))
+}
+
+fn scoped_top_preview(values: &[Value]) -> Value {
+    Value::Array(
         values
             .iter()
             .take(super::entry_points::TOP_PREVIEW_ITEMS)
             .map(top_preview_value)
             .collect(),
-    ))
+    )
 }
 
 fn top_preview_value(value: &Value) -> Value {
@@ -5795,6 +5923,13 @@ fn filter_values_for_scope(values: &mut Vec<serde_json::Value>, scope: &JobScope
 }
 
 fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> bool {
+    let is_cycle = value.get("cycle").is_some();
+    if let Some(tests) = value.get_mut("used_by_tests").and_then(Value::as_array_mut) {
+        tests.retain(|test| {
+            test.as_str()
+                .is_some_and(|file| scope.contains_display_path(file))
+        });
+    }
     if let Some(file) = value.get("file").and_then(|file| file.as_str()) {
         return scope.contains_display_path(file);
     }
@@ -5807,7 +5942,7 @@ fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> boo
             file.as_str()
                 .is_some_and(|file| scope.contains_display_path(display_file_from_occurrence(file)))
         });
-        if files.len() < 2 {
+        if files.is_empty() || (!is_cycle && files.len() < 2) {
             return false;
         }
         files.first().and_then(Value::as_str).map(str::to_string)
@@ -5817,6 +5952,27 @@ fn prune_value_for_scope(value: &mut serde_json::Value, scope: &JobScope) -> boo
 
     if let Some(occurrence) = first_scoped_occurrence {
         update_duplicate_group_sample(value, &occurrence);
+    }
+    if is_cycle {
+        // A cycle may depend on files outside the scope. Its scoped display is
+        // a slice of that cycle, never an invented closed cycle in these files.
+        let cycle = value["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        value["cycle"] = json!(cycle);
+        if let Some(edges) = value.get_mut("edges").and_then(Value::as_array_mut) {
+            edges.retain(|edge| {
+                ["from", "to"].iter().all(|key| {
+                    edge[*key]
+                        .as_str()
+                        .is_some_and(|file| scope.contains_display_path(file))
+                })
+            });
+        }
     }
 
     true
@@ -6111,6 +6267,64 @@ mod guard_tests {
         let census = store.stale_path_census().expect("census");
         assert_eq!(census.stale, 0);
         assert_eq!(census.undecodable, 1, "the skipped file must be reported");
+    }
+
+    #[test]
+    fn scoped_filter_narrows_every_summary_and_preview() {
+        let scope = JobScope::from_roots("/repo", vec![PathBuf::from("/repo/src/in")]);
+        let payload = json!({
+            "count": 2, "total_count": 99, "test_only_count": 479, "generated_count": 12,
+            "excluded_test_count": 80, "excluded_test_files": 20,
+            "items": [{"file": "src/out/a.ts", "function": "outside", "complexity": 215},
+                      {"file": "src/in/b.ts", "function": "inside", "complexity": 12}],
+            "worst": {"file": "src/out/a.ts", "function": "outside", "complexity": 215},
+            "test_only_items": [{"file": "src/out/a.ts", "symbol": "outside"},
+                                {"file": "src/in/b.ts", "symbol": "inside"}],
+            "test_only_top": [{"file": "src/out/a.ts", "symbol": "outside"}],
+            "generated_items": [{"file": "src/out/a.ts", "symbol": "outside"}],
+            "generated_top": [{"file": "src/out/a.ts", "symbol": "outside"}]
+        });
+        let filtered = filter_payload_for_scope(payload, &scope);
+        assert_eq!(filtered["worst"]["function"], "inside");
+        assert_eq!(filtered["test_only_count"], 1);
+        assert_eq!(filtered["generated_count"], 0);
+        assert_eq!(filtered["total_count"], 2);
+        assert!(filtered.get("excluded_test_count").is_none());
+        assert!(!filtered.to_string().contains("outside"), "{filtered}");
+
+        let duplicates = filter_payload_for_scope(
+            json!({
+                "count": 2, "total_analyzed_lines": 968281, "duplicated_lines": 100,
+                "duplicated_percent": 0.01, "suppressed_groups": 72,
+                "items": [{"files": ["src/out/a.ts:1-20", "src/out/b.ts:1-20"]},
+                          {"files": ["src/in/b.ts:1-20", "src/out/c.ts:1-20"]}]
+            }),
+            &scope,
+        );
+        assert_eq!(
+            duplicates["count"], 1,
+            "cross-boundary groups must touch the scope"
+        );
+        assert_eq!(duplicates["scope_relation"], "touches");
+        assert!(duplicates.get("total_analyzed_lines").is_none());
+        assert!(duplicates.get("suppressed_groups").is_none());
+        assert!(!duplicates.to_string().contains("src/out"), "{duplicates}");
+
+        let cycles = filter_payload_for_scope(
+            json!({
+                "count": 1, "largest": 3, "items": [{
+                    "cycle": "src/in/a.ts -> src/out/b.ts -> src/in/c.ts",
+                    "files": ["src/in/a.ts", "src/out/b.ts", "src/in/c.ts"],
+                    "edges": [{"from": "src/in/a.ts", "to": "src/out/b.ts"},
+                              {"from": "src/in/c.ts", "to": "src/in/a.ts"}]
+                }]
+            }),
+            &scope,
+        );
+        assert_eq!(cycles["count"], 1);
+        assert_eq!(cycles["largest"], 2);
+        assert_eq!(cycles["scope_relation"], "touches");
+        assert!(!cycles.to_string().contains("src/out"), "{cycles}");
     }
 
     #[test]

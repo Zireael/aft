@@ -1,2 +1,1 @@
-inspect could not complete: metrics did not complete (inspect_not_fresh).
-Completed phases: 1. Retry, or narrow with sections=...
+PHASE-FAILED — inspect could not complete: metrics did not complete (inspect_not_fresh). Retry aft_inspect, or narrow the scope.

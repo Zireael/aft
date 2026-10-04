@@ -2471,7 +2471,7 @@ fn inspect_tool_call_multiple_roots_reports_combined_corpus_and_duplicates() {
     assert!(
         combined["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("scope: 2 roots, 4 files\n")),
+            .is_some_and(|text| text.lines().any(|line| line == "scope: 2 roots, 4 files")),
         "response: {combined:#}"
     );
     let alpha_count = alpha["summary"]["duplicates"]["count"]
@@ -3576,9 +3576,10 @@ fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
     // `src/main.rs` has no Cargo.toml, so Rust diagnostics are unknown and the
     // rendered text opens with the partial header that names rust.
     let mut lines = text.lines();
-    assert_eq!(
-        lines.next(),
-        Some("PARTIAL: diagnostics unknown for rust (see below)"),
+    assert!(
+        lines.next().is_some_and(|line| line
+            .starts_with("PARTIAL — diagnostics unknown: rust-analyzer")
+            && line.contains("retry aft_inspect")),
         "{text}"
     );
     assert!(
@@ -3931,11 +3932,11 @@ fn scoped_blocking_inspect_caps_the_files_it_opens() {
         "response: {response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
-    // The coverage line counts files with authoritative diagnostics: the 1000
-    // opened and answered, but not the one file past the cap, which is the
-    // single uncovered file asserted above.
+    // The cap's unknown file is explained once in the header; exact coverage
+    // remains structured rather than repeating incompleteness in a body line.
     assert!(
-        text.contains("authoritative results for 1000 of 1001 scoped files (1 not examined"),
+        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: not examined:")
+            && text.contains("(1 file); retry aft_inspect."),
         "{text}"
     );
 }
@@ -3962,7 +3963,7 @@ fn scoped_blocking_inspect_names_an_unfinished_cargo_check() {
     );
     let text = response["text"].as_str().expect("rendered text");
     assert!(
-        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry;"),
+        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running (1 file); retry aft_inspect."),
         "{text}"
     );
 }
@@ -4889,7 +4890,7 @@ fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
     .expect("inspect response serializes");
 
     let text = response["text"].as_str().expect("rendered text");
-    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
     assert!(!text.contains("0 errors"), "{text}");
     assert!(text.contains("rust"), "{text}");
     assert!(response["summary"]["diagnostics"]["errors"].is_null());
@@ -4972,17 +4973,14 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     let text = response["text"].as_str().expect("rendered text");
     let group_lines = text
         .lines()
-        .filter(|line| line.starts_with("Incomplete diagnostics: no authoritative diagnostics"))
+        .filter(|line| line.starts_with("PARTIAL — diagnostics unknown:"))
         .collect::<Vec<_>>();
     assert_eq!(group_lines.len(), 1, "one line per cause: {text}");
     assert!(
-        group_lines[0].starts_with(
-            "Incomplete diagnostics: no authoritative diagnostics for 7 files (typescript in web: "
-        ),
+        group_lines[0].starts_with("PARTIAL — diagnostics unknown: typescript @ web: "),
         "{text}"
     );
-    // The remedy is printed once, on the TypeScript producer's failure line;
-    // the group line names that producer instead of repeating the reason.
+    // The status header carries the install remedy exactly once.
     let remedy = "no node_modules in web: the project's dependencies are not installed; \
                   run your package manager's install";
     assert_eq!(
@@ -4992,12 +4990,12 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     );
     assert!(
         text.lines().any(|line| line
-            .starts_with("Incomplete diagnostics: producer typescript @ web failed (")
+            .starts_with("PARTIAL — diagnostics unknown: typescript @ web: ")
             && line.contains(remedy)),
         "the producer line must carry the install remedy: {text}"
     );
     assert!(
-        group_lines[0].ends_with("(typescript in web: producer typescript failed, reason above)"),
+        group_lines[0].ends_with("(7 files); retry aft_inspect."),
         "{text}"
     );
     let listed = text
@@ -5084,8 +5082,13 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     // The Rust producer failed, so the completed result is partial and its
     // reason names rust.
     assert_eq!(response["inspect_terminal"], "partial");
-    assert_eq!(
-        response["partial_reason"], "diagnostics unknown for rust",
+    assert!(
+        response["partial_reason"]
+            .as_str()
+            .is_some_and(
+                |reason| reason.starts_with("diagnostics unknown: rust-analyzer @ .:")
+                    && reason.ends_with("retry aft_inspect.")
+            ),
         "{response:#}"
     );
     assert_eq!(response["complete"], false);
@@ -5100,7 +5103,7 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
         .and_then(|gaps| gaps.iter().find(|gap| gap["producer"] == "rust"))
         .unwrap_or_else(|| panic!("Rust producer gap missing: {response:#}"));
     let text = response["text"].as_str().expect("rendered text");
-    assert!(text.contains("diagnostics: unknown"), "{text}");
+    assert!(text.starts_with("PARTIAL — diagnostics unknown:"), "{text}");
     assert!(!text.contains("diagnostics: 0 errors"), "{text}");
     assert!(text.contains("from typescript"), "{text}");
     assert!(text.contains("test diagnostic error"), "{text}");
@@ -5367,7 +5370,9 @@ fn assert_removed_field_reported(response: &Value) {
     if still_checking {
         assert_eq!(response["complete"], false, "{response:#}");
         assert!(
-            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            text.starts_with(
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running"
+            ),
             "{text}"
         );
         return;
@@ -5551,7 +5556,9 @@ fn reported_check_still_running(response: &Value) -> bool {
         assert_eq!(response["complete"], false, "{response:#}");
         let text = response["text"].as_str().expect("rendered text");
         assert!(
-            text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry"),
+            text.starts_with(
+                "PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running"
+            ),
             "{text}"
         );
     }
@@ -5805,7 +5812,7 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
     );
     let text = response["text"].as_str().expect("rendered text");
     assert!(
-        text.contains("diagnostics: unknown (rust-analyzer: cargo check still running; retry)"),
+        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running; retry aft_inspect."),
         "{text}"
     );
     assert!(!text.contains("producer rust failed"), "{text}");
