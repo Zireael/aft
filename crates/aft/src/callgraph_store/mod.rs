@@ -519,6 +519,18 @@ mod root_repair_warning_tests {
 
 #[cfg(test)]
 mod write_amplification_tests {
+    #[test]
+    fn durability_callgraph_pointer_count() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::durability::take();
+        super::publish_pointer(dir.path(), "durability", "generation.sqlite").unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert_eq!(
+            std::fs::read(super::pointer_path(dir.path(), "durability")).unwrap(),
+            b"generation.sqlite\n"
+        );
+    }
     use super::*;
     use std::fs;
     use tempfile::tempdir;
@@ -4563,7 +4575,6 @@ impl CallGraphStore {
             // brand-new and owned by us, so the rename never hits an open file.
             remove_sqlite_file_set(&gen_path);
             crate::fs_lock::rename_over(&temp_path, &gen_path)?;
-            crate::fs_lock::sync_parent(&gen_path);
             remove_sqlite_sidecars(&gen_path);
             // The rename moves the staging database file alone. Its WAL and
             // WAL-index describe the file that just left, and the staging path
@@ -8867,7 +8878,6 @@ fn publish_backup_migration(
     }
     destination.execute_batch("PRAGMA optimize;")?;
     drop(destination);
-    sync_file(&temp_path)?;
     fail_after_temp_copy_for_test()?;
 
     let mut source = source.clone();
@@ -8905,7 +8915,6 @@ fn publish_migrated_generation(
         verify_writer_lease(&writer_lease)?;
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
-        crate::fs_lock::sync_parent(&gen_path);
         // A backup copy is written in rollback mode; switch it while no
         // pointer names it, as a cold build does.
         switch_generation_to_wal_before_publication(&gen_path);
@@ -8938,7 +8947,6 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
         }
         let destination_path = sqlite_file_set_path(destination, suffix);
         std::fs::copy(&source_path, &destination_path)?;
-        sync_file(&destination_path)?;
     }
     Ok(())
 }
@@ -9009,15 +9017,6 @@ fn sqlite_file_set_path(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-fn sync_file(path: &Path) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    file.sync_all()?;
-    Ok(())
-}
-
 fn fail_after_temp_copy_for_test() -> Result<()> {
     if MIGRATION_FAIL_AFTER_TEMP_COPY.with(|slot| slot.get()) {
         return Err(CallGraphStoreError::Unavailable(
@@ -9074,13 +9073,11 @@ fn write_migration_manifest(
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
     }
     if let Err(error) = crate::fs_lock::rename_over(&temp_path, &manifest_path) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(error.into());
     }
-    crate::fs_lock::sync_parent(&manifest_path);
     Ok(())
 }
 
@@ -9152,7 +9149,6 @@ fn cleanup_incomplete_migrations(callgraph_dir: &Path, project_key: &str) {
             let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &name));
         }
     }
-    crate::fs_lock::sync_parent(callgraph_dir);
 }
 
 fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
@@ -10361,7 +10357,7 @@ fn refuse_newer_published_format(callgraph_dir: &Path, project_key: &str) -> Res
 }
 
 /// Atomically publish `generation` as the current store by flipping the pointer
-/// file. Writes a temp file, fsyncs, then renames over the pointer — never
+/// file. Writes a temp file, then atomically renames over the pointer — never
 /// replacing an open DB file, so it succeeds cross-platform.
 fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) -> Result<()> {
     // Last line of defence: never move the pointer away from a generation
@@ -10378,13 +10374,13 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
         let mut file = std::fs::File::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
+        // Generations rebuild from source. Atomic replacement is sufficient
+        // for readers; the pointer need not survive power loss.
     }
     if let Err(error) = crate::fs_lock::rename_over(&tmp, &pointer) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
     }
-    crate::fs_lock::sync_parent(&pointer);
     Ok(())
 }
 
@@ -10719,9 +10715,7 @@ fn sweep_callgraph_root_dirs_with_limits(
             cursors.remove(root_dir);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(root_dir);
-    }
+    if summary.removed > 0 {}
     summary
 }
 
@@ -11079,9 +11073,7 @@ fn sweep_orphaned_build_temps_older_than(callgraph_dir: &Path, min_age: Duration
             Err(_) => {}
         }
     }
-    if removed_any {
-        crate::fs_lock::sync_parent(callgraph_dir);
-    }
+    if removed_any {}
 }
 
 /// Bound the cold-build's tree-sitter pass to half the cores (cap 8) instead of
