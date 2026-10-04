@@ -1,0 +1,232 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/per_checkout_semantic_runtime.rs"
+  ],
+  "note": "The ranking-fenced semantic_search/mod.rs edits restore lexical-winning semantic symbol previews and disclose checkout coverage gaps. Candidate enumeration, lane plans, scores, fusion and paging are unchanged. Legacy migration isolates unusable equal-key payloads. These exact summary_text transitions are copied from the checked-in reference (sha256 396d491df35d5d203d159b28815bb164ed8e41e051dff4a227649ebd59a0b60b) and a real aft 0.58.2 release replay (binary sha256 535aa74067aa2357ef56a087382f85070560d8d1e0ec00231a721122894093fa, score sha256 90ffe51fba4c3477f615339b4cf26eea10346bb1cae5ec134b0aa07793457c14). All 93 rows are byte-equal except these ten summary_text fields; families, fixture groups, shapes and mechanisms are equal. The next train must re-record the reference; this delivery does not change it.",
+  "presentation_rows": {
+    "followup-census:910001": {
+      "before": [
+        "[pattern `ast_grep_search`: 23 files matched, 19 also found by the query; no definition found]",
+        "",
+        "crates/aft/src/search_index.rs [lexical match]",
+        "",
+        "crates/aft/src/main.rs [lexical match]",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `ast_grep_search`: 23 files matched, 19 also found by the query; no definition found]",
+        "",
+        "crates/aft/src/search_index.rs [lexical match]",
+        "  ingest_paths_parallel [method] lines 1241-1288",
+        "          fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {",
+        "              let max_file_size = self.max_file_size;",
+        "              let pool_size = search_index_build_pool_size();",
+        "              let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);"
+      ]
+    },
+    "followup-census:910003": {
+      "before": [
+        "[pattern `Error|Result`: 569 files matched, 143 also found by the query; defined in crates/aft/src/callgraph_store/mod.rs:939, crates/aft/src/backup.rs:269, crates/aft/src/views/mod.rs:101]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]",
+        "",
+        "packages/aft-bridge/src/subc-transport.ts [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `Error|Result`: 569 files matched, 143 also found by the query; defined in crates/aft/src/callgraph_store/mod.rs:939, crates/aft/src/backup.rs:269, crates/aft/src/views/mod.rs:101]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "  SUBC_MODULE_RESTART_DISPOSITION [variable] lines 76-77",
+        "      export const SUBC_MODULE_RESTART_DISPOSITION =",
+        "        \"The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.\";",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]"
+      ]
+    },
+    "followup-census:910004": {
+      "before": [
+        "[pattern `Error|Result`: 569 files matched, 292 also found by the query; defined in crates/aft/src/callgraph_store/mod.rs:939, crates/aft/src/backup.rs:269, crates/aft/src/views/mod.rs:101]",
+        "",
+        ".cortexkit/alfonso/drafts/2026-08-09-hashline-edit-surface-refire4.md:59 [exact]",
+        "      …llback mechanism. It performs no externally visible mutation. Phase 2 processes files sequentially through backup, write, formatting, validation, durability, authoritative final-byte observation, and LSP notification under one patch-level undo identity. Baseline bytes are rechecked immediately before each write. A stopping execution failure produces an ordered mutation-result envelope with an explicit per-file classification and marks later files skipped; it is not converted back into a Phase-1… [line truncated]",
+        "",
+        "crates/aft/src/hashline/transaction/mod.rs [lexical match]",
+        "",
+        "crates/aft/src/backup.rs [lexical match]"
+      ],
+      "after": [
+        "[pattern `Error|Result`: 569 files matched, 292 also found by the query; defined in crates/aft/src/callgraph_store/mod.rs:939, crates/aft/src/backup.rs:269, crates/aft/src/views/mod.rs:101]",
+        "",
+        ".cortexkit/alfonso/drafts/2026-08-09-hashline-edit-surface-refire4.md:59 [exact]",
+        "      …llback mechanism. It performs no externally visible mutation. Phase 2 processes files sequentially through backup, write, formatting, validation, durability, authoritative final-byte observation, and LSP notification under one patch-level undo identity. Baseline bytes are rechecked immediately before each write. A stopping execution failure produces an ordered mutation-result envelope with an explicit per-file classification and marks later files skipped; it is not converted back into a Phase-1… [line truncated]",
+        "",
+        "crates/aft/src/hashline/transaction/mod.rs [lexical match]",
+        "  mixed_patch_keeps_distinct_file_independent_and_same_path_pair_atomic [function] lines 1984-2067",
+        "          #[test]"
+      ]
+    },
+    "followup-census:910005": {
+      "before": [
+        "[pattern `^pub struct (FormatContext|HostEscalationAttempt|PinOwner|ServerKey|LspManager|LspChildRegistry|FileId|InspectSnapshot|DispatchHandles|SwiftSyntax|PhpSyntax|KotlinSyntax|CSharpSyntax|CSyntax|ExternalToolResult|WriteResult|FileFreshness|AlertEngine|SemanticIndexFingerprint|SearchIndex|ShapeWeights|ListEnvelope|LockGuard|AppContext|Config|TomlFilter|PytestCompressor|CargoCompressor|BunCompressor|OutputProbe)\\b`: 30 files matched, 19 also found by the query; defined in crates/aft/src/alert_render.rs:157, crates/aft/src/cache_freshness.rs:65, crates/aft/src/compress/bun.rs:5]",
+        "",
+        "packages/pi-plugin/src/tools/bash.ts [lexical match]",
+        "",
+        "crates/aft/src/compress/mod.rs [lexical match]",
+        "",
+        "crates/aft/src/compress/vitest.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `^pub struct (FormatContext|HostEscalationAttempt|PinOwner|ServerKey|LspManager|LspChildRegistry|FileId|InspectSnapshot|DispatchHandles|SwiftSyntax|PhpSyntax|KotlinSyntax|CSharpSyntax|CSyntax|ExternalToolResult|WriteResult|FileFreshness|AlertEngine|SemanticIndexFingerprint|SearchIndex|ShapeWeights|ListEnvelope|LockGuard|AppContext|Config|TomlFilter|PytestCompressor|CargoCompressor|BunCompressor|OutputProbe)\\b`: 30 files matched, 19 also found by the query; defined in crates/aft/src/alert_render.rs:157, crates/aft/src/cache_freshness.rs:65, crates/aft/src/compress/bun.rs:5]",
+        "",
+        "packages/pi-plugin/src/tools/bash.ts [lexical match]",
+        "  BashCompressionParam [variable] lines 150-157",
+        "      const BashCompressionParam = {",
+        "        compressed: Type.Optional(",
+        "          Type.Boolean({",
+        "            description:"
+      ]
+    },
+    "followup-census:910006": {
+      "before": [
+        "[pattern `shutdown_all`: 5 files matched, 5 also found by the query; defined in crates/aft/src/lsp/manager.rs:2295]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "",
+        "crates/aft/src/subc/mod.rs [lexical match]",
+        "",
+        "crates/aft/src/lsp/manager.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `shutdown_all`: 5 files matched, 5 also found by the query; defined in crates/aft/src/lsp/manager.rs:2295]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "  SUBC_MODULE_RESTART_DISPOSITION [variable] lines 76-77",
+        "      export const SUBC_MODULE_RESTART_DISPOSITION =",
+        "        \"The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.\";",
+        "",
+        "crates/aft/src/subc/mod.rs [lexical match]"
+      ]
+    },
+    "followup-census:910007": {
+      "before": [
+        "[pattern `shutdown_all`: 5 files matched, 5 also found by the query; defined in crates/aft/src/lsp/manager.rs:2295]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "",
+        "crates/aft/src/subc/mod.rs [lexical match]",
+        "",
+        "crates/aft/src/lsp/manager.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `shutdown_all`: 5 files matched, 5 also found by the query; defined in crates/aft/src/lsp/manager.rs:2295]",
+        "",
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "  SUBC_MODULE_RESTART_DISPOSITION [variable] lines 76-77",
+        "      export const SUBC_MODULE_RESTART_DISPOSITION =",
+        "        \"The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.\";",
+        "",
+        "crates/aft/src/subc/mod.rs [lexical match]"
+      ]
+    },
+    "followup-census:910008": {
+      "before": [
+        "crates/aft/src/search_index.rs [lexical match]",
+        "",
+        "crates/aft/src/main.rs [lexical match]",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]",
+        "",
+        "crates/aft/src/callgraph_store/mod.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "crates/aft/src/search_index.rs [lexical match]",
+        "  ingest_paths_parallel [method] lines 1241-1288",
+        "          fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {",
+        "              let max_file_size = self.max_file_size;",
+        "              let pool_size = search_index_build_pool_size();",
+        "              let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);",
+        "              let pool = match rayon::ThreadPoolBuilder::new()",
+        "                  .num_threads(pool_size)"
+      ]
+    },
+    "followup-census:910009": {
+      "before": [
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]",
+        "",
+        "packages/aft-bridge/src/subc-transport.ts [lexical match]",
+        "",
+        "crates/aft/src/subc/mod.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "packages/aft-bridge/src/error-contract.ts [lexical match]",
+        "  SUBC_MODULE_RESTART_DISPOSITION [variable] lines 76-77",
+        "      export const SUBC_MODULE_RESTART_DISPOSITION =",
+        "        \"The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.\";",
+        "",
+        "crates/aft/src/runtime_drain.rs [lexical match]",
+        "  shutdown_idle_lsp [function] lines 2811-2816",
+        "      /// Shut down language servers for a standalone runtime whose last request is"
+      ]
+    },
+    "followup-census:910011": {
+      "before": [
+        "[pattern `Tier2PhaseTimings|Error`: 439 files matched, 51 also found by the query; defined in crates/aft/src/backup.rs:269, crates/aft/src/inspect/manager.rs:2641]",
+        "",
+        "crates/aft/src/inspect/manager.rs [lexical match]",
+        "",
+        "crates/aft/src/logging.rs [lexical match]",
+        "",
+        "crates/aft/src/context.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `Tier2PhaseTimings|Error`: 439 files matched, 51 also found by the query; defined in crates/aft/src/backup.rs:269, crates/aft/src/inspect/manager.rs:2641]",
+        "",
+        "crates/aft/src/inspect/manager.rs [lexical match]",
+        "  latest_tier2_counts [method] lines 1215-1255",
+        "          /// Latest persisted counts for the three Tier-2 categories, in",
+        "          /// `(dead_code, unused_exports, duplicates)` order. Reads the most recent",
+        "          /// aggregate regardless of contribution-hash freshness (last-known), so the",
+        "          /// agent status bar can refresh after a background scan completes without a"
+      ]
+    },
+    "followup-census:910012": {
+      "before": [
+        "[pattern `tracked_files|Error`: 443 files matched, 176 also found by the query; defined in crates/aft/src/backup.rs:269]",
+        "",
+        "crates/aft/src/protocol.rs [lexical match]",
+        "",
+        "crates/aft/src/backup.rs [lexical match]",
+        "",
+        "crates/aft/src/commands/status.rs [lexical match]",
+        ""
+      ],
+      "after": [
+        "[pattern `tracked_files|Error`: 443 files matched, 176 also found by the query; defined in crates/aft/src/backup.rs:269]",
+        "",
+        "crates/aft/src/protocol.rs [lexical match]",
+        "  new [method] lines 193-199",
+        "          pub fn new(session_id: Option<String>, snapshot: StatusPayload) -> Self {",
+        "              Self {",
+        "                  frame_type: \"status_changed\",",
+        "                  session_id,"
+      ]
+    }
+  }
+}

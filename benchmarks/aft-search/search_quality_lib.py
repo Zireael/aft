@@ -629,11 +629,34 @@ def derive_slice_class(paths: Sequence[str]) -> str:
     return "ranking" if any(any(path == prefix or path.startswith(prefix) for prefix in RANKING_FENCE_PREFIXES) for path in paths) else "non_ranking"
 
 
+def validate_presentation_rows(descriptor: Mapping[str, Any]) -> None:
+    """Allow only exact rendered-line transitions, never a ranking-field waiver."""
+    if "presentation_rows" not in descriptor:
+        return
+    if descriptor.get("slice_class") != "engine_unwired":
+        raise InputFault("malformed_descriptor:presentation_rows:engine_unwired_only")
+    entries = descriptor["presentation_rows"]
+    if not isinstance(entries, Mapping):
+        raise InputFault("malformed_descriptor:presentation_rows:not_a_map")
+    for episode_id, entry in entries.items():
+        if not isinstance(episode_id, str):
+            raise InputFault("malformed_descriptor:presentation_rows:episode_id")
+        episode_number(episode_id)
+        field = f"presentation_rows.{episode_id}"
+        if not isinstance(entry, Mapping) or set(entry) != {"before", "after"}:
+            raise InputFault(f"malformed_descriptor:{field}:keys_must_be_before_after")
+        for side in ("before", "after"):
+            lines = entry[side]
+            if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+                raise InputFault(f"malformed_descriptor:{field}.{side}:not_string_lines")
+
+
 def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> tuple[dict[str, Any], bool]:
     derived = derive_slice_class(list(diff_paths))
     missing_ranking = descriptor is None and derived == "ranking"
     if descriptor is None:
         return {"slice_class": derived, "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}, missing_ranking
+    validate_presentation_rows(descriptor)
     declared = descriptor.get("slice_class")
     if declared == "engine_unwired":
         if derived != "ranking":
@@ -782,8 +805,49 @@ def _first_family_difference(reference: Mapping[str, Any], score: Mapping[str, A
     return None
 
 
-def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str]) -> str | None:
-    row = _first_row_difference(reference, score)
+def _presentation_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any], presentation_rows: Mapping[str, Any]) -> str | None:
+    """Compare all row fields, exempting only observed, declared line transitions.
+
+    Validate every declaration even when the scores are equal: a stale allowance
+    must fail rather than silently permit a later, unrelated presentation change.
+    Row order and identities remain part of the strict comparison.
+    """
+    old_rows = reference.get("rows", [])
+    new_rows = score.get("rows", [])
+    if not isinstance(old_rows, list) or not isinstance(new_rows, list):
+        return "real_query.rows"
+    for episode_id, transition in presentation_rows.items():
+        old = next((row for row in old_rows if isinstance(row, Mapping) and row.get("episode_id") == episode_id), None)
+        new = next((row for row in new_rows if isinstance(row, Mapping) and row.get("episode_id") == episode_id), None)
+        field = f"real_query.{episode_id}.summary_text"
+        if old is None:
+            return f"{field}:missing_reference_row"
+        if new is None:
+            return f"{field}:missing_score_row"
+        if "summary_text" not in old or canonical_json(old["summary_text"]) != canonical_json(transition["before"]):
+            return f"{field}:before_mismatch"
+        if "summary_text" not in new or canonical_json(new["summary_text"]) != canonical_json(transition["after"]):
+            return f"{field}:after_mismatch"
+        if canonical_json(old["summary_text"]) == canonical_json(new["summary_text"]):
+            return f"{field}:unchanged"
+    for index in range(max(len(old_rows), len(new_rows))):
+        old = old_rows[index] if index < len(old_rows) else None
+        new = new_rows[index] if index < len(new_rows) else None
+        if not isinstance(old, Mapping) or not isinstance(new, Mapping):
+            if canonical_json(old) != canonical_json(new):
+                return f"real_query.rows[{index}]"
+            continue
+        episode_id = old.get("episode_id")
+        for key in sorted(set(old) | set(new)):
+            if key == "summary_text" and episode_id in presentation_rows and episode_id == new.get("episode_id"):
+                continue
+            if key not in old or key not in new or canonical_json(old[key]) != canonical_json(new[key]):
+                return f"real_query.{episode_id or index}.{key}"
+    return None
+
+
+def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str], presentation_rows: Mapping[str, Any] | None = None) -> str | None:
+    row = _first_row_difference(reference, score) if presentation_rows is None else _presentation_row_difference(reference, score, presentation_rows)
     if row:
         return row
     old_score = _real_query_score_document(reference)
@@ -1112,7 +1176,7 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
-            difference = _engine_unwired_difference(reference, score, diff_paths)
+            difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"))
             if difference:
                 raise InputFault(f"engine_unwired_mismatch:row={difference}")
         if resolved["slice_class"] == "ranking" and resolved["targeted_mechanism"] == "none":

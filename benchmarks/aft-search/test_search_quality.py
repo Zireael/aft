@@ -26,6 +26,7 @@ from search_quality_lib import (
     apply_unreachable_split_rows,
     included_manifest_ids,
     real_query_behavior_diff,
+    resolve_descriptor,
     split_paired_failures,
     split_rows_not_applicable,
     evaluate_predicate,
@@ -502,6 +503,136 @@ class EngineUnwiredGateTests(unittest.TestCase):
     def test_task_and_train_branches_resolve_the_train_descriptor_label(self) -> None:
         self.assertIn("train-55", descriptor_labels("train/55"))
         self.assertIn("train-55", descriptor_labels("alfonso/task/r48-engine-unwired-train-55-"))
+
+
+class EngineUnwiredPresentationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.episode_id = "followup-census:1"
+        self.before = ["opened.rs [lexical match]", "other.rs [lexical match]"]
+        self.after = ["opened.rs [lexical match]", "  opened [function] lines 1-3"]
+        self.reference["rows"][0]["summary_text"] = list(self.before)
+        self.score["rows"][0]["summary_text"] = list(self.after)
+        self.descriptor = {
+            "slice_class": "engine_unwired",
+            "targeted_mechanism": "none",
+            "kind": "harness",
+            "fixtures": [TOOL_CALL_PARITY_FIXTURE_SOURCE],
+            "presentation_rows": {self.episode_id: {"before": self.before, "after": self.after}},
+        }
+        self.paths = ["crates/aft/src/commands/semantic_search/mod.rs"]
+
+    def gate(self):
+        return total_gate(self.reference, self.score, self.manifest, self.descriptor, self.paths)
+
+    def assert_mismatch(self, field: str) -> None:
+        result = self.gate()
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.reasons, (f"engine_unwired_mismatch:row=real_query.{field}",))
+
+    def test_presentation_rows_accepts_only_exact_declared_transitions(self) -> None:
+        for document in (self.reference, self.score):
+            row = copy.deepcopy(document["rows"][0])
+            row["episode_id"] = "followup-census:2"
+            document["rows"].append(row)
+        manifest_row = copy.deepcopy(self.manifest["rows"][0])
+        manifest_row["episode_id"] = "followup-census:2"
+        self.manifest["rows"].append(manifest_row)
+        self.descriptor["presentation_rows"]["followup-census:2"] = copy.deepcopy(
+            self.descriptor["presentation_rows"][self.episode_id]
+        )
+        self.assertEqual(self.gate().exit_code, 0)
+
+        # The allowance identifies rows, but does not turn their order into a set.
+        self.score["rows"].reverse()
+        self.assert_mismatch(f"{self.episode_id}.episode_id")
+
+    def test_presentation_rows_refuses_an_unlisted_summary_change(self) -> None:
+        for document in (self.reference, self.score):
+            row = copy.deepcopy(document["rows"][0])
+            row["episode_id"] = "followup-census:2"
+            row["summary_text"] = ["same"]
+            document["rows"].append(row)
+        manifest_row = copy.deepcopy(self.manifest["rows"][0])
+        manifest_row["episode_id"] = "followup-census:2"
+        self.manifest["rows"].append(manifest_row)
+        self.score["rows"][1]["summary_text"] = ["changed"]
+        self.assert_mismatch("followup-census:2.summary_text")
+
+    def test_presentation_rows_refuses_wrong_before_lines(self) -> None:
+        self.descriptor["presentation_rows"][self.episode_id]["before"] = ["wrong"]
+        self.assert_mismatch(f"{self.episode_id}.summary_text:before_mismatch")
+
+    def test_presentation_rows_refuses_wrong_after_lines(self) -> None:
+        self.descriptor["presentation_rows"][self.episode_id]["after"] = ["wrong"]
+        self.assert_mismatch(f"{self.episode_id}.summary_text:after_mismatch")
+
+    def test_presentation_rows_refuses_a_listed_row_that_did_not_change(self) -> None:
+        self.score["rows"][0]["summary_text"] = list(self.before)
+        self.descriptor["presentation_rows"][self.episode_id]["after"] = list(self.before)
+        self.assert_mismatch(f"{self.episode_id}.summary_text:unchanged")
+
+    def test_presentation_rows_refuses_a_missing_listed_row_or_summary(self) -> None:
+        for side in ("reference", "score"):
+            for missing in ("row", "summary_text"):
+                with self.subTest(side=side, missing=missing):
+                    self.setUp()
+                    document = getattr(self, side)
+                    if missing == "row":
+                        document["rows"].clear()
+                        reason = f"missing_{side}_row"
+                    else:
+                        del document["rows"][0]["summary_text"]
+                        reason = "before_mismatch" if side == "reference" else "after_mismatch"
+                    self.assert_mismatch(f"{self.episode_id}.summary_text:{reason}")
+
+    def test_presentation_rows_keeps_every_other_row_field_strict(self) -> None:
+        for field, value in (
+            ("ranked_paths", ["different.rs"]),
+            ("pattern_summary", "changed"),
+            ("metrics", {"mrr_at_10": 0.6}),
+            ("retrieval_depth", 2),
+            ("request_count", 2),
+        ):
+            with self.subTest(field=field):
+                self.setUp()
+                self.score["rows"][0][field] = value
+                self.assert_mismatch(f"{self.episode_id}.{field}")
+
+    def test_presentation_rows_keeps_families_and_aggregates_strict(self) -> None:
+        for family in ("exact_recall", "concept_recall", "real_query"):
+            with self.subTest(family=family):
+                self.setUp()
+                self.score["families"][family]["mrr_at_10"] = 0.6
+                result = self.gate()
+                self.assertEqual(result.exit_code, 2)
+                field = f"real_query.families.{family}.mrr_at_10" if family == "real_query" else f"{family}.family"
+                self.assertEqual(result.reasons, (f"engine_unwired_mismatch:row={field}",))
+
+    def test_presentation_rows_is_engine_unwired_only(self) -> None:
+        for slice_class, kind, paths in (
+            ("ranking", "paging", self.paths),
+            ("non_ranking", "harness", ["scripts/telemetry/cost-gate.sh"]),
+        ):
+            with self.subTest(slice_class=slice_class):
+                descriptor = dict(self.descriptor, slice_class=slice_class, kind=kind)
+                with self.assertRaisesRegex(InputFault, "malformed_descriptor:presentation_rows:engine_unwired_only"):
+                    resolve_descriptor(descriptor, paths)
+
+    def test_presentation_rows_validator_refuses_malformed_entries(self) -> None:
+        for entries in (
+            [],
+            {"invalid-id": {"before": [], "after": []}},
+            {self.episode_id: []},
+            {self.episode_id: {"before": self.before}},
+            {self.episode_id: {"before": self.before, "after": self.after, "ranked_paths": []}},
+            {self.episode_id: {"before": "not lines", "after": self.after}},
+            {self.episode_id: {"before": self.before, "after": [1]}},
+        ):
+            with self.subTest(entries=entries):
+                descriptor = dict(self.descriptor, presentation_rows=entries)
+                with self.assertRaises(InputFault):
+                    resolve_descriptor(descriptor, self.paths)
 
 
 class PageInvarianceExcuseGateTests(unittest.TestCase):

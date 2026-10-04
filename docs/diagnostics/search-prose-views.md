@@ -171,3 +171,109 @@ implementation and captured an empty diff:
 The restored targets are green. Mutation markers are not part of the delivered
 code. Full mutation logs and benchmark artifacts remain under the ignored
 `benchmarks/aft-search/.bench/search-prose/` in the task worktree.
+
+## Completing the presentation-only quality gate
+
+The continued delivery starts at main `2772a315f` and cherry-picks the preserved
+`d347aa4c3` fix. It leaves the reference, its sidecar, manifest, vector packs and
+answer keys unchanged. The ranking-fenced production change is still only
+`crates/aft/src/commands/semantic_search/mod.rs`, and it changes presentation,
+not candidate ranking or routing.
+
+The harness now accepts `presentation_rows` **only on `engine_unwired`**. Each
+entry pins the exact reference and replay `summary_text` arrays. Every listed
+row must actually change; missing rows, mismatched before/after lines and any
+unlisted difference fail with the row and field named. All other row fields,
+including ranked paths and pattern summaries, and the existing family/metric
+comparisons remain strict. Latency-only ranking descriptors get no allowance.
+Existing cross-Python aggregate-rounding normalization is unchanged.
+
+The new real replay used a fresh release build (`aft 0.58.2`, binary SHA-256
+`535aa74067aa2357ef56a087382f85070560d8d1e0ec00231a721122894093fa`), the
+provisioned four-repository exact corpus, and the pinned evidence tree at
+`30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17` (tree SHA-256
+`310722813f165b4e1b5d6f2427428c5ab5dd82a05f510ee8361d7920aece59d5`).
+`AFT_SEARCH_BENCH_SETTLE_SECONDS=30` avoids the documented macOS watcher burst.
+It replayed **16 exact fixtures, 26 concept fixtures and 93 real-query rows**.
+The strict descriptor failed on `real_query.followup-census:910001`, before the
+new descriptor copied the measured lines. The replay score SHA-256 is
+`90ffe51fba4c3477f615339b4cf26eea10346bb1cae5ec134b0aa07793457c14`; the
+reference SHA-256 is
+`396d491df35d5d203d159b28815bb164ed8e41e051dff4a227649ebd59a0b60b`.
+
+Exactly these ten rows differ, **only in `summary_text`**:
+
+- `followup-census:910001`
+- `followup-census:910003`
+- `followup-census:910004`
+- `followup-census:910005`
+- `followup-census:910006`
+- `followup-census:910007`
+- `followup-census:910008`
+- `followup-census:910009`
+- `followup-census:910011`
+- `followup-census:910012`
+
+All 93 rows' remaining fields are byte-equal, as are the complete families,
+fixture groups, shapes and mechanisms. For example, `910008`'s eight lines were:
+
+```text
+crates/aft/src/search_index.rs [lexical match]
+
+crates/aft/src/main.rs [lexical match]
+
+crates/aft/src/runtime_drain.rs [lexical match]
+
+crates/aft/src/callgraph_store/mod.rs [lexical match]
+
+```
+
+They are now:
+
+```text
+crates/aft/src/search_index.rs [lexical match]
+  ingest_paths_parallel [method] lines 1241-1288
+          fn ingest_paths_parallel(&mut self, paths: &[PathBuf]) -> usize {
+              let max_file_size = self.max_file_size;
+              let pool_size = search_index_build_pool_size();
+              let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
+              let pool = match rayon::ThreadPoolBuilder::new()
+                  .num_threads(pool_size)
+```
+
+The task descriptor is renamed to the continuation branch's label so automatic
+descriptor discovery works. It contains all ten exact measured pairs; the gate
+passes on that score without re-recording anything. **The next train must
+re-record the reference** after this presentation fix lands, rather than carry
+these temporary reference transitions indefinitely.
+
+The continuation's required gates pass on Rust/cargo 1.99.0 and Python 3.9.6:
+
+- `scripts/telemetry/cost-gate.sh --search-quality --self-test`: goldens plus
+  116 tests (one Windows-only case skipped).
+- `cargo test -p agent-file-tools --lib -- semantic_search migration views`:
+  503 passed, 12 ignored; child fixtures also passed.
+- `cargo test -p agent-file-tools --test integration per_checkout_semantic_runtime`:
+  six passed.
+- `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu`:
+  finished successfully (compile-only, not Windows runtime execution).
+- `cargo fmt --all -- --check`: exit 0 with rustfmt 1.10.0.
+
+Ten additional staged-state mutations disabled the presentation pass path,
+before-line check, after-line check, unchanged-row refusal, unlisted-row fence,
+other-row-field fence, family/aggregate comparisons, descriptor-class check,
+descriptor-shape validation and missing-row refusal separately. Each reddened
+only its corresponding named `EngineUnwiredPresentationTests` test; the 13
+existing `EngineUnwiredGateTests` remained green. The pass-path mutation ran its
+one targeted test plus those 13 controls; the other nine ran all 23 tests. The
+other tests in those runs remained green, and every mutation was restored from
+the staged implementation with an empty `git diff --stat` afterward.
+
+Scoped Python diagnostics show only the pre-existing `None`-to-`str` argument
+error in `UnreachableSplitRowTests.test_a_waiver_is_refused_when_the_answer_file_cannot_be_read`;
+no new Python diagnostic was introduced. The JSON schema has no LSP producer.
+The first release build timed out while queued for shared compile slots; the
+retry finished with the queue preserved. The fixture server printed broken
+pipes when the held-building replay shut down, but every replay phase exited 0
+and produced its complete score. Only the expected strict-descriptor predicate
+failed before the allowance was populated.
