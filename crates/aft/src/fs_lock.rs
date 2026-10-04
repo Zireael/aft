@@ -1377,12 +1377,6 @@ pub(crate) fn sync_parent(path: &Path) {
     }
 }
 
-/// `File::sync_all` for lease files, counted by the test I/O ledger.
-pub(crate) fn sync_lease_file(file: &File) -> io::Result<()> {
-    io_ledger::record(|ledger| ledger.file_syncs += 1);
-    crate::durability::sync_file(file, Path::new("<lease>"))
-}
-
 /// Per-thread counters of the durable I/O that lease code performs: file
 /// fsyncs, directory fsyncs, newly created files (new inodes) and payload
 /// bytes. Tests read them to prove which paths sync and how much a heartbeat

@@ -449,7 +449,7 @@ impl ArtifactOwnerLease {
 /// never fsyncs the file or its directory. After a crash the manifest simply
 /// carries an older heartbeat and looks stale sooner, which the ownership
 /// rules already handle. Claiming or reclaiming ownership still goes through
-/// the fsyncing `create_owner_manifest` / `atomic_write_manifest`.
+/// the exclusive `create_owner_manifest` / atomic `atomic_write_manifest`.
 ///
 /// When the file still holds exactly the manifest this lease last wrote, the
 /// new bytes have the same length (only timestamp digits change), so they are
@@ -512,8 +512,6 @@ fn create_owner_manifest(
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
     write_manifest_to_file(&mut file, &manifest)?;
-    fs_lock::sync_lease_file(&file)?;
-    sync_parent(path);
     Ok(owner_claim(path, project_key, manifest))
 }
 
@@ -587,7 +585,6 @@ fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) ->
                 && current.created_at_ms == judged.created_at_ms =>
         {
             fs::remove_file(path)?;
-            sync_parent(path);
             Ok(true)
         }
         Ok(_)
@@ -665,9 +662,7 @@ fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::R
         let mut file = File::create(&tmp)?;
         fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_to_file(&mut file, manifest)?;
-        fs_lock::sync_lease_file(&file)?;
         fs::rename(&tmp, path)?;
-        sync_parent(path);
         Ok(())
     })();
     if write_result.is_err() {
@@ -867,10 +862,6 @@ fn owner_manifest_is_orphaned(manifest: &ArtifactOwnerManifest, now: u64) -> boo
     !manifest.checkout_path.is_empty()
         && matches!(Path::new(&manifest.checkout_path).try_exists(), Ok(false))
         && now.saturating_sub(manifest.heartbeat_at_ms) > OWNER_REAP_MIN_HEARTBEAT_AGE_MS
-}
-
-fn sync_parent(path: &Path) {
-    fs_lock::sync_parent(path);
 }
 
 fn heartbeat_interval_ms() -> u64 {
@@ -1259,10 +1250,11 @@ mod tests {
         }
     }
 
-    /// Claiming, re-claiming and reclaiming an owner manifest keep full
-    /// durability.
+    /// Claims used to flush both file and directory. Ownership instead depends
+    /// on a live process: a torn record is stale, and a dead owner's caches can
+    /// rebuild, so exclusive creation and atomic replacement need no sync.
     #[test]
-    fn owner_claim_and_reclaim_still_fsync() {
+    fn durability_owner_claim_and_reclaim_unsynced() {
         let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -1272,7 +1264,7 @@ mod tests {
         let created = fs_lock::io_ledger::take();
         assert_eq!(
             (created.file_syncs, created.dir_syncs, created.new_files),
-            (1, dir_syncs_per_create(), 1),
+            (0, 0, 1),
             "first claim: {created:?}"
         );
 
@@ -1284,29 +1276,14 @@ mod tests {
                 reclaimed.dir_syncs,
                 reclaimed.new_files
             ),
-            (1, dir_syncs_per_create(), 1),
+            (0, 0, 1),
             "same-checkout re-claim: {reclaimed:?}"
         );
 
         let current = read_manifest(&lease.path).unwrap();
         assert!(reclaim_manifest_if_unchanged(&lease.path, &current).unwrap());
         let removed = fs_lock::io_ledger::take();
-        assert_eq!(
-            removed.dir_syncs,
-            dir_syncs_per_create(),
-            "dead-owner removal: {removed:?}"
-        );
-    }
-
-    /// Directory fsyncs recorded per directory-entry change. Windows cannot open
-    /// a directory as a file to sync it, so the parent sync is a no-op there and
-    /// records nothing.
-    fn dir_syncs_per_create() -> u64 {
-        if cfg!(windows) {
-            0
-        } else {
-            1
-        }
+        assert_eq!(removed.dir_syncs, 0, "dead-owner removal: {removed:?}");
     }
 
     /// A crash after an unsynced heartbeat rename can leave a zero-length
