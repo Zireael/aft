@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["callgraph-extraction-speedup-and-false-zero-fixes"],
+  "note": "Call-graph extraction: one parse per file with a determinism fix, plus typed receiver resolution and integration-test caller fixes; no ranking-fence file."
+}
