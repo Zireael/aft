@@ -12987,8 +12987,53 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
+    fn views_legacy_refresh_ignores_busy_process_worker() {
+        // Only the process-worker control needs this lock: refresh-worker tests
+        // shut that worker down or hold its queue while exercising exit paths.
+        let _guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                Duration::from_secs(12)
+            )
+        );
+        let (_busy_dirs, busy_ctx) = cold_build_context();
+        let busy_root = std::fs::canonicalize(busy_ctx.config().project_root.as_ref().unwrap())
+            .expect("canonical busy root");
+        let family = crate::search_index::artifact_cache_key(&busy_root);
+        crate::root_cache::configure_artifact_access(&busy_root, &family, false);
+        busy_ctx.set_canonical_cache_root(busy_root.clone());
+        busy_ctx
+            .ensure_callgraph_store()
+            .expect("busy root callgraph build")
+            .expect("busy root callgraph reader");
+        let (held, release) =
+            crate::callgraph_store::install_callgraph_refresh_worker_test_gate(busy_root.clone());
+        assert!(busy_ctx.enqueue_callgraph_store_refresh([busy_root.join("src/lib.rs")]));
+        held.recv_timeout(Duration::from_secs(12))
+            .expect("process worker must be held on the unrelated root");
+
+        // Exercise the entire migration window while another root cannot finish
+        // its refresh. A views fixture must not inherit that queue's backlog.
+        views_first_publication_retires_legacy_after_migration_window();
+
+        release.send(()).expect("release busy process worker");
+        assert!(
+            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                Duration::from_secs(12)
+            )
+        );
+    }
+
+    #[test]
     fn views_first_publication_retires_legacy_after_migration_window() {
         let fixture = ViewsCallgraphFixture::new();
+        // Process-worker tests hold unrelated roots and shut down the shared
+        // queue. Keep this root's migration refreshes on a fixture-owned worker.
+        let worker = crate::callgraph_store::isolated_callgraph_refresh_worker_for_test(
+            fixture.root.clone(),
+        );
         crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
         crate::runtime_drain::refresh_callgraph_store_for_watcher(
             &fixture.ctx,
@@ -12998,6 +13043,10 @@ mod callgraph_store_for_ops_tests {
             crate::runtime_drain::legacy_watcher_refreshes_for_test(),
             1,
             "legacy refresh must remain active before the first publication"
+        );
+        assert!(
+            worker.wait(Duration::from_secs(12)),
+            "legacy refresh worker hung"
         );
         let legacy_response = fixture.callers();
         assert!(legacy_response.success, "{legacy_response:?}");
@@ -13036,18 +13085,16 @@ mod callgraph_store_for_ops_tests {
             1,
             "disabling views must enqueue legacy refresh again"
         );
-        let deadline = Instant::now() + Duration::from_secs(12);
-        loop {
-            let response = fixture.callers();
-            if response.success && response.data["total_callers"] == 2 {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "views-off legacy refresh did not converge: {response:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(
+            worker.wait(Duration::from_secs(12)),
+            "views-off legacy refresh worker hung"
+        );
+        let response = fixture.callers();
+        assert!(response.success, "{response:?}");
+        assert_eq!(
+            response.data["total_callers"], 2,
+            "views-off legacy refresh did not converge: {response:?}"
+        );
     }
 
     #[test]
