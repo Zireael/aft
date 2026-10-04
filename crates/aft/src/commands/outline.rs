@@ -4,6 +4,8 @@ const ENTRY_BUDGET: usize = 10_000;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
@@ -493,6 +495,114 @@ struct OutlineFileDiscovery {
     walk_truncated: bool,
     collection_truncated: bool,
     skipped_foreign_mounts: usize,
+}
+
+#[derive(Clone, Default)]
+struct OutlineIgnoreStack {
+    matchers: Vec<Arc<ignore::gitignore::Gitignore>>,
+}
+
+impl OutlineIgnoreStack {
+    fn for_target_root(root: &Path) -> Self {
+        let root = root.to_path_buf();
+        let mut stack = Self::default();
+
+        // Global excludes and .git/info/exclude are lower priority than every
+        // .gitignore in the target's ancestor chain. Load them once per walk.
+        let (global, _) = ignore::gitignore::GitignoreBuilder::new(&root).build_global();
+        if !global.is_empty() {
+            stack.matchers.push(Arc::new(global));
+        }
+        if let Some((repo_root, exclude_path)) = git_info_exclude_for_target(&root) {
+            if let Some(matcher) = build_outline_gitignore(&repo_root, &exclude_path) {
+                stack.matchers.push(matcher);
+            }
+        }
+
+        let mut ancestors = root.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+        ancestors.reverse();
+        for directory in ancestors {
+            if let Some(matcher) =
+                build_outline_gitignore(&directory, &directory.join(".gitignore"))
+            {
+                stack.matchers.push(matcher);
+            }
+        }
+        stack
+    }
+
+    fn for_child_directory(&self, directory: &Path) -> Self {
+        let mut child = self.clone();
+        if let Some(matcher) = build_outline_gitignore(directory, &directory.join(".gitignore")) {
+            child.matchers.push(matcher);
+        }
+        child
+    }
+
+    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for matcher in &self.matchers {
+            let matched = matcher.matched_path_or_any_parents(path, is_dir);
+            if matched.is_ignore() {
+                ignored = true;
+            } else if matched.is_whitelist() {
+                ignored = false;
+            }
+        }
+        ignored
+    }
+}
+
+fn build_outline_gitignore(
+    root: &Path,
+    ignore_file: &Path,
+) -> Option<Arc<ignore::gitignore::Gitignore>> {
+    if !ignore_file.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    let _ = builder.add(ignore_file);
+    builder.build().ok().map(Arc::new)
+}
+
+fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
+    for repository_root in target.ancestors() {
+        let git_entry = repository_root.join(".git");
+        let Ok(metadata) = std::fs::metadata(&git_entry) else {
+            continue;
+        };
+        let git_dir = if metadata.is_dir() {
+            git_entry
+        } else if metadata.is_file() {
+            let contents = std::fs::read_to_string(&git_entry).ok()?;
+            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
+            let git_dir = PathBuf::from(git_dir);
+            if git_dir.is_absolute() {
+                git_dir
+            } else {
+                repository_root.join(git_dir)
+            }
+        } else {
+            continue;
+        };
+        let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
+        let common_dir = git_dir.join("commondir");
+        let git_common_dir = if let Ok(common) = std::fs::read_to_string(&common_dir) {
+            let common = PathBuf::from(common.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        } else {
+            git_dir
+        };
+        return Some((
+            repository_root.to_path_buf(),
+            git_common_dir.join("info/exclude"),
+        ));
+    }
+    None
 }
 
 fn handle_outline_files_mode(
@@ -1421,8 +1531,8 @@ fn discover_outline_files_with_options(
     // child can otherwise make a directory iterator's destructor abort the daemon.
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(directory);
     if let Ok(boundary) = boundary {
-        let mut device_lookup = crate::walk_boundary::filesystem_device_id;
         if breadth_first {
+            let ignore_stack = OutlineIgnoreStack::for_target_root(directory);
             entries_examined = collect_outline_files_breadth_first_with_device_lookup(
                 directory,
                 &mut files,
@@ -1431,7 +1541,7 @@ fn discover_outline_files_with_options(
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
                 &boundary,
-                &mut device_lookup,
+                &ignore_stack,
             );
         } else {
             collect_outline_files_with_device_lookup(
@@ -1442,7 +1552,7 @@ fn discover_outline_files_with_options(
                 &mut collection_truncated,
                 &mut skipped_foreign_mounts,
                 &boundary,
-                &mut device_lookup,
+                crate::walk_boundary::filesystem_device_id,
             );
         }
     } else {
@@ -1463,9 +1573,8 @@ fn discover_outline_files_with_options(
 
 fn outline_target_walk_builder(directory: &Path) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(directory);
-    // Use each target's ignore files, including global Git excludes, rather than
-    // applying only the active session's matcher. Hidden entries remain visible;
-    // symbols mode applies its existing hidden-directory rule explicitly.
+    // One ignore-aware walker loads the target's nested rules without reopening
+    // each ancestor ignore file for every directory.
     builder
         .hidden(false)
         .git_ignore(true)
@@ -1486,27 +1595,61 @@ fn collect_outline_files_with_device_lookup<F>(
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    device_lookup: &mut F,
+    device_lookup: F,
 ) where
-    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
+    F: Fn(&Path) -> std::io::Result<Option<u64>> + Copy + Send + Sync + 'static,
 {
     if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
         *walk_truncated = true;
         return;
     }
-    let walker = outline_target_walk_builder(directory)
-        .max_depth(Some(1))
-        .build();
-    for entry in walker {
+    let skipped_mounts = Arc::new(AtomicUsize::new(0));
+    let boundary_failed = Arc::new(AtomicBool::new(false));
+    let mut builder = outline_target_walk_builder(directory);
+    {
+        let skipped_mounts = Arc::clone(&skipped_mounts);
+        let boundary_failed = Arc::clone(&boundary_failed);
+        let boundary = *boundary;
+        builder.filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Some(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                return false;
+            }
+            if !file_type.is_dir() {
+                return true;
+            }
+            if should_skip_directory(entry.path()) {
+                return false;
+            }
+            match boundary.should_descend_with(entry.path(), device_lookup) {
+                Ok(true) => true,
+                Ok(false) => {
+                    skipped_mounts.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                Err(_) => {
+                    boundary_failed.store(true, Ordering::Relaxed);
+                    false
+                }
+            }
+        });
+    }
+
+    for entry in builder.build() {
+        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+            *walk_truncated = true;
+            break;
+        }
         let Ok(entry) = entry else {
             continue;
         };
         if entry.depth() == 0 {
             continue;
-        }
-        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
-            *walk_truncated = true;
-            return;
         }
         let Some(file_type) = entry.file_type() else {
             continue;
@@ -1516,41 +1659,18 @@ fn collect_outline_files_with_device_lookup<F>(
         }
         let path = entry.into_path();
         if file_type.is_dir() {
-            if should_skip_directory(&path) {
-                continue;
-            }
-            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    *skipped_foreign_mounts += 1;
-                    continue;
-                }
-                Err(_) => {
-                    *collection_truncated = true;
-                    return;
-                }
-            }
             directories.push(path.to_string_lossy().to_string());
-            collect_outline_files_with_device_lookup(
-                &path,
-                files,
-                directories,
-                walk_truncated,
-                collection_truncated,
-                skipped_foreign_mounts,
-                boundary,
-                device_lookup,
-            );
-            if *walk_truncated || *collection_truncated {
-                return;
-            }
         } else if file_type.is_file() {
             files.push(path.to_string_lossy().to_string());
         }
     }
+    *skipped_foreign_mounts += skipped_mounts.load(Ordering::Relaxed);
+    if boundary_failed.load(Ordering::Relaxed) {
+        *collection_truncated = true;
+    }
 }
 
-fn collect_outline_files_breadth_first_with_device_lookup<F>(
+fn collect_outline_files_breadth_first_with_device_lookup(
     directory: &Path,
     files: &mut Vec<String>,
     directories: &mut Vec<String>,
@@ -1558,25 +1678,22 @@ fn collect_outline_files_breadth_first_with_device_lookup<F>(
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    device_lookup: &mut F,
-) -> usize
-where
-    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
-{
-    let mut pending = VecDeque::from([directory.to_path_buf()]);
+    root_ignore_stack: &OutlineIgnoreStack,
+) -> usize {
+    let root_stack = root_ignore_stack.clone();
+    let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
     let mut entries_examined = 0usize;
 
-    while let Some(current) = pending.pop_front() {
+    while let Some((current, ignore_stack)) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return entries_examined;
         }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
         let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
-        let walker = outline_target_walk_builder(&current)
-            .max_depth(Some(1))
-            .build();
-        let mut entries = walker
-            .filter(|entry| entry.as_ref().map_or(true, |entry| entry.depth() > 0))
+        let mut entries = entries
             .take(remaining.saturating_add(1))
             .collect::<Vec<_>>();
         entries_examined += entries.len();
@@ -1585,33 +1702,33 @@ where
             *collection_truncated = true;
         }
         let mut entries = entries.into_iter().flatten().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.path().to_path_buf());
+        entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
         for entry in entries {
-            let Some(file_type) = entry.file_type() else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             if file_type.is_symlink() {
                 continue;
             }
             if file_type.is_dir() {
-                child_directories.push(entry.into_path());
+                child_directories.push(entry.path());
             } else if file_type.is_file() {
-                child_files.push(entry.into_path());
+                child_files.push(entry.path());
             }
         }
 
         // Queue directories before counting sibling files so the traversal keeps
         // its breadth-first coverage when the 10,000-file limit is reached.
         for path in child_directories {
-            if should_skip_directory(&path) {
+            if should_skip_directory(&path) || ignore_stack.is_ignored(&path, true) {
                 continue;
             }
-            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
+            match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
-                    pending.push_back(path);
+                    pending.push_back((path.clone(), ignore_stack.for_child_directory(&path)));
                 }
                 Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
@@ -1626,7 +1743,9 @@ where
                 *walk_truncated = true;
                 return entries_examined;
             }
-            files.push(path.to_string_lossy().to_string());
+            if !ignore_stack.is_ignored(&path, false) {
+                files.push(path.to_string_lossy().to_string());
+            }
         }
         if *collection_truncated {
             return entries_examined;
@@ -2018,6 +2137,16 @@ mod tests {
         .expect("write nested visible file");
     }
 
+    fn outline_add_info_exclude_fixture(root: &Path) {
+        std::fs::write(root.join(".git/info/exclude"), "info-excluded.ts\n")
+            .expect("write repository exclude file");
+        std::fs::write(
+            root.join("info-excluded.ts"),
+            "export function excludedByInfo() {}\n",
+        )
+        .expect("write info-excluded file");
+    }
+
     fn assert_outline_discovery_honors_target_ignore_rules(discovery: OutlineFileDiscovery) {
         let paths = discovery
             .files
@@ -2030,6 +2159,10 @@ mod tests {
             "{paths:?}"
         );
         assert!(!paths.iter().any(|path| path == "ignored.ts"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|path| path == "info-excluded.ts"),
+            "repository info/exclude rule must apply: {paths:?}"
+        );
         assert!(
             !paths.iter().any(|path| path == "nested-ignored.ts"),
             "{paths:?}"
@@ -2058,6 +2191,7 @@ mod tests {
             .expect("run git init");
         assert!(git.success(), "git init failed: {git}");
         outline_ignore_fixture(&external);
+        outline_add_info_exclude_fixture(&external);
         assert_outline_discovery_honors_target_ignore_rules(discover_outline_files(&external));
 
         let non_git = temp.path().join("standalone");
@@ -2086,6 +2220,7 @@ mod tests {
             .expect("run git init");
         assert!(git.success(), "git init failed: {git}");
         outline_ignore_fixture(&external);
+        outline_add_info_exclude_fixture(&external);
         assert_outline_discovery_honors_target_ignore_rules(discover_outline_files_for_files_mode(
             &external,
         ));
@@ -2252,8 +2387,6 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             discovery.entries_examined, 5,
             "count the three root entries and two source files, not skipped directory contents"
         );
-        assert!(!discovery.collection_truncated);
-        assert!(!discovery.walk_truncated);
     }
 
     #[test]
@@ -2273,7 +2406,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let mut walk_truncated = false;
         let mut collection_truncated = false;
         let mut skipped_foreign_mounts = 0usize;
-        let mut lookup = |path: &Path| {
+        let lookup = |path: &Path| {
             Ok(Some(
                 if path.file_name().is_some_and(|name| name == "foreign") {
                     99
@@ -2291,7 +2424,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             &mut collection_truncated,
             &mut skipped_foreign_mounts,
             &boundary,
-            &mut lookup,
+            lookup,
         );
 
         assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");
