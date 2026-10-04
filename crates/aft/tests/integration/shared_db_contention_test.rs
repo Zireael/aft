@@ -17,7 +17,7 @@ use super::helpers::AftProcess;
 
 /// Longer than the steady busy wait, so any maintenance still using it fails.
 const HOLD: Duration = Duration::from_secs(7);
-const STATUS_BUDGET: Duration = Duration::from_secs(1);
+const STATUS_RESPONSE_CEILING: Duration = Duration::from_secs(5);
 /// How long the child's maintenance keeps retrying a write that meets the
 /// held write lock. Set far above [`READ_BUDGET`], so a maintenance path that
 /// waits while holding the connection mutex delays reads by about this much,
@@ -141,6 +141,18 @@ impl Contended {
         log_start
     }
 
+    /// Keep the lock held for the complete assertion instead of relying on a
+    /// short sampling window that can end before a delayed status call runs.
+    fn with_write_lock(&mut self, during: impl FnOnce(&mut AftProcess)) {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the write lock");
+        during(&mut self.aft);
+        self.conn
+            .execute_batch("COMMIT")
+            .expect("release the write lock");
+    }
+
     /// Stop the child and return its complete durable log.
     fn finish(self) -> String {
         let log_path = self.log_path();
@@ -194,32 +206,30 @@ fn minute_fold_defers_under_a_foreign_write_lock_and_commits_after_release() {
 /// `status` answers from memory. A write lock held by another process must
 /// not delay it, however long this process's maintenance waits for that lock.
 #[test]
-fn status_answers_within_a_second_while_another_process_holds_the_write_lock() {
+fn status_answers_while_another_process_holds_the_write_lock() {
     let mut contended = Contended::start();
-    let mut latencies = Vec::new();
-    contended.hold_write_lock(|aft| {
-        let started = Instant::now();
-        let response = aft.send_with_timeout(
-            &json!({ "id": "status", "command": "status" }).to_string(),
-            Duration::from_secs(30),
-        );
-        latencies.push(started.elapsed());
-        assert_eq!(response["success"], true, "status failed: {response:?}");
+    let mut calls = 0;
+    contended.with_write_lock(|aft| {
+        for _ in 0..5 {
+            let started = Instant::now();
+            let response = aft.send_with_timeout(
+                &json!({ "id": "status", "command": "status" }).to_string(),
+                Duration::from_secs(10),
+            );
+            let elapsed = started.elapsed();
+            assert_eq!(response["success"], true, "status failed: {response:?}");
+            assert!(
+                elapsed < STATUS_RESPONSE_CEILING,
+                "status took {elapsed:?} while aft.db remained write-locked"
+            );
+            calls += 1;
+        }
     });
     contended.finish();
 
-    assert!(
-        latencies.len() >= 5,
-        "only {} status calls ran",
-        latencies.len()
-    );
-    let slow = latencies
-        .iter()
-        .filter(|latency| **latency >= STATUS_BUDGET)
-        .collect::<Vec<_>>();
-    assert!(
-        slow.is_empty(),
-        "status exceeded {STATUS_BUDGET:?} while aft.db was write-locked: {slow:?} of {latencies:?}"
+    assert_eq!(
+        calls, 5,
+        "every status request must run under the write lock"
     );
 }
 

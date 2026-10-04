@@ -3389,9 +3389,11 @@ fn run_subc_mode_inner(
         Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
     );
     let index_flush = std::thread::spawn(move || {
+        record_exit_phase_event("index_flush", "start");
         if flush_indexes {
             flush_actor_indexes_on_graceful_shutdown(&flush_contexts, exit_started);
         }
+        record_exit_phase_event("index_flush", "end");
         log::info!(
             "subc exit phase=index_flush_done elapsed_ms={}",
             exit_started.elapsed().as_millis()
@@ -3411,9 +3413,11 @@ fn run_subc_mode_inner(
         crate::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET.as_millis(),
         exit_started.elapsed().as_millis()
     );
+    record_exit_phase_event("lsp_shutdown", "start");
     if let Some(registry) = registry {
         crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
     }
+    record_exit_phase_event("lsp_shutdown", "end");
     log::info!(
         "subc exit phase=lsp_done elapsed_ms={}",
         exit_started.elapsed().as_millis()
@@ -3641,6 +3645,34 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     }
     line
 }
+
+/// Record phase boundaries for process-level shutdown tests without relying on
+/// log timestamps, which are rounded and intended for diagnostics.
+#[cfg(debug_assertions)]
+static EXIT_PHASE_EVENT_LOCK: StdMutex<()> = StdMutex::new(());
+
+#[cfg(debug_assertions)]
+fn record_exit_phase_event(phase: &str, boundary: &str) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("AFT_TEST_EXIT_PHASE_EVENTS") else {
+        return;
+    };
+    let Ok(_guard) = EXIT_PHASE_EVENT_LOCK.lock() else {
+        return;
+    };
+    if let Ok(mut events) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(events, "{phase}:{boundary}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn record_exit_phase_event(_phase: &str, _boundary: &str) {}
 
 /// Test-only entry that enables the non-manifest native-command passthrough on
 /// route channels. Integration tests drive synthetic native commands (`glob`,

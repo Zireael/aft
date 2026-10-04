@@ -568,7 +568,7 @@ fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
 
 #[test]
 fn subc_drain_with_slow_writer_persists_terminal_line() {
-    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"));
+    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"), Some("450"));
 }
 
 /// Binds 34 roots that each start a fake rust-analyzer which never answers
@@ -577,7 +577,7 @@ fn subc_drain_with_slow_writer_persists_terminal_line() {
 /// `NAME=value` assignments for the fake servers; `under_load` keeps every
 /// CPU busy from the drain until the module has exited.
 fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
-    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None);
+    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None, None);
 }
 
 fn drain_with_live_lsp_servers_and_writer(
@@ -586,6 +586,7 @@ fn drain_with_live_lsp_servers_and_writer(
     active_ort: bool,
     writer_delay: &str,
     flush_hold: Option<&str>,
+    index_delay: Option<&str>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -602,6 +603,7 @@ fn drain_with_live_lsp_servers_and_writer(
         let pids = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let stderr_path = logs.path().join("module.stderr");
+        let phase_events_path = logs.path().join("exit-phase-events.log");
         let config_dir = config_home.path().join("cortexkit");
         std::fs::create_dir_all(&config_dir).unwrap();
         let fake = crate::test_helpers::fake_lsp::fake_server_binary();
@@ -639,6 +641,8 @@ fn drain_with_live_lsp_servers_and_writer(
             true,
             writer_delay,
             flush_hold,
+            index_delay,
+            index_delay.map(|_| phase_events_path.as_path()),
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -689,6 +693,11 @@ fn drain_with_live_lsp_servers_and_writer(
             elapsed.as_millis()
         );
         let log = std::fs::read_to_string(&stderr_path).unwrap();
+        if index_delay.is_some() {
+            let events = std::fs::read_to_string(&phase_events_path)
+                .expect("shutdown phase event hook recorded its boundaries");
+            assert_shutdown_phases_overlap(&events);
+        }
         if writer_delay == "1000" {
             assert!(log.contains("phase=log_flush_done flushed=false"),
                 "slow writer must exhaust the async flush budget: {}", log_tail(&log));
@@ -736,22 +745,6 @@ fn drain_with_live_lsp_servers_and_writer(
             .next()
             .and_then(|value| value.trim().parse::<u128>().ok())
             .expect("shutdown summary reports elapsed_ms");
-        if !under_load {
-            // Compare the combined phase to its sequential cost, not the entire
-            // process exit to LSP time. Log persistence and observer scheduling
-            // are outside these phases and retain the separate two-second cap.
-            let combined_ms = log.lines()
-                .find(|line| line.contains("phase=lsp_done elapsed_ms="))
-                .and_then(|line| line.rsplit("elapsed_ms=").next())
-                .and_then(|value| value.parse::<u128>().ok())
-                .expect("combined shutdown elapsed time");
-            let sequential_ms = lsp_elapsed_ms + 450;
-            assert!(
-                combined_ms + 225 < sequential_ms,
-                "shutdown did not save half the index wait by overlapping: combined={combined_ms} ms, sequential={sequential_ms} ms; {}",
-                log_tail(&log)
-            );
-        }
         let lsp_ceiling = aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150);
         assert!(
             lsp_elapsed_ms <= lsp_ceiling.as_millis(),
@@ -777,6 +770,36 @@ fn drain_with_live_lsp_servers_and_writer(
 fn log_tail(log: &str) -> String {
     let lines = log.lines().collect::<Vec<_>>();
     lines[lines.len().saturating_sub(20)..].join("\n")
+}
+
+fn assert_shutdown_phases_overlap(events: &str) {
+    let events = events.lines().collect::<Vec<_>>();
+    let position = |event: &str| {
+        let positions = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, recorded)| (*recorded == event).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(positions.len(), 1, "expected one {event} event: {events:?}");
+        positions[0]
+    };
+
+    let index_start = position("index_flush:start");
+    let index_end = position("index_flush:end");
+    let lsp_start = position("lsp_shutdown:start");
+    let lsp_end = position("lsp_shutdown:end");
+    assert!(
+        index_start < index_end,
+        "invalid index flush interval: {events:?}"
+    );
+    assert!(
+        lsp_start < lsp_end,
+        "invalid LSP shutdown interval: {events:?}"
+    );
+    assert!(
+        index_start < lsp_end && lsp_start < index_end,
+        "index flush and LSP shutdown intervals did not intersect: {events:?}"
+    );
 }
 
 pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
@@ -856,6 +879,8 @@ impl ModuleProcess {
             false,
             "40",
             None,
+            None,
+            None,
         )
     }
 
@@ -869,6 +894,8 @@ impl ModuleProcess {
         busy_index: bool,
         writer_delay: &str,
         flush_hold: Option<&str>,
+        index_delay: Option<&str>,
+        phase_events_path: Option<&Path>,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -900,6 +927,12 @@ impl ModuleProcess {
             command.env("AFT_CACHE_DIR", data_home);
             command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
             command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
+        }
+        if let Some(delay) = index_delay {
+            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", delay);
+        }
+        if let Some(path) = phase_events_path {
+            command.env("AFT_TEST_EXIT_PHASE_EVENTS", path);
         }
         if let Some(hold) = flush_hold {
             // A writer this slow cannot acknowledge a flush inside the exit
