@@ -1147,7 +1147,7 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
     let target = storage_dir.join(harness).join("checkpoints");
     if !target.exists() {
         if let Some(parent) = target.parent() {
-            if let Err(error) = crate::backup::create_private_dir_all(parent) {
+            if let Err(error) = crate::backup::create_private_durable_dir(parent) {
                 crate::slog_warn!(
                     "failed to create durable checkpoint harness directory {}: {}",
                     parent.display(),
@@ -1916,9 +1916,17 @@ mod tests {
             .create_for_files(DEFAULT_SESSION_ID, "snap", vec![path.clone()])
             .unwrap();
         let events = crate::durability::take();
+        // Two data syncs, one directory commit and four first-use directories.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.0 == crate::durability::EventKind::DirectoryCreated)
+                .count(),
+            4
+        );
         assert_eq!(
             crate::durability::sync_count(&events),
-            if cfg!(unix) { 4 } else { 2 },
+            if cfg!(unix) { 7 } else { 2 },
             "{events:?}"
         );
         // Replacing an existing checkpoint needs no new-directory flush.

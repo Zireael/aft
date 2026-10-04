@@ -26,6 +26,8 @@ about **4 ms** (p50 3.99 ms, p90 5.0 ms). A plain `fsync()` costs 0.024 ms.
 | `aft.db` (SQLite) | 0 per op; plain `fsync()` at WAL checkpoints | **Keep** | Atomic and consistent after any crash; recent commits can be lost on power loss (today too). | None. Documented, not changed. |
 | Shared: `fs_lock` lease | 2 per acquire (file + dir), inside every backup, undo, checkpoint, semantic and cache op | **0** | Unchanged: a lease from before a crash is dead by identity, and a torn lease is treated as stale. | Low; contract test changes. |
 
+Implemented correction: the table describes steady-state commits; first use also syncs each newly created ancestor directory into its parent, so a returned backup or checkpoint cannot vanish with its namespace.
+
 Per-op saving at about 4 ms per removed sync: bash about 32 ms per command
 (about half the measured response), edit about 36–44 ms of 52–62 ms, undo about
 12 ms, checkpoint list about 8 ms.
@@ -601,7 +603,7 @@ at the same time.
     `:8817`, `:10124`);
   - inspect pointer (`inspect/cache.rs:1625`);
   - symbol cache (`symbol_cache_disk.rs:188`, `:413`);
-  - the reader floor (`reader_floor.rs:260`, `:277`);
+  - the reader floor (`reader_floor.rs:260`, `:277`): its file + directory syncs are retained and count-pinned because it is a monotonic rollback-safety guard, not a cache; it must never lag newer durable data after a crash.
   - artifact owner manifests (`artifact_owner.rs`);
   - the root cache (`root_cache.rs:896`).
 

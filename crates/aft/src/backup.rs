@@ -2884,7 +2884,7 @@ impl BackupStore {
         let Some(session_dir) = self.session_dir(session) else {
             return;
         };
-        if let Err(e) = create_private_dir_all(&session_dir) {
+        if let Err(e) = create_private_durable_dir(&session_dir) {
             crate::slog_warn!("failed to create session dir: {}", e);
             return;
         }
@@ -2922,7 +2922,7 @@ impl BackupStore {
             return;
         }
         if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = create_private_dir_all(parent) {
+            if let Err(error) = create_private_durable_dir(parent) {
                 crate::slog_warn!(
                     "failed to create harness backup dir {}: {}",
                     parent.display(),
@@ -2947,7 +2947,7 @@ impl BackupStore {
                     harness_backups.display(),
                     error
                 );
-                if create_private_dir_all(&harness_backups).is_err() {
+                if create_private_durable_dir(&harness_backups).is_err() {
                     return;
                 }
                 if let Ok(entries) = std::fs::read_dir(&root_backups) {
@@ -3038,7 +3038,7 @@ impl BackupStore {
             }
             // This is a legacy flat-layout path-hash directory. Move it under
             // the default session namespace.
-            if let Err(e) = create_private_dir_all(&default_session_dir) {
+            if let Err(e) = create_private_durable_dir(&default_session_dir) {
                 crate::slog_warn!("failed to create default session dir: {}", e);
                 return;
             }
@@ -5278,19 +5278,35 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Publish a new durable store directory into its parent before committing
-/// records inside it. The atomic mkdir also handles competing first writers.
+/// Publish a new durable store directory and any missing ancestors into their
+/// parents before committing records inside it. Existing directories cost no sync.
 pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_private_dir_all(parent)?;
+    if path.is_dir() {
+        return Ok(());
     }
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(PRIVATE_DIR_MODE);
+        // A durable child entry is insufficient when an ancestor can vanish.
+        // Existing ancestors cost nothing; each new one publishes into its own
+        // parent before any records can be committed under this namespace.
+        create_private_durable_dir(parent)?;
     }
-    match builder.create(path) {
+    let created = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(PRIVATE_DIR_MODE)
+                .create(path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(path)
+        }
+    };
+    match created {
         Ok(()) => {
             crate::durability::record(crate::durability::EventKind::DirectoryCreated, path);
             if let Some(parent) = path.parent() {
@@ -5678,9 +5694,17 @@ mod tests {
         fs::write(&path, "first edit").unwrap();
         store.record_post_mutation_states();
         let first = take();
+        // Three commit syncs plus backups/, session/ and path/ publication.
+        assert_eq!(
+            first
+                .iter()
+                .filter(|e| e.0 == EventKind::DirectoryCreated)
+                .count(),
+            3
+        );
         assert_eq!(
             sync_count(&first),
-            if cfg!(unix) { 5 } else { 2 },
+            if cfg!(unix) { 6 } else { 2 },
             "{first:?}"
         );
         store.snapshot("durability", &path, "second").unwrap();
@@ -5716,6 +5740,31 @@ mod tests {
             .position(|e| *e == (EventKind::FileSync, dir.join("meta.json")))
             .unwrap();
         assert!(created < parent && parent < meta, "{events:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_new_store_ancestor_order_and_count() {
+        let storage = tempfile::tempdir().unwrap();
+        let namespace = storage.path().join("namespace");
+        let session = namespace.join("session");
+        let store = session.join("store");
+        take();
+        create_private_durable_dir(&store).unwrap();
+        assert_eq!(
+            take(),
+            vec![
+                (EventKind::DirectoryCreated, namespace.clone()),
+                (EventKind::DirectorySync, storage.path().to_path_buf()),
+                (EventKind::DirectoryCreated, session.clone()),
+                (EventKind::DirectorySync, namespace),
+                (EventKind::DirectoryCreated, store.clone()),
+                (EventKind::DirectorySync, session),
+            ]
+        );
+        // Reusing a durable namespace must not add steady-state syncs.
+        create_private_durable_dir(&store).unwrap();
+        assert!(take().is_empty());
     }
 
     #[test]
