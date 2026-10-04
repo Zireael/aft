@@ -357,7 +357,7 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-export { WORKER_SESSION_FIELD } from "./transport.js";
+export { callPresetFor, PRESET_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,

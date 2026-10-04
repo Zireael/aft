@@ -290,6 +290,7 @@ describe("SubcTransport.toolCall", () => {
     expect(client.requests[0]?.body).toEqual({
       name: "read",
       arguments: { filePath: "a.ts" },
+      preset: "head",
     });
     // The adapter promotes supported fields to the top-level result, preserving
     // background completions while excluding the retired status_bar field.
@@ -312,6 +313,7 @@ describe("SubcTransport.toolCall", () => {
       name: "edit",
       arguments: { patch: "[a.ts#TAG]\nPUT 1:\n+x" },
       edit_slot_survives: true,
+      preset: "head",
     });
   });
 
@@ -329,6 +331,7 @@ describe("SubcTransport.toolCall", () => {
       name: "bash",
       arguments: { session_id: "sess", command: "cat build.rs" },
       edit_slot_survives: true,
+      preset: "head",
     });
   });
 
@@ -360,6 +363,7 @@ describe("SubcTransport.toolCall", () => {
       name: "edit",
       arguments: { oldString: "a" },
       preview: true,
+      preset: "head",
     });
   });
 
@@ -378,6 +382,7 @@ describe("SubcTransport.toolCall", () => {
       name: "bash",
       arguments: { command: "make" },
       worker_session: true,
+      preset: "worker",
     });
   });
 
@@ -395,7 +400,33 @@ describe("SubcTransport.toolCall", () => {
       name: "bash",
       arguments: { session_id: "sess", command: "make" },
       worker_session: true,
+      preset: "worker",
     });
+  });
+
+  // A route the daemon stamped with a scope refuses a tool call that names no
+  // catalog preset, and a plugin route may be scoped, so every call names one:
+  // `worker` for a worker session, `head` for a primary.
+  test("every tool call and native command names its catalog preset", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+
+    await bridge.toolCall("s", "read", { filePath: "a.ts" });
+    await bridge.toolCall("s", "read", { filePath: "a.ts" }, { workerSession: true });
+    await bridge.send("bash_status", { session_id: "sess", task_id: "bash-1" });
+    await bridge.send("bash_status", {
+      session_id: "sess",
+      task_id: "bash-1",
+      worker_session: true,
+    });
+
+    expect(client.requests.map((request) => (request.body as { preset?: string }).preset)).toEqual([
+      "head",
+      "worker",
+      "head",
+      "worker",
+    ]);
   });
 
   test("transportTimeoutMs (wait-aware bash budget) reaches the wire request deadline", async () => {
@@ -1514,6 +1545,7 @@ describe("SubcTransport.send", () => {
     expect(client.requests[0]?.body).toEqual({
       name: "bash_drain_completions",
       arguments: { session_id: "sess-Z" },
+      preset: "head",
     });
   });
 });

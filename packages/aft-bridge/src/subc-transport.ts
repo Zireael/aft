@@ -57,7 +57,7 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-import { WORKER_SESSION_FIELD } from "./transport.js";
+import { callPresetFor, PRESET_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -1124,6 +1124,7 @@ class SubcTransport implements AftProjectTransport {
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
     if (options?.workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    body[PRESET_FIELD] = callPresetFor(options?.workerSession === true);
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
       body,
@@ -1162,6 +1163,7 @@ class SubcTransport implements AftProjectTransport {
     const { [WORKER_SESSION_FIELD]: workerSession, ...args } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    body[PRESET_FIELD] = callPresetFor(workerSession === true);
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     const reply = await this.pool.routeRequest(

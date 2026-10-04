@@ -43,6 +43,20 @@ export interface ToolCallOptions extends AftTransportOptions {
  */
 export const WORKER_SESSION_FIELD = "worker_session";
 
+/**
+ * Tool-call body field naming the catalog preset the caller runs under
+ * (subc-protocol 0.29 `ToolCallRequest.preset`). The module refuses a tool
+ * call that names no preset on a route the daemon stamped with a scope, so
+ * the subc transport names one on every call: `worker` for a worker session,
+ * `head` otherwise. It travels beside the call, never in the arguments.
+ */
+export const PRESET_FIELD = "preset";
+
+/** The catalog preset for a call from a worker or a primary session. */
+export function callPresetFor(workerSession: boolean): "worker" | "head" {
+  return workerSession ? "worker" : "head";
+}
+
 // A single project's transport (today: one BinaryBridge per project root).
 export interface AftProjectTransport {
   send(
