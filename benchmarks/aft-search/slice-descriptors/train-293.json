@@ -1,8 +1,10 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
-  "fixtures": ["harness-goldens"],
-  "slices": ["callgraph-extraction-speedup-and-false-zero-fixes"],
-  "note": "Call-graph extraction: one parse per file with a determinism fix, plus typed receiver resolution and integration-test caller fixes; no ranking-fence file."
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["callgraph-extraction-speedup-and-false-zero-fixes", "callgraph-scheduler-test-isolation"],
+  "note": "The only ranking-fenced file touched is crates/aft/src/commands/semantic_search/mod.rs, and only in its #[cfg(test)] module (test imports and a per-context spawn counter assertion). Production search is unchanged, so no benchmark row may move. The rest is call-graph extraction (one parse per file, a determinism fix), typed receiver resolution and integration-test callers."
 }
