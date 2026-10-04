@@ -4775,10 +4775,16 @@ fn restore_regular_file(
     {
         std::fs::remove_file(path)?;
     }
-    std::fs::write(path, content_bytes)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(content_bytes)?;
     set_file_mode(path, mode)?;
     // Do not pop the undo stack while restored bytes exist only in page cache.
-    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    // Keep the writer handle through mode restoration: reopening for write
+    // would fail if the backup's original permissions were read-only.
     crate::durability::sync_file(&file, path)
 }
 
@@ -5793,6 +5799,22 @@ mod tests {
             .unwrap();
         assert!(restored < meta, "{events:?}");
         assert_eq!(fs::read_to_string(path).unwrap(), "edited");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_undo_syncs_read_only_restoration_using_writer_handle() {
+        let (mut store, _storage, path) = durability_store();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        store.snapshot("durability", &path, "edit").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&path, "edited").unwrap();
+        store.restore_latest("durability", &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
     }
 
     #[test]
