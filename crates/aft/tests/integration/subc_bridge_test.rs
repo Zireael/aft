@@ -3022,6 +3022,76 @@ fn subc_bridge_health_check_returns_root_status_report() {
     );
 }
 
+/// A channel-0 request AFT cannot decode costs only that request. Here the
+/// scope stamp's `attributes` carries a field the deny-unknown-fields type
+/// does not know: the bind is refused by name, and the next valid bind and a
+/// health check on the same connection are still answered. Before, the
+/// decode error ended the frame loop and with it every route on the module.
+#[test]
+fn subc_bridge_undecodable_control_request_is_refused_without_ending_the_loop() {
+    run_subc_bridge_test(
+        "subc_bridge_undecodable_control_request_is_refused_without_ending_the_loop",
+        Duration::from_secs(30),
+        drive_undecodable_control_request_daemon,
+        |_, _, _| {},
+    );
+}
+
+async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+
+    let mut request = serde_json::to_value(ModuleControlRequest::RouteBind {
+        route_channel: 11,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity::new(
+            root1.clone(),
+            "opencode".to_string(),
+            "session-11".to_string(),
+        ),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Default::default(),
+        scope: None,
+        role_versions: None,
+    })
+    .expect("route bind body");
+    // The control request is internally tagged (`op`), so the bind fields sit
+    // at the top level.
+    request["scope"] = json!({
+        "owner": {"kind": "direct"},
+        "ref": "scope-ref",
+        "scope_epoch": 1,
+        "kind": "worker",
+        "attributes": {"agent_id": "agent", "a_field_no_reader_knows": true},
+        "owner_authorized": true,
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            120,
+            serde_json::to_vec(&request).expect("route bind bytes"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+    expect_route_bind_error(&mut stream, 120, "undecodable_control_request").await;
+
+    send_route_bind_with_session(&mut stream, 12, 121, &root1, "session-12").await;
+    expect_route_bind_ack(&mut stream, 121).await;
+    send_control_request(&mut stream, 122, ModuleControlRequest::HealthCheck {}).await;
+    let _report = expect_health_check_report(&mut stream, 122).await;
+    send_connection_goodbye(&mut stream).await;
+}
+
 #[test]
 fn subc_bridge_health_check_reports_pending_route_bind() {
     run_subc_bridge_test(

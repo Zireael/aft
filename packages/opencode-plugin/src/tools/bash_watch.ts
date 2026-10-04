@@ -12,6 +12,7 @@ import {
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
   type WatchCallerRole,
+  WORKER_KEEP_WAITING,
   watchClock,
   watchPollDelayMs,
   watchTimeoutSteer,
@@ -81,13 +82,28 @@ function coerceConfiguredWatchTimeout(
   }
 }
 
+/**
+ * The bash_watch tool description. Every plugin registration uses the
+ * `primary` wording, which covers both roles. The subc module catalog's
+ * `worker` preset uses the `worker` wording: a delegated worker is never woken
+ * by a completion reminder or an async notification once its turn ends, so it
+ * is told only how to wait. The polling warning names bash_status only when
+ * the model can call it.
+ */
+export function bashWatchDescription(role: WatchCallerRole, statusRegistered: boolean): string {
+  const noPolling = statusRegistered ? " Never loop bash_status to wait." : "";
+  if (role === "worker") {
+    return `Watch a background bash task and wait until it exits or prints a pattern. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. A background task never wakes you, so wait on it before you report a result. ${WORKER_KEEP_WAITING}${noPolling}`;
+  }
+  return `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${noPolling}`;
+}
+
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
-  // The polling warning names bash_status only when the model can call it.
-  const noPolling = bashCompanionRegistered(ctx.config, "bash_status")
-    ? " Never loop bash_status to wait."
-    : "";
   return {
-    description: `Watch a background bash task. ${WATCH_SYNC_DEFAULTS_DESCRIPTION}. In a main session sync waits are for a short remaining wait on a task; for anything longer end the turn on \`bash({background:true})\` and let the completion reminder wake you, or use \`bash({wait:true})\` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn.${noPolling}`,
+    description: bashWatchDescription(
+      "primary",
+      bashCompanionRegistered(ctx.config, "bash_status"),
+    ),
     args: {
       taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z

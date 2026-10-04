@@ -1022,6 +1022,9 @@ struct RouteIdentityData {
     /// kept so that when the daemon ends that scope, the bash tasks started on
     /// this route can be ended with it; that cleanup is not built yet.
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Set by the route's first tool call, so the health counter of scoped
+    /// routes that make tool calls counts each route once.
+    made_tool_call: AtomicBool,
 }
 
 impl Deref for RouteIdentity {
@@ -6014,8 +6017,10 @@ async fn handle_control_request(
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
 ) -> Result<(), SubcError> {
-    let request =
-        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(SubcError::Json)?;
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => return refuse_undecodable_control_request(tx, frame, &error, metrics).await,
+    };
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -6029,6 +6034,19 @@ async fn handle_control_request(
             role_versions,
         } => {
             let route_id = route_key(route_channel, epoch);
+            // Whether the daemon stamped this bind with a scope decides what a
+            // tool call without a preset gets (refused when scoped, the
+            // unscoped default otherwise), so every bind says which it was.
+            log::info!(
+                "subc route bind: channel={route_channel} epoch={epoch} harness={} session={} scope={} role_versions={}",
+                identity.harness,
+                identity.session,
+                scope.as_ref().map_or_else(
+                    || "none".to_string(),
+                    |stamp| format!("{:?}", stamp.kind).to_lowercase()
+                ),
+                if role_versions.is_some() { "declared" } else { "none" }
+            );
             if epoch == 0 {
                 return send_route_bind_error(
                     tx,
@@ -6312,6 +6330,7 @@ async fn handle_control_request(
                 consumer_elicitation_capable,
                 disabled_tools: bind_disabled_tools,
                 scope,
+                made_tool_call: AtomicBool::new(false),
             }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
@@ -6557,8 +6576,28 @@ async fn handle_management_request(
                 "command".to_string(),
                 json!(crate::commands::health_digest::HEALTH_DIGEST_OPERATION),
             );
-            let request = serde_json::from_value::<RawRequest>(Value::Object(request))
-                .map_err(SubcError::Json)?;
+            let request = match serde_json::from_value::<RawRequest>(Value::Object(request)) {
+                Ok(request) => request,
+                // A malformed parameter (a non-string `session_id`, say) is
+                // this request's error, never a reason to end the frame loop.
+                Err(error) => {
+                    return send_management_response(
+                        tx,
+                        frame,
+                        operation,
+                        Response::error(
+                            "management-health-digest",
+                            "invalid_request",
+                            format!(
+                                "health.digest params do not decode: {}",
+                                brief_decode_error(&error)
+                            ),
+                        ),
+                        metrics,
+                    )
+                    .await;
+                }
+            };
             match ProjectRootId::from_path(Path::new(root))
                 .ok()
                 .and_then(|root_id| executor.actor_context(&root_id))
@@ -6863,6 +6902,54 @@ async fn send_route_bind_ack(
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await
 }
 
+/// Longest decode-error text a refusal carries back to the sender; serde can
+/// quote a whole body in its message.
+const DECODE_ERROR_TEXT_MAX: usize = 240;
+
+/// A serde decode error, shortened for a refusal message and a log line.
+fn brief_decode_error(error: &serde_json::Error) -> String {
+    let text = error.to_string();
+    match text.char_indices().nth(DECODE_ERROR_TEXT_MAX) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text,
+    }
+}
+
+/// Answers a channel-0 request whose body does not decode, and keeps the
+/// module running.
+///
+/// One request AFT cannot read (for example a route bind whose scope stamp
+/// carries a field a deny-unknown-fields type does not know yet) must cost
+/// only that request. Ending the frame loop instead would drop every route on
+/// the connection, fleet-wide, until the daemon respawned the module. Only
+/// transport failures may end the loop.
+async fn refuse_undecodable_control_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    error: &serde_json::Error,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let reason = brief_decode_error(error);
+    log::warn!(
+        "subc attach: refusing channel-0 request corr={} whose body does not decode ({} bytes): {reason}",
+        frame.header.corr,
+        frame.body.len()
+    );
+    let response = build_error_frame(
+        frame.header.ver,
+        0,
+        0,
+        frame.header.corr,
+        frame.header.flags,
+        UNDECODABLE_CONTROL_REQUEST,
+        &format!("control request does not decode: {reason}"),
+    )?;
+    send_reliable_writer_frame(tx, metrics, response, "undecodable control request error").await
+}
+
+/// Error code for a channel-0 request AFT could not decode.
+pub(crate) const UNDECODABLE_CONTROL_REQUEST: &str = "undecodable_control_request";
+
 async fn send_route_bind_error(
     tx: &WriterSender,
     frame: &Frame,
@@ -7154,7 +7241,10 @@ async fn handle_tool_call(
         }
     }
 
-    let envelope = serde_json::from_slice::<Value>(&frame.body).map_err(SubcError::Json)?;
+    let envelope = match serde_json::from_slice::<Value>(&frame.body) {
+        Ok(envelope) => envelope,
+        Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
+    };
     let operation = envelope.get("op").and_then(Value::as_str).or_else(|| {
         envelope
             .get("name")
@@ -7198,6 +7288,7 @@ async fn handle_tool_call(
         }
     }
     let route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+        note_route_tool_call(&identity, metrics);
         let call = match serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
             envelope,
         ) {
@@ -7215,15 +7306,17 @@ async fn handle_tool_call(
                 .await
             }
         };
-        if let Err(error) = tool_provider::admit(
+        let role = match tool_provider::admit(
             &call,
+            identity.scope.is_some(),
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
             !matches!(identity.trust, BindTrust::Untrusted),
         ) {
-            return send_provider_error(tx, metrics, frame, error).await;
-        }
+            Ok(role) => role,
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        };
         let mut arguments = call.arguments;
         if matches!(call.name.as_str(), "bash" | "powershell") {
             let args = arguments
@@ -7246,11 +7339,19 @@ async fn handle_tool_call(
             edit_slot_survives: None,
             preview: false,
             worker_session: false,
+            preset: call.preset,
+            v1_role: Some(role),
             call_key: call.call_key,
             schema_pin: call.schema_pin,
         })
     } else {
-        decode_legacy_route_request(envelope)?
+        match decode_legacy_route_request(envelope) {
+            Ok(request) => request,
+            Err(SubcError::Json(error)) => {
+                return refuse_undecodable_route_request(tx, frame, &error, metrics).await
+            }
+            Err(error) => return Err(error),
+        }
     };
     if matches!(
         route_request,
@@ -7333,6 +7434,35 @@ async fn handle_tool_call(
     if let Err(error) = validate_opaque_call_fields(&call) {
         let refusal = opaque_field_refusal_frame(&frame, &error)?;
         return send_reliable_writer_frame(tx, metrics, refusal, "invalid_request refusal").await;
+    }
+    note_route_tool_call(&identity, metrics);
+    let scoped_route = identity.scope.is_some();
+    // The preset rule covers the model's tool calls, the names the catalog
+    // serves. A legacy route's management op (`op` + `params`) and the
+    // plugins' own plumbing commands are not model calls and name no preset.
+    let agent_tool = is_subc_agent_core_tool(&call.name);
+    // The call's preset decides its role. A v1 call was refused at admission
+    // already; a legacy call is refused here, before anything runs, with the
+    // same error frame a v1 refusal gets.
+    let role = match call.caller_role(scoped_route && agent_tool) {
+        Ok(role) => role,
+        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+    };
+    if agent_tool && call.preset.is_none() && !scoped_route {
+        metrics.record_presetless_tool_call(&identity.harness);
+    }
+    if role == tool_provider::CallerRole::Reader
+        && !tool_provider::READER_TOOLS.contains(&call.name.as_str())
+    {
+        let error = subc_protocol::ErrorBody::new(
+            "unknown_tool",
+            format!(
+                "tool {:?} is not served by the \"reader\" preset",
+                call.name
+            ),
+        )
+        .with_detail(json!({"tool": call.name, "preset": "reader"}));
+        return send_provider_error(tx, metrics, frame, error).await;
     }
     if let Some(pin) = call.schema_pin.as_deref() {
         // The pin is only logged: refusing a call built against a catalog
@@ -7500,7 +7630,7 @@ async fn handle_tool_call(
             &bare_name,
             &arguments,
             call.preview,
-            call.worker_session,
+            role.is_worker(),
         );
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
@@ -7609,7 +7739,7 @@ async fn handle_tool_call(
                     cancel,
                     grants: plan.grants,
                     repeat,
-                    worker_session: call.worker_session,
+                    worker_session: role.is_worker(),
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -7661,7 +7791,7 @@ async fn handle_tool_call(
             call_key,
             None,
             repeat,
-            call.worker_session,
+            role.is_worker(),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
         );
         return Ok(());
@@ -7678,7 +7808,7 @@ async fn handle_tool_call(
         report_registration_downgrade: identity.role == tool_provider::RouteRole::Legacy,
         standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
-        worker_session: call.worker_session,
+        worker_session: role.is_worker(),
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
@@ -8400,6 +8530,8 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
                 edit_slot_survives: None,
                 preview: false,
                 worker_session: false,
+                preset: None,
+                v1_role: None,
                 call_key: None,
                 schema_pin: None,
             }))
@@ -8448,9 +8580,20 @@ struct ToolCallRequest {
     preview: bool,
     /// The caller is a delegated worker session. The AFT plugins set it next
     /// to the call, like `preview`, and never inside the agent's `arguments`;
-    /// see `RawRequest::worker_session`.
+    /// see `RawRequest::worker_session`. Read it through
+    /// [`ToolCallRequest::caller_role`].
     #[serde(default)]
     worker_session: bool,
+    /// The catalog preset the call names (subc-protocol 0.29's
+    /// `ToolCallRequest.preset`, set by the consumer beside `call_key`). It
+    /// decides the call's role; see `tool_provider::resolve_caller_role`.
+    #[serde(default)]
+    preset: Option<String>,
+    /// The role a v1 call resolved at admission, from the catalog preset it
+    /// names (`tool_provider::caller_role`). Never decoded from the wire: a v1
+    /// body has no `worker_session`, and a legacy body leaves this `None`.
+    #[serde(skip)]
+    v1_role: Option<tool_provider::CallerRole>,
     /// The consumer's own key for this call, which lets it recognise the
     /// same call arriving twice. Checked with subc-protocol's validator
     /// before anything runs; a bash call records it on its background task.
@@ -8463,6 +8606,63 @@ struct ToolCallRequest {
     /// refusing a call whose pin no longer matches the catalog comes later.
     #[serde(default)]
     schema_pin: Option<String>,
+}
+
+impl ToolCallRequest {
+    /// The role this call runs under: the v1 role resolved at admission, or
+    /// on a legacy route the role its preset (or, without one, the plugins'
+    /// `worker_session` flag) resolves to. Every worker-specific behaviour
+    /// downstream reads the resolved role's `is_worker()`.
+    fn caller_role(
+        &self,
+        scoped_route: bool,
+    ) -> Result<tool_provider::CallerRole, subc_protocol::ErrorBody> {
+        match self.v1_role {
+            Some(role) => Ok(role),
+            None => tool_provider::resolve_caller_role(
+                self.preset.as_deref(),
+                scoped_route,
+                self.worker_session,
+            ),
+        }
+    }
+}
+
+/// Counts a scoped route's first tool call in the health metrics. A call on
+/// any route, refused or not, marks the route; only the first one counts.
+fn note_route_tool_call(identity: &RouteIdentity, metrics: &DispatchPathMetrics) {
+    if identity.scope.is_some() && !identity.made_tool_call.swap(true, Ordering::Relaxed) {
+        metrics.record_scoped_route_with_tool_calls();
+    }
+}
+
+/// Answers a route request whose body does not decode with `invalid_request`
+/// for that one request. Like [`refuse_undecodable_control_request`], a body
+/// AFT cannot read must never end the frame loop and every route with it.
+async fn refuse_undecodable_route_request(
+    tx: &WriterSender,
+    frame: &Frame,
+    error: &serde_json::Error,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let reason = brief_decode_error(error);
+    log::warn!(
+        "subc attach: refusing route request channel={} corr={} whose body does not decode ({} bytes): {reason}",
+        frame.header.channel,
+        frame.header.corr,
+        frame.body.len()
+    );
+    let refusal = build_error_frame_with_detail(
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+        frame.header.flags,
+        "invalid_request",
+        &format!("request body does not decode: {reason}"),
+        json!({ "field": "body" }),
+    )?;
+    send_reliable_writer_frame(tx, metrics, refusal, "undecodable route request error").await
 }
 
 /// Check the consumer-chosen opaque tokens on a call (`call_key`,
@@ -9618,6 +9818,7 @@ pub(crate) mod test_support {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }))
     }
 
@@ -13255,6 +13456,7 @@ mod tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }));
         let replay_key = push::ReplayKey::from_identity(&identity);
         let completion = RouteBindCompletion {
@@ -13339,6 +13541,7 @@ mod tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            made_tool_call: AtomicBool::new(false),
         }));
         let completion = RouteBindCompletion {
             route,

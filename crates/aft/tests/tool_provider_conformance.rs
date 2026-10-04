@@ -33,7 +33,14 @@ use tokio::{
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
 
-struct Subject;
+/// The provider under test, fetching its catalog with `preset` (`None` sends
+/// no preset, which AFT serves as `head`).
+struct Subject {
+    preset: Option<&'static str>,
+}
+impl Subject {
+    const HEAD: Subject = Subject { preset: None };
+}
 struct Process {
     child: Mutex<Child>,
     stream: Arc<AsyncMutex<Wire>>,
@@ -485,10 +492,19 @@ impl ToolProviderSubject for Subject {
         None
     }
     fn catalog_arguments(&self) -> Value {
-        json!({})
+        match self.preset {
+            Some(preset) => json!({ "preset": preset }),
+            None => json!({}),
+        }
     }
     fn quick_call(&self) -> CallSpec {
-        ("status".into(), json!({}))
+        // The quick call's tool must be in the catalog under test, and the
+        // reader preset serves no `status`.
+        if self.preset == Some("reader") {
+            ("glob".into(), json!({"pattern": "*"}))
+        } else {
+            ("status".into(), json!({}))
+        }
     }
     fn slow_call(&self) -> Option<CallSpec> {
         Some((
@@ -515,12 +531,30 @@ impl ToolProviderSubject for Subject {
 
 #[tokio::test]
 async fn slice_a_real_module_conformance_inventory() {
+    conformance_inventory(Subject::HEAD).await;
+}
+
+/// The commons suite holds for every catalog preset AFT serves: each one is a
+/// complete catalog, refuses an undefined preset, and admits its own quick
+/// call and schema pins.
+#[tokio::test]
+async fn every_catalog_preset_passes_the_conformance_suite() {
+    for preset in ["head", "worker", "reader"] {
+        eprintln!("preset {preset}:");
+        conformance_inventory(Subject {
+            preset: Some(preset),
+        })
+        .await;
+    }
+}
+
+async fn conformance_inventory(subject: Subject) {
     use cortexkit_role_tool_provider_conformance::CaseOutcome;
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/tool_provider_conformance.json")).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let report =
-        cortexkit_role_tool_provider_conformance::run_suite(&Subject, &dir.path().join("run"))
+        cortexkit_role_tool_provider_conformance::run_suite(&subject, &dir.path().join("run"))
             .await
             .unwrap();
     let mut enabled = BTreeSet::new();
@@ -623,7 +657,7 @@ async fn catalog_reply(route: &Route, request: Value) -> Value {
 async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let process = Subject.spawn(&state).await.unwrap();
+    let process = Subject::HEAD.spawn(&state).await.unwrap();
     std::fs::create_dir_all(state.join("config/cortexkit")).unwrap();
     std::fs::write(state.join("config/cortexkit/aft.jsonc"), serde_json::to_vec(&json!({"disabled_tools": [], "harnesses": {"runner": {"disabled_tools": ["aft_outline"]}, "opencode": {"disabled_tools": ["aft_search"]}}})).unwrap()).unwrap();
     let p1 = state.join("project");
@@ -707,7 +741,7 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     drop(routes);
     drop(restored);
     drop(process);
-    let restarted = Subject.restart(&state).await.unwrap();
+    let restarted = Subject::HEAD.restart(&state).await.unwrap();
     std::fs::write(p1.join(".cortexkit/aft.jsonc"), project_config(vec![])).unwrap();
     let route = bind_route(&restarted, &p1, "runner", "restart")
         .await

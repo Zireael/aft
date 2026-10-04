@@ -3,11 +3,11 @@
  * Generates subc_tool_schemas.json for the agent-file-tools crate.
  *
  * Run: bun run build:tool-schemas
- * Output: crates/aft/src/subc_tool_schemas.json
+ * Output: crates/aft/src/subc_tool_schemas.json and crates/aft/src/subc_tool_presets.json
  */
 
 import * as path from "node:path";
-import { buildSubcToolSchemasJson } from "../src/subc-tool-schemas.js";
+import { buildSubcToolPresetsJson, buildSubcToolSchemasJson } from "../src/subc-tool-schemas.js";
 
 async function main() {
   const pluginRoot = path.resolve(import.meta.dir, "..");
@@ -32,6 +32,19 @@ async function main() {
     }
   } else {
     await Bun.write(outputPath, json);
+  }
+
+  const presetsPath = path.join(repoRoot, "crates", "aft", "src", "subc_tool_presets.json");
+  const presetsJson = buildSubcToolPresetsJson();
+  if (checkOnly) {
+    const existing = await Bun.file(presetsPath).text();
+    if (existing !== presetsJson) {
+      throw new Error(
+        `subc tool preset byte drift detected at ${presetsPath}; run without --check to regenerate it`,
+      );
+    }
+  } else {
+    await Bun.write(presetsPath, presetsJson);
   }
 
   // The generator is a tiny debug binary, so a compile cache buys nothing and

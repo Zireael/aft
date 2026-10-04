@@ -54,6 +54,7 @@ impl DatabaseWaits {
             };
             if tool_provider::admit(
                 &call,
+                identity.scope.is_some(),
                 &identity.disabled_tools,
                 crate::bash_background::powershell_available(),
                 &identity.session,

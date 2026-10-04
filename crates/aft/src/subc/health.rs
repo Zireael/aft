@@ -1,5 +1,6 @@
 //! Dispatch-path metrics and health-report helpers for the subc transport loop.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -532,6 +533,13 @@ pub(super) struct DispatchPathMetrics {
     bg_event_rates: BgEventRates,
     reap: ReapMetrics,
     bind_acks: StdMutex<BindAckLatencies>,
+    /// Tool calls that named no catalog preset on a route without a scope
+    /// stamp (so they ran under the unscoped default), by the route's
+    /// harness. Shows when the last caller starts naming one.
+    presetless_tool_calls: StdMutex<BTreeMap<String, u64>>,
+    /// Routes bound with a daemon scope stamp that made at least one tool
+    /// call, each counted once.
+    scoped_routes_with_tool_calls: AtomicU64,
 }
 
 impl DispatchPathMetrics {
@@ -563,7 +571,37 @@ impl DispatchPathMetrics {
             bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
             bind_acks: StdMutex::new(BindAckLatencies::default()),
+            presetless_tool_calls: StdMutex::new(BTreeMap::new()),
+            scoped_routes_with_tool_calls: AtomicU64::new(0),
         }
+    }
+
+    /// A tool call on an unscoped route named no catalog preset.
+    pub(super) fn record_presetless_tool_call(&self, harness: &str) {
+        if let Ok(mut counts) = self.presetless_tool_calls.lock() {
+            *counts.entry(harness.to_string()).or_default() += 1;
+        }
+    }
+
+    /// A route bound with a scope stamp made its first tool call.
+    pub(super) fn record_scoped_route_with_tool_calls(&self) {
+        self.scoped_routes_with_tool_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn tool_call_preset_snapshot(&self) -> Value {
+        let by_harness = self
+            .presetless_tool_calls
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
+        json!({
+            "tool_calls_without_preset": {
+                "total": by_harness.values().sum::<u64>(),
+                "by_harness": by_harness,
+            },
+            "scoped_routes_with_tool_calls": self.scoped_routes_with_tool_calls.load(Ordering::Relaxed),
+        })
     }
 
     /// Record how long a RouteBind took from arrival to its answer: a
@@ -903,6 +941,7 @@ impl DispatchPathMetrics {
                 "oldest_age_ms": oldest_pending_age_ms,
             },
             "bind_acks": self.bind_ack_snapshot(),
+            "tool_call_presets": self.tool_call_preset_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
