@@ -1727,143 +1727,48 @@ fn graphql_query_is_read_only(args: &[OsString]) -> bool {
             .all(|query| graphql_document_is_read_only(query))
 }
 
-/// Tokenize just enough GraphQL to identify operation boundaries. Strings
-/// (including block strings) and comments cannot introduce an operation, and
-/// mismatched delimiters or unsupported definitions are never admitted. This
-/// is deliberately not a schema validator: GitHub still validates query fields.
 fn graphql_document_is_read_only(document: &str) -> bool {
-    let Some(tokens) = graphql_tokens(document) else {
-        return false;
+    graphql_document_shape(document).read_only
+}
+
+#[derive(Default)]
+struct GraphqlDocumentShape {
+    read_only: bool,
+    has_mutation: bool,
+}
+
+/// Delegated reads use the operator's credentials, so inspect the complete
+/// syntax tree rather than guessing operation boundaries from delimiters.
+/// Parser recovery trees cannot authorize reads. GitHub still validates fields
+/// against its schema; only queries and fragments may cross this boundary.
+fn graphql_document_shape(document: &str) -> GraphqlDocumentShape {
+    use apollo_parser::{cst::Definition, Parser};
+
+    let parsed = Parser::new(document).parse();
+    if parsed.errors().next().is_some() {
+        return GraphqlDocumentShape::default();
+    }
+
+    let mut shape = GraphqlDocumentShape {
+        read_only: true,
+        has_mutation: false,
     };
-    let mut index = 0;
-    let mut operations = 0;
-    while index < tokens.len() {
-        if tokens[index] == "query" {
-            index += 1;
-            if tokens.get(index).is_some_and(|token| graphql_name(token)) {
-                index += 1;
-            }
-            if tokens.get(index) == Some(&"(") && !graphql_skip_group(&tokens, &mut index) {
-                return false;
-            }
-            while tokens.get(index) == Some(&"@") {
-                index += 1;
-                if !tokens.get(index).is_some_and(|token| graphql_name(token)) {
-                    return false;
-                }
-                index += 1;
-                if tokens.get(index) == Some(&"(") && !graphql_skip_group(&tokens, &mut index) {
-                    return false;
+    let mut has_operation = false;
+    for definition in parsed.document().definitions() {
+        match definition {
+            Definition::OperationDefinition(operation) => {
+                has_operation = true;
+                if let Some(kind) = operation.operation_type() {
+                    shape.read_only &= kind.query_token().is_some();
+                    shape.has_mutation |= kind.mutation_token().is_some();
                 }
             }
-        }
-        // Both a named query and the bare shorthand must start a selection
-        // set here. In particular mutation, subscription, and fragments are
-        // not accepted as top-level definitions, even when operationName would
-        // select a different operation in the same document.
-        if tokens.get(index) != Some(&"{") || !graphql_skip_group(&tokens, &mut index) {
-            return false;
-        }
-        operations += 1;
-    }
-    operations > 0
-}
-
-fn graphql_name(token: &str) -> bool {
-    token
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-}
-
-fn graphql_tokens(document: &str) -> Option<Vec<&str>> {
-    let bytes = document.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let start = index;
-        match bytes[index] {
-            b' ' | b'\t' | b'\r' | b'\n' | b',' => {
-                index += 1;
-                continue;
-            }
-            b'#' => {
-                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
-                    index += 1;
-                }
-                continue;
-            }
-            b'"' => {
-                let block = bytes[index..].starts_with(b"\"\"\"");
-                let delimiter: &[u8] = if block { b"\"\"\"" } else { b"\"" };
-                index += delimiter.len();
-                loop {
-                    if index >= bytes.len() {
-                        return None;
-                    }
-                    if bytes[index] == b'\\' {
-                        index += 2;
-                    } else if bytes[index..].starts_with(delimiter) {
-                        index += delimiter.len();
-                        break;
-                    } else {
-                        if !block && matches!(bytes[index], b'\r' | b'\n') {
-                            return None;
-                        }
-                        index += 1;
-                    }
-                }
-            }
-            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
-                index += 1;
-                while index < bytes.len()
-                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-                {
-                    index += 1;
-                }
-            }
-            b'!'
-            | b'$'
-            | b'('
-            | b')'
-            | b'.'
-            | b':'
-            | b'='
-            | b'@'
-            | b'['
-            | b']'
-            | b'{'
-            | b'|'
-            | b'}'
-            | b'-'
-            | b'0'..=b'9' => index += 1,
-            _ => return None,
-        }
-        tokens.push(&document[start..index]);
-    }
-    Some(tokens)
-}
-
-fn graphql_skip_group(tokens: &[&str], index: &mut usize) -> bool {
-    let mut closers = Vec::new();
-    while let Some(token) = tokens.get(*index) {
-        *index += 1;
-        match *token {
-            "{" => closers.push("}"),
-            "(" => closers.push(")"),
-            "[" => closers.push("]"),
-            "}" | ")" | "]" => {
-                if closers.pop() != Some(*token) {
-                    return false;
-                }
-                if closers.is_empty() {
-                    return true;
-                }
-            }
-            _ => {}
+            Definition::FragmentDefinition(_) => {}
+            _ => shape.read_only = false,
         }
     }
-    false
+    shape.read_only &= has_operation;
+    shape
 }
 
 /// What a write acts on (see `WriteTarget`), from the same resolver the
@@ -1966,23 +1871,7 @@ fn api_refusal_subject(args: &[OsString]) -> String {
         let Some(document) = field.strip_prefix("query=") else {
             return false;
         };
-        let Some(tokens) = graphql_tokens(document) else {
-            return false;
-        };
-        let mut index = 0;
-        while let Some(token) = tokens.get(index) {
-            if *token == "mutation" {
-                return true;
-            }
-            if matches!(*token, "{" | "(" | "[") {
-                if !graphql_skip_group(&tokens, &mut index) {
-                    return false;
-                }
-            } else {
-                index += 1;
-            }
-        }
-        false
+        graphql_document_shape(document).has_mutation
     });
     format!(
         "api graphql ({})",
@@ -9127,6 +9016,18 @@ mod tests {
         }
     }
 
+    const GRAPHQL_READ_DOCUMENTS: &[&str] = &[
+        r#"{ repository(owner:"o", name:"r") { pullRequest(number:1) { reviewThreads(first:100){nodes{isResolved}} } } }"#,
+        "query Read($n: Int!) { repository { issue(number: $n) { title } } }",
+        "query First { viewer { login } } query Second { viewer { id } }",
+        r#"{ repository(name:"mutation") { mutationField } }"#,
+        "# mutation is only a comment\n{ viewer { login } }",
+        r#"query Read @skip(if: false) { field(arg: "\"}") }"#,
+        "{ field(arg: \"\"\"mutation { text }\"\"\") }",
+        "query Read { viewer { ...Identity } } fragment Identity on User { login }",
+        "fragment Identity on User { login } { viewer { ...Identity } }",
+    ];
+
     #[test]
     fn graphql_reads_delegate_unchanged_as_mechanical_operator_reads() {
         let directory = tempfile::tempdir().unwrap();
@@ -9139,15 +9040,7 @@ mod tests {
             repo: "cortexkit/aft".into(),
             agent_id: "bound-agent".into(),
         };
-        for query in [
-            r#"{ repository(owner:"o", name:"r") { pullRequest(number:1) { reviewThreads(first:100){nodes{isResolved}} } } }"#,
-            "query Read($n: Int!) { repository { issue(number: $n) { title } } }",
-            "query First { viewer { login } } query Second { viewer { id } }",
-            r#"{ repository(name:"mutation") { mutationField } }"#,
-            "# mutation is only a comment\n{ viewer { login } }",
-            r#"query Read @skip(if: false) { field(arg: "\"}") }"#,
-            "{ field(arg: \"\"\"mutation { text }\"\"\") }",
-        ] {
+        for query in GRAPHQL_READ_DOCUMENTS {
             let args = os_args(&[
                 "api",
                 "graphql",
@@ -9239,6 +9132,229 @@ mod tests {
                 "{tail:?}"
             );
         }
+    }
+
+    #[test]
+    fn graphql_block_string_escape_cannot_hide_a_selected_mutation() {
+        let document = r#"{ f(a: """\\"""X""") } mutation Write { addStar(input:{starrableId:"x"}) { clientMutationId } } # """ ) }"#;
+        let args = os_args(&[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={document}"),
+            "-f",
+            "operationName=Write",
+        ]);
+        assert!(
+            !graphql_query_is_read_only(&args),
+            "selected mutation must never be admitted: {document}"
+        );
+        assert!(api_invocation_writes(&args));
+        assert!(matches!(
+            classify(&args, &fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+        assert_eq!(api_refusal_subject(&args), "api graphql (mutation)");
+    }
+
+    const GRAPHQL_STRING_VALUES: &[&str] = &[
+        r##""plain""##,
+        r##""\" mutation Write { addStar } #""##,
+        r##""# mutation is string text""##,
+        r##""\\\"""##,
+        r##""\n\r\t\u0022""##,
+        r##""""block # mutation { addStar }""""##,
+        r##""""\""" mutation { addStar } #""""##,
+        r##""""\\"""X""""##,
+        "\"\"\"literal \\n and \\q\r\n# still a string\"\"\"",
+    ];
+
+    #[test]
+    fn graphql_parser_distinguishes_strings_comments_and_operations() {
+        let manifest = fixture_manifest();
+        for prefix in ["", "\u{feff}", "# ignored mutation { addStar }\r\n"] {
+            for value in GRAPHQL_STRING_VALUES {
+                let query = format!("{prefix}query Read {{ field(arg: {value}) }}");
+                let args = os_args(&["api", "graphql", "-f", &format!("query={query}")]);
+                assert!(graphql_query_is_read_only(&args), "{query}");
+                assert!(matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Mechanical
+                ));
+                assert_eq!(
+                    api_refusal_subject(&args),
+                    "api graphql (uninspectable query)",
+                    "{query}"
+                );
+
+                // Even selecting the query must not authorize another operation
+                // in the same document to run with the operator's credentials.
+                let mixed = format!("{query} # comment\r\nmutation Write {{ addStar }}");
+                for selected in ["Read", "Write"] {
+                    let args = os_args(&[
+                        "api",
+                        "graphql",
+                        "-f",
+                        &format!("query={mixed}"),
+                        "-f",
+                        &format!("operationName={selected}"),
+                    ]);
+                    assert!(!graphql_query_is_read_only(&args), "{mixed}");
+                    assert!(api_invocation_writes(&args));
+                    assert!(matches!(
+                        classify(&args, &manifest, "macos"),
+                        Classification::Unclassified
+                    ));
+                    assert_eq!(api_refusal_subject(&args), "api graphql (mutation)");
+                }
+            }
+        }
+    }
+
+    const GRAPHQL_REFUSED_DOCUMENTS: &[&str] = &[
+        "",
+        "# no operation\r\n",
+        "mutation { addStar }",
+        "subscription { events }",
+        "query Read { viewer { login } } mutation Write { addStar }",
+        "query Read($n: Int!) { viewer { login } } subscription Watch { events }",
+        "@-",
+        "@file",
+        "{ viewer { login }",
+        "not_a_document",
+        r#"{ field(arg: "unterminated) }"#,
+        "{ field(arg: [1, 2) }",
+        r#"{ field(arg: """text""") } mutation { addStar }"#,
+        "fragment Only on Query { viewer { login } }",
+        "fragment Only on Mutation { addStar }",
+        "fragment Only on Query { viewer { login } } mutation Write { addStar }",
+        "fragment Only on Query { mutation Write { addStar } }",
+        "{}",
+        "query Read($n Int) { viewer }",
+        "{ field(arg: 01) }",
+        "{ field(arg: 1.) }",
+        r#"{ field(arg: "\q") }"#,
+        r#"{ field(arg: "\uZZZZ") }"#,
+        r#"{ field(arg: """unterminated) }"#,
+    ];
+
+    const GRAPHQL_TYPE_SYSTEM_DOCUMENTS: &[&str] = &[
+        "schema { query: Query }",
+        "scalar Custom",
+        "type Query { viewer: User }",
+        "interface Node { id: ID! }",
+        "union Result = User | Issue",
+        "enum Color { RED GREEN }",
+        "input Filter { name: String }",
+        "directive @custom on FIELD",
+        "extend schema { mutation: Mutation }",
+        "extend scalar Custom @custom",
+        "extend type Query { other: String }",
+        "extend interface Node { name: String }",
+        "extend union Result = PullRequest",
+        "extend enum Color { BLUE }",
+        "extend input Filter { id: ID }",
+    ];
+
+    #[test]
+    fn graphql_parser_refuses_non_query_definitions_and_parse_errors() {
+        let manifest = fixture_manifest();
+        for document in GRAPHQL_REFUSED_DOCUMENTS {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            assert!(!graphql_query_is_read_only(&args), "{document}");
+            assert!(api_invocation_writes(&args));
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+        for definition in GRAPHQL_TYPE_SYSTEM_DOCUMENTS {
+            for prefix in ["", "query Read { viewer { login } } "] {
+                let document = format!("{prefix}{definition}");
+                let parsed = apollo_parser::Parser::new(&document).parse();
+                assert_eq!(parsed.errors().count(), 0, "{document}");
+                assert!(!graphql_document_is_read_only(&document), "{document}");
+            }
+        }
+        for document in [
+            "fragment Only on Query { mutation }",
+            "type Mutation { addStar: String }",
+            "query { mutation }",
+            "mutation Write { addStar } ?",
+            "query { viewer } # mutation Write { addStar }",
+        ] {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            assert_eq!(
+                api_refusal_subject(&args),
+                "api graphql (uninspectable query)",
+                "{document}"
+            );
+        }
+    }
+
+    #[test]
+    fn graphql_admission_matches_an_independent_full_parse_over_a_corpus() {
+        use graphql_parser::query::{Definition, OperationDefinition};
+
+        let mut corpus: Vec<String> = GRAPHQL_READ_DOCUMENTS
+            .iter()
+            .chain(GRAPHQL_REFUSED_DOCUMENTS)
+            .chain(GRAPHQL_TYPE_SYSTEM_DOCUMENTS)
+            .map(|document| (*document).to_string())
+            .collect();
+        corpus.push(r#"{ f(a: """\\"""X""") } mutation Write { addStar(input:{starrableId:"x"}) { clientMutationId } } # """ ) }"#.into());
+        for prefix in ["", "\u{feff}", "# mutation { ignored }\r\n"] {
+            for value in GRAPHQL_STRING_VALUES {
+                for operation in ["query Read", "mutation Write", "subscription Watch", ""] {
+                    for suffix in [
+                        "",
+                        " # mutation { ignored }\r\n",
+                        "\r\nquery Another { viewer { login } }",
+                        "\r\nmutation WriteAgain { addStar }",
+                        "\r\nsubscription WatchAgain { events }",
+                        "\r\nfragment Fields on Query { viewer { login } }",
+                        "\r\ntype Query { field: String }",
+                        "\r\n{ field(arg: \"\\q\") }",
+                    ] {
+                        corpus.push(format!(
+                            "{prefix}{operation} {{ field(arg: {value}) }}{suffix}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut admitted = 0;
+        let mut refused = 0;
+        for document in &corpus {
+            let args = os_args(&["api", "graphql", "-f", &format!("query={document}")]);
+            if !graphql_query_is_read_only(&args) {
+                refused += 1;
+                continue;
+            }
+            admitted += 1;
+            // Use a second implementation, not the admission summary, to check
+            // the actual document's full grammar and operation kinds.
+            let parsed = graphql_parser::parse_query::<String>(document)
+                .unwrap_or_else(|error| panic!("admitted invalid document {document:?}: {error}"));
+            let mut operations = 0;
+            for definition in parsed.definitions {
+                match definition {
+                    Definition::Operation(OperationDefinition::Query(_))
+                    | Definition::Operation(OperationDefinition::SelectionSet(_)) => {
+                        operations += 1
+                    }
+                    Definition::Fragment(_) => {}
+                    other => panic!("admitted non-query definition in {document:?}: {other:?}"),
+                }
+            }
+            assert!(
+                operations > 0,
+                "admitted fragment-only document: {document}"
+            );
+        }
+        assert!(admitted > 0 && refused > 0);
+        assert!(corpus.len() > 800, "generated corpus did not run");
     }
 
     #[test]
