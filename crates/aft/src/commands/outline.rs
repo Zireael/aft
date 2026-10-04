@@ -1605,6 +1605,9 @@ where
         // Queue directories before counting sibling files so the traversal keeps
         // its breadth-first coverage when the 10,000-file limit is reached.
         for path in child_directories {
+            if should_skip_directory(&path) {
+                continue;
+            }
             match boundary.should_descend_with(&path, |child| device_lookup(child)) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
@@ -2198,6 +2201,59 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             .expect("outline fixture files");
         assert!(skipped.is_empty(), "{skipped:?}");
         format_multi_file_tree(&outlines, 30 * 1024, files.len())
+    }
+
+    #[test]
+    fn files_mode_skips_git_and_dependency_directories_before_counting_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(temp.path())
+            .status()
+            .expect("run git init");
+        assert!(git.success(), "git init failed: {git}");
+
+        for path in [
+            "node_modules/package/deep/dependency.ts",
+            "src/index.ts",
+            "src/other.ts",
+        ] {
+            let file = temp.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).expect("create fixture directory");
+            std::fs::write(file, "export function fixture() {}\n").expect("write fixture");
+        }
+
+        let discovery = discover_outline_files_with_options(temp.path(), true);
+        assert!(
+            discovery
+                .files
+                .iter()
+                .any(|path| path.ends_with("src/index.ts")),
+            "source file missing: {:?}",
+            discovery.files
+        );
+        assert!(
+            discovery
+                .files
+                .iter()
+                .any(|path| path.ends_with("src/other.ts")),
+            "source file missing: {:?}",
+            discovery.files
+        );
+        assert!(
+            discovery
+                .files
+                .iter()
+                .all(|path| { !path.contains("/.git/") && !path.contains("/node_modules/") }),
+            "Git metadata or dependencies were traversed: {:?}",
+            discovery.files
+        );
+        assert_eq!(
+            discovery.entries_examined, 5,
+            "count the three root entries and two source files, not skipped directory contents"
+        );
+        assert!(!discovery.collection_truncated);
+        assert!(!discovery.walk_truncated);
     }
 
     #[test]
