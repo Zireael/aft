@@ -496,6 +496,11 @@ pub enum WatchdogPassCause {
 }
 
 pub(crate) struct RegistryInner {
+    #[cfg(unix)]
+    db_hint_jobs:
+        Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
+    #[cfg(unix)]
+    db_schema_hints: AtomicBool,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
@@ -833,6 +838,10 @@ impl BgTaskRegistry {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
             inner: Arc::new(RegistryInner {
+                #[cfg(unix)]
+                db_hint_jobs: Mutex::new(HashMap::new()),
+                #[cfg(unix)]
+                db_schema_hints: AtomicBool::new(true),
                 tasks: Mutex::new(HashMap::new()),
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 completions: Mutex::new(VecDeque::new()),
@@ -868,6 +877,44 @@ impl BgTaskRegistry {
                 active_wait_sessions: Mutex::new(HashMap::new()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
             }),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn set_db_schema_hints(&self, enabled: bool) {
+        self.inner.db_schema_hints.store(enabled, Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    fn db_hint_job(&self, task_id: &str) -> Option<Arc<crate::bash_db_hints::HintJob>> {
+        self.inner
+            .db_hint_jobs
+            .lock()
+            .ok()?
+            .get(task_id)
+            .map(|(_, job)| Arc::clone(job))
+    }
+
+    pub(crate) fn append_db_hint(&self, task_id: &str, text: &mut String) {
+        #[cfg(unix)]
+        if let Some(job) = self.db_hint_job(task_id) {
+            if let Some(hint) = job.hint() {
+                crate::response_finalize::append_db_schema_hint(text, hint);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (task_id, text);
+    }
+
+    #[cfg(unix)]
+    fn finish_db_hint(&self, metadata: &PersistedTask, buffer: &BgBuffer) {
+        if let Some(job) = self.db_hint_job(&metadata.task_id) {
+            let raw = buffer.read_combined_head_tail(
+                COMPRESS_INPUT_CAP_BYTES,
+                COMPRESS_INPUT_HEAD_BYTES,
+                COMPRESS_INPUT_TAIL_BYTES,
+            );
+            job.finish(&raw.text, metadata.exit_code);
         }
     }
 
@@ -1248,6 +1295,8 @@ impl BgTaskRegistry {
         disk_truncation: DiskTruncation,
         paths: Option<&TaskPaths>,
     ) -> TerminalOutputCache {
+        #[cfg(unix)]
+        self.finish_db_hint(metadata, buffer);
         let output_readable = buffer
             .output_path()
             .is_some_and(|path| self.is_session_owned_artifact_path(&metadata.session_id, &path));
@@ -2475,6 +2524,19 @@ impl BgTaskRegistry {
             }),
         });
 
+        if !shell.is_powershell() {
+            let job = Arc::new(crate::bash_db_hints::HintJob::new(
+                command,
+                &workdir,
+                &env,
+                &spawn_plan,
+                self.inner.db_schema_hints.load(Ordering::Relaxed),
+            ));
+            if let Ok(mut jobs) = self.inner.db_hint_jobs.lock() {
+                jobs.retain(|_, (task, _)| task.strong_count() > 0);
+                jobs.insert(task_id.clone(), (Arc::downgrade(&task), job));
+            }
+        }
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
         self.inner
@@ -2681,6 +2743,20 @@ impl BgTaskRegistry {
             }),
         });
 
+        #[cfg(unix)]
+        if !shell.is_powershell() {
+            let job = Arc::new(crate::bash_db_hints::HintJob::new(
+                command,
+                &workdir,
+                &env,
+                &spawn_plan,
+                self.inner.db_schema_hints.load(Ordering::Relaxed),
+            ));
+            if let Ok(mut jobs) = self.inner.db_hint_jobs.lock() {
+                jobs.retain(|_, (task, _)| task.strong_count() > 0);
+                jobs.insert(task_id.clone(), (Arc::downgrade(&task), job));
+            }
+        }
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
         self.inner
@@ -4677,11 +4753,21 @@ impl BgTaskRegistry {
     /// terminal bytes are rendered by the plugin's PTY path, not the line
     /// compressor.
     fn maybe_compress_snapshot(&self, task: &Arc<BgTask>, snapshot: &mut BgTaskSnapshot) {
-        if !snapshot.info.status.is_terminal() || snapshot.info.mode == BgMode::Pty {
+        if !snapshot.info.status.is_terminal() {
+            return;
+        }
+        if snapshot.info.mode == BgMode::Pty {
+            #[cfg(unix)]
+            if let Ok(state) = task.state.lock() {
+                let (metadata, buffer) = (state.metadata.clone(), state.buffer.clone());
+                drop(state);
+                self.finish_db_hint(&metadata, &buffer);
+            }
             return;
         }
         if let Some(cache) = self.ensure_terminal_output_cache(task) {
             let mut output_preview = cache.output_preview.clone();
+            self.append_db_hint(&task.task_id, &mut output_preview);
             let envelope = append_bash_output_envelope(&cache, &mut output_preview);
             snapshot.output_preview = output_preview;
             snapshot.bash_output_list_envelope = envelope;
@@ -5309,6 +5395,7 @@ impl BgTaskRegistry {
                 })
                 .unwrap_or_else(|| (String::new(), false, None))
         };
+        self.append_db_hint(&task.task_id, &mut output_preview);
         let bash_output_list_envelope = cache
             .as_ref()
             .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
@@ -6338,6 +6425,10 @@ impl BgTaskRegistry {
             None
         };
         let render_buffer = buffer.or(owned_buffer.as_ref());
+        #[cfg(unix)]
+        if let Some(buffer) = buffer {
+            self.finish_db_hint(metadata, buffer);
+        }
         let owned_render = if terminal_render.is_none() {
             render_buffer.map(|buffer| {
                 let mut capped_buffer = buffer.clone();
@@ -6364,6 +6455,7 @@ impl BgTaskRegistry {
                 };
             }
         }
+        self.append_db_hint(&metadata.task_id, &mut output_preview);
         let bash_output_list_envelope =
             render.and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
 

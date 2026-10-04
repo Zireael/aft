@@ -824,6 +824,58 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bash_db_hints_real_missing_column_trailer() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let created = std::process::Command::new("sqlite3")
+            .arg(project.path().join("store.db"))
+            .arg("CREATE TABLE tasks(id TEXT, kind TEXT);")
+            .status()
+            .expect("sqlite3 must be installed for schema hint tests");
+        assert!(created.success());
+        let ctx = spawn_test_context(project.path(), storage.path());
+        let request = spawn_test_request(
+            "db-hint",
+            "sqlite3 store.db 'SELECT substrate FROM tasks'",
+            false,
+        );
+        let launched = handle(&request, &ctx);
+        assert!(launched.success, "{:?}", launched.data);
+        let task_id = launched.data["task_id"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "sandbox-spawn-test",
+                    Some(project.path()),
+                    Some(storage.path()),
+                    8192,
+                )
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                assert!(
+                    snapshot.output_preview.contains("[aft: no column"),
+                    "{}",
+                    snapshot.output_preview
+                );
+                assert!(
+                    snapshot
+                        .output_preview
+                        .contains("tasks: id TEXT, kind TEXT"),
+                    "{}",
+                    snapshot.output_preview
+                );
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// A foreground bash that hits its timeout is reported to a status
     /// poller as `timed_out` with exit code 124 and the kill's exit marker,
     /// even when the poll lands while the timeout kill is still signaling the

@@ -1658,6 +1658,17 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
+fn bash_db_hint_metrics() -> Value {
+    #[cfg(unix)]
+    {
+        crate::bash_db_hints::metrics()
+    }
+    #[cfg(not(unix))]
+    {
+        Value::Null
+    }
+}
+
 fn bash_task_retention_metrics(shared_app: &App) -> Value {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1982,6 +1993,7 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
+        "bash_db_schema_hints": bash_db_hint_metrics(),
         "mutating_lanes": mutating_lanes_metrics(executor),
         "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,

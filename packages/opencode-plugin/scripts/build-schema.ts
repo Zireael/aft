@@ -418,6 +418,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
               },
+              db_schema_hints: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Append AFT read-only database schema hints after missing-table or missing-column errors. SQLite on Unix only; supported literal database paths only. Project-safe.",
+              },
               watch_sync_max_ms: {
                 type: "integer",
                 minimum: 1000,

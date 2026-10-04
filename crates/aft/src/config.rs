@@ -581,6 +581,9 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
     pub detach_on_user_message: bool,
+    /// Append read-only database CLI schema hints after missing-schema errors.
+    #[serde(default = "default_bash_enabled")]
+    pub db_schema_hints: bool,
     /// Maximum synchronous `bash_watch` wait accepted by the hosting plugin.
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_watch_sync_max_ms")]
@@ -605,6 +608,7 @@ impl Default for BashConfig {
             enabled: true,
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
+            db_schema_hints: true,
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
             linux_scope: false,

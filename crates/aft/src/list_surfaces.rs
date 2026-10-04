@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "bash_db_hints/mod.rs",
+        enclosing_item: "table_list, render, run_probe",
+        location_or_primitive: "BLOCK_CAP, PROBE_OUTPUT_CAP",
+        reason: "supplemental read-only schema trailer, not a paginated bash output list; omitted tables or schemas are explicitly counted, and an over-cap probe is discarded and counted as an error",
+    },
+    ExclusionEntry {
         file: "agent_child_env.rs",
         enclosing_item: "refresh_legacy_git_hooks",
         location_or_primitive: "legacy hook directory and file byte take",

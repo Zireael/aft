@@ -55,6 +55,8 @@ pub mod ast_grep_hints;
 pub mod ast_grep_lang;
 pub mod backup;
 pub mod bash_background;
+#[cfg(unix)]
+pub(crate) mod bash_db_hints;
 pub mod bash_permissions;
 pub mod bash_rewrite;
 pub mod blob_store;

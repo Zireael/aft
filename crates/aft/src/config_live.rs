@@ -799,6 +799,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
+    live!("bash.db_schema_hints", bash.db_schema_hints);
     later!("bash.powershell_tool", bash.powershell_tool);
     live!(
         "bash.long_running_reminder_enabled",
@@ -917,6 +918,7 @@ fn classification_is_exhaustive(config: &Config) {
         enabled: _,
         host_fallback: _,
         detach_on_user_message: _,
+        db_schema_hints: _,
         watch_sync_max_ms: _,
         worker_wait_max_ms: _,
         linux_scope: _,

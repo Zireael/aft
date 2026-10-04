@@ -287,6 +287,70 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
 }
 
 #[test]
+fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
+    skip_if_landlock_absent!();
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let project = fixture.path().join("project");
+    let storage = fixture.path().join("storage");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&storage).unwrap();
+    let db = project.join("store.db");
+    let created = std::process::Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE tasks(id TEXT, kind TEXT)")
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let mut aft = AftProcess::spawn();
+    assert_eq!(
+        configure_native(&mut aft, &project, &storage, true)["success"],
+        true
+    );
+    let allowed = foreground(
+        &mut aft,
+        "schema-allowed",
+        "sqlite3 store.db 'SELECT substrate FROM tasks'",
+    );
+    assert_eq!(allowed["status"], "failed", "{allowed}");
+    assert!(
+        allowed["output"]
+            .as_str()
+            .unwrap()
+            .contains("tasks: id TEXT, kind TEXT"),
+        "{allowed}"
+    );
+
+    // The command can report an error without reading the protected database.
+    // Its probe must not gain access just because it runs after that command.
+    let binary = project.join("sqlite3");
+    let real_binary = which::which("sqlite3").unwrap();
+    std::fs::write(&binary, format!("#!/bin/sh\nif [ \"$1\" = -readonly ]; then exec {} \"$@\"; fi\nprintf 'Error: in prepare, no such column: substrate\\n' >&2\nexit 1\n", quote(&real_binary))).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        configure_native_policy(
+            &mut aft,
+            &project,
+            &storage,
+            true,
+            &[],
+            std::slice::from_ref(&db)
+        )["success"],
+        true
+    );
+    let denied = foreground(
+        &mut aft,
+        "schema-denied",
+        "./sqlite3 store.db 'SELECT substrate FROM tasks'",
+    );
+    assert_eq!(denied["status"], "failed", "{denied}");
+    let output = denied["output"].as_str().unwrap();
+    assert!(output.contains("no such column: substrate"), "{output}");
+    assert!(!output.contains("[aft: no column"), "{output}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn native_sandbox_filters_ambient_environment_but_disabled_mode_preserves_it() {
     skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();

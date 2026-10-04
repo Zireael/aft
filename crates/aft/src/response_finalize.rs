@@ -139,6 +139,13 @@ fn append_trailing_line(text: &mut String, line: &str) {
     text.push_str(line);
 }
 
+/// Schema lookups are AFT-added trailers, not command output. Both terminal
+/// snapshots and completion previews call this after their output size caps.
+#[cfg(unix)]
+pub(crate) fn append_db_schema_hint(text: &mut String, hint: &str) {
+    append_trailing_line(text, hint);
+}
+
 /// Finalize an agent-visible response using the root selected by dispatch. The finalizer owns
 /// the alert transition and never reads `ctx.config().project_root` for alert state.
 pub fn finalize_response_for_dispatch_root(

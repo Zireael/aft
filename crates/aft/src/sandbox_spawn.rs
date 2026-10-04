@@ -2705,6 +2705,26 @@ fn command_argv_for_plan(
     }
 }
 
+/// Auxiliary read-only CLI lookups inherit the command's exact launch policy,
+/// rather than resolving a new principal or silently falling back to the host.
+#[cfg(unix)]
+pub(crate) fn probe_command_for_plan(
+    plan: &SpawnPlan,
+    program: &OsStr,
+    args: &[OsString],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let (program, args, _profile_handle) =
+        command_argv_for_plan(plan, program, args, Path::new(""), None)?;
+    let mut command = crate::effective_path::new_command(program);
+    command.args(args).current_dir(cwd);
+    crate::agent_child_env::apply_to_command(&mut command, env);
+    apply_sandbox_environment(plan, &mut command, env);
+    crate::bash_background::process::start_new_session(&mut command);
+    Ok(command)
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn launcher_argv(

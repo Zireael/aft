@@ -789,6 +789,12 @@ const CASES: ParityCase[] = [
     project: { bash: { detach_on_user_message: false } },
   },
   {
+    name: "bash_db_schema_hints_project_safe",
+    user: { bash: { db_schema_hints: true } },
+    project: { bash: { db_schema_hints: false } },
+  },
+  { name: "bash_db_schema_hints_user_off", user: { bash: { db_schema_hints: false } } },
+  {
     name: "idle_user_tier",
     user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 5 } },
   },

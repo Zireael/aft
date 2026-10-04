@@ -425,6 +425,7 @@ pub struct RawBashFeatures {
     pub host_fallback: Option<bool>,
     pub subagent_background: Option<bool>,
     pub detach_on_user_message: Option<bool>,
+    pub db_schema_hints: Option<bool>,
     pub long_running_reminder_enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub long_running_reminder_interval_ms: Option<u64>,
@@ -1505,6 +1506,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 detach_on_user_message: override_features
                     .detach_on_user_message
                     .or(base.detach_on_user_message),
+                db_schema_hints: override_features.db_schema_hints.or(base.db_schema_hints),
                 long_running_reminder_enabled: override_features
                     .long_running_reminder_enabled
                     .or(base.long_running_reminder_enabled),
@@ -1539,6 +1541,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             host_fallback: None,
             subagent_background: None,
             detach_on_user_message: None,
+            db_schema_hints: None,
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
@@ -2301,6 +2304,7 @@ struct ResolvedBashConfig {
     host_fallback: bool,
     subagent_background: bool,
     detach_on_user_message: bool,
+    db_schema_hints: bool,
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
@@ -2318,6 +2322,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.enabled = bash.enabled;
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
+    config.bash.db_schema_hints = bash.db_schema_hints;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
@@ -2389,6 +2394,9 @@ fn resolve_bash_config(
         host_fallback: false,
         subagent_background: true,
         detach_on_user_message: true,
+        db_schema_hints: top_features
+            .and_then(|features| features.db_schema_hints)
+            .unwrap_or(true),
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,

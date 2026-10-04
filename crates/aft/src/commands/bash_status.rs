@@ -100,6 +100,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 &mut snapshot,
                 output_mode.as_deref(),
             );
+            if snapshot.info.mode == BgMode::Pty && snapshot.info.status.is_terminal() {
+                ctx.bash_background()
+                    .append_db_hint(&task_id, &mut snapshot.output_preview);
+            }
             if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
                 && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)

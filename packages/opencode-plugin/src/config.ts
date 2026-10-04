@@ -320,6 +320,7 @@ const BashFeaturesSchema = z.object({
    * forces detachment; a token-only message becomes `(requested background detach)`.
    */
   detach_on_user_message: z.boolean().optional(),
+  db_schema_hints: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   /**
@@ -899,6 +900,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     (config.bash.enabled !== undefined ||
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
+      config.bash.db_schema_hints !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
       config.bash.powershell_tool !== undefined)
@@ -910,6 +912,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         : {}),
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
+        : {}),
+      ...(config.bash.db_schema_hints !== undefined
+        ? { db_schema_hints: config.bash.db_schema_hints }
         : {}),
       ...(config.bash.watch_sync_max_ms !== undefined
         ? { watch_sync_max_ms: config.bash.watch_sync_max_ms }
@@ -959,6 +964,8 @@ export interface ResolvedBashConfig {
   subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides and is stripped before delivery. */
   detach_on_user_message: boolean;
+  /** Read-only database CLI schema hints after missing-table/column errors. */
+  db_schema_hints: boolean;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -1055,6 +1062,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     host_fallback: false,
     subagent_background: true,
     detach_on_user_message: true,
+    db_schema_hints: typeof top === "object" && top !== null ? (top.db_schema_hints ?? true) : true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,

@@ -12,6 +12,7 @@ mod bash_background_persistence_test;
 mod bash_background_test;
 mod bash_compress_extras_test;
 mod bash_compress_test;
+mod bash_db_hints_test;
 mod bash_drain_completions_test;
 mod bash_foreground_background_architecture_test;
 mod bash_orchestrate_test;

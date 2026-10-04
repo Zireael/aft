@@ -339,6 +339,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // through such messages; even then, a message containing `&detach` forces the
     // detach (the token is stripped before the model sees the message).
     "detach_on_user_message": true,
+    // Read-only schema trailers after missing-table/column errors. Default true;
+    // user and project tiers. SQLite on Unix; literal paths only (no variables,
+    // globs or memory databases; file: URIs require mode=ro, and startup -cmd/
+    // -init flags are skipped because they may change the connection).
+    // Finished commands only, including
+    // background completions, independent of compression. Probe: same launch
+    // sandbox, 1.5s timeout, 256 KiB output cap; trailer: 2 KiB with omissions.
+    "db_schema_hints": true,
 
     // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
     // values outside 1000..=1800000 are clamped with a warning. Sync waits are

@@ -1,0 +1,5 @@
+{
+  "bash": {
+    "db_schema_hints": false
+  }
+}

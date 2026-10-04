@@ -426,6 +426,9 @@ pub fn spawn(
     }
 
     let cleanup_plan = spawn_plan.clone();
+    #[cfg(unix)]
+    ctx.bash_background()
+        .set_db_schema_hints(ctx.config().bash.db_schema_hints);
     let spawn_result = if pty {
         ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
