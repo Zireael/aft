@@ -20,6 +20,9 @@
       "models": {
         "mock-model": {
           "name": "Mock Model"
+        },
+        "gpt-5-mock": {
+          "name": "Mock GPT Model"
         }
       }
     }
@@ -36,6 +39,9 @@
         "models": {
           "mock-model": {
             "name": "Mock Model"
+          },
+          "gpt-5-mock": {
+            "name": "Mock GPT Model"
           }
         }
       }

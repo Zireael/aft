@@ -8,6 +8,17 @@ Tool slices add `registration.json`, `registration.ts`, or `*.scenario.json` bel
 
 Every scenario gets private `HOME`, `TMPDIR`, and `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR` roots. Shared-server scenarios start their host with `serve --service`, so it publishes a registration under the scenario's own `XDG_STATE_HOME`; that registration is both where the harness reads the server password and the only thing the plugin's service discovery looks at. The matrix uses `AFT_E2E_CONCURRENCY` workers (default `4`), while each scenario keeps its own server and per-row timeout. Reports and forensic paths are emitted in scenario-id order. Forensics remain under `AFT_E2E_ARTIFACT_ROOT`. Use `AFT_E2E_SCENARIO=<tool>/<trajectory>` to run one parent row.
 
+V2 isolation removes both `opencode.tool.shell` and `opencode.tool.patch`, as
+setup does, leaving AFT's own model gate in charge of its editing tools.
+`scenario.model` overrides the V2 provider contract default. All apply_patch
+rows select `openai/gpt-5-mock`; edit/write rows retain `openai/mock-model`.
+Both models use the same mock provider and endpoint. The paired
+`read/T1/edit-family/{non-gpt,gpt}` cases check real outgoing tool lists and
+persist `tool-surface-<turn>.json`: non-GPT offers edit/write without apply_patch,
+GPT offers apply_patch without edit/write, and neither offers host patch.
+Run this regression with `AFT_E2E_SCENARIO=read/T1/edit-family`. V1 parity
+continues using its captured `mock/mock-model` selector.
+
 A row whose call must be answered from a built index says so with `preconditions`. Today the one precondition is `callgraph_ready`. The plugin starts AFT only when the first tool call arrives, and AFT then builds the fixture project's callgraph in the background, answering "building, retry shortly" until it has finished. That answer is correct product behaviour, so a row that needs the finished graph cannot rely on its call arriving late enough: on a loaded runner running four rows at a time it often does not. The loader plays such a row's first `aft_callgraph` turn twice. The first copy is not judged and exists only to start AFT and its build. The driver holds the real call back, before handing it to the host, until AFT has published the store under the scenario's storage directory: the `<key>.current` pointer names a generation database whose `meta` table says `ready = 1`, which is the state AFT's own read path accepts as built. The hold is bounded (60 s, added to the host's row timeout so the host is not killed first); a store that never becomes ready fails the row as `callgraph_never_ready` instead of letting the call through, so a product that stays in "building" forever still fails by name. Rows whose arguments the host rejects never reach AFT, start no build, and do not declare the precondition; neither does a row that means to observe the "building" answer.
 
 A permission scenario declares its operation, the paths it gates, and how the prompt is answered under `metadata.permission`. The harness turns that into an ordered ruleset and installs it on the host session with `PATCH /api/session/{id}` before the first scripted response, because the session ruleset is the one channel the plugin reads and the host evaluates the same rules when the plugin asks it to raise a prompt.

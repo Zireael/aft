@@ -56,13 +56,13 @@ and write and withholds apply_patch. The plugin is never asked.
 
 What that means for the harness
 -------------------------------
-The V1 leg runs `--model mock/mock-model` (see host1-provider-config.json) and
-the V2 leg runs `--model openai/mock-model`. Neither contains "gpt-", so `F` is
-false on this host and apply_patch structurally cannot be offered to the V1
-leg in this harness.
+The V1 leg still runs `--model mock/mock-model` (see host1-provider-config.json).
+It does not contain "gpt-", so `F` is false on this host and apply_patch cannot
+be offered to that V1 leg. apply_patch/T7 therefore still excludes its V1 leg.
 
-Renaming the mock model to a gpt-5 shape would flip the same switch the other
-way: apply_patch would appear and edit and write would disappear, so the
-apply_patch row would be bought with the edit and write rows. That is why
-apply_patch/T7 excludes its V1 leg instead, and why this file exists — so the
-rename is not tried again.
+The V2 leg is no longer uniform: apply_patch scenarios select
+`--model openai/gpt-5-mock`, while the default remains `openai/mock-model` for
+the edit/write family. Both models use the same isolated mock endpoint.
+V2 now disables the host patch plugin and AFT owns its per-model tool gate.
+The paired read/T1/edit-family cases inspect actual provider requests for
+both surfaces without changing the V1 source observation quoted above.

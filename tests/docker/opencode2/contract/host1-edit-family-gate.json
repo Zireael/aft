@@ -17,7 +17,8 @@
   ],
   "harness_models": {
     "v1_leg": "mock/mock-model",
-    "v2_leg": "openai/mock-model"
+    "v2_leg": "openai/gpt-5-mock",
+    "v2_default": "openai/mock-model"
   },
-  "reading": "F is true only for a GPT-5-shaped model id. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. Neither harness model contains \"gpt-\", so the V1 leg is never offered apply_patch, and renaming the model to earn it would cost the edit and write rows instead."
+  "reading": "F is true for a model id containing gpt- but neither oss nor gpt-4. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. V1 parity still uses the captured mock/mock-model, so its apply_patch leg remains excluded. V2 apply_patch scenarios now explicitly select openai/gpt-5-mock while other scenarios keep openai/mock-model by default. V2 disables the host patch plugin and AFT supplies the corresponding per-model gate; the V1 source fragments above remain unchanged."
 }

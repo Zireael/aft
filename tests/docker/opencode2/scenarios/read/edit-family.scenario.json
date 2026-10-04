@@ -1,0 +1,45 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "read",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "read/T1/edit-family/non-gpt",
+      "tool": "read",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "model": "openai/mock-model",
+      "prompt": "Read sample.txt with the non-GPT editing tool family.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "edit-family-read", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "read only observes fixture bytes"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "compare_call_id": "edit-family-read",
+      "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta\n"},
+      "metadata": {"tool_surface": {"model": "mock-model", "present": ["read", "edit", "write"], "absent": ["apply_patch", "patch"]}}
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T1/edit-family/gpt",
+      "tool": "read",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "model": "openai/gpt-5-mock",
+      "prompt": "Read sample.txt with the GPT editing tool family.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "edit-family-read", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "read only observes fixture bytes"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "compare_call_id": "edit-family-read",
+      "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta\n"},
+      "metadata": {"tool_surface": {"model": "gpt-5-mock", "present": ["read", "apply_patch"], "absent": ["edit", "write", "patch"]}}
+    }
+  ]
+}

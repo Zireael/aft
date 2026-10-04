@@ -318,7 +318,12 @@ export function startScenarioClient(options: {
     args = attached.args;
     env = attached.env;
   }
-  args.push("--format", "json", "--model", options.model ?? options.scenario.model ?? "openai/mock-model");
+  // V2 rows may choose a model-specific tool family. V1 parity still uses its
+  // own captured provider/model, not a V2 selector that V1 cannot resolve.
+  const model = options.hostGeneration === "v1"
+    ? options.model ?? options.scenario.model ?? "mock/mock-model"
+    : options.scenario.model ?? options.model ?? "openai/mock-model";
+  args.push("--format", "json", "--model", model);
   if (options.scenario.auto) args.push("--auto");
   args.push(options.scenario.prompt);
   const captured = spawnCaptured(options.executable, args, options.cwd, env);

@@ -38,3 +38,10 @@ $ OPENAI_API_KEY=sk-mock opencode run --standalone --print-logs --format json --
 [exit 0; server log reports provider.updated then model.updated for /probe5/project]
 
 Diff from 2.0.3: none. The providers/package/settings shape, the @opencode/ai/providers/openai-compatible package id, the {env:OPENAI_API_KEY} indirection and the openai/mock-model selector are all still accepted, and the session still reports model {mock-model, openai, default} with outcome succeeded. The full shared-server transcript is in shared-server-ga-2.0.11.txt; this file quotes the parts that concern the provider.
+
+Harness model extension: the provider contract now also registers gpt-5-mock
+beside mock-model under the same package/settings/baseURL. apply_patch scenarios
+select openai/gpt-5-mock so the model gate offers that tool. This is an addition
+to the harness configuration, not a change to the historical session capture
+above. The read/T1/edit-family cases record each model's actual tool-bearing
+requests and verify that both are answered by the same deterministic mock.

@@ -46,6 +46,7 @@ import {
   WatchPatternLiveness,
 } from "./liveness.js";
 import {
+  assertRequestToolSurface,
   hostToolArguments,
   hostToolName,
   isTitleGenerationRequest,
@@ -342,10 +343,10 @@ describe("scenario isolation and liveness", () => {
     expect(userAftConfig).toEqual({ disabled_tools: [] });
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
     // A V2 host reads `plugins`, configured the way `aft setup` writes it: AFT's
-    // entry and the entry removing the host's own shell tool.
+    // entry and removals for both host plugins AFT replaces.
     expect(hostConfig.plugin).toBeUndefined();
     expect(hostConfig.plugins[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
-    expect(hostConfig.plugins.slice(1)).toEqual(["-opencode.tool.shell"]);
+    expect(hostConfig.plugins.slice(1)).toEqual(["-opencode.tool.shell", "-opencode.tool.patch"]);
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
     expect(hostConfig.provider).toBeUndefined();
     const serverWrapper = await readFile(
@@ -482,6 +483,67 @@ describe("scenario isolation and liveness", () => {
       "--model",
       "openai/mock-model",
     ]);
+  });
+
+  test("V2 scenario model overrides the provider contract default without changing the V1 leg", async () => {
+    const parent = await root();
+    const executable = await cachedExecutable(CAPTURE_ARGUMENTS_SCRIPT);
+    for (const hostGeneration of ["v2", "v1"] as const) {
+      const argumentsPath = join(parent, `${hostGeneration}-arguments.txt`);
+      const client = startScenarioClient({
+        executable,
+        scenario: { ...scenario(call()), model: "openai/gpt-5-mock" },
+        cwd: parent,
+        env: { ...process.env, ARGUMENTS_PATH: argumentsPath },
+        processObserver: { trackChild() {} } as never,
+        hostGeneration,
+        model: hostGeneration === "v2" ? "openai/mock-model" : "mock/mock-model",
+      });
+      expect((await client.wait()).exit_code).toBe(0);
+      const args = (await readFile(argumentsPath, "utf8")).trim().split("\n");
+      expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+        "--model",
+        hostGeneration === "v2" ? "openai/gpt-5-mock" : "mock/mock-model",
+      ]);
+    }
+  });
+
+  test("every apply_patch scenario including materialized T7 selects the registered GPT mock", async () => {
+    const scenarios = materializeParityScenarios(await loadScenarios(join(import.meta.dir, "../scenarios")))
+      .filter((entry) => entry.tool === "apply_patch");
+    expect(scenarios).toHaveLength(7);
+    for (const entry of scenarios) expect(entry.model).toBe("openai/gpt-5-mock");
+    const contract = await loadHostProviderConfigContract(join(import.meta.dir, "../contract"), "2.0.11");
+    const openai = contract.provider_config.openai as Record<string, unknown>;
+    expect(Object.keys(openai.models as Record<string, unknown>).sort()).toEqual(["gpt-5-mock", "mock-model"]);
+    expect((openai.settings as Record<string, unknown>).baseURL).toBe("{{AIMOCK_BASE_URL}}/v1");
+  });
+
+  test("non-GPT tool-surface scenario rejects leaked apply_patch", async () => {
+    const cases = await loadScenarios(join(import.meta.dir, "../scenarios"));
+    const selected = cases.find((entry) => entry.id === "read/T1/edit-family/non-gpt")!;
+    expect(selected.model).toBe("openai/mock-model");
+    const expected = selected.metadata!.tool_surface as { model: string; present: string[]; absent: string[] };
+    const exchange = {
+      index: 0, label: "call-read", response: {}, observed_at: "test",
+      request: { model: "mock-model", tools: ["read", "edit", "write", "apply_patch"].map((name) => ({ type: "function", function: { name } })) },
+    };
+    expect(() => assertRequestToolSurface(exchange, expected)).toThrow("unexpectedly includes apply_patch");
+  });
+
+  test("GPT tool-surface scenario checks actual tool names and model", async () => {
+    const cases = await loadScenarios(join(import.meta.dir, "../scenarios"));
+    const selected = cases.find((entry) => entry.id === "read/T1/edit-family/gpt")!;
+    expect(selected.model).toBe("openai/gpt-5-mock");
+    const expected = selected.metadata!.tool_surface as { model: string; present: string[]; absent: string[] };
+    const exchange = {
+      index: 0, label: "call-read", response: {}, observed_at: "test",
+      request: { model: "gpt-5-mock", tools: ["read", "apply_patch"].map((name) => ({ type: "function", function: { name } })) },
+    };
+    expect(assertRequestToolSurface(exchange, expected)).toEqual(["apply_patch", "read"]);
+    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "mock-model", tools: exchange.request.tools } }, expected)).toThrow("expected gpt-5-mock");
+    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock" } }, expected)).toThrow("contains no tools");
+    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock", tools: [{ function: { name: "read" } }] } }, expected)).toThrow("missing apply_patch");
   });
 
   // The pinned V1 host serves a whole scenario and then never ends inside a

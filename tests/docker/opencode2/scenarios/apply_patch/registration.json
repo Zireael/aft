@@ -6,6 +6,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T1/happy",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T1",
       "execution": "standalone",
@@ -63,6 +64,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T2/invalid_arguments",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T2",
       "execution": "standalone",
@@ -106,6 +108,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T2/missing_target",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T2",
       "execution": "standalone",
@@ -147,6 +150,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T3/apply_patch_ask_allow",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T3",
       "auto": true,
@@ -241,6 +245,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T3/apply_patch_ask_deny",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T3",
       "execution": "shared-server",
@@ -286,6 +291,7 @@
     {
       "schema_version": 1,
       "id": "apply_patch/T3/apply_patch_config_deny",
+      "model": "openai/gpt-5-mock",
       "tool": "apply_patch",
       "trajectory": "T3",
       "execution": "shared-server",
