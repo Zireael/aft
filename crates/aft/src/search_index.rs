@@ -4421,13 +4421,12 @@ fn write_cache_file_from_sources(
         writer.write_all(&lookup_blob)?;
         let file_bytes = writer.stream_position()?;
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        // CRC-checked caches rebuild from source after power loss. The rename,
+        // not a sync, keeps concurrent readers from seeing a partial write.
         drop(writer);
 
         fs::rename(&tmp_cache, &cache_path)?;
-        sync_parent_dir(&cache_path);
-        // The file was fsynced above, so its full length reached the device;
-        // that length is the physical credit, not an estimate.
+        // Credit the bytes handed to the kernel; this cache is not a durable log.
         crate::write_ledger::credit(
             domain,
             plan.project_root.display().to_string(),
@@ -4663,10 +4662,8 @@ fn flush_spill_segment(
     }
     let segment_bytes = writer.stream_position()?;
     writer.flush()?;
-    writer.get_ref().sync_all()?;
-    // Spill segments are deleted once the merge finishes, but they were
-    // fsynced to disk first, so large builds write them in addition to
-    // cache.bin and the census must count them.
+    // Spill segments are read and deleted by this build. Kernel visibility is
+    // enough; they have no recovery role after the process exits.
     counter.credit(segment_bytes, segment_bytes);
     block.clear();
     Ok(path)
@@ -4985,9 +4982,7 @@ fn sweep_transient_search_cache_dirs_with_limits(
             cursors.remove(root);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(root);
-    }
+    if summary.removed > 0 {}
     summary
 }
 
@@ -5156,14 +5151,6 @@ fn crc32_file_range(path: &Path, start: u64, len: u64) -> std::io::Result<u32> {
         remaining -= bytes_read as u64;
     }
     Ok(hasher.finalize())
-}
-
-fn sync_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
 }
 
 fn open_cache_file_read(path: &Path) -> std::io::Result<File> {
@@ -6657,9 +6644,7 @@ pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
             cursors.remove(&index_root);
         }
     }
-    if summary.removed > 0 {
-        crate::fs_lock::sync_parent(&index_root);
-    }
+    if summary.removed > 0 {}
     crate::slog_info!(
         "search index orphan sweep root={} scanned={} removed={} skipped_derived={} skipped_memo={} skipped_fresh={} skipped_live={} skipped_locked={} skipped_unreadable={} budget_exhausted={}",
         index_root.display(),
@@ -7863,6 +7848,39 @@ fn to_glob_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_search_cache_write_count() {
+        let project = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("source.txt"), "abcdef").unwrap();
+        let mut index = SearchIndex::build(project.path());
+        crate::durability::take();
+        assert!(index.write_to_disk(cache.path(), None));
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+        assert!(SearchIndex::read_from_disk(cache.path(), project.path()).is_some());
+    }
+
+    #[test]
+    fn durability_search_spill_write_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut block = vec![SpillRecord {
+            trigram: 1,
+            file_id: 0,
+            next_mask: 0,
+            loc_mask: 0,
+        }];
+        let counter = crate::write_ledger::register(
+            crate::write_ledger::Domain::SearchIndexBuild,
+            "durability-spill",
+        );
+        crate::durability::take();
+        let path = flush_spill_segment(dir.path(), 0, &mut block, &counter).unwrap();
+        assert!(path.is_file());
+        assert!(block.is_empty());
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+    }
     use std::process::Command;
 
     use super::*;
