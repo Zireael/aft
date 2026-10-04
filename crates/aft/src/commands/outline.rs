@@ -2359,29 +2359,26 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         }
 
         let discovery = discover_outline_files_with_options(temp.path(), true);
+        // Compare with forward slashes so the same assertions hold on Windows.
+        let files = discovery
+            .files
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect::<Vec<_>>();
         assert!(
-            discovery
-                .files
-                .iter()
-                .any(|path| path.ends_with("src/index.ts")),
+            files.iter().any(|path| path.ends_with("src/index.ts")),
             "source file missing: {:?}",
             discovery.files
         );
         assert!(
-            discovery
-                .files
-                .iter()
-                .any(|path| path.ends_with("src/other.ts")),
-            "source file missing: {:?}",
-            discovery.files
+            files.iter().any(|path| path.ends_with("src/other.ts")),
+            "source file missing: {files:?}"
         );
         assert!(
-            discovery
-                .files
+            files
                 .iter()
-                .all(|path| { !path.contains("/.git/") && !path.contains("/node_modules/") }),
-            "Git metadata or dependencies were traversed: {:?}",
-            discovery.files
+                .all(|path| !path.contains("/.git/") && !path.contains("/node_modules/")),
+            "Git metadata or dependencies were traversed: {files:?}"
         );
         assert_eq!(
             discovery.entries_examined, 5,
