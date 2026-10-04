@@ -155,15 +155,25 @@ behaviour change and is not made here.
   `UNSCOPED_DEFAULT_PRESET` (`head`), or the plugins' `worker_session` role,
   exactly as before. Health counts presetless calls by harness
   (`dispatch_path.tool_call_presets`) and the scoped routes that made tool
-  calls. Every route bind logs whether it carried a scope stamp.
+   calls. Every route bind logs whether it carried a scope stamp. The AFT
+   bridge names `head` or `worker` on every call, so a plugin route stays
+   served even if it is ever stamped.
+- `bash_watch` is served by the module (`commands::bash_watch`) for the
+  worker preset, with the plugin tool's arguments and worker semantics. It
+  blocks until the task exits, the pattern matches, or
+  `bash.worker_wait_max_ms` passes, then hands back with elapsed time and
+  recent output, and renews the task's default kill while it waits. The wait
+  runs on its own thread behind the deferred-response seam, so it holds no
+  executor worker. The module always waits synchronously: a catalog consumer
+  has no channel for an async watch's notification.
+- A running task's `bash_status` text points a worker at `bash_watch`
+  instead of promising a completion reminder.
 
 ## Recommendations (for Ufuk)
 
 1. A Broca worker's calls get worker behaviour only once Broca sends
    `preset: "worker"` on each call. Until then they run as `head` on its
    unscoped legacy routes.
-2. The worker preset serves `bash_watch`, but this commit does not implement
-   it in the module. See the delivery notes for the open decision.
-3. The head catalog's `bash` description still promises a completion reminder
+2. The head catalog's `bash` description still promises a completion reminder
    and user-message detach that Broca never delivers. Head is pinned byte for
    byte, so changing it is a separate, deliberate catalog change.

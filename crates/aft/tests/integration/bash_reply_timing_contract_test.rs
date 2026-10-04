@@ -618,6 +618,225 @@ fn bash_watch_sync_max_default_and_clamp_match_consumer_contract() {
 }
 
 // ---------------------------------------------------------------------------
+// (f) `bash_watch`, served by the module for the catalog's `worker` preset.
+//
+// A worker session (its calls name `preset: "worker"`) backgrounds a command
+// and waits on it with `bash_watch` over the real subc route, exactly as a
+// Broca worker does. The watch must answer on completion or a pattern match,
+// and hand back at the worker wait limit while the command keeps running.
+// ---------------------------------------------------------------------------
+
+/// Worker wait limit for the hand-back test, short enough to wait out.
+const SHORT_WORKER_WAIT_MS: &str = "1500";
+
+async fn launch_worker_background(stream: &mut TcpStream, corr: u64, command: &str) -> String {
+    send_tool_call_with_preset(
+        stream,
+        corr,
+        "bash",
+        json!({ "command": command, "background": true, "compressed": false }),
+        Some("worker"),
+    )
+    .await;
+    let launch = read_tool_response(stream, corr, HANG_CATCH).await;
+    assert!(
+        !tool_result_is_error(&launch),
+        "launch: {}",
+        frame_body(&launch)
+    );
+    let text = tool_response_text(&launch);
+    assert!(
+        text.contains("won't wake you"),
+        "a worker's launch must not promise a reminder: {text}"
+    );
+    extract_task_id(&launch)
+}
+
+#[test]
+fn subc_worker_bash_watch_blocks_until_the_task_completes() {
+    run_subc(|mut harness| async move {
+        let task =
+            launch_worker_background(&mut harness.stream, 80, "sleep 1; echo watched-done").await;
+        let started = Instant::now();
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            81,
+            "bash_watch",
+            json!({ "taskId": task }),
+            Some("worker"),
+        )
+        .await;
+        let reply = read_tool_response(&mut harness.stream, 81, HANG_CATCH).await;
+        assert!(
+            !tool_result_is_error(&reply),
+            "watch: {}",
+            frame_body(&reply)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "returned before the task ended"
+        );
+        let structured = tool_response_json(&reply);
+        assert_eq!(structured["status"], "completed", "{}", frame_body(&reply));
+        assert_eq!(structured["waited"]["reason"], "exited");
+        let text = tool_response_text(&reply);
+        assert!(text.contains("task exited (completed"), "{text}");
+        assert!(text.contains("watched-done"), "{text}");
+        harness
+    });
+}
+
+#[test]
+fn subc_worker_bash_watch_returns_when_the_pattern_matches() {
+    run_subc(|mut harness| async move {
+        let task =
+            launch_worker_background(&mut harness.stream, 82, "echo READY-TO-GO; sleep 30").await;
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            83,
+            "bash_watch",
+            json!({ "taskId": task, "pattern": "READY-TO-GO" }),
+            Some("worker"),
+        )
+        .await;
+        let reply = read_tool_response(&mut harness.stream, 83, HANG_CATCH).await;
+        assert!(
+            !tool_result_is_error(&reply),
+            "watch: {}",
+            frame_body(&reply)
+        );
+        let structured = tool_response_json(&reply);
+        assert_eq!(structured["status"], "running");
+        assert_eq!(structured["waited"]["reason"], "matched");
+        assert_eq!(structured["waited"]["match_stream"], "stdout");
+        let text = tool_response_text(&reply);
+        assert!(
+            text.contains("matched \"READY-TO-GO\" in stdout at offset 0."),
+            "{text}"
+        );
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            84,
+            "bash_kill",
+            json!({ "taskId": task }),
+            Some("worker"),
+        )
+        .await;
+        let _ = read_tool_response(&mut harness.stream, 84, HANG_CATCH).await;
+        harness
+    });
+}
+
+#[test]
+fn subc_worker_bash_watch_hands_back_at_the_worker_wait_limit() {
+    run_subc_with_env(
+        &[("AFT_TEST_WORKER_WAIT_MAX_MS", SHORT_WORKER_WAIT_MS)],
+        |mut harness| async move {
+            let task =
+                launch_worker_background(&mut harness.stream, 85, "echo still-going; sleep 30")
+                    .await;
+            let started = Instant::now();
+            send_tool_call_with_preset(
+                &mut harness.stream,
+                86,
+                "bash_watch",
+                json!({ "taskId": task }),
+                Some("worker"),
+            )
+            .await;
+            let reply = read_tool_response(&mut harness.stream, 86, HANG_CATCH).await;
+            let elapsed = started.elapsed();
+            assert!(
+                !tool_result_is_error(&reply),
+                "watch: {}",
+                frame_body(&reply)
+            );
+            assert!(
+                elapsed >= Duration::from_millis(1_500)
+                    && elapsed <= Duration::from_millis(1_500) + REPLY_MARGIN,
+                "handed back after {elapsed:?}, not at the 1.5s worker wait limit"
+            );
+            let structured = tool_response_json(&reply);
+            assert_eq!(structured["status"], "running");
+            assert_eq!(structured["waited"]["reason"], "timeout");
+            assert_eq!(structured["waited"]["limit_ms"], 1_500);
+            let text = tool_response_text(&reply);
+            assert!(
+                text.contains("The command is still running after"),
+                "{text}"
+            );
+            assert!(
+                text.contains("of watching; this is not a failure."),
+                "{text}"
+            );
+            assert!(text.contains("Recent output:\nstill-going"), "{text}");
+            assert!(
+                text.contains("each wait you make on it moves that kill"),
+                "{text}"
+            );
+            assert!(!text.contains("completion reminder"), "{text}");
+            send_tool_call_with_preset(
+                &mut harness.stream,
+                87,
+                "bash_kill",
+                json!({ "taskId": task }),
+                Some("worker"),
+            )
+            .await;
+            let _ = read_tool_response(&mut harness.stream, 87, HANG_CATCH).await;
+            harness
+        },
+    );
+}
+
+#[test]
+fn subc_bash_watch_refuses_unknown_tasks_and_the_reader_preset() {
+    run_subc(|mut harness| async move {
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            88,
+            "bash_watch",
+            json!({ "taskId": "bash-0123456789abcdef" }),
+            Some("worker"),
+        )
+        .await;
+        let reply = read_tool_response(&mut harness.stream, 88, HANG_CATCH).await;
+        assert!(
+            tool_result_is_error(&reply),
+            "unknown task: {}",
+            frame_body(&reply)
+        );
+        assert!(
+            frame_body(&reply).contains("task_not_found"),
+            "{}",
+            frame_body(&reply)
+        );
+
+        send_tool_call_with_preset(
+            &mut harness.stream,
+            89,
+            "bash_watch",
+            json!({ "taskId": "bash-0123456789abcdef" }),
+            Some("reader"),
+        )
+        .await;
+        let refusal = read_non_push_frame(&mut harness.stream, HANG_CATCH, "reader refusal").await;
+        assert_eq!(
+            refusal.header.ty,
+            FrameType::Error,
+            "{}",
+            frame_body(&refusal)
+        );
+        assert_eq!(refusal.header.corr, 89);
+        let body: Value = serde_json::from_slice(&refusal.body).expect("error body");
+        assert_eq!(body["code"], "unknown_tool");
+        assert_eq!(body["detail"]["tool"], "bash_watch");
+        assert_eq!(body["detail"]["preset"], "reader");
+        harness
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Standalone (stdin/stdout) helpers.
 // ---------------------------------------------------------------------------
 
@@ -942,6 +1161,42 @@ async fn send_tool_call(stream: &mut TcpStream, corr: u64, name: &str, arguments
         .expect("tool call frame"),
     )
     .await;
+}
+
+/// [`send_tool_call`] naming the catalog preset the caller runs under, as a
+/// tool-provider consumer does on every call.
+async fn send_tool_call_with_preset(
+    stream: &mut TcpStream,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    preset: Option<&str>,
+) {
+    let mut body = json!({ "name": name, "arguments": arguments });
+    if let Some(preset) = preset {
+        body["preset"] = json!(preset);
+    }
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            ROUTE_CHANNEL,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("tool call body"),
+        )
+        .expect("tool call frame"),
+    )
+    .await;
+}
+
+fn tool_response_text(frame: &Frame) -> String {
+    let body: Value = serde_json::from_slice(&frame.body).expect("tool result body");
+    body["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn send_frame(stream: &mut TcpStream, frame: Frame) {

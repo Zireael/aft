@@ -314,12 +314,36 @@ export function buildSubcToolPresets(): Record<string, Record<string, Record<str
       bash,
       powershell: withWorkerTimeout(base.powershell),
       bash_status: argsToJsonSchema(createBashStatusTool(ctx)),
-      bash_watch: {
-        ...argsToJsonSchema(createBashWatchTool(ctx)),
-        description: bashWatchDescription("worker", statusRegistered),
-      },
+      bash_watch: workerBashWatchSchema(
+        argsToJsonSchema(createBashWatchTool(ctx)),
+        bashWatchDescription("worker", statusRegistered),
+      ),
     },
   };
+}
+
+/**
+ * The worker preset's `bash_watch`: the OpenCode tool's arguments with the
+ * worker description. The module serves this tool itself and always waits
+ * synchronously, because a catalog consumer has no channel that would deliver
+ * an async watch's notification; the two async-only arguments say so.
+ */
+function workerBashWatchSchema(
+  schema: Record<string, unknown>,
+  description: string,
+): Record<string, unknown> {
+  const clone = structuredClone(schema);
+  const properties = clone.properties as Record<string, Record<string, unknown>>;
+  properties.background = {
+    ...properties.background,
+    description:
+      "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
+  };
+  properties.once = {
+    ...properties.once,
+    description: "Accepted for compatibility; only an async watch reads it.",
+  };
+  return { ...clone, description };
 }
 
 /** Deterministic JSON bytes for the preset artifact, keys sorted at every preset level. */

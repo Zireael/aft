@@ -38,6 +38,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
             | "bash_status"
             | "bash_kill"
             | "bash_write"
+            // Served only by the catalog's `worker` preset; see
+            // `commands::bash_watch`.
+            | "bash_watch"
     )
 }
 
@@ -160,6 +163,9 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         // classified onto the reader pool; install races are handled at the
         // individual cache sites.
         "bash_status" | "outline" | "zoom" => Some(Lane::PureRead),
+
+        // Only validates the call and hands its wait to its own thread.
+        "bash_watch" => Some(Lane::PureRead),
 
         "status"
         | "inspect"

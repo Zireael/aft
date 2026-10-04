@@ -96,6 +96,7 @@ pub(super) const METADATA: &[(&str, &str, bool)] = &[
     ("bash_write", "shell.exec/v1", false),
 ];
 
+#[cfg(test)]
 pub(super) fn tools(disabled: &[String], powershell_available: bool) -> Vec<CatalogTool> {
     tools_for(CatalogPreset::Head, disabled, powershell_available)
 }
@@ -440,7 +441,11 @@ fn admit_as(
     trusted: bool,
     role: CallerRole,
 ) -> Result<(), ErrorBody> {
-    if !METADATA.iter().any(|(name, _, _)| *name == call.name) {
+    if !METADATA
+        .iter()
+        .chain(PRESET_ONLY_METADATA)
+        .any(|(name, _, _)| *name == call.name)
+    {
         return Err(errors::unknown_tool(&call.name));
     }
     if role == CallerRole::Reader && !READER_TOOLS.contains(&call.name.as_str()) {
@@ -471,7 +476,7 @@ fn admit_as(
     if !trusted
         && matches!(
             call.name.as_str(),
-            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write"
+            "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write" | "bash_watch"
         )
     {
         return Err(ErrorBody::new(
@@ -479,7 +484,9 @@ fn admit_as(
             "shell execution and observation require an admitted principal",
         ));
     }
-    let tool = tools(&[], powershell_available)
+    // The worker preset serves every head tool plus the preset-only ones, so
+    // its catalog holds the served schema of every admitted name.
+    let tool = tools_for(CatalogPreset::Worker, &[], powershell_available)
         .into_iter()
         .find(|tool| tool.name == call.name)
         .expect("admitted tool has a schema");
@@ -2017,6 +2024,42 @@ mod route_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The AFT plugins name `head` or `worker` on every call (the bridge's
+    /// `callPresetFor`), so a plugin route that the daemon stamped with a
+    /// scope keeps serving them; only a call that names no preset is refused.
+    #[tokio::test]
+    async fn scoped_plugin_style_calls_naming_a_preset_are_served() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for (body, worker) in [
+            (
+                json!({"name": "status", "arguments": {}, "preset": "head"}),
+                false,
+            ),
+            (
+                json!({"name": "status", "arguments": {}, "preset": "worker", "worker_session": true}),
+                true,
+            ),
+        ] {
+            ACTIONS.store(0, Ordering::SeqCst);
+            WORKER_ACTIONS.store(0, Ordering::SeqCst);
+            let reply = exchange_with_scope(
+                body.clone(),
+                RouteRole::Legacy,
+                "session",
+                vec![],
+                Some(stamp("head")),
+            )
+            .await;
+            assert_eq!(reply.header.ty, FrameType::Response, "{body}");
+            assert_eq!(ACTIONS.load(Ordering::SeqCst), 1, "{body}");
+            assert_eq!(
+                WORKER_ACTIONS.load(Ordering::SeqCst),
+                usize::from(worker),
+                "{body}"
+            );
         }
     }
 

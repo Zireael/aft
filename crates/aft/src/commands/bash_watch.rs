@@ -1,0 +1,667 @@
+//! `bash_watch`, served by the module itself.
+//!
+//! The OpenCode and Pi plugins implement `bash_watch` in their own process:
+//! they poll `bash_status` and scan the task's output. A consumer that builds
+//! its tool surface from AFT's catalog (Broca) has no such loop, so the
+//! catalog's `worker` preset serves this module-side tool instead, with the
+//! same arguments and the same semantics the plugin tool has.
+//!
+//! The wait never holds an executor worker: the executor job only validates
+//! the call and returns a deferred response. A dedicated thread then waits on
+//! the task's registry, which is shared and thread-safe, and the transport
+//! loop picks up its result. A cancelled call or a module drain cancels that
+//! thread through the job's cancellation.
+
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::bash_background::persistence::{BgMode, TaskArtifact};
+use crate::bash_background::registry::BgTaskSnapshot;
+use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
+use crate::commands::bash_orchestrate::{format_wait_limit, kill_deadline_sentence};
+use crate::commands::bash_status::{format_erased_task_message, format_unknown_task_message};
+use crate::context::AppContext;
+use crate::protocol::{RawRequest, Response};
+use crate::response_finalize::{DispatchOutcome, PendingResponse};
+
+/// The wait a primary session's watch gets when it passes no timeout. Mirrors
+/// `DEFAULT_PRIMARY_WATCH_TIMEOUT_MS` in `packages/aft-bridge/src/bash-hints.ts`.
+pub(crate) const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
+/// The largest timeout a worker may pass, as in the plugins' tool schema.
+pub(crate) const MAX_WATCH_TIMEOUT_MS: u64 = 1_800_000;
+/// How much recent output a regex watch keeps for matching across reads.
+const REGEX_SCAN_WINDOW_BYTES: usize = 64 * 1024;
+/// Most lines of a still-running command's output shown to a worker.
+const WORKER_OUTPUT_TAIL_LINES: usize = 20;
+/// Output preview a watch result carries for a finished task.
+const PREVIEW_BYTES: usize = crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES;
+
+#[derive(Debug, Default, Deserialize)]
+struct BashWatchParams {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    pattern: Option<Value>,
+    #[serde(default)]
+    background: Option<Value>,
+    #[serde(default)]
+    timeout_ms: Option<Value>,
+    /// Accepted for the plugin tool's shape; only an async watch reads it,
+    /// and the module always waits synchronously (see [`handle_deferred`]).
+    #[serde(default)]
+    #[allow(dead_code)]
+    once: Option<Value>,
+}
+
+/// What the watch waits for besides the task's exit.
+enum WaitPattern {
+    Substring(regex::bytes::Regex, usize),
+    Regex(regex::bytes::Regex),
+}
+
+impl WaitPattern {
+    fn regex(&self) -> &regex::bytes::Regex {
+        match self {
+            Self::Substring(regex, _) | Self::Regex(regex) => regex,
+        }
+    }
+
+    /// Where the scan buffer may be cut so a match spanning two reads is
+    /// still found: a substring keeps one byte less than its length, a regex
+    /// keeps a 64 KB window.
+    fn keep_from(&self, buffer_len: usize) -> usize {
+        let keep = match self {
+            Self::Substring(_, len) => len.saturating_sub(1),
+            Self::Regex(_) => REGEX_SCAN_WINDOW_BYTES,
+        };
+        buffer_len.saturating_sub(keep)
+    }
+}
+
+/// Why a watch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitReason {
+    Matched,
+    Exited,
+    Timeout,
+}
+
+struct Waited {
+    reason: WaitReason,
+    elapsed_ms: u64,
+    limit_ms: u64,
+    matched: Option<(String, u64, Option<&'static str>)>,
+}
+
+/// One stream's scan state: bytes not yet ruled out, and where they start in
+/// the stream.
+#[derive(Default)]
+struct StreamScan {
+    buffer: Vec<u8>,
+    base: u64,
+    next: u64,
+}
+
+fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
+    let raw = req
+        .params
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| req.params.clone());
+    serde_json::from_value(raw).map_err(|error| format!("bash_watch: invalid params: {error}"))
+}
+
+fn parse_pattern(value: Option<&Value>) -> Result<Option<WaitPattern>, Response> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            let regex = regex::bytes::Regex::new(&regex::escape(text))
+                .expect("an escaped literal is a valid regex");
+            Ok(Some(WaitPattern::Substring(regex, text.len())))
+        }
+        Some(Value::Object(object)) => match object.get("regex").and_then(Value::as_str) {
+            Some(source) => regex::bytes::RegexBuilder::new(source)
+                .multi_line(true)
+                .build()
+                .map(|regex| Some(WaitPattern::Regex(regex)))
+                .map_err(|error| {
+                    Response::error("", "invalid_request", format!("invalid_regex: {error}"))
+                }),
+            None => Err(Response::error(
+                "",
+                "invalid_request",
+                "bash_watch: pattern must be a string or { regex: string }",
+            )),
+        },
+        Some(_) => Err(Response::error(
+            "",
+            "invalid_request",
+            "bash_watch: pattern must be a string or { regex: string }",
+        )),
+    }
+}
+
+fn with_id(mut response: Response, id: &str) -> Response {
+    response.id = id.to_string();
+    response
+}
+
+/// The wait this call gets, in milliseconds, or the refusal of its timeout.
+///
+/// A delegated worker cannot be woken once its turn ends, so without a timeout
+/// it waits up to the worker wait limit (`bash.worker_wait_max_ms`), and a
+/// timeout it passes is used as given up to the schema maximum. A primary
+/// keeps the short default and the `bash.watch_sync_max_ms` cap. A worker's
+/// `background: true` keeps the async request's meaning ("tell me when it's
+/// done") as a wait up to the worker limit, exactly like the plugins when
+/// they turn a worker's async watch into a sync one.
+fn effective_wait_ms(
+    params: &BashWatchParams,
+    worker: bool,
+    worker_limit_ms: u64,
+    primary_cap_ms: u64,
+) -> Result<u64, String> {
+    let max = if worker {
+        MAX_WATCH_TIMEOUT_MS
+    } else {
+        primary_cap_ms
+    };
+    let requested = match &params.timeout_ms {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let parsed = value
+                .as_u64()
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|raw| raw.trim().parse::<u64>().ok())
+                })
+                .filter(|ms| (1..=max).contains(ms));
+            match parsed {
+                Some(ms) => Some(ms),
+                None if worker => {
+                    return Err(format!("timeoutMs must be an integer from 1 to {max}"))
+                }
+                None => {
+                    return Err(format!(
+                        "timeoutMs must be an integer from 1 to {max} (bash.watch_sync_max_ms)"
+                    ))
+                }
+            }
+        }
+    };
+    let background = params
+        .background
+        .as_ref()
+        .and_then(crate::subc_translate::model_boolean)
+        .unwrap_or(false);
+    Ok(if worker && background {
+        worker_limit_ms
+    } else if worker {
+        requested.unwrap_or(worker_limit_ms)
+    } else {
+        requested
+            .unwrap_or(DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
+            .min(primary_cap_ms)
+    })
+}
+
+/// Delay before the next look at the task, never past the deadline. The first
+/// seconds look often so a short command or a quick pattern is seen at once;
+/// later the interval grows. Mirrors `watchPollDelayMs` in the plugins.
+fn poll_delay(elapsed: Duration) -> Duration {
+    Duration::from_millis(match elapsed.as_millis() {
+        0..=4_999 => 100,
+        5_000..=29_999 => 250,
+        30_000..=119_999 => 500,
+        _ => 1_000,
+    })
+}
+
+/// Validates a `bash_watch` call and defers its wait to a dedicated thread.
+///
+/// The module always waits synchronously: a catalog consumer has no channel
+/// that would deliver an async watch's notification, so `background` only
+/// changes how long a worker waits (see [`effective_wait_ms`]).
+pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let id = req.id.clone();
+    let params = match parse_params(req) {
+        Ok(params) => params,
+        Err(message) => {
+            return DispatchOutcome::Immediate(Response::error(&id, "invalid_request", message))
+        }
+    };
+    let Some(task_id) = params.task_id.clone().filter(|task| !task.is_empty()) else {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "invalid_request",
+            "bash_watch: missing taskId",
+        ));
+    };
+    let pattern = match parse_pattern(params.pattern.as_ref()) {
+        Ok(pattern) => pattern,
+        Err(response) => return DispatchOutcome::Immediate(with_id(response, &id)),
+    };
+    let worker = req.worker_session();
+    let worker_limit_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx);
+    let primary_cap_ms = ctx.config().bash.watch_sync_max_ms;
+    let limit_ms = match effective_wait_ms(&params, worker, worker_limit_ms, primary_cap_ms) {
+        Ok(limit) => limit,
+        Err(message) => {
+            return DispatchOutcome::Immediate(Response::error(&id, "invalid_request", message))
+        }
+    };
+    let session = req.session().to_string();
+    let registry = ctx.bash_background().clone();
+    if registry.has_erased_watch_reference(&task_id) {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "task_erased",
+            format_erased_task_message(&task_id),
+        ));
+    }
+    if registry.observed_status(&task_id, &session, 0).is_none() {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "task_not_found",
+            format_unknown_task_message(&task_id),
+        ));
+    }
+    let storage_dir = crate::bash_background::task_storage_dir(&ctx);
+    let project_root = ctx.config().project_root.clone();
+    let cancellation = crate::executor::current_job_cancellation()
+        .unwrap_or_else(crate::executor::JobCancellation::new);
+    let worker_cancellation = cancellation.clone();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let thread_id = id.clone();
+    std::thread::spawn(move || {
+        let watch = WatchJob {
+            registry,
+            task_id,
+            session,
+            pattern,
+            limit_ms,
+            worker,
+            worker_limit_ms,
+            primary_cap_ms,
+        };
+        let Some(waited) = watch.wait(&worker_cancellation) else {
+            // Cancelled: the transport already answered the call.
+            return;
+        };
+        let snapshot = watch.registry.status_settled(
+            &watch.task_id,
+            &watch.session,
+            project_root.as_deref(),
+            Some(&storage_dir),
+            PREVIEW_BYTES,
+        );
+        let response = match snapshot {
+            Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
+            None => Response::error(
+                &thread_id,
+                "task_not_found",
+                format_unknown_task_message(&watch.task_id),
+            ),
+        };
+        let _ = tx.send(response);
+    });
+
+    let mut settled = false;
+    let disconnect_id = id.clone();
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id: id,
+        session_id: req.session().to_string(),
+        attach_command: "bash_watch".to_string(),
+        poll: Box::new(move |_| {
+            if settled {
+                return None;
+            }
+            match rx.try_recv() {
+                Ok(response) => {
+                    settled = true;
+                    Some(response)
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    settled = true;
+                    Some(Response::error(
+                        &disconnect_id,
+                        "watch_interrupted",
+                        "bash_watch: the watch ended without a result; the task keeps running. Call bash_watch again to keep waiting.",
+                    ))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            }
+        }),
+        cancellation: Some(cancellation),
+        on_shutdown: None,
+    })
+}
+
+struct WatchJob {
+    registry: BgTaskRegistry,
+    task_id: String,
+    session: String,
+    pattern: Option<WaitPattern>,
+    limit_ms: u64,
+    worker: bool,
+    worker_limit_ms: u64,
+    primary_cap_ms: u64,
+}
+
+impl WatchJob {
+    /// Waits until the task exits, the pattern matches, or the limit passes.
+    /// `None` when the call was cancelled first.
+    fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(self.limit_ms);
+        let mut stdout = StreamScan::default();
+        let mut stderr = StreamScan::default();
+        let waited = |reason, matched| Waited {
+            reason,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            limit_ms: self.limit_ms,
+            matched,
+        };
+        loop {
+            if cancellation.cancel_already_requested() {
+                return None;
+            }
+            // A worker waiting on its task keeps the task's default hard kill
+            // at least one worker wait limit away, as every other worker wait
+            // does (see `BgTaskRegistry::renew_hard_kill`).
+            if self.worker {
+                self.registry.renew_hard_kill(
+                    &self.task_id,
+                    &self.session,
+                    Duration::from_millis(self.worker_limit_ms),
+                );
+            }
+            let snapshot = self
+                .registry
+                .observed_status(&self.task_id, &self.session, 0);
+            let terminal = snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.info.status.is_terminal());
+            if let (Some(pattern), Some(snapshot)) = (&self.pattern, &snapshot) {
+                if let Some(found) = self.scan(pattern, snapshot, &mut stdout, &mut stderr) {
+                    return Some(waited(WaitReason::Matched, Some(found)));
+                }
+            }
+            if terminal {
+                return Some(waited(WaitReason::Exited, None));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Some(waited(WaitReason::Timeout, None));
+            }
+            let pause = poll_delay(started.elapsed()).min(deadline - now);
+            if cancellation.wait_for_cancellation(pause) {
+                return None;
+            }
+        }
+    }
+
+    /// Reads the task's new output and looks for the pattern in it. The
+    /// streams are scanned apart, so a stdout tail and a stderr head never
+    /// form a match together; stdout is checked first.
+    fn scan(
+        &self,
+        pattern: &WaitPattern,
+        snapshot: &BgTaskSnapshot,
+        stdout: &mut StreamScan,
+        stderr: &mut StreamScan,
+    ) -> Option<(String, u64, Option<&'static str>)> {
+        let pty = snapshot.info.mode == BgMode::Pty;
+        let streams: [(&mut StreamScan, TaskArtifact, Option<&'static str>); 2] = if pty {
+            [
+                (stdout, TaskArtifact::Pty, None),
+                (stderr, TaskArtifact::Stderr, None),
+            ]
+        } else {
+            [
+                (stdout, TaskArtifact::Stdout, Some("stdout")),
+                (stderr, TaskArtifact::Stderr, Some("stderr")),
+            ]
+        };
+        for (index, (scan, artifact, label)) in streams.into_iter().enumerate() {
+            if pty && index == 1 {
+                break;
+            }
+            let Ok((bytes, next)) = self.registry.read_artifact_range(
+                &self.task_id,
+                &self.session,
+                artifact,
+                scan.next,
+            ) else {
+                continue;
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if scan.buffer.is_empty() {
+                scan.base = scan.next;
+            }
+            scan.next = next.max(scan.next + bytes.len() as u64);
+            scan.buffer.extend_from_slice(&bytes);
+            if let Some(found) = pattern.regex().find(&scan.buffer) {
+                return Some((
+                    String::from_utf8_lossy(found.as_bytes()).into_owned(),
+                    scan.base + found.start() as u64,
+                    label,
+                ));
+            }
+            let cut = pattern.keep_from(scan.buffer.len());
+            if cut > 0 {
+                scan.buffer.drain(..cut);
+                scan.base += cut as u64;
+            }
+        }
+        None
+    }
+
+    /// The watch result, rendered the way the plugins render it for the same
+    /// role, plus the task's own kill deadline.
+    fn reply(&self, id: &str, snapshot: BgTaskSnapshot, waited: &Waited) -> Response {
+        let text = self.render(&snapshot, waited);
+        let mut data = json!(snapshot);
+        data["waited"] = json!({
+            "reason": match waited.reason {
+                WaitReason::Matched => "matched",
+                WaitReason::Exited => "exited",
+                WaitReason::Timeout => "timeout",
+            },
+            "elapsed_ms": waited.elapsed_ms,
+            "limit_ms": waited.limit_ms,
+        });
+        if let Some((text, offset, stream)) = &waited.matched {
+            data["waited"]["match"] = json!(text);
+            data["waited"]["match_offset"] = json!(offset);
+            if let Some(stream) = stream {
+                data["waited"]["match_stream"] = json!(stream);
+            }
+        }
+        data["output"] = json!(text);
+        Response::success(id, data)
+    }
+
+    fn render(&self, snapshot: &BgTaskSnapshot, waited: &Waited) -> String {
+        let status = status_name(&snapshot.info.status);
+        let running = !snapshot.info.status.is_terminal();
+        let exit = snapshot
+            .exit_code
+            .map(|code| format!(" (exit {code})"))
+            .unwrap_or_default();
+        let duration = snapshot
+            .info
+            .duration_ms
+            .map(|ms| format!(" {}s", (ms as f64 / 1000.0).round() as u64))
+            .unwrap_or_default();
+        let mut text = format!("Task {}: {status}{exit}{duration}", self.task_id);
+        // Only a primary's watch is bounded by the configured cap.
+        let cap_note = if !self.worker && waited.limit_ms >= self.primary_cap_ms {
+            ", the bash.watch_sync_max_ms cap"
+        } else {
+            ""
+        };
+        let waited_text = format!(
+            "Waited {}ms (limit {}ms{cap_note})",
+            waited.elapsed_ms, waited.limit_ms
+        );
+        match waited.reason {
+            WaitReason::Matched => {
+                let (matched, offset, stream) = waited
+                    .matched
+                    .as_ref()
+                    .expect("a matched watch carries its match");
+                let stream = stream.map(|s| format!(" in {s}")).unwrap_or_default();
+                text.push_str(&format!(
+                    "\n{waited_text}; matched {}{stream} at offset {offset}.",
+                    Value::String(matched.clone())
+                ));
+            }
+            WaitReason::Timeout if self.worker => {
+                text.push_str(&format!(
+                    "\n{waited_text}; timeout reached without match. {}",
+                    self.worker_still_running(snapshot, waited.elapsed_ms)
+                ));
+            }
+            WaitReason::Timeout => {
+                text.push_str(&format!(
+                    "\n{waited_text}; timeout reached without match. The command is still running; this is not a failure. Watch again, do other work, or end your turn: the completion reminder wakes you."
+                ));
+            }
+            WaitReason::Exited => {
+                let exit = snapshot
+                    .exit_code
+                    .map(|code| format!(", exit {code}"))
+                    .unwrap_or_default();
+                text.push_str(&format!("\n{waited_text}; task exited ({status}{exit})."));
+            }
+        }
+        if !running && !snapshot.output_preview.is_empty() {
+            text.push('\n');
+            text.push_str(&snapshot.output_preview);
+        }
+        let deadline = self.kill_deadline_text(snapshot);
+        if !deadline.is_empty() {
+            text.push('\n');
+            text.push_str(&deadline);
+        }
+        text
+    }
+
+    /// Mirrors `workerWatchStillRunning` in the plugins: the deadline that
+    /// passed belongs to the watch, not the command, so the worker is told the
+    /// command is still running, how long it has run, what it printed last,
+    /// and how to wait again or stop it.
+    fn worker_still_running(&self, snapshot: &BgTaskSnapshot, waited_ms: u64) -> String {
+        let task_id = &self.task_id;
+        let ran = snapshot
+            .info
+            .duration_ms
+            .map(|ms| format!(" It has run for {}.", format_wait_limit(ms)))
+            .unwrap_or_default();
+        let tail = output_tail(&snapshot.output_preview);
+        let output = if tail.is_empty() {
+            "No output yet.".to_string()
+        } else {
+            format!("Recent output:\n{tail}")
+        };
+        format!(
+            "The command is still running after {} of watching; this is not a failure.{ran} Call bash_watch({{ taskId: \"{task_id}\" }}) again to keep waiting (without timeoutMs a watch waits up to the worker wait limit, then reports it is still running), or bash_kill({{ taskId: \"{task_id}\" }}) if it should have finished by now. Don't report a result until it finishes.\n{output}",
+            format_wait_limit(waited_ms)
+        )
+    }
+
+    /// Mirrors `taskKillDeadlineText` in the plugins: how the task was killed
+    /// when a hard limit fired, or its own kill deadline while it runs.
+    fn kill_deadline_text(&self, snapshot: &BgTaskSnapshot) -> String {
+        if snapshot.info.status == BgTaskStatus::TimedOut {
+            return match snapshot.info.status_reason.as_deref() {
+                Some(reason) if !reason.is_empty() => format!("The task was {reason}."),
+                _ => "The task was killed by its time limit (exit 124).".to_string(),
+            };
+        }
+        if snapshot.info.status.is_terminal() {
+            return String::new();
+        }
+        kill_deadline_sentence(
+            self.registry
+                .hard_kill_deadline(&self.task_id, &self.session),
+            self.worker,
+        )
+    }
+}
+
+fn status_name(status: &BgTaskStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The last lines of `output`, so a worker can judge whether a command is stuck.
+fn output_tail(output: &str) -> String {
+    let trimmed = output.trim_end();
+    let lines: Vec<&str> = trimmed.split('\n').collect();
+    let start = lines.len().saturating_sub(WORKER_OUTPUT_TAIL_LINES);
+    lines[start..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(value: Value) -> BashWatchParams {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn wait_limits_follow_the_role_like_the_plugins() {
+        let limit = |value, worker| effective_wait_ms(&params(value), worker, 1_800_000, 120_000);
+        assert_eq!(limit(json!({}), true), Ok(1_800_000));
+        assert_eq!(limit(json!({"timeout_ms": 5_000}), true), Ok(5_000));
+        assert_eq!(
+            limit(json!({"timeout_ms": 1_000, "background": true}), true),
+            Ok(1_800_000)
+        );
+        assert_eq!(limit(json!({}), false), Ok(30_000));
+        assert_eq!(limit(json!({"timeout_ms": 90_000}), false), Ok(90_000));
+        assert!(limit(json!({"timeout_ms": 200_000}), false)
+            .unwrap_err()
+            .contains("bash.watch_sync_max_ms"));
+        assert!(limit(json!({"timeout_ms": 0}), true).is_err());
+        assert!(limit(json!({"timeout_ms": 1_800_001}), true).is_err());
+    }
+
+    #[test]
+    fn substring_and_regex_buffers_keep_only_what_a_split_match_needs() {
+        let substring = parse_pattern(Some(&json!("DONE"))).unwrap().unwrap();
+        assert_eq!(substring.keep_from(10), 7);
+        let regex = parse_pattern(Some(&json!({"regex": "a+"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(regex.keep_from(10), 0);
+        assert_eq!(
+            regex.keep_from(REGEX_SCAN_WINDOW_BYTES + 5),
+            5,
+            "a regex keeps a 64 KB window"
+        );
+        assert!(parse_pattern(Some(&json!({"regex": "("}))).is_err());
+        assert!(parse_pattern(Some(&json!(3))).is_err());
+        assert!(parse_pattern(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn output_tail_keeps_the_last_twenty_lines() {
+        let output: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let tail = output_tail(&output);
+        assert!(tail.starts_with("line 11\n"));
+        assert!(tail.ends_with("line 30"));
+        assert_eq!(output_tail("  \n"), "");
+    }
+}

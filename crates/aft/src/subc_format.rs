@@ -46,6 +46,10 @@ pub struct FormatContext {
     pub safety_name_arg: Option<String>,
     /// `outputMode` of a `bash_status` call; PTY status text depends on it.
     pub bash_output_mode: Option<String>,
+    /// The caller is a delegated worker. A worker is never woken by a
+    /// completion reminder, so a running task's status points it at
+    /// `bash_watch` instead of promising one.
+    pub worker_session: bool,
 }
 
 impl Default for FormatContext {
@@ -67,6 +71,7 @@ impl Default for FormatContext {
             safety_file_arg: None,
             safety_name_arg: None,
             bash_output_mode: None,
+            worker_session: false,
         }
     }
 }
@@ -92,6 +97,7 @@ impl FormatContext {
             safety_file_arg: safety_string_arg_for_call(bare_name, arguments, "filePath"),
             safety_name_arg: safety_string_arg_for_call(bare_name, arguments, "name"),
             bash_output_mode: bash_output_mode_for_call(bare_name, arguments),
+            worker_session: false,
         }
     }
 }
@@ -263,6 +269,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "bash_status"
             | "bash_kill"
             | "bash_write"
+            | "bash_watch"
     )
 }
 
@@ -317,7 +324,9 @@ pub fn format_response_with_context(
         "zoom" => format_zoom(data, ctx),
         "inspect" => format_inspect(response),
         "status" => format_status(data),
-        "bash" | "powershell" => data["output"].as_str().unwrap_or_default().to_string(),
+        "bash" | "powershell" | "bash_watch" => {
+            data["output"].as_str().unwrap_or_default().to_string()
+        }
         "callgraph" => format_callgraph(
             ctx.callgraph_op.as_deref().unwrap_or("callgraph"),
             data,
@@ -330,7 +339,9 @@ pub fn format_response_with_context(
         "move" => format_move(data, ctx),
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
-        "bash_status" => format_bash_status(data, ctx.bash_output_mode.as_deref()),
+        "bash_status" => {
+            format_bash_status(data, ctx.bash_output_mode.as_deref(), ctx.worker_session)
+        }
         "bash_kill" => format_bash_kill(data),
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
@@ -989,7 +1000,7 @@ fn bash_task_id(data: &Value) -> &str {
 // Mirrors packages/opencode-plugin/src/tools/bash.ts formatBashStatusText and
 // formatPtyStatus, so a catalog consumer shows the model the same status text
 // the OpenCode tool does.
-fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
+fn format_bash_status(data: &Value, output_mode: Option<&str>, worker_session: bool) -> String {
     let task_id = bash_task_id(data);
     let status = data
         .get("status")
@@ -1054,7 +1065,12 @@ fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
             text.push_str(preview);
         }
         if running {
-            text.push_str("\nA completion reminder will be delivered automatically; don't poll.");
+            // Mirrors `runningTaskStatusHint` in the plugins.
+            text.push_str(if worker_session {
+                "\nTo wait for it, call bash_watch; don't poll."
+            } else {
+                "\nA completion reminder will be delivered automatically; don't poll."
+            });
         }
     }
     text

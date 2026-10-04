@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "7d2a07fdd874c43c15998a0ee013f0386059e9fd528de0782589c9a75e215464",
-      "catalog_digest": "7d2a07fdd874c43c15998a0ee013f0386059e9fd528de0782589c9a75e215464",
+      "generation": "d9f0ef26a58e80d93fdc23b13e5e2d9c50078755d57b61c05006d9d9b7e213ab",
+      "catalog_digest": "d9f0ef26a58e80d93fdc23b13e5e2d9c50078755d57b61c05006d9d9b7e213ab",
       "tools": [
         {
           "name": "status",
@@ -1011,7 +1011,7 @@
                 ]
               },
               "background": {
-                "description": "When true, register an async watch and return immediately. Defaults to false (sync wait).",
+                "description": "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
                 "type": "boolean"
               },
               "timeoutMs": {
@@ -1021,7 +1021,7 @@
                 "maximum": 1800000
               },
               "once": {
-                "description": "Async-only. Defaults true; false keeps the watch sticky until task exit.",
+                "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
               }
             },
@@ -1150,8 +1150,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "3a4731043a2274dacac9c646cfcc093d3a0444b6042276f34c6df244ff2f4750",
-      "catalog_digest": "3a4731043a2274dacac9c646cfcc093d3a0444b6042276f34c6df244ff2f4750",
+      "generation": "3dbca772b1e491e4e96bfb122e64ada1d2715f6e2a42b0528a1b5989d15b5c08",
+      "catalog_digest": "3dbca772b1e491e4e96bfb122e64ada1d2715f6e2a42b0528a1b5989d15b5c08",
       "tools": [
         {
           "name": "status",
@@ -2220,7 +2220,7 @@
                 ]
               },
               "background": {
-                "description": "When true, register an async watch and return immediately. Defaults to false (sync wait).",
+                "description": "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
                 "type": "boolean"
               },
               "timeoutMs": {
@@ -2230,7 +2230,7 @@
                 "maximum": 1800000
               },
               "once": {
-                "description": "Async-only. Defaults true; false keeps the watch sticky until task exit.",
+                "description": "Accepted for compatibility; only an async watch reads it.",
                 "type": "boolean"
               }
             },

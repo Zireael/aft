@@ -7479,11 +7479,12 @@ async fn handle_tool_call(
     } else {
         crate::logging::ToolCallCaller::Agent
     };
-    let format_context = crate::subc_format::FormatContext::from_tool_call(
+    let mut format_context = crate::subc_format::FormatContext::from_tool_call(
         &bare_name,
         &arguments,
         identity.project_root.as_path(),
     );
+    format_context.worker_session = role.is_worker();
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let bind_trust = identity.trust;
@@ -7812,6 +7813,7 @@ async fn handle_tool_call(
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
+        || bare_name == "bash_watch"
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -7871,6 +7873,11 @@ async fn handle_tool_call(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
+                            )
+                        } else if bare_name_for_run == "bash_watch" {
+                            crate::commands::bash_watch::handle_deferred(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(

@@ -1068,6 +1068,7 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
             | "bash_status"
             | "bash_kill"
             | "bash_write"
+            | "bash_watch"
     )
 }
 
@@ -1204,7 +1205,7 @@ pub fn subc_translate_owned_with_context(
         "move" => translate_move(agent_args, project_root),
         "import" => translate_import(agent_args),
         "safety" => translate_safety(agent_args, project_root),
-        "bash_status" | "bash_kill" | "bash_write" => {
+        "bash_status" | "bash_kill" | "bash_write" | "bash_watch" => {
             Ok(translate_bash_task_tool(bare_name, agent_args))
         }
         other => Err(unsupported_tool(format!(
@@ -1228,9 +1229,11 @@ fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
     let mut map = agent_args_map(args);
     rename(&mut map, "taskId", "task_id");
     rename(&mut map, "outputMode", "output_mode");
+    rename(&mut map, "timeoutMs", "timeout_ms");
     if let Some(Value::Object(params)) = map.get_mut("params") {
         rename(params, "taskId", "task_id");
         rename(params, "outputMode", "output_mode");
+        rename(params, "timeoutMs", "timeout_ms");
     }
     Translated {
         command: bare_name.to_string(),
