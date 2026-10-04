@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "d9f0ef26a58e80d93fdc23b13e5e2d9c50078755d57b61c05006d9d9b7e213ab",
-      "catalog_digest": "d9f0ef26a58e80d93fdc23b13e5e2d9c50078755d57b61c05006d9d9b7e213ab",
+      "generation": "7358eab9976c8f828c84c321f546ee5645ada606767cae442aada22912e4ed27",
+      "catalog_digest": "7358eab9976c8f828c84c321f546ee5645ada606767cae442aada22912e4ed27",
       "tools": [
         {
           "name": "status",
@@ -511,7 +511,7 @@
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1150,8 +1150,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "3dbca772b1e491e4e96bfb122e64ada1d2715f6e2a42b0528a1b5989d15b5c08",
-      "catalog_digest": "3dbca772b1e491e4e96bfb122e64ada1d2715f6e2a42b0528a1b5989d15b5c08",
+      "generation": "34cb7364d87cfb90d47cf58ecfdeeed12a9838f4815cd4d530a2320180cdf77b",
+      "catalog_digest": "34cb7364d87cfb90d47cf58ecfdeeed12a9838f4815cd4d530a2320180cdf77b",
       "tools": [
         {
           "name": "status",
@@ -1720,7 +1720,7 @@
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2360,8 +2360,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "d60ed2b97b9497d68fab91063020905f0a14d3b1947fab23eba3de80e5a22e14",
-      "catalog_digest": "d60ed2b97b9497d68fab91063020905f0a14d3b1947fab23eba3de80e5a22e14",
+      "generation": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
+      "catalog_digest": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
       "tools": [
         {
           "name": "read",
@@ -2649,7 +2649,7 @@
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2786,8 +2786,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "d60ed2b97b9497d68fab91063020905f0a14d3b1947fab23eba3de80e5a22e14",
-      "catalog_digest": "d60ed2b97b9497d68fab91063020905f0a14d3b1947fab23eba3de80e5a22e14",
+      "generation": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
+      "catalog_digest": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
       "tools": [
         {
           "name": "read",
@@ -3075,7 +3075,7 @@
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Blocking-fresh codebase health inspection. Each call completes current analysis and produces exactly one terminal result: FRESH includes a wait-stamp and completed phases; PARTIAL is a completed result whose diagnostics are unknown for the producers its header names; INTERRUPTED and PHASE-FAILED retain completed phases, with PHASE-FAILED also reporting its phase attribution and failure reason. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow returned results. Scope filters rendered diagnostics and limits Rust LSP startup to Cargo workspaces owning the scoped paths; it does not trigger per-file collection work. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false). Passive health changes use the alert channel; do not infer inspect completion from that channel.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
