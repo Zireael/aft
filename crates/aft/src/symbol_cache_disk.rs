@@ -184,9 +184,6 @@ pub fn write_to_disk(
     ));
     let write_result = write_cache_file(cache, &project_root, &tmp_path).and_then(|()| {
         fs::rename(&tmp_path, &data_path)?;
-        if let Ok(dir_file) = File::open(&dir) {
-            let _ = dir_file.sync_all();
-        }
         Ok(())
     });
 
@@ -410,7 +407,8 @@ fn write_cache_file(
     writer.seek(SeekFrom::Start(entry_count_offset))?;
     write_u32(&mut writer, written_entries)?;
     writer.flush()?;
-    writer.get_ref().sync_all()?;
+    // Symbols rebuild from source if a crash loses this cache. BufWriter must
+    // flush to the kernel before the caller atomically publishes its filename.
     Ok(())
 }
 
@@ -502,6 +500,16 @@ fn write_u64<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn durability_symbol_cache_write_count() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = test_cache(project.path(), "source.rs");
+        crate::durability::take();
+        write_to_disk(&cache, storage.path(), "durability").unwrap();
+        let events = crate::durability::take();
+        assert_eq!(crate::durability::sync_count(&events), 0, "{events:?}");
+    }
     use crate::symbols::{Range, SymbolKind};
 
     fn test_symbol(name: &str) -> Symbol {
