@@ -295,7 +295,11 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
     let storage = fixture.path().join("storage");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&storage).unwrap();
-    let db = project.join("store.db");
+    // Landlock read-deny rules attach to directories, not single files, so the
+    // protected database lives in its own directory and that directory is denied.
+    let private = project.join("private");
+    std::fs::create_dir_all(&private).unwrap();
+    let db = private.join("store.db");
     let created = std::process::Command::new("sqlite3")
         .arg(&db)
         .arg("CREATE TABLE tasks(id TEXT, kind TEXT)")
@@ -310,7 +314,7 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
     let allowed = foreground(
         &mut aft,
         "schema-allowed",
-        "sqlite3 store.db 'SELECT substrate FROM tasks'",
+        "sqlite3 private/store.db 'SELECT substrate FROM tasks'",
     );
     assert_eq!(allowed["status"], "failed", "{allowed}");
     assert!(
@@ -334,14 +338,14 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
             &storage,
             true,
             &[],
-            std::slice::from_ref(&db)
+            std::slice::from_ref(&private)
         )["success"],
         true
     );
     let denied = foreground(
         &mut aft,
         "schema-denied",
-        "./sqlite3 store.db 'SELECT substrate FROM tasks'",
+        "./sqlite3 private/store.db 'SELECT substrate FROM tasks'",
     );
     assert_eq!(denied["status"], "failed", "{denied}");
     let output = denied["output"].as_str().unwrap();
