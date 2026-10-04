@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { z } from "zod";
 import type { PluginContext } from "../types.js";
 import {
@@ -170,7 +170,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         ),
       ),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       const projectRoot = await resolveProjectRoot(ctx, context);
       const pattern = String(args.pattern);
       const includeArg = args.include ? String(args.include) : undefined;
@@ -215,7 +215,24 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         response.complete = false;
       }
 
-      return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
+      const matches = Array.isArray(response.matches) ? response.matches : [];
+      return {
+        output: appendSkippedSearchPaths(
+          typeof response.text === "string" ? response.text : "",
+          pathSplit?.missing ?? [],
+        ),
+        metadata: {
+          matches: matches.length,
+          ...(typeof response.total_matches === "number"
+            ? { total_matches: response.total_matches }
+            : {}),
+          ...(typeof response.rendered_matches === "number"
+            ? { rendered_matches: response.rendered_matches }
+            : {}),
+          ...(typeof response.complete === "boolean" ? { complete: response.complete } : {}),
+          ...(typeof response.truncated === "boolean" ? { truncated: response.truncated } : {}),
+        },
+      };
     },
   };
 
@@ -233,7 +250,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .describe("Directory to search (absolute or relative to project root)"),
       ),
     },
-    execute: async (args, context): Promise<string> => {
+    execute: async (args, context): Promise<ToolResult> => {
       const projectRoot = await resolveProjectRoot(ctx, context);
       // Handle absolute paths embedded in the pattern (e.g. "/abs/path/src/**/*.ts")
       // Split into path (directory prefix) and pattern (glob suffix)
@@ -292,7 +309,20 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
         response.complete = false;
       }
 
-      return appendSkippedSearchPaths(response.text, pathSplit?.missing ?? []);
+      const files = Array.isArray(response.files) ? response.files : [];
+      return {
+        output: appendSkippedSearchPaths(
+          typeof response.text === "string" ? response.text : "",
+          pathSplit?.missing ?? [],
+        ),
+        metadata: {
+          count: files.length,
+          ...(Array.isArray(response.files) ? { files } : {}),
+          ...(typeof response.total === "number" ? { total: response.total } : {}),
+          ...(typeof response.complete === "boolean" ? { complete: response.complete } : {}),
+          ...(typeof response.truncated === "boolean" ? { truncated: response.truncated } : {}),
+        },
+      };
     },
   };
 

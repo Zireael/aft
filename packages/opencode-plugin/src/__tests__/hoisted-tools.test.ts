@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
+import { Effect } from "effect";
+import { projectV2Tool } from "../tools/definitions/v2.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
@@ -576,6 +578,7 @@ describe("Hoisted tool execute handlers", () => {
               additions?: number;
               deletions?: number;
             };
+            files?: Array<Record<string, unknown>>;
           }
         | undefined;
       expect(metadata?.filediff).toMatchObject({ additions: 1, deletions: 1 });
@@ -583,9 +586,91 @@ describe("Hoisted tool execute handlers", () => {
       expect(metadata?.filediff?.patch).toContain("-export const value = 1;");
       expect(metadata?.filediff?.patch).toContain("+export const value = 2;");
       expect(metadata?.diff).toBe(metadata?.filediff?.patch);
+      expect(metadata?.files).toEqual([
+        {
+          file: metadata?.filediff?.file,
+          patch: metadata?.filediff?.patch,
+          additions: 1,
+          deletions: 1,
+          status: "modified",
+        },
+      ]);
       expect(metadata?.filediff).not.toHaveProperty("before");
       expect(metadata?.filediff).not.toHaveProperty("after");
     }
+  });
+
+  test("V2 projected edit/write metadata exposes accepted FileDiffs and write statuses", async () => {
+    tmpDir = await makeTempDir();
+    const before = "export const value = 1;\n";
+    const after = "export const value = 2;\n";
+    const { tools } = createMockHoistedHarness(async (command, params, options) => {
+      if (options?.preview) return previewResponse();
+      if (command === "write" && params.filePath === "new.ts") {
+        return {
+          success: true,
+          created: true,
+          diff: { before: "", after, additions: 1, deletions: 0 },
+          text: "Created new file.",
+        };
+      }
+      return {
+        success: true,
+        created: false,
+        diff: { before, after, additions: 1, deletions: 1 },
+        text: "Mutation complete.",
+      };
+    });
+
+    const projected = async (name: "edit" | "write", input: Record<string, unknown>) => {
+      const tool = projectV2Tool(
+        name,
+        tools[name],
+        { directory: tmpDir as string },
+        { requestPermission: async () => {} },
+      );
+      return (await Effect.runPromise(tool.execute(input, { progress: () => Effect.void }))) as {
+        metadata?: Record<string, unknown>;
+      };
+    };
+
+    const editResult = await projected("edit", {
+      path: "edit.ts",
+      oldString: "value = 1",
+      newString: "value = 2",
+    });
+    const newWriteResult = await projected("write", { path: "new.ts", content: after });
+    const overwriteResult = await projected("write", { path: "existing.ts", content: after });
+
+    const editFile = (
+      editResult.metadata?.files as Array<Record<string, unknown>> | undefined
+    )?.[0];
+    const newWriteFile = (
+      newWriteResult.metadata?.files as Array<Record<string, unknown>> | undefined
+    )?.[0];
+    const overwriteFile = (
+      overwriteResult.metadata?.files as Array<Record<string, unknown>> | undefined
+    )?.[0];
+
+    // OpenCode 2.0.22 session-ui/components/apply-patch-file.ts:17-26
+    // accepts a FileDiff only when it has a file, patch, and nonzero change counts.
+    const changedFileDiffAccepts = (file: Record<string, unknown> | undefined) =>
+      typeof file?.file === "string" &&
+      typeof file.patch === "string" &&
+      file.patch.length > 0 &&
+      ((typeof file.additions === "number" && file.additions > 0) ||
+        (typeof file.deletions === "number" && file.deletions > 0));
+
+    for (const file of [editFile, newWriteFile, overwriteFile]) {
+      expect(changedFileDiffAccepts(file)).toBe(true);
+      expect(file?.file).toBeTypeOf("string");
+      expect(file?.patch).toContain("--- ");
+      expect(file?.patch).toContain("+++ ");
+      expect(file?.patch).toContain("@@");
+    }
+    expect(editFile).toMatchObject({ additions: 1, deletions: 1, status: "modified" });
+    expect(newWriteFile).toMatchObject({ additions: 1, deletions: 0, status: "added" });
+    expect(overwriteFile).toMatchObject({ additions: 1, deletions: 1, status: "modified" });
   });
 
   test("write and edit return the preview patch for truncated responses", async () => {
@@ -639,6 +724,15 @@ describe("Hoisted tool execute handlers", () => {
         additions: 1,
         deletions: 1,
       });
+      expect(metadata?.files).toEqual([
+        {
+          file: metadata?.filediff?.file,
+          patch: previewDiff,
+          additions: 1,
+          deletions: 1,
+          status: "modified",
+        },
+      ]);
       expect(metadata?.filediff?.patch).toContain("-old line");
       expect(metadata?.filediff?.patch).toContain("+new line");
       expect(metadata?.filediff).not.toHaveProperty("before");
@@ -667,6 +761,70 @@ describe("Hoisted tool execute handlers", () => {
 
     expect(result.metadata?.diff).toBe("");
     expect(result.metadata?.filediff).toBeUndefined();
+    expect(result.metadata?.files).toBeUndefined();
+  });
+
+  test("apply_patch returns FileDiff-compatible metadata for changed files", async () => {
+    tmpDir = await makeTempDir();
+    sdkCtx = createMockSdkContext(tmpDir);
+    const patch = "--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new\n";
+    const deletePatch = "--- a/deleted.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n";
+    const { tools } = createMockHoistedHarness(async (_command, _params, options) =>
+      options?.preview
+        ? previewResponse()
+        : {
+            success: true,
+            text: "Updated file.ts",
+            metadata: {
+              diff: patch,
+              files: [
+                {
+                  filePath: resolve(tmpDir as string, "file.ts"),
+                  relativePath: "file.ts",
+                  type: "update",
+                  patch,
+                  additions: 1,
+                  deletions: 1,
+                },
+                {
+                  filePath: resolve(tmpDir as string, "deleted.ts"),
+                  relativePath: "deleted.ts",
+                  type: "delete",
+                  patch: deletePatch,
+                  additions: 0,
+                  deletions: 1,
+                },
+              ],
+            },
+          },
+    );
+
+    const result = (await tools.apply_patch.execute({ patchText: "patch" }, sdkCtx)) as {
+      metadata?: { files?: Array<Record<string, unknown>> };
+    };
+
+    expect(result.metadata?.files).toEqual([
+      {
+        filePath: resolve(tmpDir, "file.ts"),
+        relativePath: "file.ts",
+        type: "update",
+        file: resolve(tmpDir, "file.ts"),
+        patch,
+        additions: 1,
+        deletions: 1,
+        status: "modified",
+      },
+      {
+        filePath: resolve(tmpDir, "deleted.ts"),
+        relativePath: "deleted.ts",
+        type: "delete",
+        file: resolve(tmpDir, "deleted.ts"),
+        patch: deletePatch,
+        additions: 0,
+        deletions: 1,
+        status: "deleted",
+      },
+    ]);
   });
 
   test("apply_patch calls server preview then apply without diagnostics payload", async () => {
@@ -1482,7 +1640,9 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
     expect(result.output).toContain("Patch partially applied");
     expect(result.title).toBe("Applied 1 of 2 hunks");
     expect(result.metadata?.diff).toBe(diff);
-    expect(result.metadata?.files).toEqual(files);
+    expect(result.metadata?.files).toEqual([
+      { ...files[0], file: resolve(tmpDir, "created.ts"), status: "added" },
+    ]);
   });
 
   test("read returns binary-file messages without trying to split missing content", async () => {
@@ -1782,7 +1942,9 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
     expect(stored.output).toBe("Created new.ts");
     expect(stored.title).toBe("Applied 1 hunks");
     expect(stored.metadata?.diff).toBe(diff);
-    expect(stored.metadata?.files).toEqual(files);
+    expect(stored.metadata?.files).toEqual([
+      { ...files[0], file: resolve(tmpDir, "new.ts"), status: "added" },
+    ]);
   });
 });
 

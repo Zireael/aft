@@ -106,6 +106,24 @@ describe("V2 tool result metadata", () => {
     expect(metadata.files).toEqual(["a.ts", null, "b.ts"]);
   });
 
+  test("FileDiff objects pass through V2 metadata normalization intact", async () => {
+    const fileDiff = {
+      file: "/tmp/fixture/a.ts",
+      patch: "--- a.ts\n+++ a.ts\n@@ -1 +1 @@\n-old\n+new\n",
+      additions: 1,
+      deletions: 1,
+      status: "modified",
+    };
+    const { output } = await runProjected({
+      output: "edited",
+      metadata: { files: [fileDiff] },
+    });
+    const metadata = output.metadata as Record<string, unknown>;
+
+    expect(storableByHost(metadata)).toBe(true);
+    expect(metadata.files).toEqual([fileDiff]);
+  });
+
   test("progress updates are cleaned the same way", async () => {
     const definition = {
       description: "fixture tool",
