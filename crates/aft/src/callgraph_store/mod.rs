@@ -10947,7 +10947,7 @@ fn callgraph_root_file_stats(
         newest: metadata.modified().ok(),
         bytes: 0,
     };
-    match callgraph_root_file_stats_inner(cache_dir, boundary, deadline, &mut stats) {
+    match callgraph_root_file_stats_inner(cache_dir, cache_dir, boundary, deadline, &mut stats) {
         Ok(()) => CallgraphRootWalk::Complete(stats),
         Err(CallgraphRootWalkError::BudgetExceeded) => CallgraphRootWalk::BudgetExceeded,
         Err(CallgraphRootWalkError::Failed) => CallgraphRootWalk::Failed,
@@ -10961,6 +10961,7 @@ enum CallgraphRootWalkError {
 
 fn callgraph_root_file_stats_inner(
     directory: &Path,
+    cache_dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
     deadline: Instant,
     stats: &mut CallgraphRootFileStats,
@@ -10981,6 +10982,13 @@ fn callgraph_root_file_stats_inner(
             return Err(CallgraphRootWalkError::Failed);
         }
         let path = entry.path();
+        let relative = path
+            .strip_prefix(cache_dir)
+            .map_err(|_| CallgraphRootWalkError::Failed)?;
+        // Coordination files reflect lease/reader heartbeats, not cache payload
+        // activity. Their liveness is checked separately before deletion. Still
+        // walk them for byte accounting and the same conservative safety checks.
+        let track_mtime = relative != Path::new("writer.lease") && !relative.starts_with("readers");
         if file_type.is_dir() {
             if !boundary
                 .should_descend(&path)
@@ -10991,8 +10999,10 @@ fn callgraph_root_file_stats_inner(
             let metadata = entry
                 .metadata()
                 .map_err(|_| CallgraphRootWalkError::Failed)?;
-            merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
-            callgraph_root_file_stats_inner(&path, boundary, deadline, stats)?;
+            if track_mtime {
+                merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+            }
+            callgraph_root_file_stats_inner(&path, cache_dir, boundary, deadline, stats)?;
             continue;
         }
         if !file_type.is_file() {
@@ -11002,7 +11012,9 @@ fn callgraph_root_file_stats_inner(
             .metadata()
             .map_err(|_| CallgraphRootWalkError::Failed)?;
         stats.bytes = stats.bytes.saturating_add(metadata.len());
-        merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+        if track_mtime {
+            merge_newest_callgraph_root_mtime(stats, metadata.modified().ok());
+        }
     }
     Ok(())
 }
@@ -21180,10 +21192,32 @@ mod cold_build_insert_tests {
         )
         .unwrap();
         age_callgraph_root_tree(&leased);
+        let aged_lease_mtime = fs::metadata(writer_lease.path())
+            .unwrap()
+            .modified()
+            .unwrap();
         let marker = crate::root_cache::ReadMarker::create(&marked, "generation").unwrap();
         // Same-host marker protection is PID-authoritative, so this old mtime
         // proves the reader guard instead of accidentally relying on freshness.
         age_callgraph_root_tree(&marked);
+
+        // Observe a real heartbeat after aging rather than assuming the sweep
+        // runs before the heartbeat thread next refreshes the lease file.
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let modified = fs::metadata(writer_lease.path())
+                .unwrap()
+                .modified()
+                .unwrap();
+            if modified > aged_lease_mtime {
+                break;
+            }
+            assert!(
+                Instant::now() < heartbeat_deadline,
+                "the held writer lease must heartbeat after aging"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         let first = sweep_callgraph_root_dirs_with_limits(
             &callgraph_root,
@@ -21226,6 +21260,96 @@ mod cold_build_insert_tests {
             );
         }
         reset_callgraph_root_sweep_cursor_for_test();
+    }
+
+    #[test]
+    fn callgraph_root_sweep_reaps_dead_writer_despite_recent_lease_mtime() {
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let cache_dir = write_aged_callgraph_root(&callgraph_root, "b1c2d3e4f5a69788");
+        let lease_path = crate::root_cache::writer_lease_path(&cache_dir);
+        let lease = crate::fs_lock::try_acquire(&lease_path, Duration::ZERO).unwrap();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease_path).unwrap()).unwrap();
+        drop(lease);
+        metadata["pid"] = serde_json::json!(u32::MAX);
+        metadata["created_at_ms"] = serde_json::json!(0);
+        metadata["heartbeat_at_ms"] = serde_json::json!(0);
+        fs::write(&lease_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        // Filesystem mtime is not the lease's heartbeat_at_ms or owner identity.
+        // A recently touched lease from a dead writer must still be reclaimable.
+        filetime::set_file_mtime(
+            &lease_path,
+            filetime::FileTime::from_system_time(SystemTime::now()),
+        )
+        .unwrap();
+        assert!(!crate::fs_lock::process_alive(u32::MAX));
+
+        let summary = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.skipped_fresh, 0);
+        assert_eq!(summary.skipped_lease, 0);
+        assert!(!cache_dir.exists(), "a dead writer's root must be reaped");
+    }
+
+    #[test]
+    fn callgraph_root_sweep_uses_reader_liveness_not_marker_mtime() {
+        let storage = tempdir().unwrap();
+        let callgraph_root = storage.path().join("callgraph");
+        let cache_dir = write_aged_callgraph_root(&callgraph_root, "a1b2c3d4e5f69788");
+        let marker = crate::root_cache::ReadMarker::create(&cache_dir, "generation").unwrap();
+        age_callgraph_root_tree(&cache_dir);
+        let aged_root_mtime = fs::metadata(&cache_dir).unwrap().modified().unwrap();
+        // A real marker refresh also updates its generation directory's mtime.
+        marker.touch().unwrap();
+        filetime::set_file_mtime(
+            cache_dir.join("readers"),
+            filetime::FileTime::from_system_time(SystemTime::now()),
+        )
+        .unwrap();
+        let first = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(first.skipped_reader, 1, "a live reader marker must win");
+        assert_eq!(first.skipped_fresh, 0);
+        assert!(cache_dir.is_dir());
+
+        let marker_path = marker.path().to_path_buf();
+        let mut metadata = marker.metadata().clone();
+        drop(marker);
+        metadata.pid = u32::MAX;
+        fs::write(&marker_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(!crate::fs_lock::process_alive(metadata.pid));
+        // The replacement marker is fresh too, but a dead same-host PID no
+        // longer protects the payload. Only restore the root directory age,
+        // which the first sweep's writer-lease acquisition changed.
+        filetime::set_file_mtime(
+            &cache_dir,
+            filetime::FileTime::from_system_time(aged_root_mtime),
+        )
+        .unwrap();
+        let second = sweep_callgraph_root_dirs_with_limits(
+            &callgraph_root,
+            &HashSet::new(),
+            &HashSet::new(),
+            CALLGRAPH_ROOT_SWEEP_BUDGET,
+            usize::MAX,
+        );
+        assert_eq!(second.removed, 1);
+        assert_eq!(second.skipped_reader, 0);
+        assert_eq!(second.skipped_fresh, 0);
+        assert!(!cache_dir.exists(), "a dead reader's root must be reaped");
     }
 
     #[test]
