@@ -112,3 +112,22 @@ the cold replacement path; other probe failures remain unknown.
 Lock-holding regressions verify the configure and preparation decisions, bounded
 waiting, and automatic detached retry: the first busy attempt backs off for one
 second, performs no cold rebuild, and publishes after the lock is released.
+
+Verification used Cargo 1.99.0. Returning `Ok(false)` for a real busy probe made
+`busy_readiness_does_not_schedule_a_configure_rebuild`,
+`busy_readiness_defers_assembly_without_a_cold_rebuild`, and
+`busy_readiness_probe_waits_within_its_deadline` fail independently. The existing
+fail-fast reader and views-on/off controls remained green. The mutation was
+restored from the staged live file, and `git diff --stat` was empty afterwards.
+
+After restoration, all four busy regressions and all 15 publication retry tests
+passed. The wiring integration module ran ten times in a second process alongside
+the remaining views integrations: every run passed seven tests, including
+`republishing_an_unchanged_checkout_keeps_the_current_generation`, with one
+profiling benchmark ignored. The companion process passed 77 per-checkout tests
+(five child entry points ignored), four migration tests, and two callgraph
+worktree tests. The wiring loop ran from `23:28:59Z` to `23:29:34Z` on October 4;
+the companion process ran from `23:28:59Z` to `23:29:28Z`. Full logs are retained
+under `target/readiness-contention-gate/` in the task worktree. An additional
+`branch_switch_test` filter matched zero registered tests and is not counted as a
+pass; registered branch-switch and parity coverage ran in the two suites above.
