@@ -127,10 +127,10 @@ test fixture_cancellation_uses_literal_wire_error_and_no_budget ... ok
 test fixture_deadline_cleanup_uses_literal_wire_error_and_no_budget ... ok
 test fixture_failed_cancellation_at_cancel_boundary_charges_and_kills ... ok
 [truncated output; full output: read "<stdout>" and read "<stderr>"]
-   Compiling lane-candle-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
-   Compiling lane-llama v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
-   Compiling lane-wrap-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
-   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
+   Compiling lane-candle-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
+   Compiling lane-llama v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
+   Compiling lane-wrap-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
+   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 00s
 warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

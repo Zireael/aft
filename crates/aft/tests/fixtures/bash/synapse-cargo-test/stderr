@@ -26,7 +26,7 @@ prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued beh
    Compiling cc v1.2.65
    Compiling unicode-xid v0.2.6
    Compiling gimli v0.32.3
-   Compiling synapse-core v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-core)
+   Compiling synapse-core v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-core)
    Compiling hashbrown v0.16.1
    Compiling rustix v1.1.4
    Compiling system-configuration v0.7.0
@@ -147,7 +147,7 @@ prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued beh
    Compiling url v2.5.8
    Compiling objc2-foundation v0.3.2
    Compiling enum-as-inner v0.6.1
-   Compiling synapse-engine-owned v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned)
+   Compiling synapse-engine-owned v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned)
    Compiling darling_core v0.23.0
    Compiling foreign-types-macros v0.2.3
    Compiling foldhash v0.1.5
@@ -202,7 +202,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling md5 v0.8.0
    Compiling inflections v1.1.1
    Compiling presser v0.3.1
-   Compiling owned-decode-worker v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned/owned-decode-worker)
+   Compiling owned-decode-worker v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned/owned-decode-worker)
    Compiling gpu-descriptor v0.3.2
    Compiling objc2-quartz-core v0.3.2
    Compiling subc-client-rs v0.26.1
@@ -234,7 +234,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling cortexkit-log v0.3.3
    Compiling petgraph v0.8.3
    Compiling stable-vec v0.4.2
-   Compiling synapse-module v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-module)
+   Compiling synapse-module v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-module)
    Compiling either v1.16.0
    Compiling cpufeatures v0.2.17
    Compiling cortexkit-store v0.2.0
@@ -251,7 +251,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling raw-cpuid v11.6.0
    Compiling errno v0.3.14
    Compiling clang-sys v1.8.1
-   Compiling synapse-bench v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/harness)
+   Compiling synapse-bench v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/harness)
    Compiling cubecl-opt v0.10.0
    Compiling nom v7.1.3
    Compiling colored v3.1.1
@@ -292,8 +292,8 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling ciborium-io v0.2.2
    Compiling home v0.5.12
    Compiling bincode v2.0.1
-   Compiling synapse-engine-cuda v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-cuda)
-   Compiling synapse-parity v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/parity)
+   Compiling synapse-engine-cuda v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-cuda)
+   Compiling synapse-parity v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/parity)
    Compiling rmp-serde v1.3.1
    Compiling ureq-proto v0.6.0
    Compiling which v4.4.2
@@ -306,7 +306,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling ureq v3.3.0
    Compiling security-framework-sys v2.17.0
    Compiling core-foundation v0.10.1
-   Compiling synapse-worker-vulkan v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-vulkan)
+   Compiling synapse-worker-vulkan v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-vulkan)
    Compiling protobuf-parse v3.7.2
    Compiling nano-gemm-core v0.1.0
    Compiling base64ct v1.8.3
@@ -340,7 +340,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling objc2-io-surface v0.3.2
    Compiling strum_macros v0.28.0
    Compiling socks v0.3.4
-   Compiling synapse-worker-cuda v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-cuda)
+   Compiling synapse-worker-cuda v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-cuda)
    Compiling textdistance v1.1.1
    Compiling burn-fusion v0.21.0
    Compiling cubek v0.2.0
@@ -355,15 +355,15 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling matrixmultiply v0.3.10
    Compiling hmac-sha256 v1.1.14
    Compiling typed-path v0.12.3
-   Compiling synapse-worker-llama v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-llama)
-   Compiling synapse-rig v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/rig)
+   Compiling synapse-worker-llama v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-llama)
+   Compiling synapse-rig v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/rig)
    Compiling lzma-rust2 v0.15.8
    Compiling text_placeholder v0.5.1
    Compiling equator v0.2.2
    Compiling burn-store v0.21.0
    Compiling burn-cubecl-fusion v0.21.0
    Compiling rust-format v0.3.4
-   Compiling ane v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct/vendor/ane)
+   Compiling ane v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct/vendor/ane)
    Compiling ort-sys v2.0.0-rc.11
    Compiling zip v7.2.0
    Compiling gemm-f32 v0.18.2
@@ -371,7 +371,7 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling gemm-f64 v0.18.2
    Compiling gemm-c64 v0.18.2
    Compiling qd v0.7.7
-   Compiling synapse-worker-ane-direct v0.1.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct)
+   Compiling synapse-worker-ane-direct v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct)
    Compiling candle-metal-kernels v0.10.2
    Compiling equator-macro v0.4.2
    Compiling burn v0.21.0
@@ -386,12 +386,12 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
    Compiling candle-core v0.10.2
    Compiling equator v0.4.2
    Compiling burn-onnx v0.21.0
-   Compiling lane-llama-inproc v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama-inproc)
+   Compiling lane-llama-inproc v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama-inproc)
    Compiling faer-traits v0.22.1
    Compiling bit-set v0.8.0
    Compiling transpose v0.2.3
    Compiling primal-check v0.3.4
-   Compiling spike-unified-rt v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/spikes/unified-rt)
+   Compiling spike-unified-rt v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/spikes/unified-rt)
    Compiling ndarray v0.17.2
    Compiling faer v0.22.6
    Compiling fancy-regex v0.17.0
@@ -400,21 +400,21 @@ warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embe
 warning: spike-unified-rt@0.0.0: Metal developer tools unavailable; Metal step metallib will be built by a macOS toolchain
    Compiling libloading v0.9.0
    Compiling candle-nn v0.10.2
-   Compiling lane-burn v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/burn)
+   Compiling lane-burn v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/burn)
    Compiling burn-wgpu v0.21.0
    Compiling hound v3.5.1
-   Compiling synapse-worker-ane v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane)
+   Compiling synapse-worker-ane v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane)
 prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
    Compiling ort v2.0.0-rc.11
 prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
    Compiling candle-transformers v0.10.2
 prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
-   Compiling lane-ort-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/ort-embed)
-   Compiling synapse-worker-decode v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-decode)
-   Compiling lane-candle-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
-   Compiling lane-llama v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
-   Compiling lane-wrap-embed v0.0.0 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
-   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
+   Compiling lane-ort-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/ort-embed)
+   Compiling synapse-worker-decode v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-decode)
+   Compiling lane-candle-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
+   Compiling lane-llama v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
+   Compiling lane-wrap-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
+   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 00s
 warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

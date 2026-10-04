@@ -262,18 +262,18 @@ failures:
 ---- lfm2_decode_metal_step::tests::conv_cache_write_round_trips stdout ----
 
 thread 'lfm2_decode_metal_step::tests::conv_cache_write_round_trips' (152849554) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:838:14:
-engine: LFM2 Metal step metallib is missing beside /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
 
 ---- lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference stdout ----
 
 thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference' (152849555) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:759:14:
-engine: LFM2 Metal step metallib is missing beside /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic stdout ----
 
 thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic' (152849556) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:801:22:
-engine: LFM2 Metal step metallib is missing beside /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
 
 
 failures:
