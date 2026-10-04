@@ -1,6 +1,6 @@
 # Durability per store: measured syncs and a proposal
 
-Status: implementation in progress. Base commit `c7ecd5490`. Measured on an
+Status: implemented (portable full-sync commit points; no macOS-specific plain-fsync refinement). Base commit `c7ecd5490`. Measured on an
 Apple M5 Max (Mac17,6) running macOS 27.0.1, internal APFS SSD. The machine was
 shared with other build workers the whole time (load average about 48), so wall
 times are noisy. The sync counts are exact and were the same on every repeat.
@@ -609,6 +609,7 @@ at the same time.
 
   These are mostly caches or pointers to rebuildable generations, and they would
   follow principle 2. They were not analysed one by one here.
+  Implemented: callgraph/inspect/symbol artifacts and live artifact-owner/read markers now have no extra drive flushes; SQLite's own policy, the reader floor, audit/logging syncs and view publication remain unchanged.
 - The gh shim (`gh_shim.rs:6177`, `:6511`) and logging's terminal line
   (`logging.rs:999`) sync on purpose, for audit and crash diagnostics. They are
   rare, so keep them.
