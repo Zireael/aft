@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "omp-internal-url-handback"
+  ],
+  "note": "Pi plugin: hand Oh My Pi internal URLs back to OMP's native tools and defer binary resolution to first demand (#396); no ranking-fence file."
+}
