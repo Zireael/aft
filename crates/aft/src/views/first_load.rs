@@ -817,6 +817,15 @@ struct ObservedStat {
     recorded_ns: u128,
 }
 
+/// Publish stat evidence together with the extracted content it validates.
+/// Concurrent strict loads must not pair one walk's stamps with another
+/// walk's entries, even when an obsolete walk loses the installation fence.
+#[derive(Clone, Default)]
+struct ObservedCheckout {
+    entries: BTreeMap<RelPath, LiveEntry>,
+    stats: BTreeMap<RelPath, ObservedStat>,
+}
+
 impl ObservedStat {
     fn new(metadata: &std::fs::Metadata, recorded_ns: u128) -> Self {
         Self {
@@ -888,7 +897,7 @@ mod stat_tests {
         driver.take_reconcile_work();
         driver.reconcile(&access).unwrap();
         assert_eq!(driver.take_reconcile_work().reads, 0);
-        let before = driver.observed_stats.lock().unwrap()[&path].clone();
+        let before = driver.observed.lock().unwrap().stats[&path].clone();
         std::fs::write(&file, b"edited").unwrap();
         old_mtime(&file);
         let current = ObservedStat::new(&std::fs::metadata(&file).unwrap(), before.recorded_ns);
@@ -926,8 +935,8 @@ mod stat_tests {
         // Inject the timestamp boundary instead of waiting for the host clock
         // or depending on this filesystem's timestamp resolution.
         {
-            let mut stats = driver.observed_stats.lock().unwrap();
-            let observed = stats.get_mut(&path).unwrap();
+            let mut observed = driver.observed.lock().unwrap();
+            let observed = observed.stats.get_mut(&path).unwrap();
             observed.recorded_ns = observed.stamp.modified_ns.unwrap();
         }
         let checkout = driver.reconcile(&access).unwrap();
@@ -956,8 +965,7 @@ pub struct CheckoutDriver {
     planes: Vec<Arc<dyn CompositePlane>>,
     adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
     publish_fence: std::sync::RwLock<Option<Arc<dyn PublishFence>>>,
-    observed: std::sync::Mutex<BTreeMap<RelPath, LiveEntry>>,
-    observed_stats: std::sync::Mutex<BTreeMap<RelPath, ObservedStat>>,
+    observed: std::sync::Mutex<ObservedCheckout>,
     installed: std::sync::Mutex<InstalledCheckout>,
     #[cfg(test)]
     work: std::sync::Mutex<ReconcileWork>,
@@ -999,8 +1007,7 @@ impl CheckoutDriver {
             planes,
             adapters: Vec::new(),
             publish_fence: std::sync::RwLock::new(None),
-            observed: std::sync::Mutex::new(BTreeMap::new()),
-            observed_stats: Default::default(),
+            observed: Default::default(),
             installed: std::sync::Mutex::new(InstalledCheckout {
                 revision: 0,
                 snapshot: delta.snapshot(),
@@ -1090,11 +1097,6 @@ impl FirstLoadDriver for CheckoutDriver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let previous_stats = self
-            .observed_stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let mut entries = BTreeMap::new();
         let mut stats = BTreeMap::new();
         #[cfg(test)]
@@ -1120,8 +1122,8 @@ impl FirstLoadDriver for CheckoutDriver {
             let before = self.source_stat(&absolute, recorded_ns)?;
             if !pending.contains(&path) {
                 if let (Some(old), Some(cached), Some(current)) = (
-                    previous.get(&path),
-                    previous_stats.get(&path),
+                    previous.entries.get(&path),
+                    previous.stats.get(&path),
                     before.as_ref(),
                 ) {
                     if cached.reusable(current) {
@@ -1140,7 +1142,10 @@ impl FirstLoadDriver for CheckoutDriver {
             };
             let after = self.source_stat(&absolute, recorded_ns)?;
             if let (Some(before), Some(after)) = (before, after) {
-                if before.stamp == after.stamp {
+                let stable = before.stamp == after.stamp;
+                #[cfg(unix)]
+                let stable = stable && before.device == after.device;
+                if stable {
                     stats.insert(path.clone(), before);
                 }
             }
@@ -1167,11 +1172,10 @@ impl FirstLoadDriver for CheckoutDriver {
         *self
             .observed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = entries.clone();
-        *self
-            .observed_stats
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = stats;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ObservedCheckout {
+            entries: entries.clone(),
+            stats,
+        };
         Ok(ReconciledCheckout { revision, entries })
     }
     fn install(
@@ -1263,6 +1267,7 @@ impl FirstLoadDriver for CheckoutDriver {
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .clone();
         for plane in &self.planes {
             plane.materialize(

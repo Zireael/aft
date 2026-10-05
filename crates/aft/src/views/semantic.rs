@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use crate::blob_store::v2::{ContentHash, FamilyKey, FamilyPlane, FamilyStoreReader, PutOrTouch};
+use crate::blob_store::v2::{
+    ContentHash, FamilyKey, FamilyPlane, FamilyStore, FamilyStoreReader, PutOrTouch,
+};
 use crate::blob_store::{FullKey, SemanticKey, SEMANTIC_PRODUCER_VERSION};
 use crate::refresh::{FailureClass, FailureTracker, PreparedWork};
 use crate::semantic_index::{
@@ -603,8 +605,27 @@ impl SemanticPlane {
             {
                 report.stored_hits += 1;
                 ready.push((item.clone(), key));
-            } else if let Some(claim) = arena.claim(key) {
-                claimed.push((item.clone(), relative.clone(), group, claim));
+            } else if let Some(claim) = {
+                #[cfg(test)]
+                run_before_claim_for_test();
+                arena.claim(key)
+            } {
+                // A previous owner can finish and release its claim between
+                // our store miss and acquiring this claim. Recheck under the
+                // claim or a completed key would be embedded a second time.
+                if arena.get(&key).is_some() {
+                    report.resident_hits += 1;
+                    ready.push((item.clone(), key));
+                } else if arena
+                    .load(&store.reader(), &key, relative, &payload_producer)
+                    .map_err(plane_error)?
+                    .is_some()
+                {
+                    report.stored_hits += 1;
+                    ready.push((item.clone(), key));
+                } else {
+                    claimed.push((item.clone(), relative.clone(), group, claim));
+                }
             } else {
                 waiting.push((item.clone(), relative.clone(), key));
             }
@@ -630,7 +651,34 @@ impl SemanticPlane {
         }
         let mut transient = Vec::new();
         let mut succeeded = Vec::new();
-        if !to_embed.is_empty() {
+        // Protect all planned keys once, even though complete file runs are
+        // stored in smaller batches. Per-batch growing-pin writes would undo
+        // the linear pin-write bound. Unattempted keys are harmless protection.
+        let keys = ready
+            .iter()
+            .map(|(_, key)| *key)
+            .chain(to_embed.iter().map(|(_, _, _, claim)| *claim.key()))
+            .collect::<Vec<_>>();
+        protect(&view, &keys)?;
+        let mut pending = to_embed.into_iter().zip(chunks).peekable();
+        while pending.peek().is_some() {
+            // Keep whole files together so every successful request can be
+            // stored before the next one. A single larger file still spans
+            // requests and cannot be persisted until its run is complete.
+            let mut to_embed = Vec::new();
+            let mut chunks = Vec::new();
+            let mut batch_texts = 0usize;
+            while let Some((_, file_chunks)) = pending.peek() {
+                if !to_embed.is_empty()
+                    && batch_texts.saturating_add(file_chunks.len()) > budget.max_batch.max(1)
+                {
+                    break;
+                }
+                let (item, file_chunks) = pending.next().expect("peeked file");
+                batch_texts += file_chunks.len();
+                to_embed.push(item);
+                chunks.push(file_chunks);
+            }
             let (mut calls, mut texts) = (0usize, 0usize);
             let embedded = {
                 let mut counted = |batch: Vec<String>| {
@@ -644,13 +692,6 @@ impl SemanticPlane {
             report.embedded_texts += texts;
             match embedded {
                 Ok(runs) => {
-                    // Protect the entire embedding batch before any puts. A
-                    // growing pin written once per key costs quadratic bytes.
-                    let keys = to_embed
-                        .iter()
-                        .map(|(_, _, _, claim)| *claim.key())
-                        .collect::<Vec<_>>();
-                    protect(&view, &keys)?;
                     for ((item, relative, full_key, claim), mut run) in
                         to_embed.into_iter().zip(runs)
                     {
@@ -687,10 +728,24 @@ impl SemanticPlane {
                         // Releasing the claim wakes views waiting on the key.
                         drop(claim);
                     }
+                    admit_ready(
+                        &view,
+                        &store,
+                        std::mem::take(&mut ready),
+                        &self.producer.id(),
+                        current,
+                        &mut report,
+                    )?;
+                    if !report.errors.is_empty() || !report.store_errors.is_empty() {
+                        report.deferred += pending.count();
+                        break;
+                    }
                 }
                 Err(error) => {
                     transient.extend(to_embed.into_iter().map(|(_, _, full_key, _)| full_key));
                     report.errors.push(error);
+                    report.deferred += pending.count();
+                    break;
                 }
             }
         }
@@ -708,20 +763,14 @@ impl SemanticPlane {
             }
         }
 
-        let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-        protect(&view, &keys)?;
-        // A family GC sweep can delete a blob row between the lookup above and
-        // the live-pin write. Such a key is not admitted: its path stays
-        // pending and the next fill stores the blob again.
-        let swept = store
-            .touch(&keys)
-            .map_err(|error| plane_error(error.to_string()))?
-            .missing
-            .into_iter()
-            .collect::<HashSet<_>>();
-        ready.retain(|(_, key)| !swept.contains(key));
-        let now = current();
-        let producer = self.producer.id();
+        admit_ready(
+            &view,
+            &store,
+            ready,
+            &self.producer.id(),
+            current,
+            &mut report,
+        )?;
         let mut state = lock(&view);
         for full_key in &succeeded {
             state.tracker.record_success(full_key);
@@ -740,24 +789,55 @@ impl SemanticPlane {
                 .insert((item.rel_path.clone(), item.content), reason);
             report.failed += 1;
         }
-        for (item, key) in ready {
-            let live = now.live_state(&item.rel_path).copied();
-            let admission = state.fill.admit(
-                &Completion { item, key },
-                &producer,
-                live.as_ref(),
-                Some(now.generation().manifest()),
-            );
-            match admission {
-                Admission::Installed => report.installed += 1,
-                Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
-            }
-        }
-        if report.installed > 0 || report.failed > 0 {
+        if report.failed > 0 {
             state.fill_version += 1;
         }
         Ok(report)
     }
+}
+
+fn admit_ready(
+    view: &Mutex<ViewState>,
+    store: &FamilyStore,
+    ready: Vec<(WorkItem, FamilyKey)>,
+    producer: &str,
+    current: &dyn Fn() -> Snapshot,
+    report: &mut FillReport,
+) -> Result<(), PlaneError> {
+    if ready.is_empty() {
+        return Ok(());
+    }
+    let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+    protect(view, &keys)?;
+    // GC may have won before the live-pin write. Do not admit a missing row.
+    let swept = store
+        .touch(&keys)
+        .map_err(|error| plane_error(error.to_string()))?
+        .missing
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let now = current();
+    let mut state = lock(view);
+    let installed_before = report.installed;
+    for (item, key) in ready {
+        if swept.contains(&key) {
+            continue;
+        }
+        let live = now.live_state(&item.rel_path).copied();
+        match state.fill.admit(
+            &Completion { item, key },
+            producer,
+            live.as_ref(),
+            Some(now.generation().manifest()),
+        ) {
+            Admission::Installed => report.installed += 1,
+            Admission::DroppedContent | Admission::DroppedProducer => report.dropped += 1,
+        }
+    }
+    if report.installed != installed_before {
+        state.fill_version += 1;
+    }
+    Ok(())
 }
 
 fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError> {
@@ -766,6 +846,24 @@ fn protect(view: &Mutex<ViewState>, keys: &[FamilyKey]) -> Result<(), PlaneError
             .protect(keys)
             .map_err(|error| plane_error(error.to_string())),
         None => Err(plane_error("semantic fill has no live pin")),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_claim_for_test(callback: impl FnOnce() + 'static) {
+    BEFORE_CLAIM.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+}
+
+#[cfg(test)]
+fn run_before_claim_for_test() {
+    let callback = BEFORE_CLAIM.with(|hook| hook.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
     }
 }
 

@@ -33,16 +33,22 @@ fn vector(text: &str) -> Vec<f32> {
 #[derive(Default)]
 struct Model {
     texts: AtomicUsize,
+    calls: AtomicUsize,
 }
 
 impl Model {
     fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         self.texts.fetch_add(texts.len(), Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(texts.iter().map(|text| vector(text)).collect())
     }
 
     fn texts(&self) -> usize {
         self.texts.load(Ordering::SeqCst)
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -155,6 +161,401 @@ fn two_worktrees_two_sessions_embed_each_chunk_once() {
         assert!(answer.complete(), "incomplete after restart: {answer:?}");
         assert_eq!(rows(root, &answer.results), expected);
     }
+}
+
+#[test]
+fn family_fill_rechecks_completed_work_after_acquiring_claim() {
+    let storage = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let files = [("src/file.rs", "pub fn one_chunk() -> u8 { 1 }\n")];
+    write_tree(first.path(), &files);
+    write_tree(second.path(), &files);
+    let a = open(storage.path(), "a", first.path());
+    let b = Arc::new(open(storage.path(), "b", second.path()));
+    let model = Arc::new(Model::default());
+    let callback_model = Arc::clone(&model);
+    let callback_b = Arc::clone(&b);
+    // Finish the competing fill exactly between a's store miss and claim.
+    // No sleep or host scheduling assumption is involved.
+    super::super::semantic::before_claim_for_test(move || {
+        let report = refresh(&callback_b, &callback_model);
+        assert_eq!((report.embedded_keys, report.installed), (1, 1));
+    });
+    let report = refresh(&a, &model);
+    let usage = a
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap()
+        .usage()
+        .unwrap();
+    eprintln!(
+        "completed claim race: texts={} calls={} outer_embedded={} stored_rows={}",
+        model.texts(),
+        model.calls(),
+        report.embedded_keys,
+        usage.rows
+    );
+    assert!(query(&a, "one chunk").complete());
+    assert_eq!(
+        rows(first.path(), &query(&a, "one chunk").results),
+        cold(first.path(), "one chunk").0
+    );
+    assert_eq!(
+        model.texts(),
+        1,
+        "a completed claim must not embed the same stored key again"
+    );
+    assert_eq!(model.calls(), 1);
+    assert_eq!(report.embedded_keys, 0);
+    assert_eq!(usage.rows, 1);
+    assert_eq!(
+        a.installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        b.installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap()
+    );
+    assert_eq!(
+        rows(first.path(), &query(&a, "one chunk").results),
+        rows(second.path(), &query(&b, "one chunk").results)
+    );
+}
+
+#[test]
+fn completed_embedding_batches_survive_a_later_batch_failure() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(
+        root.path(),
+        &[
+            ("a.rs", "pub fn first_chunk() -> u8 { 1 }\n"),
+            ("b.rs", "pub fn second_chunk() -> u8 { 2 }\n"),
+            ("c.rs", "pub fn third_chunk() -> u8 { 3 }\n"),
+        ],
+    );
+    let runtime = open(storage.path(), "batch-failure", root.path());
+    let model = Model::default();
+    let budget = FillBudget {
+        max_batch: 1,
+        ..FillBudget::default()
+    };
+    let report = runtime
+        .refresh(budget, &mut |texts| {
+            let vectors = model.embed(texts)?;
+            if model.calls() == 2 {
+                Err("embedding backend interrupted".into())
+            } else {
+                Ok(vectors)
+            }
+        })
+        .unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    eprintln!(
+        "later batch failure: texts={} calls={} embedded_keys={} installed={} rows={}",
+        model.texts(),
+        model.calls(),
+        report.embedded_keys,
+        report.installed,
+        store.usage().unwrap().rows
+    );
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(
+        (report.embedded_keys, report.installed),
+        (1, 1),
+        "a later batch error must not discard an already complete file run"
+    );
+    assert_eq!(store.usage().unwrap().rows, 1);
+    runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!(
+        model.texts(),
+        4,
+        "retry must not re-embed the completed first file"
+    );
+    assert_eq!(model.calls(), 4);
+    assert_eq!(store.usage().unwrap().rows, 3);
+    let answer = query(&runtime, "chunk");
+    assert!(answer.complete());
+    assert_eq!(
+        rows(root.path(), &answer.results),
+        cold(root.path(), "chunk").0
+    );
+}
+
+#[test]
+fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_texts() {
+    let storage = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    for root in &roots {
+        for i in 0..2048 {
+            std::fs::write(
+                root.path().join(format!("file_{i:04}.rs")),
+                format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let runtimes: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| open(storage.path(), &format!("flaky-worktree-{i}"), root.path()))
+        .collect();
+    let store = runtimes[0]
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let model = Model::default();
+    let completed = std::cell::RefCell::new(std::collections::HashSet::new());
+    let successful_texts = std::cell::Cell::new(0usize);
+    let mut failed_texts = 0usize;
+    let mut embed = |texts: Vec<String>| {
+        // One chunk per file makes completed text count independent of the
+        // actual store's row count. Each completed request must already have
+        // reached the store before another request is sent.
+        assert_eq!(
+            store.usage().unwrap().rows as usize,
+            successful_texts.get(),
+            "completed batches were not persisted before the next request"
+        );
+        for text in &texts {
+            assert!(
+                !completed.borrow().contains(text),
+                "a stored text was embedded again after retry"
+            );
+        }
+        let count = texts.len();
+        let retained = texts.clone();
+        let vectors = model.embed(texts)?;
+        if model.calls().is_multiple_of(7) {
+            failed_texts += count;
+            Err("embedding backend interrupted every seventh batch".into())
+        } else {
+            completed.borrow_mut().extend(retained);
+            successful_texts.set(successful_texts.get() + count);
+            Ok(vectors)
+        }
+    };
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    let mut new_keys = 0;
+    for runtime in &runtimes {
+        let before = model.calls();
+        for attempt in 0..64 {
+            let report = runtime.refresh(budget, &mut embed).unwrap();
+            new_keys += report.embedded_keys;
+            if report.errors.is_empty() && report.deferred == 0 {
+                break;
+            }
+            assert!(attempt < 63, "fixture failed to settle");
+        }
+        assert!(query(runtime, "item").complete());
+        if runtime.access.scope() != "flaky-worktree-0" {
+            assert_eq!(
+                model.calls(),
+                before,
+                "a sibling must reuse all stored vectors"
+            );
+        }
+    }
+    for round in 0..8 {
+        // A new whole-file key can legitimately have the same chunk text
+        // (the template need not include a changed body). Reject duplicates
+        // within a content revision/retry schedule, not across new keys.
+        completed.borrow_mut().clear();
+        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
+            let file = root.path().join("file_0000.rs");
+            std::fs::write(&file, &source).unwrap();
+            runtime.driver.record_absolute_change(&file);
+            let before = model.calls();
+            for attempt in 0..64 {
+                let report = runtime.refresh(budget, &mut embed).unwrap();
+                new_keys += report.embedded_keys;
+                if report.errors.is_empty() && report.deferred == 0 {
+                    break;
+                }
+                assert!(attempt < 63, "fixture failed to settle");
+            }
+            if i > 0 {
+                assert_eq!(
+                    model.calls(),
+                    before,
+                    "same-content sibling edit sent a model request"
+                );
+            }
+            assert!(query(runtime, "revised item").complete());
+        }
+    }
+    drop(embed);
+    assert_eq!(successful_texts.get(), 2056);
+    assert_eq!(new_keys, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056);
+    assert_eq!(failed_texts, 321);
+    assert_eq!(model.texts(), 2377);
+    assert_eq!(model.calls(), 46);
+    for (runtime, root) in runtimes.iter().zip(&roots) {
+        assert_eq!(
+            rows(root.path(), &query(runtime, "revised item").results),
+            cold(root.path(), "revised item").0
+        );
+    }
+    eprintln!("periodic failure, three worktrees: successful texts={} failed texts={failed_texts} sent texts={} calls={} new keys={new_keys} stored rows={}", successful_texts.get(), model.texts(), model.calls(), store.usage().unwrap().rows);
+}
+
+#[test]
+fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admission() {
+    let storage = tempfile::tempdir().unwrap();
+    let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    for root in &roots {
+        for i in 0..2048 {
+            std::fs::write(
+                root.path().join(format!("file_{i:04}.rs")),
+                format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let runtimes: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| open(storage.path(), &format!("worktree-{i}"), root.path()))
+        .collect();
+    let model = Model::default();
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    let mut embedded_keys = 0;
+    for (i, runtime) in runtimes.iter().enumerate() {
+        let report = runtime
+            .refresh(budget, &mut |texts| model.embed(texts))
+            .unwrap();
+        embedded_keys += report.embedded_keys;
+        assert_eq!(report.embedded_keys, if i == 0 { 2048 } else { 0 });
+        assert_eq!(report.model_calls, if i == 0 { 32 } else { 0 });
+    }
+    let store = runtimes[0]
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    for runtime in &runtimes[1..] {
+        assert_eq!(
+            runtime
+                .owner
+                .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+                .unwrap()
+                .path(),
+            store.path()
+        );
+    }
+    for round in 0..8 {
+        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
+            let file = root.path().join("file_0000.rs");
+            {
+                let _intent = crate::views::intent::record_paths([file.as_path()]);
+                std::fs::write(&file, &source).unwrap();
+            }
+            let before = model.texts();
+            let report = runtime
+                .refresh(budget, &mut |texts| model.embed(texts))
+                .unwrap();
+            embedded_keys += report.embedded_keys;
+            assert_eq!(report.embedded_keys, usize::from(i == 0));
+            assert_eq!(report.model_calls, usize::from(i == 0));
+            assert_eq!(
+                model.texts() - before,
+                usize::from(i == 0),
+                "second/third worktree repeated an embedding"
+            );
+            // Repeated no-op writes to the same content must not send texts.
+            let _intent = crate::views::intent::record_paths([file.as_path()]);
+            std::fs::write(&file, &source).unwrap();
+            drop(_intent);
+            let report = runtime
+                .refresh(budget, &mut |texts| model.embed(texts))
+                .unwrap();
+            assert_eq!((report.embedded_keys, report.model_calls), (0, 0));
+        }
+    }
+    assert_eq!(model.texts(), 2056);
+    assert_eq!(model.calls(), 40);
+    assert_eq!(embedded_keys, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056);
+
+    // A source completion rejected at admission still stores its immutable
+    // payload first. Retry and a sibling must reuse it, not re-embed it.
+    let a = &runtimes[0];
+    let source = "pub fn admission_was_cancelled() -> u32 { 99999 }\n";
+    let file = roots[0].path().join("file_0000.rs");
+    std::fs::write(&file, source).unwrap();
+    a.driver.record_absolute_change(&file);
+    let snapshot = a
+        .loader
+        .refresh(&a.access, Arc::clone(a.installed().generation()))
+        .unwrap();
+    let path = super::super::RelPath::new(b"file_0000.rs".to_vec()).unwrap();
+    let mut moved = super::super::snapshot::LiveDelta::new(Arc::clone(snapshot.generation()));
+    moved.apply(
+        path,
+        super::super::snapshot::LiveEntry::new(
+            super::super::snapshot::DiskState::of_bytes(b"other bytes"),
+            1,
+        ),
+    );
+    let cancelled = moved.snapshot();
+    let report = a
+        .plane
+        .fill(
+            &a.owner,
+            &snapshot,
+            budget,
+            &mut |texts| model.embed(texts),
+            &|| cancelled.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        (report.embedded_keys, report.installed, report.dropped),
+        (1, 0, 1)
+    );
+    let before = model.texts();
+    let retry = a.refresh(budget, &mut |texts| model.embed(texts)).unwrap();
+    assert_eq!(
+        (retry.embedded_keys, retry.model_calls, retry.installed),
+        (0, 0, 1)
+    );
+    let file = roots[1].path().join("file_0000.rs");
+    std::fs::write(&file, source).unwrap();
+    runtimes[1].driver.record_absolute_change(&file);
+    let sibling = runtimes[1]
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!((sibling.embedded_keys, sibling.model_calls), (0, 0));
+    assert_eq!(model.texts(), before);
+    assert_eq!(model.texts(), 2057);
+    assert_eq!(model.calls(), 41);
+    assert_eq!(store.usage().unwrap().rows, 2057);
+    for (runtime, root) in runtimes.iter().zip(&roots) {
+        let answer = query(runtime, "revised item");
+        assert!(answer.complete());
+        assert_eq!(
+            rows(root.path(), &answer.results),
+            cold(root.path(), "revised item").0
+        );
+    }
+    eprintln!("three worktrees, repeated edits and cancelled admission: texts={} calls={} stored_rows={} payload_bytes={}", model.texts(), model.calls(), store.usage().unwrap().rows, store.usage().unwrap().payload_bytes);
 }
 
 /// An edit the watcher reports and an edit AFT writes each reach the fill:
