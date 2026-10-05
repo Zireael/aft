@@ -141,6 +141,35 @@ describe("RevivableTransportPool", () => {
     expect(client.closed).toBe(1);
   });
 
+  test("fresh-session hints reported before a deferred pool exists reach the pool it creates", async () => {
+    const observed: Array<[string, string]> = [];
+    let created = 0;
+    const owner = new RevivableTransportPool(null, async () => {
+      created += 1;
+      const pool = makeSubcPool(new FakeClient());
+      pool.observeSessionStart = (root: string, session: string) => {
+        observed.push([root, session]);
+      };
+      return pool;
+    });
+    // Pi reports `session_start` before the first tool call creates the pool.
+    // This must neither throw nor create the pool, and the hint must survive.
+    owner.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    for (let i = 0; i < 300; i++) owner.observeSessionStart(TEST_PROJECT_ROOT, `extra-${i}`);
+    expect(created).toBe(0);
+    await owner.getBridge(TEST_PROJECT_ROOT).toolCall("extra-299", "read", {});
+    expect(created).toBe(1);
+    // Bounded: the oldest unused hints are dropped (that session then counts as
+    // unobserved and is retained), the newest reach the pool exactly once.
+    expect(observed.length).toBe(256);
+    expect(observed.at(-1)).toEqual([TEST_PROJECT_ROOT, "extra-299"]);
+    expect(observed.some(([, session]) => session === "fresh")).toBe(false);
+    owner.observeSessionStart(TEST_PROJECT_ROOT, "after-create");
+    expect(observed.at(-1)).toEqual([TEST_PROJECT_ROOT, "after-create"]);
+    expect(observed.length).toBe(257);
+    await owner.shutdown();
+  });
+
   test("shutting down an unused deferred pool does not initialize it", async () => {
     let created = 0;
     const owner = new RevivableTransportPool(null, async () => {

@@ -20,6 +20,8 @@ type PoolFactory = () => Promise<AftTransportPool>;
 /** After a failed terminal-pool revival, wait before retrying so repeated traffic cannot immediately start another connection attempt. */
 const REVIVAL_RETRY_FLOOR_MS = 100;
 const REVIVAL_RETRY_CAP_MS = 2_000;
+/** Matches the subc pool's own bound on unused fresh-session hints. */
+const MAX_PENDING_SESSION_STARTS = 256;
 
 /**
  * Owns one transport instance (or defers its creation) and replaces it when new demand arrives
@@ -35,6 +37,7 @@ export class RevivableTransportPool implements AftTransportPool {
   private readonly transports = new Map<string, RevivableProjectTransport>();
   private readonly configureOverrides = new Map<string, unknown>();
   private editSlotSurvivesCaptured = false;
+  private readonly pendingSessionStarts = new Map<string, [string, string]>();
 
   constructor(
     // A null initial pool defers construction until the first request. Hosts
@@ -57,7 +60,20 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   observeSessionStart(projectRoot: string, session: string): void {
-    if (!this.activePool.isShutdown()) this.activePool.observeSessionStart?.(projectRoot, session);
+    if (this.activePool && !this.activePool.isShutdown()) {
+      this.activePool.observeSessionStart?.(projectRoot, session);
+      return;
+    }
+    // Hosts report a fresh session before the lazily created pool exists. Keep
+    // the hint for the pool that serves the session's first call; without it the
+    // session would count as unobserved and could never be reclaimed when idle.
+    const key = `${projectRoot}\u0000${session}`;
+    this.pendingSessionStarts.delete(key);
+    this.pendingSessionStarts.set(key, [projectRoot, session]);
+    if (this.pendingSessionStarts.size > MAX_PENDING_SESSION_STARTS) {
+      const oldest = this.pendingSessionStarts.keys().next().value;
+      if (oldest !== undefined) this.pendingSessionStarts.delete(oldest);
+    }
   }
 
   /** Delegate to the active pool: session-scoped signal fan-out reaches the
@@ -188,6 +204,10 @@ export class RevivableTransportPool implements AftTransportPool {
           pool.setConfigureOverride(key, value);
         }
         this.activePool = pool;
+        for (const [root, session] of this.pendingSessionStarts.values()) {
+          pool.observeSessionStart?.(root, session);
+        }
+        this.pendingSessionStarts.clear();
         this.shutdownReason = null;
         this.revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
         this.revivalRetryNotBefore = 0;
