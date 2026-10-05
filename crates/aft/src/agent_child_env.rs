@@ -2464,8 +2464,7 @@ mod tests {
         );
         fs::write(worktree.join("data"), "delivery\n").unwrap();
         for args in [&["add", "-A"][..], &["commit", "-m", "delivery"][..]] {
-            let output =
-                run_git_with_timeout(&worktree, args, &environment, Duration::from_secs(10));
+            let output = run_git_with_timeout(&worktree, args, &environment, HOOK_REENTRY_GUARD);
             assert!(
                 output.status.success(),
                 "git {args:?}: {}",
