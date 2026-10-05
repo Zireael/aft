@@ -1653,6 +1653,17 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/integration/per_checkout_callgraph.rs",
+      "line": 137,
+      "column": 14,
+      "token": "toFile",
+      "text": "\"toFile\": file,",
+      "location": "line 137, column 14",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "crates/aft/tests/integration/read_freshness_test.rs",
       "line": 134,
       "column": 18,
