@@ -156,6 +156,8 @@ Examples:
       "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER`",
     );
     expect(disabled).not.toContain("issue://NUMBER");
+    expect(enabled).toContain("pr://NUMBER/diff/<path>");
+    expect(disabled).not.toContain("/diff");
   });
 
   test("injects false for a vision-less current model", async () => {

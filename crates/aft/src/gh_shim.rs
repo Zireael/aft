@@ -8933,6 +8933,7 @@ mod tests {
             ("pr status", &["pr", "status"]),
             ("pr checks", &["pr", "checks", "313", "--watch"]),
             ("pr diff", &["pr", "diff", "313"]),
+            ("pr diff", &["pr", "diff", "313", "--repo", "cortexkit/aft"]),
             ("release view", &["release", "view", "v0.56.2"]),
             ("release list", &["release", "list"]),
             (

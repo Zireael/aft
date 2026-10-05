@@ -414,6 +414,7 @@ mod tests {
             number: 7,
             repository: None,
             comment_selector: None,
+            diff_path: None,
         };
         let document = normalize_structured_document(
             &resource,
@@ -443,6 +444,7 @@ mod tests {
             number: 999,
             repository: Some("cortexkit/aft".to_string()),
             comment_selector: None,
+            diff_path: None,
         };
         let primary = serde_json::from_str(include_str!("fixtures/pr-999-timeline.json"))
             .expect("parse timeline PR fixture");

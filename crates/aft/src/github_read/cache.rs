@@ -196,6 +196,7 @@ pub struct GithubReadCompletion {
     pub attachments: Vec<GithubImageAttachment>,
     /// Live structured data retained for mutation flows that must reuse read ordinals.
     pub document: Option<super::model::GithubDocument>,
+    pub diff_page: Option<super::diff::GithubDiffPage>,
 }
 
 /// Handle for a fetch or attachment task that is running away from the request
@@ -350,6 +351,27 @@ impl GithubReadEngine {
         view: GithubReadView,
     ) -> Result<GithubReadStart, GithubReadError> {
         self.require_enabled(github)?;
+        if request.resource.diff_path.is_some() {
+            if view != GithubReadView::Document {
+                return Err(GithubReadError::invalid_resource(
+                    "Use read for diffs; aft_outline and aft_zoom do not support diff links",
+                ));
+            }
+            // Diff requests bypass cache lookup and shared document flights.
+            // Every page must reflect a fresh PR head, even after a failed fetch.
+            let (sender, receiver) = mpsc::channel();
+            let fetcher = Arc::clone(&self.fetcher);
+            std::thread::spawn(move || {
+                let result = fetcher
+                    .fetch_diff(&GithubFetchRequest {
+                        resource: request.resource,
+                        working_directory: request.working_directory,
+                    })
+                    .map(|diff| diff.page(selector));
+                let _ = sender.send(result);
+            });
+            return Ok(GithubReadStart::Deferred(GithubReadDeferred { receiver }));
+        }
         let fallback = self.cache_fallback_for_request(&request);
         Ok(self.defer_fetch(request, selector, view, fallback))
     }
@@ -520,6 +542,7 @@ fn fetch_store(
         number: request.resource.number,
         repository: Some(repository.clone()),
         comment_selector: None,
+        diff_path: None,
     };
     let canonical_text = render_document_for_resource(&document, &cache_resource)
         .expect("cache rendering has no discussion selector");
@@ -593,6 +616,7 @@ fn complete(
         freshness,
         attachments,
         document,
+        diff_page: None,
     }
 }
 
@@ -907,6 +931,95 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("deferred read did not complete")
+    }
+
+    #[test]
+    fn diff_reads_fetch_live_without_cache_or_attachments() {
+        struct DiffFetcher(AtomicUsize);
+        impl GithubFetcher for DiffFetcher {
+            fn fetch(&self, _: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+                panic!("diff must not fetch a document");
+            }
+            fn fetch_diff(
+                &self,
+                _: &GithubFetchRequest,
+            ) -> Result<super::super::diff::GithubDiff, GithubReadError> {
+                let revision = self.0.fetch_add(1, Ordering::SeqCst);
+                if revision >= 2 {
+                    return Err(GithubReadError::FetchFailed(
+                        "live diff unavailable".to_string(),
+                    ));
+                }
+                Ok(super::super::diff::GithubDiff {
+                    header: format!("PR owner/repo#42 head {revision}"),
+                    body: "+change\n".to_string(),
+                    cap_hit: false,
+                })
+            }
+        }
+        let cache = Arc::new(MemoryCache::with_entry("ordinary document", 1));
+        let downloader = Arc::new(CountingDownloader::default());
+        let engine = GithubReadEngine::new(
+            cache.clone(),
+            Arc::new(DiffFetcher(AtomicUsize::new(0))),
+            downloader.clone(),
+            Arc::new(FixtureClock::new(1)),
+        );
+        for revision in 0..3 {
+            let started = engine
+                .start_resource(
+                    &enabled_gh_read(),
+                    "pr://owner/repo/42/diff",
+                    "fixture",
+                    "identity",
+                    Some(true),
+                    GithubReadSelector::WholeDocument,
+                )
+                .unwrap();
+            let GithubReadStart::Deferred(deferred) = started else {
+                panic!("live diff must defer");
+            };
+            let result = wait_for(deferred);
+            if revision < 2 {
+                assert!(result
+                    .unwrap()
+                    .content
+                    .contains(&format!("head {revision}")));
+            } else {
+                assert_eq!(result.unwrap_err().to_string(), "live diff unavailable");
+            }
+        }
+        assert_eq!(
+            cache.0.lock().as_ref().unwrap().canonical_text,
+            "ordinary document"
+        );
+        assert_eq!(downloader.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn diff_outline_refuses_before_fetching() {
+        let fetcher = Arc::new(FixtureFetcher::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1)),
+        );
+        let result = engine.start_resource_with_view(
+            &enabled_gh_read(),
+            "pr://42/diff",
+            "fixture",
+            "identity",
+            None,
+            GithubReadSelector::WholeDocument,
+            GithubReadView::Outline,
+        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Use read for diffs"));
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -875,9 +875,24 @@ fn github_read_response(
     completion: GithubReadCompletion,
     start_line: usize,
 ) -> Response {
-    let lines_read = completion.content.lines().count();
-    let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
-    let truncated = lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines);
+    let (start_line, lines_read, actual_end, truncated) = if let Some(page) = &completion.diff_page
+    {
+        (
+            page.start_line,
+            page.lines_read,
+            page.end_line,
+            page.truncated,
+        )
+    } else {
+        let lines_read = completion.content.lines().count();
+        let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
+        (
+            start_line,
+            lines_read,
+            actual_end,
+            lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
+        )
+    };
     let attachments = completion
         .attachments
         .into_iter()
@@ -952,6 +967,13 @@ pub(crate) fn handle_github_zoom(
     selector: &str,
 ) -> Response {
     let resource = match parse_resource(target) {
+        Ok(resource) if resource.diff_path.is_some() => {
+            return Response::error(
+                &req.id,
+                "invalid_resource",
+                "Use read for diffs; aft_zoom does not support diff links",
+            )
+        }
         Ok(resource) if resource.comment_selector.is_none() => resource,
         Ok(_) => return Response::error(
             &req.id,
@@ -2070,6 +2092,7 @@ mod tests {
                     bytes: vec![137, 80, 78, 71, 13, 10, 26, 10],
                 }],
                 document: None,
+                diff_page: None,
             },
             1,
         );

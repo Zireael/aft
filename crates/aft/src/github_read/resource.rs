@@ -147,6 +147,8 @@ pub struct GithubResource {
     pub number: u64,
     pub repository: Option<String>,
     pub comment_selector: Option<GithubCommentSelector>,
+    /// An empty path selects the whole diff; otherwise the exact changed path.
+    pub diff_path: Option<String>,
 }
 
 impl GithubResource {
@@ -229,9 +231,16 @@ pub fn parse_resource(resource: &str) -> Result<GithubResource, InvalidGithubRes
     let authority = parsed
         .host_str()
         .ok_or_else(|| InvalidGithubResource::new(resource, "missing authority"))?;
-    let path_segments: Vec<_> = parsed
-        .path_segments()
-        .map(|segments| segments.collect())
+    // Preserve the literal suffix: URL path normalization must not turn a
+    // different spelling (such as src/../file) into an exact changed-path match.
+    let raw_path = resource
+        .split_once("://")
+        .unwrap()
+        .1
+        .split_once('/')
+        .map(|(_, path)| path);
+    let path_segments: Vec<_> = raw_path
+        .map(|path| path.split('/').collect())
         .unwrap_or_default();
 
     // `issue://373` uses the URL authority for the number. It has no path.
@@ -241,18 +250,29 @@ pub fn parse_resource(resource: &str) -> Result<GithubResource, InvalidGithubRes
             number: parse_number(resource, authority)?,
             repository: None,
             comment_selector: None,
+            diff_path: None,
         });
     }
 
     // A short resource keeps its number in the authority, so its only accepted
     // path is the discussion drill-down suffix.
     if authority.bytes().all(|byte| byte.is_ascii_digit()) {
+        if kind == GithubResourceKind::PullRequest && path_segments.first() == Some(&"diff") {
+            return Ok(GithubResource {
+                kind,
+                number: parse_number(resource, authority)?,
+                repository: None,
+                comment_selector: None,
+                diff_path: Some(parse_diff_path(resource, &path_segments[1..])?),
+            });
+        }
         if path_segments.len() == 2 && path_segments[0] == "comments" {
             return Ok(GithubResource {
                 kind,
                 number: parse_number(resource, authority)?,
                 repository: None,
                 comment_selector: Some(parse_comment_selector(resource, path_segments[1])?),
+                diff_path: None,
             });
         }
         return Err(InvalidGithubResource::new(
@@ -272,9 +292,14 @@ pub fn parse_resource(resource: &str) -> Result<GithubResource, InvalidGithubRes
             "unsupported authority or malformed repository path",
         ));
     }
+    let mut diff_path = None;
     let comment_selector = match path_segments.as_slice() {
         [_, _] => None,
         [_, _, "comments", selector] => Some(parse_comment_selector(resource, selector)?),
+        [_, _, "diff", path @ ..] if kind == GithubResourceKind::PullRequest => {
+            diff_path = Some(parse_diff_path(resource, path)?);
+            None
+        }
         _ => {
             return Err(InvalidGithubResource::new(
                 resource,
@@ -288,7 +313,53 @@ pub fn parse_resource(resource: &str) -> Result<GithubResource, InvalidGithubRes
         number: parse_number(resource, path_segments[1])?,
         repository: Some(format!("{authority}/{}", path_segments[0])),
         comment_selector,
+        diff_path,
     })
+}
+
+fn parse_diff_path(resource: &str, segments: &[&str]) -> Result<String, InvalidGithubResource> {
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
+    {
+        return Err(InvalidGithubResource::new(
+            resource,
+            "diff path contains an empty or relative component",
+        ));
+    }
+    // Decode URL escapes without form-urlencoding's special treatment of '+'.
+    // A literal percent in a filename must be escaped as %25.
+    let raw = segments.join("/");
+    let mut bytes = Vec::new();
+    let mut input = raw.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = input.next().and_then(|b| (b as char).to_digit(16));
+            let low = input.next().and_then(|b| (b as char).to_digit(16));
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(InvalidGithubResource::new(
+                    resource,
+                    "invalid diff path escape",
+                ));
+            };
+            bytes.push((high * 16 + low) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let path = String::from_utf8(bytes)
+        .map_err(|_| InvalidGithubResource::new(resource, "diff path is not UTF-8"))?;
+    if !path.is_empty()
+        && path.split('/').any(|segment| {
+            segment.is_empty() || matches!(segment, "." | "..") || segment.contains('\0')
+        })
+    {
+        return Err(InvalidGithubResource::new(
+            resource,
+            "diff path contains an empty or relative component",
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_number(resource: &str, value: &str) -> Result<u64, InvalidGithubResource> {
@@ -448,6 +519,7 @@ mod tests {
                 number: 373,
                 repository: None,
                 comment_selector: None,
+                diff_path: None,
             }
         );
         assert_eq!(
@@ -457,6 +529,7 @@ mod tests {
                 number: 45,
                 repository: Some("Owner/repo-name".to_string()),
                 comment_selector: None,
+                diff_path: None,
             }
         );
 
@@ -627,5 +700,32 @@ mod tests {
         let selector = GithubCommentSelector::parse("-1").unwrap();
         let err = selector.resolve(0).unwrap_err();
         assert_eq!(err, -1);
+    }
+    #[test]
+    fn accepts_pull_request_diff_resources() {
+        for resource in [
+            "pr://42/diff",
+            "pr://owner/repo/42/diff",
+            "pr://42/diff/src/new.rs",
+            "pr://owner/repo/42/diff/src/new.rs",
+        ] {
+            assert!(parse_resource(resource).is_ok(), "{resource}");
+        }
+        assert!(parse_resource("issue://42/diff").is_err());
+        assert_eq!(
+            parse_resource("pr://42/diff/src/a%20b%23c+d.rs")
+                .unwrap()
+                .diff_path
+                .as_deref(),
+            Some("src/a b#c+d.rs")
+        );
+        for invalid in [
+            "pr://42/diff/",
+            "pr://42/diff/src/../file",
+            "pr://42/diff/src/%2E%2E/file",
+            "pr://42/diff/%FF",
+        ] {
+            assert!(parse_resource(invalid).is_err(), "{invalid}");
+        }
     }
 }

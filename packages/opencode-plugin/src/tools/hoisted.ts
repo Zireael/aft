@@ -66,7 +66,7 @@ function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
 }
 
 const ISSUE_AND_PR_READ_DESCRIPTION =
-  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
+  "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`). Use `pr://NUMBER/diff` for the whole diff or `pr://NUMBER/diff/<path>` for an exact changed path (also with OWNER/REPO). Diff pages name the head SHA; use read, not outline or zoom.";
 
 /** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {

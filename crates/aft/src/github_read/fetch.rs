@@ -1,6 +1,7 @@
 use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 use serde_json::Value;
@@ -24,6 +25,15 @@ pub struct GithubFetchRequest {
 /// text; the engine only accepts a normalized document from this interface.
 pub trait GithubFetcher: Send + Sync {
     fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError>;
+
+    fn fetch_diff(
+        &self,
+        _request: &GithubFetchRequest,
+    ) -> Result<super::diff::GithubDiff, GithubReadError> {
+        Err(GithubReadError::FetchFailed(
+            "GitHub diff fetching is unavailable".to_string(),
+        ))
+    }
 }
 
 /// The typed failures returned by the GitHub read engine.
@@ -94,6 +104,14 @@ pub trait GhCommandRunner: Send + Sync {
         working_directory: &std::path::Path,
         args: &[String],
     ) -> Result<GhCommandOutput, GhCommandError>;
+
+    /// Unlike `run`, this must bound subprocess reads before allocating output.
+    fn run_bounded(
+        &self,
+        working_directory: &std::path::Path,
+        args: &[String],
+        byte_cap: usize,
+    ) -> Result<(GhCommandOutput, bool), GhCommandError>;
 }
 
 /// Production runner that executes the bare `gh` command in the caller's
@@ -121,6 +139,58 @@ impl GhCommandRunner for SystemGhCommandRunner {
             stderr: output.stderr,
         })
     }
+
+    fn run_bounded(
+        &self,
+        working_directory: &std::path::Path,
+        args: &[String],
+        byte_cap: usize,
+    ) -> Result<(GhCommandOutput, bool), GhCommandError> {
+        let mut child = Command::new("gh")
+            .args(args)
+            .current_dir(working_directory)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(command_error)?;
+        let stderr = child.stderr.take().expect("piped gh stderr");
+        // Drain stderr concurrently so a diagnostic cannot block stdout. Its
+        // own iterator is bounded; credentials are redacted by the fetcher.
+        let errors = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
+        let stdout = read_capped(child.stdout.take().expect("piped gh stdout"), byte_cap);
+        let cap_hit = stdout.as_ref().is_ok_and(|bytes| bytes.len() == byte_cap);
+        if cap_hit || stdout.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait().map_err(command_error)?;
+        let stderr = errors
+            .join()
+            .map_err(|_| GhCommandError::Other("GitHub CLI stderr reader stopped".to_string()))??;
+        Ok((
+            GhCommandOutput {
+                success: status.success(),
+                stdout: stdout?,
+                stderr,
+            },
+            cap_hit,
+        ))
+    }
+}
+
+fn command_error(error: std::io::Error) -> GhCommandError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => GhCommandError::NotFound,
+        _ => GhCommandError::Other(error.to_string()),
+    }
+}
+
+fn read_capped(reader: impl Read, byte_cap: usize) -> Result<Vec<u8>, GhCommandError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(byte_cap as u64)
+        .read_to_end(&mut bytes)
+        .map_err(command_error)?;
+    Ok(bytes)
 }
 
 /// Structured `gh issue view` / `gh pr view` fetcher.
@@ -165,6 +235,13 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
         )?;
         document.timeline = normalize_timeline_events(&timeline_json);
         Ok(document)
+    }
+
+    fn fetch_diff(
+        &self,
+        request: &GithubFetchRequest,
+    ) -> Result<super::diff::GithubDiff, GithubReadError> {
+        super::diff::fetch_diff(&self.runner, request)
     }
 }
 
@@ -347,6 +424,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn bounded_reader_stops_at_the_iterator_ceiling() {
+        struct CountingReader(usize);
+        impl Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += output.len();
+                output.fill(b'x');
+                Ok(output.len())
+            }
+        }
+        let mut reader = CountingReader(0);
+        assert_eq!(read_capped(&mut reader, 37).unwrap().len(), 37);
+        assert_eq!(
+            reader.0, 37,
+            "must not read then discard the rest of gh output"
+        );
+    }
     use crate::github_read::resource::{GithubResource, GithubResourceKind};
 
     #[derive(Default)]
@@ -367,6 +462,18 @@ mod tests {
                 .push((working_directory.to_path_buf(), args.to_vec()));
             self.output.lock().unwrap().remove(0)
         }
+
+        fn run_bounded(
+            &self,
+            working_directory: &std::path::Path,
+            args: &[String],
+            byte_cap: usize,
+        ) -> Result<(GhCommandOutput, bool), GhCommandError> {
+            let mut output = self.run(working_directory, args)?;
+            let capped = output.stdout.len() >= byte_cap;
+            output.stdout.truncate(byte_cap);
+            Ok((output, capped))
+        }
     }
 
     #[test]
@@ -376,6 +483,7 @@ mod tests {
             number: 1,
             repository: None,
             comment_selector: None,
+            diff_path: None,
         };
         let explicit = GithubResource {
             repository: Some("owner/repo".to_string()),
@@ -435,6 +543,7 @@ mod tests {
                 number: 1,
                 repository: None,
                 comment_selector: None,
+                diff_path: None,
             },
             working_directory: PathBuf::from("/fixture"),
         };

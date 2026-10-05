@@ -93,6 +93,13 @@ enable them) plus the call graph:
 Plain file reading and directory listing. Pass `path` to read a file, or a directory path to
 list its entries. Paginate large files with `startLine`/`endLine` or `offset`/`limit`.
 
+With `github.read` enabled, use `pr://N/diff` for a live unified diff or
+`pr://N/diff/<path>` for one exact changed path (renames use the new path).
+Both accept `pr://OWNER/REPO/N/diff` forms. Each page names the PR head SHA;
+line ranges select the diff body, not the repeated header. Binary changes get
+one line, and paging or the 4 MiB fetch ceiling is disclosed. Diffs are read-only
+views: use `read`, not `aft_outline` or `aft_zoom`. Diff failures never use cached data.
+
 ```json
 // Read full file
 { "path": "src/app.ts" }

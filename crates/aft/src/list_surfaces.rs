@@ -287,6 +287,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "github_read/fetch.rs",
+        enclosing_item: "read_capped",
+        location_or_primitive: "bounded gh subprocess reader",
+        reason: "bounds stdout and stderr at the iterator; diff fetch ceilings are disclosed independently of line paging, and metadata ceilings refuse the fetch",
+    },
+    ExclusionEntry {
+        file: "github_read/diff.rs",
+        enclosing_item: "fetch_diff, page",
+        location_or_primitive: "PR diff diagnostic paths and line window",
+        reason: "diagnostic changed-path previews and sequential diff line pages integrate their list envelope trailers into content through the authorized NDJSON text builder",
+    },
+    ExclusionEntry {
         file: "logging.rs",
         enclosing_item: "write_str",
         location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",
