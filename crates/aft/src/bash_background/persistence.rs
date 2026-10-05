@@ -555,6 +555,9 @@ pub struct PersistedTask {
     pub(crate) remote: Option<super::registry::remote::RemoteTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
+    /// Missing job-wide output ranges, independent of execution outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_output: Vec<(u64, u64)>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub local_fallback_started: bool,
 }
@@ -629,6 +632,7 @@ impl PersistedTask {
             call_key,
             remote: None,
             execution_note: None,
+            incomplete_output: Vec::new(),
             local_fallback_started: false,
         }
     }
@@ -754,6 +758,7 @@ impl From<BashTaskRow> for PersistedTask {
             call_key: None,
             remote: None,
             execution_note: None,
+            incomplete_output: Vec::new(),
             local_fallback_started: false,
         }
     }
