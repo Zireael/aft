@@ -2121,6 +2121,10 @@ pub(super) fn build_health_report(
     };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert(
+        "durable_log".to_string(),
+        crate::logging::durable_log_health(),
+    );
+    metrics.insert(
         "runtime".to_string(),
         json!({
             "live_watchers": shared_app.watcher_count(),
@@ -3140,6 +3144,24 @@ mod tests {
         assert!(stall["last_stall_duration_ms"].is_null(), "{stall}");
         assert_eq!(stall["active_stalls"].as_u64(), Some(0), "{stall}");
         assert_eq!(stall["captures"].as_u64(), Some(0), "{stall}");
+    }
+
+    #[test]
+    fn health_report_exposes_live_durable_log_counters() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = App::default_shared();
+        let report = build_health_report(
+            &HealthRollupCache::new(),
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        let health = &report.metrics.expect("health metrics")["durable_log"];
+        assert!(health["dropped_lines_total"].is_u64(), "{health}");
+        assert!(health.get("last_write_error").is_some(), "{health}");
+        assert!(health.get("failing_since").is_some(), "{health}");
     }
 
     #[test]

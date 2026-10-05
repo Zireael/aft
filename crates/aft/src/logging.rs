@@ -24,6 +24,8 @@ const LOG_GENERATIONS: usize = 1;
 /// Check the active file on every write so the cap is not exceeded by a burst.
 const ROTATION_CHECK_EVERY: u64 = 1;
 const LOG_CHANNEL_CAPACITY: usize = 4096;
+const LOG_WRITE_RETRY_MIN: Duration = Duration::from_secs(1);
+const LOG_WRITE_RETRY_MAX: Duration = Duration::from_secs(30);
 /// Do not reap a dead PID's file until it has been quiet for at least one day.
 const DEAD_PROCESS_LOG_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Limit the total regular-file footprint left in the log directory.
@@ -659,40 +661,35 @@ pub fn init() {
     let logs_dir = storage_root.join("logs");
     let file_name = format!("aft-{}.log", std::process::id());
     let file_path = logs_dir.join(file_name);
-    let mut startup_sweep = None;
-
-    let file_tx = match prepare_file_sink(&logs_dir, &file_path) {
-        Ok((sink, summary)) => {
-            startup_sweep = Some(summary);
-            let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
-            let sink = Arc::new(Mutex::new(Some(sink)));
-            let worker_sink = Arc::clone(&sink);
-            thread::Builder::new()
-                .name("aft-log-writer".to_string())
-                .spawn(move || run_file_writer(worker_sink, rx))
-                .map(|_| {
-                    if let Ok(mut control) = FILE_CONTROL.lock() {
-                        control.tx = Some(tx.clone());
-                        control.sink = Some(sink);
-                        control.storage_root = Some(storage_root.clone());
-                    }
-                    Some(tx)
-                })
-                .unwrap_or_else(|error| {
-                    write_stderr_once(&format!(
-                        "[aft] WARN durable log disabled: cannot start writer thread: {error}\n"
-                    ));
-                    None
-                })
-        }
-        Err(error) => {
+    let (sink, startup_sweep) =
+        initial_file_sink(&logs_dir, &file_path, Arc::clone(&LOG_WRITE_HEALTH));
+    let (tx, rx) = mpsc::sync_channel(LOG_CHANNEL_CAPACITY);
+    let sink = Arc::new(Mutex::new(Some(sink)));
+    let worker_sink = Arc::clone(&sink);
+    let file_tx = thread::Builder::new()
+        .name("aft-log-writer".to_string())
+        .spawn(move || {
+            run_file_writer(
+                worker_sink,
+                rx,
+                Arc::clone(&LOG_WRITE_HEALTH),
+                LOG_WRITE_RETRY_MIN,
+            )
+        })
+        .map(|_| {
+            if let Ok(mut control) = FILE_CONTROL.lock() {
+                control.tx = Some(tx.clone());
+                control.sink = Some(sink);
+                control.storage_root = Some(storage_root.clone());
+            }
+            Some(tx)
+        })
+        .unwrap_or_else(|error| {
             write_stderr_once(&format!(
-                "[aft] WARN durable log disabled for {}: {error}\n",
-                file_path.display()
+                "[aft] WARN durable log disabled: cannot start writer thread: {error}\n"
             ));
             None
-        }
-    };
+        });
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(TeeWriter { file_tx })))
@@ -870,14 +867,217 @@ fn prepare_file_sink(
     Ok((sink, summary))
 }
 
+fn initial_file_sink(
+    logs_dir: &Path,
+    file_path: &Path,
+    health: Arc<LogWriteHealth>,
+) -> (RotatingFile, Option<SweepSummary>) {
+    match prepare_file_sink(logs_dir, file_path) {
+        Ok((sink, summary)) => (sink, Some(summary)),
+        Err(error) => {
+            LogWriteRecovery::new(health, LOG_WRITE_RETRY_MIN).failed(&error, 0, Instant::now());
+            write_stderr_once(&format!(
+                "[aft] WARN durable log will retry opening {}: {error}\n",
+                file_path.display()
+            ));
+            (
+                RotatingFile::unopened(
+                    file_path.to_path_buf(),
+                    LOG_FILE_BYTES,
+                    LOG_GENERATIONS,
+                    ROTATION_CHECK_EVERY,
+                ),
+                None,
+            )
+        }
+    }
+}
+
 enum LogMessage {
     Write(Vec<u8>),
     Reconfigure(PathBuf),
     /// Write everything queued before this message, then signal the sender.
-    Flush(SyncSender<()>),
+    Flush(SyncSender<bool>),
 }
 
-type SharedFileSink = Arc<Mutex<Option<RotatingFile>>>;
+type SharedFileSink<S = RotatingFile> = Arc<Mutex<Option<S>>>;
+
+/// Only the writer thread performs sink I/O. Tests inject failures at this
+/// boundary without consuming disk space or changing the global logger.
+trait FileLogSink: Send {
+    fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()>;
+    fn reopen(&mut self) -> io::Result<()>;
+    fn discard_buffer(&mut self);
+    fn reconfigure(&mut self, storage_root: &Path) -> io::Result<SweepSummary>;
+}
+
+#[derive(Default)]
+struct LogWriteHealth {
+    dropped_lines_total: AtomicU64,
+    last_write_error: Mutex<Option<String>>,
+    failing_since: Mutex<Option<String>>,
+}
+
+static LOG_WRITE_HEALTH: LazyLock<Arc<LogWriteHealth>> =
+    LazyLock::new(|| Arc::new(LogWriteHealth::default()));
+
+/// Read error metadata, never the file or the sink's I/O lock. The cumulative
+/// counter includes queue overflow and unconfirmed/deferred file batches;
+/// recovery markers count the latter over each write outage. Partial writes
+/// cannot confirm a record, so an errored batch is counted in full.
+pub fn durable_log_health() -> serde_json::Value {
+    LOG_WRITE_HEALTH.snapshot()
+}
+
+impl LogWriteHealth {
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "dropped_lines_total": self.dropped_lines_total.load(Ordering::Relaxed),
+            "last_write_error": self.last_write_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            "failing_since": self.failing_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+        })
+    }
+
+    fn drop_lines(&self, count: u64) {
+        self.dropped_lines_total.fetch_add(count, Ordering::Relaxed);
+        PERF.file_lines_dropped.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+fn log_line_count(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&byte| byte == b'\n').count().max(1) as u64
+}
+
+struct LogWriteOutage {
+    since: String,
+    first_error: String,
+    last_error: String,
+    dropped_lines: u64,
+    retry_at: Instant,
+}
+
+struct LogWriteRecovery {
+    health: Arc<LogWriteHealth>,
+    outage: Option<LogWriteOutage>,
+    retry_min: Duration,
+    retry_delay: Duration,
+}
+
+impl LogWriteRecovery {
+    fn new(health: Arc<LogWriteHealth>, retry_min: Duration) -> Self {
+        // Initialization can itself fail on a full volume. Retain its path
+        // and error, and let the same worker retry instead of disabling it.
+        let since = health
+            .failing_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let error = health
+            .last_write_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outage = since.zip(error).map(|(since, error)| LogWriteOutage {
+            since,
+            first_error: error.clone(),
+            last_error: error,
+            dropped_lines: 0,
+            retry_at: Instant::now(),
+        });
+        Self {
+            health,
+            outage,
+            retry_min,
+            retry_delay: retry_min,
+        }
+    }
+
+    fn failed(&mut self, error: &io::Error, dropped_lines: u64, now: Instant) {
+        let error = crate::log_redact::aft_redactor(&error.to_string()).into_owned();
+        let outage = self.outage.get_or_insert_with(|| {
+            let since = format_utc_timestamp();
+            *self
+                .health
+                .failing_since
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(since.clone());
+            LogWriteOutage {
+                since,
+                first_error: error.clone(),
+                last_error: error.clone(),
+                dropped_lines: 0,
+                retry_at: now,
+            }
+        });
+        outage.last_error = error.clone();
+        outage.dropped_lines = outage.dropped_lines.saturating_add(dropped_lines);
+        outage.retry_at = now + self.retry_delay;
+        self.retry_delay = self.retry_delay.saturating_mul(2).min(LOG_WRITE_RETRY_MAX);
+        *self
+            .health
+            .last_write_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+        self.health.drop_lines(dropped_lines);
+    }
+
+    fn write_batch(
+        &mut self,
+        sink: &mut impl FileLogSink,
+        lines: &[Vec<u8>],
+        now: Instant,
+    ) -> bool {
+        if lines.is_empty() {
+            return true;
+        }
+        let dropped_lines = lines.iter().map(|line| log_line_count(line)).sum();
+        if let Some(outage) = self.outage.as_mut() {
+            if now < outage.retry_at {
+                // Drain rather than sleep: logging stays bounded even when a
+                // full disk remains unavailable for hours.
+                outage.dropped_lines = outage.dropped_lines.saturating_add(dropped_lines);
+                self.health.drop_lines(dropped_lines);
+                return false;
+            }
+            let recovered_at = format_utc_timestamp();
+            let errors = if outage.first_error == outage.last_error {
+                outage.first_error.clone()
+            } else {
+                format!("{}; last error: {}", outage.first_error, outage.last_error)
+            };
+            let marker = format!(
+                "{recovered_at} [aft] WARN log writes failed from {} to {recovered_at} ({errors}); {} lines dropped\n",
+                outage.since, outage.dropped_lines
+            );
+            // Flush the marker separately. No normal line may precede it on
+            // the replacement handle, including buffered data from a failure.
+            if let Err(error) = sink
+                .reopen()
+                .and_then(|()| sink.write_batch(&[marker.into_bytes()]))
+            {
+                sink.discard_buffer();
+                self.failed(&error, dropped_lines, now);
+                return false;
+            }
+            self.outage = None;
+            self.retry_delay = self.retry_min;
+            *self
+                .health
+                .failing_since
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        if let Err(error) = sink.write_batch(lines) {
+            sink.discard_buffer();
+            // Some bytes may have reached disk before a write/flush error.
+            // Count the whole unconfirmed batch as lost, rather than silently
+            // claiming partially written records were durable.
+            self.failed(&error, dropped_lines, now);
+            return false;
+        }
+        true
+    }
+}
 
 #[derive(Default)]
 struct FileControl {
@@ -904,15 +1104,7 @@ impl Write for TeeWriter {
         // shutting down that pipe can be closed. A failed stderr write used to
         // return early here and drop the file copy too, which is how a module
         // exit could leave no line explaining it.
-        if let Some(tx) = self.file_tx.as_ref() {
-            match tx.try_send(LogMessage::Write(line.to_vec())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    PERF.file_lines_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TrySendError::Disconnected(_)) => self.file_tx = None,
-            }
-        }
+        enqueue_file_line(&mut self.file_tx, &line, &LOG_WRITE_HEALTH);
         let _ = io::stderr().write_all(&line);
         Ok(buf.len())
     }
@@ -923,7 +1115,31 @@ impl Write for TeeWriter {
     }
 }
 
-fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) {
+fn enqueue_file_line(
+    file_tx: &mut Option<SyncSender<LogMessage>>,
+    line: &[u8],
+    health: &LogWriteHealth,
+) {
+    if let Some(tx) = file_tx.as_ref() {
+        match tx.try_send(LogMessage::Write(line.to_vec())) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => health.drop_lines(log_line_count(line)),
+            Err(TrySendError::Disconnected(_)) => {
+                health.drop_lines(log_line_count(line));
+                *file_tx = None;
+            }
+        }
+    }
+}
+
+fn run_file_writer<S: FileLogSink>(
+    shared_sink: SharedFileSink<S>,
+    rx: mpsc::Receiver<LogMessage>,
+    health: Arc<LogWriteHealth>,
+    retry_min: Duration,
+) {
+    let mut recovery = LogWriteRecovery::new(health, retry_min);
+    let mut durable = true;
     // Test-only: hold each batch so a test can prove exit paths wait for the
     // writer instead of racing it. Debug builds only; release ignores it.
     #[cfg(debug_assertions)]
@@ -975,35 +1191,32 @@ fn run_file_writer(shared_sink: SharedFileSink, rx: mpsc::Receiver<LogMessage>) 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(sink) = slot.as_mut() else { break };
-        if !lines.is_empty() {
-            if let Err(error) = sink.write_batch(&lines) {
-                write_stderr_once(&format!(
-                    "[aft] WARN durable log disabled after write failure for {}: {error}\n",
-                    sink.path.display()
-                ));
-                break;
-            }
-        }
+        durable &= recovery.write_batch(sink, &lines, Instant::now());
         // The channel is FIFO, so every line queued before the flush request
-        // has been written by now.
+        // has been attempted by now. Report losses instead of confirming that
+        // a failed batch was durable; the receiver stays alive for recovery.
         if let Some(done) = flushed {
+            let confirmed = durable;
+            durable = true;
             #[cfg(debug_assertions)]
             if let Some(hold) = test_flush_hold {
                 // Release the sink first: the exit path takes it to write its
                 // terminal line, and must not wait out this hold.
                 drop(slot);
                 thread::sleep(hold);
-                let _ = done.try_send(());
+                let _ = done.try_send(confirmed);
                 continue;
             }
-            let _ = done.try_send(());
+            let _ = done.try_send(confirmed);
         }
         if let Some(storage_root) = reconfigure {
             let logs_dir = storage_root.join("logs");
             let path = logs_dir.join(format!("aft-{}.log", std::process::id()));
-            match prepare_file_sink(&logs_dir, &path) {
-                Ok((new_sink, summary)) => {
-                    *sink = new_sink;
+            match sink.reconfigure(&storage_root) {
+                Ok(summary) => {
+                    if let Some(outage) = recovery.outage.as_mut() {
+                        outage.retry_at = Instant::now();
+                    }
                     log_sweep_summary(summary);
                 }
                 Err(error) => write_stderr_once(&format!(
@@ -1042,7 +1255,7 @@ pub fn flush_durable_log(timeout: std::time::Duration) -> bool {
     if tx.send(LogMessage::Flush(done_tx)).is_err() {
         return false;
     }
-    done_rx.recv_timeout(timeout).is_ok()
+    done_rx.recv_timeout(timeout).unwrap_or(false)
 }
 
 /// Persist the last process-exit line without depending on the async writer.
@@ -1093,6 +1306,21 @@ struct RotatingFile {
 }
 
 impl RotatingFile {
+    fn unopened(path: PathBuf, threshold: u64, generations: usize, check_every: u64) -> Self {
+        Self {
+            path,
+            writer: None,
+            size: 0,
+            threshold,
+            generations,
+            check_every: check_every.max(1),
+            writes_since_check: 0,
+            write_counter: crate::write_ledger::process_root_counter(
+                crate::write_ledger::Domain::Logs,
+            ),
+        }
+    }
+
     fn open(
         path: PathBuf,
         threshold: u64,
@@ -1110,18 +1338,9 @@ impl RotatingFile {
             }
         }
         let size = file.metadata()?.len();
-        let mut sink = Self {
-            path,
-            writer: Some(BufWriter::new(file)),
-            size,
-            threshold,
-            generations,
-            check_every: check_every.max(1),
-            writes_since_check: 0,
-            write_counter: crate::write_ledger::process_root_counter(
-                crate::write_ledger::Domain::Logs,
-            ),
-        };
+        let mut sink = Self::unopened(path, threshold, generations, check_every);
+        sink.writer = Some(BufWriter::new(file));
+        sink.size = size;
         if size > threshold {
             sink.rotate()?;
         }
@@ -1157,7 +1376,10 @@ impl RotatingFile {
 
     fn rotate(&mut self) -> io::Result<()> {
         if let Some(mut writer) = self.writer.take() {
-            writer.flush()?;
+            if let Err(error) = writer.flush() {
+                let _ = writer.into_parts();
+                return Err(error);
+            }
         }
         if self.generations > 0 {
             let oldest = rotated_path(&self.path, self.generations);
@@ -1176,6 +1398,43 @@ impl RotatingFile {
         self.size = 0;
         self.writes_since_check = 0;
         Ok(())
+    }
+}
+
+impl FileLogSink for RotatingFile {
+    fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()> {
+        RotatingFile::write_batch(self, lines)
+    }
+
+    fn reopen(&mut self) -> io::Result<()> {
+        self.discard_buffer();
+        create_private_log_dir(
+            self.path
+                .parent()
+                .ok_or_else(|| io::Error::other("log path has no parent"))?,
+        )?;
+        let file = open_private_log_file(&self.path, false)?;
+        self.size = file.metadata()?.len();
+        self.writer = Some(BufWriter::new(file));
+        self.writes_since_check = 0;
+        Ok(())
+    }
+
+    fn discard_buffer(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            // BufWriter::drop flushes implicitly. A failed batch is already
+            // counted as lost; never replay it ahead of the recovery marker.
+            let _ = writer.into_parts();
+        }
+    }
+
+    fn reconfigure(&mut self, storage_root: &Path) -> io::Result<SweepSummary> {
+        let logs_dir = storage_root.join("logs");
+        let path = logs_dir.join(format!("aft-{}.log", std::process::id()));
+        let (sink, summary) = prepare_file_sink(&logs_dir, &path)?;
+        self.discard_buffer();
+        *self = sink;
+        Ok(summary)
     }
 }
 
@@ -2006,6 +2265,348 @@ mod tests {
     use filetime::{set_file_mtime, FileTime};
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SinkFault {
+        None,
+        Write,
+        Flush,
+        Open,
+    }
+
+    struct SinkProbe {
+        fault: SinkFault,
+        output: Vec<u8>,
+        opens: usize,
+        writes: usize,
+        flushes: usize,
+    }
+
+    struct FaultWriter {
+        probe: Arc<Mutex<SinkProbe>>,
+        pending: Vec<u8>,
+    }
+
+    impl Write for FaultWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.writes += 1;
+            if probe.fault == SinkFault::Write {
+                return Err(io::Error::other("No space left on device (injected write)"));
+            }
+            self.pending.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut probe = self.probe.lock().unwrap();
+            probe.flushes += 1;
+            if probe.fault == SinkFault::Flush {
+                return Err(io::Error::other("No space left on device (injected flush)"));
+            }
+            probe.output.append(&mut self.pending);
+            Ok(())
+        }
+    }
+
+    struct FaultSink {
+        probe: Arc<Mutex<SinkProbe>>,
+        writer: Option<BufWriter<FaultWriter>>,
+        write_gate: Option<(SyncSender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl FaultSink {
+        fn new(fault: SinkFault) -> Self {
+            let probe = Arc::new(Mutex::new(SinkProbe {
+                fault,
+                output: Vec::new(),
+                opens: 0,
+                writes: 0,
+                flushes: 0,
+            }));
+            Self {
+                writer: Some(BufWriter::new(FaultWriter {
+                    probe: Arc::clone(&probe),
+                    pending: Vec::new(),
+                })),
+                probe,
+                write_gate: None,
+            }
+        }
+    }
+
+    impl FileLogSink for FaultSink {
+        fn write_batch(&mut self, lines: &[Vec<u8>]) -> io::Result<()> {
+            if let Some((entered, proceed)) = self.write_gate.take() {
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+            }
+            let writer = self.writer.as_mut().expect("sink must reopen before retry");
+            for line in lines {
+                writer.write_all(line)?;
+            }
+            writer.flush()
+        }
+
+        fn reopen(&mut self) -> io::Result<()> {
+            self.discard_buffer();
+            let mut probe = self.probe.lock().unwrap();
+            probe.opens += 1;
+            if probe.fault == SinkFault::Open {
+                return Err(io::Error::other("bad handle (injected reopen)"));
+            }
+            self.writer = Some(BufWriter::new(FaultWriter {
+                probe: Arc::clone(&self.probe),
+                pending: Vec::new(),
+            }));
+            Ok(())
+        }
+
+        fn discard_buffer(&mut self) {
+            if let Some(writer) = self.writer.take() {
+                let _ = writer.into_parts();
+            }
+        }
+
+        fn reconfigure(&mut self, _root: &Path) -> io::Result<SweepSummary> {
+            unreachable!("this test never reconfigures storage")
+        }
+    }
+
+    fn writer_barrier(tx: &SyncSender<LogMessage>) -> bool {
+        let (done, reply) = mpsc::sync_channel(1);
+        tx.send(LogMessage::Flush(done))
+            .expect("writer still running");
+        reply
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer must survive a failed log write and answer flush requests")
+    }
+
+    #[test]
+    fn file_writer_recovers_after_write_and_flush_errors() {
+        for fault in [SinkFault::Write, SinkFault::Flush] {
+            let sink = FaultSink::new(fault);
+            let probe = Arc::clone(&sink.probe);
+            let shared = Arc::new(Mutex::new(Some(sink)));
+            let health = Arc::new(LogWriteHealth::default());
+            let (tx, rx) = mpsc::sync_channel(8);
+            let worker_health = Arc::clone(&health);
+            let worker = thread::spawn(move || {
+                run_file_writer(shared, rx, worker_health, Duration::ZERO);
+            });
+
+            tx.send(LogMessage::Write(b"lost one\nlost two\n".to_vec()))
+                .unwrap();
+            assert!(
+                !writer_barrier(&tx),
+                "failed writes cannot confirm durability"
+            );
+            let failed = health.snapshot();
+            assert_eq!(failed["dropped_lines_total"], 2);
+            assert!(failed["last_write_error"]
+                .as_str()
+                .unwrap()
+                .contains("No space left on device"));
+            let since = failed["failing_since"].as_str().unwrap();
+
+            // Opening the replacement handle can fail as well. It must not
+            // terminate the worker or erase the original outage's start time.
+            probe.lock().unwrap().fault = SinkFault::Open;
+            tx.send(LogMessage::Write(b"lost three\n".to_vec()))
+                .unwrap();
+            assert!(!writer_barrier(&tx));
+            assert_eq!(health.snapshot()["dropped_lines_total"], 3);
+            assert_eq!(health.snapshot()["failing_since"], since);
+
+            probe.lock().unwrap().fault = SinkFault::None;
+            tx.send(LogMessage::Write(b"recovered\n".to_vec())).unwrap();
+            assert!(writer_barrier(&tx));
+            tx.send(LogMessage::Write(b"still logging\n".to_vec()))
+                .unwrap();
+            assert!(writer_barrier(&tx));
+            drop(tx);
+            worker.join().unwrap();
+
+            let probe = probe.lock().unwrap();
+            let output = String::from_utf8(probe.output.clone()).unwrap();
+            let lines: Vec<_> = output.lines().collect();
+            assert_eq!(lines.len(), 3, "no replay of lost buffers: {output}");
+            assert!(
+                lines[0].contains(&format!("log writes failed from {since} to ")),
+                "{output}"
+            );
+            assert!(lines[0].contains("3 lines dropped"), "{output}");
+            assert!(
+                lines[0].contains("bad handle (injected reopen)"),
+                "{output}"
+            );
+            assert_eq!(lines[1], "recovered");
+            assert_eq!(lines[2], "still logging");
+            assert_eq!(probe.opens, 2);
+            let recovered = health.snapshot();
+            assert_eq!(recovered["dropped_lines_total"], 3);
+            assert!(recovered["failing_since"].is_null());
+            assert_eq!(
+                recovered["last_write_error"],
+                "bad handle (injected reopen)"
+            );
+        }
+    }
+
+    #[test]
+    fn log_write_retries_back_off_without_sleeping_or_replaying_lost_lines() {
+        let mut sink = FaultSink::new(SinkFault::Write);
+        let health = Arc::new(LogWriteHealth::default());
+        let mut recovery = LogWriteRecovery::new(Arc::clone(&health), LOG_WRITE_RETRY_MIN);
+        let now = Instant::now();
+        assert!(!recovery.write_batch(&mut sink, &line("lost one"), now));
+        let writes = sink.probe.lock().unwrap().writes;
+        assert!(!recovery.write_batch(
+            &mut sink,
+            &line("lost two"),
+            now + Duration::from_millis(999)
+        ));
+        assert_eq!(sink.probe.lock().unwrap().writes, writes);
+        assert_eq!(sink.probe.lock().unwrap().opens, 0);
+
+        sink.probe.lock().unwrap().fault = SinkFault::Open;
+        assert!(!recovery.write_batch(
+            &mut sink,
+            &line("lost three"),
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(sink.probe.lock().unwrap().opens, 1);
+        assert!(!recovery.write_batch(
+            &mut sink,
+            &line("lost four"),
+            now + Duration::from_millis(2999)
+        ));
+        assert_eq!(
+            sink.probe.lock().unwrap().opens,
+            1,
+            "reopen failures also back off"
+        );
+
+        sink.probe.lock().unwrap().fault = SinkFault::None;
+        assert!(recovery.write_batch(&mut sink, &line("recovered"), now + Duration::from_secs(3)));
+        let output = String::from_utf8(sink.probe.lock().unwrap().output.clone()).unwrap();
+        assert!(
+            output.lines().next().unwrap().contains("4 lines dropped"),
+            "{output}"
+        );
+        assert!(output.ends_with("\nrecovered\n"), "{output}");
+        assert_eq!(health.snapshot()["dropped_lines_total"], 4);
+        assert_eq!(recovery.retry_delay, LOG_WRITE_RETRY_MIN);
+
+        // Repeated failures must reach a ceiling, not a busy retry loop or an
+        // unbounded delay that effectively disables the log again.
+        sink.probe.lock().unwrap().fault = SinkFault::Write;
+        let mut next = now + Duration::from_secs(4);
+        for _ in 0..10 {
+            assert!(!recovery.write_batch(&mut sink, &line("lost again"), next));
+            next = recovery.outage.as_ref().unwrap().retry_at;
+        }
+        assert_eq!(recovery.retry_delay, LOG_WRITE_RETRY_MAX);
+        assert_eq!(
+            next.duration_since(now + Duration::from_secs(4)),
+            Duration::from_secs(181)
+        );
+    }
+
+    #[test]
+    fn log_callers_and_health_do_not_wait_for_a_stalled_sink_or_full_queue() {
+        let mut sink = FaultSink::new(SinkFault::Write);
+        let (entered, entering) = mpsc::sync_channel(1);
+        let (proceed, proceeding) = mpsc::sync_channel(1);
+        sink.write_gate = Some((entered, proceeding));
+        let shared = Arc::new(Mutex::new(Some(sink)));
+        let health = Arc::new(LogWriteHealth::default());
+        let (tx, rx) = mpsc::sync_channel(1);
+        let worker_health = Arc::clone(&health);
+        let worker =
+            thread::spawn(move || run_file_writer(shared, rx, worker_health, Duration::ZERO));
+        tx.send(LogMessage::Write(b"in flight\n".to_vec())).unwrap();
+        entering
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker entered sink I/O");
+
+        let caller_health = Arc::clone(&health);
+        let caller_tx = tx.clone();
+        let (finished, finishing) = mpsc::sync_channel(1);
+        let caller = thread::spawn(move || {
+            let mut tx = Some(caller_tx);
+            enqueue_file_line(&mut tx, b"queued\n", &caller_health);
+            enqueue_file_line(&mut tx, b"queue full one\n", &caller_health);
+            enqueue_file_line(&mut tx, b"queue full two\n", &caller_health);
+            finished.send(caller_health.snapshot()).unwrap();
+        });
+        let while_stalled = finishing
+            .recv_timeout(Duration::from_secs(5))
+            .expect("log caller and health must finish while sink I/O is still stalled");
+        assert_eq!(while_stalled["dropped_lines_total"], 2);
+        proceed.send(()).unwrap();
+        caller.join().unwrap();
+        assert!(!writer_barrier(&tx));
+        drop(tx);
+        worker.join().unwrap();
+        assert_eq!(health.snapshot()["dropped_lines_total"], 4);
+    }
+
+    #[test]
+    fn file_log_reopens_after_rotation_loses_its_handle() {
+        let temp = TempDir::new().unwrap();
+        let logs = temp.path().join("logs");
+        create_private_log_dir(&logs).unwrap();
+        let path = logs.join("aft-777.log");
+        let mut sink = RotatingFile::open(path.clone(), 100, 1, 1).unwrap();
+        sink.write_batch(&line("before outage")).unwrap();
+        let health = Arc::new(LogWriteHealth::default());
+        let mut recovery = LogWriteRecovery::new(Arc::clone(&health), Duration::ZERO);
+
+        // A regular file at the directory path makes rotation fail after it
+        // takes the active handle, with no reliance on disk usage or modes.
+        let moved = temp.path().join("moved-logs");
+        fs::rename(&logs, &moved).unwrap();
+        fs::write(&logs, b"not a directory").unwrap();
+        assert!(!recovery.write_batch(&mut sink, &line(&"x".repeat(101)), Instant::now()));
+        assert!(sink.writer.is_none());
+        fs::remove_file(&logs).unwrap();
+        fs::rename(&moved, &logs).unwrap();
+        // Do not rotate again: examine the original file's append ordering.
+        sink.threshold = LOG_FILE_BYTES;
+        assert!(recovery.write_batch(&mut sink, &line("after outage"), Instant::now()));
+        let output = fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 3, "{output}");
+        assert_eq!(lines[0], "before outage");
+        assert!(lines[1].contains("1 lines dropped"), "{output}");
+        assert_eq!(lines[2], "after outage");
+        assert_eq!(health.snapshot()["dropped_lines_total"], 1);
+    }
+
+    #[test]
+    fn file_log_recovers_when_initial_open_failed() {
+        let temp = TempDir::new().unwrap();
+        let logs = temp.path().join("logs");
+        fs::write(&logs, b"not a directory").unwrap();
+        let path = logs.join("aft-777.log");
+        let health = Arc::new(LogWriteHealth::default());
+        let (mut sink, summary) = initial_file_sink(&logs, &path, Arc::clone(&health));
+        assert!(summary.is_none());
+        assert!(sink.writer.is_none());
+        assert!(health.snapshot()["last_write_error"].is_string());
+        let mut recovery = LogWriteRecovery::new(Arc::clone(&health), Duration::ZERO);
+        assert!(!recovery.write_batch(&mut sink, &line("lost startup line"), Instant::now()));
+        fs::remove_file(&logs).unwrap();
+        assert!(recovery.write_batch(&mut sink, &line("startup recovered"), Instant::now()));
+        let output = fs::read_to_string(path).unwrap();
+        assert!(
+            output.lines().next().unwrap().contains("1 lines dropped"),
+            "{output}"
+        );
+        assert!(output.ends_with("\nstartup recovered\n"), "{output}");
+        assert!(health.snapshot()["failing_since"].is_null());
+    }
+
     #[test]
     fn panic_hook_child_probe() {
         if std::env::var_os("AFT_TEST_PANIC_LOG_CHILD").is_none() {
@@ -2220,7 +2821,14 @@ mod tests {
         let sink = RotatingFile::open(path.clone(), LOG_FILE_BYTES, 1, 1).unwrap();
         let (tx, rx) = mpsc::sync_channel(8);
         let sink = Arc::new(Mutex::new(Some(sink)));
-        let writer = thread::spawn(move || run_file_writer(sink, rx));
+        let writer = thread::spawn(move || {
+            run_file_writer(
+                sink,
+                rx,
+                Arc::new(LogWriteHealth::default()),
+                LOG_WRITE_RETRY_MIN,
+            )
+        });
         let mut tee = TeeWriter { file_tx: Some(tx) };
         let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         tee.write_all(
