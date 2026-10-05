@@ -62,6 +62,24 @@ set -u
 STATE="${TRAIN_PUSH_TEST_STATE:?gh stub needs TRAIN_PUSH_TEST_STATE}"
 printf '%s\n' "$*" >> "$STATE/gh-calls"
 
+# A rerun changes the attempt number without changing the run id. The state
+# transition is controllable so recovery tests can prove they watched the new
+# attempt rather than accepting the completed result that prompted the rerun.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "rerun" ]; then
+  printf 'bypass=%s %s\n' "${GH_SHIM_BYPASS:-}" "$*" >> "$STATE/reruns"
+  attempt="$(cat "$STATE/attempt" 2>/dev/null || echo 1)"
+  printf '%s\n' "$((attempt + 1))" > "$STATE/attempt"
+  if [ -f "$STATE/rerun_conclusion" ]; then
+    cp "$STATE/rerun_conclusion" "$STATE/conclusion"
+  fi
+  if [ "$(cat "$STATE/conclusion")" = "success" ]; then
+    : > "$STATE/failed_job"
+    : > "$STATE/rerun_jobs"
+  fi
+  echo completed > "$STATE/recorded_status"
+  exit 0
+fi
+
 hook="$STATE/on-watch.sh"
 if [ -x "$hook" ]; then
   mv "$hook" "$STATE/on-watch.running"
@@ -110,12 +128,18 @@ fi
 
 case "$json" in
   defaultBranchRef) cat "$STATE/default_branch" ;;
-  databaseId,headSha|databaseId,headSha,workflowName)
+  databaseId,headSha|databaseId,headSha,workflowName|databaseId,headSha,headBranch)
     # A green_shas file makes the stub sha-aware: shas listed there have a run,
     # any other sha has none yet (what a just-pushed commit looks like).
     if [ -f "$STATE/green_shas" ]; then
       sha="$(printf '%s' "$jq_arg" | sed -n 's/.*headSha=="\([0-9a-fA-F]*\)".*/\1/p')"
       grep -qx "$sha" "$STATE/green_shas" || exit 0
+    fi
+    if [ "$json" = "databaseId,headSha,headBranch" ]; then
+      branch="$(printf '%s' "$jq_arg" | sed -n 's/.*headBranch=="\([^"]*\)".*/\1/p')"
+      have_branch="$(cat "$STATE/run_branch" 2>/dev/null || true)"
+      [ -n "$have_branch" ] || have_branch="${TRAIN_PUSH_TEST_BRANCH:-${WATCH_CI_BRANCH:-}}"
+      [ -z "$branch" ] || [ "$branch" = "$have_branch" ] || exit 0
     fi
     # The probe matches its run by the workflow's display name. The stub's run
     # belongs to the workflow named in $STATE/workflow_name (default: the name
@@ -138,7 +162,13 @@ case "$json" in
     fi
     cat "$STATE/watch_status" 2>/dev/null || echo "completed"
     ;;
-  jobs) cat "$STATE/failed_job" ;;
+  jobs)
+    case "$jq_arg" in
+      *'.conclusion + "|"'*) cat "$STATE/rerun_jobs" ;;
+      *) cat "$STATE/failed_job" ;;
+    esac
+    ;;
+  attempt) cat "$STATE/attempt" 2>/dev/null || echo 1 ;;
   conclusion) cat "$STATE/conclusion" ;;
   *)
     echo "gh stub: unhandled query: $*" >&2
@@ -215,8 +245,11 @@ new_fixture() {
   echo "4242" > "$dir/ci-state/run_id"
   echo "success" > "$dir/ci-state/conclusion"
   echo "completed" > "$dir/ci-state/recorded_status"
+  echo "1" > "$dir/ci-state/attempt"
   echo "$DEFAULT_BRANCH" > "$dir/ci-state/default_branch"
+  : > "$dir/ci-state/run_branch"
   : > "$dir/ci-state/failed_job"
+  : > "$dir/ci-state/rerun_jobs"
 
   # The first-run trigger probe has its own rows; every other fixture starts
   # already proven so it does not pay for a probe it is not testing.
@@ -262,6 +295,7 @@ run_train() {
     cd "${TRAIN_PUSH_TEST_CWD:-$dir/work}" &&
       PATH="$BIN_DIR:$PATH" \
       REPO="${TRAIN_PUSH_TEST_REPO-example/repo}" \
+      TRAIN_PUSH_TEST_BRANCH="train/${1:-}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
@@ -331,6 +365,32 @@ write_gated_workflow() {
 }
 
 origin_ref() { git -C "$1/origin.git" rev-parse --verify -q "$2" || true; }
+
+# Isolated arm used to prove that the stale completed conclusion is rejected.
+# Keeping this one assertion selectable lets mutation checks distinguish the
+# old-run verdict from unrelated recovery assertions in the full suite.
+test_same_sha_failed_rerun_message() {
+  local dir
+  dir="$(new_fixture same-sha-failed-rerun-message)"
+  add_train_commit "$dir/work" "same-sha-failed-rerun-message"
+  git -C "$dir/work" push -q origin "HEAD:refs/heads/train/same-sha-failed-rerun-message"
+  echo "failure" > "$dir/ci-state/conclusion"
+  echo "Unit / runner unavailable|9199" > "$dir/ci-state/failed_job"
+  echo "failure|9199" > "$dir/ci-state/rerun_jobs"
+  echo "success" > "$dir/ci-state/rerun_conclusion"
+  run_train "$dir" same-sha-failed-rerun-message
+  expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+    "same-sha failed-run rerun result"
+}
+
+if [ "${TRAIN_PUSH_TEST_CASE:-}" = "same-sha-failed-rerun-message" ]; then
+  test_same_sha_failed_rerun_message
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+  echo "train-push.test.sh: isolated same-sha failed rerun passed"
+  exit 0
+fi
 
 # --- refusal: no train name ------------------------------------------------
 dir="$(new_fixture usage)"
@@ -931,6 +991,21 @@ fi
 [ ! -e "$dir/work/.git/train-push-green.watch" ] ||
   fail "a clean watcher exit left its heartbeat behind"
 
+# A completed push run for the same commit on another branch is not proof that
+# the train push started a run. The branch-qualified watch must fail plainly
+# rather than treating that stale result as the train's CI.
+dir="$(new_fixture no-train-run)"
+add_train_commit "$dir/work" "no-train-run"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+echo "$DEFAULT_BRANCH" > "$dir/ci-state/run_branch"
+run_train "$dir" norun
+expect_rc 2 "a stale run for the sha on another branch does not authorize landing"
+expect_out "no tests.yml run (event=push) appeared for $train_sha" \
+  "missing train run is stated plainly"
+expect_no_out "CI_DONE" "a completed run from another branch is never reported as this push result"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" != "$train_sha" ] ||
+  fail "a stale run from another branch landed the train sha"
+
 # A signalled watch kills its timer child and removes its heartbeat rather than
 # leaving descendants that make the watcher look alive.
 dir="$(new_fixture watch-signal)"
@@ -1055,6 +1130,11 @@ fi
   fail "--land did not fast-forward the default branch to the recorded green sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/existing-green)" ] ||
   fail "--land left the recovered train branch behind"
+if [ -s "$dir/ci-state/reruns" ]; then
+  fail "an existing successful sha was rerun instead of landed"
+else
+  ok "an existing successful sha lands without a rerun"
+fi
 
 # --- recovery reports a dead watcher before updating the default branch -----
 dir="$(new_fixture stale-heartbeat)"
@@ -1125,12 +1205,66 @@ add_train_commit "$dir/work" "existing-red"
 train_sha="$(git -C "$dir/work" rev-parse HEAD)"
 git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-red"
 echo "failure" > "$dir/ci-state/conclusion"
+echo "Unit / failed job|9101" > "$dir/ci-state/failed_job"
+echo "failure|9101" > "$dir/ci-state/rerun_jobs"
+echo "failure" > "$dir/ci-state/rerun_conclusion"
 run_train "$dir" existing-red
 expect_rc 1 "an existing red train refuses to land"
+expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  "an existing failed sha announces the rerun and new attempt"
 expect_out "fix, commit, and re-run: scripts/train-push.sh existing-red" \
   "recorded red preserves the fix-and-repush instruction"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+  fail "an existing failed run was not rerun through the operator gh bypass"
+grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
+  fail "an existing failed run was not watched at attempt 2"
 [ "$(origin_ref "$dir" refs/heads/train/existing-red)" = "$train_sha" ] ||
-  fail "recorded red moved or deleted the train branch"
+  fail "existing red moved or deleted the train branch"
+
+# A failed old attempt is not the result of this push. Rerunning the failed
+# jobs must produce a higher attempt, and only that attempt's green result lands.
+dir="$(new_fixture existing-failed-rerun-green)"
+add_train_commit "$dir/work" "existing-failed-rerun-green"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-failed-rerun-green"
+echo "failure" > "$dir/ci-state/conclusion"
+echo "Unit / runner unavailable|9103" > "$dir/ci-state/failed_job"
+echo "failure|9103" > "$dir/ci-state/rerun_jobs"
+echo "success" > "$dir/ci-state/rerun_conclusion"
+run_train "$dir" existing-failed-rerun-green
+expect_rc 0 "a failed existing run reruns and lands when the new attempt passes"
+expect_out "(failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  "failed recovery identifies the new attempt"
+expect_out "CI_DONE run=4242 conclusion=success attempt=2" \
+  "recovery reports the new attempt's success"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+  fail "the failed existing run did not request a failed-jobs rerun"
+grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
+  fail "the successful retry was not watched at attempt 2"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the successful retry did not land the original verified sha"
+
+# A run-level cancellation can leave individual jobs cancelled. `--failed`
+# does not select those jobs, so recovery must request each cancelled job by id.
+dir="$(new_fixture existing-cancelled-job)"
+add_train_commit "$dir/work" "existing-cancelled-job"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-cancelled-job"
+echo "cancelled" > "$dir/ci-state/conclusion"
+printf 'cancelled|9102\ncancelled|9104\n' > "$dir/ci-state/rerun_jobs"
+echo "success" > "$dir/ci-state/rerun_conclusion"
+: > "$dir/ci-state/failed_job"
+run_train "$dir" existing-cancelled-job
+expect_rc 0 "a cancelled job is rerun and its new attempt lands"
+expect_out "(cancelled); rerunning its failed and cancelled jobs (attempt 3)" \
+  "cancelled recovery announces the new attempt"
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --job 9102
+bypass=operator run rerun 4242 --job 9104" ] ||
+  fail "cancelled jobs were not rerun by job id through the operator gh bypass"
+grep -q -- '--attempt 3' "$dir/ci-state/gh-calls" ||
+  fail "the cancelled-job recovery did not watch attempt 3"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the cancelled-job recovery did not land the rerun sha"
 
 # --- existing green is not landable after the default branch diverges ------
 dir="$(new_fixture existing-diverged)"
