@@ -4,7 +4,8 @@
 # Placement copies the staged card and never re-signs it (see
 # scripts/stage-card.sh). This reads the placed file itself, not the card:
 # a placement that re-signed, or copied the wrong file, shows up here.
-#   - macOS: identifier ck-aft, hardened runtime, no get-task-allow, and only
+#   - macOS: identifier ck-aft, a team signature, hardened runtime, no
+#     get-task-allow, and only
 #     the disable-library-validation exception (same rule as staging);
 #   - the placed bytes equal the card stage-card.sh last staged, as recorded
 #     (hash and name) in $CK_STAGING_DIR/ck-aft.current, when that file exists.

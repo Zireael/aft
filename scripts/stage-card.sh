@@ -8,7 +8,8 @@
 # the SIGNED bytes, and the card's name carries the same hash so a stale
 # sidecar can never be matched to a fresh card by a glob readback.
 #
-# On macOS the card is signed here, once, with the pinned identifier ck-aft,
+# On macOS the card is signed here, once, with a team identity (see
+# scripts/lib/ck-aft-signature.sh), the pinned identifier ck-aft,
 # hardened runtime and scripts/ck-aft.entitlements.plist (only
 # com.apple.security.cs.disable-library-validation; never get-task-allow).
 # The signature is read back from the card and the card is refused unless it
@@ -121,8 +122,8 @@ TMP="$(mktemp "$STAGING/ck-aft.tmp.XXXXXX")"
 cp "$BIN" "$TMP"
 chmod 755 "$TMP"
 if [ "$(uname -s)" = "Darwin" ]; then
-  # The identifier is pinned to the deploy name so macOS grants keyed on it
-  # survive across cards; the default identifier derives from content.
+  # Identifier and team are pinned so macOS grants keyed on them survive
+  # across cards; the default identifier derives from content.
   echo "==> signing ($CK_AFT_IDENTIFIER, hardened runtime, $(basename "$CK_AFT_ENTITLEMENTS"))"
   if ! ck_aft_sign "$TMP"; then
     rm -f "$TMP"
