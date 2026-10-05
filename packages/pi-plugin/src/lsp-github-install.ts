@@ -1172,7 +1172,7 @@ async function downloadAndInstall(
     // the digest just computed so that check does not hash it a second time.
     if (fileIdentity(targetBinary) === identityBeforeHash) {
       binaryDigestMemo.set(targetBinary, { identity: identityBeforeHash, digest: binarySha256 });
-      writeStampedFileDigest(targetBinary, binarySha256);
+      writeStampedFileDigest(targetBinary, binarySha256, identityBeforeHash);
     }
     log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
     log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);

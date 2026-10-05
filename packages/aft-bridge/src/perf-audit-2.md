@@ -58,7 +58,7 @@ Tools: Bun 1.4.2, TypeScript 5.9.3, Biome 2.4.7. Exact repository scripts were u
 
 - `bun run lint`: 689 files checked, no fixes needed.
 - All four package `typecheck` scripts passed, including OpenCode's scripts tsconfig.
-- Full units: bridge 776 pass / 3 Windows-only skip; OpenCode 1,600 pass / 2 Windows-only skip; Pi 800 pass; CLI 424 pass. No failures.
+- Full units: bridge 777 pass / 3 Windows-only skip; OpenCode 1,600 pass / 2 Windows-only skip; Pi 800 pass; CLI 424 pass. No failures.
 - OpenCode's full unit suite includes the tool-schema freshness test; no schema regeneration was needed.
 - Bridge build preceded consumer checks; workspace `bun run build` passed for all four packages.
 - Real plugin end-to-end/network-install/Windows runtime checks were not run. No Rust or search-ranking/routing source was modified.

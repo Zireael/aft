@@ -361,11 +361,16 @@ export function readStampedFileDigest(path: string): string | null {
 }
 
 /** Record a digest at the final path, after publication (rename changes ctime). */
-export function writeStampedFileDigest(path: string, sha256: string): void {
+export function writeStampedFileDigest(path: string, sha256: string, verifiedStamp?: string): void {
   const sidecar = `${path}.digest.json`;
   const tmp = `${sidecar}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ schema: 1, stamp: digestStamp(path), sha256 }));
+    // Hashing callers pass the stamp they actually verified. Re-statting here
+    // could attest a replacement file with the previous file's digest.
+    writeFileSync(
+      tmp,
+      JSON.stringify({ schema: 1, stamp: verifiedStamp ?? digestStamp(path), sha256 }),
+    );
     renameSync(tmp, sidecar);
   } catch {
     // Read-only/manual installs can still be verified, just not memoized.
@@ -407,7 +412,7 @@ export function cachedFileSha256Sync(path: string, hashFile?: () => string): str
         }
       })();
   if (digestStamp(path) !== before) throw new Error(`File changed while hashing: ${path}`);
-  writeStampedFileDigest(path, digest);
+  writeStampedFileDigest(path, digest, before);
   return digest;
 }
 
@@ -420,6 +425,6 @@ export async function cachedFileSha256(path: string): Promise<string> {
   digestWork.bytesHashed += Number(statSync(path).size);
   const digest = await sha256File(path);
   if (digestStamp(path) !== before) throw new Error(`File changed while hashing: ${path}`);
-  writeStampedFileDigest(path, digest);
+  writeStampedFileDigest(path, digest, before);
   return digest;
 }

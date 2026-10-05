@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   __fileDigestWorkForTests,
   cachedFileSha256,
+  readStampedFileDigest,
   writeStampedFileDigest,
 } from "../binary-identity.js";
 import { __test__ } from "../onnx-runtime.js";
@@ -53,6 +54,23 @@ test("legacy digests stream once and persist across later resolutions", async ()
     expect(await cachedFileSha256(file)).toBe(createHash("sha256").update("legacy").digest("hex"));
     expect(__fileDigestWorkForTests().asyncHashes - before.asyncHashes).toBe(1);
     expect(__fileDigestWorkForTests().bytesHashed - before.bytesHashed).toBe(6);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a digest sidecar cannot stamp a replacement with an earlier file's hash", async () => {
+  const root = mkdtempSync(join(tmpdir(), "aft-digest-race-"));
+  try {
+    const file = join(root, "library");
+    writeFileSync(file, "before");
+    const s = statSync(file, { bigint: true });
+    const verifiedStamp = `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    const digest = createHash("sha256").update("before").digest("hex");
+    writeFileSync(file, "after!");
+    writeStampedFileDigest(file, digest, verifiedStamp);
+    expect(readStampedFileDigest(file)).toBeNull();
+    expect(await cachedFileSha256(file)).toBe(createHash("sha256").update("after!").digest("hex"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
