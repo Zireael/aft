@@ -4965,6 +4965,18 @@ impl BgTaskRegistry {
         HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
     }
 
+    /// Time left until the task's own hard kill, measured from its monotonic
+    /// start time so wait handoffs can avoid racing a timeout terminal.
+    pub(crate) fn hard_kill_remaining(&self, task_id: &str, session_id: &str) -> Option<Duration> {
+        let task = self.task_for_session(task_id, session_id)?;
+        let state = task.state.lock().ok()?;
+        if state.metadata.status.is_terminal() {
+            return None;
+        }
+        let timeout_ms = state.metadata.timeout_ms?;
+        Some(Duration::from_millis(timeout_ms).saturating_sub(task.started.elapsed()))
+    }
+
     /// The task's hard-kill limit and the command start time that its absolute
     /// deadline is measured from.
     pub(crate) fn hard_kill_deadline_with_start(

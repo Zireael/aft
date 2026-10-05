@@ -8,6 +8,7 @@ import {
   maxWatchTimeoutMs,
   resolveWatchTimeoutMs,
   taskKillDeadlineText,
+  taskKillDeadlineWithinHandoffMargin,
   WATCH_SYNC_DEFAULTS_DESCRIPTION,
   WATCH_TIMEOUT_PARAM_DESCRIPTION,
   WATCH_UNAVAILABLE_GIVE_UP_MS,
@@ -187,6 +188,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         undefined,
         waitFor,
         effectiveWaitMs,
+        role,
       );
       const waited = data.waited;
       // User-message abort: the sync wait was interrupted because the user
@@ -388,6 +390,7 @@ export async function waitForBashStatus(
   outputMode: string | undefined,
   waitFor: BashWaitPattern | undefined,
   effectiveWaitMs: number | undefined,
+  role: WatchCallerRole,
 ): Promise<BashStatusWithWait> {
   // The deadline and the reported elapsed time both come from a monotonic
   // clock, so a wall-clock step during the wait can neither end it early nor
@@ -400,11 +403,13 @@ export async function waitForBashStatus(
   const abortSignal = (runtime as { abort?: AbortSignal }).abort;
   // Sleep until the next poll, never past the deadline. The poll interval
   // grows with the time already waited (watchPollDelayMs).
-  const pause = () =>
-    watchClock.sleep(
-      Math.min(watchPollDelayMs(elapsedMs()), Math.max(0, deadline - watchClock.now())),
+  const pause = (pastDeadline = false) => {
+    const delay = watchPollDelayMs(elapsedMs());
+    return watchClock.sleep(
+      pastDeadline ? delay : Math.min(delay, Math.max(0, deadline - watchClock.now())),
       abortSignal,
     );
+  };
   const waited = (
     reason: BashStatusWaited["reason"],
     extra: Partial<BashStatusWaited> = {},
@@ -533,10 +538,14 @@ export async function waitForBashStatus(
       if (isSyncWatchAborted(runtime.sessionID)) {
         return withWaited(data, waited("user_message"));
       }
-      if (watchClock.now() >= deadline) {
+      const waitPastDeadline =
+        role === "worker" &&
+        watchClock.now() >= deadline &&
+        taskKillDeadlineWithinHandoffMargin(data);
+      if (watchClock.now() >= deadline && !waitPastDeadline) {
         return withWaited(data, waited("timeout"));
       }
-      await pause();
+      await pause(waitPastDeadline);
     }
   } finally {
     if (!sawTerminal) unmarkTaskWaiting(runtime.sessionID, taskId);

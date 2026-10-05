@@ -17,6 +17,12 @@ const TEST_FOREGROUND_WAIT_ENV: &str = "AFT_TEST_FOREGROUND_WAIT_MS";
 /// outside tests.
 const TEST_WORKER_WAIT_ENV: &str = "AFT_TEST_WORKER_WAIT_MAX_MS";
 const DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+// Leave room for polling and the kill worker to publish its terminal status.
+const WORKER_KILL_HANDOFF_MARGIN: Duration = Duration::from_secs(5);
+
+pub(crate) fn worker_kill_deadline_within_handoff_margin(remaining: Option<Duration>) -> bool {
+    remaining.is_some_and(|remaining| remaining <= WORKER_KILL_HANDOFF_MARGIN)
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -509,6 +515,11 @@ pub fn build_bash_outcome(
                     snapshot,
                     deadline,
                     block_to_completion,
+                    worker_cap_ms.is_some()
+                        && worker_kill_deadline_within_handoff_margin(
+                            ctx.bash_background()
+                                .hard_kill_remaining(&task_id_for_poll, &session_id_for_poll),
+                        ),
                     Instant::now(),
                     &request_id_for_poll,
                 ) {
@@ -595,12 +606,13 @@ pub(crate) fn decide_bash_step(
     snapshot: BgTaskSnapshot,
     deadline: Instant,
     block_to_completion: bool,
+    wait_for_kill_terminal: bool,
     now: Instant,
     request_id: &str,
 ) -> BashStep {
     if snapshot.info.status.is_terminal() {
         BashStep::Done(foreground_result_response(request_id, snapshot))
-    } else if !block_to_completion && now >= deadline {
+    } else if !block_to_completion && !wait_for_kill_terminal && now >= deadline {
         BashStep::Promote
     } else {
         BashStep::Wait
@@ -1046,7 +1058,7 @@ mod tests {
         let snapshot = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, false, now, "req-terminal") {
+        match decide_bash_step(snapshot, now, false, false, now, "req-terminal") {
             BashStep::Done(response) => {
                 assert_eq!(response.id, "req-terminal");
                 assert!(response.success);
@@ -1063,7 +1075,7 @@ mod tests {
         let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, false, now, "req-promote") {
+        match decide_bash_step(snapshot, now, false, false, now, "req-promote") {
             BashStep::Promote => {}
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Wait => panic!("deadline should promote when not blocking"),
@@ -1079,6 +1091,7 @@ mod tests {
             snapshot,
             now + Duration::from_millis(1),
             false,
+            false,
             now,
             "req-wait",
         ) {
@@ -1093,7 +1106,7 @@ mod tests {
         let snapshot = snapshot("running", false, None, BgTaskStatus::Running, None);
         let now = Instant::now();
 
-        match decide_bash_step(snapshot, now, true, now, "req-block") {
+        match decide_bash_step(snapshot, now, true, false, now, "req-block") {
             BashStep::Wait => {}
             BashStep::Done(_) => panic!("running snapshot should not finish"),
             BashStep::Promote => panic!("block_to_completion should suppress promotion"),
@@ -1120,6 +1133,71 @@ mod tests {
         assert_eq!(worker_wait_cap_ms(true, true, 90_000), Some(90_000));
         assert_eq!(worker_wait_cap_ms(false, true, 90_000), None);
         assert_eq!(worker_wait_cap_ms(true, false, 90_000), None);
+    }
+
+    #[test]
+    fn worker_wait_cap_waits_for_timeout_when_kill_deadline_is_at_the_cap() {
+        assert!(worker_kill_deadline_within_handoff_margin(Some(
+            Duration::ZERO
+        )));
+    }
+
+    #[test]
+    fn worker_wait_cap_hands_off_when_timeout_is_beyond_the_margin() {
+        let remaining = Some(WORKER_KILL_HANDOFF_MARGIN + Duration::from_millis(1));
+        assert!(!worker_kill_deadline_within_handoff_margin(remaining));
+        let running = snapshot("still running", false, None, BgTaskStatus::Running, None);
+        let now = Instant::now();
+        match decide_bash_step(
+            running,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(remaining),
+            now,
+            "req-handoff",
+        ) {
+            BashStep::Promote => {}
+            BashStep::Done(_) => panic!("running task should not finish"),
+            BashStep::Wait => panic!("deadline beyond the margin should hand off"),
+        }
+    }
+
+    #[test]
+    fn worker_wait_cap_returns_timeout_terminal_instead_of_handoff() {
+        let now = Instant::now();
+        let running = snapshot("still running", false, None, BgTaskStatus::Running, None);
+        match decide_bash_step(
+            running,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(Some(Duration::ZERO)),
+            now,
+            "req-timeout-terminal",
+        ) {
+            BashStep::Wait => {}
+            BashStep::Done(_) => panic!("running task must wait for its timeout terminal"),
+            BashStep::Promote => panic!("nearby kill deadline must not hand off"),
+        }
+
+        let timed_out = snapshot("timed out", false, None, BgTaskStatus::TimedOut, Some(124));
+        match decide_bash_step(
+            timed_out,
+            now,
+            false,
+            worker_kill_deadline_within_handoff_margin(Some(Duration::ZERO)),
+            now,
+            "req-timeout-terminal",
+        ) {
+            BashStep::Done(response) => {
+                let output = response.data["output"].as_str().unwrap();
+                assert_eq!(response.data["status"], json!("timed_out"));
+                assert_eq!(response.data["exit_code"], json!(124));
+                assert!(output.contains("timed out"), "{output}");
+                assert!(!output.contains("worker wait limit"), "{output}");
+            }
+            BashStep::Promote => panic!("timed-out task must not hand off"),
+            BashStep::Wait => panic!("terminal snapshot must return immediately"),
+        }
     }
 
     /// The reply names the configured limit, says the command was not killed,

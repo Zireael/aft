@@ -1957,6 +1957,40 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("a worker bash_watch at its cap waits for a timeout just inside the handoff margin", async () => {
+    _resetSubagentCacheForTest();
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    const killAtMs = 1_802_000;
+    const reason = "killed by the explicit timeout (exit 124)";
+    try {
+      const { ctx, watchTool } = makeCtx(() =>
+        clock.now() < killAtMs
+          ? {
+              success: true,
+              status: "running",
+              mode: "pipes",
+              started_at: Date.now(),
+              hard_kill: { limit_ms: killAtMs, source: "timeout" },
+              elapsed_ms: Math.round(clock.now()),
+            }
+          : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
+      );
+      ctx.client = createSubagentClient();
+      const result = await watchTool.execute(
+        { taskId: "bash-worker-timeout-at-cap" },
+        createMockSdkContext({ sessionID: "ses_worker_timeout_at_cap" }),
+      );
+      expect(result).toContain("task exited (timed_out, exit 124)");
+      expect(result).toContain("The task was killed by the explicit timeout (exit 124).");
+      expect(result).not.toContain("timeout reached without match");
+      expect(result).not.toContain("The command is still running");
+      expect(clock.now()).toBeGreaterThanOrEqual(killAtMs);
+    } finally {
+      clock.restore();
+    }
+  });
+
   // A worker once watched a background task with "no limit", never learned
   // the task had AFT's 30-minute default kill, and took the kill for its
   // command failing. Every watch result names the task's own deadline, and a

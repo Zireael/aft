@@ -1102,6 +1102,13 @@ async fn run_deferred_bash_wait(
                                 snapshot,
                                 deadline,
                                 block_to_completion,
+                                worker_cap_ms.is_some()
+                                    && crate::commands::bash_orchestrate::worker_kill_deadline_within_handoff_margin(
+                                        ctx.bash_background().hard_kill_remaining(
+                                            &task_id_for_poll,
+                                            &session_for_poll,
+                                        ),
+                                    ),
                                 Instant::now(),
                                 &request_id_for_poll,
                             ) {

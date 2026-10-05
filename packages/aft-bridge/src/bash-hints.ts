@@ -228,6 +228,24 @@ export function taskKillDeadlineText(
   return `AFT kills this task ${when} ${source}${remaining}.`;
 }
 
+/**
+ * A wait should not hand back a still-running task just before its own kill
+ * deadline. Five seconds covers the slowest status poll and kill publication.
+ */
+export function taskKillDeadlineWithinHandoffMargin(data: Record<string, unknown>): boolean {
+  if (typeof data.status !== "string" || isTerminalTaskStatus(data.status)) return false;
+  const hardKill = data.hard_kill as { limit_ms?: unknown } | undefined;
+  const limitMs = hardKill?.limit_ms;
+  const elapsedMs = data.elapsed_ms;
+  return (
+    typeof limitMs === "number" &&
+    Number.isSafeInteger(limitMs) &&
+    typeof elapsedMs === "number" &&
+    Number.isSafeInteger(elapsedMs) &&
+    limitMs - elapsedMs <= 5_000
+  );
+}
+
 function formatKillDeadlineUtc(unixMs: number): string {
   const date = new Date(unixMs);
   if (!Number.isFinite(date.getTime())) throw new Error("invalid bash task start time");

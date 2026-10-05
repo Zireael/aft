@@ -217,6 +217,35 @@ describe("Pi bash_watch caller role", () => {
     }
   });
 
+  test("a worker bash_watch at its cap waits for a timeout just inside the handoff margin", async () => {
+    __resetSyncWatchAbortForTests();
+    const clock = useFakeWatchClock();
+    const killAtMs = 1_802_000;
+    const reason = "killed by the explicit timeout (exit 124)";
+    try {
+      const tool = watchTool(() =>
+        clock.now() < killAtMs
+          ? {
+              success: true,
+              status: "running",
+              started_at: Date.now(),
+              hard_kill: { limit_ms: killAtMs, source: "timeout" },
+              elapsed_ms: Math.round(clock.now()),
+            }
+          : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
+      );
+      const text = (await watch(tool, { task_id: "bash-worker-timeout-at-cap" }, false)).content[0]
+        .text;
+      expect(text).toContain("task exited (timed_out, exit 124)");
+      expect(text).toContain("The task was killed by the explicit timeout (exit 124).");
+      expect(text).not.toContain("timeout reached without match");
+      expect(text).not.toContain("The command is still running");
+      expect(clock.now()).toBeGreaterThanOrEqual(killAtMs);
+    } finally {
+      clock.restore();
+    }
+  });
+
   // A worker once watched a background task with "no limit", never learned
   // the task had AFT's 30-minute default kill, and took the kill for its
   // command failing.

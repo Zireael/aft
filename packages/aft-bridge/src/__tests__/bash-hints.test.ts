@@ -11,6 +11,7 @@ import {
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
   taskKillDeadlineText,
+  taskKillDeadlineWithinHandoffMargin,
   type WatchCallerRole,
   watchPollDelayMs,
   workerBackgroundTaskNote,
@@ -140,6 +141,32 @@ describe("taskKillDeadlineText", () => {
     ).toBe("The task was killed by AFT's default background limit of 30 minutes (exit 124).");
     expect(taskKillDeadlineText({ status: "completed" }, "worker")).toBe("");
     expect(taskKillDeadlineText({ status: "unknown" }, "worker")).toBe("");
+  });
+});
+
+describe("taskKillDeadlineWithinHandoffMargin", () => {
+  test("keeps a worker waiting at or within five seconds of the task kill", () => {
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "running",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_795_000,
+      }),
+    ).toBe(true);
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "running",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_794_999,
+      }),
+    ).toBe(false);
+    expect(
+      taskKillDeadlineWithinHandoffMargin({
+        status: "timed_out",
+        hard_kill: { limit_ms: 1_800_000 },
+        elapsed_ms: 1_800_000,
+      }),
+    ).toBe(false);
   });
 });
 

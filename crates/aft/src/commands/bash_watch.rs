@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use crate::bash_background::persistence::{BgMode, TaskArtifact};
 use crate::bash_background::registry::BgTaskSnapshot;
 use crate::bash_background::{BgTaskRegistry, BgTaskStatus};
-use crate::commands::bash_orchestrate::{format_wait_limit, kill_deadline_sentence};
+use crate::commands::bash_orchestrate::{
+    format_wait_limit, kill_deadline_sentence, worker_kill_deadline_within_handoff_margin,
+};
 use crate::commands::bash_status::{format_erased_task_message, format_unknown_task_message};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -94,6 +96,23 @@ struct Waited {
     elapsed_ms: u64,
     limit_ms: u64,
     matched: Option<(String, u64, Option<&'static str>)>,
+}
+
+fn wait_limit_outcome(
+    limit_reached: bool,
+    terminal: bool,
+    worker: bool,
+    kill_remaining: Option<Duration>,
+) -> Option<WaitReason> {
+    if terminal {
+        Some(WaitReason::Exited)
+    } else if limit_reached
+        && !(worker && worker_kill_deadline_within_handoff_margin(kill_remaining))
+    {
+        Some(WaitReason::Timeout)
+    } else {
+        None
+    }
 }
 
 /// One stream's scan state: bytes not yet ruled out, and where they start in
@@ -391,14 +410,25 @@ impl WatchJob {
                     return Some(waited(WaitReason::Matched, Some(found)));
                 }
             }
-            if terminal {
-                return Some(waited(WaitReason::Exited, None));
-            }
             let now = Instant::now();
-            if now >= deadline {
-                return Some(waited(WaitReason::Timeout, None));
+            let kill_remaining = if self.worker {
+                self.registry
+                    .hard_kill_remaining(&self.task_id, &self.session)
+            } else {
+                None
+            };
+            if let Some(reason) =
+                wait_limit_outcome(now >= deadline, terminal, self.worker, kill_remaining)
+            {
+                return Some(waited(reason, None));
             }
-            let pause = poll_delay(started.elapsed()).min(deadline - now);
+            let pause = if now >= deadline {
+                // The command is about to be killed; keep polling until the
+                // terminal timeout result is visible instead of handing it off.
+                poll_delay(started.elapsed())
+            } else {
+                poll_delay(started.elapsed()).min(deadline - now)
+            };
             if cancellation.wait_for_cancellation(pause) {
                 return None;
             }
@@ -637,6 +667,20 @@ mod tests {
             .contains("bash.watch_sync_max_ms"));
         assert!(limit(json!({"timeout_ms": 0}), true).is_err());
         assert!(limit(json!({"timeout_ms": 1_800_001}), true).is_err());
+    }
+
+    #[test]
+    fn worker_watch_at_cap_waits_for_a_nearby_kill_terminal() {
+        assert_eq!(
+            wait_limit_outcome(true, false, true, Some(Duration::from_secs(4)),),
+            None,
+            "a worker watch should keep waiting inside the handoff margin"
+        );
+        assert_eq!(
+            wait_limit_outcome(true, true, true, Some(Duration::ZERO)),
+            Some(WaitReason::Exited),
+            "the timed-out task's terminal result ends the watch"
+        );
     }
 
     #[test]
