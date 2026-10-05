@@ -43,6 +43,7 @@ import {
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isHomeDirectoryRoot,
+  observeFreshSessionStart,
   RevivableTransportPool,
   resolveCortexKitStorageRoot,
   resolveIndexes,
@@ -911,6 +912,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("session_start", (_event, extCtx) => {
     const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
+    observeFreshSessionStart(
+      pool,
+      (extCtx as ExtensionContext | undefined)?.cwd ?? projectRoot,
+      sessionID,
+      (_event as { reason?: unknown } | undefined)?.reason,
+    );
     setActiveSessionId(sessionID);
     startSessionWork();
     if (powershellRegistered) return;

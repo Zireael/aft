@@ -207,5 +207,57 @@ describe.serial.skipIf(process.platform === "win32")(
       expect(tools).toContain("write");
       expect(started).toEqual([]);
     });
+
+    test("Pi fresh-session hooks signal only new and fork lifetimes", async () => {
+      writeBinaryIdentitySidecar(cachedAft, PLUGIN_VERSION, "0".repeat(64));
+      let channel = 0;
+      const pool = new bridge.SubcTransportPool({
+        connectionFile: "/fake",
+        harness: "pi",
+        connect: async () => ({
+          routeOpen: async () => ({ channel: ++channel, epoch: channel }) as never,
+          request: async () => ({ structuredContent: { success: true, text: "status" } }),
+          subscribe: () => {
+            throw new Error("no background callbacks in this fixture");
+          },
+          closeRouteChannel: async () => undefined,
+          close: () => undefined,
+        }),
+      });
+      spyOn(bridge, "createAftTransportPool").mockImplementation(async () => pool);
+      // The plugin's pool is created lazily on first demand, so session_start
+      // hints land on the revivable wrapper first; its own test covers the
+      // replay into the pool it creates. Here: only new and fork are forwarded.
+      const starts = spyOn(bridge.RevivableTransportPool.prototype, "observeSessionStart");
+      const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+      const pi = makePi();
+      (
+        pi as unknown as {
+          on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
+        }
+      ).on = (name, handler) => {
+        const group = handlers.get(name) ?? [];
+        group.push(handler);
+        handlers.set(name, group);
+      };
+      try {
+        await (await loadPlugin())(pi);
+        for (const reason of ["startup", "reload", "resume", "new", "fork"]) {
+          for (const handler of handlers.get("session_start") ?? []) {
+            await handler(
+              { type: "session_start", reason },
+              { cwd: home, sessionManager: { getSessionId: () => `session-${reason}` } },
+            );
+          }
+        }
+        expect(starts.mock.calls).toEqual([
+          [home, "session-new"],
+          [home, "session-fork"],
+        ]);
+      } finally {
+        starts.mockRestore();
+        await pool.shutdown();
+      }
+    });
   },
 );
