@@ -1984,9 +1984,7 @@ describe("bash_status tool", () => {
         { taskId: "bash-worker-deadline", timeoutMs: 60_000 },
         context,
       );
-      expect(running).toContain(
-        "when it has run 30 minutes (its default background limit)",
-      );
+      expect(running).toContain("when it has run 30 minutes (its default background limit)");
       expect(running).toContain("remain.");
       expect(running).toContain("each wait you make on it moves that kill");
       const killed = await watchTool.execute({ taskId: "bash-worker-deadline" }, context);

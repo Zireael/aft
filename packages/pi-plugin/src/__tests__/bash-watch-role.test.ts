@@ -239,9 +239,7 @@ describe("Pi bash_watch caller role", () => {
       const running = (
         await watch(tool, { task_id: "bash-worker-deadline", timeout_ms: 60_000 }, false)
       ).content[0].text;
-      expect(running).toContain(
-        "when it has run 30 minutes (its default background limit)",
-      );
+      expect(running).toContain("when it has run 30 minutes (its default background limit)");
       expect(running).toContain("remain.");
       const killed = (await watch(tool, { task_id: "bash-worker-deadline" }, false)).content[0]
         .text;
