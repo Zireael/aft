@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import type {
   BindIdentity,
   RequestOptions,
@@ -72,6 +73,33 @@ describe("RevivableTransportPool", () => {
     const key = Symbol.for("aft-bridge-active-logger");
     if (previousLogger) setActiveLogger(previousLogger);
     else delete slot[key];
+  });
+
+  test("dispatch refresh reuses the canonical facade without another realpath", async () => {
+    const client = new FakeClient();
+    const owner = new RevivableTransportPool(makeSubcPool(client), async () => {
+      throw new Error("the live pool must not be revived");
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+    const realpaths = spyOn(fs, "realpathSync");
+    try {
+      for (let i = 0; i < 100; i++) {
+        expect((await owner.toolCall(TEST_PROJECT_ROOT, { sessionID: "hot" }, "read")).text).toBe(
+          "revived",
+        );
+      }
+      // One outer lookup and one concrete-pool lookup per operation, not a
+      // third canonicalization just to refresh the already-known facade.
+      expect(realpaths.mock.calls.length).toBe(200);
+      realpaths.mockClear();
+      for (let i = 0; i < 100; i++) {
+        expect((await transport.send("status", { session_id: "hot" })).text).toBe("revived");
+      }
+      expect(realpaths.mock.calls.length).toBe(100);
+    } finally {
+      realpaths.mockRestore();
+      await owner.shutdown();
+    }
   });
 
   test("revives a shut-down pool with fresh routes and repeats after the replacement shuts down", async () => {
