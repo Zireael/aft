@@ -72,7 +72,8 @@ fn assert_worker_hand_off(label: &str, text: &str) {
     );
     // The task's own kill deadline is named, apart from any wait on it.
     assert!(
-        text.contains("AFT kills this task once it has run 30 minutes (its default background limit), but each wait you make on it moves that kill"),
+        text.contains("AFT kills this task at ")
+            && text.contains("when it has run 30 minutes (its default background limit), but each wait you make on it moves that kill"),
         "{label}: a worker must be told the task's kill deadline: {text:?}"
     );
 }
@@ -83,7 +84,8 @@ fn assert_primary_hand_off(label: &str, text: &str) {
         "{label}: a primary keeps the completion-reminder text: {text:?}"
     );
     assert!(
-        text.contains("AFT kills this task once it has run 30 minutes (its default background limit) unless you pass a longer `timeout`."),
+        text.contains("AFT kills this task at ")
+            && text.contains("when it has run 30 minutes (its default background limit) unless you pass a longer `timeout`"),
         "{label}: a primary must be told the task's kill deadline: {text:?}"
     );
 }

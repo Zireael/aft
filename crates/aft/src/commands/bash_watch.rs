@@ -592,6 +592,7 @@ impl WatchJob {
         kill_deadline_sentence(
             self.registry
                 .hard_kill_deadline(&self.task_id, &self.session),
+            Some(snapshot.info.started_at),
             self.worker,
         )
     }

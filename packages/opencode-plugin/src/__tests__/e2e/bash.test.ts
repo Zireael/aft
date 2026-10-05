@@ -298,6 +298,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     const result = await resultPromise;
 
     expect(result.output).toContain("Detached because a user message arrived.");
+    expect(result.output).toContain("AFT kills this task at ");
+    expect(result.output).toContain("(the `timeout` you passed)");
     expect(String(result.metadata.taskId)).toMatch(/^bash-[a-f0-9]{16}$/);
     expect(result.metadata.status).toBe("running");
     expectNoClientPollOrPromote(bridgeCalls);

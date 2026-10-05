@@ -7480,6 +7480,10 @@ async fn handle_tool_call(
         identity.project_root.as_path(),
     );
     format_context.worker_session = role.is_worker();
+    format_context.bash_watch_available = Some(
+        role.has_bash_watch()
+            && crate::tool_gate::catalog_keeps("bash_watch", &identity.disabled_tools),
+    );
 
     let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let bind_trust = identity.trust;
@@ -7627,6 +7631,9 @@ async fn handle_tool_call(
             &arguments,
             call.preview,
             role.is_worker(),
+            format_context
+                .bash_watch_available
+                .unwrap_or(role.is_worker()),
         );
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the

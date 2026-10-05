@@ -4715,6 +4715,14 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             "{mode}: {text:?}"
         );
         assert!(text.contains("it was not killed"), "{mode}: {text:?}");
+        assert!(
+            text.contains("AFT kills this task at "),
+            "{mode} should name its kill deadline: {text:?}"
+        );
+        assert!(
+            text.contains("its default background limit"),
+            "{mode} should name the default deadline source: {text:?}"
+        );
         assert!(text.contains("Recent output:\nstarted"), "{mode}: {text:?}");
         let task_id = extract_bash_task_id(&text);
         send_tool_call(
@@ -8599,6 +8607,14 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
         assert!(
             text.contains("Detached because AFT is restarting"),
             "bash {corr} text: {text:?}"
+        );
+        assert!(
+            text.contains("AFT kills this task at "),
+            "bash {corr} should name its kill deadline: {text:?}"
+        );
+        assert!(
+            text.contains("the `timeout` you passed"),
+            "bash {corr} should name the explicit deadline source: {text:?}"
         );
         let response = tool_response_json(frame);
         assert_eq!(response["status"], "running", "bash {corr}: {response}");

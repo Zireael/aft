@@ -1219,11 +1219,11 @@ mod tests {
         // Both roles' wording: a catalog consumer may be a delegated worker.
         for worker_session in [false, true] {
             texts.extend([
-                orchestrate::format_background_launch(task, false, worker_session),
-                orchestrate::format_background_launch(task, true, worker_session),
-                orchestrate::format_promotion_message(task, None, 30_000, worker_session),
-                orchestrate::format_wait_detach_message(task, worker_session),
-                orchestrate::format_module_drain_detach_message(task, worker_session),
+                orchestrate::format_background_launch(task, false, worker_session, false),
+                orchestrate::format_background_launch(task, true, worker_session, false),
+                orchestrate::format_promotion_message(task, None, 30_000, worker_session, false),
+                orchestrate::format_wait_detach_message(task, worker_session, false),
+                orchestrate::format_module_drain_detach_message(task, worker_session, false),
             ]);
         }
         texts.extend([running_status("pty"), running_status("pipes")]);

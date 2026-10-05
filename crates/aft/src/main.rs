@@ -2213,6 +2213,17 @@ mod pending_response_tests {
         assert_eq!(response["status"], serde_json::json!("running"));
         assert!(output.contains(&task_id));
         assert!(output.contains("Detached because a user message arrived."));
+        assert!(output.contains("AFT kills this task at "), "{output}");
+        assert!(
+            output.contains("when it has run 10s (the `timeout` you passed)"),
+            "{output}"
+        );
+        assert_eq!(
+            ctx.bash_background()
+                .hard_kill_limit_ms_for_test(&task_id, session_id),
+            Some(10_000),
+            "detaching must not extend an explicit timeout"
+        );
         assert!(pending.is_empty());
 
         let running = wait_for_snapshot(

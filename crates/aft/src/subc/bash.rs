@@ -225,7 +225,14 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     json!({
                         "output": format!(
                         "{}{}",
-                        crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id, target.worker_session),
+                        crate::commands::bash_orchestrate::format_module_drain_detach_message(
+                            &target.task_id,
+                            target.worker_session,
+                            target
+                                .format_context
+                                .bash_watch_available
+                                .unwrap_or(target.worker_session),
+                        ),
                         crate::commands::bash_orchestrate::kill_deadline_note(&target.registry, &target.task_id, &target.session_id, target.worker_session),
                     ),
                         "task_id": target.task_id,
@@ -366,6 +373,7 @@ fn bash_background_launch_response(
     task_id: &str,
     is_pty: bool,
     worker_session: bool,
+    bash_watch_available: bool,
     deadline_note: &str,
 ) -> Response {
     Response::success(
@@ -373,7 +381,12 @@ fn bash_background_launch_response(
         json!({
             "output": format!(
                 "{}{deadline_note}",
-                crate::commands::bash_orchestrate::format_background_launch(task_id, is_pty, worker_session)
+                crate::commands::bash_orchestrate::format_background_launch(
+                    task_id,
+                    is_pty,
+                    worker_session,
+                    bash_watch_available,
+                )
             ),
             "task_id": task_id,
             "status": "running",
@@ -633,6 +646,9 @@ pub(super) fn submit_deferred_bash(
                         &task_id,
                         is_pty,
                         worker_session,
+                        format_context_for_spawn
+                            .bash_watch_available
+                            .unwrap_or(worker_session),
                         &crate::commands::bash_orchestrate::kill_deadline_note(
                             ctx.bash_background(),
                             &task_id,
@@ -1022,6 +1038,9 @@ async fn run_deferred_bash_wait(
                                         &session_for_poll,
                                         &request_id_for_poll,
                                         worker_session,
+                                        format_context_for_poll
+                                            .bash_watch_available
+                                            .unwrap_or(worker_session),
                                     );
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
@@ -1060,6 +1079,9 @@ async fn run_deferred_bash_wait(
                                     &session_for_poll,
                                     &request_id_for_poll,
                                     worker_session,
+                                    format_context_for_poll
+                                        .bash_watch_available
+                                        .unwrap_or(worker_session),
                                 );
                                 ctx.bash_background().end_wait_mode_session(
                                     &session_for_poll,
@@ -1302,6 +1324,9 @@ async fn submit_bash_promote(
                         wait_window_ms,
                         &request_id_for_promote,
                         worker_session,
+                        format_context_for_promote
+                            .bash_watch_available
+                            .unwrap_or(worker_session),
                         capped_worker_wait,
                     )
                 };

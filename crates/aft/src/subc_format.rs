@@ -47,9 +47,10 @@ pub struct FormatContext {
     /// `outputMode` of a `bash_status` call; PTY status text depends on it.
     pub bash_output_mode: Option<String>,
     /// The caller is a delegated worker. A worker is never woken by a
-    /// completion reminder, so a running task's status points it at
-    /// `bash_watch` instead of promising one.
+    /// completion reminder, so a running task's status never promises one.
     pub worker_session: bool,
+    /// Whether the caller's tool catalog includes `bash_watch`.
+    pub bash_watch_available: Option<bool>,
 }
 
 impl Default for FormatContext {
@@ -72,6 +73,7 @@ impl Default for FormatContext {
             safety_name_arg: None,
             bash_output_mode: None,
             worker_session: false,
+            bash_watch_available: None,
         }
     }
 }
@@ -98,6 +100,7 @@ impl FormatContext {
             safety_name_arg: safety_string_arg_for_call(bare_name, arguments, "name"),
             bash_output_mode: bash_output_mode_for_call(bare_name, arguments),
             worker_session: false,
+            bash_watch_available: None,
         }
     }
 }
@@ -339,9 +342,12 @@ pub fn format_response_with_context(
         "move" => format_move(data, ctx),
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
-        "bash_status" => {
-            format_bash_status(data, ctx.bash_output_mode.as_deref(), ctx.worker_session)
-        }
+        "bash_status" => format_bash_status(
+            data,
+            ctx.bash_output_mode.as_deref(),
+            ctx.worker_session,
+            ctx.bash_watch_available.unwrap_or(ctx.worker_session),
+        ),
         "bash_kill" => format_bash_kill(data),
         "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
@@ -1000,7 +1006,12 @@ fn bash_task_id(data: &Value) -> &str {
 // Mirrors packages/opencode-plugin/src/tools/bash.ts formatBashStatusText and
 // formatPtyStatus, so a catalog consumer shows the model the same status text
 // the OpenCode tool does.
-fn format_bash_status(data: &Value, output_mode: Option<&str>, worker_session: bool) -> String {
+fn format_bash_status(
+    data: &Value,
+    output_mode: Option<&str>,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
     let task_id = bash_task_id(data);
     let status = data
         .get("status")
@@ -1066,8 +1077,10 @@ fn format_bash_status(data: &Value, output_mode: Option<&str>, worker_session: b
         }
         if running {
             // Mirrors `runningTaskStatusHint` in the plugins.
-            text.push_str(if worker_session {
+            text.push_str(if worker_session && bash_watch_available {
                 "\nTo wait for it, call bash_watch; don't poll."
+            } else if worker_session {
+                "\nIt won't wake you when it finishes. Use bash_status to check whether it has finished."
             } else {
                 "\nA completion reminder will be delivered automatically; don't poll."
             });
@@ -4289,6 +4302,36 @@ mod bash_companion_format_tests {
             Path::new("/project"),
         );
         format_response_with_context("bash_status", &Response::success("1", data), &ctx)
+    }
+
+    #[test]
+    fn bash_worker_status_names_only_a_wait_tool_the_catalog_serves() {
+        let data = json!({
+            "task_id": "bash-1",
+            "status": "running",
+            "mode": "pipes",
+            "output_preview": "partial",
+        });
+        let mut ctx = FormatContext {
+            worker_session: true,
+            bash_watch_available: Some(false),
+            ..Default::default()
+        };
+        let without_watch = format_response_with_context(
+            "bash_status",
+            &Response::success("1", data.clone()),
+            &ctx,
+        );
+        assert!(!without_watch.contains("bash_watch"), "{without_watch}");
+        assert!(without_watch.contains("bash_status"), "{without_watch}");
+
+        ctx.bash_watch_available = Some(true);
+        let with_watch =
+            format_response_with_context("bash_status", &Response::success("1", data), &ctx);
+        assert!(
+            with_watch.contains("To wait for it, call bash_watch; don't poll."),
+            "{with_watch}"
+        );
     }
 
     #[test]

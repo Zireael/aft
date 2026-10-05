@@ -473,6 +473,8 @@ pub(crate) struct RepeatObservation {
     /// Picks the reminder's wording: a delegated worker is never told to end
     /// its turn.
     worker_session: bool,
+    /// Prevents reminders from naming a wait tool absent from the caller's catalog.
+    bash_watch_available: bool,
 }
 
 impl RepeatObservation {
@@ -502,6 +504,7 @@ impl RepeatObservation {
         args: &Value,
         preview: bool,
         worker_session: bool,
+        bash_watch_available: bool,
     ) -> Option<Self> {
         if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
             return None;
@@ -511,6 +514,7 @@ impl RepeatObservation {
             tool: tool.to_string(),
             semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
             worker_session,
+            bash_watch_available,
         })
     }
 
@@ -534,6 +538,7 @@ impl RepeatObservation {
                 &self.session_id,
                 &intervention,
                 self.worker_session,
+                self.bash_watch_available,
             );
         }
     }
@@ -562,6 +567,9 @@ pub fn run_tool_call(
         &args,
         ctx.preview,
         ctx.worker_session,
+        format_context
+            .bash_watch_available
+            .unwrap_or(ctx.worker_session),
     );
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;

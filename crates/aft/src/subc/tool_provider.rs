@@ -568,6 +568,13 @@ impl CallerRole {
     pub(crate) fn is_worker(self) -> bool {
         self == Self::Worker
     }
+
+    /// Whether the tools this caller has include `bash_watch`. A worker
+    /// preset includes it; a presetless legacy plugin worker has its own watch
+    /// tool, while a presetless v1 call is resolved as `Head`.
+    pub(crate) fn has_bash_watch(self) -> bool {
+        self == Self::Worker
+    }
 }
 
 /// What a tool call that names no catalog preset gets on a route without a
@@ -1229,6 +1236,11 @@ mod tests {
                     CallerRole::from_preset(preset),
                     "scoped={scoped}"
                 );
+                assert_eq!(
+                    CallerRole::from_preset(preset).has_bash_watch(),
+                    preset == CatalogPreset::Worker,
+                    "scoped={scoped} preset={preset:?}"
+                );
                 // A named preset outranks the plugins' worker flag.
                 assert_eq!(
                     resolve_caller_role(Some(preset.name()), scoped, true).unwrap(),
@@ -1256,6 +1268,12 @@ mod tests {
         assert_eq!(
             resolve_caller_role(None, false, true).unwrap(),
             CallerRole::Worker
+        );
+        assert!(
+            resolve_caller_role(None, false, true)
+                .unwrap()
+                .has_bash_watch(),
+            "legacy plugin workers have their own bash_watch tool"
         );
         // No preset on a scoped route: refused by name, whatever the flag.
         for flag in [false, true] {
@@ -1371,7 +1389,7 @@ mod tests {
     /// `CallerRole::is_worker`, so driving `CallerRole::Worker` through each
     /// one must change it, and `Head` must leave the primary wording.
     #[test]
-    fn caller_role_worker_drives_the_worker_behaviours() {
+    fn bash_caller_role_worker_drives_the_worker_behaviours() {
         use crate::commands::bash_orchestrate as orchestrate;
         for role in [CallerRole::Head, CallerRole::Worker] {
             let worker = role.is_worker();
@@ -1380,20 +1398,50 @@ mod tests {
                 worker.then_some(1_800_000),
                 "{role:?} wait cap"
             );
-            let promotion = orchestrate::format_promotion_message("bash-1", None, 15_000, worker);
+            let promotion = orchestrate::format_promotion_message(
+                "bash-1",
+                None,
+                15_000,
+                worker,
+                role.has_bash_watch(),
+            );
             assert_eq!(promotion.contains("won't wake you"), worker, "{promotion}");
             assert_eq!(
                 promotion.contains("completion reminder"),
                 !worker,
                 "{promotion}"
             );
-            let launch = orchestrate::format_background_launch("bash-1", false, worker);
+            let launch = orchestrate::format_background_launch(
+                "bash-1",
+                false,
+                worker,
+                role.has_bash_watch(),
+            );
             assert_eq!(launch.contains("completion reminder"), !worker, "{launch}");
+            let status_context = crate::subc_format::FormatContext {
+                worker_session: worker,
+                bash_watch_available: Some(role.has_bash_watch()),
+                ..Default::default()
+            };
+            let status_text = crate::subc_format::format_response_with_context(
+                "bash_status",
+                &crate::protocol::Response::success(
+                    "status",
+                    json!({"task_id": "bash-1", "status": "running", "mode": "pipes"}),
+                ),
+                &status_context,
+            );
+            assert_eq!(
+                status_text.contains("bash_watch"),
+                role.has_bash_watch(),
+                "{role:?}: {status_text}"
+            );
             let deadline = orchestrate::kill_deadline_sentence(
                 Some(crate::bash_background::registry::HardKillDeadline {
                     limit_ms: 1_800_000,
                     source: crate::bash_background::registry::HardKillSource::Default,
                 }),
+                Some(0),
                 worker,
             );
             assert_eq!(
@@ -1412,6 +1460,7 @@ mod tests {
                     outputs_identical: true,
                 },
                 worker,
+                role.has_bash_watch(),
             );
             assert_eq!(text.contains("bash_watch"), worker, "{text}");
             assert_eq!(

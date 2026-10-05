@@ -4965,6 +4965,21 @@ impl BgTaskRegistry {
         HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
     }
 
+    /// The task's hard-kill limit and the command start time that its absolute
+    /// deadline is measured from.
+    pub(crate) fn hard_kill_deadline_with_start(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Option<(HardKillDeadline, u64)> {
+        let task = self.task_for_session(task_id, session_id)?;
+        let state = task.state.lock().ok()?;
+        Some((
+            HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)?,
+            state.metadata.started_at,
+        ))
+    }
+
     /// The task's current hard-kill limit in milliseconds since it started.
     #[cfg(all(test, unix))]
     pub(crate) fn hard_kill_limit_ms_for_test(
