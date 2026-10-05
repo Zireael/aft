@@ -231,6 +231,7 @@ describe("Pi bash_watch caller role", () => {
           ? {
               success: true,
               status: "running",
+              started_at: Date.now(),
               hard_kill: { limit_ms: 1_800_000, source: "default" },
             }
           : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
@@ -239,8 +240,9 @@ describe("Pi bash_watch caller role", () => {
         await watch(tool, { task_id: "bash-worker-deadline", timeout_ms: 60_000 }, false)
       ).content[0].text;
       expect(running).toContain(
-        "AFT kills this task once it has run 30 minutes (its default background limit)",
+        "when it has run 30 minutes (its default background limit)",
       );
+      expect(running).toContain("remain.");
       const killed = (await watch(tool, { task_id: "bash-worker-deadline" }, false)).content[0]
         .text;
       expect(killed).toContain("task exited (timed_out");

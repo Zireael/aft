@@ -367,8 +367,7 @@ than capped. A delegated session's blocking `bash` call (`wait: true`, or any fo
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id. The wait limit is not the task's kill
 deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`
-result also names the task's own deadline ("AFT kills this task once it has run 30 minutes (its
-default background limit)…", or the `timeout` you passed), and a task killed by it is reported by
+result also names the task's own deadline (for example, "AFT kills this task at 2026-09-10 10:30:00Z, when it has run 30 minutes (its default background limit); about 12 minutes remain", or the `timeout` you passed), and a task killed by it is reported by
 name ("killed by AFT's default background limit of 30 minutes (exit 124)") rather than as a bare
 timeout. Sync mode
 waits until a `pattern` matches, the task exits, `timeoutMs` elapses, a new message arrives, or the

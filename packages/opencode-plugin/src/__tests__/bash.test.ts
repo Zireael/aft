@@ -1973,6 +1973,7 @@ describe("bash_status tool", () => {
           ? {
               success: true,
               status: "running",
+              started_at: Date.now(),
               hard_kill: { limit_ms: 1_800_000, source: "default" },
             }
           : { success: true, status: "timed_out", exit_code: 124, status_reason: reason },
@@ -1984,8 +1985,9 @@ describe("bash_status tool", () => {
         context,
       );
       expect(running).toContain(
-        "AFT kills this task once it has run 30 minutes (its default background limit)",
+        "when it has run 30 minutes (its default background limit)",
       );
+      expect(running).toContain("remain.");
       expect(running).toContain("each wait you make on it moves that kill");
       const killed = await watchTool.execute({ taskId: "bash-worker-deadline" }, context);
       expect(killed).toContain("task exited (timed_out, exit 124)");

@@ -2360,29 +2360,61 @@ describe("the kill-deadline line is a typed projection element", () => {
   // plugins' own source, so the pattern cannot drift from what the product
   // prints.
   const rules = [{ kind: "kill_deadline" as const }];
-  const running = (hardKill: Record<string, unknown>) => ({ status: "running", hard_kill: hardKill });
+  const startedAtMs = 1_700_000_000_000;
+  const nowMs = startedAtMs + 18 * 60_000;
+  const running = (hardKill: Record<string, unknown>) => ({
+    status: "running",
+    started_at: startedAtMs,
+    hard_kill: hardKill,
+  });
+  const render = (data: Record<string, unknown>, role: "primary" | "worker") =>
+    taskKillDeadlineText(data, role, nowMs);
 
-  test("every wording the product emits parses into limit, source and worker renewal", () => {
+  test("every wording the product emits parses absolute time, limit, source and remaining duration", () => {
     const defaultLimit = { limit_ms: 1_800_000, source: "default" };
-    expect(projectText(taskKillDeadlineText(running(defaultLimit), "primary"), rules)).toEqual({
-      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: false },
+    expect(projectText(render(running(defaultLimit), "primary"), rules)).toEqual({
+      kill_deadline: {
+        at: "2023-11-14 22:43:20Z",
+        limit: "30 minutes",
+        remaining: "12 minutes",
+        source: "default",
+        worker_renewal: false,
+      },
     });
-    expect(projectText(taskKillDeadlineText(running(defaultLimit), "worker"), rules)).toEqual({
-      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: true },
+    expect(projectText(render(running(defaultLimit), "worker"), rules)).toEqual({
+      kill_deadline: {
+        at: "2023-11-14 22:43:20Z",
+        limit: "30 minutes",
+        remaining: "12 minutes",
+        source: "default",
+        worker_renewal: true,
+      },
     });
     expect(
       projectText(
-        taskKillDeadlineText(running({ limit_ms: 45_000, source: "timeout" }), "worker"),
+        taskKillDeadlineText(
+          running({ limit_ms: 45_000, source: "timeout" }),
+          "worker",
+          startedAtMs + 10_000,
+        ),
         rules,
       ),
-    ).toEqual({ kill_deadline: { limit: "45s", source: "timeout", worker_renewal: false } });
+    ).toEqual({
+      kill_deadline: {
+        at: "2023-11-14 22:14:05Z",
+        limit: "45s",
+        remaining: "35s",
+        source: "timeout",
+        worker_renewal: false,
+      },
+    });
     expect(projectText(taskKillDeadlineText({ status: "running" }, "primary"), rules)).toEqual({
       kill_deadline: { source: "none", worker_renewal: false },
     });
   });
 
   test("a changed or mangled deadline wording is unparsed, not skipped", () => {
-    const line = taskKillDeadlineText(running({ limit_ms: 1_800_000, source: "default" }), "primary");
+    const line = render(running({ limit_ms: 1_800_000, source: "default" }), "primary");
     expect(() => projectText(line.replace("unless", "until"), rules)).toThrow(
       "projection_unparsed",
     );
@@ -2404,13 +2436,19 @@ describe("the kill-deadline line is a typed projection element", () => {
       },
       { kind: "kill_deadline" as const },
     ];
-    const text = `Task bash-1a2b: running\n${taskKillDeadlineText(
+    const text = `Task bash-1a2b: running\n${render(
       running({ limit_ms: 1_800_000, source: "default" }),
       "primary",
     )}`;
     expect(projectText(text, watchRules)).toEqual({
       task_state: "running",
-      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: false },
+      kill_deadline: {
+        at: "2023-11-14 22:43:20Z",
+        limit: "30 minutes",
+        remaining: "12 minutes",
+        source: "default",
+        worker_renewal: false,
+      },
     });
   });
 });

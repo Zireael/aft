@@ -11,6 +11,7 @@ import {
   maybeAppendGrepSearchHint,
   resolveWatchTimeoutMs,
   taskKillDeadlineText,
+  type WatchCallerRole,
   watchPollDelayMs,
   workerBackgroundTaskNote,
   workerWatchStillRunning,
@@ -61,26 +62,70 @@ describe("resolveWatchTimeoutMs", () => {
 });
 
 describe("taskKillDeadlineText", () => {
+  const startedAtMs = 1_700_000_000_000;
+  const defaultNowMs = startedAtMs + 18 * 60_000;
   const running = (hardKill?: Record<string, unknown>) => ({
     status: "running",
+    started_at: startedAtMs,
     ...(hardKill ? { hard_kill: hardKill } : {}),
   });
 
   test("names the default background limit, and for a worker that its waits move it", () => {
     const def = { limit_ms: 1_800_000, source: "default" };
-    expect(taskKillDeadlineText(running(def), "primary")).toBe(
-      "AFT kills this task once it has run 30 minutes (its default background limit) unless you pass a longer `timeout`.",
+    expect(taskKillDeadlineText(running(def), "primary", defaultNowMs)).toBe(
+      "AFT kills this task at 2023-11-14 22:43:20Z, when it has run 30 minutes (its default background limit) unless you pass a longer `timeout`; about 12 minutes remain.",
     );
-    const worker = taskKillDeadlineText(running(def), "worker");
-    expect(worker).toContain("once it has run 30 minutes (its default background limit)");
+    const worker = taskKillDeadlineText(running(def), "worker", defaultNowMs);
+    expect(worker).toContain("when it has run 30 minutes (its default background limit)");
     expect(worker).toContain("each wait you make on it moves that kill");
+    expect(worker).toContain("about 12 minutes remain.");
   });
 
   test("names an explicit timeout as the caller's, and a missing deadline as none", () => {
-    expect(taskKillDeadlineText(running({ limit_ms: 45_000, source: "timeout" }), "worker")).toBe(
-      "AFT kills this task once it has run 45s (the `timeout` you passed).",
+    expect(
+      taskKillDeadlineText(
+        running({ limit_ms: 45_000, source: "timeout" }),
+        "worker",
+        startedAtMs + 10_000,
+      ),
+    ).toBe(
+      "AFT kills this task at 2023-11-14 22:14:05Z, when it has run 45s (the `timeout` you passed); about 35s remain.",
     );
-    expect(taskKillDeadlineText(running(), "worker")).toBe("This task has no kill deadline.");
+    expect(taskKillDeadlineText(running(), "worker", defaultNowMs)).toBe(
+      "This task has no kill deadline.",
+    );
+  });
+
+  test("matches the Rust renderer's shared deadline wording fixture", () => {
+    const fixture = JSON.parse(
+      fs.readFileSync(
+        new URL("../../../../spec/fixtures/bash-kill-deadline-parity.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      cases: Array<{
+        name: string;
+        started_at_ms: number;
+        now_ms: number;
+        limit_ms: number;
+        source: string;
+        role: WatchCallerRole;
+        expected: string;
+      }>;
+    };
+    for (const entry of fixture.cases) {
+      expect(
+        taskKillDeadlineText(
+          {
+            status: "running",
+            started_at: entry.started_at_ms,
+            hard_kill: { limit_ms: entry.limit_ms, source: entry.source },
+          },
+          entry.role,
+          entry.now_ms,
+        ),
+      ).toBe(entry.expected);
+    }
   });
 
   test("names the limit that killed a timed-out task, and says nothing for other ends", () => {

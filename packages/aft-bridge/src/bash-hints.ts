@@ -180,16 +180,16 @@ export function formatWaitDuration(ms: number): string {
 
 /**
  * The sentence naming a task's own kill deadline, from the `hard_kill` field
- * of the engine's task status (`{ limit_ms, source: "default" | "timeout" }`),
- * or how the task was killed when its hard kill fired (`status_reason`).
- *
- * It is kept apart from how long a watch waits: a worker whose watch said it
- * had "no limit" never learned the task itself had a 30-minute default kill,
- * read the kill as its command failing, and re-ran it twice. Every watch
- * result carries this sentence, so a wait limit is never shown without the
- * task's own deadline. Mirrors `kill_deadline_sentence` in the engine.
+ * and `started_at` of the engine's task status (`{ limit_ms, source }`), or how
+ * the task was killed when its hard kill fired (`status_reason`). It reports an
+ * absolute UTC deadline measured from command start and the approximate time
+ * remaining. Mirrors `kill_deadline_sentence` in the engine.
  */
-export function taskKillDeadlineText(data: Record<string, unknown>, role: WatchCallerRole): string {
+export function taskKillDeadlineText(
+  data: Record<string, unknown>,
+  role: WatchCallerRole,
+  nowMs = Date.now(),
+): string {
   if (data.status === "timed_out") {
     const reason = typeof data.status_reason === "string" ? data.status_reason : "";
     return reason === ""
@@ -204,14 +204,50 @@ export function taskKillDeadlineText(data: Record<string, unknown>, role: WatchC
   if (!hardKill || typeof hardKill.limit_ms !== "number") {
     return "This task has no kill deadline.";
   }
-  const limit = formatWaitDuration(hardKill.limit_ms);
+  const startedAtMs = data.started_at;
+  if (typeof startedAtMs !== "number" || !Number.isSafeInteger(startedAtMs)) {
+    return "This task has no kill deadline.";
+  }
+  const limitMs = hardKill.limit_ms;
+  const limit = formatWaitDuration(limitMs);
+  const deadlineAt = startedAtMs + limitMs;
+  const when = `at ${formatKillDeadlineUtc(deadlineAt)}, when it has run ${limit}`;
+  let source: string;
   if (hardKill.source === "timeout") {
-    return `AFT kills this task once it has run ${limit} (the \`timeout\` you passed).`;
+    source = "(the `timeout` you passed)";
+  } else if (role === "worker") {
+    source =
+      "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit";
+  } else {
+    source = "(its default background limit) unless you pass a longer `timeout`";
   }
-  if (role === "worker") {
-    return `AFT kills this task once it has run ${limit} (its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (\`bash.worker_wait_max_ms\`) after the wait, so it is not killed while you keep waiting; pass a \`timeout\` to set your own limit.`;
+  const remaining =
+    deadlineAt <= nowMs
+      ? "; the kill deadline has passed"
+      : `; about ${formatApproximateRemaining(deadlineAt - nowMs)} remain`;
+  return `AFT kills this task ${when} ${source}${remaining}.`;
+}
+
+function formatKillDeadlineUtc(unixMs: number): string {
+  const date = new Date(unixMs);
+  if (!Number.isFinite(date.getTime())) throw new Error("invalid bash task start time");
+  const year = String(date.getUTCFullYear()).padStart(4, "0");
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  const hour = String(date.getUTCHours()).padStart(2, "0");
+  const minute = String(date.getUTCMinutes()).padStart(2, "0");
+  const second = String(date.getUTCSeconds()).padStart(2, "0");
+  const millis = date.getUTCMilliseconds();
+  const fraction = millis === 0 ? "" : `.${String(millis).padStart(3, "0")}`;
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}${fraction}Z`;
+}
+
+function formatApproximateRemaining(ms: number): string {
+  if (ms >= 60_000) {
+    const minutes = Math.max(1, Math.floor((ms + 30_000) / 60_000));
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
   }
-  return `AFT kills this task once it has run ${limit} (its default background limit) unless you pass a longer \`timeout\`.`;
+  return formatWaitDuration(ms);
 }
 
 function isTerminalTaskStatus(status: unknown): boolean {

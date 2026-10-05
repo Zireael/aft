@@ -187,8 +187,9 @@ fn assert_detached_at_limit(
     assert!(text.contains("bash_kill"), "{label}: {text:?}");
     assert!(!text.contains("completion reminder"), "{label}: {text:?}");
     assert!(
-        text.contains("AFT kills this task once it has run")
-            && text.contains("(its default background limit)"),
+        text.contains("AFT kills this task at ")
+            && text.contains("when it has run 30 minutes (its default background limit)")
+            && text.contains("remain."),
         "{label}: the reply names the task's own kill deadline: {text:?}"
     );
     let status = status_of(aft, &task_id);

@@ -103,7 +103,7 @@ pub(crate) fn format_wait_limit(ms: u64) -> String {
 /// move the default kill, so a task it keeps watching is not killed.
 pub(crate) fn kill_deadline_sentence(
     deadline: Option<HardKillDeadline>,
-    started_at_ms: Option<u64>,
+    started_at_ms: u64,
     worker_session: bool,
 ) -> String {
     kill_deadline_sentence_at(deadline, started_at_ms, unix_millis_now(), worker_session)
@@ -111,7 +111,7 @@ pub(crate) fn kill_deadline_sentence(
 
 fn kill_deadline_sentence_at(
     deadline: Option<HardKillDeadline>,
-    started_at_ms: Option<u64>,
+    started_at_ms: u64,
     now_ms: u64,
     worker_session: bool,
 ) -> String {
@@ -119,32 +119,26 @@ fn kill_deadline_sentence_at(
         return "This task has no kill deadline.".to_string();
     };
     let limit = format_wait_limit(deadline.limit_ms);
-    let deadline_at = started_at_ms.map(|started| started.saturating_add(deadline.limit_ms));
-    let when = deadline_at.map_or_else(
-        || format!("once it has run {limit}"),
-        |at| {
-            let at = i64::try_from(at).unwrap_or(i64::MAX);
-            format!(
-                "at {}, when it has run {limit}",
-                crate::subc_format::format_unix_millis_utc(at)
-            )
-        },
+    let deadline_at = started_at_ms.saturating_add(deadline.limit_ms);
+    let when = format!(
+        "at {}, when it has run {limit}",
+        crate::subc_format::format_unix_millis_utc(
+            i64::try_from(deadline_at).unwrap_or(i64::MAX)
+        )
     );
     let source = match deadline.source {
         HardKillSource::Timeout => "(the `timeout` you passed)".to_string(),
         HardKillSource::Default if worker_session => "(its default background limit), but each wait you make on it moves that kill to at least the worker wait limit (`bash.worker_wait_max_ms`) after the wait, so it is not killed while you keep waiting; pass a `timeout` to set your own limit".to_string(),
         HardKillSource::Default => "(its default background limit) unless you pass a longer `timeout`".to_string(),
     };
-    let remaining = deadline_at.map_or_else(String::new, |at| {
-        if at <= now_ms {
-            "; the kill deadline has passed".to_string()
-        } else {
-            format!(
-                "; about {} remain",
-                format_approximate_remaining(at - now_ms)
-            )
-        }
-    });
+    let remaining = if deadline_at <= now_ms {
+        "; the kill deadline has passed".to_string()
+    } else {
+        format!(
+            "; about {} remain",
+            format_approximate_remaining(deadline_at - now_ms)
+        )
+    };
     format!("AFT kills this task {when} {source}{remaining}.")
 }
 
@@ -177,14 +171,14 @@ pub(crate) fn kill_deadline_note(
     session_id: &str,
     worker_session: bool,
 ) -> String {
-    let deadline = registry.hard_kill_deadline_with_start(task_id, session_id);
+    let Some((deadline, started_at_ms)) =
+        registry.hard_kill_deadline_with_start(task_id, session_id)
+    else {
+        return "\nThis task has no kill deadline.".to_string();
+    };
     format!(
         "\n{}",
-        kill_deadline_sentence(
-            deadline.map(|(deadline, _)| deadline),
-            deadline.map(|(_, started_at)| started_at),
-            worker_session
-        )
+        kill_deadline_sentence(Some(deadline), started_at_ms, worker_session)
     )
 }
 
@@ -1173,7 +1167,7 @@ mod tests {
                 limit_ms: 30 * 60_000,
                 source: HardKillSource::Default,
             }),
-            Some(started_at_ms),
+            started_at_ms,
             now_ms,
             false,
         );
@@ -1195,7 +1189,7 @@ mod tests {
                 limit_ms: 30 * 60_000,
                 source: HardKillSource::Timeout,
             }),
-            Some(started_at_ms),
+            started_at_ms,
             now_ms,
             false,
         );
@@ -1211,6 +1205,46 @@ mod tests {
             explicit_text.contains("about 12 minutes remain"),
             "{explicit_text}"
         );
+    }
+
+    #[test]
+    fn kill_deadline_sentence_matches_the_typescript_shared_fixture() {
+        #[derive(Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            started_at_ms: u64,
+            now_ms: u64,
+            limit_ms: u64,
+            source: String,
+            role: String,
+            expected: String,
+        }
+
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../../../spec/fixtures/bash-kill-deadline-parity.json"
+        ))
+        .expect("shared kill-deadline fixture parses");
+        for case in fixture.cases {
+            let source = match case.source.as_str() {
+                "default" => HardKillSource::Default,
+                "timeout" => HardKillSource::Timeout,
+                other => panic!("unknown hard-kill source: {other}"),
+            };
+            let actual = kill_deadline_sentence_at(
+                Some(HardKillDeadline {
+                    limit_ms: case.limit_ms,
+                    source,
+                }),
+                case.started_at_ms,
+                case.now_ms,
+                case.role == "worker",
+            );
+            assert_eq!(actual, case.expected, "{}", case.name);
+        }
     }
 
     #[test]

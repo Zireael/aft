@@ -1441,7 +1441,7 @@ mod tests {
                     limit_ms: 1_800_000,
                     source: crate::bash_background::registry::HardKillSource::Default,
                 }),
-                Some(0),
+                0,
                 worker,
             );
             assert_eq!(
