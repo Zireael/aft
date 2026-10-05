@@ -767,7 +767,10 @@ fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
     for i in 0..2048 {
         let path = root.join(format!("file_{i:04}.rs"));
         std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
-        std::fs::File::open(&path)
+        // Windows refuses to change times through a read-only handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(
                 std::fs::FileTimes::new()
