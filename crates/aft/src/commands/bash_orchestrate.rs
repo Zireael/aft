@@ -122,9 +122,7 @@ fn kill_deadline_sentence_at(
     let deadline_at = started_at_ms.saturating_add(deadline.limit_ms);
     let when = format!(
         "at {}, when it has run {limit}",
-        crate::subc_format::format_unix_millis_utc(
-            i64::try_from(deadline_at).unwrap_or(i64::MAX)
-        )
+        crate::subc_format::format_unix_millis_utc(i64::try_from(deadline_at).unwrap_or(i64::MAX))
     );
     let source = match deadline.source {
         HardKillSource::Timeout => "(the `timeout` you passed)".to_string(),
