@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::hashline::scan::{scan_bytes_with_request, CaptureError};
@@ -1097,8 +1097,105 @@ pub fn capture_taggable_read_with_options(
     options: RenderOptions,
 ) -> io::Result<ReadPublication> {
     let canonical_path = canonical_path.as_ref();
+    let source = read_source(canonical_path)?;
+    capture_taggable_source_with_options(
+        store,
+        canonical_path,
+        requested_path,
+        selection,
+        options,
+        &source,
+    )
+}
+
+/// Bytes and permissions observed through the same open file. Metadata is kept
+/// private so callers cannot accidentally pair earlier bytes with a later stat.
+pub(crate) struct ReadSource {
+    bytes: Vec<u8>,
+    metadata: fs::Metadata,
+}
+
+impl ReadSource {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(crate) fn has_complete_bytes(&self) -> bool {
+        self.metadata.is_file()
+            && self.metadata.len() <= MAX_FILE_READ_BYTES
+            && self.bytes.len() as u64 == self.metadata.len()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn read_source(path: &Path) -> io::Result<ReadSource> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            // Windows cannot open a directory as a regular File. Preserve the
+            // disk capture's explicit non-regular-file refusal in that case.
+            let metadata = fs::metadata(path)?;
+            if !metadata.is_file() {
+                return Ok(ReadSource {
+                    bytes: Vec::new(),
+                    metadata,
+                });
+            }
+            return Err(error);
+        }
+    };
+    let metadata = file.metadata()?;
+    let mut bytes = Vec::new();
+    if metadata.is_file() && metadata.len() <= MAX_FILE_READ_BYTES {
+        #[cfg(test)]
+        SOURCE_READS.with(|reads| reads.set(reads.get() + 1));
+        file.read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        SOURCE_AFTER_READ.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let after = file.metadata()?;
+        if !same_read_identity(&metadata, &after) || bytes.len() as u64 != metadata.len() {
+            return Err(io::Error::other("file changed during hashline read"));
+        }
+    }
+    Ok(ReadSource { bytes, metadata })
+}
+
+fn same_read_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.mode() != after.mode()
+        {
+            return false;
+        }
+    }
+    before.len() == after.len()
+        && before.modified().ok() == after.modified().ok()
+        && before.permissions().readonly() == after.permissions().readonly()
+}
+
+/// Apply the disk capture's complete refusal and publication rules to bytes
+/// already obtained with `read_source`, without opening the file again.
+pub(crate) fn capture_taggable_source_with_options(
+    store: &mut SnapshotStore,
+    canonical_path: &Path,
+    requested_path: impl Into<String>,
+    selection: ReadSelection,
+    options: RenderOptions,
+    source: &ReadSource,
+) -> io::Result<ReadPublication> {
     let requested_path = requested_path.into();
-    let metadata = fs::metadata(canonical_path)?;
+    let metadata = &source.metadata;
     if !metadata.is_file() {
         return Ok(ReadPublication::Tagless {
             rendering: TaglessRendering {
@@ -1110,7 +1207,7 @@ pub fn capture_taggable_read_with_options(
             reason: UntaggableReason::NotRegularFile,
         });
     }
-    let write_eligible = is_write_eligible(&metadata);
+    let write_eligible = is_write_eligible(metadata);
     if metadata.len() > MAX_FILE_READ_BYTES {
         return Ok(ReadPublication::Tagless {
             rendering: TaglessRendering {
@@ -1126,8 +1223,8 @@ pub fn capture_taggable_read_with_options(
         });
     }
 
-    let bytes = fs::read(canonical_path)?;
-    if is_binary(&bytes) {
+    let bytes = source.bytes();
+    if is_binary(bytes) {
         return Ok(ReadPublication::Tagless {
             rendering: TaglessRendering {
                 text: String::new(),
@@ -1138,7 +1235,7 @@ pub fn capture_taggable_read_with_options(
             reason: UntaggableReason::Binary,
         });
     }
-    if std::str::from_utf8(&bytes).is_err() {
+    if std::str::from_utf8(bytes).is_err() {
         return Ok(ReadPublication::Tagless {
             rendering: TaglessRendering {
                 text: String::new(),
@@ -1150,7 +1247,7 @@ pub fn capture_taggable_read_with_options(
         });
     }
 
-    let source_snapshot = scan_bytes_with_request(&bytes, selection.scan_request())
+    let source_snapshot = scan_bytes_with_request(bytes, selection.scan_request())
         .snapshot
         .expect("in-memory scans always observe EOF");
     let selected = selection.selected_lines(source_snapshot.total_lines);
@@ -1448,6 +1545,23 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn read_source_rejects_identity_changes_during_the_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("changing.txt");
+        fs::write(&path, b"old\n").unwrap();
+        let changed = path.clone();
+        SOURCE_AFTER_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(changed, b"a new and longer version\n").unwrap();
+            }))
+        });
+        assert!(
+            read_source(&path).is_err(),
+            "never combine earlier bytes with a later file stamp"
+        );
+    }
 
     fn snapshot(bytes: &[u8], lines: impl IntoIterator<Item = usize>) -> Snapshot {
         scan_bytes_with_request(bytes, ScanRequest::new(CoverageInput::lines(lines)))
