@@ -200,6 +200,7 @@ new_fixture() {
   write_tests_workflow "$dir/work" "      - $DEFAULT_BRANCH\n      - \"train/**\""
   mkdir -p "$dir/work/scripts/lib"
   cp "$SCRIPT_DIR/watch-ci.sh" "$dir/work/scripts/watch-ci.sh"
+  cp "$SCRIPT_DIR/check-path-deps.py" "$dir/work/scripts/check-path-deps.py"
   cp "$SCRIPT_DIR/lib/operator-gh.sh" "$dir/work/scripts/lib/operator-gh.sh"
   cp "$SCRIPT_DIR/lib/workflow-gates.py" "$dir/work/scripts/lib/workflow-gates.py"
   git -C "$dir/work" add base.txt .github/workflows/tests.yml scripts
@@ -872,6 +873,22 @@ expect_out "actions/runs/4242" "red CI prints the run url"
   fail "red CI deleted the train branch instead of leaving it to fix"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/work" rev-parse HEAD~1)" ] ||
   fail "red CI moved origin/main"
+
+# --- local path-dependency preflight refuses an external Cargo path ----------
+dir="$(new_fixture external-path-dependency)"
+cat > "$dir/work/Cargo.toml" <<'TOML'
+[dependencies]
+escape = { path = "../outside" }
+TOML
+git -C "$dir/work" add Cargo.toml
+git -C "$dir/work" commit -qm "add external dependency path"
+git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
+add_train_commit "$dir/work" "external-path-dependency"
+run_train "$dir" external-path-dependency
+expect_rc 2 "external path dependency refuses before pushing"
+expect_out "table=[dependencies] dependency=escape" "the local gate names the escaping dependency"
+[ -z "$(origin_ref "$dir" refs/heads/train/external-path-dependency)" ] ||
+  fail "the external path dependency preflight pushed a train branch"
 
 # --- green: lands on main, train branch cleaned up -------------------------
 dir="$(new_fixture green)"

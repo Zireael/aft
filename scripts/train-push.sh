@@ -822,6 +822,12 @@ if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
   refuse "working tree is not clean (commit or stash before pushing a train)"
 fi
 
+# A train must not add local dependency paths that escape the repository. CI
+# runs the same check, and this catches the problem before spending a push run.
+if ! python3 "$REPO/scripts/check-path-deps.py"; then
+  refuse "dependency path resolves outside the repository"
+fi
+
 # A local main behind origin/main means the train was built on a stale base:
 # CI would test it green and the land would still be refused in step 5.
 if git -C "$REPO" rev-parse --verify -q refs/heads/"$default_branch" >/dev/null; then
