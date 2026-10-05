@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict
 from unittest.mock import Mock, patch
 
 MODULE = importlib.util.spec_from_file_location("inspect_truth", Path(__file__).with_name("run.py"))
@@ -19,13 +20,13 @@ def row(symbol="X", category="dead_code"):
     return {"path": "src/a.rs", "symbol": symbol, "line": 1, "category": category}
 
 
-class ScoreFixtures(unittest.TestCase):
+class ScoreFixtureBase(unittest.TestCase):
     def setUp(self):
         target = harness.CHECKOUT_ROOT / "target"
         target.mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=target)
         self.root = Path(self.temp.name)
-        self.spec = {"name": "fixture", "commit": "pin", "languages": [
+        self.spec: Dict[str, Any] = {"name": "fixture", "commit": "pin", "languages": [
             {"language": "rust", "include_paths": ["src/"], "oracle": {}}]}
         self.before = self.output("before", [])
         self.after = self.output("after", [])
@@ -59,6 +60,8 @@ class ScoreFixtures(unittest.TestCase):
     def bucket(self, result):
         return next(b for b in result["buckets"] if b["category"] == "dead_code")
 
+
+class ScoreFixtures(ScoreFixtureBase):
     def test_judgment_before_only(self):
         self.output("before", [row()])
         self.judge()
@@ -185,6 +188,17 @@ class CollectionFixtures(unittest.TestCase):
         self.assertEqual(terminal["summary"]["dead_code"]["status"], "unavailable")
         self.assertEqual(session.inspect.call_count, 3)
 
+    def test_pending_page_retries_the_same_offset(self):
+        session = Mock()
+        session.inspect.side_effect = [self.response([{"file": "a.rs", "symbol": "A", "line": 1}], 2,
+            {"total": 2, "offset": 0, "next_offset": 1}),
+            self.response([], None, summary={"status": "pending"}),
+            self.response([{"file": "a.rs", "symbol": "B", "line": 2}], 2,
+                {"total": 2, "offset": 1, "next_offset": None})]
+        with patch.object(harness.time, "sleep"):
+            self.assertEqual(len(harness.collect_category(session, "dead_code", [], {}, [])), 2)
+        self.assertEqual([c.kwargs.get("offset") for c in session.inspect.call_args_list], [None, 1, 1])
+
     def test_baseline_building_gap_is_retried(self):
         session = Mock()
         session.inspect.side_effect = [self.response([], None, summary={"unavailable": True,
@@ -209,18 +223,14 @@ class CollectionFixtures(unittest.TestCase):
                     harness.collect_category(session, "dead_code", [], {}, [])
 
 
-class CheckoutFixtures(unittest.TestCase):
-    setUp = ScoreFixtures.setUp
-    tearDown = ScoreFixtures.tearDown
-    output = ScoreFixtures.output
-    score = ScoreFixtures.score
-
+class CheckoutFixtures(ScoreFixtureBase):
     def test_local_checkout_restores_config_and_status_even_on_error(self):
         self.spec["local_checkout"] = True
         config = self.root / ".cortexkit" / "aft.jsonc"
         config.parent.mkdir()
         config.write_bytes(b"// Tracked configuration\n{}\n")
         before = config.read_bytes()
+        record = {}
         with patch.object(harness, "CHECKOUT_ROOT", self.root), patch.object(harness, "git_output", return_value=" M run.py\n"):
             with self.assertRaisesRegex(RuntimeError, "collection failed"):
                 with harness.local_hygiene(self.root, self.spec) as record:
@@ -228,6 +238,16 @@ class CheckoutFixtures(unittest.TestCase):
                     raise RuntimeError("collection failed")
         self.assertEqual(config.read_bytes(), before)
         self.assertEqual(record["git_status_before"], record["git_status_after"])
+
+    def test_local_checkout_removes_a_new_config(self):
+        self.spec["local_checkout"] = True
+        config = self.root / ".cortexkit" / "aft.jsonc"
+        with patch.object(harness, "CHECKOUT_ROOT", self.root), patch.object(harness, "git_output", return_value=""):
+            with harness.local_hygiene(self.root, self.spec):
+                config.parent.mkdir()
+                config.write_text("temporary")
+        self.assertFalse(config.exists())
+        self.assertFalse(config.parent.exists())
 
     def test_local_checkout_does_not_hide_install_changes(self):
         self.spec["local_checkout"] = True
@@ -253,7 +273,7 @@ class CheckoutFixtures(unittest.TestCase):
 
     def test_collections_preserve_baseline_and_use_fresh_storage_on_retry(self):
         session = Mock()
-        session.configure.return_value = {"success": True}
+        session.configure.side_effect = [{"success": False}, {"success": True}, {"success": True}]
         session.calls = 1
         session.inspect.return_value = {"success": True,
             "summary": {c: {"count": 0} for c in harness.AFT_CATEGORIES}, "details": {}}
@@ -261,13 +281,16 @@ class CheckoutFixtures(unittest.TestCase):
         (self.root / "fixture").mkdir()
         with patch.object(harness, "corpus_pin", return_value="pin"), patch.object(harness, "tracked_files", return_value=[]), \
                 patch.object(harness, "AftSession", return_value=session) as sessions:
+            with self.assertRaisesRegex(RuntimeError, "configure failed"):
+                harness.collect_aft(self.root, self.spec, Path("aft"), 0)
             harness.collect_aft(self.root, self.spec, Path("aft"), 0)
             first = (out / "aft.json").read_bytes()
             harness.collect_aft(self.root, self.spec, Path("different-aft"), 0)
             self.assertEqual((out / "aft.json").read_bytes(), first)
             harness.collect_aft(self.root, self.spec, Path("aft"), 0, "aaaaaaaaa")
-        self.assertEqual(sessions.call_count, 2)
+        self.assertEqual(sessions.call_count, 3)
         self.assertNotEqual(sessions.call_args_list[0].args[2], sessions.call_args_list[1].args[2])
+        self.assertNotEqual(sessions.call_args_list[1].args[2], sessions.call_args_list[2].args[2])
 
     def test_one_bucket_set_per_language(self):
         self.spec["languages"].append({"language": "typescript", "include_paths": ["src/"], "oracle": {}})
@@ -275,6 +298,16 @@ class CheckoutFixtures(unittest.TestCase):
         snapshot["typescript"] = {"buckets": {"dead_code": []}}
         (self.after / "oracle.json").write_text(json.dumps(snapshot))
         self.assertEqual([b["language"] for b in self.score()["buckets"]], ["rust", "typescript"])
+
+    def test_oracles_are_cached_once_per_corpus_pin(self):
+        with patch.object(harness, "corpus_pin", return_value="pin"), \
+                patch.object(harness, "run_language_oracles") as runner, \
+                patch.object(harness, "normalize_oracles", return_value={"buckets": {"dead_code": []}}), \
+                patch.object(harness, "install"):
+            first = harness.run_oracles(self.root, self.spec, False)
+            second = harness.run_oracles(self.root, self.spec, False, "aaaaaaaaa")
+        self.assertEqual(first, second)
+        self.assertEqual(runner.call_count, 1)
 
     def test_aft_stderr_backpressure_does_not_block_responses(self):
         binary = self.root / "fake-aft"

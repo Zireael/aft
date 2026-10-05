@@ -343,6 +343,20 @@ def children_index(files: Iterable[str]) -> Dict[str, List[str]]:
     return {key: sorted(value) for key, value in index.items()}
 
 
+def ready_category(session: AftSession, category: str, scope: List[str],
+                   response: Optional[Dict[str, Any]] = None, offset: Optional[int] = None) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"scope": scope}
+    if offset is not None:
+        params["offset"] = offset
+    response = response if response is not None else session.inspect([category], **params)
+    for _attempt in range(20):
+        if category not in pending_categories(response):
+            return response
+        time.sleep(15)
+        response = session.inspect([category], **params)
+    return response
+
+
 def collect_category(session: AftSession, category: str, scope: List[str],
                      tree: Dict[str, List[str]], truncated: List[Dict[str, Any]],
                      response: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -354,12 +368,7 @@ def collect_category(session: AftSession, category: str, scope: List[str],
     split (a list of paths in halves, a directory into its children) until
     every piece fits under the cap.
     """
-    response = response if response is not None else session.inspect([category], scope=scope)
-    for _attempt in range(20):
-        if category not in pending_categories(response):
-            break
-        time.sleep(15)
-        response = session.inspect([category], scope=scope)
+    response = ready_category(session, category, scope, response)
     if not response.get("success", False):
         raise RuntimeError(f"inspect {category} scope={scope[:3]} failed: {response}")
     summary = (response.get("summary") or {}).get(category) or {}
@@ -393,7 +402,7 @@ def collect_category(session: AftSession, category: str, scope: List[str],
             if following != offset + len(items) or following <= offset:
                 raise RuntimeError(f"{category}: invalid next_offset {following}")
             offset = following
-            response = session.inspect([category], scope=scope, offset=offset)
+            response = ready_category(session, category, scope, offset=offset)
             if not response.get("success"):
                 raise RuntimeError(f"{category}: page failed: {response}")
             summary = (response.get("summary") or {}).get(category) or {}
@@ -1262,6 +1271,11 @@ def judgment_category(category: str) -> str:
 
 def side_rows(out: Path, side: str, category: str) -> List[Dict[str, Any]]:
     if side == "aft":
+        if category == "diagnostics":
+            record = json.loads((out / "aft.json").read_text())
+            return [finding("diagnostics", row.get("file", ""), row["severity"], row.get("line", 0))
+                    for diag in (record.get("diagnostics") or {}).values() for row in diag["items"]
+                    if row.get("severity") in ("error", "warning")]
         return aft_findings(out).get(judgment_category(category), [])
     snapshot = json.loads((out / "oracle.json").read_text())
     return [row for lang in snapshot.values() for label, rows in lang["buckets"].items()
@@ -1326,6 +1340,7 @@ def cell_changes(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
         if new is not None and new >= old:
             continue
         if (new is None and metric == "precision" and after.get("aft_count") == 0
+                and isinstance(before.get("aft_count"), int)
                 and before.get("aft_rows_judged") == before.get("aft_count")):
             continue
         lowered.append(metric)
@@ -1350,7 +1365,7 @@ def score_repo(corpus_root: Path, spec: Dict[str, Any], out: Optional[Path] = No
               "aft_truncated_scopes": record.get("truncated_scopes", []),
               "aft_project_counts": record.get("project_counts"),
               "git_status_before": record.get("git_status_before"), "git_status_after": record.get("git_status_after"),
-              "judgments_unapplied": {e["_file"]: 0 for e in entries}}
+              "judgments_unapplied": {p.name: 0 for p in judgments_dir.glob("*.json")}}
     for entry in entries:
         if not any(judgment_matches(entry, r) for r in side_rows(out, entry["side"], entry["category"])):
             result["judgments_unapplied"][entry["_file"]] += 1
@@ -1361,7 +1376,7 @@ def score_repo(corpus_root: Path, spec: Dict[str, Any], out: Optional[Path] = No
             if label == "diagnostics":
                 diag = (record.get("diagnostics") or {}).get(language)
                 if diag:
-                    result["buckets"].append(score_diagnostics(spec["name"], language, repo, diag, oracle_rows))
+                    result["buckets"].append(score_diagnostics(spec["name"], language, repo, diag, oracle_rows, entries))
                 continue
             category = judgment_category(label)
             summary = (record.get("project_summary") or {}).get(category) or {}
@@ -1393,7 +1408,7 @@ def score_repo(corpus_root: Path, spec: Dict[str, Any], out: Optional[Path] = No
 
 
 def score_diagnostics(name: str, lang: str, repo: Path, diag: Dict[str, Any],
-                      oracle_diags: List[Dict[str, Any]]) -> Dict[str, Any]:
+                       oracle_diags: List[Dict[str, Any]], entries: Optional[List[Dict]] = None) -> Dict[str, Any]:
     sample_files = set(diag["sample"])
     aft = []
     for item in diag["items"]:
@@ -1405,13 +1420,21 @@ def score_diagnostics(name: str, lang: str, repo: Path, diag: Dict[str, Any],
     oracle = [finding("diagnostics", o["path"], o["severity"], o["line"], severity=o["severity"],
                       message=o.get("message", ""), code=o["symbol"])
               for o in oracle_diags if o["path"] in sample_files]
+    oracle, judged_out, judged = apply_judgments("diagnostics", aft, oracle, entries or [])
     bucket = score_bucket(name, "diagnostics", lang, aft, oracle, repo, by_line=True,
-                          note=f"{len(sample_files)} sampled files; matched on (file, line)")
+                           note=f"{len(sample_files)} sampled files; matched on (file, line)")
+    bucket.update(oracle_rows_judged_out=judged_out, aft_rows_judged=judged, aft_rows_unjudged=len(aft) - judged,
+                  status="scored", languages_unsupported=[])
     bucket["sample_files"] = len(sample_files)
     bucket["aft_pages_with_gaps"] = sum(
         1 for page in diag["pages"] if not ((page.get("summary") or {}).get("complete", True)))
     bucket["errors_aft"] = sum(1 for a in aft if a["severity"] == "error")
     bucket["errors_oracle"] = sum(1 for o in oracle if o["severity"] == "error")
+    for page in diag["pages"]:
+        summary = page.get("summary") or {}
+        if (summary.get("status") in ("pending", "unavailable") or summary.get("unavailable") or
+                any(g.get("kind") in ("analysis_incomplete", "tier2_unavailable") for g in summary.get("gaps", []))):
+            bucket.update(status="unknown", aft_count=None, precision=None, recall=None, unknown_summary=summary)
     return bucket
 
 
@@ -1486,11 +1509,42 @@ def render_markdown(results: List[Dict[str, Any]], corpus: List[Dict[str, Any]])
     return "\n".join(lines) + "\n"
 
 
+def slice_table(results: List[Dict]) -> List[str]:
+    lines = ["| repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for result in results:
+        for b in result["buckets"]:
+            lines.append("| " + " | ".join(str(v) for v in (
+                result["repo"], b["language"], b["category"], b.get("status", "not scored"),
+                fmt(b.get("aft_count")), fmt(b.get("oracle_count")),
+                f"{fmt(b.get('agreed'))} (+{fmt(b.get('agreed_file_level'))})",
+                fmt(b.get("precision")), fmt(b.get("recall")), b.get("oracle_rows_judged_out", 0),
+                b.get("aft_rows_judged", 0), b.get("aft_rows_unjudged", 0))) + " |")
+    for result in results:
+        lines.extend(["", f"- {result['repo']} raw output: `{result['raw_output']}` (corpus `{result['commit']}`).",
+                      f"- {result['repo']} baseline_aft_truncated_scopes (excluded from comparison): "
+                      + json.dumps(result["baseline_aft_truncated_scopes"]),
+                      f"- {result['repo']} judgments_unapplied: " + json.dumps(result["judgments_unapplied"])])
+        for b in result["buckets"]:
+            if b.get("languages_unsupported"):
+                lines.append(f"- {result['repo']}/{b['language']}/{b['category']} languages_unsupported: "
+                             + json.dumps(b["languages_unsupported"]))
+            if b.get("status") == "unknown":
+                lines.append(f"- {result['repo']}/{b['language']}/{b['category']} unknown: "
+                             + json.dumps(b["unknown_summary"]))
+        if result.get("git_status_before") is not None:
+            lines.extend([f"- {result['repo']} git status --porcelain before:", "```text",
+                          result["git_status_before"].rstrip(), "```",
+                          f"- {result['repo']} git status --porcelain after:", "```text",
+                          result["git_status_after"].rstrip(), "```"])
+    return lines
+
+
 def render_slice(before: List[Dict], after: List[Dict], slice_id: str) -> Tuple[str, List[str]]:
     baseline = {(r["repo"], b["language"], b["category"]): b for r in before for b in r["buckets"]}
     lines = [f"# {slice_id}: inspect-truth cell gate", "",
              f"Baseline: 0.58.2 (`{BASELINE_COMMIT}`). Both tables use this revision of `run.py score`.", "",
-             "## Before", "", render_markdown(before, []), "## After", "", render_markdown(after, []),
+             "## Before", "", *slice_table(before), "", "## After", "", *slice_table(after), "",
              "## Cell rule", ""]
     failures = []
     for result in after:
