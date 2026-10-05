@@ -29,6 +29,7 @@ DEFAULT_BRANCH="master"
 # aliases) out of the fixtures: a signing requirement in ~/.gitconfig would
 # otherwise fail every commit here for a reason that has nothing to do with the
 # script under test.
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export HOME="$TMP_ROOT/home"
 mkdir -p "$HOME"
 
@@ -876,17 +877,36 @@ expect_out "actions/runs/4242" "red CI prints the run url"
 
 # --- local path-dependency preflight refuses an external Cargo path ----------
 dir="$(new_fixture external-path-dependency)"
+mkdir -p "$dir/work/src" "$dir/outside/src"
 cat > "$dir/work/Cargo.toml" <<'TOML'
+[package]
+name = "fixture-root"
+version = "0.1.0"
+edition = "2021"
+
 [dependencies]
 escape = { path = "../outside" }
 TOML
-git -C "$dir/work" add Cargo.toml
+cat > "$dir/work/src/lib.rs" <<'RUST'
+pub fn fixture() {}
+RUST
+cat > "$dir/outside/Cargo.toml" <<'TOML'
+[package]
+name = "escape"
+version = "0.1.0"
+edition = "2021"
+TOML
+cat > "$dir/outside/src/lib.rs" <<'RUST'
+pub fn fixture() {}
+RUST
+cargo metadata --format-version 1 --offline --manifest-path "$dir/work/Cargo.toml" > /dev/null
+git -C "$dir/work" add Cargo.toml Cargo.lock src/lib.rs
 git -C "$dir/work" commit -qm "add external dependency path"
 git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
 add_train_commit "$dir/work" "external-path-dependency"
 run_train "$dir" external-path-dependency
 expect_rc 2 "external path dependency refuses before pushing"
-expect_out "table=[dependencies] dependency=escape" "the local gate names the escaping dependency"
+expect_out "package=escape" "the local gate names the escaping package"
 [ -z "$(origin_ref "$dir" refs/heads/train/external-path-dependency)" ] ||
   fail "the external path dependency preflight pushed a train branch"
 

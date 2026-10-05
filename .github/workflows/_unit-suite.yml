@@ -50,12 +50,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Refuse dependency paths outside the repository
         run: |
           python3 scripts/check-path-deps.py
           python3 scripts/check-path-deps.py --self-test
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - uses: mozilla-actions/sccache-action@v0.0.11
 

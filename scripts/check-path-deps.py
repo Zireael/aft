@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refuse Cargo and npm dependencies that escape the repository tree."""
+"""Refuse Cargo and npm dependencies that resolve outside this repository."""
 
 from __future__ import annotations
 
@@ -7,237 +7,14 @@ import argparse
 import glob
 import json
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from typing import Any
 
-try:
-    import tomllib
-except ImportError:  # Python 3.9 and 3.10 are still common on developer machines.
-    tomllib = None
-
 SKIP_DIRS = {".git", "node_modules", "target"}
-CARGO_DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 NPM_DEPENDENCY_TABLES = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
-
-
-def _strip_toml_comment(line: str) -> str:
-    quote = ""
-    escaped = False
-    for index, character in enumerate(line):
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = ""
-        elif quote:
-            if character == quote:
-                quote = ""
-        elif character in ('"', "'"):
-            quote = character
-        elif character == "#":
-            return line[:index]
-    return line
-
-
-def _toml_key_parts(source: str) -> list[str]:
-    parts: list[str] = []
-    start = 0
-    quote = ""
-    escaped = False
-    for index, character in enumerate(source):
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = ""
-        elif quote:
-            if character == quote:
-                quote = ""
-        elif character in ('"', "'"):
-            quote = character
-        elif character == ".":
-            raw = source[start:index].strip()
-            parts.append(_toml_string(raw) if raw.startswith(('"', "'")) else raw)
-            start = index + 1
-    raw = source[start:].strip()
-    if raw:
-        parts.append(_toml_string(raw) if raw.startswith(('"', "'")) else raw)
-    return parts
-
-
-def _toml_string(source: str) -> str:
-    source = source.strip()
-    if source.startswith('"') and source.endswith('"'):
-        try:
-            return json.loads(source)
-        except json.JSONDecodeError:
-            return source[1:-1]
-    if source.startswith("'") and source.endswith("'"):
-        return source[1:-1]
-    return source
-
-
-def _top_level_split(source: str, separator: str) -> list[str]:
-    pieces: list[str] = []
-    start = 0
-    quote = ""
-    escaped = False
-    depth = 0
-    for index, character in enumerate(source):
-        if quote == '"':
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote = ""
-        elif quote:
-            if character == quote:
-                quote = ""
-        elif character in ('"', "'"):
-            quote = character
-        elif character in "[{(":
-            depth += 1
-        elif character in "]})":
-            depth -= 1
-        elif character == separator and depth == 0:
-            pieces.append(source[start:index])
-            start = index + 1
-    pieces.append(source[start:])
-    return pieces
-
-
-def _inline_path(value: str) -> str | None:
-    value = value.strip()
-    if not (value.startswith("{") and value.endswith("}")):
-        return None
-    for field in _top_level_split(value[1:-1], ","):
-        assignment = _top_level_split(field, "=")
-        if len(assignment) == 2 and _toml_key_parts(assignment[0]) == ["path"]:
-            raw = assignment[1].strip()
-            if raw.startswith(('"', "'")):
-                return _toml_string(raw)
-            return raw
-    return None
-
-
-def _scope_for_table(table: list[str]) -> tuple[list[str], str] | None:
-    if len(table) == 1 and table[0] in CARGO_DEPENDENCY_TABLES:
-        return table, f"[{table[0]}]"
-    if len(table) == 2 and table[0] == "workspace" and table[1] == "dependencies":
-        return table, "[workspace.dependencies]"
-    if len(table) == 3 and table[0] == "target" and table[2] in CARGO_DEPENDENCY_TABLES:
-        return table, f"[target.{table[1]}.{table[2]}]"
-    if len(table) == 2 and table[0] == "patch":
-        return table, f"[patch.{table[1]}]"
-    if table == ["replace"]:
-        return table, "[replace]"
-    return None
-
-
-def _toml_string_array(source: str) -> list[str]:
-    source = source.strip()
-    if not (source.startswith("[") and source.endswith("]")):
-        return []
-    return [
-        _toml_string(value.strip())
-        for value in _top_level_split(source[1:-1], ",")
-        if value.strip().startswith(('"', "'"))
-    ]
-
-
-def fallback_cargo_data(
-    manifest: Path,
-) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
-    """Read dependency path fields on Python versions without stdlib tomllib."""
-    references: list[tuple[str, str, str]] = []
-    workspace_patterns: list[tuple[str, str]] = []
-    lines = manifest.read_text(encoding="utf-8").splitlines()
-    table: list[str] = []
-    index = 0
-    while index < len(lines):
-        line = _strip_toml_comment(lines[index]).strip()
-        index += 1
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            header = line[2:-2] if line.startswith("[[") else line[1:-1]
-            table = _toml_key_parts(header)
-            continue
-        assignment = _top_level_split(line, "=")
-        if len(assignment) != 2:
-            continue
-        key_parts = _toml_key_parts(assignment[0])
-        value = assignment[1].strip()
-        # TOML permits whitespace and comments inside multiline arrays/inline tables.
-        balance = 0
-        quote = ""
-        escaped = False
-        for character in value:
-            if quote == '"':
-                if escaped:
-                    escaped = False
-                elif character == "\\":
-                    escaped = True
-                elif character == quote:
-                    quote = ""
-            elif quote:
-                if character == quote:
-                    quote = ""
-            elif character in ('"', "'"):
-                quote = character
-            elif character in "[{":
-                balance += 1
-            elif character in "]}":
-                balance -= 1
-        while balance > 0 and index < len(lines):
-            continuation = _strip_toml_comment(lines[index]).strip()
-            index += 1
-            value += " " + continuation
-            for character in continuation:
-                if quote == '"':
-                    if escaped:
-                        escaped = False
-                    elif character == "\\":
-                        escaped = True
-                    elif character == quote:
-                        quote = ""
-                elif quote:
-                    if character == quote:
-                        quote = ""
-                elif character in ('"', "'"):
-                    quote = character
-                elif character in "[{":
-                    balance += 1
-                elif character in "]}":
-                    balance -= 1
-
-        scope = _scope_for_table(table)
-        if scope is not None:
-            path_value = _inline_path(value)
-            if path_value is not None and key_parts:
-                references.append((scope[1], ".".join(key_parts), path_value))
-            elif len(key_parts) > 1 and key_parts[-1] == "path":
-                references.append((scope[1], ".".join(key_parts[:-1]), _toml_string(value)))
-            continue
-        if table == ["workspace"] and key_parts in (["members"], ["exclude"]):
-            workspace_table = f"[workspace.{key_parts[0]}]"
-            workspace_patterns.extend(
-                (workspace_table, pattern) for pattern in _toml_string_array(value)
-            )
-            continue
-        dependency_scope = _scope_for_table(table[:-1]) if table else None
-        if dependency_scope is not None:
-            if key_parts == ["path"]:
-                raw = value.strip()
-                references.append((dependency_scope[1], table[-1], _toml_string(raw)))
-    return references, workspace_patterns
 
 
 def repository_manifests(root: Path) -> list[Path]:
@@ -258,161 +35,145 @@ def inside_repository(path: Path, root: Path) -> bool:
         return False
 
 
-def check_root(root: Path) -> tuple[list[str], int, int]:
+def short_error(result: subprocess.CompletedProcess[str]) -> str:
+    text = " ".join((result.stderr or result.stdout).split())
+    return text[:400] or f"command exited {result.returncode} without a diagnostic"
+
+
+def cargo_workspace_root(manifest: Path) -> tuple[Path | None, str | None]:
+    command = [
+        "cargo",
+        "locate-project",
+        "--workspace",
+        "--manifest-path",
+        str(manifest),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        return None, str(error)
+    if result.returncode:
+        return None, short_error(result)
+    try:
+        root_manifest = Path(json.loads(result.stdout)["root"]).resolve(strict=True)
+    except (KeyError, json.JSONDecodeError, OSError, RuntimeError) as error:
+        return None, f"invalid cargo locate-project response: {error}"
+    return root_manifest, None
+
+
+def cargo_metadata(manifest: Path) -> tuple[dict[str, Any] | None, str | None]:
+    command = [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        str(manifest),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        return None, str(error)
+
+    # Hosted CI can have a fresh Cargo cache. Retry there without --offline,
+    # while keeping --locked so the check never rewrites a committed lockfile.
+    if result.returncode and os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
+        online_command = [part for part in command if part != "--offline"]
+        try:
+            result = subprocess.run(online_command, capture_output=True, text=True, check=False)
+        except OSError as error:
+            return None, str(error)
+    if result.returncode:
+        return None, short_error(result)
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        return None, f"cargo metadata returned invalid JSON: {error}"
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("packages"), list):
+        return None, "cargo metadata response has no package list"
+    return metadata, None
+
+
+def check_root(root: Path) -> tuple[list[str], list[str], list[str], int, int, int]:
     root = root.resolve(strict=True)
     manifests = repository_manifests(root)
     violations: list[str] = []
-    checked_paths = 0
+    unchecked: list[str] = []
+    errors: list[str] = []
+    checked_references = 0
+    cargo_roots: dict[Path, Path] = {}
 
-    def check_reference(manifest: Path, table: str, dependency: str, raw_path: Any) -> None:
-        nonlocal checked_paths
-        checked_paths += 1
-        if not isinstance(raw_path, str):
-            violations.append(
-                f"{manifest.relative_to(root)}: table={table} dependency={dependency} "
-                f"has a non-string path value {raw_path!r}"
-            )
-            return
-        if os.name != "nt":
-            windows_path = PureWindowsPath(raw_path)
-            if windows_path.drive or windows_path.root:
-                violations.append(
-                    f"{manifest.relative_to(root)}: table={table} dependency={dependency} "
-                    f"resolved=<Windows absolute path {raw_path}>"
-                )
-                return
-        raw_paths = [raw_path]
-        if os.name != "nt" and "\\" in raw_path:
-            raw_paths.append(raw_path.replace("\\", "/"))
+    def check_reference(manifest: Path, table: str, dependency: str, raw_path: str) -> None:
+        nonlocal checked_references
+        checked_references += 1
         try:
-            resolved_paths = [(manifest.parent / path).resolve(strict=False) for path in raw_paths]
+            resolved = (manifest.parent / raw_path).resolve(strict=False)
         except (OSError, RuntimeError) as error:
             violations.append(
                 f"{manifest.relative_to(root)}: table={table} dependency={dependency} "
-                f"cannot resolve path {raw_path!r}: {error}"
+                f"cannot resolve {raw_path!r}: {error}"
             )
             return
-        resolved = next((path for path in resolved_paths if not inside_repository(path, root)), None)
-        if resolved is not None:
+        if not inside_repository(resolved, root):
             violations.append(
-                f"{manifest.relative_to(root)}: table={table} dependency={dependency} "
-                f"resolved={resolved}"
+                f"{manifest.relative_to(root)}: table={table} dependency={dependency} resolved={resolved}"
             )
 
-    def check_workspace_patterns(manifest: Path, table: str, patterns: Any) -> None:
-        nonlocal checked_paths
+    def check_workspace_globs(manifest: Path, patterns: Any) -> None:
+        nonlocal checked_references
         if not isinstance(patterns, list):
             return
         for pattern in patterns:
             if not isinstance(pattern, str) or pattern.startswith("!"):
                 continue
-            checked_paths += 1
-            if os.name != "nt":
-                windows_pattern = PureWindowsPath(pattern)
-                if windows_pattern.drive or windows_pattern.root:
-                    violations.append(
-                        f"{manifest.relative_to(root)}: table={table} dependency={pattern} "
-                        f"resolved=<Windows absolute path {pattern}>"
-                    )
-                    continue
-            patterns_to_check = [pattern]
-            if os.name != "nt" and "\\" in pattern:
-                patterns_to_check.append(pattern.replace("\\", "/"))
-            bases = [manifest.parent / item for item in patterns_to_check]
-            candidates = [
-                Path(candidate)
-                for item in patterns_to_check
-                for candidate in glob.glob(str(manifest.parent / item), recursive=True)
-            ]
-            # Check the pattern even when it matches no package, and each match
-            # so a symlink cannot hide an escape.
-            outside_path: Path | None = None
-            resolution_error: str | None = None
-            for candidate in [*bases, *candidates]:
+            checked_references += 1
+            paths = [manifest.parent / pattern]
+            paths.extend(Path(item) for item in glob.glob(str(manifest.parent / pattern), recursive=True))
+            outside: Path | None = None
+            for candidate in paths:
                 try:
                     resolved = candidate.resolve(strict=False)
                 except (OSError, RuntimeError) as error:
-                    resolution_error = str(error)
+                    violations.append(
+                        f"{manifest.relative_to(root)}: table=[workspaces] dependency={pattern} "
+                        f"cannot resolve path: {error}"
+                    )
                     break
                 if not inside_repository(resolved, root):
-                    outside_path = resolved
+                    outside = resolved
                     break
-            if resolution_error is not None:
+            if outside is not None:
                 violations.append(
-                    f"{manifest.relative_to(root)}: table={table} dependency={pattern} "
-                    f"cannot resolve path: {resolution_error}"
-                )
-            elif outside_path is not None:
-                violations.append(
-                    f"{manifest.relative_to(root)}: table={table} dependency={pattern} "
-                    f"resolved={outside_path}"
+                    f"{manifest.relative_to(root)}: table=[workspaces] dependency={pattern} resolved={outside}"
                 )
 
-    def check_cargo(manifest: Path) -> None:
-        if tomllib is None:
-            try:
-                references, workspace_patterns = fallback_cargo_data(manifest)
-            except OSError as error:
-                violations.append(f"{manifest.relative_to(root)}: cannot read Cargo.toml: {error}")
-                return
-            for table, dependency, path_value in references:
-                check_reference(manifest, table, dependency, path_value)
-            for table, pattern in workspace_patterns:
-                check_workspace_patterns(manifest, table, [pattern])
-            return
-        try:
-            document = tomllib.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            violations.append(f"{manifest.relative_to(root)}: cannot read Cargo.toml: {error}")
-            return
+    for manifest in manifests:
+        if manifest.name == "Cargo.toml":
+            workspace_manifest, error = cargo_workspace_root(manifest)
+            if error is not None:
+                relative = manifest.relative_to(root).as_posix()
+                message = f"{relative}: cargo locate-project failed: {error}"
+                if relative.startswith("crates/aft/tests/fixtures/"):
+                    unchecked.append(message)
+                else:
+                    errors.append(message)
+                continue
+            assert workspace_manifest is not None
+            cargo_roots.setdefault(workspace_manifest, workspace_manifest)
+            continue
 
-        def check_dependency_table(dependencies: Any, table: str) -> None:
-            if not isinstance(dependencies, dict):
-                return
-            for dependency, specification in dependencies.items():
-                if isinstance(specification, dict) and "path" in specification:
-                    check_reference(manifest, table, str(dependency), specification["path"])
-
-        for table_name in CARGO_DEPENDENCY_TABLES:
-            check_dependency_table(document.get(table_name), f"[{table_name}]")
-
-        workspace = document.get("workspace", {})
-        if isinstance(workspace, dict):
-            check_dependency_table(workspace.get("dependencies"), "[workspace.dependencies]")
-            check_workspace_patterns(manifest, "[workspace.members]", workspace.get("members"))
-            check_workspace_patterns(manifest, "[workspace.exclude]", workspace.get("exclude"))
-
-        targets = document.get("target", {})
-        if isinstance(targets, dict):
-            for target_name, target_tables in targets.items():
-                if isinstance(target_tables, dict):
-                    for table_name in CARGO_DEPENDENCY_TABLES:
-                        check_dependency_table(
-                            target_tables.get(table_name),
-                            f"[target.{target_name}.{table_name}]",
-                        )
-
-        # Cargo's [replace] table uses dependency specifications just like
-        # dependency tables, but keys are package IDs rather than crate names.
-        check_dependency_table(document.get("replace"), "[replace]")
-
-        patch_tables = document.get("patch", {})
-        if isinstance(patch_tables, dict):
-            for registry, dependencies in patch_tables.items():
-                check_dependency_table(dependencies, f"[patch.{registry}]")
-
-    def check_package(manifest: Path) -> None:
         try:
             document = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
-            violations.append(f"{manifest.relative_to(root)}: cannot read package.json: {error}")
-            return
+            errors.append(f"{manifest.relative_to(root)}: cannot read package.json: {error}")
+            continue
         if not isinstance(document, dict):
-            violations.append(f"{manifest.relative_to(root)}: package.json must contain an object")
-            return
-
-        for table_name in NPM_DEPENDENCY_TABLES:
-            dependencies = document.get(table_name, {})
+            errors.append(f"{manifest.relative_to(root)}: package.json must contain an object")
+            continue
+        for table in NPM_DEPENDENCY_TABLES:
+            dependencies = document.get(table, {})
             if not isinstance(dependencies, dict):
                 continue
             for dependency, specification in dependencies.items():
@@ -421,24 +182,53 @@ def check_root(root: Path) -> tuple[list[str], int, int]:
                         if specification.startswith(prefix):
                             check_reference(
                                 manifest,
-                                f"[{table_name}]",
+                                f"[{table}]",
                                 str(dependency),
                                 specification[len(prefix) :],
                             )
                             break
-
         workspaces = document.get("workspaces", [])
         if isinstance(workspaces, dict):
             workspaces = workspaces.get("packages", [])
-        check_workspace_patterns(manifest, "[workspaces]", workspaces)
+        check_workspace_globs(manifest, workspaces)
 
-    for manifest in manifests:
-        if manifest.name == "Cargo.toml":
-            check_cargo(manifest)
-        else:
-            check_package(manifest)
+    checked_workspaces = 0
+    checked_package_manifests: set[Path] = set()
+    for workspace_manifest, discovered_from in sorted(cargo_roots.items()):
+        metadata, error = cargo_metadata(workspace_manifest)
+        if error is not None:
+            relative = workspace_manifest.relative_to(root).as_posix()
+            message = f"{relative}: cargo metadata --locked --offline failed: {error}"
+            if relative.startswith("spikes/"):
+                unchecked.append(message)
+            else:
+                errors.append(message)
+            continue
+        assert metadata is not None
+        checked_workspaces += 1
+        packages = metadata["packages"]
+        # Metadata contains patched packages only when they participate in the
+        # resolved graph; an unused [patch] entry cannot add code to the build.
+        for package in packages:
+            if not isinstance(package, dict) or package.get("source") is not None:
+                continue
+            try:
+                manifest_path = Path(package["manifest_path"]).resolve(strict=False)
+            except (KeyError, OSError, RuntimeError, TypeError) as error:
+                errors.append(f"{discovered_from.relative_to(root)}: invalid package manifest path: {error}")
+                continue
+            if manifest_path in checked_package_manifests:
+                continue
+            checked_package_manifests.add(manifest_path)
+            checked_references += 1
+            if not inside_repository(manifest_path, root):
+                package_name = str(package.get("name", "<unnamed>"))
+                violations.append(
+                    f"Cargo workspace {discovered_from.relative_to(root)}: package={package_name} "
+                    f"manifest={manifest_path} resolved={manifest_path}"
+                )
 
-    return violations, len(manifests), checked_paths
+    return violations, unchecked, errors, len(manifests), checked_references, checked_workspaces
 
 
 def _write(root: Path, relative: str, content: str) -> None:
@@ -447,153 +237,221 @@ def _write(root: Path, relative: str, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def self_test() -> int:
-    failures = 0
+def _cargo_package(directory: Path, name: str, version: str = "0.1.0") -> None:
+    _write(
+        directory,
+        "Cargo.toml",
+        f'[package]\nname = "{name}"\nversion = "{version}"\nedition = "2021"\n',
+    )
+    _write(directory, "src/lib.rs", "pub fn fixture() {}\n")
 
-    def verify(name: str, setup: Any, expected_count: int, expected_fragments: tuple[str, ...] = ()) -> None:
-        nonlocal failures
+
+def _prepare_lock(root: Path) -> str | None:
+    command = [
+        "cargo",
+        "metadata",
+        "--format-version",
+        "1",
+        "--offline",
+        "--manifest-path",
+        str(root / "Cargo.toml"),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as error:
+        return str(error)
+    if result.returncode:
+        return short_error(result)
+    if not (root / "Cargo.lock").exists():
+        return "cargo metadata did not create a fixture lockfile"
+    return None
+
+
+def self_test(selected_case: str | None = None) -> int:
+    failures = 0
+    cases_run = 0
+
+    def verify(
+        name: str,
+        setup: Any,
+        expected_violations: tuple[tuple[str, ...], ...] = (),
+        expected_errors: tuple[tuple[str, ...], ...] = (),
+        expected_unchecked: tuple[tuple[str, ...], ...] = (),
+    ) -> None:
+        nonlocal failures, cases_run
+        if selected_case is not None and name != selected_case:
+            return
+        cases_run += 1
         with tempfile.TemporaryDirectory(prefix="check-path-deps-") as temporary:
-            root = Path(temporary) / "repo"
+            temporary_root = Path(temporary)
+            root = temporary_root / "repo"
+            outside = temporary_root / "outside"
             root.mkdir()
-            outside = Path(temporary) / "outside"
             outside.mkdir()
-            setup(root, outside)
-            violations, _, _ = check_root(root)
-            passed = len(violations) == expected_count and all(
-                any(fragment in violation for violation in violations)
-                for fragment in expected_fragments
+            try:
+                setup(root, outside)
+            except (AssertionError, OSError) as error:
+                failures += 1
+                print(f"check-path-deps self-test: FAIL — {name}: fixture setup failed: {error}", file=sys.stderr)
+                return
+            violations, unchecked, errors, _, _, _ = check_root(root)
+
+            def matches(actual: list[str], expected: tuple[tuple[str, ...], ...]) -> bool:
+                return len(actual) == len(expected) and all(
+                    any(all(fragment in line for fragment in group) for line in actual)
+                    for group in expected
+                )
+
+            passed = (
+                matches(violations, expected_violations)
+                and matches(errors, expected_errors)
+                and matches(unchecked, expected_unchecked)
             )
             if passed:
                 print(f"check-path-deps self-test: PASS — {name}")
             else:
                 failures += 1
                 print(
-                    f"check-path-deps self-test: FAIL — {name}: expected {expected_count} "
-                    f"violation(s), found {len(violations)}; {violations}",
+                    f"check-path-deps self-test: FAIL — {name}: expected violations={expected_violations}, "
+                    f"errors={expected_errors}, unchecked={expected_unchecked}; got violations={violations}, "
+                    f"errors={errors}, unchecked={unchecked}",
                     file=sys.stderr,
                 )
 
+    def direct_path(root: Path, outside: Path) -> None:
+        _cargo_package(root, "fixture-root")
+        _cargo_package(outside, "outside")
+        with (root / "Cargo.toml").open("a", encoding="utf-8") as file:
+            file.write('\n[dependencies]\nescape = { package = "outside", path = "../outside" }\n')
+        error = _prepare_lock(root)
+        assert error is None, error
+
     verify(
         "[dependencies] path outside repository is refused",
-        lambda root, outside: _write(
-            root, "Cargo.toml", '[dependencies]\nexternal = { path = "../outside" }\n'
-        ),
-        1,
-        ("table=[dependencies]", "dependency=external", "resolved="),
+        direct_path,
+        (("package=outside", "resolved="),),
     )
+
+    def patched_path(root: Path, outside: Path) -> None:
+        _cargo_package(root, "fixture-root")
+        _cargo_package(outside, "patched", "1.0.0")
+        with (root / "Cargo.toml").open("a", encoding="utf-8") as file:
+            file.write(
+                '\n[dependencies]\npatched = "1.0.0"\n'
+                '[patch.crates-io]\npatched = { path = "../outside" }\n'
+            )
+        error = _prepare_lock(root)
+        assert error is None, error
+
     verify(
         "[patch.crates-io] path outside repository is refused",
-        lambda root, outside: _write(
-            root, "Cargo.toml", '[patch.crates-io]\nexternal = { path = "../outside" }\n'
-        ),
-        1,
-        ("table=[patch.crates-io]", "dependency=external", "resolved="),
+        patched_path,
+        (("package=patched", "resolved="),),
     )
+
     verify(
         "package.json file: path outside repository is refused",
         lambda root, outside: _write(
             root, "package.json", '{"dependencies":{"external":"file:../outside"}}\n'
         ),
-        1,
-        ("table=[dependencies]", "dependency=external", "resolved="),
+        (("table=[dependencies]", "dependency=external", "resolved="),),
     )
     verify(
         "package.json link: path outside repository is refused",
         lambda root, outside: _write(
             root, "package.json", '{"devDependencies":{"external":"link:../outside"}}\n'
         ),
-        1,
-        ("table=[devDependencies]", "dependency=external", "resolved="),
+        (("table=[devDependencies]", "dependency=external", "resolved="),),
     )
 
-    def symlink_fixture(root: Path, outside: Path) -> None:
+    def symlink_path(root: Path, outside: Path) -> None:
+        _cargo_package(root, "fixture-root")
+        _cargo_package(outside, "outside")
         (root / "linked-outside").symlink_to(outside, target_is_directory=True)
-        _write(root, "Cargo.toml", '[dependencies]\nexternal = { path = "linked-outside" }\n')
+        with (root / "Cargo.toml").open("a", encoding="utf-8") as file:
+            file.write('\n[dependencies]\nescape = { package = "outside", path = "linked-outside" }\n')
+        error = _prepare_lock(root)
+        assert error is None, error
 
     verify(
-        "symlinked path dependency escaping repository is refused",
-        symlink_fixture,
-        1,
-        ("table=[dependencies]", "dependency=external", "resolved="),
-    )
-    verify(
-        "Windows-style path separators cannot hide an escape",
-        lambda root, outside: _write(
-            root,
-            "Cargo.toml",
-            "[dependencies]\nwindows_escape = { path = '" + r"..\outside" + "' }\n",
-        ),
-        1,
-        ("dependency=windows_escape", "resolved="),
+        "symlinked Cargo path dependency escaping repository is refused",
+        symlink_path,
+        (("package=outside", "resolved="),),
     )
 
-    def other_cargo_tables(root: Path, outside: Path) -> None:
-        _write(
-            root,
-            "Cargo.toml",
-            """[build-dependencies]
-build_out = { path = "../outside" }
-
-[target.'cfg(unix)'.dev-dependencies.target_out]
-path = "../outside"
-
-[dependencies]
-dotted.path = "../outside"
-
-[workspace.dependencies]
-workspace_out = { path = "../outside" }
-
-[replace]
-"replaced:1.0" = { path = "../outside" }
-""",
-        )
+    def cargo_tables(root: Path, outside: Path) -> None:
+        _cargo_package(root, "fixture-root")
+        for name in ("build-out", "target-out", "workspace-out"):
+            _cargo_package(outside / name, name, "1.0.0")
+        with (root / "Cargo.toml").open("a", encoding="utf-8") as file:
+            file.write(
+                '\n[build-dependencies]\nbuild-out = { path = "../outside/build-out" }\n'
+                "[target.'cfg(unix)'.dev-dependencies]\n"
+                'target-out = { path = "../outside/target-out" }\n'
+                '\n[workspace]\nmembers = []\n'
+                '[workspace.dependencies]\nworkspace-out = { path = "../outside/workspace-out" }\n'
+                '\n[dependencies]\nworkspace-out = { workspace = true }\n'
+            )
+        error = _prepare_lock(root)
+        assert error is None, error
 
     verify(
-        "build, target, workspace, and replace dependency tables are scanned",
-        other_cargo_tables,
-        5,
-        ("table=[build-dependencies]", "dependency=build_out", "table=[target.cfg(unix).dev-dependencies]", "dependency=target_out", "table=[dependencies]", "dependency=dotted", "table=[workspace.dependencies]", "dependency=workspace_out", "table=[replace]", "dependency=replaced:1.0", "resolved="),
+        "Cargo build, target, and workspace dependency tables resolve through metadata",
+        cargo_tables,
+        (("package=build-out",), ("package=target-out",), ("package=workspace-out",)),
     )
 
     def inside_only(root: Path, outside: Path) -> None:
+        _cargo_package(root, "fixture-root")
+        _cargo_package(root / "crates/inside", "inside")
+        with (root / "Cargo.toml").open("a", encoding="utf-8") as file:
+            file.write(
+                '\n[workspace]\nmembers = ["crates/inside"]\n'
+                '[dependencies]\ninside = { path = "crates/inside" }\n'
+            )
         _write(
             root,
-            "Cargo.toml",
-            '[dependencies]\ninside = { path = "crates/inside" }\n'
-            '[workspace]\nmembers = ["crates/*"]\n',
+            "package.json",
+            '{"dependencies":{"file-dep":"file:./vendor/file-dep",'
+            '"link-dep":"link:./vendor/link-dep"},"workspaces":["packages/*"]}\n',
         )
-        _write(root, "crates/inside/Cargo.toml", "[package]\nname='inside'\nversion='0.1.0'\n")
-        _write(root, "package.json", '{"dependencies":{"file-dep":"file:./vendor/file-dep","link-dep":"link:./vendor/link-dep"},"workspaces":["packages/*"]}\n')
         _write(root, "vendor/file-dep/package.json", "{}\n")
         _write(root, "vendor/link-dep/package.json", "{}\n")
         _write(root, "packages/app/package.json", "{}\n")
         _write(root, "target/Cargo.toml", '[dependencies]\nignored = { path = "../../outside" }\n')
         _write(root, "node_modules/ignored/package.json", '{"dependencies":{"bad":"file:../../outside"}}\n')
         _write(root, ".git/ignored/Cargo.toml", '[dependencies]\nignored = { path = "../../outside" }\n')
-
-    verify("inside-repository paths pass and generated directories are skipped", inside_only, 0)
+        error = _prepare_lock(root)
+        assert error is None, error
 
     verify(
-        "workspace glob outside repository is refused",
-        lambda root, outside: _write(
-            root, "package.json", '{"workspaces":["../../outside/*"]}\n'
-        ),
-        1,
-        ("table=[workspaces]", "dependency=../../outside/*", "resolved="),
-    )
-    verify(
-        "Cargo workspace member glob outside repository is refused",
-        lambda root, outside: _write(
-            root, "Cargo.toml", '[workspace]\nmembers = ["../../outside/*"]\n'
-        ),
-        1,
-        ("table=[workspace.members]", "dependency=../../outside/*", "resolved="),
+        "inside-repository dependencies and workspace members pass; generated trees are skipped",
+        inside_only,
     )
 
+    verify(
+        "package workspace glob outside repository is refused",
+        lambda root, outside: _write(root, "package.json", '{"workspaces":["../../outside/*"]}\n'),
+        (("table=[workspaces]", "dependency=../../outside/*", "resolved="),),
+    )
+
+    def outside_workspace_member(root: Path, outside: Path) -> None:
+        _cargo_package(outside, "outside-member")
+        _write(root, "Cargo.toml", '[workspace]\nmembers = ["../outside*"]\n')
+
+    verify(
+        "Cargo workspace member glob outside repository is not accepted",
+        outside_workspace_member,
+        expected_errors=(("not hierarchically below the workspace root",),),
+    )
+
+    if selected_case is not None and cases_run == 0:
+        print(f"check-path-deps self-test: unknown case {selected_case!r}", file=sys.stderr)
+        return 2
     if failures:
         print(f"check-path-deps self-test: {failures} check(s) failed", file=sys.stderr)
         return 1
-    print("check-path-deps self-test: all 10 checks passed")
+    print(f"check-path-deps self-test: all {cases_run} checks passed")
     return 0
 
 
@@ -601,26 +459,35 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, help="repository root to check (defaults to this script's repository)")
     parser.add_argument("--self-test", action="store_true", help="run fixture-based self-tests")
+    parser.add_argument("--self-test-case", help="run one named self-test case for mutation checks")
     args = parser.parse_args()
-    if args.self_test:
-        if args.root is not None:
-            parser.error("--root cannot be combined with --self-test")
-        return self_test()
+    if args.self_test or args.self_test_case:
+        if args.root is not None or (args.self_test_case and not args.self_test):
+            parser.error("self-test options cannot be combined with --root, and --self-test-case requires --self-test")
+        return self_test(args.self_test_case)
 
     root = args.root if args.root is not None else Path(__file__).resolve().parent.parent
     try:
-        violations, manifest_count, path_count = check_root(root)
+        violations, unchecked, errors, manifest_count, reference_count, workspace_count = check_root(root)
     except (OSError, RuntimeError) as error:
         print(f"check-path-deps: cannot inspect repository {root}: {error}", file=sys.stderr)
         return 2
-    if violations:
-        for violation in violations:
-            print(f"check-path-deps: OUTSIDE {violation}", file=sys.stderr)
+    for violation in violations:
+        print(f"check-path-deps: OUTSIDE {violation}", file=sys.stderr)
+    for error in errors:
+        print(f"check-path-deps: ERROR {error}", file=sys.stderr)
+    for item in unchecked:
+        print(f"check-path-deps: UNCHECKED {item}", file=sys.stderr)
+    if violations or errors:
         return 1
-    print(
-        f"checked {manifest_count} manifests, {path_count} path dependencies, "
-        "all inside the repository"
+
+    summary = (
+        f"checked {manifest_count} manifests and {workspace_count} Cargo workspaces, "
+        f"{reference_count} resolved path references inside the repository"
     )
+    if unchecked:
+        summary += f"; unchecked Cargo manifests: {', '.join(item.split(':', 1)[0] for item in unchecked)}"
+    print(summary)
     return 0
 
 
