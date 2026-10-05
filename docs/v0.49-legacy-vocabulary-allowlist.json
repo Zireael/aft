@@ -5280,6 +5280,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/pi-plugin/src/__tests__/fixtures/omp-internal-urls-harness.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/pi-plugin/src/__tests__/fs-renderers.test.ts",
       "token": "filePath",
       "location": "file-level",
