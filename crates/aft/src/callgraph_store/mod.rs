@@ -21687,7 +21687,9 @@ mod cold_build_insert_tests {
         TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
         assert!(store.indexed_file_count().is_err());
         assert!(store.indexed_file_count().is_err());
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
+        // An unready store is re-validated on every read: one readiness SELECT
+        // (schema version, fingerprint and ready flag in one statement) each.
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 2);
 
         store
             .cold_build(std::slice::from_ref(&file))
@@ -21695,7 +21697,8 @@ mod cold_build_insert_tests {
         TOTAL_CALLER_TRAVERSAL_SELECTS.with(|count| count.set(0));
         assert_eq!(store.indexed_file_count().expect("first ready read"), 1);
         assert_eq!(store.indexed_file_count().expect("cached ready read"), 1);
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 5);
+        // The first ready read validates once; the cached read skips validation.
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 3);
 
         let mut conn = store.conn.lock().expect("callgraph store mutex poisoned");
         conn.trace(None);
@@ -21740,7 +21743,7 @@ mod cold_build_insert_tests {
         assert_eq!(callers.get(&targets[0]).unwrap().len(), 1);
         assert_eq!(CALLER_QUERY_SELECTS.with(Cell::get), 3);
         assert_eq!(BOUNDARY_COUNT_SELECTS.with(Cell::get), 0);
-        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 6);
+        assert_eq!(TOTAL_CALLER_TRAVERSAL_SELECTS.with(Cell::get), 4);
     }
 
     #[test]
@@ -21804,7 +21807,8 @@ mod cold_build_insert_tests {
         assert_eq!(result.total_callers, CALLER_COUNT);
         assert_eq!(caller_queries, 1);
         assert_eq!(boundary_queries, 3);
-        assert_eq!(total_selects, 9);
+        // Includes one readiness SELECT, which reads all readiness metadata at once.
+        assert_eq!(total_selects, 7);
     }
 
     #[test]
