@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "durable-log-write-recovery"
+  ],
+  "note": "Daemon log keeps writing after a failed write (disk full), reports dropped lines in the log and in health; no ranking-fence file."
+}
