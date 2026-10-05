@@ -11,7 +11,11 @@ import {
 } from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import type { Logger, LogMeta } from "../logger.js";
-import { type SubcClientLike, SubcTransportPool } from "../subc-transport.js";
+import {
+  __dispatchProbeCountForTests,
+  type SubcClientLike,
+  SubcTransportPool,
+} from "../subc-transport.js";
 import { TEST_OTHER_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
 /** A controllable held-open subscription handle. */
@@ -182,6 +186,265 @@ async function tick(): Promise<void> {
 async function settleMicrotasks(turns = 32): Promise<void> {
   for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
 }
+
+test("idle subc carriers evict and replay queued completions after recreation", async () => {
+  const pending = new Map<string, Array<{ task_id: string; status: string }>>();
+  const delivered: string[] = [];
+  const drains: Promise<unknown>[] = [];
+  const client = new FakeClient(async (channel, rawBody) => {
+    const body = rawBody as { name: string; arguments: { session_id?: string } };
+    const session = client.routeOpens[channel - 1].session;
+    if (body.name === "bash_drain_completions") {
+      return envelope({
+        success: true,
+        text: "",
+        bg_completions: pending.get(session) ?? [],
+        pending_matches: [],
+      });
+    }
+    if (body.name === "bash_ack_completions") {
+      const acked = (pending.get(session) ?? []).map((item) => item.task_id);
+      pending.delete(session);
+      return envelope({ success: true, text: "", acked_task_ids: acked });
+    }
+    return envelope({ success: true, text: "ok" });
+  });
+  const beforeProbes = __dispatchProbeCountForTests();
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake/connection.json",
+    harness: "opencode",
+    connect: async () => client,
+    onBgEventsNudge: (root, session) => {
+      const drain = pool
+        .getBridge(root)
+        .send("bash_drain_completions", { session_id: session })
+        .then(async (reply) => {
+          const items = reply.bg_completions as Array<{ task_id: string }>;
+          delivered.push(...items.map((item) => item.task_id));
+          if (items.length)
+            await pool.getBridge(root).send("bash_ack_completions", {
+              session_id: session,
+              task_ids: items.map((item) => item.task_id),
+            });
+        });
+      drains.push(drain);
+    },
+  });
+  try {
+    for (let i = 0; i < 20; i++) {
+      pool.observeSessionStart(TEST_PROJECT_ROOT, `idle-${i}`);
+      await pool.toolCall(TEST_PROJECT_ROOT, { sessionID: `idle-${i}` }, "read", {});
+      await settleMicrotasks();
+    }
+    await Promise.all(drains);
+    expect(pool.__retainedSessionCountsForTests()).toEqual({
+      sessions: 20,
+      roots: 1,
+      routes: 20,
+      subscriptions: 20,
+      sweepTimers: 1,
+    });
+    expect(__dispatchProbeCountForTests() - beforeProbes).toBe(1);
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests()).toEqual({
+      sessions: 0,
+      roots: 0,
+      routes: 0,
+      subscriptions: 0,
+      sweepTimers: 0,
+    });
+    expect(__dispatchProbeCountForTests() - beforeProbes).toBe(0);
+    expect(client.closedRoutes.length).toBe(40);
+    // No subscription exists while the daemon queues this durable completion.
+    // Rebind must replay it on subscription startup, not require another event.
+    pending.set("idle-3", [{ task_id: "completed-while-evicted", status: "completed" }]);
+    await pool.toolCall(TEST_PROJECT_ROOT, { sessionID: "idle-3" }, "read", {});
+    await settleMicrotasks();
+    await Promise.all(drains);
+    expect(delivered).toEqual(["completed-while-evicted"]);
+    expect(pending.has("idle-3")).toBe(false);
+    expect(client.routeOpens.length).toBe(42);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("idle subc eviction preserves in-flight calls", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const client = new FakeClient(async () => {
+    await gate;
+    return envelope({ success: true, text: "reply" });
+  });
+  const { pool } = poolWith(client);
+  try {
+    const request = pool.toolCall(TEST_PROJECT_ROOT, { sessionID: "active" }, "read", {});
+    await settleMicrotasks();
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(1);
+    expect(client.closedRoutes).toEqual([]);
+    release();
+    expect((await request).text).toBe("reply");
+  } finally {
+    release();
+    await pool.shutdown();
+  }
+});
+
+test("unknown rebound subc sessions retain their subscriptions while idle", async () => {
+  const client = new FakeClient(async () => envelope({ success: true, text: "read" }));
+  let nudges = 0;
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+    onBgEventsNudge: () => {
+      nudges += 1;
+    },
+  });
+  try {
+    await pool.toolCall(TEST_PROJECT_ROOT, { sessionID: "resumed" }, "read");
+    await settleMicrotasks();
+    const before = nudges;
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().subscriptions).toBe(1);
+    client.subscriptions[0].emit();
+    expect(nudges).toBe(before + 1);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+for (const work of [
+  "running task",
+  "running task after pattern ACK",
+  "un-ACKed completion",
+  "active watch",
+] as const) {
+  test(`retained idle ${work} wakes immediately without another request`, async () => {
+    const client = new FakeClient(async (_channel, rawBody) => {
+      const name = (rawBody as { name: string }).name;
+      if (name === "bash")
+        return envelope({
+          success: true,
+          text: "running",
+          task_id: "task-live",
+          status: "running",
+        });
+      if (name === "bash_notify")
+        return envelope({ success: true, text: "registered", watch_id: "watch-live" });
+      if (name === "bash_ack_completions")
+        return envelope({ success: true, text: "", acked_task_ids: ["task-live"] });
+      if (name === "bash_unnotify")
+        return envelope({ success: true, text: "", unregistered: true });
+      return envelope({
+        success: true,
+        text: "",
+        bg_completions: [{ task_id: "task-live", status: "completed" }],
+        pending_matches: [],
+      });
+    });
+    let nudges = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/fake",
+      harness: "pi",
+      connect: async () => client,
+      onBgEventsNudge: () => {
+        nudges += 1;
+      },
+    });
+    try {
+      pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+      const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+      await bridge.send("bash", { session_id: "fresh", command: "echo ready", background: true });
+      if (!work.startsWith("running task"))
+        await bridge.send("bash_drain_completions", { session_id: "fresh" });
+      if (work === "running task after pattern ACK") {
+        await bridge.send("bash_notify", {
+          session_id: "fresh",
+          task_id: "task-live",
+          pattern: "ready",
+        });
+        await bridge.send("bash_ack_completions", { session_id: "fresh", task_ids: ["task-live"] });
+        await bridge.send("bash_unnotify", {
+          session_id: "fresh",
+          task_id: "task-live",
+          watch_id: "watch-live",
+        });
+      }
+      if (work === "active watch") {
+        await bridge.send("bash_ack_completions", { session_id: "fresh", task_ids: ["task-live"] });
+        // The real registry allows a watch on a terminal task's cached output;
+        // ACKing its completion does not ACK a queued pattern match.
+        await bridge.send("bash_notify", {
+          session_id: "fresh",
+          task_id: "task-live",
+          pattern: "ready",
+        });
+      }
+      await settleMicrotasks();
+      const before = nudges;
+      const requestsBefore = client.requests.length;
+      await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+      expect(pool.__retainedSessionCountsForTests().subscriptions).toBe(1);
+      client.subscriptions[0].emit();
+      expect(nudges).toBe(before + 1);
+      expect(client.requests.length).toBe(requestsBefore);
+      if (work === "active watch") {
+        await bridge.send("bash_drain_completions", { session_id: "fresh" });
+        await bridge.send("bash_ack_completions", { session_id: "fresh", task_ids: ["task-live"] });
+        await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+        expect(pool.__retainedSessionCountsForTests().subscriptions).toBe(0);
+      }
+    } finally {
+      await pool.shutdown();
+    }
+  });
+}
+
+test("ambiguous background status pins the carrier until an explicit ACK", async () => {
+  let statusFailed = true;
+  const client = new FakeClient(async (_channel, rawBody) => {
+    if ((rawBody as { name: string }).name === "bash_status") {
+      if (statusFailed) throw new Error("outcome unknown");
+      return envelope({
+        success: true,
+        text: "terminal",
+        task_id: "task-ambiguous",
+        status: "completed",
+      });
+    }
+    return envelope({ success: true, text: "ACKed", acked_task_ids: ["task-ambiguous"] });
+  });
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+    onBgEventsNudge: () => undefined,
+  });
+  try {
+    pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await expect(
+      bridge.send("bash_status", { session_id: "fresh", task_id: "task-ambiguous" }),
+    ).rejects.toThrow("outcome unknown");
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(1);
+    statusFailed = false;
+    await bridge.send("bash_status", { session_id: "fresh", task_id: "task-ambiguous" });
+    await bridge.send("bash_ack_completions", {
+      session_id: "fresh",
+      task_ids: ["task-ambiguous"],
+    });
+    await settleMicrotasks();
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(0);
+  } finally {
+    await pool.shutdown();
+  }
+});
 
 /** Deterministic timer seam for asserting parked reconnect work without real waits. */
 class FakeClock {

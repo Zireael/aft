@@ -1,6 +1,56 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { type FSWatcher, realpathSync, statSync, watch } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
+
+const rootMemo = new Map<string, { canonical: string; stamp: string; watchers: FSWatcher[] }>();
+const rootWork = { realpaths: 0, stats: 0 };
+export function __projectRootWorkForTests(): typeof rootWork {
+  return { ...rootWork };
+}
+
+function rootStamp(path: string): string {
+  rootWork.stats += 1;
+  const s = statSync(path, { bigint: true });
+  return `${s.dev}:${s.ino}:${s.ctimeNs}`;
+}
+
+export function invalidateProjectRootMemo(dir: string): void {
+  const key = resolve(dir);
+  const entry = rootMemo.get(key);
+  if (!entry) return;
+  rootMemo.delete(key);
+  for (const watcher of entry.watchers) watcher.close();
+}
+
+// Watch aliases AND canonical ancestors: renaming an ancestor can change the
+// absolute path without changing the descendant directory's own stat stamp.
+function watchRootAncestors(key: string, canonical: string): FSWatcher[] {
+  const watchers: FSWatcher[] = [];
+  const seen = new Set<string>();
+  try {
+    for (const path of new Set([key, canonical])) {
+      let child = path;
+      while (dirname(child) !== child) {
+        const parent = dirname(child);
+        const watchKey = `${parent}\u0000${basename(child)}`;
+        if (!seen.has(watchKey)) {
+          seen.add(watchKey);
+          const name = basename(child);
+          const watcher = watch(parent, { persistent: false }, (_event, filename) => {
+            if (filename === null || filename.toString() === name) invalidateProjectRootMemo(key);
+          });
+          watcher.on("error", () => invalidateProjectRootMemo(key));
+          watchers.push(watcher);
+        }
+        child = parent;
+      }
+    }
+  } catch {
+    for (const watcher of watchers) watcher.close();
+    return [];
+  }
+  return watchers;
+}
 
 /**
  * The single TypeScript project-root canonicalizer, mirroring the Rust
@@ -25,13 +75,36 @@ import { resolve } from "node:path";
  */
 export function canonicalizeProjectRoot(dir: string): string {
   const trimmed = dir.replace(/[/\\]+$/, "");
+  const key = resolve(trimmed);
   let canonical: string;
+  let stamp: string | undefined;
   try {
+    stamp = rootStamp(key);
+    const known = rootMemo.get(key);
+    if (known && known.stamp === stamp) {
+      try {
+        if (key === known.canonical || rootStamp(known.canonical) === stamp) return known.canonical;
+      } catch {
+        // A renamed target must be realpathed again, not treated as a missing alias.
+      }
+    }
+    invalidateProjectRootMemo(key);
+    rootWork.realpaths += 1;
     canonical = realpathSync(trimmed);
   } catch {
+    invalidateProjectRootMemo(key);
     canonical = resolve(trimmed);
+    stamp = undefined;
   }
-  return normalizeWindowsRoot(canonical);
+  canonical = normalizeWindowsRoot(canonical);
+  if (stamp !== undefined) {
+    const watchers = watchRootAncestors(key, canonical);
+    if (watchers.length > 0) {
+      if (rootMemo.size >= 128) invalidateProjectRootMemo(rootMemo.keys().next().value as string);
+      rootMemo.set(key, { canonical, stamp, watchers });
+    }
+  }
+  return canonical;
 }
 
 /**

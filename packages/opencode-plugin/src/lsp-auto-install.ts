@@ -28,20 +28,12 @@
  *      avoids mid-session bridge restarts.
  */
 
-import { createHash } from "node:crypto";
-import {
-  createReadStream,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type AftTransportPool,
+  cachedFileSha256,
+  cachedFileSha256Sync,
   npmInvocation,
   npmSpawnEnv,
   resolveNpm,
@@ -581,39 +573,9 @@ function cachedPackageDir(npmPackage: string): string {
  * failure (caller decides whether to log+continue or fail the install).
  */
 function hashInstalledBinary(spec: NpmServerSpec): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const candidates =
-      process.platform === "win32"
-        ? [
-            lspBinaryPath(spec.npm, spec.binary),
-            lspBinaryPath(spec.npm, `${spec.binary}.cmd`),
-            lspBinaryPath(spec.npm, `${spec.binary}.exe`),
-            lspBinaryPath(spec.npm, `${spec.binary}.bat`),
-          ]
-        : [lspBinaryPath(spec.npm, spec.binary)];
-
-    let pathToHash: string | null = null;
-    for (const p of candidates) {
-      try {
-        if (statSync(p).isFile()) {
-          pathToHash = p;
-          break;
-        }
-      } catch {
-        // Continue to the next candidate.
-      }
-    }
-    if (!pathToHash) {
-      reject(new Error(`installed binary not found at any of: ${candidates.join(", ")}`));
-      return;
-    }
-
-    const hash = createHash("sha256");
-    const stream = createReadStream(pathToHash);
-    stream.on("error", reject);
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("end", () => resolve(hash.digest("hex")));
-  });
+  const path = installedBinaryPath(spec);
+  if (!path) return Promise.reject(new Error(`installed binary not found: ${spec.binary}`));
+  return cachedFileSha256(path);
 }
 
 function installedBinaryPath(spec: NpmServerSpec): string | null {
@@ -635,7 +597,7 @@ function installedBinaryPath(spec: NpmServerSpec): string | null {
 }
 
 function sha256OfFileSync(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  return cachedFileSha256Sync(path);
 }
 
 function quarantineCachedNpmInstall(spec: NpmServerSpec, reason: string): void {

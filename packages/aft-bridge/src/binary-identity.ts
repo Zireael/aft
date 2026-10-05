@@ -25,8 +25,11 @@
 
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   createReadStream,
+  openSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -335,4 +338,88 @@ export function peekBinaryContentHash(binaryPath: string): string | null {
   if (cached && cached.stampKey === stampKey) return cached.sha256;
   void binaryContentHash(binaryPath);
   return null;
+}
+
+/** Stronger stamps for TOFU digests: ctime also catches writes that restore mtime. */
+function digestStamp(path: string): string {
+  const s = statSync(path, { bigint: true });
+  return `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+}
+
+export function readStampedFileDigest(path: string): string | null {
+  try {
+    const value = JSON.parse(readFileSync(`${path}.digest.json`, "utf8"));
+    return value.schema === 1 &&
+      value.stamp === digestStamp(path) &&
+      typeof value.sha256 === "string" &&
+      /^[a-f0-9]{64}$/.test(value.sha256)
+      ? value.sha256
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record a digest at the final path, after publication (rename changes ctime). */
+export function writeStampedFileDigest(path: string, sha256: string): void {
+  const sidecar = `${path}.digest.json`;
+  const tmp = `${sidecar}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ schema: 1, stamp: digestStamp(path), sha256 }));
+    renameSync(tmp, sidecar);
+  } catch {
+    // Read-only/manual installs can still be verified, just not memoized.
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* Already renamed or never created. */
+    }
+  }
+}
+
+const digestWork = { syncHashes: 0, asyncHashes: 0, bytesHashed: 0 };
+export function __fileDigestWorkForTests(): typeof digestWork {
+  return { ...digestWork };
+}
+
+/** Legacy synchronous callers pay a hash only when no matching stamp exists. */
+export function cachedFileSha256Sync(path: string, hashFile?: () => string): string {
+  const known = readStampedFileDigest(path);
+  if (known) return known;
+  const before = digestStamp(path);
+  digestWork.syncHashes += 1;
+  digestWork.bytesHashed += Number(statSync(path).size);
+  const digest = hashFile
+    ? hashFile()
+    : (() => {
+        const hash = createHash("sha256");
+        const fd = openSync(path, "r");
+        try {
+          const buffer = Buffer.allocUnsafe(1024 * 1024);
+          let n: number;
+          while ((n = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+            hash.update(buffer.subarray(0, n));
+          }
+          return hash.digest("hex");
+        } finally {
+          closeSync(fd);
+        }
+      })();
+  if (digestStamp(path) !== before) throw new Error(`File changed while hashing: ${path}`);
+  writeStampedFileDigest(path, digest);
+  return digest;
+}
+
+/** Stream a legacy/stale library once; matching sidecars never read its bytes. */
+export async function cachedFileSha256(path: string): Promise<string> {
+  const known = readStampedFileDigest(path);
+  if (known) return known;
+  const before = digestStamp(path);
+  digestWork.asyncHashes += 1;
+  digestWork.bytesHashed += Number(statSync(path).size);
+  const digest = await sha256File(path);
+  if (digestStamp(path) !== before) throw new Error(`File changed while hashing: ${path}`);
+  writeStampedFileDigest(path, digest);
+  return digest;
 }

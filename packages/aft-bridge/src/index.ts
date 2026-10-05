@@ -61,10 +61,14 @@ export {
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {
+  __fileDigestWorkForTests,
+  cachedFileSha256,
+  cachedFileSha256Sync,
   checkBinaryIdentity,
   identitySidecarPath,
   isTrustedCachedBinary,
   readBinaryIdentity,
+  writeStampedFileDigest,
 } from "./binary-identity.js";
 export type {
   BashCompletedPayload,
@@ -357,7 +361,12 @@ export type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-export { callPresetFor, PRESET_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
+export {
+  callPresetFor,
+  observeFreshSessionStart,
+  PRESET_FIELD,
+  WORKER_SESSION_FIELD,
+} from "./transport.js";
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,

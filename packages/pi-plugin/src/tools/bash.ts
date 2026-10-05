@@ -60,6 +60,12 @@ import {
 } from "./_shared.js";
 import { asString, collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
+/** Only the UI preview is bounded; the final response still carries the complete output. */
+export function appendBashStreamTail(previous: string, chunk: string): string {
+  const cap = 64 * 1024;
+  return (previous + chunk.slice(-cap)).slice(-cap);
+}
+
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 /**
@@ -847,7 +853,7 @@ export function registerBashTool(
               workerWaitMaxMs,
             ),
             onProgress: ({ text }) => {
-              streamed += text;
+              streamed = appendBashStreamTail(streamed, text);
               // Stream truncated output to avoid overwhelming the UI
               const displayText = truncateToVisualLines(streamed, 100);
               onUpdate?.(bashResult(displayText, { streaming: true }));

@@ -30,7 +30,7 @@
  *   brew install onnxruntime
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -55,6 +55,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "n
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { cachedFileSha256, sha256File, writeStampedFileDigest } from "./binary-identity.js";
 import { execFileSync } from "./child-process.js";
 import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { relativePathEscapesRoot } from "./path-display.js";
@@ -256,7 +257,10 @@ function resolveOnnxRuntime(
  * The cached managed runtime for this version, or null when there is none or
  * it fails TOFU verification.
  */
-function findCachedOnnxRuntime(ortVersionDir: string, libName: string): string | null {
+async function findCachedOnnxRuntime(
+  ortVersionDir: string,
+  libName: string,
+): Promise<string | null> {
   // Keep the version root separate from the resolved library directory. The
   // root owns cleanup, downloads, and TOFU metadata; the resolved dir only
   // feeds the return value / ORT_DYLIB_PATH and may be `<version>/lib` for
@@ -275,7 +279,7 @@ function findCachedOnnxRuntime(ortVersionDir: string, libName: string): string |
     const meta = readOnnxInstalledMeta(ortVersionDir);
     if (meta?.sha256) {
       try {
-        const currentHash = sha256File(libPath);
+        const currentHash = await cachedFileSha256(libPath);
         if (currentHash !== meta.sha256) {
           error(
             `ONNX Runtime at ${resolvedOrtDir}: TOFU sha256 mismatch — refusing to use ` +
@@ -310,7 +314,7 @@ async function resolveOnnxRuntimeUncoalesced(
   // 1. Cached location with TOFU.
   const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
   const libName = info?.libName ?? "libonnxruntime.dylib";
-  const cached = findCachedOnnxRuntime(ortVersionDir, libName);
+  const cached = await findCachedOnnxRuntime(ortVersionDir, libName);
   if (cached) return cached;
 
   // 2. System locations.
@@ -355,7 +359,7 @@ async function resolveOnnxRuntimeUncoalesced(
       return null;
     }
     await new Promise((done) => setTimeout(done, pollMs));
-    const published = findCachedOnnxRuntime(ortVersionDir, libName);
+    const published = await findCachedOnnxRuntime(ortVersionDir, libName);
     if (published) {
       lastInstallFailure = null;
       return published;
@@ -365,7 +369,7 @@ async function resolveOnnxRuntimeUncoalesced(
   try {
     // Another holder may have finished between our cache check and taking
     // the lock; use its runtime rather than downloading again.
-    const published = findCachedOnnxRuntime(ortVersionDir, libName);
+    const published = await findCachedOnnxRuntime(ortVersionDir, libName);
     if (published) {
       lastInstallFailure = null;
       return published;
@@ -932,7 +936,7 @@ async function downloadOnnxRuntime(
     await downloadFileWithCap(url, archivePath);
 
     // Hash the archive for TOFU.
-    const archiveSha256 = sha256File(archivePath);
+    const archiveSha256 = await sha256File(archivePath);
     log(`ONNX Runtime archive sha256=${archiveSha256}`);
 
     if (info.archiveType === "tgz") {
@@ -993,7 +997,7 @@ async function downloadOnnxRuntime(
     // future sessions can verify the runtime against the first installation.
     // Hash the actual main library because steady-state resolution checks it.
     const libPath = join(stagedInstallDir, info.libName);
-    const libHash = sha256File(libPath);
+    const libHash = await sha256File(libPath);
     // A corrupted or tampered download must never be published: AFT would
     // refuse to load it anyway, and a published copy would shadow a retry.
     if (libHash !== info.librarySha256) {
@@ -1005,6 +1009,7 @@ async function downloadOnnxRuntime(
     writeOnnxInstalledMeta(stagedInstallDir, ORT_VERSION, libHash, archiveSha256);
 
     publishOnnxRuntime(stagedInstallDir, targetDir);
+    writeStampedFileDigest(join(targetDir, info.libName), libHash);
     rmSync(tmpDir, { recursive: true, force: true });
 
     log(`ONNX Runtime v${ORT_VERSION} installed to ${targetDir}`);
@@ -1190,18 +1195,6 @@ function readOnnxInstalledMeta(installDir: string): OnnxInstalledMeta | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Synchronous SHA-256 of a file. ONNX libs are ~50 MB so a single
- * `readFileSync` is fine — we accept the brief blocking read in exchange
- * for keeping the call sites simple (no awaits inside the path-resolution
- * fast path that runs every plugin start).
- */
-function sha256File(path: string): string {
-  const hash = createHash("sha256");
-  hash.update(readFileSync(path));
-  return hash.digest("hex");
 }
 
 /* ─────────────────────────── install lock ─────────────────────────── */

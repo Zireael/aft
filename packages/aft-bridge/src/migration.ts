@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { spawnSync } from "./child-process.js";
+import { spawn, spawnSync } from "./child-process.js";
 import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 import { resolveCortexKitStorageRoot } from "./storage-paths.js";
@@ -25,6 +25,50 @@ let spawnSyncForMigration: SpawnSyncForMigration = spawnSync;
 
 export function __setSpawnSyncForTests(impl: SpawnSyncForMigration | null): void {
   spawnSyncForMigration = impl ?? spawnSync;
+}
+
+/** Keep only diagnostic tails while the migrator writes its complete log to disk. */
+let migrationAsyncSpawns = 0;
+export function __migrationAsyncSpawnsForTests(): number {
+  return migrationAsyncSpawns;
+}
+function runMigration(
+  binary: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<{
+  error?: Error;
+  status: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+}> {
+  return new Promise((resolve) => {
+    migrationAsyncSpawns += 1;
+    const child = spawn(binary, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let error: Error | undefined;
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout = (stdout + chunk).slice(-4000);
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr = (stderr + chunk).slice(-4000);
+    });
+    const timer = setTimeout(() => {
+      error = new Error(`migration timed out after ${timeoutMs}ms (ETIMEDOUT)`);
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.on("error", (err) => {
+      error = err;
+    });
+    child.on("close", (status, signal) => {
+      clearTimeout(timer);
+      resolve({ error, status, signal, stdout, stderr });
+    });
+  });
 }
 
 export type MigrationHarness = "opencode" | "pi";
@@ -610,11 +654,9 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
       `(binary=${binaryPath}, log=${logPath})`,
   );
 
-  // User-visible notice. The migration spawn below is synchronous and can
-  // take several minutes for large semantic/search indexes (>1GB). Without
-  // a stderr message, the user sees OpenCode/Pi hang during plugin init
-  // and may reasonably assume it's stuck. The host (OpenCode TUI, Pi TTY)
-  // typically passes plugin stderr through to the user.
+  // Initialization still waits for migration to finish, but other host work can
+  // continue while large indexes migrate. Explain the wait on stderr as well as
+  // in the migration log so it is visible before the plugin is ready.
   try {
     process.stderr.write(
       `\n[AFT] Migrating ${opts.harness} storage to ${newRoot}.\n` +
@@ -627,7 +669,7 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
     // still gets the same information.
   }
 
-  const result = spawnSyncForMigration(
+  const result = await runMigration(
     binaryPath,
     [
       "migrate-storage",
@@ -640,11 +682,7 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
       "--log",
       logPath,
     ],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    },
+    opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   );
 
   if (!result.error && result.status === 0) {

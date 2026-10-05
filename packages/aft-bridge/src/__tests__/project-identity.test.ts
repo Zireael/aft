@@ -1,14 +1,38 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  __projectRootWorkForTests,
   canonicalizeProjectRoot,
+  invalidateProjectRootMemo,
   normalizeWindowsRoot,
   projectRootKeyHash,
 } from "../project-identity.js";
 
 describe("project-identity canonicalization", () => {
+  test("repeated roots realpath once and retargeted aliases invalidate", () => {
+    const a = realpathSync(mkdtempSync(join(tmpdir(), "aft-memo-a-")));
+    const b = realpathSync(mkdtempSync(join(tmpdir(), "aft-memo-b-")));
+    const parent = realpathSync(mkdtempSync(join(tmpdir(), "aft-memo-link-")));
+    const link = join(parent, "link");
+    try {
+      symlinkSync(a, link);
+      const before = __projectRootWorkForTests();
+      for (let i = 0; i < 100; i++) expect(canonicalizeProjectRoot(link)).toBe(a);
+      expect(__projectRootWorkForTests().realpaths - before.realpaths).toBe(1);
+      expect(__projectRootWorkForTests().stats - before.stats).toBe(199);
+      unlinkSync(link);
+      symlinkSync(b, link);
+      expect(canonicalizeProjectRoot(link)).toBe(b);
+      rmSync(b, { recursive: true });
+      expect(canonicalizeProjectRoot(link)).toBe(link);
+      expect(__projectRootWorkForTests().realpaths - before.realpaths).toBe(2);
+    } finally {
+      invalidateProjectRootMemo(link);
+      for (const path of [a, b, parent]) rmSync(path, { recursive: true, force: true });
+    }
+  });
   test("trailing separators collapse to one identity", () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "aft-pid-")));
     try {

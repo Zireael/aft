@@ -56,6 +56,10 @@ export class RevivableTransportPool implements AftTransportPool {
     return transport;
   }
 
+  observeSessionStart(projectRoot: string, session: string): void {
+    if (!this.activePool.isShutdown()) this.activePool.observeSessionStart?.(projectRoot, session);
+  }
+
   /** Delegate to the active pool: session-scoped signal fan-out reaches the
    * same live transports the underlying pool would report. */
   activeBridges(): AftProjectTransport[] {
@@ -255,7 +259,7 @@ export class RevivableTransportPool implements AftTransportPool {
   ): Promise<Record<string, unknown>> {
     const pool = await this.ensureActivePool();
     const bridge = pool.getBridge(projectRoot);
-    this.getBridge(projectRoot).refreshStatusSubscription(bridge);
+    this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
     return bridge.send(command, params, options);
   }
 
@@ -268,7 +272,7 @@ export class RevivableTransportPool implements AftTransportPool {
   ): Promise<ToolCallResult> {
     const pool = await this.ensureActivePool();
     const bridge = pool.getBridge(projectRoot);
-    this.getBridge(projectRoot).refreshStatusSubscription(bridge);
+    this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
     return bridge.toolCall(sessionId, name, rawArgs, options);
   }
 }
