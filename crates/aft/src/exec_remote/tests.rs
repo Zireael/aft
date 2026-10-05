@@ -5,13 +5,45 @@ fn job_id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+#[test]
+fn accepted_021_vector_and_single_locked_contract_are_pinned() {
+    use sha2::{Digest, Sha256};
+    let canonical = include_bytes!("fixtures/frames/accepted.jcs");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical)),
+        include_str!("fixtures/frames/accepted.sha256")
+    );
+    let mut value: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/frames/accepted.json")).unwrap();
+    // This vector contains only ASCII strings and small integers. Sorting its
+    // object keys is the independent JCS step, regardless of serde map order.
+    value.as_object_mut().unwrap().sort_keys();
+    assert_eq!(serde_json::to_vec(&value).unwrap(), canonical);
+    let record: StreamRecord = serde_json::from_value(value).unwrap();
+    let StreamRecord::Accepted(accepted) = record else {
+        panic!("accepted vector must decode as acceptance")
+    };
+    assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
+    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
+    let packages: Vec<_> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
+        .collect();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.1"));
+}
+
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
     use sha2::{Digest, Sha256};
-    // Embed the published 0.2.0 corpus and its original digests. Runtime cargo
-    // metadata resolves unrelated target dependencies even in offline mode;
-    // a unit test must not require those packages in the caller's Cargo cache.
-    // Keep the version fence too: updating the dependency must not silently
-    // leave these grading tests exercising a previous release's corpus.
+    // Retain the published 0.2.0 grading corpus and its original digests;
+    // the additive 0.2.1 accepted-frame contract is pinned separately above.
+    // Runtime cargo metadata resolves unrelated target dependencies even in
+    // offline mode, so unit tests embed the corpus rather than requiring those
+    // packages in the caller's Cargo cache. Keep the singleton version fence
+    // explicit when updating the dependency.
     let lock: toml::Value = toml::from_str(include_str!("../../../../Cargo.lock")).unwrap();
     let versions = lock["package"]
         .as_array()
@@ -20,7 +52,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.0"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.1"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
