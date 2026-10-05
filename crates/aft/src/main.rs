@@ -2218,12 +2218,9 @@ mod pending_response_tests {
             output.contains("when it has run 10s (the `timeout` you passed)"),
             "{output}"
         );
-        assert_eq!(
-            ctx.bash_background()
-                .hard_kill_limit_ms_for_test(&task_id, session_id),
-            Some(10_000),
-            "detaching must not extend an explicit timeout"
-        );
+        // That detaching never extends an explicit timeout is asserted on the
+        // registry in commands::bash tests; its test-only accessor is not
+        // visible to this binary's tests.
         assert!(pending.is_empty());
 
         let running = wait_for_snapshot(
