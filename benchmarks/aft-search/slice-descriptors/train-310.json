@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "perf-audit-2-parser-read"
+  ],
+  "note": "Parser, call extraction, read/zoom single-source reads and tokenizer work bounds; no ranking-fence file."
+}
