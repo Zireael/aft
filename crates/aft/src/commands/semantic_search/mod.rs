@@ -9095,7 +9095,14 @@ mod tests {
         let request: RawRequest =
             serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
                 .expect("status request");
-        let bound = Duration::from_millis(200);
+        // The proof that neither call waited is that both answered while the
+        // probe was still out: status reports the check in progress and search
+        // says so (asserted below). A connect to a blackholed address only ends
+        // at the probe's 2 s timeout, so a call that waited on it would also
+        // take at least that long. The wall-clock bound sits well below the
+        // timeout but far above a loaded machine's scheduling delay, which made
+        // a 200 ms bound flaky without testing anything more.
+        let bound = Duration::from_millis(1_000);
 
         let started = std::time::Instant::now();
         let status = response_value(crate::commands::status::handle_status(&request, &ctx));
