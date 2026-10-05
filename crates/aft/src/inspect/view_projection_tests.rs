@@ -330,8 +330,16 @@ fn views_keyless_callgraph_generation_preserves_unused_exports_but_names_dead_co
         .unwrap();
     let unused = roll_up_unused_exports_contributions(&job, &scan.contributions, None);
     assert_eq!(unused["count"], 2, "{unused:#}");
-    assert_eq!(unused["items"][0]["symbol"], "main", "{unused:#}");
-    assert_eq!(unused["items"][1]["symbol"], "dead", "{unused:#}");
+    // Item order is not part of this contract (it differs across platforms);
+    // what matters is that both real findings survive.
+    let mut symbols = unused["items"]
+        .as_array()
+        .expect("unused export items")
+        .iter()
+        .map(|item| item["symbol"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    assert_eq!(symbols, ["dead", "main"], "{unused:#}");
 
     job.category = InspectCategory::DeadCode;
     // No refresh-path check: this specifically exercises the generation guard,
