@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "database-open-retry"
+  ],
+  "note": "A failed project-database open retries with capped backoff instead of latching until rebind; no ranking-fence file."
+}
