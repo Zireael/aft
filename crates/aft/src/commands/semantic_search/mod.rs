@@ -4407,30 +4407,37 @@ fn run_engine_ranking(
                 .collect::<Vec<_>>()
         });
     let mut semantic_metadata = HashMap::new();
+    let mut semantic_symbol_previews = HashMap::new();
     let mut seen_semantic_paths = HashSet::new();
     let mut prepared_semantic = Vec::new();
     for result in semantic_results {
         let path = result.file.clone();
+        let preview = HybridResult {
+            file: result.file.clone(),
+            name: result.name.clone(),
+            kind: result.kind,
+            start_line: result.start_line,
+            end_line: result.end_line,
+            exported: result.exported,
+            score: result.score,
+            source: "semantic",
+            semantic_score: Some(result.score),
+            lexical_score: None,
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+            snippet: result.snippet.clone(),
+        };
         semantic_metadata
             .entry(path.clone())
-            .or_insert_with(|| HybridResult {
-                file: result.file.clone(),
-                name: result.name.clone(),
-                kind: result.kind,
-                start_line: result.start_line,
-                end_line: result.end_line,
-                exported: result.exported,
-                score: result.score,
-                source: "semantic",
-                semantic_score: Some(result.score),
-                lexical_score: None,
-                hybrid_boosted: false,
-                exact: false,
-                exact_phrase_count: 0,
-                exact_window_lines: None,
-                fusion_score: 0.0,
-                snippet: result.snippet.clone(),
-            });
+            .or_insert_with(|| preview.clone());
+        if !matches!(preview.kind, SymbolKind::FileSummary) {
+            semantic_symbol_previews
+                .entry(path.clone())
+                .or_insert(preview);
+        }
         if seen_semantic_paths.insert(path.clone()) {
             prepared_semantic.push(CandidateResult {
                 path,
@@ -4831,7 +4838,7 @@ fn run_engine_ranking(
     let confidence = ConfidenceEngine::running()
         .evaluate_reply(&page.reply)
         .map_err(|error| error.to_string())?;
-    let recall_audit = audit_enabled.then(|| {
+    let mut recall_audit = audit_enabled.then(|| {
         recall_audit::engine_audit(recall_audit::EngineAuditInput {
             project_root,
             plan,
@@ -4852,6 +4859,34 @@ fn run_engine_ranking(
             lanes_exhausted: page.reply.lanes_exhausted,
         })
     });
+    if let Some(audit) = recall_audit.as_mut() {
+        let mut metadata = semantic_metadata.iter().collect::<Vec<_>>();
+        metadata.sort_by_key(|(path, _)| *path);
+        let mut symbols = semantic_symbol_previews.iter().collect::<Vec<_>>();
+        symbols.sort_by_key(|(path, _)| *path);
+        // Display paths hide canonical prefixes and aliases. Keep Debug forms
+        // of the actual lookup keys and page paths so a missing preview can be
+        // distinguished from a file-summary winner without changing ranking.
+        audit["semantic_preview"] = serde_json::json!({
+            "metadata": metadata.iter().map(|(path, preview)| serde_json::json!({
+                "path_debug": format!("{path:?}"),
+                "name": preview.name,
+                "kind": symbol_kind_label(&preview.kind),
+                "score": preview.semantic_score,
+            })).collect::<Vec<_>>(),
+            "symbol_metadata": symbols.iter().map(|(path, preview)| serde_json::json!({
+                "path_debug": format!("{path:?}"),
+                "name": preview.name,
+                "kind": symbol_kind_label(&preview.kind),
+                "score": preview.semantic_score,
+            })).collect::<Vec<_>>(),
+            "ranked_page": page.reply.page.iter().map(|entry| serde_json::json!({
+                "path_debug": format!("{:?}", entry.result.path),
+                "tier": entry.result.evidence.tier,
+                "best_lane": entry.result.best_lane,
+            })).collect::<Vec<_>>(),
+        });
+    }
     let confidence_telemetry = match confidence.confidence {
         Some(Confidence::High) => Some(ConfidenceTelemetry::High),
         Some(Confidence::Low) => Some(ConfidenceTelemetry::Low),
@@ -4953,6 +4988,23 @@ fn run_engine_ranking(
                 _ => "hybrid",
             },
         };
+        // Ranking admits a file's highest-scoring chunk, which may be its
+        // summary. A textual winner can still have a useful lower-scoring
+        // symbol: show that symbol instead of replacing it with a comment
+        // line. Keep the winning path and every ranking/score field intact.
+        if matches!(result.kind, SymbolKind::FileSummary)
+            && (result.exact || result.source == "lexical")
+        {
+            if let Some(symbol) = take_semantic_preview(&mut semantic_symbol_previews, &ranked.path)
+            {
+                result.name = symbol.name;
+                result.kind = symbol.kind;
+                result.start_line = symbol.start_line;
+                result.end_line = symbol.end_line;
+                result.exported = symbol.exported;
+                result.snippet = symbol.snippet;
+            }
+        }
         let pattern_file = split
             .filter(|_| matches!(result.kind, SymbolKind::FileSummary) && !result.exact)
             .and_then(|split| split.patterns.file(&ranked.path));
@@ -11188,6 +11240,144 @@ mod tests {
         );
         assert!(text.contains("terminate_child();"), "{text}");
         assert!(text.contains("[lexical match]"), "{text}");
+    }
+
+    #[test]
+    fn watchdog_mock_embedding_scores_depend_on_native_separators() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src/watchdog.rs");
+        std::fs::write(&file, "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n").unwrap();
+        let mock_vector = |text: &str| {
+            blake3::hash(format!("views-semantic-mock\u{0}{text}").as_bytes()).as_bytes()[..8]
+                .iter()
+                .map(|byte| f32::from(*byte) / 255.0 - 0.5)
+                .collect::<Vec<_>>()
+        };
+        let query = mock_vector(
+            "how does the bash watchdog kill a background task that exceeded its timeout",
+        );
+        // For this fixture, slashes occur only in the embedding's relative
+        // path, not its body or doc. Emulate both native path separators while
+        // keeping chunk kinds, source bytes, and the mock model unchanged.
+        for (separator, expected_kind) in
+            [('/', SymbolKind::Function), ('\\', SymbolKind::FileSummary)]
+        {
+            let index = SemanticIndex::build(
+                &root,
+                &[file.clone()],
+                &mut |texts: Vec<String>| {
+                    Ok(texts
+                        .iter()
+                        .map(|text| {
+                            mock_vector(
+                                &text.replace('\\', "/").replace('/', &separator.to_string()),
+                            )
+                        })
+                        .collect())
+                },
+                64,
+            )
+            .unwrap();
+            let hits = index.search(&query, 100);
+            eprintln!("mock separator={separator:?}, watchdog hits={hits:#?}");
+            assert_eq!(hits[0].kind, expected_kind, "{hits:#?}");
+            assert!(hits.iter().any(|hit| hit.name == "kill_expired_task"));
+        }
+    }
+
+    #[test]
+    fn higher_scoring_file_summary_does_not_hide_lexical_winner_symbol() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let file = root.join("watchdog.rs");
+        std::fs::write(
+            &file,
+            "// The bash watchdog stops background tasks when their time budget expires.\n\npub fn kill_expired_task() {\n    terminate_child();\n}\n",
+        )
+        .unwrap();
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let summary = SemanticResult {
+            file: file.clone(),
+            name: "watchdog".into(),
+            qualified_name: None,
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            snippet: String::new(),
+            score: 0.02,
+            rank_score: 0.02,
+            cap_protected: false,
+            source: "semantic",
+        };
+        let symbol = SemanticResult {
+            name: "kill_expired_task".into(),
+            kind: SymbolKind::Function,
+            start_line: 2,
+            end_line: 4,
+            exported: true,
+            score: 0.01,
+            rank_score: 0.01,
+            ..summary.clone()
+        };
+        let extensions = crate::search_b2::install_defaults();
+        for (query, exact) in [
+            (
+                "how does the bash watchdog kill a background task that exceeded its timeout",
+                false,
+            ),
+            (
+                "The bash watchdog stops background tasks when their time budget expires.",
+                true,
+            ),
+        ] {
+            let plan = split_query_plan(
+                extensions,
+                query,
+                &extensions::Readiness::new(false, true, true),
+            );
+            let serve = |semantic| {
+                run_engine_ranking(
+                    "summary-preview-test",
+                    &ctx,
+                    &root,
+                    query,
+                    query,
+                    false,
+                    semantic,
+                    paging::parse_public_page_request(&serde_json::json!({"topK": 10})).unwrap(),
+                    extensions,
+                    &plan,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let summary_only = serve(vec![summary.clone()]);
+            let mut with_symbol = serve(vec![summary.clone(), symbol.clone()]);
+            assert_eq!(with_symbol.results.len(), 1);
+            assert_eq!(with_symbol.results[0].exact, exact);
+            if !exact {
+                assert_eq!(with_symbol.results[0].source, "lexical");
+            }
+            assert_eq!(with_symbol.results[0].file, file);
+            assert_eq!(with_symbol.results[0].semantic_score, Some(0.02));
+            assert_eq!(with_symbol.results[0].score, summary_only.results[0].score);
+            assert_eq!(
+                with_symbol.structured_content,
+                summary_only.structured_content
+            );
+            enrich_snippets_from_source(&mut with_symbol.results, &root);
+            let text = format_semantic_text(&with_symbol.results, &root, false, false, None);
+            assert!(
+                text.contains("kill_expired_task [function] lines 3-5"),
+                "{text}"
+            );
+            assert!(text.contains("terminate_child();"), "{text}");
+        }
     }
 
     #[test]

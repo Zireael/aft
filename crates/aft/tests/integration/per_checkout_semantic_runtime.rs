@@ -347,6 +347,13 @@ fn search(ctx: &AppContext, query: &str) -> Value {
 
 #[test]
 fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
+    let _serial = crate::helpers::watcher_serial_lock();
+    let _audit = EnvGuard(
+        "AFT_SEARCH_RECALL_AUDIT",
+        std::env::var_os("AFT_SEARCH_RECALL_AUDIT"),
+    );
+    // SAFETY: environment changes in this module hold watcher_serial_lock.
+    unsafe { std::env::set_var("AFT_SEARCH_RECALL_AUDIT", "1") };
     let server = MockEmbedder::start();
     let repo = repository();
     write(&repo.main, "src/watchdog.rs",
@@ -360,15 +367,48 @@ fn prose_watchdog_query_reports_views_coverage_and_keeps_symbol_previews() {
     let vectors = runtime.index().unwrap().len();
     let raw = runtime.search(&query_vector, 100, &|_| true).unwrap();
     let answer = search(&ctx, query);
+    let audit = &answer["recall_audit"]["semantic_preview"];
+    let mut diagnostics = format!(
+        "repository root={:?}, configured root={:?}, cache root={:?}\n",
+        repo.main,
+        ctx.config().project_root,
+        ctx.canonical_cache_root_opt()
+    );
+    for section in ["metadata", "symbol_metadata", "ranked_page"] {
+        diagnostics.push_str(&format!("semantic preview {section}:\n"));
+        if let Some(rows) = audit[section].as_array() {
+            for row in rows {
+                diagnostics.push_str(&format!(
+                    "  path={} details={}\n",
+                    row["path_debug"].as_str().unwrap_or("<missing Debug path>"),
+                    row
+                ));
+            }
+        } else {
+            diagnostics.push_str("  <missing audit section>\n");
+        }
+    }
+    diagnostics.push_str(&format!("raw semantic hits: {:#?}\n", raw.results));
     eprintln!("watchdog reproduction: vectors={vectors}, raw_semantic_hits={}, pending={}, failed={}, complete={}\n{}", raw.results.len(), raw.pending.len(), raw.failed.len(), raw.complete(), answer["text"]);
-    assert!(vectors > 0 && !raw.results.is_empty());
+    assert!(
+        audit["metadata"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "missing semantic metadata diagnostics\n{diagnostics}\n{answer:#}"
+    );
+    assert_eq!(
+        audit["ranked_page"].as_array().map(Vec::len),
+        answer["results"].as_array().map(Vec::len),
+        "missing ranked-path diagnostics\n{diagnostics}\n{answer:#}"
+    );
+    assert!(vectors > 0 && !raw.results.is_empty(), "{diagnostics}");
     assert_eq!(answer["complete"], true, "{answer:#}");
     let text = answer["text"].as_str().unwrap();
     assert!(
         text.contains("kill_expired_task [function] lines 3-5"),
-        "{text}"
+        "{text}\n{diagnostics}"
     );
-    assert!(text.contains("terminate_child();"), "{text}");
+    assert!(text.contains("terminate_child();"), "{text}\n{diagnostics}");
 }
 
 /// The ranked rows of a search answer, relative to `root`.
