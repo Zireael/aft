@@ -5991,6 +5991,9 @@ pub(crate) fn open_database_runtime(
 ) -> crate::database_open::DatabaseOpenReport {
     use crate::database_open::{DatabaseOpenOutcome, DatabaseOpenReport};
 
+    #[cfg(test)]
+    ctx.note_database_open_attempt_for_test();
+
     wait_on_configure_tail_stage_gate_for_test(
         canonical_cache_root,
         ConfigureMaintenanceStage::DatabaseRuntime,
@@ -6020,17 +6023,23 @@ pub(crate) fn open_database_runtime(
     // storage root's reader floor is above this build) is refused by name
     // before a read-write connection, PRAGMA or migration touches it.
     let floor_started = Instant::now();
+    let schema = ctx.app().database_schema_version(&db_path, mode);
     let gate = crate::persisted_format::gate(
         crate::persisted_format::PersistedStore::AftDb,
         &db_path,
         &db_path,
-        crate::db::peek_schema_version(&db_path).map(u64::from),
+        schema
+            .as_ref()
+            .ok()
+            .and_then(|(version, _)| *version)
+            .map(u64::from),
     );
     let floor_check = floor_started.elapsed();
     if let Err(refusal) = gate {
         let published = ctx.publish_database_open(epoch, |slot| {
             slot.ready_for = None;
-            ctx.app().clear_db_for_path(&db_path);
+            // Keep any process-shared handle: other roots may still own its
+            // pools, and evicting it would let a retry open a second descriptor.
             ctx.backup().lock().clear_db_pool();
             ctx.bash_background().clear_db_pool();
             ctx.finish_database_runtime_error(refusal.to_string(), false);
@@ -6049,9 +6058,9 @@ pub(crate) fn open_database_runtime(
             },
         };
     }
-    let reused_handle = ctx.app().db_for_path(&db_path).is_some();
+    let reused_handle = schema.as_ref().is_ok_and(|(_, reused)| *reused);
     let open_started = Instant::now();
-    let opened = ctx.app().open_db_with_mode(&db_path, mode);
+    let opened = schema.and_then(|_| ctx.app().open_db_with_mode(&db_path, mode));
     let open = open_started.elapsed();
     let (published, outcome) = match opened {
         Ok(shared) => (
@@ -6073,7 +6082,6 @@ pub(crate) fn open_database_runtime(
             // connection and WAL descriptors.
             let published = ctx.publish_database_open(epoch, |slot| {
                 slot.ready_for = None;
-                ctx.app().clear_db_for_path(&db_path);
                 ctx.backup().lock().clear_db_pool();
                 ctx.bash_background().clear_db_pool();
                 ctx.finish_database_runtime_error(message.clone(), err.is_busy());

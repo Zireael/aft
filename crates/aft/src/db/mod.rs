@@ -663,6 +663,8 @@ pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
     if !path.is_file() {
         return None;
     }
+    #[cfg(test)]
+    SCHEMA_PEEKS.with(|count| count.set(count.get() + 1));
     let conn = open_readonly(path).ok()?;
     conn.busy_timeout(Duration::ZERO).ok()?;
     let has_table: bool = conn
@@ -676,6 +678,16 @@ pub(crate) fn peek_schema_version(path: &Path) -> Option<u32> {
         return None;
     }
     current_schema_version(&conn).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCHEMA_PEEKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn schema_peek_count_for_test() -> u64 {
+    SCHEMA_PEEKS.with(std::cell::Cell::get)
 }
 
 /// Apply the per-connection PRAGMAs required for every AFT SQLite connection.
@@ -735,6 +747,12 @@ fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
         [],
         |row| row.get::<_, u32>(0),
     )
+}
+
+/// Re-check a resident database without waiting for another process's lock or
+/// opening a second descriptor. Restore its normal busy wait before release.
+pub(crate) fn schema_version_without_wait(conn: &mut TrackedConnection) -> rusqlite::Result<u32> {
+    with_busy_wait(conn, Duration::ZERO, |conn| current_schema_version(conn))
 }
 
 fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError> {

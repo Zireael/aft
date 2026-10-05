@@ -2292,6 +2292,36 @@ fn database_path_key(path: &Path) -> PathBuf {
         .unwrap_or_else(|| canonical_parent.join(path))
 }
 
+fn database_connection_busy() -> crate::db::OpenError {
+    crate::db::OpenError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some("process-shared database connection is in use".into()),
+    ))
+}
+
+#[derive(Default)]
+struct DatabaseRuntimeFailure {
+    error: Option<String>,
+    retry_at: Option<Instant>,
+    backoff: Duration,
+}
+
+impl DatabaseRuntimeFailure {
+    fn record(&mut self, error: String, busy: bool) {
+        self.error = Some(error);
+        if !busy {
+            self.backoff = if self.backoff.is_zero() {
+                Duration::from_secs(2)
+            } else {
+                (self.backoff * 2).min(Duration::from_secs(60))
+            };
+            // Measure from completion: even a slow failed open gets a full
+            // pause before another call can attempt it.
+            self.retry_at = Some(Instant::now() + self.backoff);
+        }
+    }
+}
+
 /// Process-global services shared by all project actors in this AFT process.
 ///
 /// `App` owns only true process services. Per-root caches and the live
@@ -2472,7 +2502,11 @@ impl App {
         mode: crate::db::OpenMode,
     ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
-        let mut slot = self.db.lock();
+        let mut slot = if mode == crate::db::OpenMode::SingleAttempt {
+            self.db.try_lock().ok_or_else(database_connection_busy)?
+        } else {
+            self.db.lock()
+        };
         if let Some((existing_path, conn)) = slot.as_ref() {
             if existing_path == &key {
                 return Ok(Arc::clone(conn));
@@ -2482,6 +2516,40 @@ impl App {
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         *slot = Some((key, Arc::clone(&conn)));
         Ok(conn)
+    }
+
+    /// Peek through the resident handle if this process already owns the file.
+    /// Opening and closing another descriptor can release SQLite's process-wide
+    /// locks. Hold the App slot through the peek so another root cannot open
+    /// the file between checking for a handle and opening a read-only one.
+    pub(crate) fn database_schema_version(
+        &self,
+        path: &Path,
+        mode: crate::db::OpenMode,
+    ) -> Result<(Option<u32>, bool), crate::db::OpenError> {
+        let key = database_path_key(path);
+        let slot = if mode == crate::db::OpenMode::SingleAttempt {
+            self.db.try_lock().ok_or_else(database_connection_busy)?
+        } else {
+            self.db.lock()
+        };
+        if let Some((existing_path, shared)) = slot.as_ref() {
+            if existing_path == &key {
+                let shared = Arc::clone(shared);
+                drop(slot);
+                let mut conn = if mode == crate::db::OpenMode::SingleAttempt {
+                    shared.try_lock().map_err(|_| database_connection_busy())?
+                } else {
+                    shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                };
+                return crate::db::schema_version_without_wait(&mut conn)
+                    .map(|version| (Some(version), true))
+                    .map_err(Into::into);
+            }
+        }
+        Ok((crate::db::peek_schema_version(path), false))
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
@@ -2998,7 +3066,9 @@ pub struct AppContext {
     // run persistence-dependent tools while the root's database is opening.
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
-    database_runtime_error: parking_lot::Mutex<Option<String>>,
+    database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
+    #[cfg(test)]
+    database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
     /// whether an open is running. See `crate::database_open`.
     database_open: parking_lot::Mutex<crate::database_open::DatabaseOpenSlot>,
@@ -3603,7 +3673,9 @@ impl AppContext {
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
-            database_runtime_error: parking_lot::Mutex::new(None),
+            database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
+            #[cfg(test)]
+            database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
             database_open_idle: parking_lot::Condvar::new(),
             parked_configure_tail: parking_lot::Mutex::new(None),
@@ -5498,6 +5570,11 @@ impl AppContext {
         self.database_open.lock().epoch
     }
 
+    #[cfg(test)]
+    pub(crate) fn note_database_open_attempt_for_test(&self) {
+        self.database_open_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub(crate) fn database_open_slot(
         &self,
     ) -> (
@@ -5528,26 +5605,46 @@ impl AppContext {
     }
 
     pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {
-        let success = result.is_ok();
-        *self.database_runtime_error.lock() = result.err();
-        self.database_runtime_state
-            .store(if success { 2 } else { 3 }, Ordering::Release);
-        self.database_runtime_changed.notify_waiters();
+        match result {
+            Ok(()) => {
+                *self.database_runtime_failure.lock() = DatabaseRuntimeFailure::default();
+                self.database_runtime_state.store(2, Ordering::Release);
+                self.database_runtime_changed.notify_waiters();
+            }
+            Err(error) => self.finish_database_runtime_error(error, false),
+        }
     }
 
     pub(crate) fn finish_database_runtime_error(&self, error: String, busy: bool) {
-        *self.database_runtime_error.lock() = Some(error);
+        let mut failure = self.database_runtime_failure.lock();
+        failure.record(error, busy);
         self.database_runtime_state
             .store(if busy { 4 } else { 3 }, Ordering::Release);
+        drop(failure);
         self.database_runtime_changed.notify_waiters();
     }
 
     pub fn claim_database_runtime_retry(&self, command: &str) -> bool {
-        crate::persistence_gate::requires_database(command)
-            && self
+        if !crate::persistence_gate::requires_database(command) {
+            return false;
+        }
+        if self.database_runtime_state.load(Ordering::Acquire) == 3 {
+            // Concurrent calls must neither queue on a retry nor start their
+            // own open. Only the claimant changes failed to initializing.
+            let Some(failure) = self.database_runtime_failure.try_lock() else {
+                return false;
+            };
+            if failure.retry_at.is_none_or(|at| Instant::now() < at) {
+                return false;
+            }
+            return self
                 .database_runtime_state
-                .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .compare_exchange(3, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        }
+        self.database_runtime_state
+            .compare_exchange(5, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub fn retry_database_runtime(&self) {
@@ -5607,6 +5704,14 @@ impl AppContext {
         if !crate::persistence_gate::requires_database(command) {
             return None;
         }
+        // Some library callers enter this gate without transport admission.
+        // They get the same bounded reopen as standalone and daemon calls,
+        // never the bind's longer deferred initialization retry loop.
+        if self.database_runtime_state.load(Ordering::Acquire) == 3
+            && self.claim_database_runtime_retry(command)
+        {
+            self.retry_database_runtime();
+        }
         let failure;
         let (code, message, retryable) = match self.database_runtime_state.load(Ordering::Acquire) {
             1 => (
@@ -5620,16 +5725,21 @@ impl AppContext {
                 let _ = self.database_runtime_state.compare_exchange(4, 5, Ordering::AcqRel, Ordering::Acquire);
                 failure = format!(
                     "Project persistence is busy after bounded initialization retries: {}. Retry the tool shortly; no rebind is needed. No tool operation was performed.",
-                    self.database_runtime_error.lock().as_deref().unwrap_or("database busy")
+                    self.database_runtime_failure.lock().error.as_deref().unwrap_or("database busy")
                 );
                 ("database_unavailable", failure.as_str(), true)
             },
             3 => {
+                let state = self.database_runtime_failure.lock();
+                let remaining = state.retry_at.map_or(Duration::ZERO, |at| {
+                    at.saturating_duration_since(Instant::now())
+                });
                 failure = format!(
-                    "Project persistence could not be opened: {}. Read-only tools still work. Resolve the database error and rebind to retry. No tool operation was performed.",
-                    self.database_runtime_error.lock().as_deref().unwrap_or("unknown database error")
+                    "Project persistence could not be opened: {}. Read-only tools still work. AFT retries on the next persistence-requiring call after {} seconds; no rebind is needed. No tool operation was performed.",
+                    state.error.as_deref().unwrap_or("unknown database error"),
+                    remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0),
                 );
-                ("database_unavailable", failure.as_str(), false)
+                ("database_unavailable", failure.as_str(), true)
             },
             _ => return None,
         };
@@ -14711,6 +14821,308 @@ mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
 
+    struct DatabaseStorageGuard {
+        previous: Option<std::ffi::OsString>,
+        storage: tempfile::TempDir,
+        _env_lock: crate::test_env::ProcessEnvLockGuard,
+    }
+
+    impl DatabaseStorageGuard {
+        fn new() -> Self {
+            let env_lock = crate::test_env::process_env_lock();
+            let storage = tempdir().unwrap();
+            let previous = std::env::var_os("AFT_STORAGE_DIR");
+            std::env::set_var("AFT_STORAGE_DIR", storage.path());
+            Self {
+                previous,
+                storage,
+                _env_lock: env_lock,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.storage.path()
+        }
+    }
+
+    impl Drop for DatabaseStorageGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("AFT_STORAGE_DIR", previous),
+                None => std::env::remove_var("AFT_STORAGE_DIR"),
+            }
+        }
+    }
+
+    fn failed_database_context() -> (DatabaseStorageGuard, tempfile::TempDir, AppContext) {
+        // The environment override wins over Config::storage_dir. Keep both
+        // pointed at this fixture for the whole failed-open/retry lifecycle.
+        let storage = DatabaseStorageGuard::new();
+        let root = tempdir().unwrap();
+        let path = storage.path().join("aft.db");
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        drop(conn);
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "database-recovery".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 3);
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        let response = ctx.database_runtime_refusal("failed", "bash").unwrap();
+        assert!(serde_json::to_value(response).unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_requires_newer_reader"));
+        assert!(ctx.db().is_none());
+        (storage, root, ctx)
+    }
+
+    fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
+        ctx.database_runtime_refusal("retry", "db_set_host_state")
+    }
+
+    #[test]
+    fn failed_database_open_recovers_after_backoff_without_rebind() {
+        let (storage, _root, ctx) = failed_database_context();
+        // The failed open held no connection. Repair only this test's database,
+        // closing the repair connection before AFT attempts to reopen it.
+        let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION],
+        )
+        .unwrap();
+        drop(conn);
+        std::thread::sleep(Duration::from_millis(2_100));
+
+        let refusal = persistence_call(&ctx);
+        assert!(
+            refusal.is_none(),
+            "repaired database stayed latched: {refusal:?}"
+        );
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+        assert!(ctx.db().is_some());
+        let failure = ctx.database_runtime_failure.lock();
+        assert!(failure.error.is_none());
+        assert!(failure.retry_at.is_none());
+        assert_eq!(failure.backoff, Duration::ZERO);
+        drop(failure);
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "persist", "command": "db_set_host_state",
+            "params": {"key": "recovered", "value": "without-rebind"}
+        }))
+        .unwrap();
+        assert!(crate::commands::state::handle_db_set_host_state(&request, &ctx).success);
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            crate::db::state::get_host_state(&conn, "recovered").unwrap(),
+            Some("without-rebind".into())
+        );
+    }
+
+    #[test]
+    fn failed_database_open_does_not_reopen_inside_backoff() {
+        let (_storage, _root, ctx) = failed_database_context();
+        for _ in 0..10 {
+            assert!(persistence_call(&ctx).is_some());
+        }
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert!(ctx.database_runtime_refusal("read", "read").is_none());
+    }
+
+    fn make_database_retry_due(ctx: &AppContext) {
+        ctx.database_runtime_failure.lock().retry_at =
+            Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn permanent_database_error_is_rechecked_with_doubling_capped_backoff() {
+        let (storage, _root, ctx) = failed_database_context();
+        assert_eq!(
+            ctx.database_runtime_failure.lock().backoff,
+            Duration::from_secs(2)
+        );
+        // A different unsupported version must appear in the next refusal,
+        // proving that retries re-check the file rather than replaying an error.
+        let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            [crate::db::CURRENT_SCHEMA_VERSION + 2],
+        )
+        .unwrap();
+        drop(conn);
+        for (index, seconds) in [4, 8, 16, 32, 60, 60].into_iter().enumerate() {
+            make_database_retry_due(&ctx);
+            assert!(ctx.database_runtime_refusal("read", "read").is_none());
+            assert!(!ctx.claim_database_runtime_retry("read"));
+            let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+            let message = response["message"].as_str().unwrap();
+            assert!(message.contains("storage_requires_newer_reader"));
+            assert!(message.contains(&format!(
+                "format version {}",
+                crate::db::CURRENT_SCHEMA_VERSION + 2
+            )));
+            assert!(message.contains("next persistence-requiring call after"));
+            assert!(message.contains("AFT retries"));
+            assert!(!message.contains("rebind to retry"));
+            assert_eq!(response["retryable"], true);
+            assert_eq!(
+                ctx.database_runtime_failure.lock().backoff,
+                Duration::from_secs(seconds)
+            );
+            assert_eq!(
+                ctx.database_open_attempts.load(Ordering::Acquire),
+                index as u64 + 2
+            );
+            assert!(persistence_call(&ctx).is_some());
+            assert_eq!(
+                ctx.database_open_attempts.load(Ordering::Acquire),
+                index as u64 + 2
+            );
+            assert!(ctx.db().is_none());
+        }
+    }
+
+    #[test]
+    fn only_one_concurrent_call_claims_a_failed_database_retry() {
+        let (_storage, _root, ctx) = failed_database_context();
+        let ctx = Arc::new(ctx);
+        make_database_retry_due(&ctx);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let calls = (0..8)
+            .map(|_| {
+                let ctx = Arc::clone(&ctx);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ctx.claim_database_runtime_retry("bash")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .into_iter()
+                .map(|call| call.join().unwrap())
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        ctx.retry_database_runtime();
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn failed_database_retry_reuses_and_preserves_a_resident_connection() {
+        let storage = DatabaseStorageGuard::new();
+        let root = tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let path = storage.path().join("aft.db");
+        let resident = ctx.app().open_db(&path).unwrap();
+        let peeks = crate::db::schema_peek_count_for_test();
+        resident
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                [crate::db::CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "resident".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "resident schema checks must not open another descriptor"
+        );
+        let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(response["message"]
+            .as_str()
+            .unwrap()
+            .contains("storage_requires_newer_reader"));
+        assert!(Arc::ptr_eq(
+            &resident,
+            &ctx.db().expect("refusal must preserve the shared handle")
+        ));
+        resident
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                [crate::db::CURRENT_SCHEMA_VERSION],
+            )
+            .unwrap();
+        make_database_retry_due(&ctx);
+        assert!(persistence_call(&ctx).is_none());
+        assert_eq!(
+            crate::db::schema_peek_count_for_test(),
+            peeks,
+            "retries must not open another descriptor on a resident database"
+        );
+        assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn database_single_attempt_does_not_wait_for_a_held_connection_or_open_slot() {
+        let storage = tempdir().unwrap();
+        let path = storage.path().join("aft.db");
+        let app = App::default_shared();
+        let resident = app.open_db(&path).unwrap();
+        let held = resident.lock().unwrap();
+        assert!(app
+            .database_schema_version(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        drop(held);
+        let held = app.db.lock();
+        assert!(app
+            .database_schema_version(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        assert!(app
+            .open_db_with_mode(&path, crate::db::OpenMode::SingleAttempt)
+            .unwrap_err()
+            .is_busy());
+        drop(held);
+    }
+
     #[test]
     fn database_retry_without_configured_root_refuses_without_panicking() {
         let ctx = AppContext::from_app(App::default_shared(), Config::default());
@@ -14727,7 +15139,7 @@ mod shared_db_tests {
         )
         .unwrap();
         assert_eq!(response["code"], "database_unavailable");
-        assert_eq!(response["retryable"], false);
+        assert_eq!(response["retryable"], true);
         assert!(response["message"]
             .as_str()
             .unwrap()
