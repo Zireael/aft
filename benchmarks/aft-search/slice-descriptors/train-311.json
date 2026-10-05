@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-truth-harness"
+  ],
+  "note": "aft_inspect accuracy evaluation harness (benchmarks/inspect-truth); no product code and no ranking-fence file."
+}
