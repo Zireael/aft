@@ -3,7 +3,7 @@
 //! Extracted from `commands/zoom.rs` so both the zoom command and the
 //! call-graph engine can reuse the same AST-walking logic.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::parser::LangId;
 
@@ -508,11 +508,236 @@ pub fn extract_rust_value_references(
     source: &str,
     root: tree_sitter::Node,
 ) -> Vec<(String, String, u32, usize, usize)> {
+    #[cfg(test)]
+    if LEGACY_VALUE_REFERENCES.with(|legacy| legacy.get()) {
+        let mut results = Vec::new();
+        collect_rust_value_references(root, source, &mut results, 0);
+        return results;
+    }
+    let mut walk = RustValueWalk {
+        source,
+        ancestors: Vec::new(),
+        blocks: HashMap::new(),
+        results: Vec::new(),
+    };
+    // Callers may pass a subtree. Capture its outside ancestry once, rather
+    // than asking tree-sitter to rediscover it for every identifier.
+    let mut parent = root.parent();
+    while let Some(node) = parent {
+        walk.ancestors.push(node);
+        parent = node.parent();
+    }
+    walk.ancestors.reverse();
+    for node in &walk.ancestors {
+        if node.kind() == "block" {
+            walk.blocks
+                .insert(node.id(), rust_block_bindings(*node, source));
+        }
+    }
+    walk.visit(root, 0);
+    walk.results
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_VALUE_REFERENCES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VALUE_BINDING_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct RustValueWalk<'tree, 'source> {
+    source: &'source str,
+    ancestors: Vec<tree_sitter::Node<'tree>>,
+    // The first declaration end for a name is enough: the legacy rule asks
+    // whether *any* preceding let binds it, not which binding supplies a type.
+    blocks: HashMap<usize, HashMap<&'source str, usize>>,
+    results: Vec<(String, String, u32, usize, usize)>,
+}
+
+fn rust_block_bindings<'source>(
+    block: tree_sitter::Node<'_>,
+    source: &'source str,
+) -> HashMap<&'source str, usize> {
+    let mut bindings = HashMap::new();
+    let mut cursor = block.walk();
+    for child in block.children(&mut cursor) {
+        #[cfg(test)]
+        VALUE_BINDING_WORK.with(|work| work.set(work.get() + 1));
+        if child.kind() != "let_declaration" {
+            continue;
+        }
+        if let Some(pattern) = child.child_by_field_name("pattern") {
+            let mut pending = vec![pattern];
+            while let Some(node) = pending.pop() {
+                #[cfg(test)]
+                VALUE_BINDING_WORK.with(|work| work.set(work.get() + 1));
+                if node.kind() == "identifier" {
+                    bindings
+                        .entry(&source[node.byte_range()])
+                        .or_insert(child.end_byte());
+                }
+                let mut pattern_cursor = node.walk();
+                pending.extend(node.children(&mut pattern_cursor));
+            }
+        }
+    }
+    bindings
+}
+
+impl<'tree> RustValueWalk<'tree, '_> {
+    fn visit(&mut self, node: tree_sitter::Node<'tree>, depth: u32) {
+        if node.kind() == "block" {
+            self.blocks
+                .insert(node.id(), rust_block_bindings(node, self.source));
+        }
+        let nested = self.ancestors.last().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier" | "generic_function"
+            )
+        });
+        if matches!(node.kind(), "identifier" | "scoped_identifier")
+            && !nested
+            && self.is_value_position(node)
+        {
+            let full = self.source[node.byte_range()].trim();
+            let short = full.rsplit("::").next().unwrap_or(full).trim();
+            if !full.is_empty()
+                && !short.is_empty()
+                && (node.kind() != "identifier" || !self.is_shadowed(node))
+            {
+                self.results.push((
+                    full.to_string(),
+                    short.to_string(),
+                    node.start_position().row as u32 + 1,
+                    node.start_byte(),
+                    node.end_byte(),
+                ));
+            }
+        }
+        if depth < MAX_AST_WALK_DEPTH {
+            self.ancestors.push(node);
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                self.visit(child, depth + 1);
+            }
+            self.ancestors.pop();
+        }
+        if node.kind() == "block" {
+            self.blocks.remove(&node.id());
+        }
+    }
+
+    fn is_value_position(&self, node: tree_sitter::Node<'_>) -> bool {
+        let mut current = node;
+        for parent in self.ancestors.iter().rev() {
+            let selected = |field: &str| {
+                parent
+                    .child_by_field_name(field)
+                    .is_some_and(|child| same_node(&child, &current))
+            };
+            if parent.kind() == "call_expression" && selected("function") {
+                return false;
+            }
+            match parent.kind() {
+                "arguments" | "array_expression" | "tuple_expression" => return true,
+                "let_declaration" if selected("value") => return true,
+                "assignment_expression" if selected("right") => return true,
+                "field_initializer" if selected("value") => return true,
+                "shorthand_field_initializer" | "return_expression" | "break_expression" => {
+                    return true
+                }
+                "parenthesized_expression"
+                | "reference_expression"
+                | "unary_expression"
+                | "await_expression"
+                | "try_expression" => current = *parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn is_shadowed(&self, node: tree_sitter::Node<'_>) -> bool {
+        let name = &self.source[node.byte_range()];
+        let mut current = node;
+        for parent in self.ancestors.iter().rev() {
+            match parent.kind() {
+                "function_item" | "closure_expression" => {
+                    if parent
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| {
+                            rust_pattern_binds_name(parameters, self.source, name)
+                        })
+                    {
+                        return true;
+                    }
+                }
+                "match_arm" => {
+                    if parent
+                        .child_by_field_name("pattern")
+                        .is_some_and(|pattern| rust_pattern_binds_name(pattern, self.source, name))
+                    {
+                        return true;
+                    }
+                }
+                "for_expression" => {
+                    if parent
+                        .child_by_field_name("body")
+                        .is_some_and(|body| node_contains(&body, &node))
+                        && parent
+                            .child_by_field_name("pattern")
+                            .is_some_and(|pattern| {
+                                rust_pattern_binds_name(pattern, self.source, name)
+                            })
+                    {
+                        return true;
+                    }
+                }
+                "if_expression" | "while_expression" => {
+                    if parent
+                        .child_by_field_name("consequence")
+                        .or_else(|| parent.child_by_field_name("body"))
+                        .is_some_and(|body| node_contains(&body, &node))
+                        && parent
+                            .child_by_field_name("condition")
+                            .is_some_and(|condition| {
+                                rust_let_condition_binds_name(condition, self.source, name)
+                            })
+                    {
+                        return true;
+                    }
+                }
+                "block" => {
+                    #[cfg(test)]
+                    VALUE_BINDING_WORK.with(|work| work.set(work.get() + 1));
+                    if self
+                        .blocks
+                        .get(&parent.id())
+                        .and_then(|bindings| bindings.get(name))
+                        .is_some_and(|end| *end <= current.start_byte())
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            current = *parent;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+fn legacy_rust_value_references(
+    source: &str,
+    root: tree_sitter::Node,
+) -> Vec<(String, String, u32, usize, usize)> {
     let mut results = Vec::new();
     collect_rust_value_references(root, source, &mut results, 0);
     results
 }
 
+#[cfg(test)]
 fn collect_rust_value_references(
     node: tree_sitter::Node,
     source: &str,
@@ -554,6 +779,7 @@ fn collect_rust_value_references(
     }
 }
 
+#[cfg(test)]
 fn rust_path_is_nested(node: &tree_sitter::Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         matches!(
@@ -563,6 +789,7 @@ fn rust_path_is_nested(node: &tree_sitter::Node<'_>) -> bool {
     })
 }
 
+#[cfg(test)]
 fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
     let mut current = *node;
     while let Some(parent) = current.parent() {
@@ -597,6 +824,7 @@ fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
     false
 }
 
+#[cfg(test)]
 fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) -> bool {
     let name = &source[node.byte_range()];
     let mut current = *node;
@@ -647,6 +875,7 @@ fn rust_bare_identifier_is_shadowed(node: &tree_sitter::Node<'_>, source: &str) 
             "block" => {
                 let mut sibling = current.prev_named_sibling();
                 while let Some(previous) = sibling {
+                    VALUE_BINDING_WORK.with(|work| work.set(work.get() + 1));
                     if previous.kind() == "let_declaration"
                         && previous
                             .child_by_field_name("pattern")
@@ -1133,6 +1362,32 @@ fn collect_calls_full(
 mod tests {
     use super::*;
     use crate::parser::grammar_for;
+
+    #[test]
+    fn rust_value_binding_work_is_linear_and_results_are_identical() {
+        let mut source = String::from("fn process() {\n");
+        for i in 0..1000 {
+            source.push_str(&format!(
+                "let v{i} = callback; consume(v{i}); consume(callback);\n"
+            ));
+        }
+        source.push_str("}\nfn scopes(callback: fn()) {\nlet later = callback;\n{ consume(other); let other = later; consume(other); }\nlet (a, b) = (later, ns::callback);\nconsume(a);\nfor other in values { consume(other); consume(callback); }\nif let Some(other) = option { consume(other); } else { consume(other); }\nwhile let Some(other) = option { consume(other); }\nmatch value { Some(other) => consume(other), _ => consume(callback) }\nlet f = |other| { consume(other); consume(callback); };\n}\n");
+        let tree = parse_source(LangId::Rust, &source);
+        assert!(!tree.root_node().has_error());
+        VALUE_BINDING_WORK.with(|work| work.set(0));
+        let reference = legacy_rust_value_references(&source, tree.root_node());
+        let before = VALUE_BINDING_WORK.with(|work| work.get());
+        VALUE_BINDING_WORK.with(|work| work.set(0));
+        let actual = extract_rust_value_references(&source, tree.root_node());
+        let after = VALUE_BINDING_WORK.with(|work| work.get());
+        assert_eq!(actual, reference);
+        assert!(actual.len() >= 2000);
+        eprintln!("Rust binding work {before} -> {after}");
+        assert!(
+            after <= 10000,
+            "{after} block binding operations for 1000 declarations"
+        );
+    }
 
     fn parse_source(lang: LangId, source: &str) -> tree_sitter::Tree {
         let grammar = grammar_for(lang);

@@ -18,14 +18,11 @@ impl IndentStyle {
     pub fn as_str(&self) -> &'static str {
         match self {
             IndentStyle::Tabs => "\t",
-            IndentStyle::Spaces(2) => "  ",
-            IndentStyle::Spaces(4) => "    ",
-            IndentStyle::Spaces(8) => "        ",
             IndentStyle::Spaces(n) => {
-                // For uncommon widths, leak a static string. In practice
-                // this only fires for exotic indent widths (1, 3, 5, 6, 7).
-                let s: String = " ".repeat(*n as usize);
-                Box::leak(s.into_boxed_str())
+                // Every u8 width fits in this shared ASCII buffer. Slicing it
+                // keeps the static API without allocating or leaking per call.
+                static SPACES: [u8; u8::MAX as usize] = [b' '; u8::MAX as usize];
+                std::str::from_utf8(&SPACES[..*n as usize]).expect("ASCII spaces")
             }
         }
     }
@@ -217,6 +214,23 @@ mod tests {
         assert_eq!(IndentStyle::Tabs.as_str(), "\t");
         assert_eq!(IndentStyle::Spaces(2).as_str(), "  ");
         assert_eq!(IndentStyle::Spaces(4).as_str(), "    ");
+    }
+
+    #[test]
+    fn indent_strings_reuse_storage_for_every_width() {
+        let mut addresses = std::collections::HashSet::new();
+        for _ in 0..32 {
+            for width in 0..=u8::MAX {
+                let text = IndentStyle::Spaces(width).as_str();
+                assert_eq!(text, " ".repeat(width as usize));
+                addresses.insert((width, text.as_ptr() as usize));
+            }
+        }
+        assert_eq!(
+            addresses.len(),
+            256,
+            "one stable slice per width, not one allocation per call"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub const LARGE_CONTAINER_MENU_LINE_THRESHOLD: usize = 150;
 
 pub struct ContainerOutline {
     entry: OutlineEntry,
-    symbols: Vec<Symbol>,
+    symbols: std::sync::Arc<Vec<Symbol>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub fn build_container_outline(
     resolved_file_path: &Path,
     target: &Symbol,
 ) -> Result<ContainerOutline, crate::error::AftError> {
-    let symbols = ctx.provider().list_symbols(resolved_file_path)?;
+    let symbols = crate::parser::list_symbols_shared(ctx.provider(), resolved_file_path)?;
     let entries = build_outline_tree(&symbols);
     let entry = find_outline_entry(&entries, target)
         .cloned()
