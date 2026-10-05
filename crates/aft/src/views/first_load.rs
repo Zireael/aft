@@ -232,6 +232,67 @@ impl SiblingLoader {
         }
         pending
     }
+
+    /// Refresh an already installed owner without reopening sibling manifests.
+    /// Membership is still strictly reconciled, including unreported edits.
+    pub(crate) fn refresh(
+        &self,
+        access: &ViewAccess,
+        base: Arc<OpenGeneration>,
+    ) -> Result<Snapshot, PlaneError> {
+        let (snapshot, revision) = self.reconciled(access, base)?;
+        self.driver.install(access, &snapshot, revision)?;
+        self.fold(access, &snapshot, revision)
+    }
+
+    /// Fold plane completions from a revision-fenced cut. Publication is not a
+    /// source edit: only a delivered edit during the build requires a new walk.
+    pub(crate) fn fold(
+        &self,
+        access: &ViewAccess,
+        snapshot: &Snapshot,
+        revision: u64,
+    ) -> Result<Snapshot, PlaneError> {
+        if self.driver.revision(access) != revision
+            || snapshot.pending_intent().next().is_some()
+            || matches!(access, ViewAccess::Owner(owner) if super::intent::active(owner.root()))
+        {
+            return Err(Self::error(CHECKOUT_CHANGED_BEFORE_INSTALL));
+        }
+        let own = self
+            .driver
+            .build_own_generation(access, snapshot, DERIVED_CALLGRAPH_SEEDING)?;
+        own.manifest()
+            .ensure_producers(&self.driver.producers(access))
+            .map_err(|error| Self::error(error.to_string()))?;
+        let (snapshot, revision) = if self.driver.revision(access) == revision {
+            // Rebase the reconciled disk facts, not the new manifest's claims.
+            // A builder can leave pending data without changing source bytes.
+            let members = snapshot.membership();
+            let mut delta = super::snapshot::LiveDelta::new(Arc::clone(&own));
+            delta.bump_epoch();
+            for (path, _) in own.manifest().entries() {
+                if !members.contains_key(path) {
+                    delta.apply(
+                        path.clone(),
+                        LiveEntry::new(super::snapshot::DiskState::Absent, revision),
+                    );
+                }
+            }
+            for (path, disk) in members {
+                let entry = match snapshot.source(&path) {
+                    super::snapshot::Source::Live(entry) => entry.clone(),
+                    _ => LiveEntry::new(disk, revision),
+                };
+                delta.apply(path, entry);
+            }
+            (delta.snapshot(), revision)
+        } else {
+            self.reconciled(access, own)?
+        };
+        self.driver.install(access, &snapshot, revision)?;
+        Ok(snapshot)
+    }
 }
 
 impl super::contracts::PlaneLoader for SiblingLoader {
@@ -247,16 +308,7 @@ impl super::contracts::PlaneLoader for SiblingLoader {
         }
         let (snapshot, revision) = self.reconciled(access, seed)?;
         self.driver.install(access, &snapshot, revision)?;
-        let own = self
-            .driver
-            .build_own_generation(access, &snapshot, DERIVED_CALLGRAPH_SEEDING)?;
-        own.manifest()
-            .ensure_producers(&self.driver.producers(access))
-            .map_err(|error| Self::error(error.to_string()))?;
-        // The builder may have read an earlier cut. Re-walk rather than assuming
-        // publication also installed every edit delivered while it was building.
-        let (snapshot, revision) = self.reconciled(access, own)?;
-        self.driver.install(access, &snapshot, revision)?;
+        let snapshot = self.fold(access, &snapshot, revision)?;
         let pending_planes = self.open_planes(access, &snapshot);
         Ok(super::contracts::LoadOutcome {
             snapshot,
@@ -754,6 +806,145 @@ struct InstalledCheckout {
     own_installed: bool,
 }
 
+/// In-memory evidence that a previous source read still describes this file.
+/// No stamps survive a restart. Platforms without a kernel change time and
+/// file identity keep reading bytes instead of trusting mtime alone.
+#[derive(Clone)]
+struct ObservedStat {
+    stamp: crate::watcher::FileStamp,
+    #[cfg(unix)]
+    device: u64,
+    recorded_ns: u128,
+}
+
+impl ObservedStat {
+    fn new(metadata: &std::fs::Metadata, recorded_ns: u128) -> Self {
+        Self {
+            stamp: crate::watcher::FileStamp::from_metadata(metadata),
+            #[cfg(unix)]
+            device: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.dev()
+            },
+            recorded_ns,
+        }
+    }
+
+    fn reusable(&self, current: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.stamp == current.stamp && self.device == current.device
+            // Equal timestamps can hide a write made within the filesystem's
+            // timestamp granularity. Do not move the observation time on hits.
+            && self.stamp.modified_ns.is_some_and(|mtime| mtime < self.recorded_ns)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (current, self.recorded_ns);
+            false
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stat_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn driver(root: &std::path::Path, storage: &std::path::Path) -> (CheckoutDriver, ViewAccess) {
+        let registry = super::super::registry::FamilyRegistry::open(storage, "family").unwrap();
+        let owner = registry.register_view("stat", root).unwrap();
+        let driver = CheckoutDriver::new(
+            owner.clone(),
+            Producers {
+                trigram: "unused".into(),
+                semantic: None,
+                callgraph: "unused".into(),
+            },
+            None,
+            Arc::new(ConfiguredMembershipWalker),
+            vec![],
+        );
+        (driver, ViewAccess::Owner(owner))
+    }
+
+    fn old_mtime(path: &std::path::Path) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(60)))
+            .unwrap();
+    }
+
+    #[test]
+    fn stat_reconcile_detects_unreported_same_size_backdated_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.rs");
+        std::fs::write(&file, b"before").unwrap();
+        old_mtime(&file);
+        let (driver, access) = driver(root.path(), storage.path());
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        driver.reconcile(&access).unwrap();
+        driver.take_reconcile_work();
+        driver.reconcile(&access).unwrap();
+        assert_eq!(driver.take_reconcile_work().reads, 0);
+        let before = driver.observed_stats.lock().unwrap()[&path].clone();
+        std::fs::write(&file, b"edited").unwrap();
+        old_mtime(&file);
+        let current = ObservedStat::new(&std::fs::metadata(&file).unwrap(), before.recorded_ns);
+        assert_eq!(before.stamp.size, current.stamp.size);
+        assert_eq!(before.stamp.modified_ns, current.stamp.modified_ns);
+        assert_eq!(before.stamp.inode, current.stamp.inode);
+        assert_ne!(
+            before.stamp.ctime_ns, current.stamp.ctime_ns,
+            "fixture must move ctime"
+        );
+        // No event or intent is delivered: the changed ctime alone must force
+        // a source read despite an identical size, inode and backdated mtime.
+        let checkout = driver.reconcile(&access).unwrap();
+        let work = driver.take_reconcile_work();
+        eprintln!("unreported backdated edit: {work:?}");
+        assert_eq!(
+            checkout.entries[&path].disk,
+            super::super::snapshot::DiskState::of_bytes(b"edited")
+        );
+        assert_eq!(work.reads, 1);
+        assert_eq!(work.content_hash_bytes, 6);
+    }
+
+    #[test]
+    fn stat_reconcile_reads_racily_clean_file_even_when_stamp_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let file = root.path().join("file.rs");
+        std::fs::write(&file, b"before").unwrap();
+        old_mtime(&file);
+        let (driver, access) = driver(root.path(), storage.path());
+        let path = RelPath::new(b"file.rs".to_vec()).unwrap();
+        driver.reconcile(&access).unwrap();
+        driver.take_reconcile_work();
+        // Inject the timestamp boundary instead of waiting for the host clock
+        // or depending on this filesystem's timestamp resolution.
+        {
+            let mut stats = driver.observed_stats.lock().unwrap();
+            let observed = stats.get_mut(&path).unwrap();
+            observed.recorded_ns = observed.stamp.modified_ns.unwrap();
+        }
+        let checkout = driver.reconcile(&access).unwrap();
+        let work = driver.take_reconcile_work();
+        eprintln!("racily clean: {work:?}");
+        assert_eq!(
+            checkout.entries[&path].disk,
+            super::super::snapshot::DiskState::of_bytes(b"before")
+        );
+        assert_eq!(
+            work.reads, 1,
+            "an equal stat in the observation's timestamp window is not proof of unchanged bytes"
+        );
+        assert_eq!(work.content_hash_bytes, 6);
+    }
+}
+
 /// Composite checkout driver shared by the loader and query-wait router.
 /// Watchers and first-party mutation paths call `record_change` before acknowledging
 /// edits. Real planes supply extraction/materialization bridges at construction.
@@ -766,7 +957,21 @@ pub struct CheckoutDriver {
     adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
     publish_fence: std::sync::RwLock<Option<Arc<dyn PublishFence>>>,
     observed: std::sync::Mutex<BTreeMap<RelPath, LiveEntry>>,
+    observed_stats: std::sync::Mutex<BTreeMap<RelPath, ObservedStat>>,
     installed: std::sync::Mutex<InstalledCheckout>,
+    #[cfg(test)]
+    work: std::sync::Mutex<ReconcileWork>,
+}
+
+/// Source work only; publication and model counters belong to their stores.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReconcileWork {
+    pub walks: usize,
+    pub stats: usize,
+    pub reads: usize,
+    pub content_hash_bytes: usize,
+    pub attachments: usize,
 }
 
 impl CheckoutDriver {
@@ -795,6 +1000,7 @@ impl CheckoutDriver {
             adapters: Vec::new(),
             publish_fence: std::sync::RwLock::new(None),
             observed: std::sync::Mutex::new(BTreeMap::new()),
+            observed_stats: Default::default(),
             installed: std::sync::Mutex::new(InstalledCheckout {
                 revision: 0,
                 snapshot: delta.snapshot(),
@@ -802,6 +1008,8 @@ impl CheckoutDriver {
                 uncertain_paths: std::collections::BTreeSet::new(),
                 own_installed: false,
             }),
+            #[cfg(test)]
+            work: Default::default(),
         }
     }
 
@@ -875,24 +1083,80 @@ impl FirstLoadDriver for CheckoutDriver {
         if super::intent::active(self.owner.root()) {
             return Err(SiblingLoader::error(CHECKOUT_WRITE_ACTIVE));
         }
-        let revision = self.revision(access);
+        let (installed, revision) = self.installed_cut();
+        let pending: std::collections::BTreeSet<_> = installed.pending_intent().cloned().collect();
+        let previous = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let previous_stats = self
+            .observed_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut entries = BTreeMap::new();
-        // No git diff or stat shortcut: copied trees and non-git roots take
-        // the same complete content walk as every other checkout kind.
+        let mut stats = BTreeMap::new();
+        #[cfg(test)]
+        {
+            self.work.lock().unwrap().walks += 1;
+        }
+        // Full configured membership, even for copied and non-git roots. Stat
+        // reuse avoids source I/O, not the discovery of unreported changes.
         for absolute in self.walker.files(self.owner.root())? {
             let relative = absolute
                 .strip_prefix(self.owner.root())
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
             let path = RelPath::from_os_path(relative)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?;
+            // Round down to the second so coarse filesystem timestamps in the
+            // observation's second are also treated as racily clean.
+            let recorded_ns = u128::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ) * 1_000_000_000;
+            let before = self.source_stat(&absolute, recorded_ns)?;
+            if !pending.contains(&path) {
+                if let (Some(old), Some(cached), Some(current)) = (
+                    previous.get(&path),
+                    previous_stats.get(&path),
+                    before.as_ref(),
+                ) {
+                    if cached.reusable(current) {
+                        let mut entry = old.clone();
+                        entry.seq = revision;
+                        entries.insert(path.clone(), entry);
+                        stats.insert(path, cached.clone());
+                        continue;
+                    }
+                }
+            }
             let Some(bytes) = super::assembly::read_working_tree_file(&absolute)
                 .map_err(|error| SiblingLoader::error(error.to_string()))?
             else {
                 continue;
             };
+            let after = self.source_stat(&absolute, recorded_ns)?;
+            if let (Some(before), Some(after)) = (before, after) {
+                if before.stamp == after.stamp {
+                    stats.insert(path.clone(), before);
+                }
+            }
+            #[cfg(test)]
+            {
+                let mut work = self.work.lock().unwrap();
+                work.reads += 1;
+                work.content_hash_bytes += bytes.len();
+            }
             let mut entry = LiveEntry::new(super::snapshot::DiskState::of_bytes(&bytes), revision);
             for plane in &self.planes {
                 if plane.applies_to(&path) {
+                    #[cfg(test)]
+                    {
+                        self.work.lock().unwrap().attachments += 1;
+                    }
                     entry
                         .attachments
                         .insert(plane.plane(), plane.attachment(&path, &bytes)?);
@@ -904,6 +1168,10 @@ impl FirstLoadDriver for CheckoutDriver {
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = entries.clone();
+        *self
+            .observed_stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stats;
         Ok(ReconciledCheckout { revision, entries })
     }
     fn install(
@@ -1751,6 +2019,38 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    fn source_stat(
+        &self,
+        path: &std::path::Path,
+        recorded_ns: u128,
+    ) -> Result<Option<ObservedStat>, PlaneError> {
+        #[cfg(test)]
+        {
+            self.work.lock().unwrap().stats += 1;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                Ok(Some(ObservedStat::new(&metadata, recorded_ns)))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(SiblingLoader::error(error.to_string())),
+        }
+    }
+
+    pub(crate) fn installed_cut(&self) -> (Snapshot, u64) {
+        let installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (installed.snapshot.clone(), installed.revision)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_reconcile_work(&self) -> ReconcileWork {
+        std::mem::take(&mut *self.work.lock().unwrap())
+    }
+
     /// The snapshot last installed for this checkout, without computing the
     /// per-plane gaps `installed_state` reports.
     pub fn installed_snapshot(&self) -> Snapshot {

@@ -230,6 +230,110 @@ fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
         .count()
 }
 
+/// A large, already-filled checkout must not read or embed unchanged sources
+/// again just to publish one edit. Compare to the strict loader and an
+/// independent cold index, not to another copy of the fast path.
+#[test]
+fn large_checkout_edit_counts_source_work_and_preserves_outputs() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root.path()).unwrap();
+    for i in 0..2048 {
+        let path = root.join(format!("file_{i:04}.rs"));
+        std::fs::write(&path, format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(60)),
+            )
+            .unwrap();
+    }
+    let runtime = open(storage.path(), "large", &root);
+    let model = Model::default();
+    let budget = FillBudget {
+        max_files: 4096,
+        ..FillBudget::default()
+    };
+    runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    runtime.driver().take_reconcile_work();
+    let before = model.texts();
+    let target = root.join("file_0000.rs");
+    let changed = "pub fn rewritten_item() -> u32 { 9999 }\n";
+    {
+        let _intent = crate::views::intent::record_paths([target.as_path()]);
+        std::fs::write(&target, changed).unwrap();
+    }
+    let report = runtime
+        .refresh(budget, &mut |texts| model.embed(texts))
+        .unwrap();
+    let work = runtime.driver().take_reconcile_work();
+    eprintln!(
+        "edit: {work:?}; embedded texts={}, keys={}",
+        model.texts() - before,
+        report.embedded_keys
+    );
+    assert_eq!(
+        model.texts() - before,
+        1,
+        "unchanged content was re-embedded"
+    );
+    let answer = query(&runtime, "rewritten item");
+    assert!(answer.complete(), "{answer:?}");
+    assert_eq!(
+        rows(&root, &answer.results),
+        cold(&root, "rewritten item").0
+    );
+    let snapshot = runtime.installed();
+    let manifest = snapshot.generation().manifest().to_json_bytes().unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let blobs: Vec<_> = snapshot
+        .generation()
+        .manifest()
+        .ready_keys()
+        .map(|key| (key, store.get(&key).unwrap().unwrap()))
+        .collect();
+    runtime.load().unwrap();
+    assert_eq!(
+        runtime
+            .installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        manifest
+    );
+    for (key, payload) in blobs {
+        assert_eq!(store.get(&key).unwrap().unwrap(), payload);
+    }
+    assert_eq!(
+        rows(&root, &query(&runtime, "rewritten item").results),
+        rows(&root, &answer.results)
+    );
+    assert_eq!(
+        work.walks, 1,
+        "an edit needs one strict membership reconciliation, not fold walks"
+    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            work.reads, 1,
+            "unchanged files should cost a stat, not a source read"
+        );
+        assert_eq!(work.content_hash_bytes, changed.len());
+        assert_eq!(work.attachments, 1);
+        assert_eq!(
+            work.stats, 2049,
+            "one stat per member plus a post-read stability stat"
+        );
+    }
+}
+
 /// A catch-up that takes several budgeted rounds serves each round's vectors
 /// at once but publishes them in one fold at the end, because every fold
 /// re-walks the whole checkout.

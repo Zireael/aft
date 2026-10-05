@@ -183,13 +183,14 @@ impl CheckoutSemantic {
 
     /// Brings the checkout's vectors up to date within `budget`.
     ///
-    /// The checkout is reloaded first when the installed snapshot carries
+    /// The checkout is reconciled first when the installed snapshot carries
     /// edits it has not reconciled (a watcher change or an AFT write records
     /// an intent), so the fill sees the current bytes. Once no budgeted work
     /// remains (or a round makes no progress), the completions are folded
     /// into a newly published generation, which keeps them across restarts
     /// and lets sibling checkouts seed from them. Folding once per catch-up
-    /// rather than per round matters: each fold re-walks the whole checkout.
+    /// rather than per round avoids repeated manifest publications. A fold
+    /// reuses reconciled disk facts unless an edit arrives during publication.
     /// Until then the fill map serves them and the live pin protects them.
     ///
     /// Errors are classified: [`RefreshError::Transient`] for failures that
@@ -204,7 +205,13 @@ impl CheckoutSemantic {
         self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = self.installed();
         if needs_reload(&snapshot) {
-            snapshot = self.load().map_err(RefreshError::classify)?;
+            snapshot = if snapshot.generation().name() == "empty" {
+                self.load().map_err(RefreshError::classify)?
+            } else {
+                self.loader
+                    .refresh(&self.access, Arc::clone(snapshot.generation()))
+                    .map_err(|error| RefreshError::classify(error.to_string()))?
+            };
         }
         let driver = Arc::clone(&self.driver);
         let report = self
@@ -218,9 +225,10 @@ impl CheckoutSemantic {
         }
         let caught_up = report.deferred == 0 || (report.installed == 0 && report.failed == 0);
         if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
-            if let Err(error) = self.load() {
+            let (snapshot, revision) = self.driver.installed_cut();
+            if let Err(error) = self.loader.fold(&self.access, &snapshot, revision) {
                 self.unfolded.store(true, Ordering::SeqCst);
-                return Err(RefreshError::classify(error));
+                return Err(RefreshError::classify(error.to_string()));
             }
         }
         Ok(report)
