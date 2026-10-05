@@ -12,10 +12,10 @@ For every repository in corpus.json this script:
 4. normalizes both sides to (category, path, symbol, line), matches them and
    writes per-category counts, precision/recall and sampled disagreements.
 
-Phases can be run separately (`fetch`, `aft`, `oracle`, `score`) or together
-with `all`. Raw tool output is kept under <corpus_root>/_results/<repo>/ so a
-re-score never has to re-run the tools; the committed summary lives in
-benchmarks/inspect-truth/results/.
+`collect` runs the pinned 0.58.2 baseline, the oracles (once per corpus pin),
+and the requested after binary. `score` never runs tools: both sides of a
+slice use this scorer over immutable <corpus_root>/_results/<repo>/<aft-commit>/
+outputs. Use --slice to write the cell gate to slices/<slice>.md.
 
 Only the Python standard library is used. The NDJSON client and the Tier 2
 readiness check are reused from benchmarks/inspect-field-audit/run_audit.py.
@@ -31,7 +31,9 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -42,6 +44,9 @@ from run_audit import NdjsonClient, pending_tier2  # noqa: E402
 
 RESULTS_DIR = HERE / "results"
 DEFAULT_AFT_BIN = CHECKOUT_ROOT / "target" / "release" / "aft"
+BASELINE_COMMIT = "13dd9cb71"
+DEFAULT_BASELINE_BIN = CHECKOUT_ROOT / "target" / "inspect-truth-baseline" / "target" / "release" / "aft"
+JUDGMENTS_DIR = HERE / "judgments"
 SAMPLE_SIZE = 10
 # Inspect drill-down lists are capped at 100 rows server-side; topK cannot
 # raise that, so larger result sets are collected by narrowing `scope`.
@@ -113,10 +118,74 @@ def log(msg: str) -> None:
     print(f"[inspect-truth {time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
-def raw_dir(corpus_root: Path, spec: Dict[str, Any]) -> Path:
-    path = corpus_root / "_results" / spec["name"]
+def raw_dir(corpus_root: Path, spec: Dict[str, Any], aft_commit: str = BASELINE_COMMIT) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{9,40}", aft_commit):
+        raise ValueError(f"not an AFT commit: {aft_commit!r}")
+    path = corpus_root / "_results" / spec["name"] / aft_commit
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def repo_path(corpus_root: Path, spec: Dict[str, Any]) -> Path:
+    return CHECKOUT_ROOT if spec.get("local_checkout") else corpus_root / spec["name"]
+
+
+def language_specs(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Project identity is shared; domains, installation and oracles are not."""
+    return [{**spec, **entry, **entry["oracle"]} for entry in spec["languages"]]
+
+
+def git_output(repo: Path, *args: str) -> str:
+    code, stdout, stderr, _ = run(["git", *args], cwd=repo)
+    if code:
+        raise RuntimeError(f"git {' '.join(args)} failed: {stderr}")
+    return stdout
+
+
+def corpus_pin(corpus_root: Path, spec: Dict[str, Any]) -> str:
+    head = git_output(repo_path(corpus_root, spec), "rev-parse", "HEAD").strip()
+    if not spec.get("local_checkout") and head != spec["commit"]:
+        raise ValueError(f"{spec['name']}: expected corpus pin {spec['commit']}, got {head}")
+    return head
+
+
+def install(corpus_root: Path, spec: Dict[str, Any]) -> None:
+    repo = repo_path(corpus_root, spec)
+    for lang in language_specs(spec):
+        directory = repo / lang.get("install_cwd", "")
+        if lang.get("install") and not (directory / "node_modules").exists():
+            log(f"{spec['name']}/{lang['language']}: installing dependencies")
+            code, _o, err, _ = run(lang["install"], cwd=directory, env=lang.get("install_env"))
+            if code:
+                raise RuntimeError(f"install failed: {err[-2000:]}")
+
+
+@contextmanager
+def local_hygiene(corpus_root: Path, spec: Dict[str, Any]):
+    """Restore the tracked config even on errors; never hide checkout changes."""
+    if not spec.get("local_checkout"):
+        yield {}
+        return
+    repo = repo_path(corpus_root, spec)
+    before = git_output(repo, "status", "--porcelain")
+    config = repo / ".cortexkit" / "aft.jsonc"
+    original = config.read_bytes() if config.exists() else None
+    mode = config.stat().st_mode if config.exists() else 0o644
+    directory_existed = config.parent.exists()
+    record = {"git_status_before": before}
+    try:
+        yield record
+    finally:
+        if original is None:
+            config.unlink(missing_ok=True)
+            if not directory_existed and config.parent.exists():
+                config.parent.rmdir()
+        else:
+            config.write_bytes(original)
+            config.chmod(mode)
+        record["git_status_after"] = git_output(repo, "status", "--porcelain")
+        if record["git_status_after"] != before:
+            raise RuntimeError(f"{spec['name']}: collect changed git status --porcelain")
 
 
 def tools_dir(corpus_root: Path) -> Path:
@@ -165,6 +234,8 @@ def source_line(repo: Path, path: str, line: int, skip_preamble: bool = False) -
 
 
 def fetch(corpus_root: Path, spec: Dict[str, Any]) -> None:
+    if spec.get("local_checkout"):
+        return
     repo = corpus_root / spec["name"]
     if not repo.exists():
         log(f"{spec['name']}: cloning {spec['url']}")
@@ -186,11 +257,7 @@ def fetch(corpus_root: Path, spec: Dict[str, Any]) -> None:
         if pattern not in existing.split("\n"):
             existing += ("" if existing.endswith("\n") or not existing else "\n") + pattern + "\n"
     exclude.write_text(existing)
-    if spec.get("install") and not (repo / "node_modules").exists():
-        log(f"{spec['name']}: installing dependencies")
-        code, _o, err, _ = run(spec["install"], cwd=repo, env=spec.get("install_env"), timeout=3600)
-        if code != 0:
-            raise RuntimeError(f"install failed: {err[-2000:]}")
+    install(corpus_root, spec)
 
 
 # --------------------------------------------------------------------------
@@ -234,10 +301,12 @@ class AftSession:
             harness="runner", storage_dir=str(self.storage.resolve()), **extra)
 
     def inspect(self, sections: List[str], scope: Optional[List[str]] = None,
-                timeout_s: float = 1800) -> Dict[str, Any]:
+                timeout_s: float = 1800, offset: Optional[int] = None) -> Dict[str, Any]:
         params: Dict[str, Any] = {"sections": sections, "topK": PAGE_CAP}
         if scope:
             params["scope"] = scope
+        if offset is not None:
+            params["offset"] = offset
         self.calls += 1
         return self.client.request("inspect", timeout_s=timeout_s, **params)
 
@@ -258,7 +327,8 @@ def children_index(files: Iterable[str]) -> Dict[str, List[str]]:
 
 
 def collect_category(session: AftSession, category: str, scope: List[str],
-                     tree: Dict[str, List[str]], truncated: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                     tree: Dict[str, List[str]], truncated: List[Dict[str, Any]],
+                     response: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Return every finding of `category` under `scope`.
 
     A scoped inspect rolls up the whole project, filters to the scope and only
@@ -267,48 +337,103 @@ def collect_category(session: AftSession, category: str, scope: List[str],
     split (a list of paths in halves, a directory into its children) until
     every piece fits under the cap.
     """
-    response = session.inspect([category], scope=scope)
+    response = response if response is not None else session.inspect([category], scope=scope)
     for _attempt in range(20):
-        if not unavailable_categories(response, [category]):
+        if category not in pending_categories(response):
             break
         time.sleep(15)
         response = session.inspect([category], scope=scope)
     if not response.get("success", False):
         raise RuntimeError(f"inspect {category} scope={scope[:3]} failed: {response}")
+    summary = (response.get("summary") or {}).get(category) or {}
+    if not scoreable(summary) or category in pending_categories(response):
+        raise CategoryUnknown(category, summary)
     count = summary_count(response, category)
     items = detail_items(response, category)
     if count is None:
         raise RuntimeError(f"inspect {category} returned no count for scope={scope[:3]}: "
                            f"{json.dumps(response.get('summary'))[:500]}")
+    envelope = (response.get("details") or {}).get(f"{category}_list_envelope") or {}
+    # Older inspect silently ignores unknown arguments. Capability comes from
+    # the response envelope, never from whether an offset request was accepted.
+    if "offset" in envelope and "next_offset" in envelope:
+        total, offset, seen = envelope["total"], 0, set()
+        rows = []
+        while True:
+            if envelope.get("offset") != offset or envelope.get("total") != total:
+                raise RuntimeError(f"{category}: pagination generation changed")
+            for item in items:
+                key = (item.get("file"), item.get("symbol") or item.get("text"), item.get("line"))
+                if key in seen:
+                    raise RuntimeError(f"{category}: overlapping pages: {key}")
+                seen.add(key)
+                rows.append(item)
+            following = envelope["next_offset"]
+            if following is None:
+                if len(rows) != total:
+                    raise RuntimeError(f"{category}: collected {len(rows)} of {total} rows")
+                return rows
+            if following != offset + len(items) or following <= offset:
+                raise RuntimeError(f"{category}: invalid next_offset {following}")
+            offset = following
+            response = session.inspect([category], scope=scope, offset=offset)
+            if not response.get("success"):
+                raise RuntimeError(f"{category}: page failed: {response}")
+            summary = (response.get("summary") or {}).get(category) or {}
+            if not scoreable(summary):
+                raise CategoryUnknown(category, summary)
+            items = detail_items(response, category)
+            envelope = (response.get("details") or {}).get(f"{category}_list_envelope") or {}
+            if "offset" not in envelope or "next_offset" not in envelope:
+                raise RuntimeError(f"{category}: paging envelope disappeared")
     if count <= len(items):
         return items
+    if not scope:
+        scope = tree.get("", [])
     if len(scope) > 1:
         middle = len(scope) // 2
         return (collect_category(session, category, scope[:middle], tree, truncated)
                 + collect_category(session, category, scope[middle:], tree, truncated))
-    children = tree.get(scope[0], [])
+    children = tree.get(scope[0], []) if scope else []
     if children:
         return collect_category(session, category, children, tree, truncated)
-    truncated.append({"category": category, "path": scope[0], "count": count, "returned": len(items)})
+    truncated.append({"category": category, "path": scope[0] if scope else "", "count": count, "returned": len(items)})
     return items
 
 
-def unavailable_categories(response: Dict[str, Any], categories: Iterable[str]) -> set:
-    """Categories whose summary says the Tier 2 result is not ready yet.
+class CategoryUnknown(RuntimeError):
+    def __init__(self, category: str, summary: Dict[str, Any]):
+        super().__init__(f"{category} is not scoreable: {summary}")
+        self.summary = summary
 
-    On a large repo the dead-code aggregate can outlive inspect's phase wait
-    budget; the summary then carries `unavailable: true` and no count.
-    """
+
+def pending_categories(response: Dict[str, Any]) -> set:
+    # The baseline calls a still-building graph unavailable. Only that named
+    # transient is retried; terminal unavailable must not become an empty set.
+    pending = pending_tier2(response)
     summary = response.get("summary") or {}
-    return {c for c in categories
-            if isinstance(summary.get(c), dict) and summary[c].get("unavailable")}
+    pending.update(c for c, s in summary.items() if isinstance(s, dict)
+                   and ("building" in str(s.get("reason", "")) or
+                        any("builder_state=building" in g.get("reason", "")
+                            for g in s.get("gaps", []))))
+    return pending
+
+
+def scoreable(summary: Dict[str, Any]) -> bool:
+    return (summary.get("status") not in ("pending", "stale", "unavailable")
+            and not summary.get("unavailable")
+            and not any(g.get("kind") in ("analysis_incomplete", "tier2_unavailable")
+                        for g in summary.get("gaps", []))
+            and any(isinstance(summary.get(k), int) for k in ("count", "total_groups")))
 
 
 def wait_until_ready(session: AftSession, deadline_s: float) -> Dict[str, Any]:
     started = time.monotonic()
     while True:
         response = session.inspect(AFT_CATEGORIES)
-        pending = (pending_tier2(response) | unavailable_categories(response, AFT_CATEGORIES)) & set(AFT_CATEGORIES)
+        if not response.get("success"):
+            raise RuntimeError(f"inspect failed: {response}")
+        pending = pending_categories(response) & set(AFT_CATEGORIES)
         if not pending:
             return response
         if time.monotonic() - started > deadline_s:
@@ -318,9 +443,26 @@ def wait_until_ready(session: AftSession, deadline_s: float) -> Dict[str, Any]:
 
 
 def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
-                diagnostics_sample: int) -> None:
-    repo = corpus_root / spec["name"]
-    out = raw_dir(corpus_root, spec)
+                 diagnostics_sample: int, aft_commit: str = BASELINE_COMMIT) -> None:
+    repo = repo_path(corpus_root, spec)
+    out = raw_dir(corpus_root, spec, aft_commit)
+    pin = corpus_pin(corpus_root, spec)
+    if (out / "aft.json").exists():
+        record = json.loads((out / "aft.json").read_text())
+        if record["commit"] != pin:
+            raise ValueError(f"{out}: output belongs to another corpus pin")
+        log(f"{spec['name']}/{aft_commit}: already collected, preserving raw output")
+        return
+    with local_hygiene(corpus_root, spec) as hygiene:
+        install(corpus_root, spec)
+        record = collect_aft_record(repo, spec, aft_bin, out, diagnostics_sample, pin)
+    record.update(hygiene)
+    record["aft_commit"] = aft_commit
+    write_json(out / "aft.json", record)
+
+
+def collect_aft_record(repo: Path, spec: Dict[str, Any], aft_bin: Path, out: Path,
+                       diagnostics_sample: int, pin: str) -> Dict[str, Any]:
     config_dir = repo / ".cortexkit"
     config_dir.mkdir(exist_ok=True)
     (config_dir / "aft.jsonc").write_text(json.dumps(AFT_PROJECT_CONFIG, indent=2) + "\n")
@@ -329,8 +471,9 @@ def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
     tree = children_index(files)
     user_config = out / "collection-user-config.jsonc"
     user_config.write_text(json.dumps(COLLECTION_USER_CONFIG, indent=2) + "\n")
-    session = AftSession(aft_bin, repo, out / "aft-storage")
-    record: Dict[str, Any] = {"aft_bin": str(aft_bin), "commit": spec["commit"]}
+    storage = Path(tempfile.mkdtemp(prefix="aft-storage-", dir=out))
+    session = AftSession(aft_bin, repo, storage)
+    record: Dict[str, Any] = {"aft_bin": str(aft_bin), "commit": pin, "storage": str(storage)}
     try:
         started = time.monotonic()
         configured = session.configure(user_config)
@@ -338,7 +481,7 @@ def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
             raise RuntimeError(f"configure failed or dropped keys: {json.dumps(configured)[:1000]}")
         project = wait_until_ready(session, deadline_s=3600)
         record["ready_s"] = round(time.monotonic() - started, 1)
-        record["project_summary"] = project.get("summary")
+        record["project_summary"] = project.get("summary") or {}
         record["scanner_state"] = project.get("scanner_state")
         # test-only and generated rows are reported beside the headline list and
         # are not narrowed by scope, so only the capped project-wide copy exists.
@@ -351,11 +494,11 @@ def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
         record["items"] = {}
         for category in LISTED_CATEGORIES:
             total = summary_count(project, category)
-            first = detail_items(project, category)
-            if total is not None and total <= len(first):
-                items = first
-            else:
-                items = collect_category(session, category, tree.get("", []), tree, truncated)
+            try:
+                items = collect_category(session, category, [], tree, truncated, response=project)
+            except CategoryUnknown as unknown:
+                record["project_summary"][category] = unknown.summary
+                items = []
             unique = {(i.get("file"), i.get("symbol") or i.get("text"), i.get("line")): i for i in items}
             record["items"][category] = list(unique.values())
             record.setdefault("project_counts", {})[category] = total
@@ -366,15 +509,16 @@ def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
     finally:
         session.close()
     if diagnostics_sample > 0:
-        session = AftSession(aft_bin, repo, out / "aft-storage")
+        session = AftSession(aft_bin, repo, storage)
         try:
             configured = session.configure()
             if not configured.get("success", False):
                 raise RuntimeError(f"configure failed: {configured}")
-            record["diagnostics"] = collect_aft_diagnostics(session, spec, files, diagnostics_sample)
+            record["diagnostics"] = {lang["language"]: collect_aft_diagnostics(
+                session, lang, files, diagnostics_sample) for lang in language_specs(spec)}
         finally:
             session.close()
-    (out / "aft.json").write_text(json.dumps(record, indent=1))
+    return record
 
 
 def diagnostics_sample_files(spec: Dict[str, Any], files: List[str], size: int) -> List[str]:
@@ -421,25 +565,25 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=1))
 
 
-def run_oracles(corpus_root: Path, spec: Dict[str, Any], diagnostics: bool) -> None:
-    repo = corpus_root / spec["name"]
-    out = raw_dir(corpus_root, spec)
+def run_language_oracles(corpus_root: Path, spec: Dict[str, Any], diagnostics: bool, out: Path) -> None:
+    repo = repo_path(corpus_root, spec) / spec.get("oracle_cwd", "")
     tools = tools_dir(corpus_root)
     meta: Dict[str, Any] = {}
     lang = spec["language"]
     if lang == "typescript":
-        fallow = "/opt/homebrew/bin/fallow"
+        fallow = spec.get("fallow", "fallow")
         for label, extra in (("fallow-default", []), ("fallow-entry-exports", ["--include-entry-exports"])):
             code, stdout, stderr, elapsed = run([fallow, "dead-code", "--format", "json", *extra], cwd=repo)
             (out / f"{label}.json").write_text(stdout)
             meta[label] = {"exit": code, "elapsed_s": round(elapsed, 1), "stderr_tail": stderr[-500:]}
         code, stdout, stderr, _ = run([fallow, "list", "--entry-points", "--format", "json"], cwd=repo)
         (out / "fallow-entry-points.json").write_text(stdout)
-        knip = tools / "node" / "node_modules" / ".bin" / "knip"
-        code, stdout, stderr, elapsed = run([str(knip), "--reporter", "json", "--no-exit-code",
-                                             "--no-progress"], cwd=repo, timeout=3600)
-        (out / "knip.json").write_text(stdout)
-        meta["knip"] = {"exit": code, "elapsed_s": round(elapsed, 1), "stderr_tail": stderr[-1500:]}
+        if spec.get("knip", True):
+            knip = tools / "node" / "node_modules" / ".bin" / "knip"
+            code, stdout, stderr, elapsed = run([str(knip), "--reporter", "json", "--no-exit-code",
+                                                 "--no-progress"], cwd=repo, timeout=3600)
+            (out / "knip.json").write_text(stdout)
+            meta["knip"] = {"exit": code, "elapsed_s": round(elapsed, 1), "stderr_tail": stderr[-1500:]}
         if diagnostics:
             texts = []
             for project in spec.get("tsc_projects", ["tsconfig.json"]):
@@ -464,6 +608,8 @@ def run_oracles(corpus_root: Path, spec: Dict[str, Any], diagnostics: bool) -> N
     elif lang == "rust":
         env = {"RUSTC_WRAPPER": "", "CARGO_BUILD_RUSTC_WRAPPER": ""}
         code, stdout, stderr, elapsed = run(spec["cargo_check"], cwd=repo, env=env, timeout=7200)
+        if code:
+            raise RuntimeError(f"rustc oracle did not complete: {stderr[-2000:]}")
         (out / "cargo-check.jsonl").write_text(stdout)
         meta["cargo_check"] = {"exit": code, "elapsed_s": round(elapsed, 1), "stderr_tail": stderr[-1500:]}
         code, stdout, stderr, _ = run(["cargo", "+nightly", "udeps", "--version"], cwd=repo)
@@ -507,6 +653,48 @@ def run_oracles(corpus_root: Path, spec: Dict[str, Any], diagnostics: bool) -> N
     write_json(out / "oracle-meta.json", meta)
 
 
+def run_oracles(corpus_root: Path, spec: Dict[str, Any], diagnostics: bool,
+                aft_commit: str = BASELINE_COMMIT) -> Path:
+    """Freeze one oracle snapshot per corpus pin; after outputs reference it."""
+    repo = repo_path(corpus_root, spec)
+    pin = corpus_pin(corpus_root, spec)
+    owner = aft_commit if not spec.get("baseline", True) else BASELINE_COMMIT
+    out = raw_dir(corpus_root, spec, owner) / "oracles" / pin
+    out.mkdir(parents=True, exist_ok=True)
+    if (out / "oracle.json").exists():
+        return out / "oracle.json"
+    snapshot = {}
+    with local_hygiene(corpus_root, spec):
+        install(corpus_root, spec)
+        for lang in language_specs(spec):
+            runs = []
+            for prefix in lang.get("fallow_roots", [""]):
+                directory = out / lang["language"] / (prefix or "project")
+                directory.mkdir(parents=True, exist_ok=True)
+                run_language_oracles(corpus_root, {**lang, "oracle_cwd": prefix}, diagnostics, directory)
+                runs.append((prefix, directory))
+            snapshot[lang["language"]] = normalize_oracles(repo, lang, runs)
+    write_json(out / "oracle.json", snapshot)
+    return out / "oracle.json"
+
+
+def collect(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path, baseline_bin: Path,
+            aft_commit: str, diagnostics_sample: int) -> None:
+    with local_hygiene(corpus_root, spec) as hygiene:
+        fetch(corpus_root, spec)
+        install(corpus_root, spec)
+        if spec.get("baseline", True):
+            collect_aft(corpus_root, spec, baseline_bin, diagnostics_sample, BASELINE_COMMIT)
+        collect_aft(corpus_root, spec, aft_bin, diagnostics_sample, aft_commit)
+        oracle = run_oracles(corpus_root, spec, diagnostics_sample > 0, aft_commit)
+        for commit in dict.fromkeys(([BASELINE_COMMIT] if spec.get("baseline", True) else []) + [aft_commit]):
+            target = raw_dir(corpus_root, spec, commit) / "oracle.json"
+            if not target.exists():
+                target.write_bytes(oracle.read_bytes())
+    if spec.get("local_checkout"):
+        write_json(raw_dir(corpus_root, spec, aft_commit) / "checkout-status.json", hygiene)
+
+
 # --------------------------------------------------------------------------
 # `score` phase: normalize, match and report
 # --------------------------------------------------------------------------
@@ -518,8 +706,8 @@ def finding(category: str, path: str, symbol: str, line: int, **extra: Any) -> D
     return item
 
 
-def aft_findings(corpus_root: Path, spec: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    record = json.loads((raw_dir(corpus_root, spec) / "aft.json").read_text())
+def aft_findings(out: Path) -> Dict[str, List[Dict[str, Any]]]:
+    record = json.loads((out / "aft.json").read_text())
     result: Dict[str, List[Dict[str, Any]]] = {}
     for category, items in record["items"].items():
         rows = []
@@ -1015,114 +1203,173 @@ def score_bucket(name: str, category: str, language: str, aft: List[Dict], oracl
     return entry
 
 
-def score_repo(corpus_root: Path, spec: Dict[str, Any]) -> Dict[str, Any]:
-    repo = corpus_root / spec["name"]
-    out = raw_dir(corpus_root, spec)
-    name, lang = spec["name"], spec["language"]
-    aft_record = json.loads((out / "aft.json").read_text())
-    aft = aft_findings(corpus_root, spec)
-    excluded: Dict[str, Dict[str, int]] = {}
-
-    def keep(items: List[Dict[str, Any]], label: str = "") -> List[Dict[str, Any]]:
-        # Test files are dropped from both sides: AFT withholds dead symbols in
-        # them by design, so neither side's test-file findings are comparable.
-        domain = [i for i in items if in_domain(i["path"], spec)]
-        kept = [i for i in domain if not is_test_path(i["path"])]
-        if label:
-            excluded[label] = len(domain) - len(kept)
-        return kept
-
-    result: Dict[str, Any] = {"repo": name, "language": lang, "commit": spec["commit"], "buckets": [],
-                              "aft_project_counts": aft_record.get("project_counts"),
-                              "aft_truncated_scopes": aft_record.get("truncated_scopes"),
-                              "aft_inspect_calls": aft_record.get("inspect_calls"),
-                              "aft_elapsed_s": aft_record.get("elapsed_s"),
-                              "aft_ready_s": aft_record.get("ready_s"),
-                              "aft_duplicate_groups": summary_count({"summary": aft_record.get("project_summary")},
-                                                                    "duplicates"),
-                              "test_file_findings_excluded": excluded}
-    aft_dead = keep(aft["dead_code"], "aft_dead_code")
-    grep = Grepper(repo, spec)
-    oracle_diags: List[Dict[str, Any]] = []
+def normalize_oracles(repo: Path, spec: Dict[str, Any], runs: List[Tuple[str, Path]]) -> Dict[str, Any]:
+    """Normalize once, while sources are pinned, including the derived TS oracle."""
+    lang = spec["language"]
+    buckets, files, diags = {}, set(), []
+    for prefix, out in runs:
+        if lang == "typescript":
+            rows, unused, _entries = fallow_oracle(out)
+            for item in rows:
+                item["path"] = str(Path(prefix) / item["path"])
+            files.update(str(Path(prefix) / f) for f in unused)
+            buckets.setdefault("unused_exports", []).extend(rows)
+            diags.extend(tsc_diagnostics(spec, out))
+        elif lang == "rust":
+            rows, diags = rust_oracle(repo, out)
+            buckets["dead_code"] = rows
+        elif lang == "go":
+            rows, diags = go_oracle(repo, out)
+            buckets["dead_code"] = rows
+            buckets["dead_code (functions)"] = deadcode_oracle(out)
+        elif lang == "python":
+            rows, diags = python_oracle(repo, out)
+            buckets["dead_code"] = rows
+        else:
+            raise ValueError(f"unsupported oracle language: {lang}")
     if lang == "typescript":
-        oracle, unused_files, entry_files = fallow_oracle(out)
-        knip = knip_verdicts(out)
-        oracle_in = keep(oracle, "oracle_unused_exports")
-        files_in = {f for f in unused_files if in_domain(f, spec)}
-        result["oracle_dead_files"] = len(files_in)
-        result["fallow_entry_files"] = len(entry_files)
-        result["buckets"].append(score_bucket(
-            name, "unused_exports", lang, keep(aft["unused_exports"], "aft_unused_exports"), oracle_in, repo,
-            oracle_files=files_in, knip=knip, grep=grep,
-            note="oracle: fallow --include-entry-exports minus fallow entry files"))
-        # An export used only inside its own file is an unneeded `export`, not
-        # dead code, so the dead-code comparison drops those oracle rows.
-        texts: Dict[str, str] = {}
-        for item in oracle_in:
+        texts = {}
+        for item in buckets["unused_exports"]:
             item["used_in_own_file"] = used_in_own_file(repo, item, texts)
-        dead_oracle = [o for o in oracle_in if not o["used_in_own_file"]]
-        bucket = score_bucket(
-            name, "dead_code", lang, aft_dead, dead_oracle, repo, oracle_files=files_in, knip=knip, grep=grep,
-            note="oracle: fallow unused exports not referenced in their own file, plus fallow unused files")
-        bucket["oracle_used_in_own_file_dropped"] = len(oracle_in) - len(dead_oracle)
-        result["buckets"].append(bucket)
-        result["buckets"].append({
-            "repo": name, "category": "dead_files", "language": lang, "aft_count": None,
-            "oracle_count": len(files_in), "note": "AFT has no dead-file category"})
-        oracle_diags = tsc_diagnostics(spec, out)
-    elif lang == "rust":
-        oracle, oracle_diags = rust_oracle(repo, out)
-        oracle_in = keep(oracle, "oracle_dead_code")
-        bucket = score_bucket(name, "dead_code", lang, aft_dead, oracle_in, repo, grep=grep,
-                              note="oracle: rustc dead_code from cargo check --all-targets")
-        # AFT only considers items with a visibility modifier and never fields or
-        # variants; recall against that slice separates design scope from misses.
-        domain = [o for o in oracle_in if o["pub"] and o["kind"] in RUST_ITEM_DOMAIN]
-        agreed_domain, _a, missed_domain = match_findings(aft_dead, domain)
-        bucket["oracle_in_aft_domain"] = len(domain)
-        bucket["recall_in_aft_domain"] = ratio(len(agreed_domain), len(domain))
-        bucket["oracle_only_by_kind"] = dict(collections.Counter(
-            ("pub " if o["pub"] else "private ") + o["kind"] for o in match_findings(
-                aft_dead, oracle_in)[2]))
-        bucket["oracle_test_only_use"] = sum(1 for o in oracle_in if o["test_only_use"])
-        bucket["samples"]["oracle_only_in_aft_domain"] = sample(missed_domain, f"{name}:domain", repo)
-        result["buckets"].append(bucket)
-    elif lang == "go":
-        oracle, oracle_diags = go_oracle(repo, out)
-        oracle_in = keep(oracle, "oracle_dead_code")
-        bucket = score_bucket(name, "dead_code", lang, aft_dead, oracle_in, repo, grep=grep,
-                              note="oracle: staticcheck -checks U1000")
-        exported = [o for o in oracle_in if o["exported"]]
-        agreed_exp, _a, _m = match_findings(aft_dead, exported)
-        bucket["oracle_exported"] = len(exported)
-        bucket["recall_exported"] = ratio(len(agreed_exp), len(exported))
-        result["buckets"].append(bucket)
-        reach = keep(deadcode_oracle(out), "oracle_deadcode")
-        # deadcode reports only functions and methods, so AFT's type, const and
-        # var findings are compared against it only as functions and methods.
-        aft_funcs = [a for a in aft_dead if a.get("kind") in ("function", "method")]
-        reach_bucket = score_bucket(
-            name, "dead_code (functions)", lang, aft_funcs, reach, repo, grep=grep,
-            note="oracle: x/tools deadcode (unreachable from main); AFT restricted to functions/methods")
-        reach_bucket["oracle_exported"] = sum(1 for o in reach if o["exported"])
-        reach_bucket["oracle_test_only_use"] = sum(1 for o in reach if o["test_only_use"])
-        result["buckets"].append(reach_bucket)
-    elif lang == "python":
-        oracle, oracle_diags = python_oracle(repo, out)
-        oracle_in = keep(oracle, "oracle_dead_code")
-        result["buckets"].append(score_bucket(
-            name, "dead_code", lang, aft_dead, oracle_in, repo, grep=grep,
-            note="oracle: vulture --min-confidence 60; AFT skips Python dead code"))
-    todo_bucket = score_bucket(name, "todos", lang, keep(aft["todos"]), keep(todo_oracle(repo, spec)), repo,
-                               by_line=True, note="regex cross-check, not authoritative")
-    result["buckets"].append(todo_bucket)
-    diag = aft_record.get("diagnostics")
-    if diag:
-        result["buckets"].append(score_diagnostics(name, lang, repo, diag, oracle_diags))
-    lists = {}
-    for bucket in result["buckets"]:
-        if "_lists" in bucket:
-            lists[bucket["category"]] = bucket.pop("_lists")
+        buckets["dead_code"] = [dict(i, category="dead_code") for i in buckets["unused_exports"]
+                                if not i["used_in_own_file"]]
+    buckets["todos"] = todo_oracle(repo, spec)
+    buckets["diagnostics"] = diags
+    return {"buckets": buckets, "unused_files": sorted(files)}
+
+
+def judgment_category(category: str) -> str:
+    return "dead_code" if category == "dead_code (functions)" else category
+
+
+def side_rows(out: Path, side: str, category: str) -> List[Dict[str, Any]]:
+    if side == "aft":
+        return aft_findings(out).get(judgment_category(category), [])
+    snapshot = json.loads((out / "oracle.json").read_text())
+    return [row for lang in snapshot.values() for label, rows in lang["buckets"].items()
+            if judgment_category(label) == category for row in rows]
+
+
+def judgment_matches(entry: Dict[str, Any], row: Dict[str, Any]) -> bool:
+    return entry["path"] == row["path"] and entry["symbol"] == row["symbol"]
+
+
+def load_judgments(spec: Dict[str, Any], baseline_out: Optional[Path],
+                   judgments_dir: Path = JUDGMENTS_DIR) -> List[Dict[str, Any]]:
+    entries, cache, verdicts = [], {}, {}
+    for path in sorted(judgments_dir.glob("*.json")):
+        doc = json.loads(path.read_text())
+        for entry in doc["entries"]:
+            if entry["repo"] != spec["name"]:
+                continue
+            if entry["side"] not in ("oracle", "aft") or not entry.get("note", "").strip():
+                raise ValueError(f"{path.name}: invalid judgment side or missing note")
+            allowed = {"oracle": {"oracle_wrong", "public_api", "test_only_oracle"},
+                       "aft": {"aft_correct", "aft_false_positive"}}
+            if entry["verdict"] not in allowed[entry["side"]]:
+                raise ValueError(f"{path.name}: invalid verdict {entry['verdict']}")
+            after = Path(os.path.expanduser(doc["after_outputs"][spec["name"]]))
+            if not after.is_absolute():
+                after = CHECKOUT_ROOT / after
+            rows = []
+            for directory in (baseline_out, after):
+                if directory is None:
+                    continue
+                key = (directory, entry["side"], entry["category"])
+                if key not in cache:
+                    cache[key] = side_rows(*key)
+                rows.extend(cache[key])
+            if not any(judgment_matches(entry, row) for row in rows):
+                raise ValueError(f"{path.name}: {entry['side']} {entry['category']} "
+                                 f"{entry['path']}::{entry['symbol']} absent from baseline and recorded after")
+            key = (entry["category"], entry["side"], entry["path"], entry["symbol"])
+            if key in verdicts and verdicts[key] != entry["verdict"]:
+                raise ValueError(f"{path.name}: conflicting judgments for {key}")
+            verdicts[key] = entry["verdict"]
+            entries.append(dict(entry, _file=path.name))
+    return entries
+
+
+def apply_judgments(category: str, aft: List[Dict], oracle: List[Dict],
+                    entries: List[Dict]) -> Tuple[List[Dict], int, int]:
+    scoped = [e for e in entries if e["category"] == judgment_category(category)]
+    kept = [row for row in oracle if not any(e["side"] == "oracle" and judgment_matches(e, row) for e in scoped)]
+    judged = sum(any(e["side"] == "aft" and judgment_matches(e, row) for e in scoped) for row in aft)
+    return kept, len(oracle) - len(kept), judged
+
+
+def cell_changes(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    """Only precision may become undefined, with zero fully-explained findings."""
+    lowered = []
+    for metric in ("precision", "recall", "recall_in_aft_domain", "recall_exported"):
+        old, new = before.get(metric), after.get(metric)
+        if old is None:
+            continue
+        if new is not None and new >= old:
+            continue
+        if (new is None and metric == "precision" and after.get("aft_count") == 0
+                and before.get("aft_rows_judged") == before.get("aft_count")):
+            continue
+        lowered.append(metric)
+    return lowered
+
+
+def score_repo(corpus_root: Path, spec: Dict[str, Any], out: Optional[Path] = None,
+               baseline_out: Optional[Path] = None, judgments_dir: Path = JUDGMENTS_DIR) -> Dict[str, Any]:
+    repo = repo_path(corpus_root, spec)
+    out = out or raw_dir(corpus_root, spec)
+    record = json.loads((out / "aft.json").read_text())
+    aft = aft_findings(out)
+    snapshot = json.loads((out / "oracle.json").read_text())
+    entries = load_judgments(spec, baseline_out, judgments_dir)
+    truncated = []
+    if baseline_out is not None:
+        truncated = json.loads((baseline_out / "aft.json").read_text()).get("truncated_scopes", [])
+    result = {"repo": spec["name"], "language": ", ".join(s["language"] for s in spec["languages"]),
+              "commit": record["commit"], "aft_commit": record.get("aft_commit"), "raw_output": str(out),
+              "baseline": "available" if spec.get("baseline", True) else "new, no baseline",
+              "buckets": [], "baseline_aft_truncated_scopes": truncated,
+              "aft_truncated_scopes": record.get("truncated_scopes", []),
+              "aft_project_counts": record.get("project_counts"),
+              "git_status_before": record.get("git_status_before"), "git_status_after": record.get("git_status_after"),
+              "judgments_unapplied": {e["_file"]: 0 for e in entries}}
+    for entry in entries:
+        if not any(judgment_matches(entry, r) for r in side_rows(out, entry["side"], entry["category"])):
+            result["judgments_unapplied"][entry["_file"]] += 1
+    for lang in language_specs(spec):
+        language = lang["language"]
+        oracle = snapshot[language]
+        for label, oracle_rows in oracle["buckets"].items():
+            if label == "diagnostics":
+                diag = (record.get("diagnostics") or {}).get(language)
+                if diag:
+                    result["buckets"].append(score_diagnostics(spec["name"], language, repo, diag, oracle_rows))
+                continue
+            category = judgment_category(label)
+            summary = (record.get("project_summary") or {}).get(category) or {}
+
+            def keep(rows):
+                return [r for r in rows if in_domain(r["path"], lang) and not is_test_path(r["path"])
+                        and not any(t["category"] == category and
+                                    (r["path"] == t["path"] or r["path"].startswith(t["path"].rstrip("/") + "/"))
+                                    for t in truncated)]
+
+            aft_rows = keep(aft.get(category, []))
+            if label == "dead_code (functions)":
+                aft_rows = [r for r in aft_rows if r.get("kind") in ("function", "method")]
+            oracle_rows, judged_out, judged = apply_judgments(label, aft_rows, keep(oracle_rows), entries)
+            bucket = score_bucket(spec["name"], label, language, aft_rows, oracle_rows, repo,
+                                  oracle_files=set(oracle.get("unused_files", [])), by_line=category == "todos")
+            bucket.update(oracle_rows_judged_out=judged_out, aft_rows_judged=judged,
+                          aft_rows_unjudged=len(aft_rows) - judged,
+                          languages_unsupported=[{"language": g["language"], "files": g["files"]}
+                                                 for g in summary.get("gaps", []) if g.get("kind") == "language_unsupported"],
+                          status="scored" if scoreable(summary) else "unknown")
+            if not scoreable(summary):
+                bucket.update(aft_count=None, agreed=None, agreed_file_level=None, aft_only=None,
+                              oracle_only=None, precision=None, recall=None, unknown_summary=summary)
+            result["buckets"].append(bucket)
+    lists = {f"{b['language']}:{b['category']}": b.pop("_lists") for b in result["buckets"] if "_lists" in b}
     write_json(out / "disagreements.json", lists)
     return result
 
@@ -1180,6 +1427,8 @@ def render_markdown(results: List[Dict[str, Any]], corpus: List[Dict[str, Any]])
     for result in results:
         lines.append(f"## {result['repo']} ({result['language']}, {result['commit'][:12]})")
         lines.append("")
+        lines.append("- baseline_aft_truncated_scopes (excluded from comparison): "
+                     + json.dumps(result.get("baseline_aft_truncated_scopes", [])))
         extras = {k: v for k, v in result.items() if k not in ("buckets", "repo", "language", "commit")}
         lines.append("```json")
         lines.append(json.dumps(extras, indent=1))
@@ -1193,9 +1442,12 @@ def render_markdown(results: List[Dict[str, Any]], corpus: List[Dict[str, Any]])
                         "oracle_only_by_kind", "oracle_test_only_use", "oracle_in_test_files_excluded",
                         "oracle_exported", "recall_exported", "knip_agrees_aft_only",
                         "knip_agrees_oracle_only", "sample_files", "aft_pages_with_gaps",
-                        "errors_aft", "errors_oracle", "oracle_used_in_own_file_dropped", "cause_hints"):
+                         "errors_aft", "errors_oracle", "oracle_used_in_own_file_dropped", "cause_hints"):
                 if key in b and b[key] is not None:
                     lines.append(f"- {key}: {fmt(b[key]) if not isinstance(b[key], dict) else json.dumps(b[key])}")
+            for key in ("status", "oracle_rows_judged_out", "aft_rows_judged", "aft_rows_unjudged", "languages_unsupported"):
+                if key in b:
+                    lines.append(f"- {key}: {json.dumps(b[key])}")
             lines.append("")
             for bucket_name, rows in b["samples"].items():
                 if not rows:
@@ -1216,6 +1468,30 @@ def render_markdown(results: List[Dict[str, Any]], corpus: List[Dict[str, Any]])
     return "\n".join(lines) + "\n"
 
 
+def render_slice(before: List[Dict], after: List[Dict], slice_id: str) -> Tuple[str, List[str]]:
+    baseline = {(r["repo"], b["language"], b["category"]): b for r in before for b in r["buckets"]}
+    lines = [f"# {slice_id}: inspect-truth cell gate", "",
+             f"Baseline: 0.58.2 (`{BASELINE_COMMIT}`). Both tables use this revision of `run.py score`.", "",
+             "## Before", "", render_markdown(before, []), "## After", "", render_markdown(after, []),
+             "## Cell rule", ""]
+    failures = []
+    for result in after:
+        if result["baseline"] == "new, no baseline":
+            lines.append(f"- {result['repo']}: new, no baseline")
+            continue
+        for bucket in result["buckets"]:
+            key = (result["repo"], bucket["language"], bucket["category"])
+            if key not in baseline:
+                failures.append(f"{key}: missing before bucket")
+                continue
+            failures.extend(f"{key}: {metric} lowered" for metric in cell_changes(baseline[key], bucket))
+        after_keys = {(result["repo"], b["language"], b["category"]) for b in result["buckets"]}
+        failures.extend(f"{key}: missing after bucket" for key in baseline
+                        if key[0] == result["repo"] and key not in after_keys)
+    lines.extend([f"- FAIL: {failure}" for failure in failures] or ["- PASS: no cell lowered."])
+    return "\n".join(lines) + "\n", failures
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -1223,41 +1499,70 @@ def render_markdown(results: List[Dict[str, Any]], corpus: List[Dict[str, Any]])
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("phase", choices=["fetch", "aft", "oracle", "score", "all"])
+    parser.add_argument("phase", choices=["fetch", "collect", "score"])
     parser.add_argument("--repo", action="append", help="limit to these corpus names")
     parser.add_argument("--aft-bin", type=Path, default=DEFAULT_AFT_BIN)
+    parser.add_argument("--baseline-bin", type=Path, default=DEFAULT_BASELINE_BIN,
+                        help="release binary built from 13dd9cb71 (0.58.2)")
+    parser.add_argument("--aft-commit", help="identity of the after binary; defaults to checkout HEAD")
+    parser.add_argument("--corpus-root", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--side", choices=["before", "after", "both"], default="both")
+    parser.add_argument("--slice", help="write slices/<id>.md and exit nonzero if a cell is lowered")
     parser.add_argument("--diagnostics-sample", type=int, default=60,
                         help="files per repo for the diagnostics comparison (0 disables)")
     args = parser.parse_args()
 
     corpus_root, corpus = load_corpus()
+    corpus_root = (args.corpus_root or corpus_root).expanduser().resolve()
+    aft_commit = args.aft_commit or git_output(CHECKOUT_ROOT, "rev-parse", "HEAD").strip()
+    if args.slice and not re.fullmatch(r"[a-z0-9_-]+", args.slice):
+        parser.error("--slice must be a simple slice name")
     selected = [spec for spec in corpus if not args.repo or spec["name"] in args.repo]
-    if args.phase in ("aft", "all") and not args.aft_bin.exists():
+    if not selected or (args.repo and set(args.repo) - {s["name"] for s in corpus}):
+        parser.error("unknown corpus repo")
+    if args.phase == "collect" and not args.aft_bin.exists():
         parser.error(f"{args.aft_bin} not found; build it with "
                      "`CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo build --release -p agent-file-tools`")
-    # One repository at a time, AFT and oracles never concurrently, to keep
-    # machine load predictable.
+    if args.phase == "collect" and any(s.get("baseline", True) and not (
+            raw_dir(corpus_root, s) / "aft.json").exists() for s in selected):
+        if not args.baseline_bin.exists():
+            parser.error(f"baseline binary not found: {args.baseline_bin}; build 13dd9cb71 first")
+        code, version, stderr, _ = run([str(args.baseline_bin.resolve()), "--version"], cwd=CHECKOUT_ROOT)
+        if code or not re.search(r"\b0\.58\.2\b", version + stderr):
+            parser.error(f"baseline must be 0.58.2: {version}{stderr}")
+    corpus_root.mkdir(parents=True, exist_ok=True)
+    # One repository at a time; Cargo oracle invocations are serialized too.
     for spec in selected:
-        if args.phase in ("fetch", "all"):
+        if args.phase == "fetch":
             fetch(corpus_root, spec)
-        if args.phase in ("aft", "all"):
-            log(f"{spec['name']}: running AFT")
-            collect_aft(corpus_root, spec, args.aft_bin, args.diagnostics_sample)
-        if args.phase in ("oracle", "all"):
-            log(f"{spec['name']}: running oracles")
-            run_oracles(corpus_root, spec, diagnostics=args.diagnostics_sample > 0)
-    if args.phase in ("score", "all"):
-        RESULTS_DIR.mkdir(exist_ok=True)
-        results = []
-        for spec in corpus:
-            if not (raw_dir(corpus_root, spec) / "aft.json").exists() or not (
-                    raw_dir(corpus_root, spec) / "oracle-meta.json").exists():
-                log(f"{spec['name']}: AFT or oracle results missing, skipping score")
-                continue
-            results.append(score_repo(corpus_root, spec))
-        write_json(RESULTS_DIR / "results.json", {"corpus": corpus, "results": results})
-        (RESULTS_DIR / "results.md").write_text(render_markdown(results, corpus))
-        log(f"wrote {RESULTS_DIR / 'results.json'} and results.md")
+        if args.phase == "collect":
+            collect(corpus_root, spec, args.aft_bin.resolve(), args.baseline_bin.resolve(),
+                    aft_commit, args.diagnostics_sample)
+    if args.phase == "score":
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        before, after = [], []
+        for spec in selected:
+            baseline_out = raw_dir(corpus_root, spec) if spec.get("baseline", True) else None
+            if args.side in ("before", "both") and baseline_out is not None:
+                before.append(score_repo(corpus_root, spec, out=baseline_out, baseline_out=baseline_out))
+            if args.side in ("after", "both"):
+                after.append(score_repo(corpus_root, spec, out=raw_dir(corpus_root, spec, aft_commit),
+                                        baseline_out=baseline_out))
+        write_json(args.output_dir / "results.json", {"corpus": selected, "before": before, "after": after})
+        text = "## Before\n\n" + render_markdown(before, selected) + "\n## After\n\n" + render_markdown(after, selected)
+        failures = []
+        if args.slice:
+            if args.side != "both":
+                parser.error("--slice requires --side both")
+            text, failures = render_slice(before, after, args.slice)
+            path = HERE / "slices" / f"{args.slice}.md"
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(text)
+        (args.output_dir / "results.md").write_text(text)
+        print(text)
+        log(f"scored {len(before)} before and {len(after)} after repos; {len(failures)} lowered cells")
+        return 1 if failures else 0
     return 0
 
 
