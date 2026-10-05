@@ -2552,6 +2552,10 @@ mod tests {
     }
 
     #[test]
+    // Unix only: the fault is staged by renaming the log directory while the
+    // sink holds a file open in it, which Windows refuses (Access is denied).
+    // The injected-sink tests cover the same recovery path on every platform.
+    #[cfg(unix)]
     fn file_log_reopens_after_rotation_loses_its_handle() {
         let temp = TempDir::new().unwrap();
         let logs = temp.path().join("logs");
