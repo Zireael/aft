@@ -378,6 +378,8 @@ pub mod work_counters {
     thread_local! {
         static WRITES: Cell<u64> = const { Cell::new(0) };
         static SYNCS: Cell<u64> = const { Cell::new(0) };
+        #[cfg(test)]
+        static BYTES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// Pin key-file `(write calls, fsyncs)` made on this thread so far.
@@ -385,12 +387,21 @@ pub mod work_counters {
         (WRITES.with(Cell::get), SYNCS.with(Cell::get))
     }
 
+    /// Bytes actually written to pin key files on this thread.
+    #[cfg(test)]
+    pub(crate) fn key_file_bytes() -> u64 {
+        BYTES.with(Cell::get)
+    }
+
     pub(crate) struct CountingFile(pub(crate) File);
 
     impl Write for CountingFile {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             WRITES.with(|c| c.set(c.get() + 1));
-            self.0.write(buf)
+            let written = self.0.write(buf)?;
+            #[cfg(test)]
+            BYTES.with(|c| c.set(c.get() + written as u64));
+            Ok(written)
         }
 
         fn flush(&mut self) -> io::Result<()> {

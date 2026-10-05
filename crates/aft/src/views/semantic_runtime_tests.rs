@@ -230,6 +230,131 @@ fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
         .count()
 }
 
+fn large_pin_fixture() -> (tempfile::TempDir, tempfile::TempDir, CheckoutSemantic) {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..2048 {
+        std::fs::write(
+            root.path().join(format!("file_{i:04}.rs")),
+            format!("pub fn item_{i:04}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+    let runtime = open(storage.path(), "pins", root.path());
+    (storage, root, runtime)
+}
+
+fn fill_large(runtime: &CheckoutSemantic) {
+    let report = runtime
+        .plane()
+        .fill(
+            &runtime.owner,
+            &runtime.installed(),
+            FillBudget {
+                max_files: 4096,
+                ..FillBudget::default()
+            },
+            &mut |texts| Model::default().embed(texts),
+            &|| runtime.installed(),
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            report.installed,
+            report.embedded_keys,
+            report.embedded_texts
+        ),
+        (2048, 2048, 2048)
+    );
+}
+
+#[test]
+fn large_semantic_fill_batches_pin_writes() {
+    use crate::pins::work_counters::{key_file_bytes, key_file_work};
+    let (_storage, root, runtime) = large_pin_fixture();
+    let (writes, syncs) = key_file_work();
+    let bytes = key_file_bytes();
+    fill_large(&runtime);
+    let after = key_file_work();
+    eprintln!(
+        "fill pins: writes={} bytes={} key syncs={}",
+        after.0 - writes,
+        key_file_bytes() - bytes,
+        after.1 - syncs
+    );
+    let answer = query(&runtime, "item");
+    assert!(answer.complete());
+    assert_eq!(
+        rows(root.path(), &answer.results),
+        cold(root.path(), "item").0
+    );
+    assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
+    assert_eq!(key_file_bytes() - bytes, 2048 * 65);
+}
+
+#[test]
+fn large_semantic_materialization_batches_pins_and_touches() {
+    use crate::pins::work_counters::{key_file_bytes, key_file_work};
+    let (_storage, root, runtime) = large_pin_fixture();
+    fill_large(&runtime);
+    let answer = query(&runtime, "item");
+    let (writes, syncs) = key_file_work();
+    let bytes = key_file_bytes();
+    crate::blob_store::v2::take_touch_transactions();
+    let (snapshot, revision) = runtime.driver.installed_cut();
+    runtime
+        .loader
+        .fold(&runtime.access, &snapshot, revision)
+        .unwrap();
+    let after = key_file_work();
+    let transactions = crate::blob_store::v2::take_touch_transactions();
+    let written_bytes = key_file_bytes() - bytes;
+    eprintln!(
+        "fold pins: writes={} bytes={} key syncs={} touch transactions={transactions}",
+        after.0 - writes,
+        written_bytes,
+        after.1 - syncs
+    );
+    assert_eq!(pending_semantic(&runtime), 0);
+    assert_eq!(
+        rows(root.path(), &query(&runtime, "item").results),
+        rows(root.path(), &answer.results)
+    );
+    let manifest = runtime
+        .installed()
+        .generation()
+        .manifest()
+        .to_json_bytes()
+        .unwrap();
+    let store = runtime
+        .owner
+        .open_store(crate::blob_store::v2::FamilyPlane::Semantic)
+        .unwrap();
+    let blobs: Vec<_> = runtime
+        .installed()
+        .generation()
+        .manifest()
+        .ready_keys()
+        .map(|key| (key, store.get(&key).unwrap().unwrap()))
+        .collect();
+    runtime.load().unwrap();
+    assert_eq!(
+        runtime
+            .installed()
+            .generation()
+            .manifest()
+            .to_json_bytes()
+            .unwrap(),
+        manifest
+    );
+    for (key, payload) in blobs {
+        assert_eq!(store.get(&key).unwrap().unwrap(), payload);
+    }
+    assert_eq!((after.0 - writes, after.1 - syncs), (2, 0));
+    assert_eq!(written_bytes, 2048 * 65 * 2);
+    assert_eq!(transactions, 1);
+}
+
 /// A large, already-filled checkout must not read or embed unchanged sources
 /// again just to publish one edit. Compare to the strict loader and an
 /// independent cold index, not to another copy of the fast path.

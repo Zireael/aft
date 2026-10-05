@@ -519,6 +519,8 @@ impl FamilyStore {
         }
         let mut connection = lock(&self.inner.connection);
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        #[cfg(test)]
+        TOUCH_TRANSACTIONS.with(|count| count.set(count.get() + 1));
         let epoch = read_epoch(&tx)?;
         let mut report = TouchReport {
             ref_epoch: epoch,
@@ -815,6 +817,16 @@ impl FamilyStore {
             )))
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOUCH_TRANSACTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_touch_transactions() -> usize {
+    TOUCH_TRANSACTIONS.with(|count| count.replace(0))
 }
 
 const DELETE_UNREFERENCED_SQL: &str =

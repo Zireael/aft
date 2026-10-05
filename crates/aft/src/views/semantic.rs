@@ -644,12 +644,18 @@ impl SemanticPlane {
             report.embedded_texts += texts;
             match embedded {
                 Ok(runs) => {
+                    // Protect the entire embedding batch before any puts. A
+                    // growing pin written once per key costs quadratic bytes.
+                    let keys = to_embed
+                        .iter()
+                        .map(|(_, _, _, claim)| *claim.key())
+                        .collect::<Vec<_>>();
+                    protect(&view, &keys)?;
                     for ((item, relative, full_key, claim), mut run) in
                         to_embed.into_iter().zip(runs)
                     {
                         let key = *claim.key();
                         let payload = run.encode_view_payload(&payload_producer);
-                        protect(&view, &[key])?;
                         match store.put_or_touch(&key, &payload) {
                             Ok(PutOrTouch::Inserted { .. } | PutOrTouch::Reused { .. }) => {
                                 succeeded.push(full_key);
@@ -1189,6 +1195,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
             .map_err(|error| plane_error(error.to_string()))?;
         let view = self.view(&ViewAccess::Owner(owner.clone()));
         let state = lock(&view);
+        let mut candidates = Vec::new();
         for (path, entry) in manifest.entries_mut() {
             let EntryV2::Regular {
                 content, planes, ..
@@ -1220,15 +1227,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
                 },
             };
             if let Some(key) = key {
-                live.protect(&[key])
-                    .map_err(|error| plane_error(error.to_string()))?;
-                let touched = store
-                    .touch(&[key])
-                    .map_err(|error| plane_error(error.to_string()))?;
-                if touched.missing.is_empty() {
-                    planes.semantic = Some(PlaneState::ready(&key));
-                    continue;
-                }
+                candidates.push((path.clone(), key));
             }
             if let Some(reason) = state.failed.get(&(path.clone(), *content)) {
                 planes.semantic = Some(PlaneState::Failed {
@@ -1240,6 +1239,26 @@ impl super::first_load::CompositePlane for SemanticPlane {
             if !matches!(&planes.semantic, Some(PlaneState::Failed { producer, .. }) if *producer == id)
             {
                 planes.semantic = Some(PlaneState::pending("awaiting semantic fill"));
+            }
+        }
+        if !candidates.is_empty() {
+            // Pin all candidates before the touch transaction. Missing rows
+            // remain pending/failed: GC may have won before protection landed.
+            let keys = candidates.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+            live.protect(&keys)
+                .map_err(|error| plane_error(error.to_string()))?;
+            let missing = store
+                .touch(&keys)
+                .map_err(|error| plane_error(error.to_string()))?
+                .missing
+                .into_iter()
+                .collect::<HashSet<_>>();
+            for (path, key) in candidates {
+                if !missing.contains(&key) {
+                    if let Some(EntryV2::Regular { planes, .. }) = manifest.get_mut(&path) {
+                        planes.semantic = Some(PlaneState::ready(&key));
+                    }
+                }
             }
         }
         Ok(())
