@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -273,6 +275,25 @@ class CheckoutFixtures(unittest.TestCase):
         snapshot["typescript"] = {"buckets": {"dead_code": []}}
         (self.after / "oracle.json").write_text(json.dumps(snapshot))
         self.assertEqual([b["language"] for b in self.score()["buckets"]], ["rust", "typescript"])
+
+    def test_aft_stderr_backpressure_does_not_block_responses(self):
+        binary = self.root / "fake-aft"
+        binary.write_text("#!/usr/bin/env python3\nimport sys, json\n"
+            "for line in sys.stdin:\n"
+            "    request = json.loads(line)\n"
+            "    sys.stderr.write('warning\\n' * 200000)\n"
+            "    sys.stderr.flush()\n"
+            "    print(json.dumps({'id':request['id'], 'success':True}), flush=True)\n")
+        binary.chmod(0o755)
+        driver = (f"import sys; sys.path.insert(0, {str(harness.HERE)!r}); import run; "
+                  f"from pathlib import Path; s=run.AftSession(Path({str(binary)!r}), "
+                  f"Path({str(self.root)!r}), Path({str(self.root / 'storage')!r})); "
+                  "assert s.configure()['success']; s.close()")
+        try:
+            proc = subprocess.run([sys.executable, "-c", driver], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("Undrained AFT stderr blocked the configure response")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":

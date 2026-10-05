@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -291,14 +292,27 @@ class AftSession:
         self.repo = repo
         self.storage = storage
         self.calls = 0
+        # A large scoped walk can emit more warnings than a pipe holds. Drain
+        # stderr while waiting for NDJSON stdout or the child cannot respond.
+        self.stderr_thread = threading.Thread(target=self.drain_stderr, daemon=True)
+        self.stderr_thread.start()
+
+    def drain_stderr(self) -> None:
+        if self.client.proc.stderr is not None:
+            with (self.storage / "aft-stderr.log").open("a") as log_file:
+                for line in self.client.proc.stderr:
+                    log_file.write(line)
+                    log_file.flush()
 
     def configure(self, user_config: Optional[Path] = None) -> Dict[str, Any]:
         extra: Dict[str, Any] = {}
         if user_config is not None:
             extra["cortexkit_user_config_path"] = str(user_config.resolve())
-        return self.client.request(
+        response = self.client.request(
             "configure", timeout_s=600, project_root=str(self.repo.resolve()),
             harness="runner", storage_dir=str(self.storage.resolve()), **extra)
+        write_json(self.storage / "configure.json", response)
+        return response
 
     def inspect(self, sections: List[str], scope: Optional[List[str]] = None,
                 timeout_s: float = 1800, offset: Optional[int] = None) -> Dict[str, Any]:
@@ -308,10 +322,13 @@ class AftSession:
         if offset is not None:
             params["offset"] = offset
         self.calls += 1
-        return self.client.request("inspect", timeout_s=timeout_s, **params)
+        response = self.client.request("inspect", timeout_s=timeout_s, **params)
+        write_json(self.storage / f"inspect-{self.calls:05d}.json", {"request": params, "response": response})
+        return response
 
     def close(self) -> None:
         self.client.close()
+        self.stderr_thread.join(timeout=5)
 
 
 def children_index(files: Iterable[str]) -> Dict[str, List[str]]:
@@ -498,6 +515,7 @@ def collect_aft_record(repo: Path, spec: Dict[str, Any], aft_bin: Path, out: Pat
                 items = collect_category(session, category, [], tree, truncated, response=project)
             except CategoryUnknown as unknown:
                 record["project_summary"][category] = unknown.summary
+                log(f"{spec['name']}: {category} unknown: {json.dumps(unknown.summary)}")
                 items = []
             unique = {(i.get("file"), i.get("symbol") or i.get("text"), i.get("line")): i for i in items}
             record["items"][category] = list(unique.values())
