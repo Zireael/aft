@@ -283,6 +283,29 @@ fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
         .status()
         .unwrap()
         .success());
+    // Linux splits project reads around repository hooks into existing children.
+    // Keep this file present at launch while still testing its sandboxed edit,
+    // git add, and commit through the managed attribution hook.
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::write(f.project.join("tracked"), "before").unwrap();
+        // Keep the original repository hooks outside the worktree so the
+        // existing nested-hook read limitation does not also split Git metadata
+        // into inode-specific grants that git add replaces. The original hooks
+        // directory is still denied; AFT's managed hook remains the dispatcher.
+        let original_hooks = f.home.join("repository-hooks");
+        std::fs::create_dir_all(&original_hooks).unwrap();
+        let output = linux_fixture_git(
+            &f,
+            &[
+                "config",
+                "--local",
+                "core.hooksPath",
+                original_hooks.to_str().unwrap(),
+            ],
+        );
+        assert!(output.status.success(), "{output:?}");
+    }
     // Executing a Mach-O image does not by itself prove file-read access on
     // Seatbelt. Check the managed bytes too, before exercising both consumers.
     let response = foreground(&mut f.aft, "governed-child", "cat \"$AFT_GH_SHIMS_DIR/gh\" > /dev/null && gh --status && cat \"$GIT_CONFIG_VALUE_0/prepare-commit-msg\" > /dev/null && git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial && git log -1 --format=%B");
@@ -312,6 +335,86 @@ fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
         2,
         "{denied:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_fixture_git(fixture: &CortexkitFloorFixture, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new("git");
+    super::helpers::apply_hermetic_git_env(&mut command);
+    command
+        .current_dir(&fixture.project)
+        .env("HOME", &fixture.home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// This is an observation of an existing Linux policy limitation, not an
+/// assertion that git add/commit must fail. It records success or the exact
+/// kernel/tool error so a real-Landlock CI run can establish current behavior.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_default_hooks_add_then_commit_records_existing_read_limit() {
+    skip_if_landlock_absent!();
+    let mut f = CortexkitFloorFixture::new();
+    let initialized = linux_fixture_git(&f, &["init", "-q", "--template="]);
+    assert!(initialized.status.success(), "{initialized:?}");
+    let tracked = f.project.join("tracked");
+    std::fs::write(&tracked, "before").unwrap();
+    let staged = linux_fixture_git(&f, &["add", "tracked"]);
+    assert!(staged.status.success(), "{staged:?}");
+    // Force git add in the sandbox to replace the existing index inode.
+    std::fs::write(&tracked, "after").unwrap();
+    let response = foreground(
+        &mut f.aft,
+        "default-hooks-read-probe",
+        "git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm default-hooks-read-probe",
+    );
+    assert_eq!(
+        response["success"], true,
+        "sandbox did not launch: {response:?}"
+    );
+    match response["status"].as_str() {
+        Some("completed") => {
+            let log = linux_fixture_git(&f, &["log", "-1", "--format=%s"]);
+            assert!(log.status.success(), "{log:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&log.stdout).trim(),
+                "default-hooks-read-probe"
+            );
+        }
+        Some("failed") => {
+            assert!(
+                response["exit_code"].as_i64().is_some_and(|code| code != 0),
+                "{response:?}"
+            );
+            assert!(
+                !response["output"].as_str().unwrap().is_empty(),
+                "a failed probe must retain its exact error"
+            );
+        }
+        _ => panic!("probe never reached a terminal Git outcome: {response:?}"),
+    }
+    let record = json!({
+        "probe": "linux_default_hooks_add_then_commit_records_existing_read_limit",
+        "status": response["status"], "exit_code": response["exit_code"], "output": response["output"],
+    });
+    eprintln!("Linux default-hooks Git outcome: {record}");
+    // nextest normally hides output from passing tests. Preserve this deliberate
+    // observation in the CI job summary even when the probe test itself passes.
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        let mut summary = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            summary,
+            "\n### Linux default-hooks Git read probe\n```json\n{record}\n```\n"
+        )
+        .unwrap();
+    }
 }
 
 #[test]

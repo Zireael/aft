@@ -1399,7 +1399,7 @@ fn build_native_profile(
                 .iter()
                 .flat_map(|policy| policy.read_roots.iter().cloned())
                 .collect::<Vec<_>>();
-            profile.read_allow = build_linux_read_allow(&profile, &home, &git_read_roots, &[])?;
+            profile = build_linux_profile(profile, &home, &git_read_roots)?;
             profile = profile
                 .canonicalize_for_launch()
                 .map_err(|error| error.to_string())?;
@@ -1771,22 +1771,11 @@ trait ReadDirectoryLister {
 }
 
 #[cfg(target_os = "linux")]
-fn build_linux_read_allow(
-    profile: &SandboxProfile,
+fn build_linux_profile(
+    profile: SandboxProfile,
     home: &Path,
     git_read_roots: &[PathBuf],
-    omitted_roots: &[PathBuf],
-) -> Result<Vec<PathBuf>, String> {
-    let mandatory_floor = &profile.write_deny;
-    validate_mandatory_floor_overlap(profile.write_allow_roots(), mandatory_floor)?;
-    profile
-        .data_policy
-        .validate_grants(
-            profile.write_allow_roots(),
-            &profile.data_policy.write_allow,
-        )
-        .map_err(|error| error.to_string())?;
-
+) -> Result<SandboxProfile, String> {
     let mut intended = Vec::new();
     for path in [
         "/usr",
@@ -1831,6 +1820,37 @@ fn build_linux_read_allow(
         });
     }
 
+    compute_linux_profile(
+        profile,
+        home,
+        git_read_roots,
+        &intended,
+        &mut SecureReadDirectoryLister,
+    )
+}
+
+/// Compute the exact launcher policy from canonical paths and an injected
+/// directory inventory. Only the wrapper above discovers host filesystem paths;
+/// this policy calculation also runs in tests on hosts without Landlock.
+#[cfg(any(test, target_os = "linux"))]
+fn compute_linux_profile(
+    mut profile: SandboxProfile,
+    home: &Path,
+    git_read_roots: &[PathBuf],
+    base_read_grants: &[IntendedReadGrant],
+    lister: &mut impl ReadDirectoryLister,
+) -> Result<SandboxProfile, String> {
+    validate_mandatory_floor_overlap(profile.write_allow_roots(), &profile.write_deny)?;
+    profile
+        .data_policy
+        .validate_grants(
+            profile.write_allow_roots(),
+            &profile.data_policy.write_allow,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut intended = base_read_grants.to_vec();
+
     intended.push(IntendedReadGrant {
         path: home.to_path_buf(),
         force_children: true,
@@ -1861,13 +1881,14 @@ fn build_linux_read_allow(
         .read_deny
         .iter()
         .chain(&profile.data_policy.deny)
-        .chain(omitted_roots)
         .cloned()
         .collect::<Vec<_>>();
-    let mut lister = SecureReadDirectoryLister;
-    let mut grants = split_read_grants(&intended, &split_denies, &mut lister)?;
+    let mut grants = split_read_grants(&intended, &split_denies, lister)?;
     // Reintroduce only explicit private-tree exceptions, still split around
     // ordinary denies (including the connection file and repository hooks).
+    // A nested repository-hooks deny means reads are granted per existing
+    // project child. Files newly created at the project root after this launch
+    // cannot be read within the same sandboxed command; writes remain allowed.
     let exceptions = profile
         .data_policy
         .read_allow
@@ -1878,11 +1899,7 @@ fn build_linux_read_allow(
             mandatory: false,
         })
         .collect::<Vec<_>>();
-    grants.extend(split_read_grants(
-        &exceptions,
-        &profile.read_deny,
-        &mut lister,
-    )?);
+    grants.extend(split_read_grants(&exceptions, &profile.read_deny, lister)?);
     grants.sort_unstable();
     grants.dedup();
     profile
@@ -1892,7 +1909,8 @@ fn build_linux_read_allow(
             &profile.data_policy.read_allow,
         )
         .map_err(|error| error.to_string())?;
-    Ok(grants)
+    profile.read_allow = grants;
+    Ok(profile)
 }
 
 #[cfg(target_os = "linux")]
@@ -2012,7 +2030,11 @@ fn split_read_grant(
         )
     })?;
     for child in children {
-        let child_contains_deny = denies.iter().any(|deny| deny.starts_with(&child.path));
+        // An exact denied file is simply omitted by the recursive call. Only a
+        // strict descendant deny would require traversing this child as a directory.
+        let child_contains_deny = denies
+            .iter()
+            .any(|deny| deny != &child.path && deny.starts_with(&child.path));
         if child_contains_deny && !child.is_dir {
             return Err(format!(
                 "sandbox_unavailable: deny chain crosses non-directory path {}",
@@ -4043,7 +4065,8 @@ mod read_allow_tests {
     impl ReadDirectoryLister for FakeLister {
         fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
             self.entries
-                .remove(parent)
+                .get(parent)
+                .cloned()
                 .unwrap_or_else(|| Err(format!("unexpected enumeration of {}", parent.display())))
         }
     }
@@ -4054,6 +4077,313 @@ mod read_allow_tests {
             force_children,
             mandatory,
         }
+    }
+
+    /// Canonical directory inventory independent of the host filesystem. The
+    /// connection is a regular file outside CortexKit data, just as in the
+    /// production spawn fixture. Private subtrees are intentionally absent from
+    /// the inventory: policy may grant exact exceptions, never enumerate them.
+    fn linux_profile_model() -> (SandboxProfile, FakeLister, Vec<IntendedReadGrant>) {
+        let data = "/home/alice/.local/share/cortexkit";
+        let storage = format!("{data}/aft");
+        let project = format!("{data}/alfonso/worktrees/own");
+        let session = format!("{storage}/opencode/bash-tasks/current");
+        let temp = format!("{session}/bash-own/io/aft-sandbox-own");
+        let shims = format!("{storage}/shims");
+        let hooks = format!("{storage}/cache/git-hooks/current");
+        let binary = format!("{data}/bin/ck-aft");
+        let connection = PathBuf::from("/home/alice/daemon/connection.json");
+        let profile = SandboxProfile {
+            v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+            data_policy: crate::sandbox_profile::SandboxDataPolicy {
+                deny: vec![
+                    data.into(),
+                    "/home/alice/.local/state/cortexkit".into(),
+                    storage.into(),
+                    session.into(),
+                ],
+                read_allow: vec![
+                    project.clone().into(),
+                    temp.clone().into(),
+                    shims.clone().into(),
+                    hooks.clone().into(),
+                    binary.clone().into(),
+                ],
+                write_allow: vec![project.clone().into(), temp.clone().into()],
+            },
+            writable_roots: vec![project.into()],
+            write_deny: vec![
+                connection.clone(),
+                "/home/alice/.ssh".into(),
+                shims.into(),
+                hooks.into(),
+                binary.into(),
+            ],
+            write_deny_nested: Vec::new(),
+            read_allow: Vec::new(),
+            read_deny: vec![
+                connection,
+                "/home/alice/.ssh".into(),
+                "/run/user".into(),
+                "/run/credentials".into(),
+                "/run/secrets".into(),
+            ],
+            socket_deny: Vec::new(),
+            cache_roots: vec!["/home/alice/.npm".into()],
+            temp_dir: temp.into(),
+        };
+        let inventory = FakeLister::default()
+            .directory(
+                "/home/alice",
+                &[
+                    (".ssh", true),
+                    (".local", true),
+                    ("daemon", true),
+                    ("notes", false),
+                    (".npm", true),
+                ],
+            )
+            .directory(
+                "/home/alice/daemon",
+                &[("connection.json", false), ("readme", false)],
+            )
+            .directory("/home/alice/.local", &[("share", true), ("state", true)])
+            .directory(
+                "/home/alice/.local/share",
+                &[("cortexkit", true), ("other-program", true)],
+            )
+            .directory(
+                "/home/alice/.local/state",
+                &[("cortexkit", true), ("other-state", true)],
+            )
+            .directory(
+                "/run",
+                &[
+                    ("user", true),
+                    ("credentials", true),
+                    ("secrets", true),
+                    ("lock", true),
+                ],
+            );
+        (
+            profile,
+            inventory,
+            vec![grant("/usr", false, true), grant("/run", false, true)],
+        )
+    }
+
+    #[test]
+    fn linux_profile_private_tree_carve_outs_are_exact() {
+        let (profile, mut inventory, base) = linux_profile_model();
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect("a worktree inside private data must produce a usable Linux profile");
+        let mut expected = [
+            "/usr", "/run/lock", "/home/alice/.npm", "/home/alice/notes", "/home/alice/daemon/readme",
+            "/home/alice/.local/share/other-program", "/home/alice/.local/state/other-state",
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/own",
+            "/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/current/bash-own/io/aft-sandbox-own",
+            "/home/alice/.local/share/cortexkit/aft/shims",
+            "/home/alice/.local/share/cortexkit/aft/cache/git-hooks/current",
+            "/home/alice/.local/share/cortexkit/bin/ck-aft",
+        ].map(PathBuf::from).to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            profile.read_allow, expected,
+            "read/execute rules must be exact"
+        );
+        let writes = profile.write_allow_roots();
+        assert_eq!(writes, vec![
+            Path::new("/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/current/bash-own/io/aft-sandbox-own"),
+            Path::new("/home/alice/.local/share/cortexkit/alfonso/worktrees/own"),
+            Path::new("/home/alice/.npm"),
+        ]);
+        for deny in &profile.data_policy.deny {
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| deny.starts_with(grant)),
+                "a read grant covers private tree {}",
+                deny.display()
+            );
+            assert!(
+                !writes.iter().any(|grant| deny.starts_with(grant)),
+                "a write grant covers private tree {}",
+                deny.display()
+            );
+        }
+        // These victim paths are deliberately outside every exact exception.
+        for victim in [
+            "/home/alice/daemon/connection.json",
+            "/home/alice/.local/share/cortexkit/other-module/store",
+            "/home/alice/.local/share/cortexkit/aft/undo/history",
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/other/file",
+            "/home/alice/.local/share/cortexkit/aft/opencode/bash-tasks/other/io/stdout",
+            "/home/alice/.local/state/cortexkit/gh-shim/manifest.json",
+        ] {
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| Path::new(victim).starts_with(grant)),
+                "readable victim: {victim}"
+            );
+            assert!(
+                !writes
+                    .iter()
+                    .any(|grant| Path::new(victim).starts_with(grant)),
+                "writable victim: {victim}"
+            );
+        }
+        for managed in [
+            "/home/alice/.local/share/cortexkit/aft/shims",
+            "/home/alice/.local/share/cortexkit/aft/cache/git-hooks/current",
+            "/home/alice/.local/share/cortexkit/bin/ck-aft",
+        ] {
+            assert!(
+                profile.read_allow.contains(&PathBuf::from(managed)),
+                "missing managed read/execute grant: {managed}"
+            );
+            assert!(
+                !writes
+                    .iter()
+                    .any(|grant| paths_overlap(grant, Path::new(managed))),
+                "managed executable writable: {managed}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_profile_repository_hooks_preserve_existing_child_reads() {
+        let (mut profile, mut inventory, base) = linux_profile_model();
+        let project = "/home/alice/.local/share/cortexkit/alfonso/worktrees/own";
+        let git = format!("{project}/.git");
+        profile.read_deny.push(format!("{git}/hooks").into());
+        inventory = inventory
+            .directory(
+                project,
+                &[("tracked", false), ("src", true), (".git", true)],
+            )
+            .directory(
+                &git,
+                &[
+                    ("hooks", true),
+                    ("objects", true),
+                    ("refs", true),
+                    ("index", false),
+                ],
+            );
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[git.into()],
+            &base,
+            &mut inventory,
+        )
+        .expect("nested hooks must not make the entire project unavailable");
+        assert!(profile.write_allow_roots().contains(&Path::new(project)));
+        for readable in ["tracked", "src", ".git/objects", ".git/refs", ".git/index"] {
+            assert!(
+                profile
+                    .read_allow
+                    .contains(&Path::new(project).join(readable)),
+                "missing project child: {readable}"
+            );
+        }
+        for denied in [".git/hooks/pre-commit", "new-at-project-root"] {
+            let denied = Path::new(project).join(denied);
+            assert!(
+                !profile
+                    .read_allow
+                    .iter()
+                    .any(|grant| denied.starts_with(grant)),
+                "unexpected readable path: {}",
+                denied.display()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_profile_broad_base_read_grant_is_split_around_private_data() {
+        let (profile, mut inventory, mut base) = linux_profile_model();
+        // Even another source of read access to the parent must be split, not
+        // emitted wholesale alongside the precise private-tree exceptions.
+        base.push(grant("/home/alice/.local/share", false, true));
+        let profile = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect("a broad base read grant can be split without refusing the worktree");
+        assert!(profile.read_allow.contains(&PathBuf::from(
+            "/home/alice/.local/share/cortexkit/alfonso/worktrees/own"
+        )));
+        assert!(profile
+            .read_allow
+            .contains(&PathBuf::from("/home/alice/.local/share/other-program")));
+        assert!(!profile
+            .read_allow
+            .iter()
+            .any(|grant| Path::new("/home/alice/.local/share/cortexkit").starts_with(grant)));
+    }
+
+    #[test]
+    fn linux_profile_connection_file_inside_project_still_refuses() {
+        let (mut profile, mut inventory, base) = linux_profile_model();
+        let connection = profile.writable_roots[0].join("connection.json");
+        profile.read_deny.push(connection.clone());
+        profile.write_deny.push(connection);
+        let error = compute_linux_profile(
+            profile,
+            Path::new("/home/alice"),
+            &[],
+            &base,
+            &mut inventory,
+        )
+        .expect_err("private-tree exceptions must not override credential denies");
+        assert!(error.contains("overlaps mandatory secret floor"), "{error}");
+    }
+
+    #[test]
+    fn denied_connection_file_is_omitted_without_refusing_readable_siblings() {
+        let mut lister = FakeLister::default().directory(
+            "/home/alice/daemon",
+            &[("connection.json", false), ("ordinary.txt", false)],
+        );
+        let emitted = split_read_grants(
+            &[grant("/home/alice/daemon", false, false)],
+            &[PathBuf::from("/home/alice/daemon/connection.json")],
+            &mut lister,
+        )
+        .expect("an exact denied file must be omitted, not treated as a directory");
+        assert_eq!(
+            emitted,
+            vec![PathBuf::from("/home/alice/daemon/ordinary.txt")]
+        );
+    }
+
+    #[test]
+    fn deny_chain_crossing_regular_file_still_refuses() {
+        let mut lister =
+            FakeLister::default().directory("/home/alice", &[("not-a-directory", false)]);
+        let error = split_read_grants(
+            &[grant("/home/alice", true, false)],
+            &[PathBuf::from("/home/alice/not-a-directory/secret")],
+            &mut lister,
+        )
+        .expect_err("a strict descendant deny cannot be represented through a regular file");
+        assert!(
+            error.contains("deny chain crosses non-directory path"),
+            "{error}"
+        );
     }
 
     #[test]

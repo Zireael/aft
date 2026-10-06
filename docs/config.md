@@ -591,6 +591,8 @@ Background stdout/stderr and exit markers use descriptors opened before confinem
 | TCP, UDP, DNS, and raw sockets | Open | Open |
 | Unsupported native platform | `sandbox_unavailable` | `sandbox_unavailable` |
 
+On Linux, the existing repository-hook read denial requires granting project reads per child present at launch, rather than granting the complete project root. Within one sandboxed command, files newly created at the project root after launch cannot be read, even though they can be written. A subsequent command recomputes the read grants and can read those files. This is a pre-existing Landlock limitation of the nested `.git/hooks` read deny, not a denial of the session's worktree by the CortexKit data floor. macOS does not have this limitation.
+
 ### Linux guarantee boundary
 
 The Linux guarantee applies to canonical paths without pre-existing aliases into a granted tree. Granted project, cache, task, and system trees are treated as trusted content. The following limitations are deliberate and surfaced honestly:
