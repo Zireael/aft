@@ -22,6 +22,65 @@ fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
+#[test]
+fn lsp_child_environment_disables_optional_git_locks_unless_configured() {
+    use aft::lsp::client::LspClient;
+
+    let (temp, file, _) = rust_fixture_files();
+    let root = file.parent().unwrap().parent().unwrap().to_path_buf();
+    let registry = LspChildRegistry::new();
+    let (events, _receiver) = crossbeam_channel::unbounded();
+
+    let default_value_path = temp.path().join("default-git-optional-locks");
+    let mut default_env = HashMap::new();
+    default_env.insert(
+        "AFT_FAKE_LSP_GIT_OPTIONAL_LOCKS_FILE".into(),
+        default_value_path.display().to_string(),
+    );
+    let mut client = LspClient::spawn(
+        ServerKind::Rust,
+        root.clone(),
+        &fake_server_path(),
+        &[],
+        &default_env,
+        events.clone(),
+        registry.clone(),
+    )
+    .expect("spawn fake LSP");
+    client.initialize(&root, None).expect("initialize fake LSP");
+    assert_eq!(
+        fs::read_to_string(&default_value_path).expect("fake LSP environment marker"),
+        "0",
+        "AFT must disable optional Git locks for LSP children"
+    );
+    client.shutdown().expect("shutdown fake LSP");
+
+    let configured_value_path = temp.path().join("configured-git-optional-locks");
+    let mut configured_env = HashMap::new();
+    configured_env.insert(
+        "AFT_FAKE_LSP_GIT_OPTIONAL_LOCKS_FILE".into(),
+        configured_value_path.display().to_string(),
+    );
+    configured_env.insert("GIT_OPTIONAL_LOCKS".into(), "1".into());
+    let mut client = LspClient::spawn(
+        ServerKind::Rust,
+        root.clone(),
+        &fake_server_path(),
+        &[],
+        &configured_env,
+        events,
+        registry,
+    )
+    .expect("spawn fake LSP with configured environment");
+    client.initialize(&root, None).expect("initialize fake LSP");
+    assert_eq!(
+        fs::read_to_string(&configured_value_path).expect("fake LSP environment marker"),
+        "1",
+        "an explicit server environment value must take precedence"
+    );
+    client.shutdown().expect("shutdown fake LSP");
+}
+
 /// A completed spawning thread must not end the server's usable lifetime.
 #[test]
 fn lsp_remains_usable_after_spawning_thread_exits() {

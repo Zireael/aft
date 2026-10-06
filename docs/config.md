@@ -698,6 +698,8 @@ only if their binary can be resolved from project `node_modules/.bin`, AFT's man
 `PATH`. Python-family servers additionally check the selected nested workspace's `.venv` or
 `venv` first.
 
+AFT sets `GIT_OPTIONAL_LOCKS=0` for every language server so Git status calls by server descendants skip optional index locks; mandatory Git write locks are unaffected.
+
 **Built-in servers** (auto-registered, no config needed):
 
 | Server | Languages | Binary |

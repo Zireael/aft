@@ -476,6 +476,10 @@ pub(crate) fn main() -> io::Result<()> {
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_STARTED_SIGNAL") {
         std::fs::write(signal_path, b"started")?;
     }
+    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_GIT_OPTIONAL_LOCKS_FILE") {
+        let value = std::env::var("GIT_OPTIONAL_LOCKS").unwrap_or_else(|_| "<unset>".into());
+        std::fs::write(path, value)?;
+    }
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     // Messages are read on their own thread so the main loop can also act on

@@ -827,7 +827,11 @@ impl LspClient {
             .stdout(Stdio::piped())
             // Drain stderr on a background thread so failed shims/crashes have
             // actionable diagnostics without risking pipe-buffer deadlock.
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Git status may run in server descendants such as build scripts.
+            // Disable its optional index lock so killing a check cannot leave
+            // a stale lock behind; per-server env entries below may override it.
+            .env("GIT_OPTIONAL_LOCKS", "0");
         for (key, value) in env {
             #[cfg(windows)]
             if is_batch_file && crate::windows_command::is_batch_internal_env(key, args.len()) {
