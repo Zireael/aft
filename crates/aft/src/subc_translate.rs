@@ -3248,6 +3248,30 @@ mod tests {
     }
 
     #[test]
+    fn grep_translation_splits_comma_separated_exact_include_names() {
+        let translated = subc_translate_owned(
+            "grep",
+            serde_json::json!({
+                "pattern": "(fail)|error",
+                "path": ".cortexkit/alfonso/reports",
+                "include": "a.stderr.log,b.stderr.log,c.stderr.log"
+            }),
+            Path::new("/project"),
+        )
+        .expect("agent grep arguments should translate");
+
+        assert_eq!(translated.command, "grep");
+        assert_eq!(
+            translated.args.get("include"),
+            Some(&serde_json::json!([
+                "**/a.stderr.log",
+                "**/b.stderr.log",
+                "**/c.stderr.log"
+            ]))
+        );
+    }
+
+    #[test]
     fn owned_write_translation_moves_content_buffer() {
         let content = "x".repeat(256 * 1024);
         let content_ptr = content.as_ptr();
