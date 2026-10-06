@@ -33,8 +33,7 @@ use std::os::windows::process::CommandExt;
 
 use super::buffer::{combine_streams, BgBuffer, DiskTruncation, StreamKind, TokenCountInput};
 use super::output::{
-    cap_completion_output, cap_completion_output_with_marker, cap_final_output,
-    cap_final_output_with_marker, completion_preview_threshold, json_output_pointer, quote_path,
+    cap_completion_output, completion_preview_threshold, json_output_pointer, quote_path,
     retained_json_output_pointer, COMPRESS_INPUT_CAP_BYTES, COMPRESS_INPUT_HEAD_BYTES,
     COMPRESS_INPUT_TAIL_BYTES, FINAL_OUTPUT_CAP_BYTES, RAW_PASSTHROUGH_CAP_BYTES,
     RAW_PASSTHROUGH_HEAD_BYTES, RAW_PASSTHROUGH_TAIL_BYTES, RUNNING_OUTPUT_PREVIEW_BYTES,
@@ -403,6 +402,9 @@ struct ArtifactRecoveryAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecoveryContext {
+    // Each capture has its own ending; concatenation cannot identify which
+    // stream wrote last. These lines must survive both reply and reminder caps.
+    final_lines: Vec<String>,
     dropped_by_class: BTreeMap<DropClass, usize>,
     had_inner_drop: bool,
     offset_hint_eligible: bool,
@@ -432,6 +434,11 @@ fn terminal_output_cache_estimated_bytes(cache: &TerminalOutputCache) -> u64 {
                 )
                 .saturating_add(optional_string_bytes(recovery.output_path.as_ref()))
                 .saturating_add(optional_string_bytes(recovery.stderr_path.as_ref()))
+                .saturating_add(recovery.final_lines.iter().fold(0_u64, |bytes, line| {
+                    bytes.saturating_add(crate::memory::usize_to_u64(
+                        std::mem::size_of::<String>() + line.len(),
+                    ))
+                }))
                 .saturating_add(crate::memory::usize_to_u64(
                     recovery.artifact_access.task_id.len(),
                 ))
@@ -1360,15 +1367,37 @@ impl BgTaskRegistry {
         } else if !metadata.compressed {
             render_raw_passthrough(buffer, disk_truncation, artifact_access)
         } else {
-            let raw = buffer.read_combined_head_tail(
+            let (raw, stdout_end) = buffer.read_combined_head_tail_with_boundary(
                 COMPRESS_INPUT_CAP_BYTES,
                 COMPRESS_INPUT_HEAD_BYTES,
                 COMPRESS_INPUT_TAIL_BYTES,
             );
-            let compressed = self.compress_output(&metadata.command, raw.text, metadata.exit_code);
+            let endings: Vec<String> = [&raw.text[..stdout_end], &raw.text[stdout_end..]]
+                .into_iter()
+                .map(crate::compress::generic::strip_ansi)
+                .map(|text| crate::compress::line_cut::ensure_final_lines(&text, ""))
+                .filter(|text| !text.is_empty())
+                .collect();
+            let mut compressed =
+                self.compress_output(&metadata.command, raw.text, metadata.exit_code);
+            // Summary extractors may see stderr's final "Finished" line and
+            // conclude the tail is intact even though stdout's verdict vanished.
+            // Repair all compressor tiers here, before either byte cap runs.
+            for ending in &endings {
+                let last = ending.lines().last().unwrap();
+                if !compressed.text.lines().any(|line| line.trim_end() == last) {
+                    compressed.text =
+                        crate::compress::line_cut::ensure_final_lines(ending, &compressed.text);
+                }
+            }
+            let final_lines = endings
+                .iter()
+                .map(|ending| ending.lines().last().unwrap().to_string())
+                .collect();
             render_compressed_with_recovery(
                 buffer,
                 compressed,
+                final_lines,
                 raw.truncated,
                 disk_truncation,
                 artifact_access,
@@ -7432,6 +7461,7 @@ fn normalize_piped_display_output(text: &mut String) {
 fn render_compressed_with_recovery(
     buffer: &BgBuffer,
     mut compressed: CompressionResult,
+    final_lines: Vec<String>,
     input_truncated: bool,
     disk_truncation: DiskTruncation,
     artifact_access: ArtifactRecoveryAccess,
@@ -7457,6 +7487,7 @@ fn render_compressed_with_recovery(
     let stderr_path = buffer.stderr_path().map(|path| path.display().to_string());
     let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
     let mut recovery = RecoveryContext {
+        final_lines,
         dropped_by_class: compressed.dropped_by_class,
         had_inner_drop: compressed.had_inner_drop,
         offset_hint_eligible: compressed.offset_hint_eligible,
@@ -7484,12 +7515,15 @@ fn render_compressed_with_recovery(
 }
 
 fn render_body_with_recovery_marker(body: &str, recovery: &mut RecoveryContext) -> (String, bool) {
+    let final_lines = recovery.final_lines.clone();
     render_body_with_recovery_marker_at_cap(
         body,
         recovery,
         FINAL_OUTPUT_CAP_BYTES,
-        cap_final_output,
-        cap_final_output_with_marker,
+        |input| super::output::cap_final_output_preserving(input, None, &final_lines),
+        |input, marker| {
+            super::output::cap_final_output_preserving(input, Some(marker), &final_lines)
+        },
     )
 }
 
@@ -7800,6 +7834,7 @@ fn render_raw_passthrough(
 
     let include_stderr_path = buffer.stream_len(StreamKind::Stderr) > 0;
     let mut recovery = RecoveryContext {
+        final_lines: Vec::new(),
         dropped_by_class: BTreeMap::new(),
         had_inner_drop: false,
         offset_hint_eligible: false,
@@ -7865,7 +7900,12 @@ fn completion_preview_for_cache(
         let mut completion_recovery = recovery.clone();
         completion_recovery.byte_truncated = true;
         if let Some(marker) = recovery_marker(&completion_recovery) {
-            let capped = cap_completion_output_with_marker(&body, &marker, exit_ok);
+            let capped = super::output::cap_completion_output_preserving(
+                &body,
+                Some(&marker),
+                exit_ok,
+                &recovery.final_lines,
+            );
             return (capped.text, true);
         }
     }
@@ -9474,6 +9514,7 @@ mod tests {
     #[test]
     fn recovery_marker_reports_disk_prefix_truncation_as_retained_output() {
         let recovery = RecoveryContext {
+            final_lines: Vec::new(),
             dropped_by_class: BTreeMap::new(),
             had_inner_drop: false,
             offset_hint_eligible: false,
@@ -9921,6 +9962,151 @@ mod tests {
             normalize(snapshot.output_preview),
             normalize(completion.output_preview.clone()),
         )
+    }
+
+    fn gate_tail_agent_text(command: &str, stdout: &str, stderr: &str) -> (String, String) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&frames);
+        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+            captured.lock().unwrap().push(frame);
+        }));
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
+        registry.record_live_delivery_session("session");
+        let filters = crate::compress::toml_filter::build_registry(
+            crate::compress::builtin_filters::ALL,
+            None,
+            None,
+        );
+        registry.set_compressor_with_exit_code(move |command, output, exit_code| {
+            crate::compress::compress_with_registry_exit_code(command, &output, exit_code, &filters)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
+        let snapshot = registry
+            .status(
+                &task_id,
+                "session",
+                None,
+                Some(dir.path()),
+                RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .unwrap();
+        registry.post_terminal_transition(&task, true).unwrap();
+        let frames = frames.lock().unwrap();
+        let completion = frames
+            .iter()
+            .find_map(|frame| match frame {
+                PushFrame::BashCompleted(frame) => Some(frame.output_preview.clone()),
+                _ => None,
+            })
+            .expect("actual bash completion frame");
+        (snapshot.output_preview, completion)
+    }
+
+    #[test]
+    fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
+        let output = std::process::Command::new("bash")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/bash/gate-tail/command.sh"
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stdout.lines().count() + stderr.lines().count(), 327);
+        assert_eq!(stdout.lines().last(), Some("GATE PASSED: all phases green"));
+        assert!(stderr.lines().last().unwrap().contains("Finished"));
+
+        // The bare script is claimed by Cargo's output-shape extractor. The
+        // explicit cargo command takes the command tier; nextest and the shell
+        // list take generic compression. Padding forces the 16 KiB reply cap
+        // on those generic paths in addition to the 600-byte completion cap.
+        for command in [
+            "scripts/rust-test-gate.sh",
+            "cargo test --workspace",
+            "cargo nextest run --workspace",
+            "cargo test && printf done",
+        ] {
+            for padding in [String::new(), cargo_verdict_noise("build context", 2000)] {
+                let (foreground, completion) =
+                    gate_tail_agent_text(command, &(padding + &stdout), &stderr);
+                for text in [foreground, completion] {
+                    assert!(
+                        text.contains("GATE PASSED: all phases green"),
+                        "script verdict was lost for {command}: {text}"
+                    );
+                    assert!(text.contains("Finished `test` profile"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gate_tail_all_compressor_tiers_keep_stream_endings() {
+        for (command, stdout, stderr) in [
+            (
+                "bun install",
+                "1 package installed\nSTDOUT VERDICT\n",
+                "STDERR VERDICT\n",
+            ),
+            (
+                "curl --silent https://example.invalid",
+                "response\n* Connected to STDOUT VERDICT\n",
+                "* TLS STDERR VERDICT\n",
+            ),
+            (
+                "custom-command",
+                "output\nSTDOUT VERDICT\n",
+                "STDERR VERDICT\n",
+            ),
+        ] {
+            let (foreground, completion) = gate_tail_agent_text(command, stdout, stderr);
+            for text in [foreground, completion] {
+                assert!(text.contains("STDOUT VERDICT"), "{command}: {text}");
+                assert!(text.contains("STDERR VERDICT"), "{command}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn gate_tail_repeated_endings_do_not_expand_soft_cap() {
+        let stdout = (0..2000)
+            .map(|index| format!("context {index}\nok\n"))
+            .collect::<String>();
+        let stderr = cargo_verdict_noise("stderr context", 2000) + "ok\n";
+        let (foreground, completion) = gate_tail_agent_text("custom-command", &stdout, &stderr);
+        for (text, cap) in [
+            (foreground, FINAL_OUTPUT_CAP_BYTES),
+            (completion, completion_preview_threshold(true)),
+        ] {
+            let body = text.rsplit_once("\nshown ").unwrap().0;
+            assert!(body.len() <= cap, "repeated endings exhausted the cap");
+            assert!(body.ends_with("ok"));
+        }
+    }
+
+    #[test]
+    fn gate_tail_byte_caps_keep_both_streams_oversized_final_lines() {
+        let stdout_last = format!("STDOUT VERDICT {}", "🦀".repeat(FINAL_OUTPUT_CAP_BYTES));
+        let stderr_last = format!("STDERR VERDICT {}", "é".repeat(FINAL_OUTPUT_CAP_BYTES));
+        let stdout = format!(
+            "{}\n{stdout_last}\n\n  \n",
+            cargo_verdict_noise("stdout context", 2000)
+        );
+        let stderr = format!(
+            "{}\n{stderr_last}\n\n  \n",
+            cargo_verdict_noise("stderr context", 2000)
+        );
+        let (foreground, completion) = gate_tail_agent_text("custom-command", &stdout, &stderr);
+        for text in [foreground, completion] {
+            assert!(text.contains(&stdout_last), "stdout's final line was cut");
+            assert!(text.contains(&stderr_last), "stderr's final line was cut");
+            assert_eq!(text.matches(&stdout_last).count(), 1);
+            assert_eq!(text.matches(&stderr_last).count(), 1);
+        }
     }
 
     fn synapse_agent_text() -> (String, String) {

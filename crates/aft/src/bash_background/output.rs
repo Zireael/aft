@@ -40,39 +40,42 @@ pub struct CappedText {
 }
 
 pub fn cap_final_output(input: &str) -> CappedText {
-    cap_test_verdict(
-        input,
-        FINAL_OUTPUT_CAP_BYTES,
-        FINAL_OUTPUT_HEAD_BYTES,
-        FINAL_OUTPUT_TAIL_BYTES,
-        None,
-    )
-    .unwrap_or_else(|| {
-        cap_head_tail(
-            input,
-            FINAL_OUTPUT_CAP_BYTES,
-            FINAL_OUTPUT_HEAD_BYTES,
-            FINAL_OUTPUT_TAIL_BYTES,
-        )
-    })
+    cap_final_output_preserving(input, None, &[])
 }
 
 pub fn cap_final_output_with_marker(input: &str, marker: &str) -> CappedText {
+    cap_final_output_preserving(input, Some(marker), &[])
+}
+
+/// A compressed reply must retain the ending of each capture, not just the
+/// ending of their concatenation. Reserve those lines before ordinary context.
+pub(crate) fn cap_final_output_preserving(
+    input: &str,
+    marker: Option<&str>,
+    final_lines: &[String],
+) -> CappedText {
     cap_test_verdict(
         input,
         FINAL_OUTPUT_CAP_BYTES,
         FINAL_OUTPUT_HEAD_BYTES,
         FINAL_OUTPUT_TAIL_BYTES,
-        Some(marker),
+        marker,
+        final_lines,
     )
-    .unwrap_or_else(|| {
-        cap_head_tail_with_marker(
+    .unwrap_or_else(|| match marker {
+        Some(marker) => cap_head_tail_with_marker(
             input,
             FINAL_OUTPUT_CAP_BYTES,
             FINAL_OUTPUT_HEAD_BYTES,
             FINAL_OUTPUT_TAIL_BYTES,
             marker,
-        )
+        ),
+        None => cap_head_tail(
+            input,
+            FINAL_OUTPUT_CAP_BYTES,
+            FINAL_OUTPUT_HEAD_BYTES,
+            FINAL_OUTPUT_TAIL_BYTES,
+        ),
     })
 }
 
@@ -100,15 +103,26 @@ fn completion_caps(exit_ok: bool) -> (usize, usize, usize) {
 /// Cap a completion preview by exit status: success keeps a short tail,
 /// failure keeps a small head plus a larger tail (see the constants above).
 pub fn cap_completion_output(input: &str, exit_ok: bool) -> CappedText {
-    let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_test_verdict(input, threshold, head, tail, None)
-        .unwrap_or_else(|| cap_head_tail(input, threshold, head, tail))
+    cap_completion_output_preserving(input, None, exit_ok, &[])
 }
 
 pub fn cap_completion_output_with_marker(input: &str, marker: &str, exit_ok: bool) -> CappedText {
+    cap_completion_output_preserving(input, Some(marker), exit_ok, &[])
+}
+
+pub(crate) fn cap_completion_output_preserving(
+    input: &str,
+    marker: Option<&str>,
+    exit_ok: bool,
+    final_lines: &[String],
+) -> CappedText {
     let (threshold, head, tail) = completion_caps(exit_ok);
-    cap_test_verdict(input, threshold, head, tail, Some(marker))
-        .unwrap_or_else(|| cap_head_tail_with_marker(input, threshold, head, tail, marker))
+    cap_test_verdict(input, threshold, head, tail, marker, final_lines).unwrap_or_else(|| {
+        match marker {
+            Some(marker) => cap_head_tail_with_marker(input, threshold, head, tail, marker),
+            None => cap_head_tail(input, threshold, head, tail),
+        }
+    })
 }
 
 /// Reserve the runner's verdict before spending bytes on ordinary head/tail
@@ -116,35 +130,58 @@ pub fn cap_completion_output_with_marker(input: &str, marker: &str, exit_ok: boo
 /// to stderr; concatenating those streams puts the results in the *middle*.
 /// A chronological byte cut can therefore hide every failure in a failed run.
 ///
-/// The byte cap is soft only when the mandatory names/totals themselves exceed
-/// it: reporting every failing name takes precedence over the preview budget.
-/// Other commands continue through the original byte-cap path unchanged.
+/// The byte cap is soft when mandatory names/totals or final command lines
+/// themselves exceed it: the verdict takes precedence over the preview budget.
 fn cap_test_verdict(
     input: &str,
     threshold: usize,
     keep_head: usize,
     keep_tail: usize,
     marker: Option<&str>,
+    final_lines: &[String],
 ) -> Option<CappedText> {
     if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
         return None;
     }
     let lines: Vec<&str> = input.trim_end().lines().collect();
-    let verdict = crate::compress::cargo::test_verdict(&lines)?;
+    let verdict = crate::compress::cargo::test_verdict(&lines);
+    // Even a non-runner command's last line is never split by a compressed
+    // byte cap. Ordinary fitting tails retain their original cap policy.
+    let last = lines.len().checked_sub(1)?;
+    if verdict.is_none() && final_lines.is_empty() && lines[last].len() <= keep_tail {
+        return None;
+    }
     let mut required = vec![false; lines.len()];
-    for index in verdict.required {
-        required[index] = true;
+    let mut empty = vec![false; lines.len()];
+    if let Some(verdict) = verdict {
+        for index in verdict.required {
+            required[index] = true;
+        }
+        for index in verdict.empty_results {
+            empty[index] = true;
+        }
+    }
+    for final_line in final_lines {
+        let Some(index) = lines.iter().rposition(|line| *line == final_line) else {
+            continue;
+        };
+        // Empty test targets already have an equivalent counted summary.
+        // Do not turn the last empty target of stdout into a duplicate total.
+        // Only the latest occurrence needs protection: a repeated "ok" must
+        // not make every earlier "ok" mandatory and defeat the byte budget.
+        if !empty[index] {
+            required[index] = true;
+        }
     }
     // Like the compressor line cut, always retain the command's last line,
     // including a wrapper's verdict after the runner's own summary.
-    let last = lines.len().checked_sub(1)?;
     required[last] = true;
-    let mut empty = vec![false; lines.len()];
     let mut empty_count = 0;
-    for index in verdict.empty_results {
-        if !required[index] {
-            empty[index] = true;
+    for (index, is_empty) in empty.iter_mut().enumerate() {
+        if *is_empty && !required[index] {
             empty_count += 1;
+        } else {
+            *is_empty = false;
         }
     }
     let mut context = Vec::new();
