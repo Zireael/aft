@@ -13,6 +13,63 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+/// Bound consecutive empty recovery attempts, not silence on an open stream.
+/// Accepted jobs can disappear with a wiped runner state; they must never rerun.
+#[cfg(unix)]
+struct ReattachBudget {
+    limit: Duration,
+    deadline: Option<tokio::time::Instant>,
+}
+
+#[cfg(unix)]
+impl ReattachBudget {
+    fn new(_root: &Path) -> Self {
+        #[cfg(test)]
+        let limit = tests::take_reattach_budget(_root).unwrap_or(REMOTE_REATTACH_BUDGET);
+        #[cfg(not(test))]
+        let limit = REMOTE_REATTACH_BUDGET;
+        Self {
+            limit,
+            deadline: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.deadline = None;
+    }
+
+    fn expired(job_id: Uuid) -> String {
+        format!("remote outcome unknown: job {job_id} could not be re-attached for 5 minutes; command not rerun")
+    }
+
+    fn check(&self, job_id: Uuid) -> Result<(), String> {
+        if self
+            .deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(Self::expired(job_id));
+        }
+        Ok(())
+    }
+
+    async fn wait<T>(
+        &mut self,
+        job_id: Uuid,
+        attempt: impl std::future::Future<Output = T>,
+    ) -> Result<T, String> {
+        self.check(job_id)?;
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + self.limit);
+        tokio::time::timeout_at(deadline, attempt)
+            .await
+            .map_err(|_| Self::expired(job_id))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     pub connection_file: Option<PathBuf>,
@@ -476,6 +533,7 @@ impl BgTaskRegistry {
             .clone()
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
+        let mut recovery = ReattachBudget::new(&root);
         if let Some(record) = remote.terminal.as_ref() {
             if let Verdict::RunLocally { reason } = exec::grade(record) {
                 return self.restored_remote_fallback(
@@ -496,18 +554,29 @@ impl BgTaskRegistry {
             .as_ref()
             .ok_or_else(|| "daemon connection file unavailable".to_string());
         let mut client = loop {
-            let result = match &connection {
-                Ok(path) => ExecRemoteClient::connect(
-                    path,
-                    subc_protocol::BindIdentity::new(
-                        root.display().to_string(),
-                        remote.harness.clone(),
-                        remote.session.clone(),
-                    ),
-                )
-                .await
-                .map_err(|e| e.to_string()),
-                Err(error) => Err(error.clone()),
+            let connect = async {
+                match &connection {
+                    Ok(path) => ExecRemoteClient::connect(
+                        path,
+                        subc_protocol::BindIdentity::new(
+                            root.display().to_string(),
+                            remote.harness.clone(),
+                            remote.session.clone(),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    Err(error) => Err(error.clone()),
+                }
+            };
+            let result = if initial.is_none() {
+                if let Some(point) = remote.point() {
+                    recovery.wait(point.job_id, connect).await?
+                } else {
+                    connect.await
+                }
+            } else {
+                connect.await
             };
             match result {
                 Ok(c) => break c,
@@ -515,8 +584,11 @@ impl BgTaskRegistry {
                     if let Some((_, fallback)) = initial.take() {
                         return self.remote_fallback(&task, fallback, &error);
                     }
-                    if remote.point().is_some() && remote.connection_file.is_some() {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
+                    {
+                        recovery
+                            .wait(point.job_id, tokio::time::sleep(Duration::from_secs(1)))
+                            .await?;
                         continue;
                     }
                     return Err(format!("remote outcome unknown; attach required: {error}"));
@@ -544,7 +616,9 @@ impl BgTaskRegistry {
                 }
             }
         } else {
-            self.attach_remote(&mut client,remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?,&remote,&root,&task).await?
+            let point = remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?;
+            self.attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
+                .await?
         };
         let mut cancelled = false;
         loop {
@@ -562,7 +636,7 @@ impl BgTaskRegistry {
                 if let Some(point) = stream.resume_point() {
                     let _ = client.cancel_job(point.job_id).await;
                     stream = self
-                        .attach_remote(&mut client, point, &remote, &root, &task)
+                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
                     cancelled = true;
                 }
@@ -574,7 +648,7 @@ impl BgTaskRegistry {
                 }
             };
             match result {
-                Ok(StreamProgress::Record) => {}
+                Ok(StreamProgress::Record) => recovery.reset(),
                 Ok(StreamProgress::Complete(Verdict::RunLocally { reason })) => {
                     if let Some(fallback) = fallback.take() {
                         // A live refusal uses the launch plan captured before
@@ -607,17 +681,25 @@ impl BgTaskRegistry {
                     let Some(point) = stream.resume_point() else {
                         return Err(format!("remote outcome unknown; not resubmitted: {error}"));
                     };
+                    // Even an undecodable frame proves this was not an empty
+                    // attach. A quiet but open stream has no output deadline.
+                    if stream.received_frame() {
+                        recovery.reset();
+                    }
                     // A known accepted job is recovered only by attach. Never
                     // convert a lost stream into another run or local fallback.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    recovery
+                        .wait(point.job_id, tokio::time::sleep(Duration::from_millis(100)))
+                        .await?;
                     stream = self
-                        .attach_remote(&mut client, point, &remote, &root, &task)
+                        .attach_remote(&mut client, point, &remote, &root, &task, &mut recovery)
                         .await?;
                 }
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn attach_remote(
         &self,
         client: &mut ExecRemoteClient,
@@ -625,39 +707,44 @@ impl BgTaskRegistry {
         remote: &RemoteTask,
         root: &Path,
         task: &Arc<BgTask>,
+        recovery: &mut ReattachBudget,
     ) -> Result<exec::RemoteStream, String> {
         point.attach_request().map_err(|e| e.to_string())?;
-        loop {
-            let cancel = task
-                .state
-                .lock()
-                .map_err(|_| "task lock poisoned")?
-                .metadata
-                .remote
-                .as_ref()
-                .is_some_and(|r| r.cancel_requested);
-            if cancel {
-                let _ = client.cancel_job(point.job_id).await;
-            }
-            if let Ok(stream) = client.attach(point.clone()).await {
-                return Ok(stream);
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Some(path) = &remote.connection_file {
-                if let Ok(reconnected) = ExecRemoteClient::connect(
-                    path,
-                    subc_protocol::BindIdentity::new(
-                        root.display().to_string(),
-                        remote.harness.clone(),
-                        remote.session.clone(),
-                    ),
-                )
-                .await
-                {
-                    *client = reconnected;
+        recovery
+            .wait(point.job_id, async {
+                loop {
+                    let cancel = task
+                        .state
+                        .lock()
+                        .map_err(|_| "task lock poisoned")?
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.cancel_requested);
+                    if cancel {
+                        let _ = client.cancel_job(point.job_id).await;
+                    }
+                    if let Ok(stream) = client.attach(point.clone()).await {
+                        return Ok(stream);
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Some(path) = &remote.connection_file {
+                        if let Ok(reconnected) = ExecRemoteClient::connect(
+                            path,
+                            subc_protocol::BindIdentity::new(
+                                root.display().to_string(),
+                                remote.harness.clone(),
+                                remote.session.clone(),
+                            ),
+                        )
+                        .await
+                        {
+                            *client = reconnected;
+                        }
+                    }
                 }
-            }
-        }
+            })
+            .await?
     }
 
     fn remote_fallback(

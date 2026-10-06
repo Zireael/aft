@@ -78,6 +78,7 @@ impl ExecRemoteClient {
             subscription,
             consumer,
             finished: false,
+            received_frame: false,
         })
     }
 
@@ -157,11 +158,19 @@ pub struct RemoteStream {
     subscription: Subscription,
     consumer: StreamConsumer,
     finished: bool,
+    received_frame: bool,
 }
 
 impl RemoteStream {
     pub fn resume_point(&self) -> Option<ResumePoint> {
         self.consumer.resume_point()
+    }
+
+    /// StreamEnd and transport errors alone do not prove the job still exists.
+    // The background remote worker currently runs only on Unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn received_frame(&self) -> bool {
+        self.received_frame
     }
 
     /// Read one record into a durable sink. Only a known terminal followed by a
@@ -173,6 +182,7 @@ impl RemoteStream {
             return self.consumer.finish().map(StreamProgress::Complete);
         }
         if let Some(bytes) = self.subscription.events().recv().await {
+            self.received_frame = true;
             if let Err(error) = self.consumer.consume_bytes(&bytes, sink) {
                 return Err(self.consumer.recovery(error.to_string()));
             }

@@ -26,6 +26,9 @@ pub(crate) enum Script {
     AttachRefused,
     RetainedGap,
     Continuous,
+    GappedAttach(Duration),
+    GappedCancel(Duration),
+    AttachDisconnected,
 }
 
 pub(crate) struct Daemon {
@@ -98,6 +101,10 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                     match body["method"].as_str().unwrap() {
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
+                            if attaching && matches!(script, Script::AttachDisconnected) {
+                                // Drop the route and listener; later attach calls and connects fail.
+                                return;
+                            }
                             if !attaching && !matches!(script, Script::Refused | Script::KnownRefused) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }
@@ -111,7 +118,8 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous) && !attaching { /* accepted, still running */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_)) && !attaching { /* accepted, still running */ }
+                            else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
                             else {
                                 if matches!(script, Script::Restart) {
                                     let from = if attaching { body["params"]["from_seq"].as_u64().unwrap() } else { 0 };
@@ -129,7 +137,7 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                     let output=Output::new(3,OutputStream::Stdout,BytePayload(b"D".to_vec())).with_truncated_before_seq(3);
                                     replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(output)).unwrap()));
                                 }
-                                if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart | Script::AttachRefused) || attaching) {
+                                if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach(_) | Script::AttachDisconnected) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
                                     if cancelled { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
@@ -154,6 +162,69 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                 subc_transport::write_frame(&mut *writer.lock().await, &response)
                     .await
                     .unwrap();
+            }
+            if body["method"] == "exec.attach" {
+                if let Script::GappedAttach(gap) | Script::GappedCancel(gap) = script {
+                    let writer = writer.clone();
+                    let seq = body["params"]["from_seq"].as_u64().unwrap();
+                    producers.push(tokio::spawn(async move {
+                        let data = |record| {
+                            Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamData,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                serde_json::to_vec(&record).unwrap(),
+                            )
+                            .unwrap()
+                        };
+                        let output = data(StreamRecord::Output(Output::new(
+                            seq,
+                            OutputStream::Stdout,
+                            BytePayload(vec![b'A' + seq as u8]),
+                        )));
+                        if subc_transport::write_frame(&mut *writer.lock().await, &output)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(gap).await;
+                        if matches!(script, Script::GappedCancel(_)) || seq == 2 {
+                            let outcome = if cancelled {
+                                Outcome::Signal { signal: 15 }
+                            } else {
+                                Outcome::Exit { code: 0 }
+                            };
+                            let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
+                            if cancelled {
+                                terminal = terminal.with_killed(Killed::Cancel);
+                            }
+                            if subc_transport::write_frame(
+                                &mut *writer.lock().await,
+                                &data(StreamRecord::Terminal(terminal)),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let end = Frame::build_with_version(
+                            header.ver,
+                            FrameType::StreamEnd,
+                            header.flags,
+                            header.channel,
+                            header.epoch,
+                            header.corr,
+                            vec![],
+                        )
+                        .unwrap();
+                        let _ = subc_transport::write_frame(&mut *writer.lock().await, &end).await;
+                    }));
+                }
             }
             if matches!(script, Script::Continuous) && body["method"] == "exec.run" {
                 let writer = writer.clone();
@@ -413,4 +484,41 @@ async fn end_without_terminal_returns_recovery_promptly() {
         Err(Error::RecoveryRequired { .. })
     ));
     assert!(client.status().await.unwrap().server_reachable);
+}
+
+#[tokio::test]
+async fn empty_attach_reports_no_frames_and_keeps_accepted_resume_point() {
+    let daemon = daemon(Script::MissingTerminal, client::CAPABILITY).await;
+    let client = client(&daemon).await;
+    let mut stream = client
+        .run(&RunRequest::new(
+            "/workspace/task",
+            "/src/repo",
+            "/workspace/task",
+            "cargo test",
+        ))
+        .await
+        .unwrap();
+    let mut sink = MemorySink::default();
+    assert!(!stream.received_frame());
+    assert!(matches!(
+        drain(&mut stream, &mut sink).await,
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(
+        stream.received_frame(),
+        "acceptance is a frame even without output"
+    );
+    let point = stream.resume_point().unwrap();
+    assert_eq!(point.job_id, id());
+    let mut attached = client.attach(point.clone()).await.unwrap();
+    assert!(matches!(
+        drain(&mut attached, &mut sink).await,
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(
+        !attached.received_frame(),
+        "StreamEnd alone must not reset the empty-attach budget"
+    );
+    assert_eq!(attached.resume_point(), Some(point));
 }

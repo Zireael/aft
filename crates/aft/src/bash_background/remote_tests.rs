@@ -1,5 +1,23 @@
 use super::*;
 use crate::exec_remote::wire_tests::{daemon, id, Script};
+fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
+    static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
+        std::sync::OnceLock::new();
+    BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn take_reattach_budget(root: &Path) -> Option<Duration> {
+    reattach_budgets().lock().unwrap().remove(root)
+}
+
+fn shorten_reattach_budget(root: &Path) {
+    // Scope the hook to one worker, so parallel remote tests keep the real budget.
+    reattach_budgets()
+        .lock()
+        .unwrap()
+        .insert(root.into(), Duration::from_millis(250));
+}
+
 fn crash_tasks() -> &'static Mutex<HashSet<String>> {
     static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
     TASKS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -174,6 +192,210 @@ async fn exec_remote_bash_loss_reattaches_without_resubmission() {
             .1["params"]["from_seq"],
         2
     );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
+    let daemon = daemon(Script::MissingTerminal, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+        .await
+        .expect("empty attaches must exhaust the recovery budget");
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(
+        done.info.status_reason.as_deref(),
+        Some(format!("remote outcome unknown: job {} could not be re-attached for 5 minutes; command not rerun", id()).as_str())
+    );
+    assert!(!done.output_preview.contains("local-proof"));
+    let task = registry.task(&task_id).unwrap();
+    let durable = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    assert_eq!(durable.status, BgTaskStatus::FateUnknown);
+    assert_eq!(durable.status_reason, done.info.status_reason);
+    let log = daemon.log.lock().unwrap();
+    assert!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.attach")
+            .count()
+            >= 2
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_gapped_attach_records_reset_budget_and_complete() {
+    let daemon = daemon(
+        Script::GappedAttach(Duration::from_millis(500)),
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let task = registry.task(&task_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while task
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .last_seq
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(
+        registry
+            .observed_status(&task_id, "session", 8192)
+            .unwrap()
+            .info
+            .status,
+        BgTaskStatus::Running,
+        "an open attach is not subject to an output-idle deadline"
+    );
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed);
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"ABC");
+    let log = daemon.log.lock().unwrap();
+    let from: Vec<_> = log
+        .iter()
+        .filter(|(_, b)| b["method"] == "exec.attach")
+        .map(|(_, b)| b["params"]["from_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(from, [0, 1, 2]);
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_reattach_budget_cancel_observes_real_terminal() {
+    let daemon = daemon(
+        Script::GappedCancel(Duration::from_millis(500)),
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let task = registry.task(&task_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while task
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .job_id
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(registry.record_remote_cancel(&task).unwrap());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    let state = task.state.lock().unwrap();
+    let terminal = state
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .terminal
+        .as_ref()
+        .unwrap();
+    assert_eq!(terminal.outcome, Outcome::Signal { signal: 15 });
+    assert_eq!(terminal.killed, Some(Killed::Cancel));
+    drop(state);
+    let log = daemon.log.lock().unwrap();
+    let cancel = log
+        .iter()
+        .position(|(_, b)| b["method"] == "exec.cancel")
+        .unwrap();
+    let attach = log
+        .iter()
+        .position(|(_, b)| b["method"] == "exec.attach")
+        .unwrap();
+    assert!(
+        cancel < attach,
+        "cancel intent must be sent before attaching for its terminal"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
+    let daemon = daemon(Script::AttachDisconnected, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+        .await
+        .expect("failed attach calls and reconnects must exhaust the recovery budget");
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert!(done.info.status_reason.unwrap().contains(&format!(
+        "job {} could not be re-attached for 5 minutes; command not rerun",
+        id()
+    )));
+    assert!(!done.output_preview.contains("local-proof"));
+    let log = daemon.log.lock().unwrap();
+    assert!(log.iter().any(|(_, b)| b["method"] == "exec.attach"));
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection.json"),
+        "printf local-proof",
+    );
+    shorten_reattach_budget(dir.path());
+    registry.resume_remote_task(&task_id).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(2), terminal(&registry, &task_id))
+        .await
+        .expect("restarting an accepted job cannot retry connect forever");
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert!(done.info.status_reason.unwrap().contains(&format!(
+        "job {} could not be re-attached for 5 minutes; command not rerun",
+        id()
+    )));
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"");
 }
 
 #[tokio::test]
