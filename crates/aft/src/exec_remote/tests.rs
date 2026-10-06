@@ -1,62 +1,39 @@
 use super::*;
 use cortexkit_exec_remote_types::*;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 
 fn job_id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
-// Resolve the locked, published package rather than a second copy of its corpus.
-// Metadata runs offline, so these tests cannot silently download new goldens.
-fn vectors() -> &'static std::path::Path {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        let output = std::process::Command::new(env!("CARGO"))
-            .args(["metadata", "--offline", "--locked", "--format-version", "1"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let packages: Vec<_> = metadata["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| p["name"] == "cortexkit-exec-remote-types")
-            .collect();
-        assert_eq!(packages.len(), 1, "exactly one caller contract version");
-        assert_eq!(packages[0]["version"], "0.2.0");
-        PathBuf::from(packages[0]["manifest_path"].as_str().unwrap())
-            .parent()
-            .unwrap()
-            .join("test-vectors/exec-remote-v1")
-    })
-}
-
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
     use sha2::{Digest, Sha256};
+    // Embed the published 0.2.0 corpus and its original digests. Runtime cargo
+    // metadata resolves unrelated target dependencies even in offline mode;
+    // a unit test must not require those packages in the caller's Cargo cache.
+    // Keep the version fence too: updating the dependency must not silently
+    // leave these grading tests exercising a previous release's corpus.
+    let lock: toml::Value = toml::from_str(include_str!("../../../../Cargo.lock")).unwrap();
+    let versions = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
+        .map(|package| package["version"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(versions, ["0.2.0"], "exactly one caller contract version");
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/exec-remote/published-v0.2.0.json"
+    ))
+    .unwrap();
     let mut cases = Vec::new();
-    for entry in std::fs::read_dir(vectors().join(directory)).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "jcs") {
-            let bytes = std::fs::read(&path).unwrap();
-            let hash = std::fs::read_to_string(path.with_extension("sha256")).unwrap();
-            assert_eq!(
-                format!("{:x}", Sha256::digest(&bytes)),
-                hash.trim(),
-                "{}",
-                path.display()
-            );
-            cases.push((
-                path.file_stem().unwrap().to_str().unwrap().to_string(),
-                serde_json::from_slice(&bytes).unwrap(),
-            ));
-        }
+    for (name, vector) in vectors[directory].as_object().unwrap() {
+        let bytes = vector["jcs"].as_str().unwrap().as_bytes();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            vector["sha256"].as_str().unwrap(),
+            "{directory}/{name}"
+        );
+        cases.push((name.clone(), serde_json::from_slice(bytes).unwrap()));
     }
     cases.sort_by(|a, b| a.0.cmp(&b.0));
     cases
