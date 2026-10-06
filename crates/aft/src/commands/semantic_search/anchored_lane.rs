@@ -722,7 +722,10 @@ mod hot_path_tests {
 
     #[test]
     fn audit_growth_repeated_query_splitting_compiles_the_fixed_pattern_once() {
+        // Warm first so the test also covers runs after another test initialized the cache.
+        let _ = split_query("CacheWarmupSymbol");
         let before = VARIABLE_SPAN_REGEX_COMPILATIONS.load(AtomicOrdering::Relaxed);
+        let pattern_before = &*VARIABLE_SPAN_PATTERN as *const Regex;
         let first = split_query("AlphaSymbol {} BetaSymbol");
         let second = split_query("GammaSymbol {} DeltaSymbol");
         assert_eq!(
@@ -741,8 +744,16 @@ mod hot_path_tests {
                 denominator: 22,
             }
         );
+        let pattern_after = &*VARIABLE_SPAN_PATTERN as *const Regex;
+        assert!(
+            std::ptr::eq(pattern_before, pattern_after),
+            "query splits must share the process-wide pattern"
+        );
         let compilations = VARIABLE_SPAN_REGEX_COMPILATIONS.load(AtomicOrdering::Relaxed) - before;
-        assert_eq!(compilations, 1, "fixed split pattern should compile once");
+        assert!(
+            compilations <= 1,
+            "the fixed split pattern must not compile per request"
+        );
     }
 
     #[test]
