@@ -4,7 +4,7 @@
 //! requests `tick` on a worker from its existing maintenance timer arm. Every
 //! root pass uses the existing executor's coalescable maintenance lane.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -264,28 +264,46 @@ impl StandingActor {
         }
 
         self.retire_removed_actors(&report.removed);
-        self.resume_entries_without_bound_session(&report.active_entries);
+        let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
-            self.submit_entry_pass(entry, &snapshot);
+            if !contended.contains(&entry.artifact_key) {
+                self.submit_entry_pass(entry, &snapshot);
+            }
         }
     }
 
     /// Session selection and standing selection are exclusive for one shared
     /// artifact key. A session unbind is detected from the normal subc lifecycle
     /// state and resumes only the paused standing lifecycle.
-    fn resume_entries_without_bound_session(&self, entries: &[StandingRootEntry]) {
+    fn resume_entries_without_bound_session(
+        &self,
+        entries: &[StandingRootEntry],
+    ) -> HashSet<String> {
+        let mut contended = HashSet::new();
         let sessions = self
             .executor
             .actor_entries()
             .into_iter()
-            .filter_map(|(_, ctx)| {
-                if ctx.subc_unbound_quiesced() {
-                    return None;
-                }
+            .filter_map(|(root_id, ctx)| {
                 let root = ctx
                     .canonical_cache_root_opt()
                     .or_else(|| ctx.config().project_root.clone())?;
-                Some(ctx.memoized_artifact_cache_key(&root))
+                let key = ctx.memoized_artifact_cache_key(&root);
+                match ctx.try_subc_unbound_quiesced() {
+                    Some(true) => None,
+                    Some(false) => Some(key),
+                    None => {
+                        // A busy session may still own this artifact family.
+                        // Do not resume it or wait under standing reconciliation:
+                        // unrelated roots and new binds must keep progressing.
+                        log::debug!(
+                            "standing roots skipping {} this pass: root lifecycle admission busy",
+                            root_id.as_path().display()
+                        );
+                        contended.insert(key.clone());
+                        Some(key)
+                    }
+                }
             })
             .collect::<Vec<_>>();
         for entry in entries {
@@ -301,6 +319,7 @@ impl StandingActor {
                 }
             }
         }
+        contended
     }
 
     fn retire_removed_actors(&self, removed: &[String]) {

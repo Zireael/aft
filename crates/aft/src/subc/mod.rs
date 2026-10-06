@@ -10339,6 +10339,176 @@ mod tests {
     use crate::bash_background::BgTaskStatus;
 
     #[tokio::test]
+    async fn standing_tick_skips_busy_lifecycle_and_acks_another_root_bind() {
+        let (dir, busy_root) = test_root("standing-busy-lifecycle");
+        let healthy_path = dir.path().join("healthy-root");
+        std::fs::create_dir_all(&healthy_path).unwrap();
+        let healthy_root = ProjectRootId::from_path(&healthy_path).unwrap();
+        let app = App::default_shared();
+        let executor = Arc::new(Executor::new());
+        let index = crate::config::IndexConfig {
+            roots: vec![
+                crate::config::IndexRootConfig {
+                    path: busy_root.as_path().to_string_lossy().into_owned(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                },
+                crate::config::IndexRootConfig {
+                    path: healthy_root.as_path().to_string_lossy().into_owned(),
+                    indexes: vec![crate::config::IndexKind::Search],
+                },
+            ],
+        };
+        let busy_ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(busy_root.as_path().to_path_buf()),
+                storage_dir: Some(dir.path().join("storage")),
+                index,
+                ..Config::default()
+            },
+        ));
+        busy_ctx.set_canonical_cache_root(busy_root.as_path().to_path_buf());
+        busy_ctx.set_harness(crate::harness::Harness::Opencode);
+        executor.register_actor(busy_root.clone(), Arc::clone(&busy_ctx));
+        let actor = Arc::new(standing::StandingActor::new(
+            Arc::clone(&app),
+            Arc::clone(&executor),
+        ));
+        actor.begin_session_bind(&busy_ctx);
+        let held_ctx = Arc::clone(&busy_ctx);
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = std::thread::spawn(move || {
+            held_ctx.run_if_subc_bound_generation(held_ctx.configure_generation(), || {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let tick_actor = Arc::clone(&actor);
+        let (tick_tx, tick_rx) = crossbeam_channel::bounded(1);
+        let tick = std::thread::spawn(move || {
+            tick_actor.tick();
+            tick_tx.send(()).unwrap();
+        });
+        let tick_result = tick_rx.recv_timeout(Duration::from_secs(2));
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let fixture_path = dir.path().to_path_buf();
+        let loop_executor = Arc::clone(&executor);
+        let module_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module);
+            runtime.block_on(run_module_loop(
+                read,
+                write,
+                &fixture_path.join("absent-connection.json"),
+                app,
+                loop_executor,
+                |request, _| Response::success(request.id, json!({})),
+                Some(fixture_path.join("absent-user-config.json")),
+                false,
+                usize::MAX,
+                None,
+                &fixture_path.join("storage"),
+                Some(actor),
+            ))
+        });
+        let bind_result: Result<(), String> = async {
+            let hello = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                .await
+                .map_err(|_| "ModuleHello blocked".to_string())?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 75,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    healthy_root.as_path(),
+                    "opencode",
+                    "standing-busy-root-isolation",
+                ),
+                principal: Some(subc_protocol::Principal::Direct),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+            };
+            let bind = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                75,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &bind)
+                .await
+                .map_err(|e| e.to_string())?;
+            let reply = tokio::time::timeout(ROUTE_BIND_DEADLINE, read_frame(&mut daemon))
+                .await
+                .map_err(|_| {
+                    "healthy bind exceeded deadline while another lifecycle was held".to_string()
+                })?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            if reply.header.ty != FrameType::Response || reply.header.corr != 75 {
+                return Err(format!("bind must be acknowledged, not refused: {reply:?}"));
+            }
+            if !matches!(
+                serde_json::from_slice::<ModuleControlResponse>(&reply.body).unwrap(),
+                ModuleControlResponse::RouteBindAck {}
+            ) {
+                return Err("expected RouteBindAck".into());
+            }
+            Ok(())
+        }
+        .await;
+        // Release before teardown even on the baseline: this is a finite model
+        // of the permanent recursive hold seen in production, not a hung suite.
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tick.join().unwrap();
+        drop(daemon);
+        module_thread.join().unwrap().unwrap();
+        let settled = executor.submit_async(
+            healthy_root,
+            Lane::Mutating,
+            "standing-busy-root-settled".into(),
+            Box::new(|_| Response::success("standing-busy-root-settled", json!({}))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), settled)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(executor);
+        tick_result.expect(
+            "standing tick must skip a busy lifecycle, not hold reconciliation waiting for it",
+        );
+        bind_result
+            .expect("an unrelated busy lifecycle must not prevent successful bind acknowledgement");
+    }
+
+    #[tokio::test]
     async fn standing_actor_lock_contention_does_not_block_route_binds_or_health() {
         let (dir, root) = test_root("standing-frame-isolation");
         let app = App::default_shared();
