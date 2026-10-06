@@ -45,6 +45,10 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     let (bash_tx, mut bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+    let deferred_tx = super::DeferredResponseSender {
+        entries: deferred_tx,
+        wake: crate::response_finalize::DeferredResponseWake::default(),
+    };
     handle_tool_call(
         &writer,
         &frame,
