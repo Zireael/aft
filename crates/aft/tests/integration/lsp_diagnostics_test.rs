@@ -20,7 +20,7 @@ use aft::lsp::registry::{is_config_file_path, is_config_file_path_with_custom, S
 use aft::lsp::roots::ServerKey;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
-use aft::runtime_drain::drain_watcher_events;
+use aft::runtime_drain::{drain_watcher_events_bounded, WATCHER_PATH_DRAIN_BATCH_CAP};
 use aft::watcher_filter::WatcherDispatchEvent;
 use lsp_types::FileChangeType;
 use tempfile::tempdir;
@@ -3051,6 +3051,16 @@ fn lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyze
         compiler_error,
         "cargo check's error for the removed field is missing: {after:#}"
     );
+}
+
+/// Apply every queued watcher event. One drain call applies a single slice
+/// with a 250 ms budget, so on a slow machine it can stop before the
+/// language-server phase; production finishes the rest on later turns.
+fn drain_watcher_events(ctx: &AppContext) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+        assert!(Instant::now() < deadline, "watcher drain never finished");
+    }
 }
 
 /// A Rust workspace served by the fake language server with the environment
