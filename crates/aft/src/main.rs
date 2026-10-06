@@ -3462,12 +3462,25 @@ mod watcher_filter_tests {
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::finalize_response;
     use aft::runtime_drain::{
-        drain_semantic_refresh_events, drain_watcher_events,
+        drain_semantic_refresh_events, drain_watcher_events_bounded,
         record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
         semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
-        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_PATH_DRAIN_BATCH_CAP,
     };
+
+    /// Apply every queued watcher event. One drain call applies a single slice
+    /// with a 250 ms budget, so on a slow runner it can stop before the later
+    /// index phases; production finishes the rest on later turns.
+    fn drain_watcher_events(ctx: &AppContext) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher drain never finished"
+            );
+        }
+    }
     use aft::semantic_index::SemanticIndex;
     use aft::watcher_filter::{
         watcher_event_invalidates, FilteredWatcherPaths, WatcherDispatchEvent, WatcherFilterConfig,
