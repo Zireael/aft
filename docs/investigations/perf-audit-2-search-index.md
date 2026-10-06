@@ -17,7 +17,7 @@ the lock counter fail without timing a competing thread.
 
 | Finding / base location | Verdict | Work before → after | Test |
 | --- | --- | --- | --- |
-| #1; `executor/mod.rs:678,749-755`, `search_index.rs:3518`, grep checkpoints | Confirmed; fixed | 100,000 liveness probes → 391 for 100,000 checkpoints; per-call token clone → borrowed TLS token; lifecycle mutex is consulted only at probes | `perf_audit_cancellation_probe_budget`; `cancellation_time_probe_and_explicit_signal_are_prompt` |
+| #1; `executor/mod.rs:678,749-755`, `search_index.rs:3518`, grep checkpoints | Confirmed; fixed | 100,000 disk-liveness probes → 391 for 100,000 checkpoints; per-call token clone → borrowed TLS token; in-memory lifecycle signal checked every checkpoint, with an atomic fast path while bound | `perf_audit_cancellation_probe_budget`; `cancellation_time_probe_and_explicit_signal_are_prompt` |
 | #2; `commands/glob.rs:165,290`, `search_index.rs:5966-6009` (also build/refresh :164) | Confirmed; indexed single/multi-root sort fixed | 1,000 sort stats + 1,000 per-match canonicalizations → 0 + 0 on a 1,000-file indexed glob; presence checks remain 100 | `perf_audit_glob_only_touches_returned_page` |
 | #26; `watcher_filter.rs:1365-1382,314-327` | Confirmed; fixed | 1,002 paths: global-excludes resolution 2,002 → 1; HEAD metadata captures 1,002 → 1; resolved control-path spellings reused across both passes | `perf_audit_watcher_resolves_once_per_batch` |
 | #25; `runtime_drain.rs:2817-2829`, `search_index.rs:1876-1921` (also :168/:196) | Confirmed; watcher write-lock I/O fixed | File preparations while holding the search-index write lock: 16 → 0; 16 real preparations still executed | `perf_audit_watcher_search_io_outside_write_lock` |
@@ -105,3 +105,46 @@ serial gate chain were consequently not reached. At the reviewer's direction,
 no replacement builds were started; those gates and the byte-identical quality
 evaluation are left to the train gate. The descriptor is committed for that
 evaluation, but the self-test alone is not evidence of engine result parity.
+
+## Cancellation compatibility follow-up
+
+The original throttling also delayed the in-memory abandonment decision. On
+`next309` at `45c38646c29c9b299aa699178727a95bf871d557`, the unchanged test
+`inspect::scanners::todos::tests::quiesced_root_aborts_real_executor_todos_scan_mid_parse`
+reproduced the CI failure: the TODO scanner returned a fresh aggregate after its
+root was set aside during parsing. A first-running-checkpoint reset did not
+cover lifecycle transitions happening after parsing had already started.
+
+Only the filesystem deletion probe is now throttled. Every checkpoint checks
+explicit cancellation and the lifecycle's in-memory unbound hint. Bound roots
+use an atomic load without taking the lifecycle mutex. Bind/unbind update that
+hint while holding the existing admission lock; an unbound hint only admits the
+existing synchronized grace/rebind decision, never decides cancellation by
+itself. This preserves brief-unbind grace, immediate zero-grace set-aside, and
+rebind protection even if a worker observed a stale hint.
+
+The unchanged TODO regression passed after the fix, and the unchanged deletion
+counter still measured 391 probes for 100,000 checkpoints. New lifecycle tests
+exercise grace expiry without sleeping, a second unbind through a shared clone,
+and a stale hint racing with rebind. All Cargo tests for this follow-up use a
+throwaway HOME and pre-created XDG data/config/state/cache directories, with
+`AFT_STORAGE_DIR` unset and the original Cargo/Rustup homes retained only for
+toolchain resolution. No TODO test assertions were loosened.
+
+Mutation verification moved lifecycle observation back behind the disk-probe
+throttle. Only
+`inspect::scanners::todos::tests::quiesced_root_aborts_real_executor_todos_scan_mid_parse`
+failed, again reporting a fresh TODO aggregate. The deletion-probe counter and
+both new lifecycle controls remained green. The staged live fix was restored
+after the nonempty mutation diff (one file, five insertions/seven deletions),
+and `git diff --stat` was empty after restoration.
+
+Final follow-up gates passed with Cargo/Rust 1.99.0: the TODO scanner suite
+(six tests), lifecycle admission suite (14 tests), `executor::` filter (100
+tests, one manual perf probe ignored), deletion-probe counter (one test),
+time-probe/explicit-cancellation regression (one test), and binary cancellation
+fixtures (three tests). Formatting passed with rustfmt 1.10.0-stable. The
+Windows compile-only gate
+`RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu`
+completed with its `Finished` line; it does not establish Windows runtime
+behavior. This follow-up changes no search-index or ranking-fenced file.

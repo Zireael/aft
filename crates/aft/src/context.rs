@@ -295,6 +295,10 @@ pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120
 #[derive(Clone, Debug)]
 pub(crate) struct SubcLifecycleAdmission {
     unbound: Arc<parking_lot::Mutex<bool>>,
+    /// Mirrors `unbound` for cancellation checkpoints. A bound root takes the
+    /// atomic fast path; an unbound root still confirms grace and rebind under
+    /// the admission lock before signalling cancellation.
+    unbound_hint: Arc<AtomicBool>,
     /// When the current unbound period started; `None` while bound. Written
     /// only while holding `unbound`.
     unbound_since: Arc<parking_lot::Mutex<Option<Instant>>>,
@@ -307,6 +311,7 @@ impl Default for SubcLifecycleAdmission {
     fn default() -> Self {
         Self {
             unbound: Arc::default(),
+            unbound_hint: Arc::default(),
             unbound_since: Arc::default(),
             abandon_grace_ms: Arc::new(AtomicU64::new(
                 UNBOUND_BUILD_ABANDON_GRACE.as_millis() as u64
@@ -320,6 +325,7 @@ impl SubcLifecycleAdmission {
         let mut unbound = self.unbound.lock();
         *unbound = false;
         *self.unbound_since.lock() = None;
+        self.unbound_hint.store(false, Ordering::Release);
     }
 
     fn mark_unbound(&self, configure_generation: &AtomicU64) {
@@ -328,6 +334,7 @@ impl SubcLifecycleAdmission {
             *unbound = true;
             *self.unbound_since.lock() = Some(Instant::now());
             configure_generation.fetch_add(1, Ordering::SeqCst);
+            self.unbound_hint.store(true, Ordering::Release);
         }
     }
 
@@ -349,6 +356,12 @@ impl SubcLifecycleAdmission {
     /// Serialize cancellation with rebind: a root rebound before this decision
     /// cannot have its still-running work cancelled by a stale grace check.
     pub(crate) fn cancel_if_abandoned(&self, cancel: impl FnOnce()) {
+        // Lifecycle transitions are in memory and must be observed at every
+        // parser checkpoint, independently of the throttled disk-liveness
+        // probe. Avoid a mutex on the usual bound-root path.
+        if !self.unbound_hint.load(Ordering::Acquire) {
+            return;
+        }
         // A checkpoint may be inside a lifecycle admission closure that already
         // owns this lock. Defer that checkpoint instead of recursively locking;
         // the next batch/parser poll makes the synchronized decision.
@@ -11307,6 +11320,60 @@ pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> 
 #[cfg(test)]
 mod subc_lifecycle_admission_tests {
     use super::*;
+
+    #[test]
+    fn cancellation_hint_preserves_grace_and_rebind_decisions() {
+        let admission = SubcLifecycleAdmission::default();
+        let worker = admission.clone();
+        let generation = AtomicU64::new(0);
+        let cancelled = std::cell::Cell::new(false);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(!cancelled.get(), "bound roots must keep running");
+
+        admission.set_abandon_grace_for_test(Duration::from_secs(600));
+        admission.mark_unbound(&generation);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            !cancelled.get(),
+            "a short unbind must preserve the grace window"
+        );
+
+        // Expire the grace window without sleeping or advancing the unrelated
+        // filesystem probe. A shared lifecycle sees expiry at its next check.
+        *admission.unbound_since.lock() = Some(Instant::now() - Duration::from_secs(601));
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            cancelled.replace(false),
+            "expired unbound roots must cancel"
+        );
+
+        admission.mark_bound();
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(!cancelled.get(), "rebind must clear the cancellation hint");
+
+        admission.set_abandon_grace_for_test(Duration::ZERO);
+        admission.mark_unbound(&generation);
+        worker.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(cancelled.get(), "a second unbind must publish a fresh hint");
+    }
+
+    #[test]
+    fn cancellation_hint_never_overrides_synchronized_rebind() {
+        let admission = SubcLifecycleAdmission::default();
+        let generation = AtomicU64::new(0);
+        admission.set_abandon_grace_for_test(Duration::ZERO);
+        admission.mark_unbound(&generation);
+        admission.mark_bound();
+        // A worker may have loaded the previous true hint just before rebind.
+        // The admission lock's bound state remains the authoritative decision.
+        admission.unbound_hint.store(true, Ordering::Release);
+        let cancelled = std::cell::Cell::new(false);
+        admission.cancel_if_abandoned(|| cancelled.set(true));
+        assert!(
+            !cancelled.get(),
+            "a stale hint must not cancel a rebound root"
+        );
+    }
 
     #[test]
     fn route_teardown_does_not_supersede_disk_artifact_compatibility() {

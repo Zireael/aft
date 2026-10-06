@@ -682,13 +682,20 @@ impl JobCancellation {
             JOB_CANCEL_STATE_COMMITTED => return false,
             _ => {}
         }
-        if self.root.is_none() && self.lifecycle.is_none() {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_if_abandoned(|| self.request_cancel());
+            if self.cancel_already_requested() {
+                return true;
+            }
+        }
+        if self.root.is_none() {
             return false;
         }
-        // Every checkpoint observes explicit cancellation atomically. Disk and
-        // lifecycle probes are bounded to one per 256 checkpoints or 50ms on
-        // each worker, whichever comes first. A weak identity prevents a new
-        // token reusing an allocation from inheriting the previous job's delay.
+        // Every checkpoint observes explicit cancellation and the in-memory
+        // lifecycle signal. Only the filesystem deletion probe is bounded to
+        // one per 256 checkpoints or 50ms on each worker, whichever comes
+        // first. A weak identity prevents a new token reusing an allocation
+        // from inheriting the previous job's delay.
         // The first running checkpoint probes again after admission: setup may
         // have blocked before the command got a chance to observe its root.
         thread_local! {
@@ -735,9 +742,6 @@ impl JobCancellation {
             })
         {
             self.request_cancel();
-        }
-        if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.cancel_if_abandoned(|| self.request_cancel());
         }
         self.state() == JOB_CANCEL_STATE_CANCELLED
     }
