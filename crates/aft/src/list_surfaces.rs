@@ -550,9 +550,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "trace_to_symbol reply is a single shortest path (path: Option<Vec<...>>) with no list semantics, so it carries no truncation envelope",
     },
     ExclusionEntry {
+        file: "response_finalize.rs",
+        enclosing_item: "drop",
+        location_or_primitive: "response_finalize::DeferredWakeGuard drop self.0.take()",
+        reason: "Option::take restoring the previous deferred-completion wake when a guard drops; no list is cut",
+    },
+    ExclusionEntry {
         file: "commands/configure.rs",
-        enclosing_item: "schedule_artifact_loads",
-        location_or_primitive: "commands::configure::schedule_artifact_loads warm_permit.take()",
+        enclosing_item: "schedule_artifact_loads_admitted",
+        location_or_primitive: "commands::configure::schedule_artifact_loads_admitted warm_permit.take()",
         reason: "Option::take releasing a warm-reload permit before a cold-build acquire; no list is cut",
     },
     ExclusionEntry {
