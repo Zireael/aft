@@ -10006,16 +10006,32 @@ mod tests {
 
     #[test]
     fn gate_tail_fixture_keeps_verdict_through_extractors_and_caps() {
-        let output = std::process::Command::new("bash")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/bash/gate-tail/command.sh"
-            ))
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
+        // Model command.sh in-process: this tests captured-output compression,
+        // not shell launching, and Windows need not have a working POSIX bash.
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        for phase in 1..=2 {
+            stdout.push_str(&format!(
+                "==> cargo test --locked --workspace --quiet (phase {phase})\n"
+            ));
+            for index in 1..=40 {
+                stderr.push_str(&format!("   Compiling gate_dep_{phase}_{index} v0.1.0\n"));
+            }
+            stderr.push_str(
+                "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.00s\n",
+            );
+            stdout.push_str("running 75 tests\n");
+            for index in 1..=75 {
+                stdout.push_str(&format!("test phase_{phase}::case_{index} ... ok\n"));
+            }
+            stdout.push_str("test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n    ok (1s)\n");
+        }
+        stdout
+            .push_str("==> cargo nextest run --workspace\n    Starting 80 tests across 1 binary\n");
+        for index in 1..=80 {
+            stdout.push_str(&format!("        PASS [   0.001s] gate::case_{index}\n"));
+        }
+        stdout.push_str("     Summary [   0.080s] 80 tests run: 80 passed, 0 skipped\n    ok (1s)\n==> generated files untouched by the build\n    ok (0s)\nGATE PASSED: all phases green\n");
         assert_eq!(stdout.lines().count() + stderr.lines().count(), 327);
         assert_eq!(stdout.lines().last(), Some("GATE PASSED: all phases green"));
         assert!(stderr.lines().last().unwrap().contains("Finished"));

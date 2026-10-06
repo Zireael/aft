@@ -1,11 +1,12 @@
 # Multi-phase gate tail regression
 
-`command.sh` emits 327 lines without compiling anything: two libtest phases,
+`command.sh` models 327 lines without compiling anything: two libtest phases,
 one nextest phase, stderr build progress interleaved with the phases, and a final
 stdout verdict, `GATE PASSED: all phases green`. Its shape is modeled on a Rust
 gate that announces each phase and checks generated files after testing.
 
-The captures are stored separately. AFT concatenates stdout followed by stderr
+The unit test generates the same stdout and stderr in-process, so it does not
+require a working POSIX shell on Windows. AFT concatenates stdout followed by stderr
 for compression, so the last line of that display is a stderr `Finished` line,
 not the script's actual final stdout verdict. Cargo's output-shape extractor
 already retained the display's last line and therefore believed its tail was
@@ -30,7 +31,7 @@ lines are whole even when they exceed the byte budget. Existing zero-test-target
 summaries remain collapsed into their equivalent counted summary.
 
 Run `cargo test -p agent-file-tools --lib -- gate_tail` with isolated HOME/XDG
-directories. The tests read the real fixture's stdout/stderr through the
+directories. The tests read the modeled fixture's stdout/stderr through the
 disk-backed terminal registry and check both foreground output and an emitted
 `BashCompleted` frame. They cover Cargo's command and output-shape extractors,
 generic nextest/shell-list paths, package-manager and TOML tiers, padded output
