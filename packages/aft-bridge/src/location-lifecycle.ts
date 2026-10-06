@@ -1,4 +1,4 @@
-import type { VersionMismatchCallback } from "./bridge.js";
+import { BridgeTransportUnavailableError, type VersionMismatchCallback } from "./bridge.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type {
@@ -115,7 +115,11 @@ async function withLock<T>(key: string, operation: () => Promise<T>): Promise<T>
 }
 
 function assertLive(released: boolean): void {
-  if (released) throw new Error("AFT bridge Location lease has already been released");
+  if (released) {
+    throw new BridgeTransportUnavailableError(
+      "AFT bridge Location lease has already been released",
+    );
+  }
 }
 
 /**

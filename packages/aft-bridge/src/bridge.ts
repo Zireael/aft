@@ -855,7 +855,7 @@ export class BinaryBridge implements AftProjectTransport {
   ): Promise<Record<string, unknown>> {
     try {
       if (this._retiringDueToBinaryChange) {
-        throw new Error(
+        throw new BridgeTransportUnavailableError(
           `${this.errorPrefix} Bridge is retiring after the on-disk binary changed; retry to respawn on the updated binary`,
         );
       }
@@ -1252,7 +1252,9 @@ export class BinaryBridge implements AftProjectTransport {
     this.spawnedBinaryFingerprint = null;
     this.clearRestartResetTimer();
     this.configureWarningClients.clear();
-    this.rejectAllPending(new Error(`${this.errorPrefix} Bridge shutting down`));
+    this.rejectAllPending(
+      new BridgeTransportUnknownOutcomeError(`${this.errorPrefix} Bridge shutting down`),
+    );
 
     if (this.process) {
       const proc = this.process;
@@ -1325,7 +1327,9 @@ export class BinaryBridge implements AftProjectTransport {
     this._retiringDueToBinaryChange = false;
     this.clearRestartResetTimer();
     this.rejectAllPending(
-      new Error(`${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`),
+      new BridgeTransportUnknownOutcomeError(
+        `${this.errorPrefix} Bridge restarting with updated binary: ${newBinaryPath}`,
+      ),
     );
 
     if (!this.process) return;
@@ -1868,7 +1872,7 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-  private rejectAllPending(error: Error): void {
+  private rejectAllPending(error: BridgeTransportUnavailableError): void {
     for (const [_id, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.onSettled?.();
