@@ -1504,6 +1504,10 @@ fn search_literal_in_text(
     job_cancellation: Option<&crate::executor::JobCancellation>,
     deadline: Option<Instant>,
 ) {
+    if literal.needle.contains(&b'\n') {
+        return;
+    }
+
     let content_bytes = content.as_bytes();
     let search_content;
     let haystack = if literal.case_insensitive_ascii {
@@ -1513,31 +1517,35 @@ fn search_literal_in_text(
         content_bytes
     };
     let finder = memchr::memmem::Finder::new(&literal.needle);
-    crate::pattern_compile::for_each_line(content_bytes, |line_start, line| {
-        let line_haystack = &haystack[line_start..line_start + line.len()];
-        let Some(position) = finder.find(line_haystack) else {
-            return true;
+    let mut start = 0usize;
+    while start <= haystack.len() {
+        let Some(position) = finder.find(&haystack[start..]) else {
+            break;
         };
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
         {
             engine_capped.store(true, Ordering::Relaxed);
-            return false;
+            break;
         }
 
-        let offset = line_start + position;
+        let offset = start + position;
+        // Grep reports one match per line. Once a line is recorded, resume at
+        // the next line start instead of scanning its remaining occurrences.
         if offset < *reported_line_end {
-            return true;
+            start = offset + 1;
+            continue;
         }
         let (line, column, line_text, next_line_start) =
             line_details_with_next(content, line_starts, offset);
         *reported_line_end = next_line_start;
+        start = next_line_start.max(offset + 1);
 
         *matched_this_file = true;
         let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
         if match_number > max_results {
             truncated.store(true, Ordering::Relaxed);
-            return false;
+            break;
         }
 
         let end = offset + literal.needle.len();
@@ -1548,8 +1556,7 @@ fn search_literal_in_text(
             line_text,
             match_text: String::from_utf8_lossy(&content_bytes[offset..end]).into_owned(),
         });
-        true
-    });
+    }
 }
 
 fn should_stop_fallback_search(
@@ -2384,6 +2391,16 @@ mod tests {
                 "{pattern:?}: {:?}",
                 result.matches
             );
+        }
+
+        let rescan_pattern = compiled_regex(r"foo.*\nbar|hit");
+        for content in ["foo hit\nbar\n", "prefix foo hit\nbar\n"] {
+            std::fs::write(&file, content).expect("write cross-line case");
+            let result = grep_explicit_file(&file, &rescan_pattern, 10, IndexStatus::Fallback);
+            assert_eq!(result.matches.len(), 1, "{content:?}");
+            assert_eq!(result.matches[0].line, 1, "{content:?}");
+            assert_eq!(result.matches[0].line_text, content.lines().next().unwrap());
+            assert_eq!(result.matches[0].match_text, "hit", "{content:?}");
         }
     }
 

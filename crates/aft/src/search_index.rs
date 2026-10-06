@@ -3628,8 +3628,9 @@ enum MatchVisit {
     Stop,
     /// The occurrence is on a line that already produced a match.
     SameLine,
-    /// The occurrence was the first on its line.
-    Recorded,
+    /// The occurrence was the first on its line; skipping to the next line
+    /// avoids searching the rest of that line again.
+    Recorded { next_line_start: usize },
 }
 
 fn search_candidate_file(
@@ -3730,28 +3731,36 @@ fn search_candidate_file(
                 line_text,
                 match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
             });
-            MatchVisit::Recorded
+            MatchVisit::Recorded { next_line_start }
         };
 
         match matcher {
             SearchMatcher::Literal(literal) => {
                 let needle = &literal.needle;
-                let lowered;
-                let haystack: &[u8] = if literal.case_insensitive_ascii {
-                    lowered = content.to_ascii_lowercase();
-                    &lowered
-                } else {
-                    &content
-                };
-                let finder = memchr::memmem::Finder::new(needle);
-                pattern_compile::for_each_line(&content, |line_start, line| {
-                    let line_haystack = &haystack[line_start..line_start + line.len()];
-                    let Some(position) = finder.find(line_haystack) else {
-                        return true;
+                if !needle.contains(&b'\n') {
+                    let lowered;
+                    let haystack: &[u8] = if literal.case_insensitive_ascii {
+                        lowered = content.to_ascii_lowercase();
+                        &lowered
+                    } else {
+                        &content
                     };
-                    let offset = line_start + position;
-                    !matches!(visit(offset, offset + needle.len()), MatchVisit::Stop)
-                });
+                    let finder = memchr::memmem::Finder::new(needle);
+                    let mut start = 0;
+                    while start <= haystack.len() {
+                        let Some(position) = finder.find(&haystack[start..]) else {
+                            break;
+                        };
+                        let offset = start + position;
+                        start = match visit(offset, offset + needle.len()) {
+                            MatchVisit::Stop => break,
+                            MatchVisit::SameLine => offset + 1,
+                            MatchVisit::Recorded { next_line_start } => {
+                                next_line_start.max(offset + 1)
+                            }
+                        };
+                    }
+                }
             }
             SearchMatcher::Regex(regex) => {
                 pattern_compile::for_each_line_match(regex, &content, |start, end| {
@@ -3812,21 +3821,27 @@ fn matching_lines_in_content(
     match matcher {
         SearchMatcher::Literal(literal) => {
             let needle = &literal.needle;
-            let lowered;
-            let haystack: &[u8] = if literal.case_insensitive_ascii {
-                lowered = content.to_ascii_lowercase();
-                &lowered
-            } else {
-                content
-            };
-            let finder = memchr::memmem::Finder::new(needle);
-            pattern_compile::for_each_line(content, |line_start, line| {
-                let line_haystack = &haystack[line_start..line_start + line.len()];
-                if let Some(position) = finder.find(line_haystack) {
-                    record(line_start + position, line_start + position + needle.len());
+            if !needle.contains(&b'\n') {
+                let lowered;
+                let haystack: &[u8] = if literal.case_insensitive_ascii {
+                    lowered = content.to_ascii_lowercase();
+                    &lowered
+                } else {
+                    content
+                };
+                let finder = memchr::memmem::Finder::new(needle);
+                let mut start = 0;
+                while start <= haystack.len() {
+                    let Some(position) = finder.find(&haystack[start..]) else {
+                        break;
+                    };
+                    let offset = start + position;
+                    start = record(offset, offset + needle.len())
+                        .map_or(offset + 1, |next_line_start| {
+                            next_line_start.max(offset + 1)
+                        });
                 }
-                true
-            });
+            }
         }
         SearchMatcher::Regex(regex) => {
             pattern_compile::for_each_line_match(regex, content, |start, end| {
@@ -10324,6 +10339,26 @@ mod tests {
         };
         let result = index.search_grep(&literal_newline, &[], &[], &project, 10);
         assert!(result.matches.is_empty());
+    }
+
+    #[test]
+    fn indexed_cross_line_regex_rescans_starting_line() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("cross-line.log");
+        std::fs::write(&file, "foo hit\nbar\nprefix foo hit\nbar\n")
+            .expect("write cross-line fixture");
+        let index = SearchIndex::build(&project);
+        let result = index.grep(r"foo.*\nbar|hit", true, &[], &[], &project, 10);
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].line, 1);
+        assert_eq!(result.matches[0].line_text, "foo hit");
+        assert_eq!(result.matches[0].match_text, "hit");
+        assert_eq!(result.matches[1].line, 3);
+        assert_eq!(result.matches[1].line_text, "prefix foo hit");
+        assert_eq!(result.matches[1].match_text, "hit");
     }
 
     #[test]

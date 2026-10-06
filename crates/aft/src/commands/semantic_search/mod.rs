@@ -6401,39 +6401,37 @@ fn search_degraded_grep_file(
             let Some(needle) = std::str::from_utf8(&literal.needle).ok() else {
                 return false;
             };
+            if needle.contains('\n') {
+                return false;
+            }
             let haystack = if literal.case_insensitive_ascii {
                 Cow::Owned(content.to_ascii_lowercase())
             } else {
                 Cow::Borrowed(content)
             };
 
-            pattern_compile::for_each_line(content.as_bytes(), |line_start, line| {
-                let line_haystack = &haystack[line_start..line_start + line.len()];
-                for (line_offset, matched) in line_haystack.match_indices(needle) {
-                    if search_cancellation_requested() {
-                        return false;
-                    }
-                    let offset = line_start + line_offset;
-                    let match_text = content[offset..offset + matched.len()].to_string();
-                    let (counted, should_continue) = record_degraded_grep_match(
-                        file,
-                        content,
-                        &line_starts,
-                        &mut seen_lines,
-                        offset,
-                        match_text,
-                        max_results,
-                        total_matches,
-                        truncated,
-                        matches,
-                    );
-                    matched_this_file |= counted;
-                    if !should_continue {
-                        return false;
-                    }
+            for (offset, matched) in haystack.match_indices(needle) {
+                if search_cancellation_requested() {
+                    break;
                 }
-                true
-            });
+                let match_text = content[offset..offset + matched.len()].to_string();
+                let (counted, should_continue) = record_degraded_grep_match(
+                    file,
+                    content,
+                    &line_starts,
+                    &mut seen_lines,
+                    offset,
+                    match_text,
+                    max_results,
+                    total_matches,
+                    truncated,
+                    matches,
+                );
+                matched_this_file |= counted;
+                if !should_continue {
+                    break;
+                }
+            }
         }
         pattern_compile::CompiledPattern::Regex { compiled, .. } => {
             pattern_compile::for_each_line_match(compiled, content.as_bytes(), |offset, end| {
