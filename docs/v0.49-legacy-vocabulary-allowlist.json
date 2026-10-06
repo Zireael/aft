@@ -492,11 +492,11 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 14839,
+      "line": 14844,
       "column": 26,
       "token": "filePath",
       "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
-      "location": "line 14839, column 26",
+      "location": "line 14844, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -1654,11 +1654,11 @@
     },
     {
       "path": "crates/aft/tests/integration/per_checkout_callgraph.rs",
-      "line": 137,
+      "line": 139,
       "column": 14,
       "token": "toFile",
       "text": "\"toFile\": file,",
-      "location": "line 137, column 14",
+      "location": "line 139, column 14",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
