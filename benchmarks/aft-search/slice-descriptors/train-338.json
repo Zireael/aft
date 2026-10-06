@@ -1,0 +1,23 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "train-300",
+    "train-301",
+    "train-307",
+    "train-308",
+    "train-309",
+    "train-312",
+    "train-313",
+    "train-314",
+    "train-323",
+    "train-333",
+    "train-334",
+    "train-335"
+  ],
+  "note": "Combined landing of twelve gated trains for the fleet restart window. Ranking is not meant to change in any of them; search-ranking files are touched only by plumbing, so every benchmark row must be byte-equal."
+}
