@@ -53,6 +53,37 @@ fn concurrent_builders_compile_once() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn installation_never_write_opens_a_running_executable() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("shell");
+    fs::copy("/bin/sh", &source).unwrap();
+    let mut child = Command::new(&source)
+        .args(["-c", "echo ready; read release"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let key = cache::key(&[b"running executable"], "rustc", "unix");
+    // A hard link preserves the running inode. Linux rejects even a momentary
+    // write-open; syncing an immutable helper must require only read access.
+    let installed = cache::install(dir.path(), &key, "unix", |pending| {
+        fs::hard_link(&source, pending)
+    });
+    writeln!(child.stdin.take().unwrap(), "release").unwrap();
+    assert!(child.wait().unwrap().success());
+    installed.expect("installation must not write-open executable inodes");
+}
+
 #[test]
 fn source_toolchain_and_target_changes_get_new_keys() {
     let original = cache::key(&[b"source"], "rustc 1", "unix");

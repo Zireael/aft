@@ -62,6 +62,13 @@ pub fn install(
             .tempdir_in(&root)?;
         let pending = executable(temporary.path(), target);
         build(&pending)?;
+        // Read access is enough for fsync. A writable executable descriptor can
+        // be inherited by a concurrent fork and make Linux exec return ETXTBSY
+        // even after this thread closes it and publishes the immutable path.
+        #[cfg(target_os = "linux")]
+        fs::File::open(&pending)?.sync_all()?;
+        // Windows FlushFileBuffers requires a writable handle.
+        #[cfg(not(target_os = "linux"))]
         OpenOptions::new().write(true).open(&pending)?.sync_all()?;
         // Installation age lives beside the executable. Never write-open or
         // touch an installed executable: macOS can revoke running signatures.

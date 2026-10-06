@@ -11,6 +11,8 @@ use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -149,14 +151,15 @@ static SEMANTIC_REFRESH_RECOVERY_GATE: OnceLock<Mutex<Option<SemanticRefreshReco
 
 #[cfg(test)]
 struct WatcherPhaseCommitGate {
-    target: PathBuf,
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
 #[cfg(test)]
-static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<Mutex<Option<WatcherPhaseCommitGate>>> =
-    std::sync::OnceLock::new();
+// Parallel libtests must not replace another path's in-flight barrier.
+static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, WatcherPhaseCommitGate>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 struct WatcherRescanGate {
@@ -220,28 +223,27 @@ fn install_watcher_phase_commit_gate_for_test(
 ) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    *WATCHER_PHASE_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
+    WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("watcher phase commit gate mutex poisoned") = Some(WatcherPhaseCommitGate {
-        target,
-        reached_tx,
-        release_rx,
-    });
+        .expect("watcher phase commit gate mutex poisoned")
+        .insert(
+            target,
+            WatcherPhaseCommitGate {
+                reached_tx,
+                release_rx,
+            },
+        );
     (reached_rx, release_tx)
 }
 
 #[cfg(test)]
 fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
-    let mut slot = WATCHER_PHASE_COMMIT_GATE
-        .get_or_init(|| Mutex::new(None))
+    let gate = WATCHER_PHASE_COMMIT_GATE
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .expect("watcher phase commit gate mutex poisoned");
-    if !slot.as_ref().is_some_and(|gate| gate.target == path) {
-        return;
-    }
-    let gate = slot.take();
-    drop(slot);
+        .expect("watcher phase commit gate mutex poisoned")
+        .remove(path);
     if let Some(gate) = gate {
         let _ = gate.reached_tx.send(());
         let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
@@ -4704,6 +4706,29 @@ mod tests {
             !ctx.watcher_query_has_pending_changes(),
             "completed application retires the active demand"
         );
+    }
+
+    #[test]
+    fn watcher_phase_commit_gates_are_path_scoped() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.rs");
+        let second = temp.path().join("second.rs");
+        let (first_reached, first_release) =
+            install_watcher_phase_commit_gate_for_test(first.clone());
+        let (second_reached, second_release) =
+            install_watcher_phase_commit_gate_for_test(second.clone());
+        let first_apply =
+            std::thread::spawn(move || wait_on_watcher_phase_commit_gate_for_test(&first));
+        let second_apply =
+            std::thread::spawn(move || wait_on_watcher_phase_commit_gate_for_test(&second));
+        let first_result = first_reached.recv_timeout(Duration::from_secs(2));
+        let second_result = second_reached.recv_timeout(Duration::from_secs(2));
+        let _ = first_release.send(());
+        let _ = second_release.send(());
+        first_apply.join().unwrap();
+        second_apply.join().unwrap();
+        first_result.expect("first path's barrier must survive installing the second");
+        second_result.expect("second path's barrier must be independent");
     }
 
     #[test]

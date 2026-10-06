@@ -3457,6 +3457,8 @@ fn run_subc_mode_inner(
             tool_response_body_limit,
             lifecycle_probe,
             &storage_dir,
+            #[cfg(test)]
+            None,
         )
         .await
     });
@@ -4053,7 +4055,6 @@ async fn process_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -4070,7 +4071,6 @@ async fn process_route_bind_completion(
         pending_binds,
         installed_route_epochs,
         executor,
-        standing_actor,
         shutdown,
         metrics,
         lifecycle_probe,
@@ -4090,7 +4090,6 @@ async fn drain_pending_route_bind_completions(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -4108,7 +4107,6 @@ async fn drain_pending_route_bind_completions(
             pending_binds,
             installed_route_epochs,
             executor,
-            standing_actor,
             shutdown,
             metrics,
             lifecycle_probe,
@@ -4134,6 +4132,7 @@ async fn run_module_loop<R, W>(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
+    #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4229,15 +4228,23 @@ where
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
     let mut root_presence = RootPresenceProbe::new();
-    let standing_actor = Arc::new(standing::StandingActor::new(
-        Arc::clone(&shared_app),
-        Arc::clone(&executor),
-    ));
-    // Startup reconciliation is intentionally direct; subsequent passes use
-    // this existing maintenance timer arm and never create a standing timer.
-    standing_actor.reconcile_at_startup(storage_dir);
+    let standing_actor = Arc::new(
+        standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor))
+            .with_startup_storage_dir(storage_dir),
+    );
+    #[cfg(test)]
+    let standing_actor = standing_actor_override.unwrap_or(standing_actor);
     let standing_for_worker = Arc::clone(&standing_actor);
-    let standing_worker = standing::StandingWorker::start(move || standing_for_worker.tick());
+    let mut standing_startup_pending = true;
+    let standing_worker = standing::StandingWorker::start(move || {
+        // Startup also opens the standing database. It must not hold up the
+        // transport any more than a periodic reconciliation can.
+        if standing_startup_pending {
+            standing_for_worker.reconcile_at_startup();
+            standing_startup_pending = false;
+        }
+        standing_for_worker.tick();
+    });
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
@@ -4355,7 +4362,6 @@ where
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &shutdown,
             &dispatch_path_metrics,
             lifecycle_probe.as_ref(),
@@ -4517,7 +4523,6 @@ where
                     &mut pending_binds,
                     &mut installed_route_epochs,
                     &executor,
-                    &standing_actor,
                     &shutdown,
                     &dispatch_path_metrics,
                     lifecycle_probe.as_ref(),
@@ -4657,6 +4662,7 @@ where
                             &frame,
                             &shared_app,
                             &executor,
+                            &standing_actor,
                             &mut live_roots,
                             &mut pending_binds,
                             &mut installed_route_epochs,
@@ -5750,7 +5756,6 @@ async fn handle_route_bind_completion(
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     executor: &Arc<Executor>,
-    standing_actor: &standing::StandingActor,
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -5900,9 +5905,6 @@ async fn handle_route_bind_completion(
         meta.maintenance_poisoned = false;
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
-        // The bind transition revokes any matching unbound standing admission
-        // before this session can select the shared artifact family.
-        standing_actor.begin_session_bind(&ctx);
         ctx.mark_subc_bound();
         if restore_watcher {
             crate::commands::configure::ensure_project_watcher(&ctx);
@@ -6068,6 +6070,7 @@ async fn handle_control_request(
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
+    standing_actor: &Arc<standing::StandingActor>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -6432,11 +6435,22 @@ async fn handle_control_request(
             let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
                 configure_request_id.clone(),
-                Arc::new(move |ctx| {
-                    log_ctx::with_session(Some(configure_session.clone()), || {
-                        dispatch(configure_req.clone(), ctx)
+                {
+                    let standing_actor = Arc::clone(standing_actor);
+                    Arc::new(move |ctx| {
+                        log_ctx::with_session(Some(configure_session.clone()), || {
+                            let response = dispatch(configure_req.clone(), ctx);
+                            if response.success {
+                                // Revoke matching standing publication before the
+                                // session is installed, but never on the frame loop.
+                                // Contention is covered by the normal bind deadline;
+                                // health and other routes remain serviceable.
+                                standing_actor.begin_session_bind(ctx);
+                            }
+                            response
+                        })
                     })
-                }),
+                },
             );
             pending_binds.insert(
                 route_id,
@@ -10324,6 +10338,226 @@ mod tests {
     use super::*;
     use crate::bash_background::BgTaskStatus;
 
+    #[tokio::test]
+    async fn standing_actor_lock_contention_does_not_block_route_binds_or_health() {
+        let (dir, root) = test_root("standing-frame-isolation");
+        let app = App::default_shared();
+        let executor = Arc::new(Executor::new());
+        let ctx = Arc::new(AppContext::from_app(
+            Arc::clone(&app),
+            Config {
+                project_root: Some(root.as_path().to_path_buf()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.as_path().to_path_buf());
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        executor.register_actor(root.clone(), ctx);
+        let actor = Arc::new(standing::StandingActor::new(
+            Arc::clone(&app),
+            Arc::clone(&executor),
+        ));
+        let held_actor = Arc::clone(&actor);
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = std::thread::spawn(move || {
+            held_actor.hold_locks_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (mut daemon, module) = tokio::io::duplex(64 * 1024);
+        let fixture_path = dir.path().to_path_buf();
+        // Production keeps the executor outside the module loop through its
+        // teardown. Retain that owner here too, rather than dropping the final
+        // executor handle from a finishing bind worker.
+        let loop_executor = Arc::clone(&executor);
+        // A separate current-thread runtime reproduces the production transport.
+        // The test's deadline must still run if that frame thread takes a lock.
+        let module_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (read, write) = tokio::io::split(module);
+            runtime.block_on(run_module_loop(
+                read,
+                write,
+                &fixture_path.join("absent-connection.json"),
+                app,
+                loop_executor,
+                |request, _| Response::success(request.id, json!({})),
+                Some(fixture_path.join("absent-user-config.json")),
+                false,
+                usize::MAX,
+                None,
+                &fixture_path.join("storage"),
+                Some(actor),
+            ))
+        });
+        let while_held: Result<(), String> = async {
+            let hello = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                .await
+                .map_err(|_| "ModuleHello blocked".to_string())?
+                .map_err(|e| e.to_string())?
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack)
+                .await
+                .map_err(|e| e.to_string())?;
+            let bind = ModuleControlRequest::RouteBind {
+                route_channel: 71,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    root.as_path(),
+                    "opencode",
+                    "standing-isolation",
+                ),
+                principal: Some(subc_protocol::Principal::Direct),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+            };
+            let bind = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                71,
+                serde_json::to_vec(&bind).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &bind)
+                .await
+                .map_err(|e| e.to_string())?;
+            let health = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                72,
+                serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &health)
+                .await
+                .map_err(|e| e.to_string())?;
+            let health_reply =
+                tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                    .await
+                    .map_err(|_| "health reply blocked on standing actor locks".to_string())?
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+            assert_eq!(
+                (health_reply.header.ty, health_reply.header.corr),
+                (FrameType::Response, 72)
+            );
+            // A bind needing the standing handoff cannot succeed while it is
+            // locked, but it must be refused before the daemon's relay expires.
+            let bind_reply =
+                tokio::time::timeout(DAEMON_BIND_RELAY_TIMEOUT, read_frame(&mut daemon))
+                    .await
+                    .map_err(|_| {
+                        "route bind was not answered before the daemon relay deadline".to_string()
+                    })?
+                    .map_err(|e| e.to_string())?
+                    .unwrap();
+            assert_eq!(
+                (bind_reply.header.ty, bind_reply.header.corr),
+                (FrameType::Error, 71)
+            );
+            Ok(())
+        }
+        .await;
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        let recovery: Result<(), String> = if while_held.is_ok() {
+            async {
+                let bind = ModuleControlRequest::RouteBind {
+                    route_channel: 73,
+                    epoch: 1,
+                    target: RouteTarget::ToolProvider {
+                        module_id: "aft".into(),
+                    },
+                    identity: subc_protocol::BindIdentity::new(
+                        root.as_path(),
+                        "opencode",
+                        "standing-recovery",
+                    ),
+                    principal: Some(subc_protocol::Principal::Direct),
+                    consumer_capabilities: None,
+                    admission_facts: Default::default(),
+                    scope: None,
+                    role_versions: None,
+                };
+                let frame = Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    0,
+                    0,
+                    73,
+                    serde_json::to_vec(&bind).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut daemon, &frame)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let response =
+                    tokio::time::timeout(Duration::from_secs(2), read_frame(&mut daemon))
+                        .await
+                        .map_err(|_| {
+                            "route bind did not recover after releasing standing locks".to_string()
+                        })?
+                        .map_err(|e| e.to_string())?
+                        .unwrap();
+                assert_eq!(
+                    (response.header.ty, response.header.corr),
+                    (FrameType::Response, 73)
+                );
+                assert!(matches!(
+                    serde_json::from_slice::<ModuleControlResponse>(&response.body).unwrap(),
+                    ModuleControlResponse::RouteBindAck {}
+                ));
+                Ok(())
+            }
+            .await
+        } else {
+            Ok(())
+        };
+        // Closing the transport also makes the baseline failure safe: release
+        // locks and let the real loop tear down before asserting the deadline.
+        drop(daemon);
+        let _ = module_thread.join().unwrap();
+        let settled = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "standing-test-settled".into(),
+            Box::new(|_| Response::success("standing-test-settled", json!({}))),
+        );
+        tokio::time::timeout(Duration::from_secs(2), settled)
+            .await
+            .expect("released bind work must settle before executor teardown")
+            .unwrap();
+        drop(executor);
+        while_held.expect("standing maintenance must never park the frame loop");
+        recovery.expect("releasing standing locks must restore successful route binds");
+    }
+
     /// `call_key` and `schema_pin` decode from the request body and are held
     /// to subc-protocol's shape; a refusal names the field that failed.
     #[test]
@@ -10602,6 +10836,10 @@ mod tests {
                 &frame,
                 &app,
                 &executor,
+                &Arc::new(standing::StandingActor::new(
+                    Arc::clone(&app),
+                    Arc::clone(&executor),
+                )),
                 &mut HashMap::new(),
                 &mut pending_binds,
                 &mut HashMap::new(),
@@ -14159,8 +14397,6 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
-        let standing_actor =
-            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
 
         handle_route_bind_completion(
             &writer_tx,
@@ -14173,7 +14409,6 @@ mod tests {
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
             None,
@@ -14244,8 +14479,6 @@ mod tests {
         let (writer_tx, _writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
-        let standing_actor =
-            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
 
         handle_route_bind_completion(
             &writer_tx,
@@ -14258,7 +14491,6 @@ mod tests {
             &mut pending_binds,
             &mut installed_route_epochs,
             &executor,
-            &standing_actor,
             &Arc::new(Notify::new()),
             &metrics,
             None,
