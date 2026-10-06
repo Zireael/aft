@@ -10913,9 +10913,21 @@ mod tests {
             vec![task_id.clone()]
         );
 
-        registry.cleanup_finished(Duration::ZERO);
-
-        assert!(registry.inner.tasks.lock().unwrap().is_empty());
+        // On Windows the killed child can still hold its output files open for a
+        // moment, so deleting the bundle fails and the task stays registered for
+        // the next sweep. Sweep again, as the watchdog would, until it is gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            registry.cleanup_finished(Duration::ZERO);
+            if registry.inner.tasks.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the finished task was never removed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
