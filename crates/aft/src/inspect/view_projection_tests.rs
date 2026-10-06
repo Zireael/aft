@@ -151,17 +151,21 @@ fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
     assert!(head.contains("projection_head_mismatch:") && head.contains(&request.desired_head) && head.contains("cached_head=different-head"), "{head}");
     crate::views::cache_head_fingerprint(job.project_root.clone(), request.desired_head.clone());
 
-    let outside = storage.path().join("outside.ts");
+    // Windows separators are escaped by Debug. Exercise escaping on Unix too,
+    // where a backslash is a legal character in a filename.
+    let outside = storage.path().join(if cfg!(windows) { "outside.ts" } else { "outside\\fixture.ts" });
     let stats = [(outside.clone(), 0, UNIX_EPOCH)];
     let root = refusal(&snapshot, Some(&stats));
-    assert!(root.contains("coverage_root_mismatch:") && root.contains(outside.to_str().unwrap()) && root.contains(job.project_root.to_str().unwrap()), "{root}");
+    // The diagnostics print Debug paths, not raw path strings. Match their
+    // escaping without changing any path used by the production comparison.
+    assert!(root.contains("coverage_root_mismatch:") && root.contains(&format!("path={outside:?}")) && root.contains(&format!("root={:?}", job.project_root)), "{root}");
 
     let added = job.project_root.join("untracked.ts");
     write_projection_cache_file(&added, "export function untracked() {}\n");
     let metadata = std::fs::metadata(&added).unwrap();
     let stats = [(added.clone(), metadata.len(), metadata.modified().unwrap())];
     let coverage = refusal(&snapshot, Some(&stats));
-    assert!(coverage.contains("coverage_manifest_missing:") && coverage.contains(added.to_str().unwrap()) && coverage.contains("manifest_files=2 observed_files=1"), "{coverage}");
+    assert!(coverage.contains("coverage_manifest_missing:") && coverage.contains(&format!("path={added:?}")) && coverage.contains("manifest_files=2 observed_files=1"), "{coverage}");
 
     // Supply only the published paths so the untracked-file coverage guard
     // does not hide the source-key comparison we want to diagnose next.
