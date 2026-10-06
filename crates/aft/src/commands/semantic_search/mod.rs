@@ -9013,9 +9013,8 @@ mod tests {
     /// must still name the URL and the failure instead of "rebuilding".
     #[test]
     fn unreachable_backend_not_yet_reached_by_the_build_is_disclosed() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let port = addr.port();
         let base_url = format!("http://127.0.0.1:{port}/v1");
 
         let project = tempfile::tempdir().expect("create project dir");
@@ -9133,9 +9132,8 @@ mod tests {
     /// unreachable backend on its own.
     #[test]
     fn status_names_an_unreachable_backend_before_the_build_reaches_it() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let port = addr.port();
         let base_url = format!("http://127.0.0.1:{port}/v1");
 
         let project = tempfile::tempdir().expect("create project dir");
@@ -9717,9 +9715,8 @@ mod tests {
     /// must be awaited before that plan is made, not only at ranking.
     #[test]
     fn exact_search_waits_for_loading_trigram_when_query_embedding_fails() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
+        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let port = addr.port();
         let project = exact_lane::tests::large_identifier_project();
         let ctx = test_context(project.path());
         ctx.set_cache_role(true, None);

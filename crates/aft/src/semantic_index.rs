@@ -436,6 +436,22 @@ pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Pat
     );
 }
 
+/// Hold a loopback port without listening so a backend connection fails while
+/// no parallel test can claim the address. Dropping a temporary listener would
+/// release the port before the asynchronous backend probe connects to it.
+#[cfg(test)]
+pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("create backend socket");
+    socket
+        .bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .expect("reserve backend port without listening");
+    let addr = socket.local_addr().expect("backend address");
+    (socket, addr)
+}
+
 fn begin_semantic_index_build(
     project_root: &Path,
 ) -> (
@@ -13641,13 +13657,21 @@ public class Greeter {
     }
 
     #[test]
+    fn refused_backend_fixture_keeps_its_port_reserved() {
+        let (_backend, addr) = reserved_refused_backend_for_test();
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "a parallel listener must not be able to claim the refused backend's port"
+        );
+    }
+
+    #[test]
     fn remote_backend_probe_names_a_refused_connection() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
+        let (_backend, addr) = reserved_refused_backend_for_test();
+        let port = addr.port();
 
         let error = probe_remote_backend(&format!("http://127.0.0.1:{port}/v1"))
-            .expect_err("nothing listens on a released port");
+            .expect_err("nothing listens on the reserved port");
         assert!(
             error.starts_with("embedding backend unreachable"),
             "{error}"
