@@ -1791,7 +1791,8 @@ mod explicit_target_regressions {
                     "command": "grep",
                     "pattern": "(fail)|error",
                     "path": ".cortexkit/alfonso/reports",
-                    "include": ["a.stderr.log", "b.stderr.log", "c.stderr.log"],
+                    // The agent-facing comma list arrives in this translated form.
+                    "include": ["**/a.stderr.log", "**/b.stderr.log", "**/c.stderr.log"],
                 }),
             );
             assert_eq!(response["success"], true, "indexed={indexed}: {response}");
