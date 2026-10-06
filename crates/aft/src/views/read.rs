@@ -6,6 +6,35 @@ use std::sync::Arc;
 use crate::callgraph_store::{ReadonlyCallGraphStore, Result};
 use crate::pins::QueryPin;
 
+// Keep the first refusal on the calling test thread so a failed assertion names
+// the branch and its observed values without rerunning a potentially racy read.
+#[cfg(test)]
+thread_local! {
+    static CHECKOUT_VIEW_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_checkout_view_refusal(reason: String) {
+    CHECKOUT_VIEW_REFUSAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_checkout_view_refusal() -> Option<String> {
+    CHECKOUT_VIEW_REFUSAL.with(|slot| slot.borrow_mut().take())
+}
+
+macro_rules! note_checkout_verification_refusal {
+    ($($arg:tt)*) => {
+        #[cfg(test)]
+        record_checkout_view_refusal(format!($($arg)*));
+    };
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VerificationIo {
@@ -87,9 +116,15 @@ pub(crate) fn callgraph_paths_match_cached(
     });
     for path in paths {
         let Ok(relative) = path.strip_prefix(root) else {
+            note_checkout_verification_refusal!(
+                "verification_root_mismatch: path={path:?} root={root:?}"
+            );
             return Ok(false);
         };
-        let key = super::RelPath::from_os_path(relative)?;
+        let key = super::RelPath::from_os_path(relative).map_err(|error| {
+            note_checkout_verification_refusal!("verification_relative_path_invalid: path={path:?} relative={relative:?} error={error}");
+            error
+        })?;
         let language = if super::assembly::is_resolution_input(key.as_bytes()) {
             Some("config".to_string())
         } else {
@@ -97,9 +132,16 @@ pub(crate) fn callgraph_paths_match_cached(
         };
         let Some(language) = language else { continue };
         let Some(super::ManifestEntry::Regular { planes, .. }) = manifest.get(&key) else {
+            note_checkout_verification_refusal!(
+                "verification_regular_entry_missing: path={path:?} key={key:?} entry={:?}",
+                manifest.get(&key)
+            );
             return Ok(false);
         };
         let Some(expected_key) = planes.callgraph.as_ref() else {
+            note_checkout_verification_refusal!(
+                "verification_callgraph_key_missing: path={path:?} key={key:?} planes={planes:?}"
+            );
             return Ok(false);
         };
         let stats = match observed
@@ -110,8 +152,18 @@ pub(crate) fn callgraph_paths_match_cached(
             .unwrap_or_else(|| verification_stat(path))
         {
             Ok(stats) => stats,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                note_checkout_verification_refusal!(
+                    "verification_stat_not_found: path={path:?} error={error}"
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                note_checkout_verification_refusal!(
+                    "verification_stat_error: path={path:?} error={error}"
+                );
+                return Err(error.into());
+            }
         };
         if verified.get(path).is_some_and(|previous| {
             previous.size == stats.0
@@ -120,13 +172,27 @@ pub(crate) fn callgraph_paths_match_cached(
         }) {
             continue;
         }
-        let source = read_verification_source(path)?;
-        if verification_key(&source, language, super::callgraph::PRODUCER) != *expected_key {
+        let source = read_verification_source(path).map_err(|error| {
+            note_checkout_verification_refusal!(
+                "verification_source_read_error: path={path:?} stats={stats:?} error={error}"
+            );
+            error
+        })?;
+        let actual_key = verification_key(&source, language, super::callgraph::PRODUCER);
+        if actual_key != *expected_key {
+            note_checkout_verification_refusal!("verification_source_key_mismatch: path={path:?} expected_key={expected_key} actual_key={actual_key} stats={stats:?} source_bytes={}", source.len());
             verified.remove(path);
             return Ok(false);
         }
         // Do not associate verified bytes with metadata from before an edit.
-        if verification_stat(path)? != stats {
+        let after_stats = verification_stat(path).map_err(|error| {
+            note_checkout_verification_refusal!(
+                "verification_post_read_stat_error: path={path:?} before={stats:?} error={error}"
+            );
+            error
+        })?;
+        if after_stats != stats {
+            note_checkout_verification_refusal!("verification_post_read_stat_changed: path={path:?} before={stats:?} after={after_stats:?}");
             return Ok(false);
         }
         verified.insert(

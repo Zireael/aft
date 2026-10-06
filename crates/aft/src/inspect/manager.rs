@@ -33,6 +33,42 @@ use crate::callgraph_store::{
 };
 use crate::cold_build_limiter;
 
+#[cfg(test)]
+use crate::views::read::{record_checkout_view_refusal, take_checkout_view_refusal};
+
+// Recording and message formatting compile only in tests; the fallible reads
+// below still return None on exactly the same branches in production.
+macro_rules! note_checkout_view_refusal {
+    ($($arg:tt)*) => {
+        #[cfg(test)]
+        record_checkout_view_refusal(format!($($arg)*));
+    };
+}
+
+macro_rules! checkout_view_some {
+    ($value:expr, $($reason:tt)*) => {
+        match $value {
+            Some(value) => value,
+            None => {
+                note_checkout_view_refusal!($($reason)*);
+                return None;
+            }
+        }
+    };
+}
+
+macro_rules! checkout_view_ok {
+    ($value:expr, $($reason:tt)*) => {
+        match $value {
+            Ok(value) => value,
+            Err(_error) => {
+                note_checkout_view_refusal!("{}: {_error}", format!($($reason)*));
+                return None;
+            }
+        }
+    };
+}
+
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
 type WaiterTx = Sender<JobOutcome>;
@@ -971,7 +1007,14 @@ impl InspectManager {
         snapshot: &InspectSnapshot,
         observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
     ) -> Option<Arc<ReadonlyCallGraphStore>> {
+        #[cfg(test)]
+        let _ = take_checkout_view_refusal();
         if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
+            note_checkout_view_refusal!(
+                "config_gate: views.enabled={} indexes.callgraph={}",
+                snapshot.config.views.enabled,
+                snapshot.config.indexes.callgraph
+            );
             return None;
         }
         let files = observed_stats
@@ -982,19 +1025,35 @@ impl InspectManager {
                     &JobScope::for_project(snapshot.project_root.clone()),
                 )
             });
-        let (store, generation) = current_view_projection_store(
-            &snapshot.project_root,
-            &snapshot.inspect_dir,
-            &snapshot.config,
-            &[],
-        )?;
-        let storage = snapshot.config.storage_dir.as_ref()?;
-        let view = crate::views::ViewStore::open(
-            storage,
-            &crate::path_identity::project_scope_key(&snapshot.project_root),
-        )
-        .ok()?;
-        let manifest = view.load_manifest(&generation).ok()?;
+        let (store, generation) = checkout_view_some!(
+            current_view_projection_store(
+                &snapshot.project_root,
+                &snapshot.inspect_dir,
+                &snapshot.config,
+                &[],
+            ),
+            "projection_unavailable: root={:?} inspect_dir={:?}",
+            snapshot.project_root,
+            snapshot.inspect_dir
+        );
+        let storage = checkout_view_some!(
+            snapshot.config.storage_dir.as_ref(),
+            "verification_storage_missing: config.storage_dir=None root={:?}",
+            snapshot.project_root
+        );
+        let view = checkout_view_ok!(
+            crate::views::ViewStore::open(
+                storage,
+                &crate::path_identity::project_scope_key(&snapshot.project_root),
+            ),
+            "verification_view_open: storage={storage:?} root={:?}",
+            snapshot.project_root
+        );
+        let manifest = checkout_view_ok!(
+            view.load_manifest(&generation),
+            "verification_manifest_load: generation={generation} view_dir={:?}",
+            view.view_dir()
+        );
         // The graph must cover the complete source set, not merely the files
         // that still exist. Deletions and untracked additions can change liveness.
         if files
@@ -1002,21 +1061,43 @@ impl InspectManager {
             .filter(|path| callgraph_store_indexes_path(path))
             .any(|path| {
                 let Ok(relative) = path.strip_prefix(&snapshot.project_root) else {
+                    note_checkout_view_refusal!("coverage_root_mismatch: path={path:?} root={:?}", snapshot.project_root);
                     return true;
                 };
                 crate::views::RelPath::from_os_path(relative)
+                    .map_err(|_error| {
+                        note_checkout_view_refusal!("coverage_relative_path_invalid: path={path:?} relative={relative:?} error={_error}");
+                        _error
+                    })
                     .ok()
-                    .is_none_or(|relative| manifest.get(&relative).is_none())
+                    .is_none_or(|relative| {
+                        let missing = manifest.get(&relative).is_none();
+                        if missing {
+                            note_checkout_view_refusal!("coverage_manifest_missing: path={path:?} relative={relative:?} generation={generation} manifest_files={} observed_files={}", manifest.entries().count(), files.len());
+                        }
+                        missing
+                    })
             })
         {
             return None;
         }
         let manifest_paths = manifest.entries().filter_map(|(path, entry)| {
             matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
-                .then(|| crate::views::segment_store::rel_path_to_os(path).ok().map(|path| snapshot.project_root.join(path)))
-        }).collect::<Option<Vec<_>>>()?;
+                .then(|| crate::views::segment_store::rel_path_to_os(path).map_err(|_error| {
+                    note_checkout_view_refusal!("manifest_path_decode: path={path:?} generation={generation} error={_error}");
+                    _error
+                }).ok().map(|path| snapshot.project_root.join(path)))
+        }).collect::<Option<Vec<_>>>();
+        let manifest_paths = checkout_view_some!(
+            manifest_paths,
+            "manifest_paths_unavailable: generation={generation}"
+        );
         let ticket = crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
-        let mut verification = self.checkout_view_verification.lock().ok()?;
+        let mut verification = checkout_view_ok!(
+            self.checkout_view_verification.lock(),
+            "verification_mutex_poisoned: root={:?}",
+            snapshot.project_root
+        );
         if verification
             .as_ref()
             .is_none_or(|cached| cached.root != snapshot.project_root || cached.ticket != ticket)
@@ -1027,18 +1108,32 @@ impl InspectManager {
                 files: BTreeMap::new(),
             });
         }
-        if !crate::views::read::callgraph_paths_match_cached(
-            &manifest,
-            &snapshot.project_root,
-            &manifest_paths,
-            observed_stats,
-            &mut verification.as_mut()?.files,
-        )
-        .ok()?
-        {
+        if !checkout_view_ok!(
+            crate::views::read::callgraph_paths_match_cached(
+                &manifest,
+                &snapshot.project_root,
+                &manifest_paths,
+                observed_stats,
+                &mut checkout_view_some!(
+                    verification.as_mut(),
+                    "verification_memo_missing: root={:?} ticket={ticket}",
+                    snapshot.project_root
+                )
+                .files,
+            ),
+            "source_verification_error: root={:?} generation={generation}",
+            snapshot.project_root
+        ) {
+            note_checkout_view_refusal!("source_verification_false: root={:?} generation={generation} manifest_files={} observed_files={:?}", snapshot.project_root, manifest_paths.len(), observed_stats.map(<[_]>::len));
             return None;
         }
-        if crate::cache_freshness::capture_verify_ticket(&snapshot.project_root) != ticket {
+        let completed_ticket =
+            crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
+        if completed_ticket != ticket {
+            note_checkout_view_refusal!(
+                "invalidation_ticket_changed: root={:?} before={ticket} after={completed_ticket}",
+                snapshot.project_root
+            );
             *verification = None;
             return None;
         }
@@ -4300,22 +4395,45 @@ fn current_view_projection_store(
                 callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
                     .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
             })
-            .ok_or_else(|| "inspect storage unavailable".to_string())?;
+            .ok_or_else(|| {
+                note_checkout_view_refusal!("projection_storage_missing: config.storage_dir={:?} root={project_root:?} inspect_dir={inspect_dir:?}", config.storage_dir);
+                "inspect storage unavailable".to_string()
+            })?;
         let scope = crate::path_identity::project_scope_key(project_root);
-        let view =
-            crate::views::ViewStore::open(&storage, &scope).map_err(|error| error.to_string())?;
-        let Some(generation) = view
-            .current_generation()
-            .map_err(|error| error.to_string())?
+        let view = crate::views::ViewStore::open(&storage, &scope).map_err(|error| {
+            note_checkout_view_refusal!(
+                "projection_view_open: storage={storage:?} scope={scope} error={error}"
+            );
+            error.to_string()
+        })?;
+        let Some(generation) = view.current_generation().map_err(|error| {
+            note_checkout_view_refusal!(
+                "projection_pointer_read: view_dir={:?} error={error}",
+                view.view_dir()
+            );
+            error.to_string()
+        })?
         else {
+            note_checkout_view_refusal!(
+                "projection_unpublished: view_dir={:?} current_generation=None",
+                view.view_dir()
+            );
             return Ok(None);
         };
-        let pin = crate::pins::QueryPin::acquire(view.view_dir(), &generation)
-            .map_err(|error| error.to_string())?;
+        let pin =
+            crate::pins::QueryPin::acquire(view.view_dir(), &generation).map_err(|error| {
+                note_checkout_view_refusal!(
+                    "projection_pin_acquire: view_dir={:?} generation={generation} error={error}",
+                    view.view_dir()
+                );
+                error.to_string()
+            })?;
         let Some(head_fingerprint) = crate::views::cached_head_fingerprint(project_root) else {
+            note_checkout_view_refusal!("projection_head_uncached: root={project_root:?} scope={scope} generation={generation} cached_head=None");
             return Ok(None);
         };
         if !crate::views::generation_matches_head(&generation, &head_fingerprint) {
+            note_checkout_view_refusal!("projection_head_mismatch: root={project_root:?} generation={generation} cached_head={head_fingerprint}");
             return Ok(None);
         }
         if !refresh_paths.is_empty() {
@@ -4335,7 +4453,10 @@ fn current_view_projection_store(
             &generation,
             Some(Arc::new(pin)),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            note_checkout_view_refusal!("projection_callgraph_open: root={project_root:?} view_dir={:?} generation={generation} error={error}", view.view_dir());
+            error.to_string()
+        })?;
         Ok(Some((store, generation)))
     })();
     match result {
