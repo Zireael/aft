@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
@@ -108,7 +108,9 @@ describe("Tool round-trips", () => {
 
   test("aft_outline directory and array preserve the real structure golden", async () => {
     createBridge();
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-outline-golden-"));
+    // BridgePool canonicalizes its root. Use that same spelling for the fixture
+    // paths so the display root cannot change at a temp-directory symlink.
+    tmpDir = await realpath(await mkdtemp(resolve(tmpdir(), "aft-outline-golden-")));
     sdkCtx = createMockSdkContext(tmpDir);
     const fixtureRoot = resolve(PROJECT_CWD, "crates/aft/tests/fixtures/outline_summaries");
     const directory = resolve(tmpDir, "outline-summary");
@@ -119,7 +121,7 @@ describe("Tool round-trips", () => {
       await writeFile(path, await readFile(resolve(fixtureRoot, name), "utf8"));
       paths.push(path);
     }
-    const golden = await readFile(resolve(fixtureRoot, "structure_common_root.txt"), "utf8");
+    const golden = await readFile(resolve(fixtureRoot, "structure.txt"), "utf8");
     const tools = readingTools(createPluginContext(pool));
     expect(await tools.aft_outline.execute({ target: paths }, sdkCtx)).toBe(golden);
     expect(await tools.aft_outline.execute({ target: directory }, sdkCtx)).toBe(golden);

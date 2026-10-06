@@ -719,11 +719,12 @@ fn outline_structure_entries(
                 base.push(module);
             }
             let mut included = base.join(&included_path);
+            let mut label_path = PathBuf::from(&included_path);
             if region.implicit_include && !included.is_file() {
-                included = base.join(&region.summary.name).join("mod.rs");
+                label_path = PathBuf::from(&region.summary.name).join("mod.rs");
+                included = base.join(&label_path);
             }
-            let included_label = relative_path_from_root(&included, parent)
-                .unwrap_or_else(|| path_to_slash(&included));
+            let included_label = test_module_include_label(parent, &base, &label_path);
             // A test include is navigation metadata, not a requested file. A
             // denied or unavailable include must not hide the declaring file's
             // product API or bypass the project's path restrictions.
@@ -793,6 +794,14 @@ fn outline_structure_entries(
         insert_summary_entry(&mut entries, entry);
     }
     Ok(entries)
+}
+
+fn test_module_include_label(parent: &Path, base: &Path, included_path: &Path) -> String {
+    // Joining `..` onto a Windows verbatim path normalizes it immediately,
+    // before a relative label can be recovered. Build the label from the
+    // module's relative base and the declared path instead of its read path.
+    let relative_base = base.strip_prefix(parent).unwrap_or(base);
+    path_to_slash(&relative_base.join(included_path))
 }
 
 fn insert_summary_entry(entries: &mut Vec<OutlineEntry>, entry: OutlineEntry) {
@@ -3393,6 +3402,93 @@ mod tests {
             multi_file_text(&[path]),
             include_str!("../../tests/fixtures/outline_summaries/test_free.txt")
         );
+    }
+
+    #[test]
+    fn outline_portability_goldens_stay_lf_with_autocrlf() {
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = format!("{}/", path_to_slash(temp.path()));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (name, expected) in [
+            (
+                "test_free.txt",
+                include_str!("../../tests/fixtures/outline_summaries/test_free.txt"),
+            ),
+            (
+                "structure.txt",
+                include_str!("../../tests/fixtures/outline_summaries/structure.txt"),
+            ),
+            (
+                "structure_common_root.txt",
+                include_str!("../../tests/fixtures/outline_summaries/structure_common_root.txt"),
+            ),
+        ] {
+            let relative = format!("crates/aft/tests/fixtures/outline_summaries/{name}");
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.autocrlf=true",
+                    "checkout-index",
+                    "--force",
+                    &format!("--prefix={prefix}"),
+                    "--",
+                    &relative,
+                ])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let bytes = std::fs::read(temp.path().join(relative)).unwrap();
+            assert!(
+                !bytes.contains(&b'\r'),
+                "{name} was converted to CRLF during checkout"
+            );
+            assert_eq!(
+                bytes,
+                expected.as_bytes(),
+                "{name} checkout changed its golden bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn outline_portability_include_labels_preserve_parent_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(temp.path()).unwrap();
+        assert_eq!(
+            test_module_include_label(&parent, &parent, Path::new("../outside.rs")),
+            "../outside.rs"
+        );
+        assert_eq!(
+            test_module_include_label(
+                &parent,
+                &parent.join("product/outer"),
+                Path::new("../checks.rs")
+            ),
+            "product/outer/../checks.rs"
+        );
+        assert_eq!(
+            test_module_include_label(&parent, &parent.join("product"), Path::new("tests/mod.rs")),
+            "product/tests/mod.rs"
+        );
+    }
+
+    #[test]
+    fn outline_portability_crlf_source_renders_lf_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test_free.ts");
+        let source = include_str!("../../tests/fixtures/outline_summaries/test_free.ts");
+        std::fs::write(&path, source.replace('\n', "\r\n")).unwrap();
+        let text = multi_file_text(&[path]);
+        assert_eq!(
+            text,
+            include_str!("../../tests/fixtures/outline_summaries/test_free.txt")
+        );
+        assert!(!text.contains('\r'));
     }
 
     /// Multi-file outline checks each file's syntax and then extracts its
