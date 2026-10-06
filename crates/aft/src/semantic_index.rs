@@ -780,6 +780,8 @@ struct BuildRequestBudget {
 #[derive(Debug, Clone, Copy)]
 enum EmbeddingRequestPolicy {
     Build(BuildRequestBudget),
+    /// The view worker owns retry backoff; an identity probe sends one request.
+    Probe(Duration),
     Query(QueryBudget),
 }
 
@@ -787,13 +789,14 @@ impl EmbeddingRequestPolicy {
     fn max_attempts(self) -> usize {
         match self {
             Self::Build(_) => EMBEDDING_REQUEST_MAX_ATTEMPTS,
-            Self::Query(_) => 1,
+            Self::Probe(_) | Self::Query(_) => 1,
         }
     }
 
     fn request_timeout(self) -> Duration {
         match self {
             Self::Build(budget) => Duration::from_millis(budget.deadline_ms),
+            Self::Probe(timeout) => timeout,
             Self::Query(budget) => Duration::from_millis(budget.timeout_ms),
         }
     }
@@ -1970,7 +1973,9 @@ where
         let request = make_request().timeout(policy.request_timeout());
 
         let exchange = match policy {
-            EmbeddingRequestPolicy::Build(_) => execute_embedding_exchange(request),
+            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => {
+                execute_embedding_exchange(request)
+            }
             EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
         };
         let (status, raw) = match exchange {
@@ -2273,6 +2278,21 @@ impl SemanticEmbeddingModel {
             fingerprint.synapse_equivalent_to = identity.equivalent_to.clone();
         }
         Ok(fingerprint)
+    }
+
+    /// Resolve a view's producer with one HTTP probe, leaving retry scheduling
+    /// to the checkout worker rather than multiplying requests inside each retry.
+    pub(crate) fn fingerprint_for_view(
+        &mut self,
+        config: &SemanticBackendConfig,
+    ) -> Result<SemanticIndexFingerprint, String> {
+        if self.dimension.is_none() && self.uses_http_embedding_backend() {
+            self.embed_texts(
+                vec!["semantic index fingerprint probe".to_string()],
+                EmbeddingRequestPolicy::Probe(Duration::from_millis(self.timeout_ms)),
+            )?;
+        }
+        self.fingerprint(config)
     }
 
     fn uses_http_embedding_backend(&self) -> bool {
@@ -2646,7 +2666,7 @@ impl SemanticEmbeddingModel {
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
         let query_cache_key = match policy {
-            EmbeddingRequestPolicy::Build(_) => None,
+            EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => None,
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
@@ -2854,7 +2874,7 @@ impl SemanticEmbeddingModel {
             }
             SemanticEmbeddingEngine::Synapse(client) => {
                 let vectors = match policy {
-                    EmbeddingRequestPolicy::Build(_) => client
+                    EmbeddingRequestPolicy::Build(_) | EmbeddingRequestPolicy::Probe(_) => client
                         .embed_batch(&texts)
                         .map_err(|error| error.to_string())?,
                     EmbeddingRequestPolicy::Query(budget) => {

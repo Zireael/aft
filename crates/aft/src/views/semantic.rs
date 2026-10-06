@@ -271,6 +271,10 @@ pub struct SemanticPlane {
     separator: char,
     /// Unique in the process and never reused, unlike the plane's address.
     id: u64,
+    /// Counts actual fill reads separately from the driver's reconciliation
+    /// reads, so source-reuse tests cannot miss a read on the embedding path.
+    #[cfg(test)]
+    source_reads: Mutex<BTreeMap<PathBuf, usize>>,
 }
 
 static NEXT_PLANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -318,7 +322,14 @@ impl SemanticPlane {
             overlay_builds: std::sync::atomic::AtomicU64::new(0),
             id: NEXT_PLANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             separator: std::path::MAIN_SEPARATOR,
+            #[cfg(test)]
+            source_reads: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_source_reads(&self) -> BTreeMap<PathBuf, usize> {
+        std::mem::take(&mut *lock(&self.source_reads))
     }
 
     /// Lets a test on any platform run the overlay with Windows' separator.
@@ -560,7 +571,12 @@ impl SemanticPlane {
             ) else {
                 continue;
             };
-            match std::fs::read(root.join(&source)) {
+            let source = root.join(&source);
+            #[cfg(test)]
+            {
+                *lock(&self.source_reads).entry(source.clone()).or_default() += 1;
+            }
+            match std::fs::read(&source) {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
                     prepared.push(PreparedWork {
                         rel_path: item.rel_path.as_bytes().to_vec(),

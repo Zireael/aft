@@ -84,8 +84,8 @@ pub struct CheckoutSemantic {
     /// Fills installed since the last fold into a published generation.
     unfolded: AtomicBool,
     refresh_attempts: AtomicUsize,
-    /// Why this checkout's vectors cannot be brought up to date, when a
-    /// refresh failed in a way that retrying on a timer would not fix. Searches
+    /// Why this checkout's vectors cannot be brought up to date, including
+    /// the scheduled deadline when a transient refresh is being retried. Searches
     /// report it as `semantic: unavailable: <reason>`.
     unavailable: Mutex<Option<String>>,
     /// Wakes the fill worker after an AFT write to this checkout. It is held
@@ -239,8 +239,8 @@ impl CheckoutSemantic {
         self.refresh_attempts.load(Ordering::SeqCst)
     }
 
-    /// Why the checkout's vectors cannot be brought up to date, when a
-    /// refresh hit an error that retrying on a timer would not fix.
+    /// Why the checkout's vectors cannot be brought up to date, including a
+    /// scheduled retry deadline for transient errors.
     pub fn unavailable_reason(&self) -> Option<String> {
         lock(&self.unavailable).clone()
     }
@@ -437,6 +437,12 @@ pub struct CheckoutSemanticSlot {
     /// Held while an epoch changes and while a lane publishes its view, so a
     /// publication and the check that its lane is still current are atomic.
     publish: Mutex<()>,
+    retry: Mutex<Option<RetryDeadline>>,
+}
+
+struct RetryDeadline {
+    due: Instant,
+    query_allowed_at: Instant,
 }
 
 impl CheckoutSemanticSlot {
@@ -451,11 +457,13 @@ impl CheckoutSemanticSlot {
         let state = match self.state() {
             None => "none".to_owned(),
             Some(CheckoutSemanticState::Loading) => "loading".to_owned(),
-            Some(CheckoutSemanticState::Ready(runtime)) => format!(
-                "ready producer={} unavailable={:?}",
-                runtime.plane().semantic_producer().id(),
-                runtime.unavailable_reason()
-            ),
+            Some(CheckoutSemanticState::Ready(runtime)) => match runtime.unavailable_reason() {
+                Some(reason) => format!("unavailable: {reason}"),
+                None => format!(
+                    "ready producer={}",
+                    runtime.plane().semantic_producer().id()
+                ),
+            },
             Some(CheckoutSemanticState::Unavailable(reason)) => format!("unavailable: {reason}"),
         };
         format!(
@@ -476,6 +484,7 @@ impl CheckoutSemanticSlot {
             self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
         };
         *lock(&self.wake) = Some(sender);
+        *lock(&self.retry) = None;
         *self
             .state
             .write()
@@ -515,6 +524,7 @@ impl CheckoutSemanticSlot {
             self.epoch.fetch_add(1, Ordering::SeqCst);
         }
         *lock(&self.wake) = None;
+        *lock(&self.retry) = None;
         *self
             .state
             .write()
@@ -549,6 +559,26 @@ impl CheckoutSemanticSlot {
         if let Some(sender) = lock(&self.wake).as_ref() {
             let _ = sender.send(());
         }
+    }
+
+    /// Expedites a transient retry at most once per probe interval.
+    /// The request path only wakes the worker; it never loads or embeds sources.
+    pub fn request_retry(&self) {
+        if self.request_retry_at(Instant::now()) {
+            self.wake();
+        }
+    }
+
+    fn request_retry_at(&self, now: Instant) -> bool {
+        let mut retry = lock(&self.retry);
+        let Some(retry) = retry.as_mut() else {
+            return false;
+        };
+        if now < retry.query_allowed_at || now >= retry.due {
+            return false;
+        }
+        retry.due = now;
+        true
     }
 }
 
@@ -654,6 +684,129 @@ fn is_current(slot: &Weak<CheckoutSemanticSlot>, epoch: u64) -> bool {
     slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
 }
 
+/// Arms one bounded retry and names its deadline on every status surface.
+fn schedule_retry(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    reason: &str,
+    wait: Duration,
+    initial: Duration,
+) -> String {
+    let now = Instant::now();
+    if let Some(slot) = slot.upgrade() {
+        let mut retry = lock(&slot.retry);
+        // Recheck after acquiring the mutex: an epoch can change while a
+        // superseded worker waits for the replacement's retry state.
+        if slot.is_current(epoch) {
+            *retry = Some(RetryDeadline {
+                due: now + wait,
+                query_allowed_at: now + initial.min(Duration::from_secs(1)),
+            });
+        }
+    }
+    let due = (std::time::SystemTime::now() + wait)
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!(
+        "{}; next retry due at unix_ms={due} (scheduled in {} ms)",
+        crate::semantic_index::strip_transient_embedding_marker(reason),
+        wait.as_millis()
+    )
+}
+
+fn clear_retry(slot: &Weak<CheckoutSemanticSlot>, epoch: u64) {
+    if let Some(slot) = slot.upgrade() {
+        let mut retry = lock(&slot.retry);
+        if slot.is_current(epoch) {
+            *retry = None;
+        }
+    }
+}
+
+/// Ordinary edit wakes do not bypass backoff. Only a rate-limited query can
+/// advance the deadline. Channel closure or an epoch change cancels the wait.
+fn wait_retry(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    wake: &crossbeam_channel::Receiver<()>,
+) -> bool {
+    loop {
+        let Some(current) = slot.upgrade().filter(|slot| slot.is_current(epoch)) else {
+            return false;
+        };
+        let remaining = lock(&current.retry)
+            .as_ref()
+            .map(|retry| retry.due.saturating_duration_since(Instant::now()))
+            .unwrap_or_default();
+        drop(current);
+        if remaining.is_zero() {
+            return true;
+        }
+        match wake.recv_timeout(remaining) {
+            Ok(()) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => return is_current(slot, epoch),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Retry the failed stage, not the whole activation. In particular, a failed
+/// fingerprint probe cannot cause a checkout walk, read or content embedding.
+fn retry_activation<T>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    wake: &crossbeam_channel::Receiver<()>,
+    config: &WorkerConfig,
+    stage: &str,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, RefreshError> {
+    let mut backoff = config.schedule.retry_initial;
+    loop {
+        if !is_current(slot, epoch) {
+            return Err(RefreshError::Superseded);
+        }
+        match attempt().map_err(RefreshError::classify) {
+            Ok(value) => {
+                clear_retry(slot, epoch);
+                return Ok(value);
+            }
+            Err(RefreshError::Transient(reason)) => {
+                let reason = schedule_retry(
+                    slot,
+                    epoch,
+                    &format!("{stage}: {reason}"),
+                    backoff,
+                    config.schedule.retry_initial,
+                );
+                if let Some(slot) = slot.upgrade() {
+                    slot.fail(epoch, reason.clone());
+                }
+                set_status(
+                    slot,
+                    epoch,
+                    &config.status,
+                    crate::context::SemanticIndexStatus::Failed(format!(
+                        "semantic: unavailable: {reason}"
+                    )),
+                );
+                crate::slog_warn!(
+                    "semantic view unavailable root={} reason={}",
+                    config.root.display(),
+                    reason
+                );
+                #[cfg(test)]
+                observe_fill(&config.root, "unavailable");
+                if !wait_retry(slot, epoch, wake) {
+                    return Err(RefreshError::Superseded);
+                }
+                backoff = (backoff * 2).min(config.schedule.retry_max);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Counts a running worker on its slot for as long as it lives.
 struct WorkerGuard(Weak<CheckoutSemanticSlot>);
 
@@ -675,8 +828,8 @@ impl Drop for WorkerGuard {
 }
 
 /// Runs a root's views-on semantic lane: starts the embedding model,
-/// registers and loads the checkout, then fills it now and whenever
-/// [`serve_fills`] decides to.
+/// registers and loads the checkout, then fills it now and whenever the
+/// fill scheduler decides to.
 ///
 /// The worker holds the slot only weakly, so it stops when the root's
 /// context is dropped or the lane is cleared.
@@ -693,6 +846,7 @@ pub(crate) fn run_worker(
         return;
     }
     let fail = |reason: String| {
+        clear_retry(&slot, epoch);
         crate::slog_warn!(
             "semantic view unavailable root={} reason={}",
             config.root.display(),
@@ -707,15 +861,27 @@ pub(crate) fn run_worker(
             &config.status,
             crate::context::SemanticIndexStatus::Failed(format!("semantic: unavailable: {reason}")),
         );
+        #[cfg(test)]
+        observe_fill(&config.root, "unavailable");
     };
-    let mut model = match crate::semantic_index::EmbeddingModel::from_config(&config.semantic) {
-        Ok(model) => model,
-        Err(error) => return fail(format!("embedding model: {error}")),
-    };
-    let fingerprint = match model.fingerprint(&config.semantic) {
-        Ok(fingerprint) => fingerprint,
-        Err(error) => return fail(format!("embedding model: {error}")),
-    };
+    let mut model = None;
+    let fingerprint =
+        match retry_activation(&slot, epoch, &wake, &config, "embedding model", || {
+            if model.is_none() {
+                model = Some(crate::semantic_index::EmbeddingModel::from_config(
+                    &config.semantic,
+                )?);
+            }
+            model
+                .as_mut()
+                .unwrap()
+                .fingerprint_for_view(&config.semantic)
+        }) {
+            Ok(fingerprint) => fingerprint,
+            Err(RefreshError::Superseded) => return,
+            Err(error) => return fail(format!("embedding model: {error}")),
+        };
+    let mut model = model.unwrap();
     let producer = SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
     if !is_current(&slot, epoch) {
         return;
@@ -745,40 +911,14 @@ pub(crate) fn run_worker(
     let started = Instant::now();
     #[cfg(any(test, feature = "test-timing-hooks"))]
     delay_startup_io_for_test("SEMANTIC_VIEW_LOAD");
-    let mut wait = config.schedule.retry_initial;
-    loop {
-        match runtime.load() {
-            Ok(_) => break,
-            // This lane was superseded while it loaded; its publication was
-            // refused and the lane that replaced it owns the view.
-            Err(error) if error.contains(super::first_load::SUPERSEDED_PUBLISH) => {
-                config.drivers.clear_if(runtime.driver());
-                return;
-            }
-            // The checkout changed while it was loaded, or a database was
-            // busy: load again after a wait instead of failing the lane. A
-            // producer mismatch is not retried: with the lane fence, this
-            // process never publishes another producer into the view, so one
-            // means another process with other semantic settings publishes
-            // the same checkout, a conflict that fails the lane by name.
-            Err(error) if is_transient_reason(&error) => {
-                crate::slog_info!(
-                    "semantic view load will retry root={} error={}",
-                    config.root.display(),
-                    error
-                );
-                std::thread::sleep(wait);
-                wait = (wait * 2).min(config.schedule.retry_max);
-                if !is_current(&slot, epoch) {
-                    config.drivers.clear_if(runtime.driver());
-                    return;
-                }
-            }
-            Err(error) => {
-                config.drivers.clear_if(runtime.driver());
-                return fail(format!("view load: {error}"));
-            }
+    if let Err(error) =
+        retry_activation(&slot, epoch, &wake, &config, "view load", || runtime.load())
+    {
+        config.drivers.clear_if(runtime.driver());
+        if error != RefreshError::Superseded {
+            fail(format!("view load: {error}"));
         }
+        return;
     }
     // Build the index queries score before the lane is served, so neither
     // the first query nor a readiness sample has to build it.
@@ -804,9 +944,14 @@ pub(crate) fn run_worker(
         crate::context::SemanticIndexStatus::ready(),
     );
     drop(runtime);
-    serve_fills(&slot, epoch, &wake, &config.schedule, &mut |texts| {
-        model.embed(texts)
-    });
+    serve_fills_with_status(
+        &slot,
+        epoch,
+        &wake,
+        &config.schedule,
+        Some(&config.status),
+        &mut |texts| model.embed(texts),
+    );
 }
 
 /// What one catch-up left behind.
@@ -815,7 +960,10 @@ enum FillOutcome {
     Settled,
     /// Work is left because of a transient error or a paused root; retry
     /// after a wait. `progress` is whether this attempt got anything done.
-    Retry { progress: bool },
+    Retry {
+        progress: bool,
+        reason: Option<String>,
+    },
     /// The lane is no longer this worker's.
     Stop,
 }
@@ -875,11 +1023,25 @@ fn observe_fill(root: &Path, event: &'static str) {
 /// window following each wake, and after a backoff when a fill left work
 /// behind because of a transient error. Returns when the lane is cleared,
 /// restarted or dropped.
+#[cfg(test)]
 pub(crate) fn serve_fills<F>(
     slot: &Weak<CheckoutSemanticSlot>,
     epoch: u64,
     wake: &crossbeam_channel::Receiver<()>,
     schedule: &FillSchedule,
+    embed: &mut F,
+) where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    serve_fills_with_status(slot, epoch, wake, schedule, None, embed);
+}
+
+fn serve_fills_with_status<F>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    wake: &crossbeam_channel::Receiver<()>,
+    schedule: &FillSchedule,
+    status: Option<&RwLock<crate::context::SemanticIndexStatus>>,
     embed: &mut F,
 ) where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -894,7 +1056,15 @@ pub(crate) fn serve_fills<F>(
     loop {
         if !first {
             let woke = match retry_after {
-                Some(wait) => match wake.recv_timeout(wait) {
+                Some((_, true)) => {
+                    if !wait_retry(slot, epoch, wake) {
+                        return;
+                    }
+                    false
+                }
+                // Rebinding a paused checkout should resume it immediately;
+                // only failed backend probes are held to a retry deadline.
+                Some((wait, false)) => match wake.recv_timeout(wait) {
                     Ok(()) => true,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
@@ -923,7 +1093,10 @@ pub(crate) fn serve_fills<F>(
         let outcome = if (schedule.paused)() {
             #[cfg(test)]
             observe_fill(&schedule.root, "paused");
-            FillOutcome::Retry { progress: false }
+            FillOutcome::Retry {
+                progress: false,
+                reason: None,
+            }
         } else {
             match slot
                 .upgrade()
@@ -937,16 +1110,49 @@ pub(crate) fn serve_fills<F>(
         match outcome {
             FillOutcome::Stop => return,
             FillOutcome::Settled => {
+                clear_retry(slot, epoch);
+                if let Some(status) = status {
+                    let value = match slot
+                        .upgrade()
+                        .and_then(|slot| slot.runtime())
+                        .and_then(|runtime| runtime.unavailable_reason())
+                    {
+                        Some(reason) => crate::context::SemanticIndexStatus::Failed(format!(
+                            "semantic: unavailable: {reason}"
+                        )),
+                        None => crate::context::SemanticIndexStatus::ready(),
+                    };
+                    set_status(slot, epoch, status, value);
+                }
                 #[cfg(test)]
                 observe_fill(&schedule.root, "settled");
                 backoff = schedule.retry_initial;
                 retry_after = None;
             }
-            FillOutcome::Retry { progress } => {
+            FillOutcome::Retry { progress, reason } => {
                 if progress {
                     backoff = schedule.retry_initial;
                 }
-                retry_after = Some(backoff);
+                retry_after = Some((backoff, reason.is_some()));
+                if let Some(reason) = reason {
+                    let reason =
+                        schedule_retry(slot, epoch, &reason, backoff, schedule.retry_initial);
+                    if let Some(runtime) = slot.upgrade().and_then(|slot| slot.runtime()) {
+                        runtime.set_unavailable(reason.clone());
+                    }
+                    if let Some(status) = status {
+                        set_status(
+                            slot,
+                            epoch,
+                            status,
+                            crate::context::SemanticIndexStatus::Failed(format!(
+                                "semantic: unavailable: {reason}"
+                            )),
+                        );
+                    }
+                    #[cfg(test)]
+                    observe_fill(&schedule.root, "retry");
+                }
                 backoff = (backoff * 2).min(schedule.retry_max);
             }
         }
@@ -1026,13 +1232,25 @@ where
                     return FillOutcome::Settled;
                 }
                 if !report.errors.is_empty() {
+                    if let Some(error) = report
+                        .errors
+                        .iter()
+                        .find(|error| !crate::semantic_index::embedding_failure_is_transient(error))
+                    {
+                        mark_unavailable(runtime, schedule, error.clone());
+                        warm_index(runtime);
+                        return FillOutcome::Settled;
+                    }
                     crate::slog_warn!(
                         "semantic view fill left work for a retry root={} error={}",
                         schedule.root.display(),
                         report.errors[0]
                     );
                     warm_index(runtime);
-                    return FillOutcome::Retry { progress };
+                    return FillOutcome::Retry {
+                        progress,
+                        reason: report.errors.first().cloned(),
+                    };
                 }
                 runtime.clear_unavailable();
                 // Work beyond the budget continues at once; a round that made
@@ -1048,7 +1266,10 @@ where
                     schedule.root.display(),
                     error
                 );
-                return FillOutcome::Retry { progress };
+                return FillOutcome::Retry {
+                    progress,
+                    reason: Some(error),
+                };
             }
             Err(RefreshError::Unavailable(error)) => {
                 mark_unavailable(runtime, schedule, error);
@@ -1109,23 +1330,24 @@ impl std::fmt::Display for RefreshError {
     }
 }
 
-/// Whether a load or store failure clears by itself. Embedding failures
-/// never reach this: a fill reports them in `FillReport::errors`, which are
-/// always retried. The only store failure retried is SQLite's busy/locked
+/// Whether a model, load or store failure clears by itself. Embedding errors
+/// carry the backend's authoritative transient marker. The only store failure
+/// retried is SQLite's busy/locked
 /// (another connection holds the database for a moment); every other store
 /// error is surfaced as the checkout's named gap.
 pub fn is_transient_reason(reason: &str) -> bool {
-    [
-        super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
-        super::first_load::CHECKOUT_WRITE_ACTIVE,
-        super::first_load::CHECKOUT_CHANGED_BEFORE_INSTALL,
-        // SQLITE_BUSY and SQLITE_LOCKED, as rusqlite renders them.
-        "database is locked",
-        "database table is locked",
-        "database is busy",
-    ]
-    .iter()
-    .any(|marker| reason.contains(marker))
+    crate::semantic_index::embedding_failure_is_transient(reason)
+        || [
+            super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
+            super::first_load::CHECKOUT_WRITE_ACTIVE,
+            super::first_load::CHECKOUT_CHANGED_BEFORE_INSTALL,
+            // SQLITE_BUSY and SQLITE_LOCKED, as rusqlite renders them.
+            "database is locked",
+            "database table is locked",
+            "database is busy",
+        ]
+        .iter()
+        .any(|marker| reason.contains(marker))
 }
 
 /// Rebuilds the scored index after a fill, on the worker rather than on the

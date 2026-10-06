@@ -9228,6 +9228,10 @@ impl AppContext {
     }
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
+        // Queries sample status before deciding whether semantic search can
+        // run. Wake a failed views-on lane here, even when no runtime exists
+        // yet; status polling shares the same rate limit as interactive queries.
+        self.checkout_semantic.request_retry();
         self.semantic_index_status.as_ref()
     }
 

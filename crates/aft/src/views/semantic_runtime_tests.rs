@@ -909,6 +909,468 @@ fn fast_schedule(root: &Path) -> FillSchedule {
     }
 }
 
+/// A real HTTP backend, initially refusing connections, with counts separated
+/// into identity probes and source texts. Binding is delayed until the test
+/// has observed the worker's first failure.
+struct RecoveringBackend {
+    addr: std::net::SocketAddr,
+    probes: Arc<AtomicUsize>,
+    texts: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RecoveringBackend {
+    fn offline() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        Self {
+            addr,
+            probes: Arc::new(AtomicUsize::new(0)),
+            texts: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
+    fn config(&self) -> crate::config::SemanticBackendConfig {
+        crate::config::SemanticBackendConfig {
+            backend: crate::config::SemanticBackend::OpenAiCompatible,
+            base_url: Some(format!("http://{}", self.addr)),
+            model: "retry-test".into(),
+            timeout_ms: 1000,
+            ..Default::default()
+        }
+    }
+
+    fn start(&mut self, status: u16) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(self.addr).unwrap();
+        self.stop.store(false, Ordering::SeqCst);
+        let probes = Arc::clone(&self.probes);
+        let texts = Arc::clone(&self.texts);
+        let stop = Arc::clone(&self.stop);
+        self.worker = Some(std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                let (start, length) = loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let length: usize = String::from_utf8_lossy(&bytes[..end])
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break (end + 4, length);
+                        }
+                    }
+                };
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[start..start + length]).unwrap();
+                let inputs = body["input"].as_array().unwrap();
+                let data: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        let text = input.as_str().unwrap();
+                        if text == "semantic index fingerprint probe" {
+                            probes.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            texts.fetch_add(1, Ordering::SeqCst);
+                        }
+                        serde_json::json!({"index": index, "embedding": vector(text)})
+                    })
+                    .collect();
+                let body = if status == 200 {
+                    serde_json::json!({"data": data}).to_string()
+                } else {
+                    "wrong model".to_string()
+                };
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }));
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for RecoveringBackend {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[test]
+fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let mut backend = RecoveringBackend::offline();
+    // A previous session already stored every vector. Retrying identity must
+    // reuse these vectors, not re-embed the checkout when the backend returns.
+    backend.start(200);
+    let semantic = backend.config();
+    let mut model = crate::semantic_index::EmbeddingModel::from_config(&semantic).unwrap();
+    let fingerprint = model.fingerprint(&semantic).unwrap();
+    let seed = CheckoutSemantic::new(
+        storage.path(),
+        "family",
+        "scope",
+        root.path(),
+        SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps),
+        Weak::new(),
+    )
+    .unwrap();
+    seed.load().unwrap();
+    seed.refresh(FillBudget::default(), &mut |texts| model.embed(texts))
+        .unwrap();
+    let seed_work = seed.driver().take_reconcile_work();
+    let stored_texts = backend.texts.load(Ordering::SeqCst);
+    drop(seed);
+    drop(model);
+    backend.shutdown();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
+    let drivers = InstalledDriver::default();
+    let config = WorkerConfig {
+        root: root.path().to_path_buf(),
+        storage: storage.path().to_path_buf(),
+        family: "family".into(),
+        scope: "scope".into(),
+        semantic: backend.config(),
+        status: Arc::clone(&status),
+        drivers: drivers.clone(),
+        schedule: fast_schedule(root.path()),
+    };
+    let weak = Arc::downgrade(&slot);
+    let worker = std::thread::spawn(move || run_worker(weak, epoch, wake, config));
+    assert_eq!(observer.next(), "unavailable");
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("next retry due") && reason.contains("embedding model"))
+    );
+    // A second refused connection proves a timer fires without any wake.
+    let retried = observer.rx.recv_timeout(Duration::from_secs(5)).ok();
+    if retried != Some("unavailable") {
+        slot.clear();
+        worker.join().unwrap();
+        panic!("the failed fingerprint never retried without a wake: {retried:?}");
+    }
+    assert!(
+        drivers.get().is_none(),
+        "a failed probe must not walk the checkout"
+    );
+    backend.start(200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let recovered = loop {
+        match observer.rx.recv_deadline(deadline) {
+            Ok("unavailable") => continue,
+            event => break event.ok(),
+        }
+    };
+    let runtime = slot.runtime();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(
+        recovered,
+        Some("settled"),
+        "the failed fingerprint latched the semantic lane"
+    );
+    assert!(matches!(
+        *status.read().unwrap(),
+        crate::context::SemanticIndexStatus::Ready { .. }
+    ));
+    assert_eq!(
+        backend.probes.load(Ordering::SeqCst),
+        2,
+        "one seed probe and one recovery probe"
+    );
+    assert_eq!(
+        backend.texts.load(Ordering::SeqCst),
+        stored_texts,
+        "recovery re-embedded stored sources"
+    );
+    let runtime = runtime.unwrap();
+    assert!(query(&runtime, "alpha").complete());
+    assert!(
+        runtime.plane().take_source_reads().is_empty(),
+        "recovery fill read sources whose vectors were already stored"
+    );
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(work.walks, 1, "failed probes re-walked the checkout");
+    assert!(
+        work.reads <= seed_work.reads,
+        "recovery re-read unchanged files: {work:?}"
+    );
+}
+
+#[test]
+fn permanent_fingerprint_failure_does_not_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let mut backend = RecoveringBackend::offline();
+    backend.start(400);
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled));
+    let config = WorkerConfig {
+        root: root.path().to_path_buf(),
+        storage: storage.path().to_path_buf(),
+        family: "family".into(),
+        scope: "scope".into(),
+        semantic: backend.config(),
+        status: Arc::clone(&status),
+        drivers: InstalledDriver::default(),
+        schedule: fast_schedule(root.path()),
+    };
+    let (done, finished) = crossbeam_channel::bounded(1);
+    let weak = Arc::downgrade(&slot);
+    let worker = std::thread::spawn(move || {
+        run_worker(weak, epoch, wake, config);
+        done.send(()).unwrap();
+    });
+    let stopped = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+    let state = slot.state();
+    let armed = lock(&slot.retry).is_some();
+    slot.clear();
+    worker.join().unwrap();
+    assert!(stopped, "a permanent failure kept the retry worker alive");
+    assert!(!armed, "a permanent failure armed a retry");
+    assert!(
+        matches!(state, Some(CheckoutSemanticState::Unavailable(reason)) if reason.contains("wrong model") && !reason.contains("next retry"))
+    );
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("wrong model"))
+    );
+    assert_eq!(backend.probes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn view_fingerprint_retry_sends_one_probe_even_for_server_errors() {
+    let mut backend = RecoveringBackend::offline();
+    backend.start(503);
+    let config = backend.config();
+    let mut model = crate::semantic_index::EmbeddingModel::from_config(&config).unwrap();
+    let error = model.fingerprint_for_view(&config).unwrap_err();
+    assert!(
+        crate::semantic_index::embedding_failure_is_transient(&error),
+        "{error}"
+    );
+    assert_eq!(
+        backend.probes.load(Ordering::SeqCst),
+        1,
+        "one scheduled attempt sent multiple probes"
+    );
+    backend.shutdown();
+    backend.start(200);
+    model.fingerprint_for_view(&config).unwrap();
+    assert_eq!(backend.probes.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.texts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn query_retry_is_rate_limited_and_only_advances_transient_deadlines() {
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let weak = Arc::downgrade(&slot);
+    assert!(!slot.request_retry_at(Instant::now()));
+    schedule_retry(
+        &weak,
+        epoch,
+        "[transient] offline",
+        Duration::from_secs(300),
+        Duration::from_secs(5),
+    );
+    let allowed = lock(&slot.retry).as_ref().unwrap().query_allowed_at;
+    assert!(!slot.request_retry_at(allowed - Duration::from_nanos(1)));
+    assert!(slot.request_retry_at(allowed));
+    assert!(
+        !slot.request_retry_at(allowed),
+        "one query burst bypassed the limiter"
+    );
+    assert_eq!(lock(&slot.retry).as_ref().unwrap().due, allowed);
+    clear_retry(&weak, epoch);
+    assert!(!slot.request_retry_at(allowed + Duration::from_secs(10)));
+    slot.clear();
+    assert!(!wait_retry(&weak, epoch, &wake));
+}
+
+#[test]
+fn semantic_query_status_sample_expedites_retry_without_a_loaded_runtime() {
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = crate::context::AppContext::new(
+        crate::context::default_language_provider_factory(),
+        crate::config::Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    let reason = "semantic: unavailable: embedding model offline".to_owned();
+    *ctx.semantic_index_status().write().unwrap() =
+        crate::context::SemanticIndexStatus::Failed(reason.clone());
+    slot.fail(epoch, reason);
+    // Advance only the rate-limit clock, without sleeping or contacting a
+    // backend. The query must consume this allowance through the real context.
+    let now = Instant::now();
+    *lock(&slot.retry) = Some(RetryDeadline {
+        due: now + Duration::from_secs(300),
+        query_allowed_at: now - Duration::from_secs(1),
+    });
+    assert!(slot.runtime().is_none());
+    assert!(matches!(
+        *ctx.semantic_index_status().read().unwrap(),
+        crate::context::SemanticIndexStatus::Failed(_)
+    ));
+    assert_eq!(
+        wake.try_recv(),
+        Ok(()),
+        "query readiness did not wake the failed lane"
+    );
+    ctx.semantic_index_status();
+    assert_eq!(
+        wake.try_recv(),
+        Err(crossbeam_channel::TryRecvError::Empty),
+        "query burst bypassed the rate limit"
+    );
+    slot.clear();
+}
+
+#[test]
+fn transient_fill_recovery_does_not_reread_or_reembed_stored_content() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    let stored_texts = model.texts();
+    let target = root.path().join("src/gamma.rs");
+    std::fs::write(&target, "pub fn new_gamma() {}\n").unwrap();
+    runtime.driver().record_absolute_change(&target);
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let online = Arc::new(AtomicBool::new(false));
+    let status = Arc::new(RwLock::new(crate::context::SemanticIndexStatus::ready()));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        let online = Arc::clone(&online);
+        let model = Arc::clone(&model);
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || {
+            serve_fills_with_status(
+                &weak,
+                epoch,
+                &wake,
+                &fast_schedule(&root),
+                Some(&status),
+                &mut |texts| {
+                    if !online.load(Ordering::SeqCst) {
+                        Err("[transient] embedding backend unreachable".into())
+                    } else {
+                        model.embed(texts)
+                    }
+                },
+            );
+        })
+    };
+    assert_eq!(observer.next(), "retry");
+    assert!(
+        matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("next retry due"))
+    );
+    assert!(query(&runtime, "alpha").unavailable.is_some());
+    runtime.driver().take_reconcile_work();
+    runtime.plane().take_source_reads();
+    online.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let settled = loop {
+        match observer.rx.recv_deadline(deadline) {
+            Ok("retry") => continue,
+            event => break event.ok(),
+        }
+    };
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(settled, Some("settled"));
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(
+        (work.walks, work.reads),
+        (0, 0),
+        "retry repeated source work: {work:?}"
+    );
+    let reads = runtime.plane().take_source_reads();
+    assert_eq!(
+        reads.keys().collect::<Vec<_>>(),
+        vec![&target],
+        "retry read an unchanged, already-embedded source: {reads:?}"
+    );
+    assert_eq!(
+        model.texts() - stored_texts,
+        1,
+        "retry re-embedded unchanged sources"
+    );
+    assert!(query(&runtime, "gamma").complete());
+    assert!(matches!(
+        *status.read().unwrap(),
+        crate::context::SemanticIndexStatus::Ready { .. }
+    ));
+}
+
+#[test]
+fn permanent_fill_failure_preserves_reason_without_retry() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        let calls = Arc::clone(&calls);
+        std::thread::spawn(move || {
+            serve_fills(&weak, epoch, &wake, &fast_schedule(&root), &mut |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("embedding dimension mismatch".into())
+            });
+        })
+    };
+    let event = observer.next();
+    let armed = lock(&slot.retry).is_some();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(event, "settled");
+    assert!(!armed, "dimension mismatch armed a retry");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime.unavailable_reason().as_deref(),
+        Some("embedding dimension mismatch")
+    );
+}
+
 /// A lane whose checkout is loaded and served, as the worker leaves it.
 fn served_lane(
     storage: &Path,
@@ -956,7 +1418,7 @@ fn transient_embed_errors_retry_until_complete_without_a_wake() {
             serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
                 // The backend is unreachable for the first three calls.
                 if calls.fetch_add(1, Ordering::SeqCst) < 3 {
-                    return Err("embedding backend unreachable".to_string());
+                    return Err("[transient] embedding backend unreachable".to_string());
                 }
                 Ok(texts.iter().map(|text| vector(text)).collect())
             });
