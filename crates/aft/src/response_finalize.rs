@@ -10,6 +10,31 @@ use serde_json::Value;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
+/// Emergency ceiling, deliberately above every normal tool budget. A cut here
+/// is a bug in the tool's own cap, not normal pagination.
+pub const REPLY_CEILING_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn enforce_reply_ceiling(tool: &str, text: &mut String) {
+    let total = text.len();
+    if total <= REPLY_CEILING_BYTES {
+        return;
+    }
+    log::warn!("AFT reply ceiling: tool={tool} rendered_bytes={total} ceiling_bytes={REPLY_CEILING_BYTES}; the tool's own cap failed");
+    let footer = format!("\nthis reply was cut at {REPLY_CEILING_BYTES} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report");
+    let mut end = REPLY_CEILING_BYTES - footer.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(&format!("\nthis reply was cut at {end} of {total} bytes by AFT's reply ceiling; the tool's own cap failed, please report"));
+}
+
+fn enforce_response_ceiling(tool: &str, response: &mut Response) {
+    if let Some(Value::String(text)) = response.data.get_mut("text") {
+        enforce_reply_ceiling(tool, text);
+    }
+}
+
 pub fn append_repeat_breaker_reminder(
     text: &mut String,
     session_id: &str,
@@ -103,15 +128,14 @@ pub fn finalize_response_with_bg_completions(
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
     let publish = publish_fleet_status(response, ctx, session_id);
-    if !response.data.get("text").is_some_and(Value::is_string) {
-        return;
+    if response.data.get("text").is_some_and(Value::is_string) {
+        if let Some(line) = status_bar_line(ctx, publish, attach_command) {
+            if let Some(Value::String(text)) = response.data.get_mut("text") {
+                append_trailing_line(text, &line);
+            }
+        }
     }
-    let Some(line) = status_bar_line(ctx, publish, attach_command) else {
-        return;
-    };
-    if let Some(Value::String(text)) = response.data.get_mut("text") {
-        append_trailing_line(text, &line);
-    }
+    enforce_response_ceiling(attach_command, response);
 }
 
 /// Finalization for a tool result whose agent-visible text is held apart from the response
@@ -133,6 +157,7 @@ pub fn finalize_tool_response(
     if let Some(line) = status_bar_line(ctx, publish, attach_command) {
         append_trailing_line(text, &line);
     }
+    enforce_reply_ceiling(attach_command, text);
 }
 
 fn append_trailing_line(text: &mut String, line: &str) {
@@ -166,6 +191,7 @@ pub fn finalize_response_for_dispatch_root(
     }
     let _ = publish_fleet_status(response, ctx, session_id);
     attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
+    enforce_response_ceiling(attach_command, response);
 }
 
 fn attach_alert_block(

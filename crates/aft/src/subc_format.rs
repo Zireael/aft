@@ -295,6 +295,16 @@ pub fn format_response_with_context(
     response: &Response,
     ctx: &FormatContext,
 ) -> String {
+    let mut text = format_response_unbounded(bare_name, response, ctx);
+    crate::response_finalize::enforce_reply_ceiling(bare_name, &mut text);
+    text
+}
+
+pub(crate) fn format_response_unbounded(
+    bare_name: &str,
+    response: &Response,
+    ctx: &FormatContext,
+) -> String {
     // The inspect tool is registered as `aft_inspect`; standalone tool calls
     // keep that spelling while subc hoists it to `inspect`. Both must reach
     // the inspect renderer rather than the raw-JSON fallback for tools the
@@ -2162,6 +2172,9 @@ fn format_outline_text(data: &Value) -> String {
 // Format zoom responses as plain text so direct calls and server-side calls
 // produce identical output.
 fn format_zoom(data: &Value, ctx: &FormatContext) -> String {
+    if let Some(text) = data.get("text").and_then(Value::as_str) {
+        return text.to_string();
+    }
     if let Some(entries) = data.get("targets").and_then(Value::as_array) {
         return format_zoom_multi_target_result(entries);
     }

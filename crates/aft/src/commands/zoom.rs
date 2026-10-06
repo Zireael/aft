@@ -411,6 +411,10 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 /// context, and walks ASTs for call annotations. For code files, a whitespace-separated
 /// top-level `symbol`/`symbols` string is split into multiple same-file lookups.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
+    super::url_output::cap_zoom_response(req, handle_zoom_inner(req, ctx))
+}
+
+fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let context_lines = req
         .params
         .get("context_lines")
@@ -490,6 +494,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(file) => file,
         Err(resp) => return resp,
     };
+
+    if is_http_url(file)
+        && detect_language(&path) == Some(LangId::Json)
+        && (start_line.is_some() || end_line.is_some())
+    {
+        return Response::error(&req.id, "invalid_request",
+            "JSON URL zoom requires a top-level key in symbols; line ranges can select the entire JSON body. Use outline to list available keys, or narrow the URL with server-side filters.");
+    }
 
     let lines: Vec<&str> = source.lines().collect();
 
@@ -576,7 +588,7 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             };
             let end_col = lines[end_idx].chars().count() as u32;
 
-            return Response::success(
+            let mut response = Response::success(
                 &req.id,
                 serde_json::json!({
                     "name": format!("lines {}-{}", start, clamped_end),
@@ -596,6 +608,10 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
                     },
                 }),
             );
+            if is_http_url(file) {
+                super::url_output::disclose_download(&path, &mut response);
+            }
+            return response;
         }
         (Some(_), None) | (None, Some(_)) => {
             return Response::error(
@@ -980,6 +996,61 @@ fn zoom_batch_symbols(
 }
 
 fn zoom_one_symbol(
+    req: &RawRequest,
+    ctx: &AppContext,
+    path: &Path,
+    _file: &str,
+    source: &str,
+    lines: &[&str],
+    symbol_name: &str,
+    context_lines: usize,
+    include_callgraph: bool,
+    enrichments: &mut HashMap<PathBuf, ZoomEnrichment>,
+) -> Response {
+    let mut response = if is_http_url(_file) && detect_language(path) == Some(LangId::Json) {
+        super::url_output::json_preview(req, source, Some(symbol_name))
+    } else {
+        zoom_one_symbol_inner(
+            req,
+            ctx,
+            path,
+            _file,
+            source,
+            lines,
+            symbol_name,
+            context_lines,
+            include_callgraph,
+            enrichments,
+        )
+    };
+    if is_http_url(_file) {
+        if !response.success
+            && response.data["code"] == "symbol_not_found"
+            && is_heading_zoom_language(detect_language(path))
+        {
+            if let Ok(symbols) = ctx.provider().list_symbols(path) {
+                let mut message = format!("Requested heading {symbol_name:?} not found. Available headings in downloaded prefix:\n");
+                if symbols.is_empty() {
+                    message.push_str("No headings available. Narrow with a Markdown or HTML URL containing headings.");
+                }
+                for symbol in symbols {
+                    message.push_str(&format!(
+                        "- {} (lines {}-{})\n",
+                        symbol.name,
+                        symbol.range.start_line + 1,
+                        symbol.range.end_line + 1
+                    ));
+                }
+                response.data["message"] = message.into();
+            }
+        }
+        super::url_output::disclose_download(path, &mut response);
+    }
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn zoom_one_symbol_inner(
     req: &RawRequest,
     ctx: &AppContext,
     path: &Path,

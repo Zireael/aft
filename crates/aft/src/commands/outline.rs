@@ -170,6 +170,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         .params
         .get("file")
         .or_else(|| req.params.get("target"))
+        .or_else(|| req.params.get("url"))
         .and_then(|v| v.as_str())
     {
         Some(f) => f,
@@ -198,6 +199,31 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
+    if is_http_url(file)
+        && crate::parser::detect_language(&path) == Some(crate::parser::LangId::Json)
+    {
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => return Response::error(&req.id, "url_fetch_failed", error.to_string()),
+        };
+        let mut response = super::url_output::json_preview(req, &source, None);
+        super::url_output::disclose_download(&path, &mut response);
+        let complete = response.data["complete"].as_bool().unwrap_or(false);
+        let mut text = response.data["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        super::url_output::cap_text(
+            &mut text,
+            super::url_output::URL_OUTPUT_BYTES,
+            "a filtered URL",
+        );
+        return Response::success(
+            &req.id,
+            serde_json::json!({"text": text, "complete": complete}),
+        );
+    }
+
     let symbols = match ctx.provider().list_symbols(&path) {
         Ok(s) => s,
         Err(e) => {
@@ -215,11 +241,24 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| file.to_string());
-    let text = format_single_file_tree(&filename, &entries);
+    let mut text = format_single_file_tree(&filename, &entries);
+    let mut complete = true;
+    if is_http_url(file) {
+        if let Some(notice) = crate::url_fetch::download_notice(&path) {
+            text = format!("{notice}\n\n{text}");
+            complete = false;
+        }
+        complete &= text.len() <= super::url_output::URL_OUTPUT_BYTES;
+        super::url_output::cap_text(
+            &mut text,
+            super::url_output::URL_OUTPUT_BYTES,
+            "a smaller URL or section",
+        );
+    }
 
     Response::success(
         &req.id,
-        serde_json::json!({ "text": text, "complete": true }),
+        serde_json::json!({ "text": text, "complete": complete }),
     )
 }
 

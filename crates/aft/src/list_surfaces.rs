@@ -287,6 +287,30 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "url_fetch.rs",
+        enclosing_item: "hash_url",
+        location_or_primitive: "URL cache hash prefix",
+        reason: "cache filename derivation takes a fixed digest prefix, not a truncation of agent-visible text or records",
+    },
+    ExclusionEntry {
+        file: "commands/url_output.rs",
+        enclosing_item: "cap_text",
+        location_or_primitive: "URL rendered text byte ceiling",
+        reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
+    },
+    ExclusionEntry {
+        file: "url_fetch.rs",
+        enclosing_item: "read_response_body, fetch_url_to_cache",
+        location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",
+        reason: "the producer stops after a bounded prefix and one lookahead byte; cached metadata discloses the cut with the known size or an explicit lower bound, separately from the rendered output ceiling",
+    },
+    ExclusionEntry {
+        file: "response_finalize.rs",
+        enclosing_item: "enforce_reply_ceiling",
+        location_or_primitive: "emergency rendered reply byte ceiling",
+        reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
+    },
+    ExclusionEntry {
         file: "github_read/fetch.rs",
         enclosing_item: "read_capped",
         location_or_primitive: "bounded gh subprocess reader",
