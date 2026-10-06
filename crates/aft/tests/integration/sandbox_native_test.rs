@@ -340,7 +340,7 @@ fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
 #[cfg(target_os = "linux")]
 fn linux_fixture_git(fixture: &CortexkitFloorFixture, args: &[&str]) -> std::process::Output {
     let mut command = std::process::Command::new("git");
-    super::helpers::apply_hermetic_git_env(&mut command);
+    crate::test_helpers::apply_hermetic_git_env(&mut command);
     command
         .current_dir(&fixture.project)
         .env("HOME", &fixture.home)
