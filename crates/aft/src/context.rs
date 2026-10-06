@@ -14821,7 +14821,7 @@ mod harness_path_tests {
         );
         assert_eq!(
             ctx.inspect_dir(),
-            storage
+            ctx.storage_dir()
                 .join("inspect")
                 .join(crate::path_identity::project_scope_key(&root))
         );
@@ -14848,43 +14848,10 @@ mod shared_db_tests {
     use super::*;
     use tempfile::tempdir;
 
-    struct DatabaseStorageGuard {
-        previous: Option<std::ffi::OsString>,
-        storage: tempfile::TempDir,
-        _env_lock: crate::test_env::ProcessEnvLockGuard,
-    }
-
-    impl DatabaseStorageGuard {
-        fn new() -> Self {
-            let env_lock = crate::test_env::process_env_lock();
-            let storage = tempdir().unwrap();
-            let previous = std::env::var_os("AFT_STORAGE_DIR");
-            std::env::set_var("AFT_STORAGE_DIR", storage.path());
-            Self {
-                previous,
-                storage,
-                _env_lock: env_lock,
-            }
-        }
-
-        fn path(&self) -> &Path {
-            self.storage.path()
-        }
-    }
-
-    impl Drop for DatabaseStorageGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("AFT_STORAGE_DIR", previous),
-                None => std::env::remove_var("AFT_STORAGE_DIR"),
-            }
-        }
-    }
-
-    fn failed_database_context() -> (DatabaseStorageGuard, tempfile::TempDir, AppContext) {
-        // The environment override wins over Config::storage_dir. Keep both
-        // pointed at this fixture for the whole failed-open/retry lifecycle.
-        let storage = DatabaseStorageGuard::new();
+    fn failed_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        // Each context owns its storage fixture. A process-wide override would
+        // redirect unrelated contexts while libtest runs them in parallel.
+        let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let path = storage.path().join("aft.db");
         let conn = crate::db::open(&path).unwrap();
@@ -14922,6 +14889,14 @@ mod shared_db_tests {
             .contains("storage_requires_newer_reader"));
         assert!(ctx.db().is_none());
         (storage, root, ctx)
+    }
+
+    #[test]
+    fn database_fixtures_keep_storage_local_to_each_context() {
+        let (first_storage, _first_root, first) = failed_database_context();
+        let (second_storage, _second_root, second) = failed_database_context();
+        assert_eq!(second.storage_dir(), second_storage.path());
+        assert_eq!(first.storage_dir(), first_storage.path());
     }
 
     fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
@@ -15061,7 +15036,7 @@ mod shared_db_tests {
 
     #[test]
     fn failed_database_retry_reuses_and_preserves_a_resident_connection() {
-        let storage = DatabaseStorageGuard::new();
+        let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
             App::default_shared(),
