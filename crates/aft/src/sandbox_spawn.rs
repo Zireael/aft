@@ -3332,6 +3332,13 @@ mod policy_tests {
         std::fs::write(&file, "sandboxed\n").unwrap();
         let ctx = context(project.path().to_path_buf());
         ctx.update_config(|config| config.experimental_bash_rewrite = true);
+        // Capture files belong to the private task store, not the project. Using
+        // the project as task IO would also deny project access on Landlock.
+        let task = crate::bash_background::persistence::allocate_task_layout(
+            &ctx.storage_dir(),
+            "sandbox-predicate-test",
+        )
+        .unwrap();
         let principal = AuthenticatedPrincipal::FirstParty;
         let command = format!("cat {}", file.display());
 
@@ -3342,10 +3349,13 @@ mod policy_tests {
             &principal,
             RequestedSandboxTier::Native,
             SandboxTaskKind::BashForeground,
-            project.path(),
+            &task.paths.io_dir,
             None,
         );
-        assert!(matches!(&sandboxed, SpawnPlan::Launcher { .. }));
+        assert!(
+            matches!(&sandboxed, SpawnPlan::Launcher { .. }),
+            "native sandbox must use the launcher: {sandboxed:?}"
+        );
         sandboxed.cleanup_unspawned();
 
         ctx.update_config(|config| config.sandbox.enabled = false);
@@ -3357,7 +3367,7 @@ mod policy_tests {
                 &principal,
                 RequestedSandboxTier::Native,
                 SandboxTaskKind::BashForeground,
-                project.path(),
+                &task.paths.io_dir,
                 None,
             ),
             SpawnPlan::Unsandboxed
