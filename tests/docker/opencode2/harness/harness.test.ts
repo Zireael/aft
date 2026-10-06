@@ -2413,6 +2413,15 @@ describe("the kill-deadline line is a typed projection element", () => {
     });
   });
 
+  test("clock omit drops the wall-clock parts but still requires the full sentence", () => {
+    const omit = [{ kind: "kill_deadline" as const, clock: "omit" as const }];
+    const text = render(running({ limit_ms: 1_800_000, source: "default" }), "primary");
+    expect(projectText(text, omit)).toEqual({
+      kill_deadline: { limit: "30 minutes", source: "default", worker_renewal: false },
+    });
+    expect(() => projectText(text.replace("AFT kills", "AFT stops"), omit)).toThrow();
+  });
+
   test("a changed or mangled deadline wording is unparsed, not skipped", () => {
     const line = render(running({ limit_ms: 1_800_000, source: "default" }), "primary");
     expect(() => projectText(line.replace("unless", "until"), rules)).toThrow(

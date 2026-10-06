@@ -48,6 +48,12 @@ export interface TrailerProjectionRule {
 export interface KillDeadlineProjectionRule {
   kind: "kill_deadline";
   field?: string;
+  /**
+   * `omit` drops the wall-clock parts (`at`, `remaining`) from the projected
+   * value after the full sentence has parsed, so a scenario can pin the limit
+   * and source without depending on when the run happened.
+   */
+  clock?: "keep" | "omit";
 }
 
 export type ProjectionRule =

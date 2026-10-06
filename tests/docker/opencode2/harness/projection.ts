@@ -120,7 +120,14 @@ function matchRule(
     if (!match || match.index !== 0 || match[0].length !== match.input.length) continue;
     if (rule.kind === "ignore") return { consumed: count };
     const groups = match.groups ?? {};
-    if (rule.kind === "kill_deadline") return { consumed: count, value: killDeadlineValue(groups) };
+    if (rule.kind === "kill_deadline") {
+      const value = killDeadlineValue(groups);
+      if (rule.clock === "omit") {
+        delete value.at;
+        delete value.remaining;
+      }
+      return { consumed: count, value };
+    }
     const types: ProjectionTypeMap | undefined =
       rule.kind === "field" ? rule.types : { shown: "number", total: "number" };
     const projected = Object.fromEntries(

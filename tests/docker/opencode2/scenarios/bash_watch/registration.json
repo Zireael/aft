@@ -80,7 +80,8 @@
             "pattern": "^Waited \\d+ms \\(limit \\d+ms(, the bash\\.watch_sync_max_ms cap)?\\); (?<value>timeout reached without match)\\..*$"
           },
           {
-            "kind": "kill_deadline"
+            "kind": "kill_deadline",
+            "clock": "omit"
           }
         ],
         "expected": {
