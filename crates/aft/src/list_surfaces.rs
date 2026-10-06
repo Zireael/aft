@@ -299,6 +299,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "diagnostic changed-path previews and sequential diff line pages integrate their list envelope trailers into content through the authorized NDJSON text builder",
     },
     ExclusionEntry {
+        file: "grep_executor.rs",
+        enclosing_item: "diagnose_scope_counts, bounded_fallback_walk_files_with_limits_target",
+        location_or_primitive: "MAX_FALLBACK_WALK_FILES / FALLBACK_WALK_BUDGET",
+        reason: "bounded filesystem fallback and empty-scope exclusion probe; ignored directories are pruned and counted once, and an exhausted probe reports unknown/incomplete rather than claiming an empty filesystem",
+    },
+    ExclusionEntry {
         file: "logging.rs",
         enclosing_item: "write_str",
         location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",

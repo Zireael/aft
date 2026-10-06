@@ -33,17 +33,17 @@ pub struct FallbackWalkOutcome {
     /// Foreign filesystem mounts skipped before a recursive fallback could open them.
     pub skipped_foreign_mounts: usize,
     pub entries_visited: usize,
-    pub(crate) counts: ScopeFileCounts,
 }
 
-/// Counts are updated as entries are visited, before include/exclude filtering.
-/// Ignored directories are traversed for counting, but their files are never read.
+/// Counts are updated before include/exclude filtering. Empty-scope probes count
+/// rejected directories once, without enumerating their contents.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ScopeFileCounts {
     pub examined: usize,
     pub ignored: usize,
     pub filtered: usize,
     pub eligible: usize,
+    pub entries_visited: usize,
 }
 
 impl ScopeFileCounts {
@@ -52,13 +52,14 @@ impl ScopeFileCounts {
         self.ignored += other.ignored;
         self.filtered += other.filtered;
         self.eligible += other.eligible;
+        self.entries_visited += other.entries_visited;
     }
 
     pub(crate) fn empty_note(&self, include_only: bool) -> String {
         let mut reasons = Vec::new();
         if self.ignored > 0 {
             reasons.push(format!(
-                "{} files under the path are excluded by ignore rules (.gitignore / info/exclude / .ignore / .aftignore); pass the file path directly to search them",
+                "{} ignored items (directories counted once) excluded by ignore rules or default skips (.gitignore / info/exclude / .ignore / .aftignore); pass the file path directly to search them",
                 self.ignored
             ));
         }
@@ -150,6 +151,7 @@ pub struct ResolvedRoot {
     pub filter_root: PathBuf,
     pub use_index: bool,
     pub is_external: bool,
+    pub ignored_target: bool,
 }
 
 pub fn project_root(ctx: &AppContext) -> PathBuf {
@@ -186,9 +188,10 @@ pub fn resolve_grep_scope(
         .map(|search_root| {
             let scope = resolve_search_scope(&project_root, Some(&search_root.to_string_lossy()));
             let is_external = !scope.use_index;
-            let filter_root = if !is_same_directory(&scope.root, &project_root)
-                && target_is_ignored(&scope.root)
-            {
+            let ignored_target = paths.is_some_and(|paths| !paths.is_null())
+                && !is_same_directory(&scope.root, &project_root)
+                && target_is_ignored(&scope.root);
+            let filter_root = if ignored_target {
                 // An ignored target is outside the index's project-relative
                 // catalog. Like glob's fallback, interpret its include/exclude
                 // patterns relative to the directory the caller explicitly named.
@@ -201,6 +204,7 @@ pub fn resolve_grep_scope(
                 filter_root,
                 use_index: scope.use_index,
                 is_external,
+                ignored_target,
             }
         })
         .collect::<Vec<_>>();
@@ -241,7 +245,12 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
         if root.search_root.is_file() {
             return Some(true);
         }
-        match bounded_scope_has_files(&root.filter_root, &root.search_root, filters) {
+        match bounded_scope_has_files(
+            &root.filter_root,
+            &root.search_root,
+            filters,
+            root.ignored_target,
+        ) {
             Some(true) => return Some(true),
             None => unknown = true,
             Some(false) => {}
@@ -261,11 +270,12 @@ pub(crate) fn scope_file_counts(
 ) -> Option<ScopeFileCounts> {
     let mut counts = ScopeFileCounts::default();
     for root in &scope.roots {
-        let outcome = bounded_fallback_walk_files(&root.filter_root, &root.search_root, filters);
-        if outcome.walk_truncated || outcome.skipped_foreign_mounts > 0 {
-            return None;
-        }
-        counts.add(outcome.counts);
+        counts.add(diagnose_scope_counts(
+            &root.filter_root,
+            &root.search_root,
+            filters,
+            root.ignored_target,
+        )?);
     }
     Some(counts)
 }
@@ -275,10 +285,12 @@ fn bounded_scope_has_files(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
+    ignored_target: bool,
 ) -> Option<bool> {
     let started = Instant::now();
     let skipped = Arc::new(AtomicUsize::new(0));
-    let walker = TargetFileWalk::new(search_root, Arc::clone(&skipped));
+    let walker =
+        fallback_target_walk_builder(search_root, Arc::clone(&skipped), ignored_target).build();
     for (visited, entry) in walker.enumerate() {
         if visited >= MAX_FALLBACK_WALK_FILES.saturating_mul(8)
             || started.elapsed() >= FALLBACK_WALK_BUDGET
@@ -286,11 +298,10 @@ fn bounded_scope_has_files(
         {
             return None;
         }
-        let Ok((entry, ignored)) = entry else {
+        let Ok(entry) = entry else {
             continue;
         };
         if entry.file_type().is_some_and(|kind| kind.is_file())
-            && !ignored
             && filters.matches(filter_root, entry.path())
         {
             return Some(true);
@@ -459,8 +470,7 @@ fn execute_root_profiled(
     }
 
     let snapshot_started = Instant::now();
-    let ignored_target =
-        !is_same_directory(&root.search_root, project_root) && target_is_ignored(&root.search_root);
+    let ignored_target = root.ignored_target;
     let mut snapshot_timed_out = false;
     let indexed_snapshot =
         match try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
@@ -543,6 +553,7 @@ fn execute_root_profiled(
         index_status,
         params.path_exclusion,
         &mut counts,
+        ignored_target,
     );
     (
         result,
@@ -712,13 +723,13 @@ pub(crate) fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
-    fallback_walk_builder(search_root, skipped_foreign_mounts, true)
+    fallback_target_walk_builder(search_root, skipped_foreign_mounts, false)
 }
 
-fn fallback_walk_builder(
+fn fallback_target_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
-    use_ignore_rules: bool,
+    ignored_target: bool,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
@@ -726,8 +737,11 @@ fn fallback_walk_builder(
     // the daemon, so never open directories outside this walk root's filesystem.
     builder
         .same_file_system(true)
-        .standard_filters(use_ignore_rules)
         .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .add_custom_ignore_filename(".aftignore")
         .parents(true)
         .filter_entry(move |entry| {
             if entry.depth() > 0 && entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -760,15 +774,17 @@ fn fallback_walk_builder(
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         });
-    if use_ignore_rules {
-        builder.add_custom_ignore_filename(".aftignore");
+    if ignored_target {
+        // Like outline, an explicitly ignored target also honors Git rules in
+        // a standalone (non-Git) directory. The crate never filters depth zero,
+        // but still applies its own precedence and pruning to every descendant.
+        builder.require_git(false);
     }
     builder
 }
 
-/// The same Gitignore matcher used by outline, with direct-entry matching:
-/// ancestor rules that match the named root do not implicitly exclude all of
-/// its children. Rules matching a child directory still exclude that subtree.
+/// Used only to decide whether an explicitly named root is ignored. Descendant
+/// filtering and precedence are owned by the ignore crate's walker.
 #[derive(Clone, Default)]
 struct TargetIgnoreRules {
     git: Vec<Arc<ignore::gitignore::Gitignore>>,
@@ -810,20 +826,6 @@ impl TargetIgnoreRules {
         Self::load(&mut rules.aft, directory, &directory.join(".aftignore"));
         rules
     }
-
-    fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        // Custom ignores override .ignore, which overrides Git's rules. Within
-        // each family, a deeper rule (including a whitelist) wins.
-        for family in [&self.aft, &self.plain, &self.git] {
-            for matcher in family.iter().rev() {
-                let matched = matcher.matched(path, is_dir);
-                if !matched.is_none() {
-                    return matched.is_ignore();
-                }
-            }
-        }
-        false
-    }
 }
 
 pub(crate) fn target_is_ignored(path: &Path) -> bool {
@@ -840,50 +842,83 @@ pub(crate) fn target_is_ignored(path: &Path) -> bool {
     false
 }
 
-struct TargetFileWalk {
-    walk: ignore::Walk,
-    directories: Vec<(TargetIgnoreRules, bool)>,
-}
-
-impl TargetFileWalk {
-    fn new(root: &Path, skipped: Arc<AtomicUsize>) -> Self {
-        // Do not let the iterator hide rejected entries: they must be counted
-        // before filtering so an ignored tree cannot masquerade as an empty one.
-        let builder = fallback_walk_builder(root, skipped, false);
-        Self {
-            walk: builder.build(),
-            directories: vec![(TargetIgnoreRules::for_root(root), false)],
+/// The crate hides rejected entries before filter_entry is called. Only an
+/// empty reply needs their count: compare one directory's accepted children
+/// with its immediate on-disk entries, then recurse only through accepted
+/// directories. No ignored directory is opened to count its contents.
+pub(crate) fn diagnose_scope_counts(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    ignored_target: bool,
+) -> Option<ScopeFileCounts> {
+    let started = Instant::now();
+    let skipped = Arc::new(AtomicUsize::new(0));
+    let mut counts = ScopeFileCounts::default();
+    let within_budget = |visited: usize| {
+        visited < MAX_FALLBACK_WALK_FILES.saturating_mul(8)
+            && started.elapsed() < FALLBACK_WALK_BUDGET
+            && !crate::executor::current_job_cancelled()
+    };
+    if search_root.is_file() {
+        counts.examined = 1;
+        let root = search_root.parent().unwrap_or(search_root);
+        if filters.matches(root, search_root) {
+            counts.eligible = 1;
+        } else {
+            counts.filtered = 1;
+        }
+        return Some(counts);
+    }
+    let mut pending = vec![search_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if !within_budget(counts.entries_visited) {
+            return None;
+        }
+        let mut accepted = HashSet::new();
+        let mut builder =
+            fallback_target_walk_builder(&directory, Arc::clone(&skipped), ignored_target);
+        builder.max_depth(Some(1));
+        for entry in builder.build() {
+            if !within_budget(counts.entries_visited) {
+                return None;
+            }
+            counts.entries_visited += 1;
+            let entry = entry.ok()?;
+            if entry.depth() > 0 {
+                accepted.insert(entry.file_name().to_os_string());
+            }
+        }
+        if skipped.load(Ordering::Relaxed) > 0 {
+            return None;
+        }
+        for entry in std::fs::read_dir(&directory).ok()? {
+            if !within_budget(counts.entries_visited) {
+                return None;
+            }
+            counts.entries_visited += 1;
+            let entry = entry.ok()?;
+            let kind = entry.file_type().ok()?;
+            if kind.is_file() {
+                counts.examined += 1;
+            }
+            if !accepted.contains(&entry.file_name()) {
+                counts.ignored += 1;
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                if filters.matches(filter_root, &path) {
+                    counts.eligible += 1;
+                } else {
+                    counts.filtered += 1;
+                }
+            }
         }
     }
-}
-
-impl Iterator for TargetFileWalk {
-    type Item = Result<(ignore::DirEntry, bool), ignore::Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let entry = match self.walk.next()? {
-            Ok(entry) => entry,
-            Err(error) => return Some(Err(error)),
-        };
-        if entry.depth() == 0 {
-            return Some(Ok((entry, false)));
-        }
-        while self.directories.len() > entry.depth() {
-            self.directories.pop();
-        }
-        let (rules, parent_ignored) = self.directories.last().expect("walk parent rules");
-        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
-        let ignored = *parent_ignored || rules.is_ignored(entry.path(), is_dir);
-        if is_dir {
-            let child = if ignored {
-                rules.clone()
-            } else {
-                rules.for_directory(entry.path())
-            };
-            self.directories.push((child, ignored));
-        }
-        Some(Ok((entry, ignored)))
-    }
+    Some(counts)
 }
 
 /// Bounded project walk used when the trigram index is unavailable (grep/glob fallback).
@@ -898,6 +933,22 @@ pub(crate) fn bounded_fallback_walk_files(
         filters,
         MAX_FALLBACK_WALK_FILES,
         FALLBACK_WALK_BUDGET,
+    )
+}
+
+pub(crate) fn bounded_fallback_walk_files_for_target(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    ignored_target: bool,
+) -> FallbackWalkOutcome {
+    bounded_fallback_walk_files_with_limits_target(
+        filter_root,
+        search_root,
+        filters,
+        MAX_FALLBACK_WALK_FILES,
+        FALLBACK_WALK_BUDGET,
+        ignored_target,
     )
 }
 
@@ -932,7 +983,6 @@ pub(crate) fn source_first_fallback_walk_files(
         walk_truncated,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
-        counts: ScopeFileCounts::default(),
     }
 }
 
@@ -953,6 +1003,24 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
     max_files: usize,
     budget: Duration,
 ) -> FallbackWalkOutcome {
+    bounded_fallback_walk_files_with_limits_target(
+        filter_root,
+        search_root,
+        filters,
+        max_files,
+        budget,
+        false,
+    )
+}
+
+fn bounded_fallback_walk_files_with_limits_target(
+    filter_root: &Path,
+    search_root: &Path,
+    filters: &PathFilters,
+    max_files: usize,
+    budget: Duration,
+    ignored_target: bool,
+) -> FallbackWalkOutcome {
     let filter_root = if filter_root == search_root && search_root.is_file() {
         search_root.parent().unwrap_or(search_root)
     } else {
@@ -962,11 +1030,15 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
     let mut files = Vec::new();
     let mut walk_truncated = false;
     let mut entries_visited = 0usize;
-    let mut counts = ScopeFileCounts::default();
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = TargetFileWalk::new(search_root, Arc::clone(&skipped_foreign_mounts));
+    let walker = fallback_target_walk_builder(
+        search_root,
+        Arc::clone(&skipped_foreign_mounts),
+        ignored_target,
+    )
+    .build();
 
-    for (entry, ignored) in walker.filter_map(|entry| entry.ok()) {
+    for entry in walker.filter_map(|entry| entry.ok()) {
         entries_visited += 1;
         if started.elapsed() >= budget || entries_visited > max_files.saturating_mul(8).max(1024) {
             walk_truncated = true;
@@ -978,22 +1050,14 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
         {
             continue;
         }
-        counts.examined += 1;
-        if ignored {
-            counts.ignored += 1;
-            continue;
-        }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) {
-            counts.eligible += 1;
             files.push(path);
             if files.len() > max_files {
                 walk_truncated = true;
                 files.truncate(max_files);
                 break;
             }
-        } else {
-            counts.filtered += 1;
         }
     }
 
@@ -1003,7 +1067,6 @@ pub(crate) fn bounded_fallback_walk_files_with_limits(
         walk_truncated,
         skipped_foreign_mounts: skipped_foreign_mounts.load(Ordering::Relaxed),
         entries_visited,
-        counts,
     }
 }
 
@@ -1016,6 +1079,7 @@ fn for_each_bounded_fallback_walk_file_with_limits<F>(
     max_files: usize,
     budget: Duration,
     on_file: &mut F,
+    ignored_target: bool,
 ) -> FallbackWalkProgress
 where
     F: FnMut(&PathBuf),
@@ -1024,9 +1088,15 @@ where
     let mut files_seen = 0usize;
     let mut counts = ScopeFileCounts::default();
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = TargetFileWalk::new(search_root, Arc::clone(&skipped_foreign_mounts));
+    let walker = fallback_target_walk_builder(
+        search_root,
+        Arc::clone(&skipped_foreign_mounts),
+        ignored_target,
+    )
+    .build();
 
-    for (entry, ignored) in walker.filter_map(|entry| entry.ok()) {
+    for entry in walker.filter_map(|entry| entry.ok()) {
+        counts.entries_visited += 1;
         if crate::executor::current_job_cancelled() {
             return FallbackWalkProgress {
                 bound: Some(WalkBound::Cancelled),
@@ -1048,10 +1118,6 @@ where
             continue;
         }
         counts.examined += 1;
-        if ignored {
-            counts.ignored += 1;
-            continue;
-        }
         let path = entry.into_path();
         if path_exclusion.is_some_and(|exclude| exclude(&path, project_root)) {
             counts.filtered += 1;
@@ -1132,6 +1198,7 @@ fn fallback_grep(
         index_status,
         path_exclusion,
         &mut ScopeFileCounts::default(),
+        false,
     )
 }
 
@@ -1146,6 +1213,7 @@ fn fallback_grep_counted(
     index_status: IndexStatus,
     path_exclusion: Option<GrepPathExclusion>,
     counts: &mut ScopeFileCounts,
+    ignored_target: bool,
 ) -> GrepResult {
     fallback_grep_with_limits_counted(
         project_root,
@@ -1159,6 +1227,7 @@ fn fallback_grep_counted(
         MAX_FALLBACK_WALK_FILES,
         FALLBACK_WALK_BUDGET,
         counts,
+        ignored_target,
     )
 }
 
@@ -1190,6 +1259,7 @@ fn fallback_grep_with_limits(
         max_files,
         budget,
         &mut ScopeFileCounts::default(),
+        false,
     )
 }
 
@@ -1206,6 +1276,7 @@ fn fallback_grep_with_limits_counted(
     max_files: usize,
     budget: Duration,
     counts: &mut ScopeFileCounts,
+    ignored_target: bool,
 ) -> GrepResult {
     let total_matches = AtomicUsize::new(0);
     let files_searched = AtomicUsize::new(0);
@@ -1278,6 +1349,7 @@ fn fallback_grep_with_limits_counted(
                 flush_batch(&mut batch, &mut matches);
             }
         },
+        ignored_target,
     );
     flush_batch(&mut batch, &mut matches);
     *counts = progress.counts;
@@ -1808,6 +1880,7 @@ mod tests {
                 filter_root: PathBuf::from("/project"),
                 use_index: true,
                 is_external: false,
+                ignored_target: false,
             }],
             multi_root: false,
             per_root_max: 10,
@@ -1871,6 +1944,154 @@ mod tests {
     }
 
     #[test]
+    fn fallback_project_walk_prunes_large_ignored_trees() {
+        // build is also a fixed directory skip; vendor makes sure Git's own
+        // directory pruning, rather than only that backstop, is exercised.
+        for ignored_directory in ["build", "vendor"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir(root.join(".git")).unwrap();
+            std::fs::create_dir(root.join(ignored_directory)).unwrap();
+            std::fs::create_dir(root.join("src")).unwrap();
+            std::fs::write(root.join(".gitignore"), format!("{ignored_directory}/\n")).unwrap();
+            for index in 0..20_000 {
+                std::fs::write(
+                    root.join(ignored_directory).join(format!("{index}.txt")),
+                    "artifact\n",
+                )
+                .unwrap();
+            }
+            for index in 0..5 {
+                std::fs::write(
+                    root.join("src").join(format!("{index}.rs")),
+                    "fn needle() {}\n",
+                )
+                .unwrap();
+            }
+            let filters = build_path_filters(&["*.rs".to_string()], &[]).unwrap();
+            let mut counts = ScopeFileCounts::default();
+            let result = fallback_grep_counted(
+                root,
+                root,
+                root,
+                &literal("needle"),
+                &filters,
+                100,
+                IndexStatus::Fallback,
+                None,
+                &mut counts,
+                false,
+            );
+            assert_eq!(result.total_matches, 5, "{ignored_directory}: {result:?}");
+            assert!(!result.walk_truncated, "{ignored_directory}: {result:?}");
+            assert!(
+                counts.entries_visited < 100,
+                "{ignored_directory}: grep visited {} entries",
+                counts.entries_visited
+            );
+            let outcome = bounded_fallback_walk_files(root, root, &filters);
+            assert_eq!(outcome.files.len(), 5);
+            assert!(!outcome.walk_truncated, "{ignored_directory}: {outcome:?}");
+            assert!(
+                outcome.entries_visited < 100,
+                "{ignored_directory}: visited {} entries",
+                outcome.entries_visited
+            );
+            let counts = diagnose_scope_counts(root, root, &filters, false).unwrap();
+            assert_eq!(
+                counts.ignored, 2,
+                "the ignored tree and the fixed .git skip"
+            );
+            assert_eq!(
+                counts.examined, 6,
+                "five sources and .gitignore, not build artifacts"
+            );
+            assert!(
+                counts.entries_visited < 100,
+                "{ignored_directory}: exclusion probe visited {} entries",
+                counts.entries_visited
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_fallback_walk_visits_same_entries_as_original_crate_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for directory in [".git", "src", "vendor", "build"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        for (path, content) in [
+            (".gitignore", "vendor/\n*.log\n"),
+            (".aftignore", "src/private.rs\n"),
+            ("src/main.rs", "source\n"),
+            ("src/private.rs", "private\n"),
+            ("src/trace.log", "trace\n"),
+            ("vendor/generated.rs", "generated\n"),
+            ("build/output.rs", "output\n"),
+            (".hidden.rs", "hidden\n"),
+        ] {
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        // Reproduce the pre-change builder independently, including its fixed
+        // skips and default require_git setting, rather than comparing two
+        // calls through the same implementation.
+        let mut original = WalkBuilder::new(root);
+        original
+            .same_file_system(true)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .add_custom_ignore_filename(".aftignore")
+            .filter_entry(|entry| {
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    return !matches!(
+                        entry.file_name().to_str(),
+                        Some(
+                            "node_modules"
+                                | "target"
+                                | "venv"
+                                | ".venv"
+                                | ".git"
+                                | "__pycache__"
+                                | ".tox"
+                                | "dist"
+                                | "build"
+                        )
+                    );
+                }
+                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            });
+        let expected = original
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect::<Vec<_>>();
+        let actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(actual.contains(&root.join("src/main.rs")));
+        assert!(!actual.contains(&root.join("vendor/generated.rs")));
+        assert!(!actual.contains(&root.join("src/private.rs")));
+        // Ordinary walks must also retain the crate's pre-existing behavior
+        // outside a Git repository, instead of implicitly enabling Git rules.
+        std::fs::remove_dir(root.join(".git")).unwrap();
+        let expected = original
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect::<Vec<_>>();
+        let actual = fallback_project_walk_builder(root, Arc::new(AtomicUsize::new(0)))
+            .build()
+            .map(|entry| entry.unwrap().into_path())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(actual.contains(&root.join("vendor/generated.rs")));
+        assert!(!actual.contains(&root.join("src/private.rs")));
+    }
+
+    #[test]
     fn target_walk_counts_custom_ignores_and_preserves_rule_precedence() {
         let dir = tempfile::tempdir().unwrap();
         for (name, content) in [
@@ -1885,10 +2106,11 @@ mod tests {
         let filters = build_path_filters(&["*.log".to_string()], &[]).unwrap();
         let outcome = bounded_fallback_walk_files(dir.path(), dir.path(), &filters);
         assert_eq!(outcome.files, vec![dir.path().join("b.log")]);
-        assert_eq!(outcome.counts.examined, 5);
-        assert_eq!(outcome.counts.ignored, 1);
-        assert_eq!(outcome.counts.filtered, 3);
-        assert_eq!(outcome.counts.eligible, 1);
+        let counts = diagnose_scope_counts(dir.path(), dir.path(), &filters, false).unwrap();
+        assert_eq!(counts.examined, 5);
+        assert_eq!(counts.ignored, 1);
+        assert_eq!(counts.filtered, 3);
+        assert_eq!(counts.eligible, 1);
     }
 
     #[test]
@@ -1906,16 +2128,26 @@ mod tests {
         std::fs::write(root.join("nested/.gitignore"), "!child.log\n").unwrap();
         std::fs::write(root.join("nested/child.log"), "keep nested whitelist\n").unwrap();
         for name in [".git", "node_modules", "target"] {
-            std::fs::create_dir(root.join(name)).unwrap();
-            std::fs::write(root.join(name).join("keep.log"), "default skip\n").unwrap();
+            // A .git marker at the target itself would start a new repository
+            // and legitimately stop inherited Git rules. Test its fixed skip
+            // in a descendant instead, without changing the target's identity.
+            let skipped = if name == ".git" {
+                root.join("default-skips/.git")
+            } else {
+                root.join(name)
+            };
+            std::fs::create_dir_all(&skipped).unwrap();
+            std::fs::write(skipped.join("keep.log"), "default skip\n").unwrap();
         }
         let filters = build_path_filters(&["*.log".to_string()], &[]).unwrap();
-        let outcome = bounded_fallback_walk_files(&root, &root, &filters);
+        let outcome = bounded_fallback_walk_files_for_target(&root, &root, &filters, true);
         assert_eq!(outcome.files.len(), 2, "{:?}", outcome.files);
         assert!(outcome.files.contains(&root.join("keep.log")));
         assert!(outcome.files.contains(&root.join("nested/child.log")));
-        assert_eq!(outcome.counts.examined, 4);
-        assert_eq!(outcome.counts.ignored, 1);
+        let counts = diagnose_scope_counts(&root, &root, &filters, true).unwrap();
+        assert_eq!(counts.examined, 4);
+        // One ignored file and the three fixed-skip directories, not their files.
+        assert_eq!(counts.ignored, 4);
     }
 
     #[test]
@@ -2161,6 +2393,7 @@ mod tests {
                     filter_root: project.path().to_path_buf(),
                     use_index: true,
                     is_external: false,
+                    ignored_target: false,
                 })
                 .collect(),
             multi_root: true,

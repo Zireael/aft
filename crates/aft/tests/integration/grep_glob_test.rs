@@ -1814,7 +1814,7 @@ mod explicit_target_regressions {
                 );
                 let text = response["text"].as_str().unwrap();
                 assert!(
-                    text.contains("4 files under the path are excluded by ignore rules"),
+                    text.contains("1 ignored items (directories counted once)"),
                     "indexed={indexed}: {response}"
                 );
                 assert!(!text.contains("No searchable files exist"), "{response}");

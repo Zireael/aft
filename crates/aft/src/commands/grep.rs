@@ -127,11 +127,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     // A parent folder session answers from its child repositories' indexes.
     // Child indexes intentionally omit ignored targets, just like the local
     // index. An explicitly named ignored root must use the direct walk instead.
-    let parent_answer = if scope
-        .roots
-        .iter()
-        .any(|root| grep_executor::target_is_ignored(&root.search_root))
-    {
+    let parent_answer = if scope.roots.iter().any(|root| root.ignored_target) {
         None
     } else {
         crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters)
@@ -158,9 +154,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         .or_else(|| grep_executor::scope_has_files(&scope, &filters));
     let scope_has_files = scope_presence != Some(false);
     let empty_counts = if !scope_has_files {
-        phases
-            .walk_counts
-            .or_else(|| grep_executor::scope_file_counts(&scope, &filters))
+        grep_executor::scope_file_counts(&scope, &filters)
     } else {
         None
     };
@@ -252,7 +246,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         ));
         if let Some(counts) = empty_counts {
             body["files_examined"] = serde_json::json!(counts.examined);
-            body["files_excluded_by_ignore"] = serde_json::json!(counts.ignored);
+            body["ignored_items"] = serde_json::json!(counts.ignored);
             body["files_excluded_by_patterns"] = serde_json::json!(counts.filtered);
         }
     }

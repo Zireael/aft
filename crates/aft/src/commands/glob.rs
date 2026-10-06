@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::context::AppContext;
-use crate::grep_executor::{bounded_fallback_walk_files, ScopeFileCounts};
+use crate::grep_executor::{
+    bounded_fallback_walk_files_for_target, diagnose_scope_counts, ScopeFileCounts,
+};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, resolve_search_scope, sort_paths_by_cached_mtime_desc,
@@ -23,7 +25,6 @@ struct GlobDiscovery {
     scope_has_files: bool,
     scope_probe: Duration,
     skipped_foreign_mounts: usize,
-    counts: Option<ScopeFileCounts>,
 }
 
 pub const DEFAULT_MAX_RESULTS: usize = 100;
@@ -89,10 +90,18 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
     let mut indexed_mtimes = HashMap::new();
-    let parent_answer = if search_roots
+    let ignored_targets = search_roots
         .iter()
-        .any(|root| crate::grep_executor::target_is_ignored(root))
-    {
+        .map(|root| {
+            req.params
+                .get("path")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && !crate::grep_executor::is_same_directory(root, &project_root)
+                && crate::grep_executor::target_is_ignored(root)
+        })
+        .collect::<Vec<_>>();
+    let parent_answer = if ignored_targets.iter().any(|ignored| *ignored) {
         None
     } else {
         crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
@@ -106,7 +115,6 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_has_files,
         scope_probe,
         skipped_foreign_mounts,
-        walk_counts,
     ) = if let Some(answer) = parent_answer {
         // A parent folder session answers from its child repositories' indexes.
         parent_gaps = answer.gaps;
@@ -119,7 +127,6 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             answer.scope_has_files,
             Duration::ZERO,
             0,
-            None,
         )
     } else if search_roots.len() == 1 {
         let discovery = glob_root(
@@ -128,6 +135,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             &search_roots[0],
             pattern,
             DEFAULT_MAX_RESULTS + 1,
+            ignored_targets[0],
         );
         indexed_mtimes = discovery.indexed_mtimes;
         (
@@ -139,12 +147,21 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             discovery.scope_has_files,
             discovery.scope_probe,
             discovery.skipped_foreign_mounts,
-            discovery.counts,
         )
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
             .iter()
-            .map(|root| glob_root(ctx, &project_root, root, pattern, DEFAULT_MAX_RESULTS + 1))
+            .zip(&ignored_targets)
+            .map(|(root, ignored)| {
+                glob_root(
+                    ctx,
+                    &project_root,
+                    root,
+                    pattern,
+                    DEFAULT_MAX_RESULTS + 1,
+                    *ignored,
+                )
+            })
             .collect();
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -152,12 +169,6 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         let scope_has_files = discoveries.iter().any(|d| d.scope_has_files);
         let scope_probe = discoveries.iter().map(|d| d.scope_probe).sum();
         let skipped_foreign_mounts = discoveries.iter().map(|d| d.skipped_foreign_mounts).sum();
-        let counts = discoveries
-            .iter()
-            .try_fold(ScopeFileCounts::default(), |mut counts, d| {
-                counts.add(d.counts?);
-                Some(counts)
-            });
         let source = if discoveries.iter().all(|d| d.source == "index") {
             "index"
         } else {
@@ -181,7 +192,6 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             scope_has_files,
             scope_probe,
             skipped_foreign_mounts,
-            counts,
         )
     };
     crate::slog_debug!(
@@ -224,19 +234,16 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
     if !scope_has_files {
-        let counts = walk_counts.or_else(|| {
+        let counts = {
             let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
-            search_roots
-                .iter()
-                .try_fold(ScopeFileCounts::default(), |mut counts, root| {
-                    let outcome = bounded_fallback_walk_files(root, root, &filters);
-                    if outcome.walk_truncated || outcome.skipped_foreign_mounts > 0 {
-                        return None;
-                    }
-                    counts.add(outcome.counts);
+            search_roots.iter().zip(&ignored_targets).try_fold(
+                ScopeFileCounts::default(),
+                |mut counts, (root, ignored)| {
+                    counts.add(diagnose_scope_counts(root, root, &filters, *ignored)?);
                     Some(counts)
-                })
-        });
+                },
+            )
+        };
         // Say in the text itself that nothing was searched, so an empty scope
         // never reads as a searched directory with zero files.
         body["text"] = serde_json::Value::String(format!(
@@ -248,7 +255,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         ));
         if let Some(counts) = counts {
             body["files_examined"] = serde_json::json!(counts.examined);
-            body["files_excluded_by_ignore"] = serde_json::json!(counts.ignored);
+            body["ignored_items"] = serde_json::json!(counts.ignored);
             body["files_excluded_by_patterns"] = serde_json::json!(counts.filtered);
         } else {
             body["complete"] = serde_json::json!(false);
@@ -323,6 +330,7 @@ fn glob_root(
     search_root: &Path,
     pattern: &str,
     max_results: usize,
+    ignored_target: bool,
 ) -> GlobDiscovery {
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
@@ -332,12 +340,7 @@ fn glob_root(
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match search_index.as_ref() {
-            Some(index)
-                if index.ready
-                    && search_scope.use_index
-                    && (crate::grep_executor::is_same_directory(search_root, project_root)
-                        || !crate::grep_executor::target_is_ignored(search_root)) =>
-            {
+            Some(index) if index.ready && search_scope.use_index && !ignored_target => {
                 Some(index.snapshot())
             }
             _ => None,
@@ -367,7 +370,6 @@ fn glob_root(
             scope_has_files,
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: 0,
-            counts: None,
         }
     });
 
@@ -384,12 +386,12 @@ fn glob_root(
         // index walk never follows. Walk it rather than report zero files; the
         // walk applies ignore rules only to entries nested inside the named
         // root. A project-wide glob answers from the index even when empty.
-        Some(_) => fallback_glob(project_root, &search_scope.root, pattern),
+        Some(_) => fallback_glob(project_root, &search_scope.root, pattern, ignored_target),
         None => {
             if search_scope.use_index {
                 super::configure::trigger_search_index_reload_if_evicted(ctx);
             }
-            if !search_scope.use_index {
+            if !search_scope.use_index && !ignored_target {
                 let walk_started = Instant::now();
                 if let Some(outcome) =
                     super::grep::ripgrep_glob(&search_scope.root, pattern, max_results)
@@ -407,11 +409,10 @@ fn glob_root(
                         scope_has_files,
                         scope_probe: scope_started.elapsed(),
                         skipped_foreign_mounts: 0,
-                        counts: Some(outcome.counts),
                     };
                 }
             }
-            fallback_glob(project_root, &search_scope.root, pattern)
+            fallback_glob(project_root, &search_scope.root, pattern, ignored_target)
         }
     }
 }
@@ -431,6 +432,7 @@ fn fallback_glob(
     _project_root: &std::path::Path,
     search_root: &std::path::Path,
     pattern: &str,
+    ignored_target: bool,
 ) -> GlobDiscovery {
     let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
     // Match the glob pattern relative to the search root so that a bare
@@ -440,7 +442,8 @@ fn fallback_glob(
     // match. The `ripgrep_glob` path already passes `search_root` as both
     // arguments, so this keeps the two fallback routes in agreement.
     let walk_started = Instant::now();
-    let outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
+    let outcome =
+        bounded_fallback_walk_files_for_target(search_root, search_root, &filters, ignored_target);
     let walk_time = walk_started.elapsed();
     let scope_started = Instant::now();
     // Reuse the filtered walk; an incomplete walk cannot prove an empty scope.
@@ -456,7 +459,6 @@ fn fallback_glob(
         scope_has_files,
         scope_probe: scope_started.elapsed(),
         skipped_foreign_mounts: outcome.skipped_foreign_mounts,
-        counts: Some(outcome.counts),
     }
 }
 
