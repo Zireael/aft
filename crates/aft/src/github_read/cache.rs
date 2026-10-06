@@ -371,7 +371,9 @@ impl GithubReadEngine {
             }
             // Diff requests bypass cache lookup and shared document flights.
             // Every page must reflect a fresh PR head, even after a failed fetch.
-            let (sender, receiver) = mpsc::channel();
+            // The completion wake is captured here, so a quiet connection is
+            // still told when the diff arrives.
+            let (sender, receiver) = crate::response_finalize::pending_response_channel();
             let fetcher = Arc::clone(&self.fetcher);
             std::thread::spawn(move || {
                 let result = fetcher

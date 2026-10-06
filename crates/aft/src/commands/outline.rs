@@ -1125,7 +1125,7 @@ fn build_outline_gitignore(
     builder.build().ok().map(Arc::new)
 }
 
-fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
     for repository_root in target.ancestors() {
         let git_entry = repository_root.join(".git");
         let Ok(metadata) = std::fs::metadata(&git_entry) else {

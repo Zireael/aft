@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::context::AppContext;
-use crate::grep_executor::bounded_fallback_walk_files;
+use crate::grep_executor::{bounded_fallback_walk_files, ScopeFileCounts};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
     build_path_filters, resolve_search_scope, sort_paths_by_cached_mtime_desc,
@@ -23,6 +23,7 @@ struct GlobDiscovery {
     scope_has_files: bool,
     scope_probe: Duration,
     skipped_foreign_mounts: usize,
+    counts: Option<ScopeFileCounts>,
 }
 
 pub const DEFAULT_MAX_RESULTS: usize = 100;
@@ -88,6 +89,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
     let mut indexed_mtimes = HashMap::new();
+    let parent_answer = if search_roots
+        .iter()
+        .any(|root| crate::grep_executor::target_is_ignored(root))
+    {
+        None
+    } else {
+        crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
+    };
     let (
         mut files,
         walk_truncated,
@@ -97,7 +106,8 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         scope_has_files,
         scope_probe,
         skipped_foreign_mounts,
-    ) = if let Some(answer) = crate::views::parent::glob_fan_out(ctx, &search_roots, pattern) {
+        walk_counts,
+    ) = if let Some(answer) = parent_answer {
         // A parent folder session answers from its child repositories' indexes.
         parent_gaps = answer.gaps;
         (
@@ -109,6 +119,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             answer.scope_has_files,
             Duration::ZERO,
             0,
+            None,
         )
     } else if search_roots.len() == 1 {
         let discovery = glob_root(
@@ -128,6 +139,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             discovery.scope_has_files,
             discovery.scope_probe,
             discovery.skipped_foreign_mounts,
+            discovery.counts,
         )
     } else {
         let discoveries: Vec<GlobDiscovery> = search_roots
@@ -140,6 +152,12 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         let scope_has_files = discoveries.iter().any(|d| d.scope_has_files);
         let scope_probe = discoveries.iter().map(|d| d.scope_probe).sum();
         let skipped_foreign_mounts = discoveries.iter().map(|d| d.skipped_foreign_mounts).sum();
+        let counts = discoveries
+            .iter()
+            .try_fold(ScopeFileCounts::default(), |mut counts, d| {
+                counts.add(d.counts?);
+                Some(counts)
+            });
         let source = if discoveries.iter().all(|d| d.source == "index") {
             "index"
         } else {
@@ -163,6 +181,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             scope_has_files,
             scope_probe,
             skipped_foreign_mounts,
+            counts,
         )
     };
     crate::slog_debug!(
@@ -205,13 +224,35 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
     if !scope_has_files {
+        let counts = walk_counts.or_else(|| {
+            let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
+            search_roots
+                .iter()
+                .try_fold(ScopeFileCounts::default(), |mut counts, root| {
+                    let outcome = bounded_fallback_walk_files(root, root, &filters);
+                    if outcome.walk_truncated || outcome.skipped_foreign_mounts > 0 {
+                        return None;
+                    }
+                    counts.add(outcome.counts);
+                    Some(counts)
+                })
+        });
         // Say in the text itself that nothing was searched, so an empty scope
         // never reads as a searched directory with zero files.
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n{}",
             body["text"].as_str().unwrap_or_default(),
-            crate::commands::grep::NO_FILES_IN_SCOPE_NOTE
+            counts.map(|counts| counts.empty_note(true)).unwrap_or_else(|| {
+                "(0 files searched: the bounded walk could not determine why no files matched the scope; nothing was searched.)".to_string()
+            })
         ));
+        if let Some(counts) = counts {
+            body["files_examined"] = serde_json::json!(counts.examined);
+            body["files_excluded_by_ignore"] = serde_json::json!(counts.ignored);
+            body["files_excluded_by_patterns"] = serde_json::json!(counts.filtered);
+        } else {
+            body["complete"] = serde_json::json!(false);
+        }
     }
     if missing_on_disk > 0 {
         body["missing_on_disk_dropped"] = serde_json::json!(missing_on_disk);
@@ -291,7 +332,14 @@ fn glob_root(
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match search_index.as_ref() {
-            Some(index) if index.ready && search_scope.use_index => Some(index.snapshot()),
+            Some(index)
+                if index.ready
+                    && search_scope.use_index
+                    && (crate::grep_executor::is_same_directory(search_root, project_root)
+                        || !crate::grep_executor::target_is_ignored(search_root)) =>
+            {
+                Some(index.snapshot())
+            }
             _ => None,
         }
     };
@@ -319,6 +367,7 @@ fn glob_root(
             scope_has_files,
             scope_probe: Duration::ZERO,
             skipped_foreign_mounts: 0,
+            counts: None,
         }
     });
 
@@ -358,6 +407,7 @@ fn glob_root(
                         scope_has_files,
                         scope_probe: scope_started.elapsed(),
                         skipped_foreign_mounts: 0,
+                        counts: Some(outcome.counts),
                     };
                 }
             }
@@ -406,6 +456,7 @@ fn fallback_glob(
         scope_has_files,
         scope_probe: scope_started.elapsed(),
         skipped_foreign_mounts: outcome.skipped_foreign_mounts,
+        counts: Some(outcome.counts),
     }
 }
 
