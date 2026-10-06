@@ -1432,45 +1432,52 @@ fn fallback_search_file(
             deadline,
         ),
         CompiledPattern::Regex { compiled, .. } => {
-            for matched in compiled.find_iter(content.as_bytes()) {
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                    || should_stop_fallback_search(
-                        truncated,
-                        total_matches,
-                        stop_after,
-                        job_cancellation,
-                    )
-                {
-                    engine_capped.store(true, Ordering::Relaxed);
-                    break;
-                }
+            crate::pattern_compile::for_each_line_match(
+                compiled,
+                content.as_bytes(),
+                |match_start, match_end| {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                        || should_stop_fallback_search(
+                            truncated,
+                            total_matches,
+                            stop_after,
+                            job_cancellation,
+                        )
+                    {
+                        engine_capped.store(true, Ordering::Relaxed);
+                        return false;
+                    }
 
-                // Regex matches are not skipped ahead: a later match on the
-                // same line can run past its newline, and where the next
-                // non-overlapping match starts depends on it. Same-line
-                // matches are still dropped before any line text is built.
-                if matched.start() < reported_line_end {
-                    continue;
-                }
-                let (line, column, line_text, next_line_start) =
-                    line_details_with_next(&content, &line_starts, matched.start());
-                reported_line_end = next_line_start;
+                    // Regex matches are not skipped ahead within a line: the
+                    // engine still decides where the next non-overlapping match
+                    // starts, while only the first match on each line is reported.
+                    if match_start < reported_line_end {
+                        return true;
+                    }
+                    let (line, column, line_text, next_line_start) =
+                        line_details_with_next(&content, &line_starts, match_start);
+                    reported_line_end = next_line_start;
 
-                matched_this_file = true;
-                let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
-                if match_number > max_results {
-                    truncated.store(true, Ordering::Relaxed);
-                    break;
-                }
+                    matched_this_file = true;
+                    let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
+                    if match_number > max_results {
+                        truncated.store(true, Ordering::Relaxed);
+                        return false;
+                    }
 
-                matches.push(GrepMatch {
-                    file: file.clone(),
-                    line,
-                    column,
-                    line_text,
-                    match_text: String::from_utf8_lossy(matched.as_bytes()).into_owned(),
-                });
-            }
+                    matches.push(GrepMatch {
+                        file: file.clone(),
+                        line,
+                        column,
+                        line_text,
+                        match_text: String::from_utf8_lossy(
+                            &content.as_bytes()[match_start..match_end],
+                        )
+                        .into_owned(),
+                    });
+                    true
+                },
+            );
         }
     }
 
@@ -1506,38 +1513,31 @@ fn search_literal_in_text(
         content_bytes
     };
     let finder = memchr::memmem::Finder::new(&literal.needle);
-    let mut start = 0usize;
-
-    while let Some(position) = finder.find(&haystack[start..]) {
+    crate::pattern_compile::for_each_line(content_bytes, |line_start, line| {
+        let line_haystack = &haystack[line_start..line_start + line.len()];
+        let Some(position) = finder.find(line_haystack) else {
+            return true;
+        };
         if deadline.is_some_and(|deadline| Instant::now() >= deadline)
             || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
         {
             engine_capped.store(true, Ordering::Relaxed);
-            break;
+            return false;
         }
 
-        let offset = start + position;
-        // Grep reports the first match on each line. Occurrences arrive in
-        // increasing offset order, so one before `reported_line_end` is on the
-        // line already reported (a line with many occurrences then costs one
-        // line lookup, not one per occurrence).
+        let offset = line_start + position;
         if offset < *reported_line_end {
-            start = offset + 1;
-            continue;
+            return true;
         }
         let (line, column, line_text, next_line_start) =
             line_details_with_next(content, line_starts, offset);
         *reported_line_end = next_line_start;
-        // The finder reports every occurrence, overlapping ones included, so
-        // resuming at the next line finds exactly the occurrence a one-byte
-        // step would have reported next.
-        start = next_line_start.max(offset + 1);
 
         *matched_this_file = true;
         let match_number = total_matches.fetch_add(1, Ordering::Relaxed) + 1;
         if match_number > max_results {
             truncated.store(true, Ordering::Relaxed);
-            break;
+            return false;
         }
 
         let end = offset + literal.needle.len();
@@ -1548,7 +1548,8 @@ fn search_literal_in_text(
             line_text,
             match_text: String::from_utf8_lossy(&content_bytes[offset..end]).into_owned(),
         });
-    }
+        true
+    });
 }
 
 fn should_stop_fallback_search(
@@ -2326,6 +2327,63 @@ mod tests {
                 crate::search_index::bounded_grep_line_text(&line)
             );
             assert!(!result.scan_deadline_reached);
+        }
+    }
+
+    #[test]
+    fn regex_grep_patterns_are_line_oriented_on_explicit_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("bash-task.stderr");
+        std::fs::write(&file, "\n  566 pass\nx\n").expect("write file");
+
+        let whitespace = compiled_regex(r"^\s+[0-9]+ pass");
+        let result = grep_explicit_file(&file, &whitespace, 10, IndexStatus::Fallback);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].line, 2);
+        assert_eq!(result.matches[0].line_text, "  566 pass");
+        assert_eq!(result.matches[0].match_text, "  566 pass");
+
+        let negated_class = compiled_regex(r"[^x]+");
+        let result = grep_explicit_file(&file, &negated_class, 10, IndexStatus::Fallback);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].line, 2);
+        assert_eq!(result.matches[0].match_text, "  566 pass");
+        assert!(result
+            .matches
+            .iter()
+            .all(|matched| !matched.match_text.contains('\n')));
+
+        let explicit_newline = compiled_regex(r"pass\nx");
+        let result = grep_explicit_file(&file, &explicit_newline, 10, IndexStatus::Fallback);
+        assert!(result.matches.is_empty());
+
+        let literal_newline = match crate::pattern_compile::compile(
+            "pass\nx",
+            crate::pattern_compile::CompileOpts {
+                literal: true,
+                ..crate::pattern_compile::CompileOpts::default()
+            },
+        ) {
+            crate::pattern_compile::CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal newline: {other:?}"),
+        };
+        let result = grep_explicit_file(&file, &literal_newline, 10, IndexStatus::Fallback);
+        assert!(result.matches.is_empty());
+
+        let crlf_file = dir.path().join("crlf.stderr");
+        std::fs::write(&crlf_file, "\n  566 pass\r\nx\r\n").expect("write CRLF file");
+        for pattern in [r"pass\r\nx", r"\s+x"] {
+            let result = grep_explicit_file(
+                &crlf_file,
+                &compiled_regex(pattern),
+                10,
+                IndexStatus::Fallback,
+            );
+            assert!(
+                result.matches.is_empty(),
+                "{pattern:?}: {:?}",
+                result.matches
+            );
         }
     }
 

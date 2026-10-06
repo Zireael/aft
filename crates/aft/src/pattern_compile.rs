@@ -91,6 +91,39 @@ impl CompiledPattern {
     }
 }
 
+/// Visit each logical line without its LF terminator. Keeping the terminator
+/// out of the haystack makes regex whitespace and negated character classes
+/// behave like ripgrep's default line-oriented matcher.
+pub(crate) fn for_each_line(content: &[u8], mut visit: impl FnMut(usize, &[u8]) -> bool) {
+    let mut line_start = 0;
+    for (line_end, byte) in content.iter().enumerate() {
+        if *byte == b'\n' {
+            if !visit(line_start, &content[line_start..line_end]) {
+                return;
+            }
+            line_start = line_end + 1;
+        }
+    }
+    let _ = visit(line_start, &content[line_start..]);
+}
+
+/// Visit regex matches with offsets into the complete content, but never
+/// provide a line terminator to the regex engine.
+pub(crate) fn for_each_line_match(
+    regex: &regex::bytes::Regex,
+    content: &[u8],
+    mut visit: impl FnMut(usize, usize) -> bool,
+) {
+    for_each_line(content, |line_start, line| {
+        for matched in regex.find_iter(line) {
+            if !visit(line_start + matched.start(), line_start + matched.end()) {
+                return false;
+            }
+        }
+        true
+    });
+}
+
 pub fn compile(pattern: &str, opts: CompileOpts) -> CompileResult {
     if pattern.len() > opts.size_limit_bytes {
         return CompileResult::InvalidPattern {

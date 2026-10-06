@@ -6407,11 +6407,41 @@ fn search_degraded_grep_file(
                 Cow::Borrowed(content)
             };
 
-            for (offset, matched) in haystack.match_indices(needle) {
-                if search_cancellation_requested() {
-                    break;
+            pattern_compile::for_each_line(content.as_bytes(), |line_start, line| {
+                let line_haystack = &haystack[line_start..line_start + line.len()];
+                for (line_offset, matched) in line_haystack.match_indices(needle) {
+                    if search_cancellation_requested() {
+                        return false;
+                    }
+                    let offset = line_start + line_offset;
+                    let match_text = content[offset..offset + matched.len()].to_string();
+                    let (counted, should_continue) = record_degraded_grep_match(
+                        file,
+                        content,
+                        &line_starts,
+                        &mut seen_lines,
+                        offset,
+                        match_text,
+                        max_results,
+                        total_matches,
+                        truncated,
+                        matches,
+                    );
+                    matched_this_file |= counted;
+                    if !should_continue {
+                        return false;
+                    }
                 }
-                let match_text = content[offset..offset + matched.len()].to_string();
+                true
+            });
+        }
+        pattern_compile::CompiledPattern::Regex { compiled, .. } => {
+            pattern_compile::for_each_line_match(compiled, content.as_bytes(), |offset, end| {
+                if search_cancellation_requested() {
+                    return false;
+                }
+                let match_text =
+                    String::from_utf8_lossy(&content.as_bytes()[offset..end]).into_owned();
                 let (counted, should_continue) = record_degraded_grep_match(
                     file,
                     content,
@@ -6425,33 +6455,8 @@ fn search_degraded_grep_file(
                     matches,
                 );
                 matched_this_file |= counted;
-                if !should_continue {
-                    break;
-                }
-            }
-        }
-        pattern_compile::CompiledPattern::Regex { compiled, .. } => {
-            for matched in compiled.find_iter(content.as_bytes()) {
-                if search_cancellation_requested() {
-                    break;
-                }
-                let (counted, should_continue) = record_degraded_grep_match(
-                    file,
-                    content,
-                    &line_starts,
-                    &mut seen_lines,
-                    matched.start(),
-                    String::from_utf8_lossy(matched.as_bytes()).into_owned(),
-                    max_results,
-                    total_matches,
-                    truncated,
-                    matches,
-                );
-                matched_this_file |= counted;
-                if !should_continue {
-                    break;
-                }
-            }
+                should_continue
+            });
         }
     }
 
@@ -9383,6 +9388,36 @@ mod tests {
         assert!(text.contains("0 lexical matches"));
         assert!(text.contains("semantic lane is unavailable"));
         assert!(!text.contains("lexical-only fallback returned 0"));
+    }
+
+    #[test]
+    fn degraded_regex_grep_patterns_are_line_oriented() {
+        let file = Path::new("/fixture/stderr.log");
+        let content = "\n  566 pass\nx\n";
+        let compiled = match pattern_compile::compile(
+            r"^\s+[0-9]+ pass",
+            pattern_compile::CompileOpts::default(),
+        ) {
+            pattern_compile::CompileResult::Ok(compiled) => compiled,
+            other => panic!("compile regex: {other:?}"),
+        };
+        let mut total_matches = 0;
+        let mut truncated = false;
+        let mut matches = Vec::new();
+
+        assert!(search_degraded_grep_file(
+            file,
+            content,
+            &compiled,
+            10,
+            &mut total_matches,
+            &mut truncated,
+            &mut matches,
+        ));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 2);
+        assert_eq!(matches[0].line_text, "  566 pass");
+        assert_eq!(matches[0].match_text, "  566 pass");
     }
 
     #[test]

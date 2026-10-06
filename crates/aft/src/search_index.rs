@@ -3628,9 +3628,8 @@ enum MatchVisit {
     Stop,
     /// The occurrence is on a line that already produced a match.
     SameLine,
-    /// The occurrence was the first on its line; the next line starts at
-    /// `next_line_start`.
-    Recorded { next_line_start: usize },
+    /// The occurrence was the first on its line.
+    Recorded,
 }
 
 fn search_candidate_file(
@@ -3731,7 +3730,7 @@ fn search_candidate_file(
                 line_text,
                 match_text: String::from_utf8_lossy(&content[offset..end]).into_owned(),
             });
-            MatchVisit::Recorded { next_line_start }
+            MatchVisit::Recorded
         };
 
         match matcher {
@@ -3745,32 +3744,19 @@ fn search_candidate_file(
                     &content
                 };
                 let finder = memchr::memmem::Finder::new(needle);
-                let mut start = 0;
-
-                while let Some(position) = finder.find(&haystack[start..]) {
-                    let offset = start + position;
-                    start = match visit(offset, offset + needle.len()) {
-                        MatchVisit::Stop => break,
-                        MatchVisit::SameLine => offset + 1,
-                        // The finder reports every occurrence, overlapping
-                        // ones included, so resuming at the next line finds
-                        // exactly the occurrence a one-byte step would have
-                        // reported next, without visiting the rest of this
-                        // line.
-                        MatchVisit::Recorded { next_line_start } => next_line_start.max(offset + 1),
+                pattern_compile::for_each_line(&content, |line_start, line| {
+                    let line_haystack = &haystack[line_start..line_start + line.len()];
+                    let Some(position) = finder.find(line_haystack) else {
+                        return true;
                     };
-                }
+                    let offset = line_start + position;
+                    !matches!(visit(offset, offset + needle.len()), MatchVisit::Stop)
+                });
             }
             SearchMatcher::Regex(regex) => {
-                // Regex matches are not skipped ahead: a later match on the
-                // same line can run past its newline, and where the next
-                // non-overlapping match starts depends on it. Same-line
-                // matches are still dropped before any line text is built.
-                for matched in regex.find_iter(&content) {
-                    if let MatchVisit::Stop = visit(matched.start(), matched.end()) {
-                        break;
-                    }
-                }
+                pattern_compile::for_each_line_match(regex, &content, |start, end| {
+                    !matches!(visit(start, end), MatchVisit::Stop)
+                });
             }
         }
     }
@@ -3834,21 +3820,19 @@ fn matching_lines_in_content(
                 content
             };
             let finder = memchr::memmem::Finder::new(needle);
-            let mut start = 0;
-            while let Some(position) = finder.find(&haystack[start..]) {
-                let offset = start + position;
-                // Resume at the next line once this one is recorded: the rest
-                // of the line can only repeat it (see `search_candidate_file`).
-                start = record(offset, offset + needle.len())
-                    .map_or(offset + 1, |next_line_start| {
-                        next_line_start.max(offset + 1)
-                    });
-            }
+            pattern_compile::for_each_line(content, |line_start, line| {
+                let line_haystack = &haystack[line_start..line_start + line.len()];
+                if let Some(position) = finder.find(line_haystack) {
+                    record(line_start + position, line_start + position + needle.len());
+                }
+                true
+            });
         }
         SearchMatcher::Regex(regex) => {
-            for matched in regex.find_iter(content) {
-                record(matched.start(), matched.end());
-            }
+            pattern_compile::for_each_line_match(regex, content, |start, end| {
+                record(start, end);
+                true
+            });
         }
     }
     (matches, matched_lines)
@@ -10281,6 +10265,65 @@ mod tests {
 
         assert_eq!(result.total_matches, 1);
         assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn indexed_regex_grep_patterns_are_line_oriented() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("stderr.log");
+        fs::write(&file, "\n  566 pass\nx\n").expect("write file");
+        let index = SearchIndex::build(&project);
+        assert!(index.is_ready());
+
+        let whitespace = index.grep(r"^\s+[0-9]+ pass", true, &[], &[], &project, 10);
+        assert_eq!(whitespace.matches.len(), 1);
+        assert_eq!(whitespace.matches[0].line, 2);
+        assert_eq!(whitespace.matches[0].line_text, "  566 pass");
+        assert_eq!(whitespace.matches[0].match_text, "  566 pass");
+
+        let negated_class = index.grep(r"[^x]+", true, &[], &[], &project, 10);
+        assert_eq!(negated_class.matches.len(), 1);
+        assert_eq!(negated_class.matches[0].line, 2);
+        assert_eq!(negated_class.matches[0].match_text, "  566 pass");
+        assert!(negated_class
+            .matches
+            .iter()
+            .all(|matched| !matched.match_text.contains('\n')));
+
+        let explicit_newline = index.grep(r"pass\nx", true, &[], &[], &project, 10);
+        assert!(explicit_newline.matches.is_empty());
+
+        let regex = match pattern_compile::compile(r"[^x]+", CompileOpts::default()) {
+            CompileResult::Ok(CompiledPattern::Regex { compiled, .. }) => compiled,
+            other => panic!("compile regex: {other:?}"),
+        };
+        let never_keep = |_matched: &GrepMatch| false;
+        let (collected, collected_lines) = matching_lines_in_content(
+            &file,
+            b"\n  566 pass\nx\n",
+            &SearchMatcher::Regex(regex),
+            10,
+            &never_keep,
+        );
+        assert_eq!(collected_lines, 1);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].line, 2);
+        assert_eq!(collected[0].match_text, "  566 pass");
+
+        let literal_newline = match pattern_compile::compile(
+            "pass\nx",
+            CompileOpts {
+                literal: true,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(pattern) => pattern,
+            other => panic!("compile literal newline: {other:?}"),
+        };
+        let result = index.search_grep(&literal_newline, &[], &[], &project, 10);
+        assert!(result.matches.is_empty());
     }
 
     #[test]
