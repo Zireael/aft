@@ -7,5 +7,13 @@
     "workloads": {
       "mason": "broca"
     }
+  },
+  // Masons run plain cargo commands on the Linux build server instead of this
+  // Mac. Commands with an environment prefix (HOME=..., RUSTFLAGS=...) or a
+  // pipe stay local, which keeps the Windows cross-check and isolated-HOME
+  // runs on the Mac. macOS-only behaviour is covered by CI's macOS legs.
+  "remote_exec": {
+    "enabled": true,
+    "commands": ["cd", "cargo build", "cargo check", "cargo test", "cargo nextest", "cargo clippy"]
   }
 }
